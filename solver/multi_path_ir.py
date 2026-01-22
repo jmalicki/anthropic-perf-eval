@@ -225,19 +225,28 @@ class MultiPathIR:
         """
         Arithmetic op that scheduler can assign to ALU or VALU.
 
-        With 6 VALU + 12 ALU slots, we can do 18 ops per cycle if we mix!
-        The scheduler will balance based on what other ops need each engine.
+        VALU: 1 slot processes 8 elements (SIMD)
+        ALU: 8 slots process 8 elements (scalar expanded)
+
+        With 6 VALU + 12 ALU slots per cycle, we can process:
+        - 6 VALU ops = 48 elements on VALU
+        - 12 ALU ops = 12 elements on ALU (1.5 vectors worth)
+        Total: ~54 elements/cycle when mixed vs 48 VALU-only
+
+        ALU is less efficient but helps when VALU is saturated.
         """
+        # VALU: single op, processes all 8 elements
+        valu_impl = Implementation(Engine.VALU, [(op, dest, src1, src2)], throughput=1)
+
+        # ALU: 8 scalar ops, one per element (uses 8 of 12 ALU slots)
+        alu_slots = [(op, dest + i, src1 + i, src2 + i) for i in range(8)]
+        alu_impl = Implementation(Engine.ALU, alu_slots, throughput=1)
+
         if prefer_valu:
-            impls = [
-                Implementation(Engine.VALU, [(op, dest, src1, src2)]),
-                Implementation(Engine.ALU, [(op, dest, src1, src2)]),
-            ]
+            impls = [valu_impl, alu_impl]
         else:
-            impls = [
-                Implementation(Engine.ALU, [(op, dest, src1, src2)]),
-                Implementation(Engine.VALU, [(op, dest, src1, src2)]),
-            ]
+            impls = [alu_impl, valu_impl]
+
         return self.add_op(f"arith_{op}_{dest}", impls, deps)
 
     def multiply_or_shift(self, dest: int, src: int, by_two: int,
@@ -254,6 +263,41 @@ class MultiPathIR:
                 Implementation(Engine.VALU, [("*", dest, src, by_two)]),
                 Implementation(Engine.VALU, [("<<", dest, src, by_two)]),  # Shift by 1
             ],
+            deps
+        )
+
+    def gather_flexible(self, dest: int, forest_p: int, idx: int,
+                       st_addr: int, v_offsets: int = None,
+                       deps: list[int] = None) -> int:
+        """
+        Gather tree value with flexible implementation choice.
+
+        The scheduler chooses between:
+        - Path A (scalar): ALU address calc + scalar Load (precise, uses Load+ALU)
+        - Path B (vload): vload consecutive values + VALU selection (uses Load+VALU)
+
+        Path A is better when VALU is saturated.
+        Path B is better when Load is saturated or indices are clustered.
+
+        For VLEN=8:
+        - Path A: 1 ALU op (address calc) + 1 Load op
+        - Path B: 1 vload (8 values) + selection VALU ops (amortized across group)
+        """
+        # Path A: Scalar load - uses ALU for address calc, then Load
+        # This is a compound operation: addr = forest_p + idx, then load from addr
+        scalar_impl = Implementation(
+            Engine.LOAD,
+            [("load", dest, st_addr)],  # Assumes st_addr already computed
+            throughput=1
+        )
+
+        # Path B: For now, just offer the scalar path
+        # Full vload+selection would need restructuring to work across the group
+        # TODO: Add vload path when we can express group-level operations
+
+        return self.add_op(
+            f"gather_{dest}",
+            [scalar_impl],  # For now, single implementation
             deps
         )
 
@@ -449,6 +493,7 @@ def schedule_multi_path(ir: MultiPathIR, time_limit: float = 60.0) -> tuple[int,
                 model.Add(impl_data['start'] >= dep_completion).OnlyEnforceIf(impl_data['chosen'])
 
     # Resource constraints: cumulative per engine
+    # Demand is the number of slots used by each implementation
     for engine in Engine:
         engine_intervals = []
         engine_demands = []
@@ -457,7 +502,8 @@ def schedule_multi_path(ir: MultiPathIR, time_limit: float = 60.0) -> tuple[int,
             for impl_idx, impl_data in op_vars[op.id].items():
                 if impl_data['impl'].engine == engine:
                     engine_intervals.append(impl_data['interval'])
-                    engine_demands.append(1)
+                    # Use number of slots as demand (e.g., ALU vector op uses 8 slots)
+                    engine_demands.append(len(impl_data['impl'].slots))
 
         if engine_intervals:
             model.AddCumulative(engine_intervals, engine_demands, SLOT_LIMITS[engine])

@@ -197,14 +197,16 @@ class InterleavedUnrolledKernelBuilder:
             # PHASE 4: Branch computation (ALL rounds)
             # Use per-group temp v_t[it][i] for bit and reuse for in_bounds
             # (sequential ops so no conflict)
+            # Uses multiply_add fusion: idx = idx * 2 + t
             for it in range(n_iters):
                 base_g = it * UNROLL
                 for i in range(UNROLL):
                     t = v_t[it][i]  # Per-group temp
-                    self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], v_2)])
+                    # t = (val & 1) + 1
                     self.emit(valu=[("&", t, all_val[base_g+i], v_1)])
                     self.emit(valu=[("+", t, t, v_1)])
-                    self.emit(valu=[("+", all_idx[base_g+i], all_idx[base_g+i], t)])
+                    # idx = idx * 2 + t (fused multiply_add saves 1 VALU op)
+                    self.emit(valu=[("multiply_add", all_idx[base_g+i], all_idx[base_g+i], v_2, t)])
                     # Reuse t for in_bounds (previous value no longer needed)
                     self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
                     self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])

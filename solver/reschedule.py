@@ -79,7 +79,7 @@ def extract_ops(instrs: list[dict]) -> list[Op]:
                         for i in range(VLEN):
                             op.writes.add(slot[1] + i)
                         op.reads.add(slot[2])
-                    elif op_type == 'vmultiply_add':
+                    elif op_type in ('vmultiply_add', 'multiply_add'):
                         # dest = src1 * src2 + src3 (all vectors)
                         for i in range(VLEN):
                             op.writes.add(slot[1] + i)
