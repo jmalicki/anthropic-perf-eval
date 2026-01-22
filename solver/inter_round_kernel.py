@@ -47,6 +47,86 @@ class InterRoundKernelBuilder:
         if instr:
             self.instrs.append(instr)
 
+    def slot_utilization(self, verbose: bool = True, actual_cycles: int = None) -> dict:
+        """
+        Compute slot utilization statistics for the emitted instructions.
+
+        Args:
+            verbose: Print summary table
+            actual_cycles: If provided, also compute dynamic utilization based on
+                          actual executed cycles (for kernels with loops)
+
+        Returns a dict with:
+        - used: {engine: total slots used in static instructions}
+        - available: {engine: total slots available (cycles * limit)}
+        - unused: {engine: available - used}
+        - utilization: {engine: used / available as percentage}
+        - per_cycle: list of per-cycle usage dicts
+        """
+        n_instructions = len(self.instrs)
+
+        # Count used slots per engine (excluding debug which isn't a real constraint)
+        engines = ['valu', 'alu', 'load', 'store', 'flow']
+        used = {engine: 0 for engine in engines}
+        per_cycle = []
+
+        for instr in self.instrs:
+            cycle_usage = {}
+            for engine in engines:
+                count = len(instr.get(engine, []))
+                used[engine] += count
+                cycle_usage[engine] = count
+            per_cycle.append(cycle_usage)
+
+        # Compute available and unused based on static instruction count
+        available = {engine: n_instructions * SLOT_LIMITS[engine] for engine in engines}
+        unused = {engine: available[engine] - used[engine] for engine in engines}
+        utilization = {
+            engine: (used[engine] / available[engine] * 100) if available[engine] > 0 else 0
+            for engine in engines
+        }
+
+        if verbose:
+            print(f"\n=== Slot Utilization ({n_instructions} instructions) ===")
+            print(f"{'Engine':<8} {'Limit':<6} {'Used':<8} {'Available':<10} {'Unused':<8} {'Util%':<8}")
+            print("-" * 60)
+            for engine in engines:
+                print(f"{engine:<8} {SLOT_LIMITS[engine]:<6} {used[engine]:<8} {available[engine]:<10} {unused[engine]:<8} {utilization[engine]:<8.1f}")
+
+            total_used = sum(used.values())
+            total_available = sum(available.values())
+            total_unused = sum(unused.values())
+            total_util = (total_used / total_available * 100) if total_available > 0 else 0
+            print("-" * 60)
+            print(f"{'TOTAL':<8} {'':<6} {total_used:<8} {total_available:<10} {total_unused:<8} {total_util:<8.1f}")
+
+            # If actual_cycles provided, show dynamic utilization
+            if actual_cycles is not None:
+                print(f"\n=== Dynamic Utilization ({actual_cycles} executed cycles) ===")
+                dyn_available = {engine: actual_cycles * SLOT_LIMITS[engine] for engine in engines}
+                # Estimate dynamic used based on ratio of actual to static cycles
+                # (This is approximate since loops execute instructions multiple times)
+                ratio = actual_cycles / n_instructions if n_instructions > 0 else 1
+                dyn_used = {engine: int(used[engine] * ratio) for engine in engines}
+                dyn_unused = {engine: dyn_available[engine] - dyn_used[engine] for engine in engines}
+                dyn_util = {
+                    engine: (dyn_used[engine] / dyn_available[engine] * 100) if dyn_available[engine] > 0 else 0
+                    for engine in engines
+                }
+                print(f"{'Engine':<8} {'Limit':<6} {'~Used':<8} {'Available':<10} {'~Unused':<8} {'~Util%':<8}")
+                print("-" * 60)
+                for engine in engines:
+                    print(f"{engine:<8} {SLOT_LIMITS[engine]:<6} {dyn_used[engine]:<8} {dyn_available[engine]:<10} {dyn_unused[engine]:<8} {dyn_util[engine]:<8.1f}")
+
+        return {
+            'instructions': n_instructions,
+            'used': used,
+            'available': available,
+            'unused': unused,
+            'utilization': utilization,
+            'per_cycle': per_cycle,
+        }
+
     def build_kernel(
         self,
         forest_height: int,
