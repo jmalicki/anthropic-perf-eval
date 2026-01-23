@@ -6,7 +6,7 @@ can overlap independent operations. Uses per-iteration temps to avoid conflicts.
 """
 
 from problem import DebugInfo, SLOT_LIMITS, VLEN, SCRATCH_SIZE, HASH_STAGES
-from solver.reschedule import extract_ops, compute_dependencies
+from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, emit_scheduled
 
 
 class InterleavedUnrolledKernelBuilder:
@@ -46,7 +46,8 @@ class InterleavedUnrolledKernelBuilder:
         full_solve_time: float = 3600.0,
         require_optimal: bool = True,
         enable_valu_shift: bool = True,
-        valu_shift_time: float = None
+        valu_shift_time: float = None,
+        use_greedy: bool = False
     ):
         """Build fully unrolled kernel with interleaved emission.
 
@@ -55,6 +56,7 @@ class InterleavedUnrolledKernelBuilder:
             require_optimal: Require OPTIMAL status from CP-SAT (default: True)
             enable_valu_shift: Enable VALU→ALU shifting optimization (default: True)
             valu_shift_time: Time per VALU→ALU shift iteration (default: same as full_solve_time)
+            use_greedy: Use fast greedy scheduler instead of CP-SAT (default: False)
         """
         n_groups = batch_size // VLEN
         UNROLL = 8
@@ -98,6 +100,27 @@ class InterleavedUnrolledKernelBuilder:
         v_hc = [self.vec(f"v_hc{i}") for i in range(6)]
         v_hs = [self.vec(f"v_hs{i}") for i in range(6)]
 
+        # FMA optimization: (a + const) + (a << shift) = a * (1 + 2^shift) + const
+        # Applicable to stages where op1='+', op2='+', op3='<<'
+        hash_fma_mult = [None] * 6  # multiplier or None if not FMA-eligible
+        v_hash_mult = {}  # stage_idx -> vector address
+        for i, (op1, const, op2, op3, shift) in enumerate(HASH_STAGES):
+            if op1 == '+' and op2 == '+' and op3 == '<<':
+                hash_fma_mult[i] = 1 + (1 << shift)
+
+        # Stage 5 XOR optimization:
+        # Stage 5: (a ^ C) ^ (a >> 16) — we simplify to a ^ (a >> 16)
+        # Key: val_orig = val_opt ^ C is maintained across rounds
+        # 1. Pre-XOR tc[1-6] with C (not tc[0])
+        # 2. Pre-XOR gathered nodes with C (rounds 3+)
+        # 3. Simplify stage 5 to just a ^ (a >> 16)
+        # 4. Flip branch direction (C's LSB = 1)
+        # 5. When wrapping (idx → 0), XOR val with C
+        # 6. At the end, XOR stored val with C
+        STAGE5_XOR_CONST = 0xB55A4F09
+        stage5_xor_s = self.alloc("stage5_xor")
+        v_stage5_xor = self.vec("v_stage5_xor")
+
         print(f"Scratch usage: {self.scratch_ptr} / {SCRATCH_SIZE}")
 
         # INIT
@@ -114,9 +137,28 @@ class InterleavedUnrolledKernelBuilder:
             self.emit(valu=[("vbroadcast", v_const[i], c[i]), ("vbroadcast", v_const[i+1], c[i+1])])
         for i in range(0, 6, 2):
             self.emit(valu=[("vbroadcast", v_hc[i], hc[i]), ("vbroadcast", v_hc[i+1], hc[i+1]), ("vbroadcast", v_hs[i], hs[i]), ("vbroadcast", v_hs[i+1], hs[i+1])])
+
+        # Initialize FMA multiplier vectors for eligible hash stages
+        for i in range(6):
+            if hash_fma_mult[i] is not None:
+                mult_s = self.alloc(f"hash_mult_{i}")
+                v_mult = self.vec(f"v_hash_mult_{i}")
+                v_hash_mult[i] = v_mult
+                self.emit(load=[("const", mult_s, hash_fma_mult[i])])
+                self.emit(valu=[("vbroadcast", v_mult, mult_s)])
+
+        # Load Stage 5 XOR constant
+        self.emit(load=[("const", stage5_xor_s, STAGE5_XOR_CONST)])
+        self.emit(valu=[("vbroadcast", v_stage5_xor, stage5_xor_s)])
+
         for i in range(7):
             self.emit(alu=[("+", st[0], forest_p, c[i])])
             self.emit(load=[("load", tc[i], st[0])])
+
+        # Note: We do NOT pre-XOR tc[1-6] here because the delta computation
+        # (td_1 = tc[1] - tc[2]) doesn't preserve XOR. Instead, we XOR v_nv
+        # after computing it for rounds 1-2.
+
         self.emit(alu=[("-", td_1, tc[1], tc[2]), ("-", td_4, tc[4], tc[3]), ("-", td_5, tc[5], tc[3]), ("-", td_6, tc[6], tc[3])])
         self.emit(valu=[("vbroadcast", v_tc2, tc[2]), ("vbroadcast", v_td_1, td_1), ("vbroadcast", v_tc3, tc[3]), ("vbroadcast", v_td_4, td_4), ("vbroadcast", v_td_5, td_5), ("vbroadcast", v_td_6, td_6)])
         init_end = len(self.instrs)
@@ -148,6 +190,10 @@ class InterleavedUnrolledKernelBuilder:
                         self.emit(valu=[("==", t, all_idx[base_g+i], v_1)])
                         self.emit(valu=[("*", t, v_td_1, t)])
                         self.emit(valu=[("+", v_nv[it][i], v_tc2, t)])
+                # Stage 5 opt: XOR v_nv with C (tree nodes from rounds 1+ need pre-XOR)
+                for it in range(n_iters):
+                    for i in range(UNROLL):
+                        self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
 
             elif rnd == 2:
                 # Round 2: v_nv = tc[3] + select based on idx == 4, 5, 6
@@ -170,6 +216,10 @@ class InterleavedUnrolledKernelBuilder:
                         self.emit(valu=[("==", t, all_idx[base_g+i], v_const[6])])
                         self.emit(valu=[("*", t, v_td_6, t)])
                         self.emit(valu=[("+", v_nv[it][i], v_nv[it][i], t)])
+                # Stage 5 opt: XOR v_nv with C (tree nodes from rounds 1+ need pre-XOR)
+                for it in range(n_iters):
+                    for i in range(UNROLL):
+                        self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
 
             else:
                 # Gather from forest - use per-iteration st slots for interleaving
@@ -186,6 +236,13 @@ class InterleavedUnrolledKernelBuilder:
                                 ("load", v_nv[it][i] + vi, st_a),
                                 ("load", v_nv[it][i+1] + vi, st_b)
                             ])
+                # Stage 5 optimization: XOR gathered values with C (unconditionally)
+                # Even for idx=0 after wrap, this works because:
+                # val_input = val_opt ^ (t0 ^ C) = (val_orig ^ C) ^ (t0 ^ C) = val_orig ^ t0
+                for it in range(n_iters):
+                    base_g = it * UNROLL
+                    for i in range(UNROLL):
+                        self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
 
             # PHASE 2: XOR all values with v_nv (ALL rounds)
             for it in range(n_iters):
@@ -195,20 +252,37 @@ class InterleavedUnrolledKernelBuilder:
 
             # PHASE 3: Hash - 6 stages (ALL rounds)
             # Use per-group temps: v_t[it][i] for hash temp
+            # FMA optimization: (a + const) + (a << shift) = a * (1 + 2^shift) + const
+            # Stage 5 optimization: simplified to a ^ (a >> 16)
             for hi in range(6):
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
                 for it in range(n_iters):
                     base_g = it * UNROLL
                     for i in range(UNROLL):
-                        t = v_t[it][i]  # Per-group temp for hash
-                        self.emit(valu=[(op1, t, all_val[base_g+i], v_hc[hi]),
-                                        (op3, v_nv[it][i], all_val[base_g+i], v_hs[hi])])
-                        self.emit(valu=[(op2, all_val[base_g+i], t, v_nv[it][i])])
+                        if hash_fma_mult[hi] is not None:
+                            # FMA: val = val * mult + const (single multiply_add)
+                            self.emit(valu=[("multiply_add", all_val[base_g+i],
+                                            all_val[base_g+i], v_hash_mult[hi], v_hc[hi])])
+                        elif hi == 5:
+                            # Stage 5 optimized: just a ^ (a >> 16)
+                            t = v_t[it][i]
+                            self.emit(valu=[(">>", t, all_val[base_g+i], v_hs[hi])])
+                            self.emit(valu=[("^", all_val[base_g+i], all_val[base_g+i], t)])
+                        else:
+                            # Original: 2 ops per stage
+                            t = v_t[it][i]  # Per-group temp for hash
+                            self.emit(valu=[(op1, t, all_val[base_g+i], v_hc[hi]),
+                                            (op3, v_nv[it][i], all_val[base_g+i], v_hs[hi])])
+                            self.emit(valu=[(op2, all_val[base_g+i], t, v_nv[it][i])])
 
             # PHASE 4: Branch computation (ALL rounds)
             # Use per-group temp v_t[it][i] for bit and reuse for in_bounds
             # (sequential ops so no conflict)
             # Uses multiply_add fusion: idx = idx * 2 + t
+            #
+            # Stage 5 optimization: val_opt = val_orig ^ C, so LSB is flipped.
+            # Original: branch = (val_orig & 1) + 1
+            # Optimized: branch = ((val_opt & 1) ^ 1) + 1 = 2 - (val_opt & 1)
             #
             # Optimization: Skip bounds check for early rounds where all indices
             # are guaranteed in-bounds. At round r, max index is 2^(r+1) - 1.
@@ -220,18 +294,24 @@ class InterleavedUnrolledKernelBuilder:
                 base_g = it * UNROLL
                 for i in range(UNROLL):
                     t = v_t[it][i]  # Per-group temp
-                    # t = (val & 1) + 1
+                    # Stage 5 opt: t = 2 - (val & 1) = flipped branch
                     self.emit(valu=[("&", t, all_val[base_g+i], v_1)])
-                    self.emit(valu=[("+", t, t, v_1)])
+                    self.emit(valu=[("-", t, v_2, t)])
                     # idx = idx * 2 + t (fused multiply_add saves 1 VALU op)
                     self.emit(valu=[("multiply_add", all_idx[base_g+i], all_idx[base_g+i], v_2, t)])
-                    # Only do bounds check when needed
+                    # Only do bounds check when needed (compile-time decision)
                     if needs_bounds_check:
                         # Reuse t for in_bounds (previous value no longer needed)
                         self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
+                        # idx = idx * in_bounds (zeroes if out of bounds)
                         self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])
 
         rounds_end = len(self.instrs)
+
+        # Stage 5 optimization: XOR all values with C before storing
+        # This converts val_opt back to val_orig
+        for g in range(n_groups):
+            self.emit(valu=[("^", all_val[g], all_val[g], v_stage5_xor)])
 
         # STORE DATA
         for g in range(0, n_groups, 2):
@@ -243,18 +323,29 @@ class InterleavedUnrolledKernelBuilder:
 
         print(f"Before scheduling: {store_end} instructions")
 
-        # RESCHEDULE with CP-SAT
+        # RESCHEDULE - either with fast greedy or optimal CP-SAT
         ops = extract_ops(self.instrs)
         op_by_id = compute_dependencies(ops)
         print(f"Scheduling {len(ops)} ops...")
 
-        from solver.round_chunked_scheduler import schedule_round_chunked
-        # Multi-phase: chunked → full solve → VALU shifting
-        num_cycles, scheduled = schedule_round_chunked(
-            ops, op_by_id, rounds, n_iters, UNROLL,
-            time_limit=60.0, full_solve_time=full_solve_time,
-            require_optimal=require_optimal, enable_valu_shift=enable_valu_shift,
-            valu_shift_time=valu_shift_time
-        )
+        if use_greedy:
+            # Fast greedy scheduler - runs in seconds
+            import time
+            start = time.time()
+            num_cycles, scheduled_ops = schedule_greedy(ops, op_by_id, enable_valu_shift=enable_valu_shift)
+            scheduled = emit_scheduled(scheduled_ops, num_cycles)
+            elapsed = time.time() - start
+            print(f"Greedy scheduling completed in {elapsed:.2f}s")
+        else:
+            # CP-SAT optimal scheduler - may take hours for large kernels
+            from solver.round_chunked_scheduler import schedule_round_chunked
+            # Multi-phase: chunked → full solve → VALU shifting
+            num_cycles, scheduled = schedule_round_chunked(
+                ops, op_by_id, rounds, n_iters, UNROLL,
+                time_limit=60.0, full_solve_time=full_solve_time,
+                require_optimal=require_optimal, enable_valu_shift=enable_valu_shift,
+                valu_shift_time=valu_shift_time
+            )
+
         self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
         print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
