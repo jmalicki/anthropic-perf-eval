@@ -6,7 +6,7 @@ can overlap independent operations. Uses per-iteration temps to avoid conflicts.
 """
 
 from problem import DebugInfo, SLOT_LIMITS, VLEN, SCRATCH_SIZE, HASH_STAGES
-from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, emit_scheduled
+from solver.reschedule import extract_ops, compute_dependencies
 
 
 class InterleavedUnrolledKernelBuilder:
@@ -42,9 +42,14 @@ class InterleavedUnrolledKernelBuilder:
         forest_height: int,
         n_nodes: int,
         batch_size: int,
-        rounds: int
+        rounds: int,
+        full_solve_time: float = 1800.0
     ):
-        """Build fully unrolled kernel with interleaved emission."""
+        """Build fully unrolled kernel with interleaved emission.
+
+        Args:
+            full_solve_time: Time limit for CP-SAT full solve in seconds (default: 1800 = 30 min)
+        """
         n_groups = batch_size // VLEN
         UNROLL = 8
         n_iters = n_groups // UNROLL
@@ -198,6 +203,13 @@ class InterleavedUnrolledKernelBuilder:
             # Use per-group temp v_t[it][i] for bit and reuse for in_bounds
             # (sequential ops so no conflict)
             # Uses multiply_add fusion: idx = idx * 2 + t
+            #
+            # Optimization: Skip bounds check for early rounds where all indices
+            # are guaranteed in-bounds. At round r, max index is 2^(r+1) - 1.
+            # Bounds check needed when 2^(r+1) - 1 >= n_nodes.
+            max_idx_this_round = (1 << (rnd + 2)) - 1  # After branch: max is 2^(rnd+2) - 1
+            needs_bounds_check = max_idx_this_round >= n_nodes
+
             for it in range(n_iters):
                 base_g = it * UNROLL
                 for i in range(UNROLL):
@@ -207,9 +219,11 @@ class InterleavedUnrolledKernelBuilder:
                     self.emit(valu=[("+", t, t, v_1)])
                     # idx = idx * 2 + t (fused multiply_add saves 1 VALU op)
                     self.emit(valu=[("multiply_add", all_idx[base_g+i], all_idx[base_g+i], v_2, t)])
-                    # Reuse t for in_bounds (previous value no longer needed)
-                    self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
-                    self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])
+                    # Only do bounds check when needed
+                    if needs_bounds_check:
+                        # Reuse t for in_bounds (previous value no longer needed)
+                        self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
+                        self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])
 
         rounds_end = len(self.instrs)
 
@@ -223,27 +237,16 @@ class InterleavedUnrolledKernelBuilder:
 
         print(f"Before scheduling: {store_end} instructions")
 
-        # RESCHEDULE - try chunked CP-SAT, fall back to greedy
+        # RESCHEDULE with CP-SAT
         ops = extract_ops(self.instrs)
         op_by_id = compute_dependencies(ops)
         print(f"Scheduling {len(ops)} ops...")
 
-        SCHEDULER = "chunked"  # "cp", "greedy", or "chunked"
-
-        if SCHEDULER == "chunked" and len(ops) > 2000:
-            try:
-                from solver.round_chunked_scheduler import schedule_round_chunked
-                num_cycles, scheduled = schedule_round_chunked(
-                    ops, op_by_id, rounds, n_iters, UNROLL, time_limit=30.0
-                )
-                self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
-                print(f"Round-chunked scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
-            except ImportError:
-                print("Round-chunked scheduler not available, falling back to greedy")
-                SCHEDULER = "greedy"
-
-        if SCHEDULER == "greedy" or (SCHEDULER == "chunked" and len(ops) <= 2000):
-            num_cycles = schedule_greedy(ops, op_by_id)
-            scheduled = emit_scheduled(ops, num_cycles)
-            self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
-            print(f"Greedy scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
+        from solver.round_chunked_scheduler import schedule_round_chunked
+        # Two-phase: chunked first (60s), then full solve with hint
+        num_cycles, scheduled = schedule_round_chunked(
+            ops, op_by_id, rounds, n_iters, UNROLL,
+            time_limit=60.0, full_solve_time=full_solve_time
+        )
+        self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
+        print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")

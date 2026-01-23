@@ -21,8 +21,20 @@ class CPScheduleResult:
 
 
 def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0,
-                greedy_hint: dict[int, int] = None) -> CPScheduleResult:
-    """Schedule operations using CP-SAT solver."""
+                greedy_hint: dict[int, int] = None,
+                alu_demands: dict[int, int] = None,
+                log_file: str = None) -> CPScheduleResult:
+    """Schedule operations using CP-SAT solver.
+
+    Args:
+        ops: List of operations to schedule
+        op_by_id: Dictionary mapping op IDs to ops
+        time_limit: Max solve time in seconds
+        greedy_hint: Initial schedule hint {op_id: cycle}
+        alu_demands: Optional dict {op_id: demand} for ops with non-unit ALU demand
+                    (e.g., shifted VALU ops use 8 ALU slots)
+        log_file: Optional file path to redirect CP-SAT verbose logs
+    """
 
     SLOT_LIMITS = {
         'load': 2,
@@ -83,8 +95,11 @@ def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0
 
     for engine, engine_ops in ops_by_engine.items():
         limit = SLOT_LIMITS.get(engine, 1)
-        # Each op uses 1 unit of resource for 1 time unit
-        demands = [1] * len(engine_ops)
+        # Compute demands - use alu_demands if provided, otherwise 1 per op
+        if engine == 'alu' and alu_demands:
+            demands = [alu_demands.get(op.id, 1) for op in engine_ops]
+        else:
+            demands = [1] * len(engine_ops)
         engine_intervals = [intervals[op.id] for op in engine_ops]
         model.AddCumulative(engine_intervals, demands, limit)
 
@@ -99,13 +114,37 @@ def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0
             if op.id in greedy_hint:
                 model.AddHint(starts[op.id], greedy_hint[op.id])
 
-    # Solve
+    # Solve with optimized parameters
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
-    solver.parameters.num_search_workers = 8  # Use multiple threads
-    solver.parameters.log_search_progress = False  # Disable verbose logging
+    # Use all cores with interleaved search strategies
+    import os
+    num_cores = os.cpu_count() or 8
+    solver.parameters.num_search_workers = num_cores
+    solver.parameters.interleave_search = True  # Run different strategies in parallel
+    solver.parameters.log_search_progress = True  # Enable progress logging
+    solver.parameters.linearization_level = 2  # Stronger LP relaxations
+    solver.parameters.randomize_search = True  # Help escape local optima
+    solver.parameters.cp_model_presolve = True  # Enable presolve
+    solver.parameters.cp_model_probing_level = 2  # More aggressive probing
 
-    status = solver.Solve(model)
+    # Solve, optionally writing verbose output to a log file instead of stdout
+    if log_file:
+        # Disable stdout logging, enable logging to response
+        solver.parameters.log_to_stdout = False
+        solver.parameters.log_to_response = True
+        status = solver.Solve(model)
+        # Write the log to file
+        with open(log_file, 'a') as f:
+            f.write(solver.ResponseStats() + '\n')
+    else:
+        status = solver.Solve(model)
+
+    # Log solution quality
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print(f"    CP-SAT: {solver.Value(makespan)} cycles, "
+              f"bound={solver.BestObjectiveBound():.0f}, "
+              f"gap={(solver.Value(makespan)-solver.BestObjectiveBound())/solver.Value(makespan)*100:.1f}%")
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         schedule = {}
