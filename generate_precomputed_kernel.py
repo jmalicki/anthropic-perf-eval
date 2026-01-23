@@ -21,7 +21,10 @@ def generate_precomputed_kernel(
     n_nodes: int = 2047,
     batch_size: int = 256,
     rounds: int = 16,
-    full_solve_time: float = 1800.0,
+    full_solve_time: float = 3600.0,
+    require_optimal: bool = True,
+    enable_valu_shift: bool = True,
+    valu_shift_time: float = None,
     output_file: str = "solver/precomputed_kernel.py"
 ):
     """Generate the precomputed kernel file."""
@@ -35,6 +38,9 @@ def generate_precomputed_kernel(
     print(f"  batch_size: {batch_size}")
     print(f"  rounds: {rounds}")
     print(f"  full_solve_time: {full_solve_time}s")
+    print(f"  require_optimal: {require_optimal}")
+    print(f"  enable_valu_shift: {enable_valu_shift}")
+    print(f"  valu_shift_time: {valu_shift_time if valu_shift_time else 'same as full_solve_time'}s")
     print()
 
     # Import here to avoid issues if dependencies aren't installed
@@ -44,7 +50,10 @@ def generate_precomputed_kernel(
     print("Building kernel...")
     builder = InterleavedUnrolledKernelBuilder()
     builder.build_kernel(forest_height, n_nodes, batch_size, rounds,
-                        full_solve_time=full_solve_time)
+                        full_solve_time=full_solve_time,
+                        require_optimal=require_optimal,
+                        enable_valu_shift=enable_valu_shift,
+                        valu_shift_time=valu_shift_time)
 
     # Get the results
     instrs = builder.instrs
@@ -170,8 +179,18 @@ def main():
     parser.add_argument("--n-nodes", type=int, default=2047)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=16)
-    parser.add_argument("--full-solve-time", type=float, default=1800.0,
-                        help="Time limit for CP-SAT full solve in seconds (default: 1800)")
+    parser.add_argument("--full-solve-time", type=float, default=3600.0,
+                        help="Time limit for CP-SAT full solve in seconds (default: 3600)")
+    parser.add_argument("--require-optimal", action="store_true", default=True,
+                        help="Require OPTIMAL status from CP-SAT (default: True)")
+    parser.add_argument("--no-require-optimal", action="store_false", dest="require_optimal",
+                        help="Allow FEASIBLE status from CP-SAT")
+    parser.add_argument("--enable-valu-shift", action="store_true", default=True,
+                        help="Enable VALU→ALU shifting optimization (default: True)")
+    parser.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
+                        help="Disable VALU→ALU shifting optimization")
+    parser.add_argument("--valu-shift-time", type=float, default=None,
+                        help="Time per VALU→ALU shift iteration (default: same as full-solve-time)")
     parser.add_argument("--output", type=str, default="solver/precomputed_kernel.py",
                         help="Output file path")
 
@@ -183,6 +202,9 @@ def main():
         batch_size=args.batch_size,
         rounds=args.rounds,
         full_solve_time=args.full_solve_time,
+        require_optimal=args.require_optimal,
+        enable_valu_shift=args.enable_valu_shift,
+        valu_shift_time=args.valu_shift_time,
         output_file=args.output,
     )
 

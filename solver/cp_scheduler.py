@@ -23,7 +23,8 @@ class CPScheduleResult:
 def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0,
                 greedy_hint: dict[int, int] = None,
                 alu_demands: dict[int, int] = None,
-                log_file: str = None) -> CPScheduleResult:
+                log_file: str = None,
+                require_optimal: bool = False) -> CPScheduleResult:
     """Schedule operations using CP-SAT solver.
 
     Args:
@@ -34,6 +35,7 @@ def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0
         alu_demands: Optional dict {op_id: demand} for ops with non-unit ALU demand
                     (e.g., shifted VALU ops use 8 ALU slots)
         log_file: Optional file path to redirect CP-SAT verbose logs
+        require_optimal: If True, return success=False if only FEASIBLE (not OPTIMAL)
     """
 
     SLOT_LIMITS = {
@@ -153,11 +155,23 @@ def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0
             schedule[op.id] = cycle
             op.cycle = cycle
 
+        is_optimal = (status == cp_model.OPTIMAL)
+        status_str = "optimal" if is_optimal else "feasible"
+
+        # If require_optimal is set and we only got FEASIBLE, report as failure
+        if require_optimal and not is_optimal:
+            return CPScheduleResult(
+                success=False,
+                cycles=solver.Value(makespan),
+                schedule=schedule,
+                status="feasible_not_optimal"
+            )
+
         return CPScheduleResult(
             success=True,
             cycles=solver.Value(makespan),
             schedule=schedule,
-            status="optimal" if status == cp_model.OPTIMAL else "feasible"
+            status=status_str
         )
     else:
         return CPScheduleResult(

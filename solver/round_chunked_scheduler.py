@@ -16,7 +16,10 @@ from solver.cp_scheduler import schedule_cp, emit_scheduled_cp
 def schedule_round_chunked(ops: list[Op], op_by_id: dict[int, Op],
                            rounds: int, n_iters: int, unroll: int,
                            time_limit: float = 30.0,
-                           full_solve_time: float = 0.0) -> tuple[int, list[dict]]:
+                           full_solve_time: float = 0.0,
+                           require_optimal: bool = True,
+                           enable_valu_shift: bool = True,
+                           valu_shift_time: float = None) -> tuple[int, list[dict]]:
     """Schedule operations in round-sized chunks."""
 
     if len(ops) <= 3000:
@@ -139,16 +142,47 @@ def schedule_round_chunked(ops: list[Op], op_by_id: dict[int, Op],
         # Now run full solve with complete dependencies
         # The hint helps start from a good solution but doesn't lock boundaries
         result = schedule_cp(ops, fresh_op_by_id, time_limit=full_solve_time, greedy_hint=chunked_hint,
-                            log_file='cpsat_fullsolve.log')
+                            log_file='cpsat_fullsolve.log', require_optimal=require_optimal)
         if result.success and result.cycles < chunked_cycles:
             print(f"Full solve improved: {result.cycles} cycles ({result.status})")
-            return result.cycles, emit_scheduled(ops, result.cycles)
+        elif result.success:
+            print(f"Full solve: {result.cycles} cycles ({result.status})")
         else:
-            status_msg = f"{result.cycles} cycles" if result.success else "failed"
-            print(f"Full solve didn't improve (got {status_msg})")
-            # Restore chunked solution
+            status_msg = f"{result.cycles} cycles ({result.status})" if result.cycles > 0 else result.status
+            print(f"Full solve: {status_msg}")
+            # Restore chunked solution if full solve failed
             for op in ops:
                 op.cycle = chunked_hint[op.id]
+
+    # Phase 3 (optional): VALU→ALU shifting optimization
+    if enable_valu_shift:
+        from solver.iterative_reschedule import iterative_reschedule
+        pre_shift_cycles = max(op.cycle for op in ops) + 1
+
+        # Default valu_shift_time to full_solve_time if not specified
+        effective_shift_time = valu_shift_time if valu_shift_time is not None else full_solve_time
+        print(f"Phase 3: VALU→ALU shifting (starting from {pre_shift_cycles} cycles, {effective_shift_time}s per iter)...")
+
+        # Rebuild op_by_id with current dependencies
+        from solver.reschedule import compute_dependencies as recompute_deps
+        for op in ops:
+            op.dep_ids = set()
+        fresh_op_by_id = recompute_deps(ops)
+
+        shift_result = iterative_reschedule(
+            ops, fresh_op_by_id,
+            require_optimal=require_optimal,
+            cpsat_time_per_iter=effective_shift_time
+        )
+
+        # Assert no regression
+        assert shift_result.cycles <= pre_shift_cycles, \
+            f"VALU→ALU shifting made schedule worse: {shift_result.cycles} > {pre_shift_cycles}"
+
+        if shift_result.cycles < pre_shift_cycles:
+            print(f"Phase 3 improved: {shift_result.cycles} cycles (shifted {shift_result.valu_shifted} ops)")
+        else:
+            print(f"Phase 3: no improvement (shifted {shift_result.valu_shifted} ops)")
 
     # Emit all instructions
     max_cycle = max(op.cycle for op in ops) + 1

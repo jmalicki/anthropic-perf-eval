@@ -5,7 +5,7 @@ Key insight: Move VALU ops to ALU when ALU has EARLIER free slots, not just for 
 This directly reduces makespan by allowing earlier execution.
 
 Algorithm:
-1. Start with initial greedy schedule
+1. Start from existing schedule (warm-start)
 2. For each VALU op (in schedule order):
    a. Find earliest cycle where it could run on ALU (8 slots available, deps satisfied)
    b. If earlier than current VALU schedule, move to ALU
@@ -13,7 +13,7 @@ Algorithm:
 3. Repeat until no improvement
 """
 
-from solver.reschedule import Op, VLEN, schedule_greedy, emit_scheduled
+from solver.reschedule import Op, VLEN, emit_scheduled
 from solver.cp_scheduler import schedule_cp
 from solver.flexible_scheduler import (
     SHIFTABLE_OPS, SPECIAL_SHIFTABLE_OPS,
@@ -33,11 +33,19 @@ class IterativeResult:
 
 def iterative_reschedule(ops: list[Op], op_by_id: dict[int, Op],
                          max_iterations: int = 100,
-                         cpsat_time_per_iter: float = 60.0) -> IterativeResult:
+                         cpsat_time_per_iter: float = 60.0,
+                         require_optimal: bool = True) -> IterativeResult:
     """Iteratively move VALU ops to ALU when it enables earlier execution.
 
     After moving ops, uses CP-SAT to reschedule only the affected (later) ops,
     keeping earlier ops fixed. This gives CP-SAT quality without full-problem cost.
+
+    Args:
+        ops: List of operations (must already have cycles assigned - warm start)
+        op_by_id: Dictionary mapping op IDs to ops
+        max_iterations: Max number of shift+reschedule iterations
+        cpsat_time_per_iter: Time limit for each CP-SAT reschedule
+        require_optimal: If True, require OPTIMAL status from CP-SAT (not FEASIBLE)
     """
 
     SLOT_LIMITS = {
@@ -51,6 +59,10 @@ def iterative_reschedule(ops: list[Op], op_by_id: dict[int, Op],
     if not ops:
         return IterativeResult(True, 0, {}, 0, 0)
 
+    # Verify we have a warm start (ops already have cycles assigned)
+    if any(op.cycle < 0 for op in ops):
+        raise ValueError("iterative_reschedule requires ops to already have cycles assigned (warm start)")
+
     # Identify shiftable VALU ops
     all_shiftable = SHIFTABLE_OPS | SPECIAL_SHIFTABLE_OPS
     shiftable_ids = {
@@ -58,13 +70,8 @@ def iterative_reschedule(ops: list[Op], op_by_id: dict[int, Op],
         if op.engine == 'valu' and op.slot and op.slot[0] in all_shiftable
     }
 
-    # Initial greedy schedule
-    for op in ops:
-        op.cycle = -1
-    schedule_greedy(ops, op_by_id)
-
     initial_cycles = max(op.cycle for op in ops) + 1
-    print(f"  Initial greedy: {initial_cycles} cycles")
+    print(f"  Starting from {initial_cycles} cycles (warm start)")
 
     # Track slot usage per cycle
     def compute_usage():
@@ -200,7 +207,8 @@ def iterative_reschedule(ops: list[Op], op_by_id: dict[int, Op],
                                 time_limit=cpsat_time_per_iter,
                                 greedy_hint=later_hint,
                                 alu_demands=alu_demands,
-                                log_file='cpsat_reschedule.log')
+                                log_file='cpsat_reschedule.log',
+                                require_optimal=require_optimal)
 
             if result.success:
                 # Apply schedule back to original ops

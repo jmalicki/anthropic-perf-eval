@@ -43,12 +43,18 @@ class InterleavedUnrolledKernelBuilder:
         n_nodes: int,
         batch_size: int,
         rounds: int,
-        full_solve_time: float = 1800.0
+        full_solve_time: float = 3600.0,
+        require_optimal: bool = True,
+        enable_valu_shift: bool = True,
+        valu_shift_time: float = None
     ):
         """Build fully unrolled kernel with interleaved emission.
 
         Args:
-            full_solve_time: Time limit for CP-SAT full solve in seconds (default: 1800 = 30 min)
+            full_solve_time: Time limit for CP-SAT full solve in seconds (default: 3600 = 1 hour)
+            require_optimal: Require OPTIMAL status from CP-SAT (default: True)
+            enable_valu_shift: Enable VALU→ALU shifting optimization (default: True)
+            valu_shift_time: Time per VALU→ALU shift iteration (default: same as full_solve_time)
         """
         n_groups = batch_size // VLEN
         UNROLL = 8
@@ -243,10 +249,12 @@ class InterleavedUnrolledKernelBuilder:
         print(f"Scheduling {len(ops)} ops...")
 
         from solver.round_chunked_scheduler import schedule_round_chunked
-        # Two-phase: chunked first (60s), then full solve with hint
+        # Multi-phase: chunked → full solve → VALU shifting
         num_cycles, scheduled = schedule_round_chunked(
             ops, op_by_id, rounds, n_iters, UNROLL,
-            time_limit=60.0, full_solve_time=full_solve_time
+            time_limit=60.0, full_solve_time=full_solve_time,
+            require_optimal=require_optimal, enable_valu_shift=enable_valu_shift,
+            valu_shift_time=valu_shift_time
         )
         self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
         print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
