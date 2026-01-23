@@ -65,26 +65,29 @@ def generate_precomputed_kernel(
     # Generate the output file
     print(f"Writing {output_file}...")
 
-    # Convert instructions to a format that can be written as Python code
-    def format_instr(instr):
-        """Format a single instruction as Python dict literal."""
-        parts = []
-        for engine, slots in sorted(instr.items()):
-            formatted_slots = []
-            for slot in slots:
-                if isinstance(slot, (list, tuple)):
-                    formatted_slots.append(repr(tuple(slot)))
-                else:
-                    formatted_slots.append(repr(slot))
-            parts.append(f"'{engine}': [{', '.join(formatted_slots)}]")
-        return "{" + ", ".join(parts) + "}"
+    # Compress instructions using zlib + base64 for compact storage
+    import json
+    import zlib
+    import base64
 
-    # Format scratch_debug
-    def format_scratch_debug(sd):
-        parts = []
-        for addr, (name, length) in sorted(sd.items()):
-            parts.append(f"    {addr}: ({repr(name)}, {length})")
-        return "{\n" + ",\n".join(parts) + "\n}"
+    # Convert instructions to JSON-serializable format
+    def convert_for_json(obj):
+        if isinstance(obj, dict):
+            return {k: convert_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_for_json(x) for x in obj]
+        else:
+            return obj
+
+    instrs_json = json.dumps(convert_for_json(instrs), separators=(',', ':'))
+    compressed = zlib.compress(instrs_json.encode('utf-8'), level=9)
+    encoded = base64.b64encode(compressed).decode('ascii')
+
+    # Split into 100-char lines for readability
+    encoded_lines = [encoded[i:i+100] for i in range(0, len(encoded), 100)]
+
+    print(f"  Uncompressed: {len(instrs_json)} bytes")
+    print(f"  Compressed: {len(compressed)} bytes ({100*len(compressed)//len(instrs_json)}%)")
 
     with open(output_file, 'w') as f:
         f.write(f'''"""
@@ -107,6 +110,9 @@ Results:
     speedup={147734 / num_cycles:.1f}x
 """
 
+import json
+import zlib
+import base64
 from problem import DebugInfo
 
 
@@ -120,17 +126,51 @@ EXPECTED_PARAMS = {{
 
 # Precomputed scratch mapping
 SCRATCH_PTR = {scratch_ptr}
-SCRATCH_DEBUG = {format_scratch_debug(scratch_debug)}
-
-# Precomputed instructions ({len(instrs)} total, {num_cycles} cycles)
-INSTRUCTIONS = [
+SCRATCH_DEBUG = {{
 ''')
+        # Write scratch_debug more compactly
+        for addr, (name, length) in sorted(scratch_debug.items()):
+            f.write(f"    {addr}: ({repr(name)}, {length}),\n")
+        f.write(f'''}}\n
+# Compressed instructions ({len(instrs)} total, {num_cycles} cycles)
+# Compression: {len(instrs_json)} -> {len(compressed)} bytes ({100*len(compressed)//len(instrs_json)}%)
+_COMPRESSED_INSTRUCTIONS = (
+''')
+        for line in encoded_lines:
+            f.write(f'    "{line}"\n')
+        f.write(''')
 
-        # Write instructions one per line for readability
-        for i, instr in enumerate(instrs):
-            f.write(f"    {format_instr(instr)},\n")
+def _decompress_instructions():
+    """Decompress and parse the instruction data."""
+    compressed = base64.b64decode(_COMPRESSED_INSTRUCTIONS)
+    json_data = zlib.decompress(compressed).decode('utf-8')
+    raw = json.loads(json_data)
+    # Convert lists back to tuples for slots
+    def convert(obj):
+        if isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            # Check if this looks like a slot (tuple)
+            if obj and isinstance(obj[0], str) and obj[0] in (
+                'const', 'load', 'vload', 'vstore', 'pause',
+                '+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>',
+                '==', '!=', '<', '<=', '>', '>=',
+                'vbroadcast', 'vselect', 'multiply_add'
+            ):
+                return tuple(convert(x) for x in obj)
+            return [convert(x) for x in obj]
+        else:
+            return obj
+    return convert(raw)
 
-        f.write(''']
+# Lazy load instructions on first access
+_INSTRUCTIONS = None
+
+def _get_instructions():
+    global _INSTRUCTIONS
+    if _INSTRUCTIONS is None:
+        _INSTRUCTIONS = _decompress_instructions()
+    return _INSTRUCTIONS
 
 
 class PrecomputedKernelBuilder:
@@ -156,16 +196,16 @@ class PrecomputedKernelBuilder:
         """
         # Assert parameters match
         assert forest_height == EXPECTED_PARAMS['forest_height'], \\
-            f"Expected forest_height={EXPECTED_PARAMS['forest_height']}, got {forest_height}"
+            f"Expected forest_height={{EXPECTED_PARAMS['forest_height']}}, got {{forest_height}}"
         assert n_nodes == EXPECTED_PARAMS['n_nodes'], \\
-            f"Expected n_nodes={EXPECTED_PARAMS['n_nodes']}, got {n_nodes}"
+            f"Expected n_nodes={{EXPECTED_PARAMS['n_nodes']}}, got {{n_nodes}}"
         assert batch_size == EXPECTED_PARAMS['batch_size'], \\
-            f"Expected batch_size={EXPECTED_PARAMS['batch_size']}, got {batch_size}"
+            f"Expected batch_size={{EXPECTED_PARAMS['batch_size']}}, got {{batch_size}}"
         assert rounds == EXPECTED_PARAMS['rounds'], \\
-            f"Expected rounds={EXPECTED_PARAMS['rounds']}, got {rounds}"
+            f"Expected rounds={{EXPECTED_PARAMS['rounds']}}, got {{rounds}}"
 
         # Use precomputed instructions
-        self.instrs = list(INSTRUCTIONS)
+        self.instrs = list(_get_instructions())
 
         return self
 ''')
