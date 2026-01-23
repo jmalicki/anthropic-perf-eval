@@ -41,14 +41,23 @@ Total memory: ~2600 words minimum
 | Vector allocation | VLEN=8 words per vector |
 | Effective vectors | 1536/8 = 192 vector registers |
 
-### Scratch Budget for Blocked Kernel
-- 32 idx vectors: 256 words
-- 32 val vectors: 256 words
-- Tree cache: 7 words (nodes 0-6)
-- Constants: ~50 words
-- Temps: ~40 words
-- **Total used**: ~600 words
-- **Remaining**: ~900 words (room for speculation!)
+### Current Scratch Usage
+
+From `interleaved_unrolled_kernel.py`:
+
+| Allocation | Size (words) |
+|------------|--------------|
+| Scalar temps (st0-st15) | 16 |
+| Constants (c0-c15) | 16 |
+| Hash constants/shifts | 12 |
+| Tree cache (tc0-tc6) | 7 |
+| All indices (32 vectors) | 256 |
+| All values (32 vectors) | 256 |
+| Node values (4×8 vectors) | 256 |
+| Per-group temps (4×8 vectors) | 256 |
+| Broadcast vectors | ~100 |
+| **Total** | **~1,323** |
+| **Remaining** | **~213** |
 
 ## Slot Limits (VLIW Constraints)
 
@@ -64,198 +73,76 @@ Total memory: ~2600 words minimum
 ## Work Analysis
 
 ### Total Operations Per Round
-- 256 elements × 1 tree lookup = 256 loads (gather)
-- 256 elements × 1 XOR = 256 XORs (32 vector ops)
-- 256 elements × 6 hash stages = 1536 hash ops (192 vector ops)
-- 256 elements × 1 branch = 256 branches (32 vector ops)
 
-### Per Round Minimum Cycles
+| Operation Type | Count | Engine |
+|---------------|-------|--------|
+| Tree lookups | 256 loads (gather) | Load |
+| XOR | 32 vector ops | VALU |
+| Hash (6 stages) | 192 vector ops | VALU |
+| Branch computation | ~96 vector ops | VALU |
 
-**Without Optimizations (gather-based):**
-- Tree gather: 256 loads / 2 loads/cycle = 128 cycles
-- Hash: 192 vector ops / 6 ops/cycle = 32 cycles
-- Branch: 32 ops / 6 ops/cycle = ~6 cycles
-- Overhead: ~10 cycles
-- **Per round**: ~176 cycles
-- **16 rounds**: ~2816 cycles
+### Operations by Round Type
 
-**With Tree Preload (rounds 0-2):**
-- Round 0: 1 broadcast instead of 256 loads → saves ~127 cycles
-- Round 1: 2 broadcasts + select → saves ~120 cycles
-- Round 2: 4 broadcasts + 3 selects → saves ~110 cycles
-- **Savings**: ~357 cycles
+**Rounds 0-2 (cached tree values):**
+- Broadcast/select: ~10-30 VALU ops per round
+- XOR: 32 VALU ops
+- Hash: 192 VALU ops
+- Branch: ~96 VALU ops
+- No gather loads
 
-**With Full Blocking:**
-- Load all idx/val once: 64 vloads / 2 = 32 cycles
-- Store all idx/val once: 64 vstores / 2 = 32 cycles
-- Per-round savings: ~32 cycles (no stores between rounds)
-- **Savings over 16 rounds**: 15 × 32 = ~480 cycles
+**Rounds 3-15 (gather required):**
+- Gather: 256 scalar loads (32 groups × 8 elements)
+- Address computation: 256 ALU ops
+- XOR: 32 VALU ops
+- Hash: 192 VALU ops
+- Branch: ~96 VALU ops
+
+### Total Operation Count
+
+| Category | Ops | Notes |
+|----------|-----|-------|
+| Gather loads (rounds 3-15) | 3,328 | 13 rounds × 256 |
+| Address computation | 3,328 | 13 rounds × 256 |
+| XOR | 512 | 16 rounds × 32 |
+| Hash | 3,072 | 16 rounds × 192 |
+| Branch | ~1,536 | 16 rounds × ~96 |
+| **Total** | **~11,776** | Estimated |
 
 ## Theoretical Minimum Analysis
 
 ### Lower Bounds
 
 1. **Memory Bandwidth Bound:**
-   - Load 256 idx + 256 val = 512 loads
-   - Store 256 idx + 256 val = 512 stores
-   - Tree accesses: 256 × 16 = 4096 (if all cached: 0)
-   - At 2 loads/cycle + 2 stores/cycle: **256 cycles minimum** (data I/O only)
+   - Initial load: 512 words (idx + val)
+   - Final store: 512 words (idx + val)
+   - Gather: 256 × 13 = 3,328 loads (rounds 3-15)
+   - At 2 loads/cycle: ~1,920 cycles for loads alone
 
-2. **Compute Bound:**
-   - Hash: 16 rounds × 256 elements × 6 stages × 2 ops = 49,152 scalar ops
-   - At 6 VALU × 8 wide = 48 ops/cycle: **~1024 cycles minimum**
+2. **Compute Bound (VALU):**
+   - Total VALU ops: ~5,120 (hash + XOR + branch)
+   - At 6 VALU/cycle: ~853 cycles
 
 3. **Combined Realistic Minimum:**
-   - Accounting for dependencies and overhead: **~1500-2000 cycles**
+   - VALU and Load can overlap
+   - Dependencies prevent perfect overlap
+   - **Estimated minimum: ~1,500-2,000 cycles**
 
 ### Current Performance
 
 | Kernel | Cycles | Speedup | Status |
 |--------|--------|---------|--------|
 | Baseline | 147,734 | 1.0x | Reference |
-| Ultra (8x unroll) | 12,373 | 11.9x | Working |
-| Combined | 12,256 | 12.0x | Working |
+| **Current (precomputed)** | **2,390** | **61.8x** | Production |
 | Target | 1,487 | 99.3x | Goal |
 
-### Gap Analysis
+### Efficiency Analysis
 
-**Current best: 12,256 cycles**
-**Target: 1,487 cycles**
-**Gap: 10,769 cycles (8.2x improvement needed)**
-
-## Optimization Opportunities
-
-### 1. Full Blocking ✓ IMPLEMENTED
-- Keep all 256 idx/val in scratch
-- Process all 16 rounds without memory stores
-- Result: 13.91x → 10,622 cycles
-
-### 2. Tree Preload ✓ IMPLEMENTED
-- Broadcasts for rounds 0-2 instead of gather
-- Round 0: 1 broadcast (tree[0])
-- Round 1: 2 broadcasts + select (tree[1]/[2])
-- Round 2: 4 broadcasts + 3 selects (tree[3-6])
-- Result: 14.90x → 9,917 cycles
-
-### 3. Speculative Execution (TODO)
-- Pre-compute both branches: tree[2*idx+1] and tree[2*idx+2]
-- Overlap tree loads with computation
-- Expected: ~1.5x improvement
-
-### 4. Extended Tree Caching
-- With 2047 tree nodes and ~800 spare scratch:
-  - Can cache top ~7-8 levels (127-255 nodes)
-  - Covers more early-round accesses
-- Expected: ~1.2x improvement
-
-### 5. Software Pipelining
-- Load group N+1 while computing group N
-- Better instruction-level parallelism
-- Expected: ~1.2x improvement
-
-## MILP Optimization Variables
-
-The MILP solver could optimize these parameters:
-
-### Block Size (UNROLL)
-| UNROLL | Groups/Iter | VALU Util | Scratch Cost | Code Size |
-|--------|-------------|-----------|--------------|-----------|
-| 1 | 32 iters | 16% | 16 vectors | Small |
-| 2 | 16 iters | 33% | 32 vectors | Small |
-| 4 | 8 iters | 66% | 64 vectors | Medium |
-| 8 | 4 iters | 100% | 128 vectors | Large |
-| 16 | 2 iters | 100%* | 256 vectors | Very Large |
-
-*Beyond 6-8, limited by VALU slots (max 6/cycle)
-
-### Tree Cache Depth (MILP Variable)
-| Depth | Nodes Cached | Scratch | Rounds Covered | Gather Rounds | Saves |
-|-------|--------------|---------|----------------|---------------|-------|
-| 3 | 7 | 7 words | 0-2 | 13 | baseline |
-| 4 | 15 | 15 words | 0-3 | 12 | ~128 cycles |
-| 5 | 31 | 31 words | 0-4 | 11 | ~256 cycles |
-| 6 | 63 | 63 words | 0-5 | 10 | ~384 cycles |
-| 7 | 127 | 127 words | 0-6 | 9 | ~512 cycles |
-
-**Cost-Benefit Analysis (4 vs 5 levels):**
-- 4 levels: 15 words scratch, saves 4 gather rounds (0-3)
-- 5 levels: 31 words scratch (+16), saves 5 gather rounds (0-4)
-- Trade-off: 16 extra scratch words for 1 fewer gather round (~128 cycles saved)
-- Per gather round: 64 loads at 2/cycle = 32 cycles minimum (+ compute overlap)
-- **Recommendation**: Let MILP optimize based on scratch pressure from other uses
-
-**Round-by-Round Lookup Complexity:**
-| Round | Possible Indices | Lookup Method (if cached) |
-|-------|------------------|---------------------------|
-| 0 | {0} | 1 broadcast |
-| 1 | {1,2} | 2 broadcasts + 1 vselect |
-| 2 | {3,4,5,6} | 4 broadcasts + 3 vselects |
-| 3 | {7..14} | 8 broadcasts + 7 vselects |
-| 4 | {15..30} | 16 broadcasts + 15 vselects |
-| 5+ | {31+} | Too many selects, use gather |
-
-**Key insight**: Beyond depth 4-5, vselect chains become expensive. MILP should weigh:
-- Scratch cost: 2^depth words
-- Gather savings: ~32 cycles/round
-- vselect cost: ~(2^round) vselects per lookup
-
-### MILP Decision Variables
-```
-block_size ∈ {1, 2, 4, 8, 16}
-tree_cache_depth ∈ {3, 4, 5, 6, 7}
-use_speculation ∈ {0, 1}
-pipeline_depth ∈ {1, 2, 3}
-```
-
-### MILP Constraints
-```
-scratch_used = 2*batch_size + block_size*VLEN*3 + 2^tree_cache_depth + constants
-scratch_used <= SCRATCH_SIZE
-
-cycles = f(block_size, tree_cache_depth, speculation, pipeline)
-```
-
-### Combined Target
-- Current best: 9,917 cycles (14.90x)
-- Speculation: ÷1.5 → 6,611 cycles
-- Extended caching: ÷1.2 → 5,509 cycles
-- Pipelining: ÷1.2 → 4,591 cycles
-
-**Realistic target: ~4,000-5,000 cycles**
-
-To reach 1,487 cycles (100x), we likely need:
-- Deeper algorithmic insights
-- Perfect instruction scheduling via MILP
-- Novel loop transformations
-
-## Current Best Results
-
-| Kernel | Cycles | Speedup | Key Optimizations |
-|--------|--------|---------|-------------------|
-| baseline | 147,734 | 1.0x | Sequential scalar |
-| ultra_8x | 12,373 | 11.9x | 8-way parallel |
-| combined | 12,256 | 12.0x | + tree preload |
-| blocked_parallel | 10,622 | 13.9x | + full blocking |
-| ultimate | 9,917 | 14.9x | All combined |
-| **dual_path** | **9,898** | **14.9x** | Best current |
-
-**Current gap**: 9,898 cycles actual vs 1,487 target = **6.7x to go**
-
-## Key Findings
-
-1. **Blocking saves 16× stores** but adds complexity
-2. **Tree preload** saves ~30 cycles for rounds 0-2
-3. **8-way parallelism** essential for VALU utilization
-4. **Gather bottleneck**: 64 loads/round at 2/cycle = 32 cycles minimum
-5. **No native vpermute**: Emulation with vselect is slower than gather
-6. **Efficiency**: ~52% (estimate 5168, actual 9898) - room for improvement
-
-## Remaining Optimization Opportunities
-
-1. **Better instruction packing**: Fill all VLIW slots each cycle
-2. **Pipeline across iterations**: Load iter N+1 while computing iter N
-3. **Extended tree caching**: Cache more tree levels in scratch
-4. **MILP-driven scheduling**: Let solver find optimal instruction order
+| Metric | Value |
+|--------|-------|
+| Theoretical minimum | ~1,500 cycles |
+| Current best | 2,390 cycles |
+| Efficiency | ~63% |
+| Gap to target | ~900 cycles |
 
 ## Hash Function Details
 
@@ -272,5 +159,26 @@ HASH_STAGES = [
 
 Each stage: `val = op2(op1(val, const), op3(val, shift))`
 - 6 stages × 3 ops = 18 vector ops per hash
-- 256 elements ÷ 8 VLEN = 32 hashes per round
-- 32 × 18 = 576 vector ops per round for hashing
+- 256 elements ÷ 8 VLEN = 32 hashes per group
+- Total per round: 32 groups × 2 VALU = 64 VALU ops (with packing)
+
+## Key Constraints Summary
+
+1. **VALU is the bottleneck**: 6 slots/cycle limits hash throughput
+2. **Gather dominates later rounds**: 4 cycles minimum per group (8 loads at 2/cycle)
+3. **Scratch is sufficient**: ~213 words remaining for additional optimizations
+4. **Dependencies limit parallelism**: Hash depends on tree value, index depends on hash
+
+## Optimization Levers
+
+| Lever | Effect | Implemented |
+|-------|--------|-------------|
+| Unrolling | Exposes parallelism | ✅ Yes |
+| Interleaving | Better scheduling | ✅ Yes |
+| Tree caching | Eliminates gathers | ✅ Partial (rounds 0-2) |
+| CP-SAT scheduling | Optimal packing | ✅ Yes |
+| VALU→ALU shifting | Relieves VALU pressure | ✅ Yes |
+| multiply_add fusion | Saves VALU ops | ✅ Yes |
+| Bounds check elimination | Saves VALU ops | ✅ Yes |
+| Speculation | Hides latency | ❌ Not yet |
+| Software pipelining | Overlaps rounds | ❌ Not yet |

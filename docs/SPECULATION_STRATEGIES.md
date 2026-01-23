@@ -21,128 +21,166 @@ This creates a sequential dependency chain:
 | Engine | Slots/Cycle | Typical Usage | Free Slots |
 |--------|-------------|---------------|------------|
 | ALU | 12 | ~4 for address computation | ~8 |
-| VALU | 6 | ~4 for hash (2 groups) | ~2 |
+| VALU | 6 | ~5.2 (87% utilization) | ~0.8 |
 | Load | 2 | 2 for gather | 0 |
 | Store | 2 | 0 during compute | 2 |
 | Flow | 1 | 0-1 for select | 0-1 |
 
-## Speculation Strategy 1: Range Preload
+**Key insight**: ALU is heavily underutilized. Speculation that uses ALU is "free".
 
-**Idea**: Indices are bounded! After round r, idx ∈ [2^r - 1, 2^(r+1) - 2]
+## Implemented Strategies
 
-| Round | Output Range | Size | Strategy |
-|-------|--------------|------|----------|
-| 0 | {1, 2} | 2 | Broadcast + select |
-| 1 | {3..6} | 4 | 4-way select |
-| 2 | {7..14} | 8 | vload + offset select |
-| 3 | {15..30} | 16 | 2 vloads + select |
-| 4+ | large | 2^r | Gather |
+### Strategy 1: Tree Preload (Rounds 0-2) ✅
 
-**Benefit**: Replaces 64 gather loads with 1-2 vloads for early rounds.
-**Cost**: Extra select operations (~8 cycles per round)
+**Status: Implemented in `interleaved_unrolled_kernel.py`**
 
-## Speculation Strategy 2: Dual Path Execution
+**Idea**: Early rounds access predictable tree indices. Cache these values and use broadcast + select.
 
-**Idea**: Since next_idx is EITHER 2*idx+1 OR 2*idx+2, compute both!
+| Round | Output Range | Strategy |
+|-------|--------------|----------|
+| 0 | {0} | Broadcast tree[0] |
+| 1 | {1, 2} | Broadcast tree[1], tree[2] + select |
+| 2 | {3..6} | Broadcast tree[3-6] + 3 selects |
 
+**Benefits:**
+- Eliminates 256 gather loads per round (3 rounds = 768 loads saved)
+- Saves ~384 cycles (768 loads at 2/cycle)
+
+**Cost:**
+- Extra VALU ops for selection (~30 per round)
+- 7 words scratch for cached values
+
+### Strategy 2: Bounds Check Elimination ✅
+
+**Status: Implemented in `interleaved_unrolled_kernel.py`**
+
+**Idea**: Skip bounds checking when index overflow is impossible.
+
+```python
+max_idx_this_round = (1 << (rnd + 2)) - 1
+needs_bounds_check = max_idx_this_round >= n_nodes  # 2047
 ```
+
+For rounds 0-9: max_idx ∈ {3, 7, 15, 31, 63, 127, 255, 511, 1023} < 2047
+
+**Benefits:**
+- Saves 2 VALU ops per group per round (compare + multiply)
+- 10 rounds × 32 groups × 2 ops = 640 ops eliminated
+
+## Proposed Strategies (Not Yet Implemented)
+
+### Strategy 3: Dual Path Execution ⏳
+
+**Status: Not implemented**
+
+**Idea**: Since next_idx is EITHER 2*idx+1 OR 2*idx+2, compute both paths speculatively.
+
+```python
 # Instead of waiting for val%2 to decide which tree node to load:
 tree_left = tree[2*idx + 1]
 tree_right = tree[2*idx + 2]
 val_left = hash(val ^ tree_left)
 val_right = hash(val ^ tree_right)
-# Then select:
+
+# Then select based on original val:
 new_val = (orig_val%2 == 0) ? val_left : val_right
 new_idx = (orig_val%2 == 0) ? 2*idx+1 : 2*idx+2
 ```
 
-**Benefit**:
-- Loads BOTH paths in parallel (uses both load slots)
-- Hides memory latency behind 2x hash computation
-- Uses idle VALU slots productively
+**Benefits:**
+- Loads BOTH paths in parallel (uses both load slots productively)
+- Hides memory latency behind 2× hash computation
+- Uses idle ALU slots for address computation
 
-**Cost**:
-- 2x hash computation (but if VALU is underutilized, it's "free")
-- 2x tree loads (but parallel is same latency as sequential)
-- Extra scratch for second path
+**Cost:**
+- 2× hash computation per round
+- Extra scratch for second path temporaries
+- Extra selection ops
 
-## Speculation Strategy 3: Pipeline Prefetch
+**Analysis:**
+- Current per-round: ~150 cycles (gather-bound)
+- With speculation: ~100 cycles (parallel loads + overlapped hash)
+- Expected savings: ~650 cycles over 13 gather rounds
 
-**Idea**: While processing round R, prefetch tree values for round R+1.
+### Strategy 4: Extended Tree Caching ⏳
 
-```
-# Processing round R:
-val_R = hash(val_{R-1} ^ tree[idx_{R-1}])
-idx_R = 2*idx_{R-1} + branch
+**Status: Not implemented**
 
-# Simultaneously prefetch for round R+1:
-prefetch tree[2*idx_{R-1} + 1]  # potential left child
-prefetch tree[2*idx_{R-1} + 2]  # potential right child
-```
+**Idea**: Cache more tree levels to cover more rounds without gather.
 
-**Benefit**: Hides memory latency completely for rounds where prefetch completes in time.
-**Cost**: Requires 2 extra load slots (may conflict with current loads).
+| Depth | Nodes Cached | Scratch | Rounds Covered | Selection Cost |
+|-------|--------------|---------|----------------|----------------|
+| 3 | 7 | 7 | 0-2 | baseline ✅ |
+| 4 | 15 | 15 | 0-3 | 7 vselects |
+| 5 | 31 | 31 | 0-4 | 15 vselects |
+| 6 | 63 | 63 | 0-5 | 31 vselects |
+| 7 | 127 | 127 | 0-6 | 63 vselects |
 
-## Speculation Strategy 4: Branch Prediction
+**Trade-off**: Beyond depth 4-5, vselect chains become expensive (O(2^round)).
 
-**Idea**: Use pattern history to predict branch direction.
+**Estimated benefit**: ~30 cycles per additional cached round.
 
-### Static Prediction
-- Always predict the more common outcome
-- For random hashes, val%2 is 50/50, so either direction works
-- Misprediction cost: ~1 cycle (just a select, no rollback needed)
+### Strategy 5: Software Pipelining ⏳
 
-### Profile-Guided Prediction
-- Run profiling pass to collect branch statistics
-- Use biased prediction if one direction dominates
-- Unlikely to help for cryptographic hashes (uniform distribution)
+**Status: Not implemented**
 
-### Pattern Prediction
-- Track last N branch outcomes per element
-- Predict based on pattern (e.g., alternating)
-- Complex to implement, unlikely benefit for hashes
-
-## MILP Decision Variables
-
-The MILP solver should choose per-round:
+**Idea**: Overlap operations across consecutive rounds.
 
 ```
-strategy[r] ∈ {RANGE_PRELOAD, DUAL_PATH, PREFETCH, GATHER}
+Round R:
+  - Hash val_R
+  - Compute idx_R
+
+Overlapped with Round R+1:
+  - Start gather for tree[idx_R] (idx_R now known)
 ```
 
-### Constraints
-```
-# Range preload only valid for small ranges
-strategy[r] = RANGE_PRELOAD → 2^(r+1) <= 16
+**Benefits:**
+- Hides gather latency behind hash computation
+- Better overall throughput
 
-# Dual path requires extra scratch
-strategy[r] = DUAL_PATH → scratch_used + 8*UNROLL*VLEN <= SCRATCH_SIZE
+**Challenges:**
+- Complex scratch management (need space for 2 rounds of data)
+- Dependency tracking across rounds
 
-# Prefetch requires available load slots
-strategy[r] = PREFETCH → load_slots_used < 2
-```
+### Strategy 6: Branch Prediction ⏳
 
-### Objective Contribution
-```
-cycles[r] =
-  if strategy[r] == RANGE_PRELOAD: range_preload_cycles(r)
-  if strategy[r] == DUAL_PATH: dual_path_cycles(r)
-  if strategy[r] == GATHER: gather_cycles(r)
-```
+**Status: Not implemented (unlikely to help)**
 
-## Expected Performance
+**Idea**: Predict branch direction and speculatively load only one path.
 
-| Strategy | Best Case | Cycles Saved |
-|----------|-----------|--------------|
-| Range preload (rounds 0-3) | 4 rounds × 30 cycles | ~120 |
-| Dual path (rounds 4+) | 12 rounds × 16 cycles | ~192 |
-| Pipeline prefetch | 12 rounds × 8 cycles | ~96 |
+**Analysis:**
+- For cryptographic hashes, val%2 is uniformly random (50/50)
+- Static prediction: 50% misprediction rate
+- Pattern prediction: Hash destroys patterns
 
-Combined potential: Save ~400 cycles → ~9,500 → ~5,100 cycles goal
+**Conclusion**: Not viable for this hash function. Dual-path execution (Strategy 3) is better.
+
+## Expected Performance Impact
+
+| Strategy | Current Status | Expected Savings |
+|----------|---------------|------------------|
+| Tree preload (0-2) | ✅ Implemented | baseline |
+| Bounds check elimination | ✅ Implemented | ~100 cycles |
+| Dual path execution | ⏳ Proposed | ~500 cycles |
+| Extended tree cache | ⏳ Proposed | ~120 cycles |
+| Software pipelining | ⏳ Proposed | ~200 cycles |
+
+**Total potential**: ~2,390 - 920 = **~1,470 cycles** (approaching 100x target!)
 
 ## Implementation Priority
 
-1. ✅ Range preload (rounds 0-3) - Already implemented
-2. 🔄 Dual path execution - In progress
-3. ⏳ Pipeline prefetch - Future work
-4. ⏳ MILP integration - Future work
+1. ✅ **Tree preload (rounds 0-2)** - Done
+2. ✅ **Bounds check elimination** - Done
+3. ⏳ **Dual path execution** - Highest potential, should implement next
+4. ⏳ **Extended tree cache (rounds 3-4)** - Moderate benefit
+5. ⏳ **Software pipelining** - Complex, implement last
+
+## Code Locations
+
+| Strategy | File | Function/Section |
+|----------|------|------------------|
+| Tree preload | `interleaved_unrolled_kernel.py` | `build_kernel()` rounds 0-2 |
+| Bounds check | `interleaved_unrolled_kernel.py` | `build_kernel()` branch phase |
+| CP-SAT scheduling | `cp_scheduler.py` | `schedule_cp()` |
+| VALU→ALU shifting | `iterative_reschedule.py` | `iterative_reschedule()` |

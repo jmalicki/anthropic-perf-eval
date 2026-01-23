@@ -136,47 +136,41 @@ Each cycle executes one instruction bundle (dict of engine → list of slots):
 3. **Hide latency**: Start loads early, compute on other data while waiting
 4. **Minimize gathers**: Restructure data or precompute addresses
 5. **Unroll loops**: Reduce branch overhead, enable more packing
+6. **VALU→ALU shifting**: Move vector ops to scalar when ALU has earlier free slots
 
-### Theoretical Limits for the Tree Traversal Kernel
+### Current Performance
 
-Per group (8 elements):
-- 2 vloads (indices, values): 1 cycle
-- 8 scalar loads (gather tree nodes): 4 cycles
-- 1 XOR: 0.17 cycles (can pack with others)
-- 18 hash ops (6 stages × 3): 3 cycles (at 6 valu/cycle)
-- 6 branch ops: 1 cycle
-- 2 vstores: 1 cycle
+| Metric | Value |
+|--------|-------|
+| Baseline | 147,734 cycles |
+| Current best | 2,390 cycles |
+| Current speedup | 61.8x |
+| Target | 1,487 cycles (100x) |
 
-**Minimum: ~10 cycles per group**
+### Theoretical Analysis
+
+Per group (8 elements) per round:
+- 8 scalar loads (gather tree nodes): 4 cycles minimum
+- 1 XOR + 6 hash stages (18 VALU ops): ~3 cycles
+- Branch computation: ~1 cycle
 
 With 32 groups × 16 rounds = 512 iterations:
-- **Theoretical minimum: ~5,120 cycles** (just computation, perfect packing)
-- **Practical minimum: ~1,500-2,000 cycles** (with overhead)
-- **Target: 1,487 cycles** (Claude Opus 4.5 best)
+- **Compute-bound minimum**: ~1,024 cycles (VALU throughput)
+- **Memory-bound minimum**: ~256 cycles (load/store throughput)
+- **Realistic minimum**: ~1,500-2,000 cycles (with dependencies)
 
-## Example: Optimized Hash Stage
+## Example: Hash Stage with multiply_add
 
 ```python
-# Hash stage: val = (val + const) + (val << shift)
-# Can pack: broadcast + 2 valus, then 1 valu
+# Hash stage using fused multiply_add for branch computation
+# idx = idx * 2 + branch_offset
 
-# Cycle 1: Broadcast constants (2 valu ops)
-{"valu": [
-    ("vbroadcast", v_hc, hash_const),
-    ("vbroadcast", v_hs, shift_amt),
-]}
+# Cycle 1: Compute branch bit
+{"valu": [("&", t, val, v_1)]}    # t = val & 1
 
-# Cycle 2: First two ops (2 valu ops)
-{"valu": [
-    ("+", v_t1, v_val, v_hc),    # tmp1 = val + const
-    ("<<", v_t2, v_val, v_hs),   # tmp2 = val << shift
-]}
+# Cycle 2: Add 1 for branch offset
+{"valu": [("+", t, t, v_1)]}      # t = t + 1
 
-# Cycle 3: Final combine (1 valu op)
-{"valu": [
-    ("+", v_val, v_t1, v_t2),    # val = tmp1 + tmp2
-]}
-
-# Total: 3 cycles per hash stage × 6 stages = 18 cycles
-# With better packing: ~12 cycles for all hash stages
+# Cycle 3: Fused multiply-add (saves 1 VALU op vs separate ops)
+{"valu": [("multiply_add", idx, idx, v_2, t)]}  # idx = idx * 2 + t
 ```

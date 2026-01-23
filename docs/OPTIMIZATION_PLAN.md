@@ -1,100 +1,215 @@
-# Optimization Plan: Achieving 100x Speedup
+# Optimization Plan: Current State and Path to 100x
 
 ## Current State
-- **Best**: 12,373 cycles (12x speedup) with ultra_8x kernel
-- **Target**: 1,487 cycles (100x speedup)
-- **Gap**: 10,886 cycles to close
 
-## Phase 1: Debug Smart Kernel (Tree Preload)
+| Metric | Value |
+|--------|-------|
+| Baseline | 147,734 cycles |
+| **Current best** | **2,390 cycles** |
+| **Current speedup** | **61.8x** |
+| Target | 1,487 cycles (100x) |
+| Gap | ~900 cycles to go |
 
-### Problem
-The smart kernel that preloads tree[0..7] produces incorrect results.
+## Implemented Optimizations
 
-### Root Cause Analysis
-1. The vbroadcast from vector elements may be wrong
-2. The conditional selection between cache and gather is buggy
-3. The step loop structure may have off-by-one errors
+### 1. Full Unrolling ✅
 
-### Fix Strategy
-1. Add debug output to trace values
-2. Verify tree preload is correct
-3. Fix the permute logic (selecting tree[idx] from vector)
-4. Test each step separately
+All 16 rounds × 32 groups are emitted as explicit instructions (no loops).
 
-## Phase 2: Implement Speculative Execution
+**Benefits:**
+- Eliminates loop overhead (branch, counter update)
+- Enables cross-iteration scheduling
+- Allows CP-SAT to find optimal global packing
 
-### Concept
-Instead of:
+**Implementation:** `interleaved_unrolled_kernel.py`
+
+### 2. Interleaved Emission ✅
+
+Operations from different iterations are emitted interleaved, not sequentially.
+
+**Before (sequential):**
 ```
-val = hash(val ^ tree[idx])
-idx = 2*idx + (val%2==0 ? 1 : 2)
+iter0_op1, iter0_op2, iter0_op3, iter1_op1, iter1_op2, ...
 ```
 
-Do:
+**After (interleaved):**
 ```
-# Speculatively compute both branches
-tree_left = tree[2*idx + 1]
+iter0_op1, iter1_op1, iter2_op1, iter0_op2, iter1_op2, ...
+```
+
+**Benefits:**
+- Independent operations become adjacent
+- Scheduler can easily find parallelism
+- Better VLIW slot utilization
+
+### 3. Tree Value Caching (Rounds 0-2) ✅
+
+Early rounds access predictable tree indices:
+- Round 0: Always index 0 → broadcast tree[0]
+- Round 1: Indices 1 or 2 → broadcast + select
+- Round 2: Indices 3-6 → broadcast + multiple selects
+
+**Benefits:**
+- Eliminates gather loads for first 3 rounds
+- Saves ~128 cycles per cached round
+
+### 4. CP-SAT Scheduling ✅
+
+Three-phase scheduling pipeline:
+
+1. **Chunked solve**: Divide into ~1500-op chunks, solve each
+2. **Full solve**: Use chunked as warm-start for global optimization
+3. **VALU→ALU shifting**: Move ops when ALU has earlier free slots
+
+**Benefits:**
+- Near-optimal VLIW packing
+- Exploits all available parallelism
+- Handles ~10,000 ops in minutes
+
+### 5. Fused multiply_add ✅
+
+Branch computation uses fused multiply-add:
+```python
+# Old (2 VALU ops):
+idx = idx * 2
+idx = idx + branch_offset
+
+# New (1 VALU op):
+idx = multiply_add(idx, 2, branch_offset)  # idx*2 + offset
+```
+
+**Benefits:**
+- Saves 1 VALU op per group per round
+- 32 groups × 16 rounds = 512 ops saved
+
+### 6. Bounds Check Elimination ✅
+
+Skip bounds checking for early rounds where overflow is impossible:
+```python
+max_idx_this_round = (1 << (rnd + 2)) - 1
+needs_bounds_check = max_idx_this_round >= n_nodes  # 2047
+```
+
+For rounds 0-9 (max_idx < 2047), no bounds check needed.
+
+**Benefits:**
+- Saves 2 VALU ops per group for ~10 rounds
+- ~640 ops eliminated
+
+### 7. Precomputed Kernel ✅
+
+Kernel is built offline and stored compressed:
+- Zlib compression: 119KB → 22KB (82% reduction)
+- Base64 encoding for embedding in Python
+- Runtime decompression is instant
+
+**Benefits:**
+- No scheduling overhead at runtime
+- Reproducible results
+
+## Current Bottleneck Analysis
+
+With 2,390 cycles for 32 groups × 16 rounds:
+- **~4.7 cycles per group per round** (average)
+
+Breakdown per group per round:
+| Operation | Cycles | Notes |
+|-----------|--------|-------|
+| Gather (rounds 3-15) | ~4 | 8 loads at 2/cycle |
+| XOR | 0.17 | Packs with others |
+| Hash (6 stages) | ~3 | 18 VALU ops at 6/cycle |
+| Branch | ~0.5 | 3 VALU ops |
+| **Total** | **~7.7** | Theoretical per round |
+
+Rounds 0-2 are cheaper (~2 cycles each, no gather).
+
+**Primary bottleneck: Gather operations** (scalar loads for tree access)
+
+## Remaining Optimization Opportunities
+
+### 1. Deeper Tree Caching
+
+Current: Cache tree[0-6] (7 nodes), cover rounds 0-2
+Potential: Cache tree[0-126] (127 nodes), cover rounds 0-6
+
+| Depth | Nodes | Scratch | Rounds Covered | Expected Savings |
+|-------|-------|---------|----------------|------------------|
+| 3 | 7 | 7 | 0-2 | baseline |
+| 4 | 15 | 15 | 0-3 | ~30 cycles |
+| 5 | 31 | 31 | 0-4 | ~60 cycles |
+| 6 | 63 | 63 | 0-5 | ~90 cycles |
+| 7 | 127 | 127 | 0-6 | ~120 cycles |
+
+**Challenge:** Selection logic grows exponentially (2^round vselects needed)
+
+### 2. Speculative Dual-Path Execution
+
+Load BOTH possible tree values before knowing which is needed:
+```python
+tree_left = tree[2*idx + 1]   # Load both
 tree_right = tree[2*idx + 2]
-val_left = hash(val ^ tree_left)
+val_left = hash(val ^ tree_left)    # Compute both
 val_right = hash(val ^ tree_right)
-
-# Select based on original val
-val = (val%2==0) ? val_left : val_right
-idx = (val%2==0) ? 2*idx+1 : 2*idx+2
+val = select(condition, val_left, val_right)  # Choose
 ```
 
-### Benefits
-- Both branches loaded/computed in parallel
-- No dependency on hash result for tree load
-- Uses idle VALU slots productively
+**Benefits:**
+- Hides load latency behind computation
+- Uses idle VALU slots (computing "wrong" path)
+- Load slots used more efficiently (parallel loads)
 
-### Implementation
-1. Create speculative kernel
-2. Load both possible tree values
-3. Compute hash for both
-4. Select correct result
+**Cost:**
+- 2× hash computation (but overlapped)
+- Extra scratch for second path
 
-## Phase 3: MILP with Speculation
+### 3. Software Pipelining
 
-### New Variables
-- `spec[i,j]` = 1 if operation i is speculatively executed for branch j
-- `select[i]` = 1 if operation i is a selection (merging speculative results)
+Overlap operations across rounds:
+- While hashing round R, start gathering for round R+1
+- Requires careful scratch management
 
-### New Constraints
-- Speculative ops must have both branches scheduled
-- Selection must happen after both speculative branches complete
-- Resource limits include speculative operations
+### 4. Better VALU Packing
 
-### Objective
-Minimize cycles while allowing MILP to choose:
-- When to speculate (high parallelism available)
-- When to execute directly (low parallelism or high cost)
+Current VALU utilization: ~87% (5.2/6 slots average)
 
-## Phase 4: Integration & Benchmarking
+Opportunities:
+- Reorder operations to fill gaps
+- Use ALU for some ops to relieve VALU pressure
+- Already partially addressed by VALU→ALU shifting
 
-### Combined Optimizations
-1. Tree preload for early steps (indices < 8)
-2. Speculation for later steps
-3. 8-way group unrolling
-4. Maximum VLIW packing
+## Path to 1,487 Cycles (100x)
 
-### Expected Improvements
-| Optimization | Expected Speedup |
-|--------------|------------------|
-| Tree preload (steps 0-2) | 2x over current |
-| Speculation | 1.5x additional |
-| Better packing | 1.3x additional |
-| **Combined** | ~4x → target ~3,000 cycles |
+| Optimization | Expected Cycles | Delta |
+|--------------|-----------------|-------|
+| Current | 2,390 | - |
+| Extended tree cache (7 levels) | ~2,270 | -120 |
+| Speculative dual-path | ~1,900 | -370 |
+| Software pipelining | ~1,600 | -300 |
+| **Combined** | **~1,600** | Still ~100 cycles short |
 
-### Stretch Goal
-To reach 1,487 cycles, we may need:
-- Algorithm restructuring
-- Deeper speculation (3+ levels)
-- Custom instruction sequences
+**Conclusion:** Reaching 1,487 cycles likely requires:
+- Novel algorithmic restructuring
+- Custom instruction sequences not yet discovered
+- Near-perfect scheduling with no wasted slots
 
-## Execution Timeline
+## Files to Modify
 
-1. **Phase 1**: Debug smart kernel → verify tree preload works
-2. **Phase 2**: Implement speculation → test correctness
-3. **Phase 3**: MILP enhancement → auto-optimize speculation
-4. **Phase 4**: Integrate all → benchmark against target
+| File | Purpose |
+|------|---------|
+| `interleaved_unrolled_kernel.py` | Kernel generation |
+| `round_chunked_scheduler.py` | Multi-phase scheduling |
+| `iterative_reschedule.py` | VALU→ALU shifting |
+| `generate_precomputed_kernel.py` | Offline compilation |
+
+## Running Experiments
+
+```bash
+# Generate new kernel with different parameters
+python generate_precomputed_kernel.py --full-solve-time 7200
+
+# Test the kernel
+python test_optimized.py
+
+# Run full experiment suite with W&B logging
+python run_experiment.py
+```

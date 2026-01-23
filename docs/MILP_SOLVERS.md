@@ -1,171 +1,142 @@
-# MILP Solver Research for VLIW Instruction Scheduling
+# Scheduling Solvers for VLIW Instruction Scheduling
 
-## Problem Characteristics
+## Current Implementation: CP-SAT
 
-Our VLIW instruction scheduling problem has:
-- **~10,000+ binary variables** (x[i,t] for each operation-time pair)
-- **~50,000+ constraints** (dependencies, resource limits)
-- **Sparse constraint matrix** (most entries are 0)
-- **Need for fast solutions** (should solve in <60s)
+The codebase uses **Google OR-Tools CP-SAT** solver for instruction scheduling, not traditional MILP/ILP solvers. CP-SAT (Constraint Programming with SAT solving) is significantly faster for scheduling problems.
 
-## Open Source MILP Solvers Comparison
+### Why CP-SAT over MILP?
 
-### 1. CVXOPT (Current Choice)
-**Website:** [cvxopt.org](https://cvxopt.org)
+Traditional MILP/ILP formulations for scheduling use binary variables `x[i,t]` for each operation-time pair, leading to:
+- ~10,000+ binary variables
+- ~50,000+ constraints
+- Slow solve times (minutes to hours)
 
-| Pros | Cons |
-|------|------|
-| Pure Python, easy to install | GLPK backend not the fastest |
-| Good for convex optimization | Limited MILP features |
-| Clean matrix-based API | No callbacks, cuts |
-| Well-documented | Slower on large ILPs |
+CP-SAT uses a fundamentally different approach:
+- **Interval variables**: Each operation is an interval, not binary indicators
+- **Cumulative constraints**: Native support for resource limits
+- **Constraint propagation**: Sophisticated domain reduction
+- **Parallel solving**: Multiple search strategies in parallel
 
-**Best for:** Small-medium LPs, convex QPs, quick prototyping
+### Performance Comparison
 
-### 2. SCIP (Recommended)
-**Website:** [scipopt.org](https://scipopt.org/)
+| Approach | Variables | Constraints | Solve Time |
+|----------|-----------|-------------|------------|
+| MILP (binary x[i,t]) | ~10,000 | ~50,000 | Minutes-hours |
+| CP-SAT (intervals) | ~2,000 | ~3,000 | Seconds-minutes |
 
-| Pros | Cons |
-|------|------|
-| Fastest open-source MILP solver | Larger binary size |
-| Full branch-cut-and-price | More complex API |
-| Callbacks, custom branching | Steeper learning curve |
-| Active development (v10.0 in 2025) | |
+## Solver Architecture
 
-**Best for:** Large-scale MILP, production use, research
+### Core Scheduler: `cp_scheduler.py`
 
 ```python
-# Installation
-uv add pyscipopt
+def schedule_cp(ops: list[Op], op_by_id: dict[int, Op],
+                time_limit: float = 60.0,
+                greedy_hint: dict[int, int] = None,
+                alu_demands: dict[int, int] = None) -> CPScheduleResult
 ```
 
-### 3. HiGHS
-**Website:** [highs.dev](https://highs.dev/)
+**Key features:**
+- Creates interval variables for each operation (all take 1 cycle)
+- Adds cumulative constraints for VLIW slot limits
+- Supports warm-start hints from greedy scheduling
+- Multi-slot ALU demand tracking for shifted VALU ops
+- Parallel search with interleaved strategies
 
-| Pros | Cons |
-|------|------|
-| Very fast LP solver | Newer, less mature MILP |
-| Modern C++ codebase | Fewer advanced features |
-| Good Python bindings | |
-| Apache 2.0 license | |
+### Multi-Phase Pipeline: `round_chunked_scheduler.py`
 
-**Best for:** LPs, medium MILPs, when license matters
+The scheduling uses a three-phase approach:
+
+1. **Phase 1: Chunked Solve**
+   - Divides ~10,000 ops into ~1,500-op chunks
+   - Solves each chunk with CP-SAT
+   - Stitches results respecting cross-chunk dependencies
+
+2. **Phase 2: Full Solve (optional)**
+   - Uses chunked solution as warm-start hint
+   - Runs global CP-SAT with complete dependencies
+   - Often finds 5-15% improvement over chunked
+
+3. **Phase 3: VALU→ALU Shifting**
+   - Iteratively moves VALU ops to ALU when ALU has earlier free slots
+   - 1 VALU op → 8 ALU ops (uses 8 of 12 slots)
+   - Uses CP-SAT to reschedule affected ops after each shift
+
+### VALU→ALU Shifting: `iterative_reschedule.py`
+
+Key insight: VALU and ALU can execute the same operations, but:
+- VALU: 1 slot processes 8 elements
+- ALU: 8 slots process 8 elements (1 each)
+
+When VALU is bottleneck but ALU has free slots, shifting improves throughput.
+
+**Shiftable operations:**
+```python
+SHIFTABLE_OPS = {'+', '-', '*', '//', '^', '&', '|', '<', '==', '<<', '>>'}
+SPECIAL_SHIFTABLE_OPS = {'multiply_add'}  # Requires 16 ALU slots (2 ops × 8)
+```
+
+## Configuration
+
+### Key Parameters
 
 ```python
-# Installation
-uv add highspy
+generate_precomputed_kernel(
+    full_solve_time=3600.0,     # Time limit for full CP-SAT solve (seconds)
+    require_optimal=True,       # Require OPTIMAL status (not just FEASIBLE)
+    enable_valu_shift=True,     # Enable VALU→ALU shifting
+)
 ```
 
-### 4. OR-Tools (Google)
-**Website:** [developers.google.com/optimization](https://developers.google.com/optimization)
-
-| Pros | Cons |
-|------|------|
-| Excellent constraint programming | LP/MILP solver just "OK" |
-| SCIP integration built-in | Large dependency |
-| Great for scheduling problems | Google-style API |
-| Active community | |
-
-**Best for:** Constraint satisfaction, routing, scheduling with complex constraints
+### CP-SAT Solver Settings (in `cp_scheduler.py`)
 
 ```python
-# Installation
-uv add ortools
+solver.parameters.num_search_workers = os.cpu_count()  # Use all cores
+solver.parameters.interleave_search = True             # Multiple strategies
+solver.parameters.linearization_level = 2              # Stronger LP relaxations
+solver.parameters.cp_model_probing_level = 2           # Aggressive probing
 ```
 
-### 5. PuLP (Modeling Layer)
-**Website:** [coin-or.github.io/pulp](https://coin-or.github.io/pulp/)
+## Output Files
 
-| Pros | Cons |
-|------|------|
-| Solver-agnostic interface | Wrapper overhead |
-| Easy syntax | No advanced features |
-| Works with CBC, SCIP, HiGHS | Slow on large problems |
-| Great documentation | |
+The scheduler generates several log files:
 
-**Best for:** Prototyping, solver comparison, teaching
+| File | Contents |
+|------|----------|
+| `cpsat_chunks.log` | Per-chunk solve progress |
+| `cpsat_fullsolve.log` | Full solve progress |
+| `cpsat_reschedule.log` | VALU→ALU shifting progress |
 
-```python
-# Installation
-uv add pulp
-```
+## Alternative Solvers (Historical)
 
-### 6. Python-MIP
-**Website:** [python-mip.com](https://www.python-mip.com/)
+These were evaluated but not used:
 
-| Pros | Cons |
-|------|------|
-| Deep CBC/Gurobi integration | Less solver variety |
-| Cut generation, callbacks | |
-| MIPstarts, solution pools | |
-| PuLP-inspired syntax | |
+### SCIP
+- Fastest open-source MILP solver
+- Too slow for our problem size with binary formulation
+- Could work with cutting planes, but CP-SAT is simpler
 
-**Best for:** When you need advanced MIP features with open-source
+### HiGHS
+- Excellent LP solver, decent MILP
+- Apache 2.0 license
+- Not as good as CP-SAT for scheduling
 
-## Performance Benchmarks
+### OR-Tools MILP
+- Same OR-Tools library, but MILP backend
+- Slower than CP-SAT for this problem class
 
-Based on public benchmarks and literature:
+## Current Results
 
-| Solver | Relative Speed (LP) | Relative Speed (MILP) | Notes |
-|--------|--------------------|-----------------------|-------|
-| SCIP | 1.0x (reference) | 1.0x (reference) | Fastest OSS for MILP |
-| HiGHS | 1.2x faster | 1.5x slower | Great LP, decent MILP |
-| CBC | 2x slower | 2x slower | Solid, well-tested |
-| GLPK | 3x slower | 5x slower | Simple, stable |
+| Phase | Cycles | Improvement |
+|-------|--------|-------------|
+| Greedy baseline | ~3,500 | - |
+| Chunked CP-SAT | ~2,600 | 26% |
+| Full solve | ~2,450 | 6% |
+| VALU→ALU shift | ~2,390 | 2% |
+| **Final** | **2,390** | **31.7% total** |
 
-## Recommendation for Our Problem
+## Future Directions
 
-### Primary: SCIP via PySCIPOpt
-
-SCIP is the best choice for our VLIW scheduling ILP because:
-1. **Fastest** open-source MILP solver
-2. **Scheduling-specific** presolve and heuristics
-3. **Callbacks** allow adding cuts during solving
-4. **Symmetry breaking** reduces search space
-
-### Secondary: OR-Tools with CP-SAT
-
-For scheduling, OR-Tools' CP-SAT solver may actually outperform MILP:
-1. **Native scheduling constraints** (NoOverlap, Cumulative)
-2. **Better for discrete decisions**
-3. **LNS-based search** finds good solutions fast
-
-### Fallback: HiGHS
-
-If licensing or installation is an issue:
-1. **Apache 2.0** license (very permissive)
-2. **Fast enough** for medium problems
-3. **Simple installation** via pip/uv
-
-## Implementation Plan
-
-```python
-# Abstract interface for solver switching
-class MILPSolver(ABC):
-    @abstractmethod
-    def add_variable(self, name, lb, ub, is_integer): pass
-
-    @abstractmethod
-    def add_constraint(self, coeffs, sense, rhs): pass
-
-    @abstractmethod
-    def minimize(self, objective): pass
-
-    @abstractmethod
-    def solve(self, time_limit): pass
-
-# Implementations
-class SCIPSolver(MILPSolver): ...
-class HiGHSSolver(MILPSolver): ...
-class ORToolsSolver(MILPSolver): ...
-class CVXOPTSolver(MILPSolver): ...
-```
-
-## Sources
-
-- [Best Open-Source Mixed Integer Optimization Solver | Baeldung](https://www.baeldung.com/cs/best-open-source-mixed-integer-optimization-solver)
-- [SCIP Optimization Suite](https://scipopt.org/)
-- [PuLP Documentation](https://coin-or.github.io/pulp/)
-- [OR-Tools Documentation](https://developers.google.com/optimization)
-- [Python-MIP GitHub](https://github.com/coin-or/python-mip)
-- [ResearchGate Discussion on Python Optimization](https://www.researchgate.net/post/What_is_your_recommendation_for_using_Python_in_Optimization_Modelling_PulP_Gurobi_or_Pyomo)
+1. **Better chunking**: Use round boundaries more intelligently
+2. **Symmetry breaking**: Reduce search space for equivalent schedules
+3. **Custom branching**: Domain-specific variable selection
+4. **Incremental solving**: Reuse solver state across iterations
