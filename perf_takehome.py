@@ -24,8 +24,8 @@ from problem import (
     reference_kernel2,
 )
 
-# Import ModularKernelBuilder as KernelBuilder - single source of truth
-from solver.kernel_builder import ModularKernelBuilder as KernelBuilder
+# Import the best performing kernel builder
+from solver.kernel_builder import KernelBuilder
 
 
 BASELINE = 147734
