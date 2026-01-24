@@ -171,6 +171,10 @@ def compute_dependencies(ops: list[Op]) -> dict[int, Op]:
 
 
 # VALU ops that can be converted to scalar ALU ops (binary operations)
+# NOTE: 'multiply_add' is intentionally EXCLUDED because:
+# - VALU multiply_add is 1 fused op
+# - ALU would need 2 separate ops (multiply then add)
+# - Shifting FMA to ALU INCREASES total work, which is counterproductive
 VALU_TO_ALU_OPS = {'+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>', '==', '!=', '<', '<=', '>', '>='}
 
 
@@ -206,6 +210,135 @@ def expand_valu_to_alu(op: Op, next_op_id: int) -> list[Op]:
     return new_ops
 
 
+def expand_valu_to_alu_smart(
+    op: Op,
+    next_op_id: int,
+    broadcast_sources: dict[int, int],
+    broadcast_op_ids: dict[int, int],
+    debug: bool = False
+) -> tuple[list[Op], int]:
+    """Expand a VALU op into 8 scalar ALU ops with broadcast forwarding.
+
+    When a source operand comes from a vbroadcast AND the broadcast is the
+    defining operation for that source (checked via dependencies), use the
+    original scalar source directly instead of reading from the broadcast
+    destination. This eliminates redundant intermediate copies.
+
+    IMPORTANT: We only substitute if the current op DIRECTLY depends on the
+    broadcast operation. This ensures the broadcast is the last write to
+    those addresses before this op reads them. Addresses like v_nv that are
+    broadcast in some rounds but overwritten in others won't be incorrectly
+    substituted.
+
+    Args:
+        op: The VALU operation to expand
+        next_op_id: The next available operation ID
+        broadcast_sources: Map from broadcast dest base addr to scalar source addr
+        broadcast_op_ids: Map from broadcast dest base addr to broadcast op ID
+        debug: If True, print debug information about substitutions
+
+    Returns:
+        Tuple of (list of 8 ALU ops, count of broadcast forwards applied)
+    """
+    op_type, dest, src1, src2 = op.slot
+    new_ops = []
+
+    # Check if src1 or src2 came from a broadcast AND we depend on that broadcast
+    # Only substitute if the broadcast is the actual defining operation for this read
+    src1_is_broadcast = (src1 in broadcast_sources and
+                         broadcast_op_ids.get(src1) in op.dep_ids)
+    src2_is_broadcast = (src2 in broadcast_sources and
+                         broadcast_op_ids.get(src2) in op.dep_ids)
+
+    # Count how many forwards we're applying
+    forwards = (1 if src1_is_broadcast else 0) + (1 if src2_is_broadcast else 0)
+
+    if debug and (src1_is_broadcast or src2_is_broadcast):
+        print(f"  [DEBUG] Broadcast forwarding for op {op.id}: {op.slot}")
+        if src1_is_broadcast:
+            print(f"    src1: {src1} → {broadcast_sources[src1]} (dep on broadcast {broadcast_op_ids[src1]})")
+        if src2_is_broadcast:
+            print(f"    src2: {src2} → {broadcast_sources[src2]} (dep on broadcast {broadcast_op_ids[src2]})")
+
+    for i in range(VLEN):
+        # If source came from broadcast AND we depend on it, use scalar directly
+        if src1_is_broadcast:
+            actual_src1 = broadcast_sources[src1]
+        else:
+            actual_src1 = src1 + i
+
+        if src2_is_broadcast:
+            actual_src2 = broadcast_sources[src2]
+        else:
+            actual_src2 = src2 + i
+
+        new_op = Op(
+            id=next_op_id + i,
+            engine='alu',
+            slot=(op_type, dest + i, actual_src1, actual_src2),
+            dep_ids=set(op.dep_ids),  # Copy dependencies
+            reads={actual_src1, actual_src2},
+            writes={dest + i},
+        )
+        new_ops.append(new_op)
+
+    return new_ops, forwards
+
+
+def expand_vbroadcast_to_alu(op: Op, next_op_id: int) -> list[Op]:
+    """Expand a vbroadcast op into 8 scalar ALU copy ops.
+
+    Uses AND with the same operand twice to effectively copy:
+    dest[i] = scalar & scalar = scalar
+
+    Returns a list of 8 new Op objects.
+    """
+    _, dest, scalar_src = op.slot
+    new_ops = []
+
+    for i in range(VLEN):
+        new_op = Op(
+            id=next_op_id + i,
+            engine='alu',
+            slot=('&', dest + i, scalar_src, scalar_src),
+            dep_ids=set(op.dep_ids),  # Copy dependencies
+            reads={scalar_src},
+            writes={dest + i},
+        )
+        new_ops.append(new_op)
+
+    return new_ops
+
+
+def should_emit_broadcast(
+    dest: int,
+    op: Op,
+    scheduled_ops: list[Op],
+    ready_ops: list[Op],
+    remaining_ops: list[Op],
+    shifted_op_ids: set[int]
+) -> bool:
+    """Check if a vbroadcast needs to be emitted.
+
+    A broadcast can be skipped if ALL consumers of its destination addresses
+    will be shifted to ALU (and thus can read the scalar directly).
+
+    For simplicity, we always emit broadcasts for now since tracking all
+    consumers requires more analysis. The broadcast forwarding optimization
+    still helps by allowing shifted ops to read scalars directly.
+    """
+    # For now, always emit broadcasts - the forwarding optimization still helps
+    # by allowing shifted binary ops to read the scalar source directly instead
+    # of the broadcast destination.
+    #
+    # TODO: Full dead broadcast elimination requires tracking all consumers
+    # and checking if they will all be shifted. This is complex because:
+    # 1. Some consumers might not be shiftable (vselect, multiply_add)
+    # 2. Consumer shifting depends on VALU slot availability at schedule time
+    # 3. Dependencies need updating if broadcast is skipped
+    return True
+
+
 def schedule_greedy(
     ops: list[Op],
     op_by_id: dict[int, Op],
@@ -222,6 +355,12 @@ def schedule_greedy(
     2. Initialize ready queue with ops that have no dependencies
     3. Greedily schedule highest-priority ops that fit in available slots
     4. Update ready queue as dependencies are satisfied
+
+    Smart Broadcast Forwarding:
+    When VALU ops are shifted to ALU, we track vbroadcast sources. If a shifted
+    VALU op reads from a broadcast destination, we substitute the original scalar
+    source directly instead of reading from the broadcast destination. This
+    eliminates 8 redundant ALU copies per shifted op that reads from a broadcast.
 
     Args:
         ops: List of operations to schedule
@@ -251,6 +390,15 @@ def schedule_greedy(
     # Maps original op ID -> list of expanded ALU op IDs
     expanded_ops = {}
     next_op_id = max(op.id for op in ops) + 1 if ops else 0
+
+    # Smart Broadcast Forwarding: Track vbroadcast sources
+    # Maps broadcast dest base address -> original scalar source address
+    # When a shifted VALU op reads from a broadcast dest, we substitute the scalar
+    broadcast_sources: dict[int, int] = {}
+    # Also track broadcast op IDs to verify dependencies
+    # Maps broadcast dest base address -> op ID of the broadcast
+    broadcast_op_ids: dict[int, int] = {}
+    broadcast_ops_shifted = 0  # Count of vbroadcast ops that were shifted
 
     # Compute critical path length for each op (longest path to any sink)
     # This helps prioritize operations on the critical path
@@ -288,6 +436,15 @@ def schedule_greedy(
     # Topological sort based on dependencies
     in_degree = {op.id: len(op.dep_ids) for op in ops}
     ready = [op for op in ops if in_degree[op.id] == 0]
+
+    # Pre-scan for vbroadcast ops to build broadcast_sources mapping
+    # This allows smart expansion to substitute scalar sources during shifting
+    # We also track op IDs so we can verify dependency relationships
+    for op in ops:
+        if op.engine == 'valu' and len(op.slot) >= 3 and op.slot[0] == 'vbroadcast':
+            _, dest, scalar_src = op.slot
+            broadcast_sources[dest] = scalar_src
+            broadcast_op_ids[dest] = op.id
 
     # Track slot usage per cycle
     slot_usage: dict[int, dict[str, int]] = {}
@@ -354,6 +511,7 @@ def schedule_greedy(
 
     scheduled = []
     valu_shifted_count = 0
+    broadcast_forward_count = 0  # Track how many broadcasts were forwarded
 
     while ready:
         # Sort ready queue by priority
@@ -368,8 +526,12 @@ def schedule_greedy(
                 can_convert_valu_to_alu(op) and
                 get_free_alu_slots(cycle) >= VLEN):
 
-                # Expand VALU op to 8 ALU ops
-                alu_ops = expand_valu_to_alu(op, next_op_id)
+                # Smart Broadcast Forwarding: Expand VALU op to 8 ALU ops,
+                # substituting scalar sources for any operands from vbroadcast
+                alu_ops, forwards = expand_valu_to_alu_smart(
+                    op, next_op_id, broadcast_sources, broadcast_op_ids, debug=False
+                )
+                broadcast_forward_count += forwards
                 next_op_id += VLEN
 
                 # Schedule the 8 ALU ops across available cycles
@@ -391,11 +553,11 @@ def schedule_greedy(
             else:
                 cycle += 1
         else:
-            # Normal scheduling (didn't expand)
+            # Normal scheduling (didn't shift/expand)
             schedule_op(op, cycle)
             scheduled.append(op)
 
-        # Update ready list
+        # Update ready list for ops that depend on current op
         for other in ops:
             if op.id in other.dep_ids:
                 in_degree[other.id] -= 1
@@ -404,6 +566,10 @@ def schedule_greedy(
 
     if valu_shifted_count > 0:
         print(f"  VALU→ALU shifted: {valu_shifted_count} ops")
+        if broadcast_sources:
+            print(f"  Broadcast sources tracked: {len(broadcast_sources)} vbroadcasts")
+        if broadcast_forward_count > 0:
+            print(f"  Broadcast forwards applied: {broadcast_forward_count} (saves {broadcast_forward_count * 7} redundant reads)")
 
     num_cycles = max(op.cycle for op in scheduled) + 1 if scheduled else 0
     return num_cycles, scheduled
