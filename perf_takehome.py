@@ -24,24 +24,8 @@ from problem import (
     reference_kernel2,
 )
 
-
-class KernelBuilder:
-    """Optimized kernel builder using precomputed instructions."""
-
-    def __init__(self):
-        self.instrs = []
-        self.scratch_debug = {}
-        self.scratch_ptr = 0
-
-    def debug_info(self):
-        return DebugInfo(scratch_map=self.scratch_debug)
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """Build optimized kernel using precomputed instructions."""
-        from solver.precomputed_kernel import build_kernel
-        build_kernel(self, forest_height, n_nodes, batch_size, rounds)
+# Import ModularKernelBuilder as KernelBuilder - single source of truth
+from solver.kernel_builder import ModularKernelBuilder as KernelBuilder
 
 
 BASELINE = 147734

@@ -924,13 +924,20 @@ class VALUHashStrategy(HashStrategy):
         ctx: ScratchContext,
         rnd: int,
     ) -> None:
-        """Emit branch computation with bounds checking."""
+        """Emit branch computation with static wrap handling.
+
+        Key insight: We know at compile time exactly when wrapping occurs.
+        - At depth == forest_height (the leaf level), ALL items wrap to 0
+        - At all other depths, indices stay valid (no bounds check needed)
+
+        This eliminates runtime bounds checking entirely.
+        """
         n_groups = builder.config.batch_size // VLEN
         n_iters = n_groups // self.UNROLL
 
-        # Check if bounds check needed
-        max_idx_this_round = (1 << (rnd + 2)) - 1
-        needs_bounds_check = max_idx_this_round >= builder.config.n_nodes
+        tree_height = builder.config.forest_height + 1
+        tree_depth = rnd % tree_height
+        is_wrap_round = (tree_depth == builder.config.forest_height)
 
         for it in range(n_iters):
             base_g = it * self.UNROLL
@@ -938,15 +945,17 @@ class VALUHashStrategy(HashStrategy):
                 g = base_g + i
                 t = ctx.v_t[it][i]
 
-                # Stage 5 opt: t = 2 - (val & 1) = flipped branch
-                builder.emit(valu=[("&", t, ctx.all_val[g], ctx.v_1)])
-                builder.emit(valu=[("-", t, ctx.v_2, t)])
-                # idx = idx * 2 + t (fused multiply_add)
-                builder.emit(valu=[("multiply_add", ctx.all_idx[g], ctx.all_idx[g], ctx.v_2, t)])
-
-                if needs_bounds_check:
-                    builder.emit(valu=[("<", t, ctx.all_idx[g], ctx.v_nn)])
-                    builder.emit(valu=[("*", ctx.all_idx[g], ctx.all_idx[g], t)])
+                if is_wrap_round:
+                    # At leaf level: ALL items wrap to index 0
+                    # Skip branch computation entirely - just set idx = 0
+                    builder.emit(valu=[("*", ctx.all_idx[g], ctx.v_0, ctx.v_0)])
+                else:
+                    # Normal branching - no bounds check needed
+                    # Stage 5 opt: t = 2 - (val & 1) = flipped branch
+                    builder.emit(valu=[("&", t, ctx.all_val[g], ctx.v_1)])
+                    builder.emit(valu=[("-", t, ctx.v_2, t)])
+                    # idx = idx * 2 + t (fused multiply_add)
+                    builder.emit(valu=[("multiply_add", ctx.all_idx[g], ctx.all_idx[g], ctx.v_2, t)])
 
         # Debug
         for g in range(n_groups):
@@ -994,7 +1003,7 @@ class ModularKernelBuilder(BaseKernelBuilder):
 
     This is the main entry point for building kernels with the modular architecture.
 
-    Example usage:
+    Example usage (new style):
         config = KernelConfig(
             tree_access_mode=TreeAccessMode.HYBRID,
             hash_mode=HashMode.VALU_ONLY,
@@ -1003,6 +1012,10 @@ class ModularKernelBuilder(BaseKernelBuilder):
         builder = ModularKernelBuilder(config)
         builder.build()
 
+    Example usage (legacy style, compatible with old KernelBuilder):
+        builder = ModularKernelBuilder()
+        builder.build_kernel(forest_height=10, n_nodes=2047, batch_size=256, rounds=16)
+
         # Access results
         instrs = builder.instrs
         cycles = len(instrs) - 2  # Subtract pause instructions
@@ -1010,14 +1023,54 @@ class ModularKernelBuilder(BaseKernelBuilder):
 
     UNROLL = 8
 
-    def __init__(self, config: KernelConfig):
+    def __init__(self, config: KernelConfig = None):
+        if config is None:
+            config = KernelConfig()  # Use defaults, will be overwritten by build_kernel()
         super().__init__(config)
-        self.tree_strategy = create_tree_strategy(config)
-        self.hash_strategy = create_hash_strategy(config)
+        self.tree_strategy = None  # Initialized lazily in build()
+        self.hash_strategy = None
         self.ctx = ScratchContext()
+
+    def build_kernel(
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
+        **kwargs
+    ):
+        """Legacy interface for compatibility with old KernelBuilder.
+
+        Creates a config and calls build().
+        """
+        self.config = KernelConfig(
+            forest_height=forest_height,
+            n_nodes=n_nodes,
+            batch_size=batch_size,
+            rounds=rounds,
+            tree_access_mode=TreeAccessMode.HYBRID,
+            scheduling_mode=SchedulingMode.GREEDY_MULTIPASS,
+            **kwargs
+        )
+        # Re-initialize base class state
+        self.instrs = []
+        self.scratch = {}
+        self.scratch_debug = {}
+        self.scratch_ptr = 0
+        self.labels = {}
+        self.fixups = []
+        self.ctx = ScratchContext()
+
+        return self.build()
 
     def build(self):
         """Build the complete kernel."""
+        # Initialize strategies if not already done (e.g., when using build_kernel())
+        if self.tree_strategy is None:
+            self.tree_strategy = create_tree_strategy(self.config)
+        if self.hash_strategy is None:
+            self.hash_strategy = create_hash_strategy(self.config)
+
         n_groups = self.config.batch_size // VLEN
         n_iters = n_groups // self.UNROLL
         tree_height = self.config.forest_height + 1
@@ -1274,3 +1327,7 @@ class ModularKernelBuilder(BaseKernelBuilder):
 
         self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
         print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
+
+
+# Alias for backward compatibility - use KernelBuilder as the canonical name
+KernelBuilder = ModularKernelBuilder
