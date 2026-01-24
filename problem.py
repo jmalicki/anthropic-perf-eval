@@ -561,9 +561,14 @@ def myhash_traced_opt(a: int, trace: dict[Any, int], round: int, batch_i: int) -
     def r(x):
         return x % (2**32)
 
+    # Stage 5 optimization: skip XOR with C (0xB55A4F09)
+    # Key insight: myhash_opt(x) = myhash(x) ^ C exactly!
+    # So we call myhash_opt with the ORIGINAL val_after_xor (not XOR'd with C),
+    # and the output differs from myhash by exactly C.
     for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
         if i == 5:
             # Stage 5 optimized: just a ^ (a >> 16), skip XOR with constant
+            # This produces myhash(a) ^ C
             a = r(a ^ r(a >> val3))
         else:
             a = r(fns[op2](r(fns[op1](a, val1)), r(fns[op3](a, val3))))
@@ -625,32 +630,39 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
 
-            # Kernel XORs node_val with Stage 5 constant for ALL depths
-            node_val_xored = (node_val ^ STAGE5_XOR_CONST) % (2**32)
-            trace[(h, i, "node_val_xored")] = node_val_xored
+            # Key insight about Stage 5 optimization:
+            # myhash_opt(x) = myhash(x) ^ C exactly!
+            # So we pass the ORIGINAL val_after_xor to myhash_opt,
+            # and it returns myhash(val_after_xor) ^ C.
+            #
+            # For subsequent rounds, val_opt = myhash_opt(prev) = myhash(prev) ^ C.
+            # To get val_orig = myhash(prev), we compute val_opt ^ C.
+            # Then val_after_xor_orig = val_orig ^ node_val.
 
-            # Compute val_after_xor in optimized form
             if first_round:
-                # First round: val is original form, so val_after_xor needs XOR with C
+                # First round: val from memory is in original form
                 val_after_xor = (val ^ node_val) % (2**32)
-                val_after_xor_opt = (val_after_xor ^ STAGE5_XOR_CONST) % (2**32)
             else:
-                # Subsequent rounds: val is already optimized form
-                # Kernel does: all_val_opt = all_val_opt ^ v_nv where v_nv = node_val ^ C
-                # So: val_after_xor_opt = val_opt ^ (node_val ^ C)
-                val_after_xor_opt = (val ^ node_val_xored) % (2**32)
+                # Subsequent rounds: val_opt from previous round = myhash(prev) ^ C
+                # Convert to original: val_orig = val_opt ^ C
+                # Then: val_after_xor = val_orig ^ node_val = (val ^ C) ^ node_val
+                val_after_xor = (val ^ STAGE5_XOR_CONST ^ node_val) % (2**32)
 
-            trace[(h, i, "val_after_xor")] = val_after_xor_opt
+            trace[(h, i, "val_after_xor")] = val_after_xor
 
-            # Use optimized hash to match kernel's Stage 5 optimization
-            val_opt = myhash_traced_opt(val_after_xor_opt, trace, h, i)
+            # myhash_opt(x) returns myhash(x) ^ C
+            # So val_opt = myhash(val_after_xor) ^ C
+            val_opt = myhash_traced_opt(val_after_xor, trace, h, i)
             trace[(h, i, "hashed_val")] = val_opt
             val_opt_arr[i] = val_opt  # Store for next round
 
-            # Branch is flipped because C's LSB = 1 (val_opt LSB is opposite of val_orig LSB)
-            # Kernel computes: branch = 2 - (val_opt & 1)
-            # This equals: 2 if val_opt is even, 1 if val_opt is odd
-            idx = 2 * idx + (2 if val_opt % 2 == 0 else 1)
+            # Branch direction:
+            # Original: branch = 1 if myhash(x) even, else 2
+            # val_opt = myhash(x) ^ C, and C has LSB = 1, so val_opt has opposite parity
+            # Kernel uses: branch = 2 - (val_opt & 1) which gives same result:
+            #   val_opt even (original odd) -> branch = 2
+            #   val_opt odd (original even) -> branch = 1
+            idx = 2 * idx + (2 - (val_opt & 1))
             trace[(h, i, "next_idx")] = idx
             idx = 0 if idx >= n_nodes else idx
             trace[(h, i, "wrapped_idx")] = idx
