@@ -2032,14 +2032,18 @@ class TickTockKernelBuilder(BaseKernelBuilder):
     # Rounds 0-2: TICK stores (items 0-127)
     # Round 3: TOCK stores (items 128-255), partition ready for round 4
     # Rounds 4-6: Use sorted data, TICK stores for next
-    # Rounds 7-9: Continue, TOCK stores
-    # Round 10: Wrap (all idx=0), no partition needed
-    # Rounds 11-13: TICK stores (all items have idx=0)
-    # Round 14: TOCK stores, partition ready for round 15
-    # Round 15: Use sorted data
-
-    TICK_STORE_ROUNDS = {0, 1, 2, 4, 5, 6, 11, 12, 13}  # Store first half
-    TOCK_STORE_ROUNDS = {3, 7, 8, 9, 14}  # Store second half
+    # Partition stores based on DEPTH, not round number:
+    # - TICK depths: Store first half (groups 0-15)
+    # - TOCK depths: Store second half (groups 16-31)
+    #
+    # Schedule matches the original round-based config:
+    # Round 0-3 (depths 0-3): TICK 0,1,2 + TOCK 3 → ready for depth 4
+    # Round 4-9 (depths 4-9): TICK 4,5,6 + TOCK 7,8,9 → ready for depth 10
+    # Round 10 (depth 10): WRAP - no stores
+    # Round 11-14 (depths 0-3): TICK 0,1,2 + TOCK 3 → ready for depth 4
+    # Round 15 (depth 4): Use partition data
+    TICK_STORE_DEPTHS = {0, 1, 2, 4, 5, 6}  # First half at these depths
+    TOCK_STORE_DEPTHS = {3, 7, 8, 9}        # Second half at these depths
 
     def __init__(self, config: KernelConfig = None):
         if config is None:
@@ -2647,9 +2651,10 @@ class TickTockKernelBuilder(BaseKernelBuilder):
         The branch computation updates indices:
             new_idx = 2 * old_idx + (2 - (val & 1))
 
-        Partition stores happen AFTER branch computation using idle store slots:
-        - TICK rounds: Store first half (items 0-127)
-        - TOCK rounds: Store second half (items 128-255)
+        Partition stores happen AFTER branch computation using idle store slots,
+        based on tree DEPTH (not round) for proper wrap handling:
+        - Depths 0-2: TICK stores (first half)
+        - Depth 3: TOCK stores (second half)
         """
         ctx = self.ctx
 
@@ -2673,12 +2678,12 @@ class TickTockKernelBuilder(BaseKernelBuilder):
                     self.emit(valu=[("-", t, ctx.v_2, t)])
                     self.emit(valu=[("multiply_add", ctx.all_idx[g], ctx.all_idx[g], ctx.v_2, t)])
 
-        # Emit partition stores as a batch after branch computation
+        # Emit partition stores based on DEPTH (handles wrap correctly)
         # The scheduler will interleave these with hash computation of next round
-        if rnd in self.TICK_STORE_ROUNDS:
+        if tree_depth in self.TICK_STORE_DEPTHS:
             # Store first half: groups 0-15
             self._emit_partition_stores_batch(0, n_groups // 2, rnd)
-        elif rnd in self.TOCK_STORE_ROUNDS:
+        elif tree_depth in self.TOCK_STORE_DEPTHS:
             # Store second half: groups 16-31
             self._emit_partition_stores_batch(n_groups // 2, n_groups, rnd)
 
