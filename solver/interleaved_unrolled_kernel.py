@@ -8,17 +8,19 @@ can overlap independent operations. Uses per-iteration temps to avoid conflicts.
 import math
 
 from problem import DebugInfo, SLOT_LIMITS, VLEN, SCRATCH_SIZE, HASH_STAGES
-from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, emit_scheduled
+from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, schedule_greedy_multipass, emit_scheduled
 
 
 class InterleavedUnrolledKernelBuilder:
     """Build a fully unrolled kernel with interleaved emission for better pipelining."""
 
-    def __init__(self):
+    def __init__(self, enable_debug: bool = False):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
+        self.enable_debug = enable_debug
+        self.debug_ops = []  # Pending debug operations to attach to next emit()
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -37,7 +39,31 @@ class InterleavedUnrolledKernelBuilder:
     def emit(self, **engines):
         instr = {k: v for k, v in engines.items() if v}
         if instr:
+            # Attach any pending debug ops to this instruction
+            if self.debug_ops:
+                instr["debug"] = list(self.debug_ops)
+                self.debug_ops = []
             self.instrs.append(instr)
+
+    def emit_compare(self, loc: int, key: tuple):
+        """Emit scalar comparison with reference value.
+
+        Args:
+            loc: Scratch address of value to compare
+            key: Trace key tuple (round, batch_i, phase_name, ...)
+        """
+        if self.enable_debug:
+            self.debug_ops.append(("compare", loc, key))
+
+    def emit_vcompare(self, loc: int, keys: list):
+        """Emit vector comparison with reference values.
+
+        Args:
+            loc: Base scratch address of vector to compare
+            keys: List of trace key tuples, one per VLEN element
+        """
+        if self.enable_debug:
+            self.debug_ops.append(("vcompare", loc, keys))
 
     def build_kernel(
         self,
@@ -287,6 +313,13 @@ class InterleavedUnrolledKernelBuilder:
                     for i in range(UNROLL):
                         self.emit(valu=[("vbroadcast", v_nv[it][i], tc[0])])
                 # No Stage 5 XOR needed for root node
+                # DEBUG: emit node_val comparison for depth 0
+                for it in range(n_iters):
+                    base_g = it * UNROLL
+                    for i in range(UNROLL):
+                        g = base_g + i
+                        keys = [(rnd, g * VLEN + vi, "node_val") for vi in range(VLEN)]
+                        self.emit_vcompare(v_nv[it][i], keys)
 
             elif tree_depth == 1:
                 # Depth 1: v_nv = tc[2] + (idx == 1) * td_1
@@ -302,6 +335,13 @@ class InterleavedUnrolledKernelBuilder:
                 for it in range(n_iters):
                     for i in range(UNROLL):
                         self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
+                # DEBUG: emit node_val comparison for depth 1
+                for it in range(n_iters):
+                    base_g = it * UNROLL
+                    for i in range(UNROLL):
+                        g = base_g + i
+                        keys = [(rnd, g * VLEN + vi, "node_val_xored") for vi in range(VLEN)]
+                        self.emit_vcompare(v_nv[it][i], keys)
 
             elif tree_depth == 2:
                 # Depth 2: v_nv = tc[3] + delta selection for idx == 3, 4, 5, 6
@@ -399,6 +439,10 @@ class InterleavedUnrolledKernelBuilder:
                 base_g = it * UNROLL
                 for i in range(UNROLL):
                     self.emit(valu=[("^", all_val[base_g+i], all_val[base_g+i], v_nv[it][i])])
+            # DEBUG: emit val_after_xor comparison
+            for g in range(n_groups):
+                keys = [(rnd, g * VLEN + vi, "val_after_xor") for vi in range(VLEN)]
+                self.emit_vcompare(all_val[g], keys)
 
             # PHASE 3: Hash - 6 stages (ALL rounds)
             # Use per-group temps: v_t[it][i] for hash temp
@@ -424,6 +468,10 @@ class InterleavedUnrolledKernelBuilder:
                             self.emit(valu=[(op1, t, all_val[base_g+i], v_hc[hi]),
                                             (op3, v_nv[it][i], all_val[base_g+i], v_hs[hi])])
                             self.emit(valu=[(op2, all_val[base_g+i], t, v_nv[it][i])])
+                # DEBUG: emit hash_stage comparison after each stage
+                for g in range(n_groups):
+                    keys = [(rnd, g * VLEN + vi, "hash_stage", hi) for vi in range(VLEN)]
+                    self.emit_vcompare(all_val[g], keys)
 
             # PHASE 4: Branch computation (ALL rounds)
             # Use per-group temp v_t[it][i] for bit and reuse for in_bounds
@@ -455,6 +503,10 @@ class InterleavedUnrolledKernelBuilder:
                         self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
                         # idx = idx * in_bounds (zeroes if out of bounds)
                         self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])
+            # DEBUG: emit wrapped_idx comparison after branch/bounds
+            for g in range(n_groups):
+                keys = [(rnd, g * VLEN + vi, "wrapped_idx") for vi in range(VLEN)]
+                self.emit_vcompare(all_idx[g], keys)
 
         rounds_end = len(self.instrs)
 

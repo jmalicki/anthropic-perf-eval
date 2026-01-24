@@ -487,16 +487,27 @@ def reference_kernel(t: Tree, inp: Input):
 def build_mem_image(t: Tree, inp: Input) -> list[int]:
     """
     Build a flat memory image of the problem.
+
+    Memory layout:
+        0: rounds
+        1: n_nodes
+        2: batch_size
+        3: tree_height
+        4: forest_values_p (pointer to tree values)
+        5: inp_indices_p (pointer to input indices)
+        6: inp_values_p (pointer to input values)
+        7: extra_room_p (pointer to extra working memory)
+        8+: tree values, input indices, input values, extra room
     """
-    header = 7
-    extra_room = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
+    header = 8  # Increased from 7 to make room for extra_room_p at position 7
+    extra_room_size = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
     mem = [0] * (
-        header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room
+        header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room_size
     )
     forest_values_p = header
     inp_indices_p = forest_values_p + len(t.values)
-    inp_values_p = inp_indices_p + len(inp.values)
-    extra_room = inp_values_p + len(inp.values)
+    inp_values_p = inp_indices_p + len(inp.indices)  # Fixed: was len(inp.values)
+    extra_room_p = inp_values_p + len(inp.values)
 
     mem[0] = inp.rounds
     mem[1] = len(t.values)
@@ -505,11 +516,11 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
     mem[4] = forest_values_p
     mem[5] = inp_indices_p
     mem[6] = inp_values_p
-    mem[7] = extra_room
+    mem[7] = extra_room_p
 
-    mem[header:inp_indices_p] = t.values
+    mem[forest_values_p:inp_indices_p] = t.values
     mem[inp_indices_p:inp_values_p] = inp.indices
-    mem[inp_values_p:] = inp.values
+    mem[inp_values_p:extra_room_p] = inp.values  # Fixed: explicit end to prevent truncation
     return mem
 
 
@@ -535,6 +546,10 @@ def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> in
 def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
     """
     Reference implementation of the kernel on a flat memory.
+
+    Extended with additional trace points for debug validation:
+    - node_val_xored: node_val XOR'd with Stage 5 constant (for depths 1+)
+    - val_after_xor: val XOR node_val (before hashing, XOR'd with Stage 5 constant)
     """
     # This is the initial memory layout
     rounds = mem[0]
@@ -545,7 +560,15 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
     forest_values_p = mem[4]
     inp_indices_p = mem[5]
     inp_values_p = mem[6]
+
+    # Stage 5 XOR constant used in kernel optimization
+    STAGE5_XOR_CONST = 0xB55A4F09
+
+    # Tree traversal depth tracking (mirrors kernel behavior)
+    tree_height = forest_height + 1
+
     yield mem
+    tree_depth = 0
     for h in range(rounds):
         for i in range(batch_size):
             idx = mem[inp_indices_p + i]
@@ -554,6 +577,21 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "val")] = val
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
+
+            # For depths 1+, kernel XORs node_val with Stage 5 constant
+            # Depth 0 uses raw node_val (no XOR needed)
+            if tree_depth > 0:
+                node_val_xored = (node_val ^ STAGE5_XOR_CONST) % (2**32)
+                trace[(h, i, "node_val_xored")] = node_val_xored
+
+            # val_after_xor is computed with the XOR'd value (for Stage 5 optimization)
+            # This matches the kernel's internal representation
+            val_after_xor = (val ^ node_val) % (2**32)
+            # In kernel, val is in "optimized" form (XOR'd with C), so val_after_xor
+            # is also XOR'd with C to match the kernel's internal state
+            val_after_xor_opt = (val_after_xor ^ STAGE5_XOR_CONST) % (2**32)
+            trace[(h, i, "val_after_xor")] = val_after_xor_opt
+
             val = myhash_traced(val ^ node_val, trace, h, i)
             trace[(h, i, "hashed_val")] = val
             idx = 2 * idx + (1 if val % 2 == 0 else 2)
@@ -562,6 +600,12 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "wrapped_idx")] = idx
             mem[inp_values_p + i] = val
             mem[inp_indices_p + i] = idx
+
+        # Increment tree_depth, wrapping at tree_height (mirrors kernel)
+        tree_depth += 1
+        if tree_depth >= tree_height:
+            tree_depth = 0
+
     # You can add new yields or move this around for debugging
     # as long as it's matched by pause instructions.
     # The submission tests evaluate only on final memory.
