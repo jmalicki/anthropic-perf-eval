@@ -560,6 +560,213 @@ class HybridTreeAccessStrategy(TreeAccessStrategy):
             self.scattered_strategy.emit_access(builder, ctx, tree_depth, rnd)
 
 
+class ChunkedVloadStrategy(TreeAccessStrategy):
+    """Use vload to preload tree chunks at init, then VALU select at runtime.
+
+    EXPERIMENTAL: This strategy is currently SLOWER than HybridTreeAccessStrategy.
+    It serves as a foundation for future jump-based optimization.
+
+    Key insight: vload loads 8 contiguous values in 1 cycle (vs 4 cycles for
+    8 scalar loads). By using vload at init time, we amortize the load cost
+    across all rounds.
+
+    With chunk_size=4 and vload=8, one vload covers two chunks:
+    - Mode 1: Item in current chunk (select from vload[0:3])
+    - Mode 2: Item in next chunk of same vload (select from vload[4:7])
+    - Mode 3: Item beyond vload range (need new vload)
+
+    The vload doesn't need 8-byte alignment - we can load tree[idx:idx+8]
+    for any idx.
+
+    Cost analysis for depth 4 (16 tree values):
+    - Init: 2 vloads + 16 broadcasts = ~10 cycles (amortized over rounds)
+    - Runtime: 16 comparisons × 2 ops × 32 groups = 1024 ops = ~170 cycles
+
+    This is WORSE than scattered loads (128 cycles) for depths 4+ because
+    the VALU selection cost scales with number of tree values.
+
+    FUTURE OPTIMIZATION: Jump-based chunk skipping
+    =============================================
+    With sorted items and jump-based control flow, we could exploit the high
+    collision rate (99%+ in some rounds) to skip chunks that have no items:
+
+    1. Sort batch items by tree index within each round
+    2. Process items in chunk order, checking only the first/last item per chunk
+    3. Use jump instruction to skip empty chunks entirely
+    4. Three processing modes:
+       - Same chunk: continue processing
+       - Next chunk in same vload: switch selection range, no new load
+       - New vload needed: emit vload, reset selection range
+
+    With 99% collision (1-2 unique indices), typically only 1-2 chunks are
+    non-empty, reducing effective work from 170 cycles to ~10 cycles.
+
+    This optimization requires:
+    - Sorted items infrastructure (see partition_kernel.py)
+    - Jump-based control flow (ISA supports jumps)
+    - Per-chunk item counts or boundary detection
+
+    For now, this strategy demonstrates the structure but doesn't implement
+    jump-based skipping. Use HybridTreeAccessStrategy for best performance.
+    """
+
+    def __init__(
+        self,
+        valu_max_depth: int = 3,
+        chunked_min_depth: int = 4,
+        chunked_max_depth: int = 10,
+        chunk_size: int = 4,
+    ):
+        """Initialize chunked vload strategy.
+
+        Args:
+            valu_max_depth: Use VALU selection up to this depth (default: 3)
+            chunked_min_depth: Start chunked vload at this depth (default: 4)
+            chunked_max_depth: End chunked vload at this depth (default: 10)
+            chunk_size: Chunk size for chunked gather (default: 4)
+        """
+        self.valu_strategy = VALUSelectionStrategy(max_depth=valu_max_depth)
+        self.scattered_strategy = ScatteredLoadStrategy()
+        self.valu_max_depth = valu_max_depth
+        self.chunked_min_depth = chunked_min_depth
+        self.chunked_max_depth = chunked_max_depth
+        self.chunk_size = chunk_size
+        self.UNROLL = 8
+
+        # Will be populated during allocate()
+        self.chunked_tc: Dict[int, List[int]] = {}  # depth -> scalar tree values
+        self.chunked_v_tc: Dict[int, List[int]] = {}  # depth -> vector tree values
+        self.chunked_c: Dict[int, List[int]] = {}  # depth -> scalar comparison constants
+        self.chunked_v_c: Dict[int, List[int]] = {}  # depth -> vector comparison constants
+
+    def allocate(self, builder: BaseKernelBuilder, ctx: ScratchContext) -> None:
+        """Allocate scratch for VALU selection + chunked gather."""
+        self.valu_strategy.allocate(builder, ctx)
+        self.scattered_strategy.allocate(builder, ctx)
+
+        # Allocate for each depth in chunked range
+        tree_height = builder.config.forest_height + 1
+        n_nodes = builder.config.n_nodes
+
+        for depth in range(self.chunked_min_depth, min(self.chunked_max_depth + 1, tree_height)):
+            # Calculate tree index range for this depth
+            start_idx = (1 << depth) - 1  # 2^depth - 1
+            end_idx = (1 << (depth + 1)) - 2  # 2^(depth+1) - 2
+            n_vals = end_idx - start_idx + 1  # 2^depth values
+
+            # Only process if within n_nodes
+            if start_idx >= n_nodes:
+                continue
+
+            # Clamp to n_nodes
+            actual_n_vals = min(n_vals, n_nodes - start_idx)
+
+            # Allocate scratch
+            self.chunked_tc[depth] = [builder.alloc(f"ctc_d{depth}_{i}") for i in range(actual_n_vals)]
+            self.chunked_v_tc[depth] = [builder.vec(f"cv_tc_d{depth}_{i}") for i in range(actual_n_vals)]
+            self.chunked_c[depth] = [builder.alloc(f"cc_d{depth}_{i}") for i in range(actual_n_vals)]
+            self.chunked_v_c[depth] = [builder.vec(f"cv_c_d{depth}_{i}") for i in range(actual_n_vals)]
+
+    def emit_init(self, builder: BaseKernelBuilder, ctx: ScratchContext) -> None:
+        """Emit init: vload tree chunks and broadcast to vectors."""
+        self.valu_strategy.emit_init(builder, ctx)
+        self.scattered_strategy.emit_init(builder, ctx)
+
+        # Initialize each depth's tree values using vload
+        for depth in sorted(self.chunked_tc.keys()):
+            start_idx = (1 << depth) - 1  # First tree index at this depth
+            n_vals = len(self.chunked_tc[depth])
+            tc_list = self.chunked_tc[depth]
+            v_tc_list = self.chunked_v_tc[depth]
+            c_list = self.chunked_c[depth]
+            v_c_list = self.chunked_v_c[depth]
+
+            # Load comparison constants (tree indices)
+            for i in range(n_vals):
+                builder.emit(load=[("const", c_list[i], start_idx + i)])
+
+            # Use vload to load tree values in chunks of 8 (VLEN)
+            # This is faster than individual scalar loads: 1 vload vs 4 scalar loads
+            n_chunks = (n_vals + VLEN - 1) // VLEN
+            for chunk_i in range(n_chunks):
+                chunk_start = chunk_i * VLEN
+                chunk_idx = start_idx + chunk_start
+                # Compute address: forest_p + chunk_idx
+                builder.emit(load=[("const", ctx.st[0], chunk_idx)])
+                builder.emit(alu=[("+", ctx.st[1], ctx.forest_p, ctx.st[0])])
+                # vload into contiguous scratch starting at tc_list[chunk_start]
+                builder.emit(load=[("vload", tc_list[chunk_start], ctx.st[1])])
+
+            # Broadcast tree values to vectors
+            for i in range(0, n_vals, 2):
+                if i + 1 < n_vals:
+                    builder.emit(valu=[
+                        ("vbroadcast", v_tc_list[i], tc_list[i]),
+                        ("vbroadcast", v_tc_list[i+1], tc_list[i+1])
+                    ])
+                else:
+                    builder.emit(valu=[("vbroadcast", v_tc_list[i], tc_list[i])])
+
+            # Broadcast comparison constants to vectors
+            for i in range(0, n_vals, 2):
+                if i + 1 < n_vals:
+                    builder.emit(valu=[
+                        ("vbroadcast", v_c_list[i], c_list[i]),
+                        ("vbroadcast", v_c_list[i+1], c_list[i+1])
+                    ])
+                else:
+                    builder.emit(valu=[("vbroadcast", v_c_list[i], c_list[i])])
+
+    def emit_access(
+        self,
+        builder: BaseKernelBuilder,
+        ctx: ScratchContext,
+        tree_depth: int,
+        rnd: int,
+    ) -> None:
+        """Emit tree access: VALU selection for shallow, chunked for mid, scattered for deep."""
+        if tree_depth <= self.valu_max_depth:
+            # Use existing VALU selection for depths 0-3
+            self.valu_strategy.emit_access(builder, ctx, tree_depth, rnd)
+        elif tree_depth in self.chunked_tc:
+            # Use chunked gather with VALU selection
+            self._emit_chunked_access(builder, ctx, tree_depth, rnd)
+        else:
+            # Fall back to scattered loads for very deep or unconfigured depths
+            self.scattered_strategy.emit_access(builder, ctx, tree_depth, rnd)
+
+    def _emit_chunked_access(
+        self,
+        builder: BaseKernelBuilder,
+        ctx: ScratchContext,
+        tree_depth: int,
+        rnd: int,
+    ) -> None:
+        """Emit VALU selection from preloaded chunked tree values."""
+        n_groups = builder.config.batch_size // VLEN
+        n_iters = n_groups // self.UNROLL
+
+        v_tc_list = self.chunked_v_tc[tree_depth]
+        v_c_list = self.chunked_v_c[tree_depth]
+        n_vals = len(v_tc_list)
+
+        for it in range(n_iters):
+            base_g = it * self.UNROLL
+            for i in range(self.UNROLL):
+                t = ctx.v_t[it][i]
+                # Initialize result to 0
+                builder.emit(valu=[("*", ctx.v_nv[it][i], ctx.v_0, ctx.v_0)])
+                # For each tree value, check if idx matches and accumulate
+                for ti in range(n_vals):
+                    builder.emit(valu=[("==", t, ctx.all_idx[base_g+i], v_c_list[ti])])
+                    builder.emit(valu=[("multiply_add", ctx.v_nv[it][i], t, v_tc_list[ti], ctx.v_nv[it][i])])
+
+        # Stage 5 opt: XOR v_nv with C
+        for it in range(n_iters):
+            for i in range(self.UNROLL):
+                builder.emit(valu=[("^", ctx.v_nv[it][i], ctx.v_nv[it][i], ctx.v_stage5_xor)])
+
+
 # =============================================================================
 # Hash Computation Strategies
 # =============================================================================
@@ -761,9 +968,15 @@ def create_tree_strategy(config: KernelConfig) -> TreeAccessStrategy:
         return VALUSelectionStrategy(max_depth=config.valu_selection_max_depth)
     elif mode == TreeAccessMode.HYBRID:
         return HybridTreeAccessStrategy(valu_max_depth=config.valu_selection_max_depth)
+    elif mode == TreeAccessMode.CHUNKED_GATHER:
+        return ChunkedVloadStrategy(
+            valu_max_depth=config.valu_selection_max_depth,
+            chunked_min_depth=config.chunked_gather_min_depth,
+            chunked_max_depth=config.chunked_gather_max_depth,
+            chunk_size=config.chunk_size,
+        )
     else:
-        # CHUNKED_GATHER - fall back to hybrid for now
-        return HybridTreeAccessStrategy(valu_max_depth=config.valu_selection_max_depth)
+        raise ValueError(f"Unknown tree access mode: {mode}")
 
 
 def create_hash_strategy(config: KernelConfig) -> HashStrategy:

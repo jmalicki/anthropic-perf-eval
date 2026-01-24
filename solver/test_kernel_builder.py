@@ -99,6 +99,25 @@ class TestModularKernelBuilder(unittest.TestCase):
         self.assertLessEqual(builder.scratch_ptr, SCRATCH_SIZE,
                             f"Scratch usage {builder.scratch_ptr} exceeds budget {SCRATCH_SIZE}")
 
+    def test_chunked_gather(self):
+        """Test chunked gather strategy (experimental)."""
+        config = KernelConfig(
+            tree_access_mode=TreeAccessMode.CHUNKED_GATHER,
+            chunked_gather_min_depth=4,
+            chunked_gather_max_depth=5,  # Limit to avoid scratch overflow
+            scheduling_mode=SchedulingMode.GREEDY_SINGLE,
+        )
+        builder = ModularKernelBuilder(config)
+
+        # Check scratch usage before building (allocation happens in build)
+        builder.build()
+
+        from problem import SCRATCH_SIZE
+        print(f"Chunked gather scratch: {builder.scratch_ptr} / {SCRATCH_SIZE}")
+
+        cycles = len(builder.instrs) - 2
+        print(f"Chunked gather (depths 4-5): {cycles} cycles")
+
 
 def run_comparison():
     """Compare modular builder output with original implementation."""
