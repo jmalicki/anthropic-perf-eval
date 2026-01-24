@@ -96,6 +96,10 @@ class InterleavedUnrolledKernelBuilder:
         alu_hash_fraction: float = 0.5,
         use_multipass_scheduler: bool = False,
         enable_broadcast_lookahead: bool = False,
+        enable_chunked_gather: bool = False,
+        chunked_gather_min_depth: int = 4,
+        chunked_gather_max_depth: int = 10,
+        chunk_size: int = 8,
     ):
         """Build fully unrolled kernel with interleaved emission.
 
@@ -188,6 +192,30 @@ class InterleavedUnrolledKernelBuilder:
             # Round 5: 32 tree values (indices 31-62)
             v_tc_r5 = [self.vec(f"v_tc_r5_{i}") for i in range(32)]
             v_const_r5 = [self.vec(f"v_const_r5_{i}") for i in range(32)]
+
+        # Chunked gather: preload tree values using vload for faster init
+        # This approach uses vload (loads 8 values per cycle) instead of scalar loads
+        # for depths between chunked_gather_min_depth and chunked_gather_max_depth
+        chunked_tc = {}  # depth -> list of scalar addresses holding tree values
+        chunked_v_tc = {}  # depth -> list of vector addresses for broadcast values
+        chunked_v_const = {}  # depth -> list of vector addresses for comparison constants
+        chunked_const = {}  # depth -> list of scalar addresses for comparison constants
+        if enable_chunked_gather:
+            for depth in range(chunked_gather_min_depth, min(chunked_gather_max_depth + 1, forest_height + 1)):
+                # Calculate tree index range for this depth
+                start_idx = (1 << depth) - 1  # 2^depth - 1
+                end_idx = (1 << (depth + 1)) - 2  # 2^(depth+1) - 2
+                n_vals = end_idx - start_idx + 1  # 2^depth values
+
+                # Only process if within n_nodes
+                if start_idx >= n_nodes:
+                    continue
+
+                # Allocate scratch for tree values and vectors
+                chunked_tc[depth] = [self.alloc(f"tc_d{depth}_{i}") for i in range(n_vals)]
+                chunked_v_tc[depth] = [self.vec(f"v_tc_d{depth}_{i}") for i in range(n_vals)]
+                chunked_const[depth] = [self.alloc(f"c_d{depth}_{i}") for i in range(n_vals)]
+                chunked_v_const[depth] = [self.vec(f"v_const_d{depth}_{i}") for i in range(n_vals)]
 
         # FMA optimization: (a + const) + (a << shift) = a * (1 + 2^shift) + const
         # Applicable to stages where op1='+', op2='+', op3='<<'
@@ -320,6 +348,50 @@ class InterleavedUnrolledKernelBuilder:
             for i in range(0, 32, 2):
                 self.emit(valu=[("vbroadcast", v_const_r5[i], c_r5[i]),
                                ("vbroadcast", v_const_r5[i+1], c_r5[i+1])])
+
+        # Chunked gather initialization: preload tree values using vload
+        # For each enabled depth, use vload to load 8 contiguous tree values at a time
+        # (much faster than individual scalar loads: 1 vload vs 4 scalar load cycles)
+        if enable_chunked_gather:
+            for depth in sorted(chunked_tc.keys()):
+                start_idx = (1 << depth) - 1  # First tree index at this depth
+                n_vals = len(chunked_tc[depth])
+                tc_list = chunked_tc[depth]
+                v_tc_list = chunked_v_tc[depth]
+                c_list = chunked_const[depth]
+                v_c_list = chunked_v_const[depth]
+
+                # Load comparison constants (tree indices)
+                for i in range(n_vals):
+                    self.emit(load=[("const", c_list[i], start_idx + i)])
+
+                # Use vload to load tree values in chunks of 8 (VLEN)
+                # This is faster than individual scalar loads
+                n_chunks = (n_vals + VLEN - 1) // VLEN
+                for chunk_i in range(n_chunks):
+                    chunk_start = chunk_i * VLEN
+                    chunk_idx = start_idx + chunk_start
+                    # Compute address: forest_p + chunk_idx
+                    self.emit(load=[("const", st[0], chunk_idx)])
+                    self.emit(alu=[("+", st[1], forest_p, st[0])])
+                    # vload into contiguous scratch starting at tc_list[chunk_start]
+                    self.emit(load=[("vload", tc_list[chunk_start], st[1])])
+
+                # Broadcast tree values to vectors
+                for i in range(0, n_vals, 2):
+                    if i + 1 < n_vals:
+                        self.emit(valu=[("vbroadcast", v_tc_list[i], tc_list[i]),
+                                       ("vbroadcast", v_tc_list[i+1], tc_list[i+1])])
+                    else:
+                        self.emit(valu=[("vbroadcast", v_tc_list[i], tc_list[i])])
+
+                # Broadcast comparison constants to vectors
+                for i in range(0, n_vals, 2):
+                    if i + 1 < n_vals:
+                        self.emit(valu=[("vbroadcast", v_c_list[i], c_list[i]),
+                                       ("vbroadcast", v_c_list[i+1], c_list[i+1])])
+                    else:
+                        self.emit(valu=[("vbroadcast", v_c_list[i], c_list[i])])
 
         # Note: We do NOT pre-XOR tc[1-6] here because the delta computation
         # (td_1 = tc[1] - tc[2]) doesn't preserve XOR. Instead, we XOR v_nv
@@ -460,6 +532,39 @@ class InterleavedUnrolledKernelBuilder:
                         for ti in range(32):
                             self.emit(valu=[("==", t, all_idx[base_g+i], v_const_r5[ti])])
                             self.emit(valu=[("multiply_add", v_nv[it][i], t, v_tc_r5[ti], v_nv[it][i])])
+                # Stage 5 opt: XOR v_nv with C
+                for it in range(n_iters):
+                    for i in range(UNROLL):
+                        self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
+
+            elif enable_chunked_gather and tree_depth in chunked_tc:
+                # Chunked gather - EXPERIMENTAL
+                #
+                # The optimal approach would use three-mode processing with jumps:
+                # 1. Items in current chunk (4 values) - select from vload[0:3]
+                # 2. Items in next chunk of same vload - use vload[4:7], no new load!
+                # 3. Items beyond vload range - do new vload, reset to mode 1
+                #
+                # This requires sorted items and jump-based control flow.
+                # For now, use preloaded VALU selection (same as depth 3 pattern).
+                #
+                # Note: Analysis shows VALU selection is slower than scattered loads
+                # for depths 4+ (170 vs 128 cycles for depth 4), so this path is
+                # mainly for experimentation. The scattered load path is faster.
+
+                v_tc_list = chunked_v_tc[tree_depth]
+                v_c_list = chunked_v_const[tree_depth]
+                n_vals = len(v_tc_list)
+
+                for it in range(n_iters):
+                    base_g = it * UNROLL
+                    for i in range(UNROLL):
+                        t = v_t[it][i]
+                        self.emit(valu=[("*", v_nv[it][i], v_0, v_0)])
+                        for ti in range(n_vals):
+                            self.emit(valu=[("==", t, all_idx[base_g+i], v_c_list[ti])])
+                            self.emit(valu=[("multiply_add", v_nv[it][i], t, v_tc_list[ti], v_nv[it][i])])
+
                 # Stage 5 opt: XOR v_nv with C
                 for it in range(n_iters):
                     for i in range(UNROLL):

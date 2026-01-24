@@ -30,6 +30,10 @@ def generate_precomputed_kernel(
     alu_hash_fraction: float = 0.5,
     use_multipass_scheduler: bool = False,
     enable_broadcast_lookahead: bool = False,
+    enable_chunked_gather: bool = False,
+    chunked_gather_min_depth: int = 4,
+    chunked_gather_max_depth: int = 10,
+    chunk_size: int = 8,
     output_file: str = "solver/precomputed_kernel.py"
 ):
     """Generate the precomputed kernel file.
@@ -58,6 +62,11 @@ def generate_precomputed_kernel(
     print(f"  enable_alu_hash_parallel: {enable_alu_hash_parallel}")
     if enable_alu_hash_parallel:
         print(f"  alu_hash_fraction: {alu_hash_fraction}")
+    print(f"  enable_chunked_gather: {enable_chunked_gather}")
+    if enable_chunked_gather:
+        print(f"  chunked_gather_min_depth: {chunked_gather_min_depth}")
+        print(f"  chunked_gather_max_depth: {chunked_gather_max_depth}")
+        print(f"  chunk_size: {chunk_size}")
     print()
 
     # Import here to avoid issues if dependencies aren't installed
@@ -75,7 +84,11 @@ def generate_precomputed_kernel(
                         enable_alu_hash_parallel=enable_alu_hash_parallel,
                         alu_hash_fraction=alu_hash_fraction,
                         use_multipass_scheduler=use_multipass_scheduler,
-                        enable_broadcast_lookahead=enable_broadcast_lookahead)
+                        enable_broadcast_lookahead=enable_broadcast_lookahead,
+                        enable_chunked_gather=enable_chunked_gather,
+                        chunked_gather_min_depth=chunked_gather_min_depth,
+                        chunked_gather_max_depth=chunked_gather_max_depth,
+                        chunk_size=chunk_size)
 
     # Get the results
     instrs = builder.instrs
@@ -223,6 +236,14 @@ def main():
                         help="Try multiple scheduling strategies and pick the best")
     parser.add_argument("--enable-broadcast-lookahead", action="store_true",
                         help="EXPERIMENTAL: Proactively eliminate broadcasts based on predicted VALU pressure")
+    parser.add_argument("--enable-chunked-gather", action="store_true",
+                        help="Use chunked vload instead of scattered loads for tree access")
+    parser.add_argument("--chunked-gather-min-depth", type=int, default=4,
+                        help="Minimum tree depth to use chunked gather (default: 4, since 0-3 use VALU)")
+    parser.add_argument("--chunked-gather-max-depth", type=int, default=10,
+                        help="Maximum tree depth to use chunked gather (default: 10)")
+    parser.add_argument("--chunk-size", type=int, default=8, choices=[8, 16, 32],
+                        help="Chunk size for chunked gather (default: 8)")
     parser.add_argument("--output", type=str, default="solver/precomputed_kernel.py",
                         help="Output file path")
 
@@ -242,6 +263,10 @@ def main():
         alu_hash_fraction=args.alu_hash_fraction,
         use_multipass_scheduler=args.use_multipass_scheduler,
         enable_broadcast_lookahead=args.enable_broadcast_lookahead,
+        enable_chunked_gather=args.enable_chunked_gather,
+        chunked_gather_min_depth=args.chunked_gather_min_depth,
+        chunked_gather_max_depth=args.chunked_gather_max_depth,
+        chunk_size=args.chunk_size,
         output_file=args.output,
     )
 
