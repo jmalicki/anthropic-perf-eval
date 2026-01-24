@@ -65,6 +65,20 @@ class InterleavedUnrolledKernelBuilder:
         if self.enable_debug:
             self.debug_ops.append(("vcompare", loc, keys))
 
+    def emit_debug(self):
+        """Emit a debug-only instruction immediately.
+
+        This ensures debug comparisons are processed at the correct point
+        in the dependency graph (right after the operation they trace),
+        rather than being attached to the next emit() which may contain
+        operations that write to the same locations.
+
+        Debug-only instructions don't count toward cycle count.
+        """
+        if self.debug_ops:
+            self.instrs.append({"debug": list(self.debug_ops)})
+            self.debug_ops = []
+
     def build_kernel(
         self,
         forest_height: int,
@@ -308,18 +322,22 @@ class InterleavedUnrolledKernelBuilder:
             # This handles both initial traversal AND post-wrap traversal
 
             if tree_depth == 0:
-                # Depth 0: just broadcast tc[0] (root node)
+                # Depth 0: broadcast tc[0] (root node)
                 for it in range(n_iters):
                     for i in range(UNROLL):
                         self.emit(valu=[("vbroadcast", v_nv[it][i], tc[0])])
-                # No Stage 5 XOR needed for root node
+                # Stage 5 opt: XOR v_nv with C (same as other depths)
+                for it in range(n_iters):
+                    for i in range(UNROLL):
+                        self.emit(valu=[("^", v_nv[it][i], v_nv[it][i], v_stage5_xor)])
                 # DEBUG: emit node_val comparison for depth 0
                 for it in range(n_iters):
                     base_g = it * UNROLL
                     for i in range(UNROLL):
                         g = base_g + i
-                        keys = [(rnd, g * VLEN + vi, "node_val") for vi in range(VLEN)]
+                        keys = [(rnd, g * VLEN + vi, "node_val_xored") for vi in range(VLEN)]
                         self.emit_vcompare(v_nv[it][i], keys)
+                self.emit_debug()
 
             elif tree_depth == 1:
                 # Depth 1: v_nv = tc[2] + (idx == 1) * td_1
@@ -342,6 +360,7 @@ class InterleavedUnrolledKernelBuilder:
                         g = base_g + i
                         keys = [(rnd, g * VLEN + vi, "node_val_xored") for vi in range(VLEN)]
                         self.emit_vcompare(v_nv[it][i], keys)
+                self.emit_debug()
 
             elif tree_depth == 2:
                 # Depth 2: v_nv = tc[3] + delta selection for idx == 3, 4, 5, 6
@@ -443,6 +462,7 @@ class InterleavedUnrolledKernelBuilder:
             for g in range(n_groups):
                 keys = [(rnd, g * VLEN + vi, "val_after_xor") for vi in range(VLEN)]
                 self.emit_vcompare(all_val[g], keys)
+            self.emit_debug()
 
             # PHASE 3: Hash - 6 stages (ALL rounds)
             # Use per-group temps: v_t[it][i] for hash temp
@@ -472,6 +492,7 @@ class InterleavedUnrolledKernelBuilder:
                 for g in range(n_groups):
                     keys = [(rnd, g * VLEN + vi, "hash_stage", hi) for vi in range(VLEN)]
                     self.emit_vcompare(all_val[g], keys)
+                self.emit_debug()
 
             # PHASE 4: Branch computation (ALL rounds)
             # Use per-group temp v_t[it][i] for bit and reuse for in_bounds
@@ -507,6 +528,7 @@ class InterleavedUnrolledKernelBuilder:
             for g in range(n_groups):
                 keys = [(rnd, g * VLEN + vi, "wrapped_idx") for vi in range(VLEN)]
                 self.emit_vcompare(all_idx[g], keys)
+            self.emit_debug()
 
         rounds_end = len(self.instrs)
 

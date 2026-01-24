@@ -334,6 +334,7 @@ def validate_final_output(
         debug_info=builder.debug_info(),
         trace=False,
     )
+    machine.enable_pause = False  # Run through pause instructions
     machine.run()
 
     # Compare outputs

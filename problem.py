@@ -543,6 +543,35 @@ def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> in
     return a
 
 
+def myhash_traced_opt(a: int, trace: dict[Any, int], round: int, batch_i: int) -> int:
+    """
+    Optimized hash function matching the kernel's Stage 5 optimization.
+
+    Takes input in optimized form (val_after_xor ^ C) and computes hash stages.
+    Stage 5 is simplified from (a ^ C) ^ (a >> 16) to just a ^ (a >> 16).
+    Returns result in optimized form.
+    """
+    fns = {
+        "+": lambda x, y: x + y,
+        "^": lambda x, y: x ^ y,
+        "<<": lambda x, y: x << y,
+        ">>": lambda x, y: x >> y,
+    }
+
+    def r(x):
+        return x % (2**32)
+
+    for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        if i == 5:
+            # Stage 5 optimized: just a ^ (a >> 16), skip XOR with constant
+            a = r(a ^ r(a >> val3))
+        else:
+            a = r(fns[op2](r(fns[op1](a, val1)), r(fns[op3](a, val3))))
+        trace[(round, batch_i, "hash_stage", i)] = a
+
+    return a
+
+
 def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
     """
     Reference implementation of the kernel on a flat memory.
@@ -569,42 +598,76 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
 
     yield mem
     tree_depth = 0
+
+    # Kernel maintains values in-register (optimized form) across all rounds.
+    # We simulate this by keeping separate arrays for val_opt and idx,
+    # only writing to memory at the very end (like the kernel does).
+    val_opt_arr = [0] * batch_size  # Will hold optimized-form values
+    idx_arr = [mem[inp_indices_p + i] for i in range(batch_size)]
+
+    # First round: initialize val_opt from memory (original form)
+    # Subsequent rounds: val_opt already contains optimized form
+    first_round = True
+
     for h in range(rounds):
         for i in range(batch_size):
-            idx = mem[inp_indices_p + i]
+            idx = idx_arr[i]
             trace[(h, i, "idx")] = idx
-            val = mem[inp_values_p + i]
+
+            if first_round:
+                # First round: load original val from memory
+                val = mem[inp_values_p + i]
+            else:
+                # Subsequent rounds: val_opt is already in optimized form from previous round
+                val = val_opt_arr[i]
+
             trace[(h, i, "val")] = val
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
 
-            # For depths 1+, kernel XORs node_val with Stage 5 constant
-            # Depth 0 uses raw node_val (no XOR needed)
-            if tree_depth > 0:
-                node_val_xored = (node_val ^ STAGE5_XOR_CONST) % (2**32)
-                trace[(h, i, "node_val_xored")] = node_val_xored
+            # Kernel XORs node_val with Stage 5 constant for ALL depths
+            node_val_xored = (node_val ^ STAGE5_XOR_CONST) % (2**32)
+            trace[(h, i, "node_val_xored")] = node_val_xored
 
-            # val_after_xor is computed with the XOR'd value (for Stage 5 optimization)
-            # This matches the kernel's internal representation
-            val_after_xor = (val ^ node_val) % (2**32)
-            # In kernel, val is in "optimized" form (XOR'd with C), so val_after_xor
-            # is also XOR'd with C to match the kernel's internal state
-            val_after_xor_opt = (val_after_xor ^ STAGE5_XOR_CONST) % (2**32)
+            # Compute val_after_xor in optimized form
+            if first_round:
+                # First round: val is original form, so val_after_xor needs XOR with C
+                val_after_xor = (val ^ node_val) % (2**32)
+                val_after_xor_opt = (val_after_xor ^ STAGE5_XOR_CONST) % (2**32)
+            else:
+                # Subsequent rounds: val is already optimized form
+                # Kernel does: all_val_opt = all_val_opt ^ v_nv where v_nv = node_val ^ C
+                # So: val_after_xor_opt = val_opt ^ (node_val ^ C)
+                val_after_xor_opt = (val ^ node_val_xored) % (2**32)
+
             trace[(h, i, "val_after_xor")] = val_after_xor_opt
 
-            val = myhash_traced(val ^ node_val, trace, h, i)
-            trace[(h, i, "hashed_val")] = val
-            idx = 2 * idx + (1 if val % 2 == 0 else 2)
+            # Use optimized hash to match kernel's Stage 5 optimization
+            val_opt = myhash_traced_opt(val_after_xor_opt, trace, h, i)
+            trace[(h, i, "hashed_val")] = val_opt
+            val_opt_arr[i] = val_opt  # Store for next round
+
+            # Branch is flipped because C's LSB = 1 (val_opt LSB is opposite of val_orig LSB)
+            # Kernel computes: branch = 2 - (val_opt & 1)
+            # This equals: 2 if val_opt is even, 1 if val_opt is odd
+            idx = 2 * idx + (2 if val_opt % 2 == 0 else 1)
             trace[(h, i, "next_idx")] = idx
             idx = 0 if idx >= n_nodes else idx
             trace[(h, i, "wrapped_idx")] = idx
-            mem[inp_values_p + i] = val
-            mem[inp_indices_p + i] = idx
+            idx_arr[i] = idx  # Store for next round
+
+        first_round = False
 
         # Increment tree_depth, wrapping at tree_height (mirrors kernel)
         tree_depth += 1
         if tree_depth >= tree_height:
             tree_depth = 0
+
+    # At the end, de-optimize and store to memory (like kernel does)
+    for i in range(batch_size):
+        val = (val_opt_arr[i] ^ STAGE5_XOR_CONST) % (2**32)
+        mem[inp_values_p + i] = val
+        mem[inp_indices_p + i] = idx_arr[i]
 
     # You can add new yields or move this around for debugging
     # as long as it's matched by pause instructions.
