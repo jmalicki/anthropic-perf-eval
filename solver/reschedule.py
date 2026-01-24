@@ -15,6 +15,11 @@ while CP-SAT can take hours for large kernels.
 from dataclasses import dataclass, field
 from typing import Optional
 
+from solver.shift_analysis import (
+    analyze_shifts, can_eliminate_broadcast, ShiftAnalysis,
+    compute_lookahead_eliminations
+)
+
 # Vector length for SIMD operations
 VLEN = 8
 
@@ -344,6 +349,7 @@ def schedule_greedy(
     op_by_id: dict[int, Op],
     enable_valu_shift: bool = False,
     priority_mode: str = "critical_path",
+    enable_broadcast_lookahead: bool = False,
 ) -> tuple[int, list[Op]]:
     """Schedule operations using greedy list scheduling with configurable priority.
 
@@ -372,6 +378,9 @@ def schedule_greedy(
             - "critical_path_valu": Same but prioritize VALU ops
             - "engine_balance": Balance engine utilization
             - "original_order": Schedule in original emission order
+        enable_broadcast_lookahead: If True, use lookahead analysis to
+            proactively eliminate broadcasts whose consumers will shift.
+            Experimental - may increase cycle count in some cases.
 
     Returns:
         Tuple of (num_cycles, scheduled_ops) where scheduled_ops includes any
@@ -399,6 +408,29 @@ def schedule_greedy(
     # Maps broadcast dest base address -> op ID of the broadcast
     broadcast_op_ids: dict[int, int] = {}
     broadcast_ops_shifted = 0  # Count of vbroadcast ops that were shifted
+
+    # NEW: Run static shift analysis for vbroadcast elimination
+    shift_analysis: ShiftAnalysis = analyze_shifts(ops, op_by_id)
+    eliminated_broadcasts: set[int] = set()  # Track which broadcasts were eliminated
+    shifted_op_ids: set[int] = set()  # Track which ops have been shifted to ALU
+    must_shift: set[int] = set()  # Ops that MUST be shifted (broadcast eliminated)
+
+    # NEW: Lookahead analysis - predict which broadcasts can be eliminated proactively
+    # based on future VALU pressure (optional, can cause regressions)
+    proactive_eliminations: set[int] = set()
+    if enable_valu_shift and shift_analysis.eliminable_broadcasts:
+        if enable_broadcast_lookahead:
+            proactive_eliminations = compute_lookahead_eliminations(ops, op_by_id, shift_analysis)
+
+            # Pre-mark consumers of proactively eliminated broadcasts for shifting
+            for bc_id in proactive_eliminations:
+                consumers = shift_analysis.broadcast_consumers.get(bc_id, set())
+                must_shift.update(consumers)
+
+        print(f"  Shift analysis: {len(shift_analysis.shiftable_ops)} shiftable, "
+              f"{len(shift_analysis.broadcast_ops)} broadcasts, "
+              f"{len(shift_analysis.eliminable_broadcasts)} eliminable" +
+              (f", {len(proactive_eliminations)} proactive" if enable_broadcast_lookahead else ""))
 
     # Compute critical path length for each op (longest path to any sink)
     # This helps prioritize operations on the critical path
@@ -512,12 +544,87 @@ def schedule_greedy(
     scheduled = []
     valu_shifted_count = 0
     broadcast_forward_count = 0  # Track how many broadcasts were forwarded
+    eliminated_broadcast_count = 0  # Track eliminated broadcasts
 
     while ready:
         # Sort ready queue by priority
         ready.sort(key=priority)
         op = ready.pop(0)
         cycle = earliest_cycle(op)
+
+        # NEW: Check if this is an eliminable vbroadcast
+        # A vbroadcast can be eliminated if:
+        # 1. It's in proactive_eliminations (lookahead predicted consumers will shift), OR
+        # 2. VALU is saturated (broadcast would be shifted to ALU anyway)
+        #    AND all consumers are shiftable
+        # This avoids emitting 8 ALU copy ops for the broadcast itself
+        is_proactive = op.id in proactive_eliminations
+        is_reactive = (not can_schedule(op, cycle) and  # VALU is saturated
+                       get_free_alu_slots(cycle) >= VLEN and  # ALU has capacity
+                       can_eliminate_broadcast(op.id, shift_analysis, shifted_op_ids))
+
+        if (enable_valu_shift and op.engine == 'valu' and
+            len(op.slot) >= 3 and op.slot[0] == 'vbroadcast' and
+            (is_proactive or is_reactive)):
+
+            # ELIMINATE: Don't emit anything, just mark as done
+            _, dest, scalar = op.slot
+            broadcast_sources[dest] = scalar
+            broadcast_op_ids[dest] = op.id
+            eliminated_broadcasts.add(op.id)
+            eliminated_broadcast_count += 1
+
+            # Mark consumers as MUST SHIFT - they need to read scalar directly
+            consumers = shift_analysis.broadcast_consumers.get(op.id, set())
+            must_shift.update(consumers)
+
+            # Mark as "done" at earliest possible cycle (no actual work)
+            op.cycle = cycle
+
+            # Update ready list for dependent ops
+            for other in ops:
+                if op.id in other.dep_ids:
+                    in_degree[other.id] -= 1
+                    if in_degree[other.id] == 0:
+                        ready.append(other)
+
+            continue  # Skip normal scheduling
+
+        # NEW: Force-shift ops that must be shifted (their broadcast was eliminated)
+        if (op.id in must_shift and op.engine == 'valu' and
+            can_convert_valu_to_alu(op)):
+
+            # Must shift to ALU - broadcast was eliminated, consumer needs scalar
+            alu_ops, forwards = expand_valu_to_alu_smart(
+                op, next_op_id, broadcast_sources, broadcast_op_ids, debug=False
+            )
+            broadcast_forward_count += forwards
+            next_op_id += VLEN
+
+            # Schedule the 8 ALU ops across available cycles
+            for alu_op in alu_ops:
+                alu_cycle = cycle
+                while not can_schedule(alu_op, alu_cycle):
+                    alu_cycle += 1
+                schedule_op(alu_op, alu_cycle)
+                op_by_id[alu_op.id] = alu_op
+                scheduled.append(alu_op)
+                critical_path[alu_op.id] = critical_path.get(op.id, 1)
+
+            op.cycle = max(a.cycle for a in alu_ops)
+            expanded_ops[op.id] = [a.id for a in alu_ops]
+            valu_shifted_count += 1
+            shifted_op_ids.add(op.id)
+            must_shift.discard(op.id)  # Done shifting this op
+
+            # Update ready list for dependent ops
+            for other in ops:
+                if op.id in other.dep_ids:
+                    in_degree[other.id] -= 1
+                    if in_degree[other.id] == 0:
+                        ready.append(other)
+
+            continue  # Skip normal scheduling
 
         # Check if we can schedule as-is
         while not can_schedule(op, cycle):
@@ -549,6 +656,7 @@ def schedule_greedy(
                 op.cycle = max(a.cycle for a in alu_ops)
                 expanded_ops[op.id] = [a.id for a in alu_ops]
                 valu_shifted_count += 1
+                shifted_op_ids.add(op.id)  # Track for broadcast elimination
                 break
             else:
                 cycle += 1
@@ -564,8 +672,11 @@ def schedule_greedy(
                 if in_degree[other.id] == 0:
                     ready.append(other)
 
-    if valu_shifted_count > 0:
+    if valu_shifted_count > 0 or eliminated_broadcast_count > 0:
         print(f"  VALU→ALU shifted: {valu_shifted_count} ops")
+        if eliminated_broadcast_count > 0:
+            ops_saved = eliminated_broadcast_count * VLEN
+            print(f"  Broadcasts eliminated: {eliminated_broadcast_count} (saves {ops_saved} ALU ops)")
         if broadcast_sources:
             print(f"  Broadcast sources tracked: {len(broadcast_sources)} vbroadcasts")
         if broadcast_forward_count > 0:
@@ -579,6 +690,7 @@ def schedule_greedy_multipass(
     ops: list[Op],
     op_by_id: dict[int, Op],
     enable_valu_shift: bool = False,
+    enable_broadcast_lookahead: bool = False,
 ) -> tuple[int, list[Op]]:
     """Run multiple greedy passes with different priority orderings and return the best.
 
@@ -589,6 +701,7 @@ def schedule_greedy_multipass(
         ops: List of operations to schedule
         op_by_id: Dictionary mapping op IDs to Op objects
         enable_valu_shift: If True, convert VALU ops to ALU ops when VALU is saturated
+        enable_broadcast_lookahead: If True, use lookahead to proactively eliminate broadcasts
 
     Returns:
         Tuple of (num_cycles, scheduled_ops) from the best pass
@@ -619,7 +732,8 @@ def schedule_greedy_multipass(
 
         try:
             num_cycles, scheduled = schedule_greedy(
-                ops_copy, op_by_id_copy, enable_valu_shift, priority_mode=mode
+                ops_copy, op_by_id_copy, enable_valu_shift, priority_mode=mode,
+                enable_broadcast_lookahead=enable_broadcast_lookahead
             )
             if num_cycles < best_cycles:
                 best_cycles = num_cycles

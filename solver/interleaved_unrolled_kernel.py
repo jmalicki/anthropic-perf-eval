@@ -95,6 +95,7 @@ class InterleavedUnrolledKernelBuilder:
         enable_alu_hash_parallel: bool = False,
         alu_hash_fraction: float = 0.5,
         use_multipass_scheduler: bool = False,
+        enable_broadcast_lookahead: bool = False,
     ):
         """Build fully unrolled kernel with interleaved emission.
 
@@ -123,6 +124,8 @@ class InterleavedUnrolledKernelBuilder:
                 increase throughput. (default: False)
             alu_hash_fraction: Fraction of groups to process with ALU when enable_alu_hash_parallel
                 is True. Value between 0.0 and 1.0. (default: 0.5 = half the groups)
+            enable_broadcast_lookahead: EXPERIMENTAL - Use lookahead to proactively eliminate
+                broadcasts whose consumers will shift. May increase cycle count. (default: False)
         """
         n_groups = batch_size // VLEN
         UNROLL = 8
@@ -710,9 +713,13 @@ class InterleavedUnrolledKernelBuilder:
             start = time.time()
             if use_multipass_scheduler:
                 print("Using multipass greedy scheduler...")
-                num_cycles, scheduled_ops = schedule_greedy_multipass(ops, op_by_id, enable_valu_shift=enable_valu_shift)
+                num_cycles, scheduled_ops = schedule_greedy_multipass(
+                    ops, op_by_id, enable_valu_shift=enable_valu_shift,
+                    enable_broadcast_lookahead=enable_broadcast_lookahead)
             else:
-                num_cycles, scheduled_ops = schedule_greedy(ops, op_by_id, enable_valu_shift=enable_valu_shift)
+                num_cycles, scheduled_ops = schedule_greedy(
+                    ops, op_by_id, enable_valu_shift=enable_valu_shift,
+                    enable_broadcast_lookahead=enable_broadcast_lookahead)
             scheduled = emit_scheduled(scheduled_ops, num_cycles)
             elapsed = time.time() - start
             print(f"Greedy scheduling completed in {elapsed:.2f}s")

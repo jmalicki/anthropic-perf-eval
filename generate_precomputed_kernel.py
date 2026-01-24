@@ -29,6 +29,7 @@ def generate_precomputed_kernel(
     enable_alu_hash_parallel: bool = False,
     alu_hash_fraction: float = 0.5,
     use_multipass_scheduler: bool = False,
+    enable_broadcast_lookahead: bool = False,
     output_file: str = "solver/precomputed_kernel.py"
 ):
     """Generate the precomputed kernel file.
@@ -73,7 +74,8 @@ def generate_precomputed_kernel(
                         use_greedy=use_greedy,
                         enable_alu_hash_parallel=enable_alu_hash_parallel,
                         alu_hash_fraction=alu_hash_fraction,
-                        use_multipass_scheduler=use_multipass_scheduler)
+                        use_multipass_scheduler=use_multipass_scheduler,
+                        enable_broadcast_lookahead=enable_broadcast_lookahead)
 
     # Get the results
     instrs = builder.instrs
@@ -219,6 +221,8 @@ def main():
                         help="Fraction of groups to process with ALU (default: 0.5)")
     parser.add_argument("--use-multipass-scheduler", action="store_true",
                         help="Try multiple scheduling strategies and pick the best")
+    parser.add_argument("--enable-broadcast-lookahead", action="store_true",
+                        help="EXPERIMENTAL: Proactively eliminate broadcasts based on predicted VALU pressure")
     parser.add_argument("--output", type=str, default="solver/precomputed_kernel.py",
                         help="Output file path")
 
@@ -237,6 +241,7 @@ def main():
         enable_alu_hash_parallel=args.enable_alu_hash_parallel,
         alu_hash_fraction=args.alu_hash_fraction,
         use_multipass_scheduler=args.use_multipass_scheduler,
+        enable_broadcast_lookahead=args.enable_broadcast_lookahead,
         output_file=args.output,
     )
 
