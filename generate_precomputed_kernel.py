@@ -25,9 +25,18 @@ def generate_precomputed_kernel(
     require_optimal: bool = True,
     enable_valu_shift: bool = True,
     valu_shift_time: float = None,
+    use_greedy: bool = False,
+    enable_alu_hash_parallel: bool = False,
+    alu_hash_fraction: float = 0.5,
+    use_multipass_scheduler: bool = False,
     output_file: str = "solver/precomputed_kernel.py"
 ):
-    """Generate the precomputed kernel file."""
+    """Generate the precomputed kernel file.
+
+    Args:
+        use_greedy: Use fast greedy scheduler instead of CP-SAT.
+                    Greedy runs in seconds but may produce ~5-10% more cycles.
+    """
 
     print(f"=" * 60)
     print(f"Generating precomputed kernel")
@@ -37,10 +46,17 @@ def generate_precomputed_kernel(
     print(f"  n_nodes: {n_nodes}")
     print(f"  batch_size: {batch_size}")
     print(f"  rounds: {rounds}")
-    print(f"  full_solve_time: {full_solve_time}s")
-    print(f"  require_optimal: {require_optimal}")
-    print(f"  enable_valu_shift: {enable_valu_shift}")
-    print(f"  valu_shift_time: {valu_shift_time if valu_shift_time else 'same as full_solve_time'}s")
+    if use_greedy:
+        print(f"  scheduler: GREEDY (fast, near-optimal)")
+    else:
+        print(f"  scheduler: CP-SAT (slow, optimal)")
+        print(f"  full_solve_time: {full_solve_time}s")
+        print(f"  require_optimal: {require_optimal}")
+        print(f"  enable_valu_shift: {enable_valu_shift}")
+        print(f"  valu_shift_time: {valu_shift_time if valu_shift_time else 'same as full_solve_time'}s")
+    print(f"  enable_alu_hash_parallel: {enable_alu_hash_parallel}")
+    if enable_alu_hash_parallel:
+        print(f"  alu_hash_fraction: {alu_hash_fraction}")
     print()
 
     # Import here to avoid issues if dependencies aren't installed
@@ -53,7 +69,11 @@ def generate_precomputed_kernel(
                         full_solve_time=full_solve_time,
                         require_optimal=require_optimal,
                         enable_valu_shift=enable_valu_shift,
-                        valu_shift_time=valu_shift_time)
+                        valu_shift_time=valu_shift_time,
+                        use_greedy=use_greedy,
+                        enable_alu_hash_parallel=enable_alu_hash_parallel,
+                        alu_hash_fraction=alu_hash_fraction,
+                        use_multipass_scheduler=use_multipass_scheduler)
 
     # Get the results
     instrs = builder.instrs
@@ -191,6 +211,14 @@ def main():
                         help="Disable VALU→ALU shifting optimization")
     parser.add_argument("--valu-shift-time", type=float, default=None,
                         help="Time per VALU→ALU shift iteration (default: same as full-solve-time)")
+    parser.add_argument("--use-greedy", action="store_true",
+                        help="Use fast greedy scheduler instead of CP-SAT (seconds vs hours)")
+    parser.add_argument("--enable-alu-hash-parallel", action="store_true",
+                        help="Enable parallel hash using both ALU and VALU (fills idle ALU slots)")
+    parser.add_argument("--alu-hash-fraction", type=float, default=0.5,
+                        help="Fraction of groups to process with ALU (default: 0.5)")
+    parser.add_argument("--use-multipass-scheduler", action="store_true",
+                        help="Try multiple scheduling strategies and pick the best")
     parser.add_argument("--output", type=str, default="solver/precomputed_kernel.py",
                         help="Output file path")
 
@@ -205,6 +233,10 @@ def main():
         require_optimal=args.require_optimal,
         enable_valu_shift=args.enable_valu_shift,
         valu_shift_time=args.valu_shift_time,
+        use_greedy=args.use_greedy,
+        enable_alu_hash_parallel=args.enable_alu_hash_parallel,
+        alu_hash_fraction=args.alu_hash_fraction,
+        use_multipass_scheduler=args.use_multipass_scheduler,
         output_file=args.output,
     )
 

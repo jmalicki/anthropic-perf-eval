@@ -8,7 +8,7 @@ can overlap independent operations. Uses per-iteration temps to avoid conflicts.
 import math
 
 from problem import DebugInfo, SLOT_LIMITS, VLEN, SCRATCH_SIZE, HASH_STAGES
-from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, schedule_greedy_multipass, emit_scheduled
+from solver.reschedule import extract_ops, compute_dependencies, schedule_greedy, schedule_greedy_multipass, emit_scheduled, schedule_greedy as schedule_greedy_single
 
 
 class InterleavedUnrolledKernelBuilder:
@@ -92,6 +92,9 @@ class InterleavedUnrolledKernelBuilder:
         use_greedy: bool = False,
         enable_round3_valu_select: bool = True,
         extend_valu_selection: int = 0,
+        enable_alu_hash_parallel: bool = False,
+        alu_hash_fraction: float = 0.5,
+        use_multipass_scheduler: bool = False,
     ):
         """Build fully unrolled kernel with interleaved emission.
 
@@ -114,6 +117,12 @@ class InterleavedUnrolledKernelBuilder:
                 Testing shows this is COUNTERPRODUCTIVE (increases cycles) because VALU ops
                 become more expensive than scattered loads for larger index ranges.
                 NOT RECOMMENDED. (default: 0 = disabled)
+            enable_alu_hash_parallel: Enable parallel hash computation using both ALU and VALU.
+                When enabled, a fraction of groups are processed using scalar ALU operations
+                instead of vector VALU operations. This fills idle ALU slots (30% unused) to
+                increase throughput. (default: False)
+            alu_hash_fraction: Fraction of groups to process with ALU when enable_alu_hash_parallel
+                is True. Value between 0.0 and 1.0. (default: 0.5 = half the groups)
         """
         n_groups = batch_size // VLEN
         UNROLL = 8
@@ -186,14 +195,15 @@ class InterleavedUnrolledKernelBuilder:
                 hash_fma_mult[i] = 1 + (1 << shift)
 
         # Stage 5 XOR optimization:
-        # Stage 5: (a ^ C) ^ (a >> 16) — we simplify to a ^ (a >> 16)
-        # Key: val_orig = val_opt ^ C is maintained across rounds
-        # 1. Pre-XOR tc[1-6] with C (not tc[0])
-        # 2. Pre-XOR gathered nodes with C (rounds 3+)
-        # 3. Simplify stage 5 to just a ^ (a >> 16)
-        # 4. Flip branch direction (C's LSB = 1)
-        # 5. When wrapping (idx → 0), XOR val with C
-        # 6. At the end, XOR stored val with C
+        # Key insight: myhash_opt(x) = myhash(x) ^ C exactly, where C = 0xB55A4F09
+        # This means skipping Stage 5's XOR with C produces output that differs by exactly C.
+        #
+        # Strategy:
+        # 1. Pre-XOR tree values with C (so val ^ tree_xored = val ^ tree ^ C)
+        # 2. In Stage 5, skip XOR with C: compute a ^ (a >> 16) instead of (a ^ C) ^ (a >> 16)
+        # 3. Output differs from original by C, which flips the LSB (C has LSB = 1)
+        # 4. Flip branch direction: use (2 - bit) instead of (1 + bit)
+        # 5. At the end, XOR stored val with C to convert back to original form
         STAGE5_XOR_CONST = 0xB55A4F09
         stage5_xor_s = self.alloc("stage5_xor")
         v_stage5_xor = self.vec("v_stage5_xor")
@@ -219,15 +229,32 @@ class InterleavedUnrolledKernelBuilder:
             self.emit(valu=[("vbroadcast", v_hc[i], hc[i]), ("vbroadcast", v_hc[i+1], hc[i+1]), ("vbroadcast", v_hs[i], hs[i]), ("vbroadcast", v_hs[i+1], hs[i+1])])
 
         # Initialize FMA multiplier vectors for eligible hash stages
+        # Also track scalar multiplier addresses for ALU hash parallel
+        hash_fma_mult_s = {}  # stage_idx -> scalar scratch address for ALU use
         for i in range(6):
             if hash_fma_mult[i] is not None:
                 mult_s = self.alloc(f"hash_mult_{i}")
+                hash_fma_mult_s[i] = mult_s  # Save scalar address for ALU hash
                 v_mult = self.vec(f"v_hash_mult_{i}")
                 v_hash_mult[i] = v_mult
                 self.emit(load=[("const", mult_s, hash_fma_mult[i])])
                 self.emit(valu=[("vbroadcast", v_mult, mult_s)])
 
-        # Load Stage 5 XOR constant
+        # ALU hash parallel: allocate scalar temps for ALU hash computation
+        # We need VLEN temps (one per element within a VALU group) that can be reused
+        alu_temps = None
+        alu_hash_start_iter = n_iters  # Default: no ALU hash (all VALU)
+        if enable_alu_hash_parallel:
+            alu_temps = [self.alloc(f"alu_temp_{j}") for j in range(VLEN)]
+            # Determine which iterations use ALU vs VALU
+            # First (1-fraction) iterations use VALU, rest use ALU
+            alu_hash_start_iter = int(n_iters * (1 - alu_hash_fraction))
+            if alu_hash_start_iter == n_iters:
+                alu_hash_start_iter = n_iters - 1  # At least 1 iteration uses ALU
+            print(f"ALU hash parallel: iterations 0-{alu_hash_start_iter-1} use VALU, "
+                  f"{alu_hash_start_iter}-{n_iters-1} use ALU")
+
+        # Load Stage 5 XOR constant and correction term
         self.emit(load=[("const", stage5_xor_s, STAGE5_XOR_CONST)])
         self.emit(valu=[("vbroadcast", v_stage5_xor, stage5_xor_s)])
 
@@ -306,6 +333,14 @@ class InterleavedUnrolledKernelBuilder:
             self.emit(load=[("vload", all_idx[g], st[2]), ("vload", all_idx[g+1], st[3])])
             self.emit(load=[("vload", all_val[g], st[4]), ("vload", all_val[g+1], st[5])])
         load_end = len(self.instrs)
+
+        # Stage 5 optimization: Convert initial batch values to "optimized form"
+        # Optimized form = original ^ C, where C = STAGE5_XOR_CONST
+        # This allows the kernel to use pre-XOR'd tree values consistently:
+        # - val_opt ^ tree_xored = (val_orig ^ C) ^ (tree ^ C) = val_orig ^ tree
+        # - At the end, we XOR with C again to convert back to original form
+        for g in range(n_groups):
+            self.emit(valu=[("^", all_val[g], all_val[g], v_stage5_xor)])
 
         # Tree traversal depth tracking
         # tree_height = forest_height + 1 (rounds needed to traverse full tree)
@@ -456,8 +491,20 @@ class InterleavedUnrolledKernelBuilder:
             # PHASE 2: XOR all values with v_nv (ALL rounds)
             for it in range(n_iters):
                 base_g = it * UNROLL
+                use_alu = enable_alu_hash_parallel and it >= alu_hash_start_iter
+
                 for i in range(UNROLL):
-                    self.emit(valu=[("^", all_val[base_g+i], all_val[base_g+i], v_nv[it][i])])
+                    g = base_g + i  # Current group
+                    if use_alu:
+                        # ALU XOR path: process each element with scalar ops
+                        alu_xor_ops = [
+                            ("^", all_val[g] + j, all_val[g] + j, v_nv[it][i] + j)
+                            for j in range(VLEN)
+                        ]
+                        self.emit(alu=alu_xor_ops)
+                    else:
+                        # VALU XOR path: original code
+                        self.emit(valu=[("^", all_val[g], all_val[g], v_nv[it][i])])
             # DEBUG: emit val_after_xor comparison
             for g in range(n_groups):
                 keys = [(rnd, g * VLEN + vi, "val_after_xor") for vi in range(VLEN)]
@@ -468,26 +515,84 @@ class InterleavedUnrolledKernelBuilder:
             # Use per-group temps: v_t[it][i] for hash temp
             # FMA optimization: (a + const) + (a << shift) = a * (1 + 2^shift) + const
             # Stage 5 optimization: simplified to a ^ (a >> 16)
+            # ALU hash parallel: for iterations >= alu_hash_start_iter, use scalar ALU ops
             for hi in range(6):
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
                 for it in range(n_iters):
                     base_g = it * UNROLL
+                    use_alu = enable_alu_hash_parallel and it >= alu_hash_start_iter
+
                     for i in range(UNROLL):
-                        if hash_fma_mult[hi] is not None:
-                            # FMA: val = val * mult + const (single multiply_add)
-                            self.emit(valu=[("multiply_add", all_val[base_g+i],
-                                            all_val[base_g+i], v_hash_mult[hi], v_hc[hi])])
-                        elif hi == 5:
-                            # Stage 5 optimized: just a ^ (a >> 16)
-                            t = v_t[it][i]
-                            self.emit(valu=[(">>", t, all_val[base_g+i], v_hs[hi])])
-                            self.emit(valu=[("^", all_val[base_g+i], all_val[base_g+i], t)])
+                        g = base_g + i  # Current group
+
+                        # Smart ALU routing: Keep FMA on VALU (more efficient),
+                        # only move non-FMA stages to ALU
+                        use_alu_for_stage = use_alu and hash_fma_mult[hi] is None
+
+                        if use_alu_for_stage:
+                            # ALU hash path for non-FMA stages only
+                            if hi == 5:
+                                # Stage 5 optimized: a ^ (a >> 16)
+                                # No correction needed - myhash_opt(x) = myhash(x) ^ C exactly
+                                # Step 1: Shift all elements
+                                alu_shift_ops = [
+                                    (">>", alu_temps[j], all_val[g] + j, hs[hi])
+                                    for j in range(VLEN)
+                                ]
+                                self.emit(alu=alu_shift_ops)
+                                # Step 2: XOR all elements with shift result
+                                alu_xor_ops = [
+                                    ("^", all_val[g] + j, all_val[g] + j, alu_temps[j])
+                                    for j in range(VLEN)
+                                ]
+                                self.emit(alu=alu_xor_ops)
+                            else:
+                                # Non-FMA stages: (a op1 const) op2 (a op3 shift)
+                                # Stage 1: (a ^ C) ^ (a >> 19) - XOR const, XOR with right shift
+                                # Stage 3: (a + C) ^ (a << 9) - Add const, XOR with left shift
+                                # We need 2 temps per element: one for op1 result, one for op3 result
+                                # But we only have VLEN temps, so we do this in 3 steps:
+                                # 1. alu_temps[j] = a op1 const
+                                alu_op1_ops = [
+                                    (op1, alu_temps[j], all_val[g] + j, hc[hi])
+                                    for j in range(VLEN)
+                                ]
+                                self.emit(alu=alu_op1_ops)
+                                # 2. Compute a op3 shift and store in v_nv (reused as temp)
+                                # Actually, we need to reuse v_nv[it][i] as temp storage
+                                # Since we're doing ALU, let's use element 0 of v_nv[it][i] + j
+                                alu_op3_ops = [
+                                    (op3, v_nv[it][i] + j, all_val[g] + j, hs[hi])
+                                    for j in range(VLEN)
+                                ]
+                                self.emit(alu=alu_op3_ops)
+                                # 3. a = temp1 op2 temp2
+                                alu_op2_ops = [
+                                    (op2, all_val[g] + j, alu_temps[j], v_nv[it][i] + j)
+                                    for j in range(VLEN)
+                                ]
+                                self.emit(alu=alu_op2_ops)
                         else:
-                            # Original: 2 ops per stage
-                            t = v_t[it][i]  # Per-group temp for hash
-                            self.emit(valu=[(op1, t, all_val[base_g+i], v_hc[hi]),
-                                            (op3, v_nv[it][i], all_val[base_g+i], v_hs[hi])])
-                            self.emit(valu=[(op2, all_val[base_g+i], t, v_nv[it][i])])
+                            # VALU hash path: original code
+                            if hash_fma_mult[hi] is not None:
+                                # FMA: val = val * mult + const (single multiply_add)
+                                self.emit(valu=[("multiply_add", all_val[g],
+                                                all_val[g], v_hash_mult[hi], v_hc[hi])])
+                            elif hi == 5:
+                                # Stage 5 optimized: a ^ (a >> 16)
+                                # Key insight: myhash_opt(x) = myhash(x) ^ C exactly!
+                                # No correction term needed - skipping Stage 5's XOR with C
+                                # produces output that differs from original by exactly C.
+                                t = v_t[it][i]
+                                self.emit(valu=[(">>", t, all_val[g], v_hs[hi])])
+                                self.emit(valu=[("^", all_val[g], all_val[g], t)])
+                            else:
+                                # Original: 2 ops per stage
+                                t = v_t[it][i]  # Per-group temp for hash
+                                self.emit(valu=[(op1, t, all_val[g], v_hc[hi]),
+                                                (op3, v_nv[it][i], all_val[g], v_hs[hi])])
+                                self.emit(valu=[(op2, all_val[g], t, v_nv[it][i])])
+
                 # DEBUG: emit hash_stage comparison after each stage
                 for g in range(n_groups):
                     keys = [(rnd, g * VLEN + vi, "hash_stage", hi) for vi in range(VLEN)]
@@ -511,19 +616,66 @@ class InterleavedUnrolledKernelBuilder:
 
             for it in range(n_iters):
                 base_g = it * UNROLL
+                use_alu = enable_alu_hash_parallel and it >= alu_hash_start_iter
+
                 for i in range(UNROLL):
-                    t = v_t[it][i]  # Per-group temp
-                    # Stage 5 opt: t = 2 - (val & 1) = flipped branch
-                    self.emit(valu=[("&", t, all_val[base_g+i], v_1)])
-                    self.emit(valu=[("-", t, v_2, t)])
-                    # idx = idx * 2 + t (fused multiply_add saves 1 VALU op)
-                    self.emit(valu=[("multiply_add", all_idx[base_g+i], all_idx[base_g+i], v_2, t)])
-                    # Only do bounds check when needed (compile-time decision)
-                    if needs_bounds_check:
-                        # Reuse t for in_bounds (previous value no longer needed)
-                        self.emit(valu=[("<", t, all_idx[base_g+i], v_nn)])
-                        # idx = idx * in_bounds (zeroes if out of bounds)
-                        self.emit(valu=[("*", all_idx[base_g+i], all_idx[base_g+i], t)])
+                    g = base_g + i  # Current group
+
+                    if use_alu:
+                        # ALU branch path: process each element with scalar ops
+                        # Step 1: t = val & 1
+                        alu_and_ops = [
+                            ("&", alu_temps[j], all_val[g] + j, c[1])
+                            for j in range(VLEN)
+                        ]
+                        self.emit(alu=alu_and_ops)
+                        # Step 2: t = 2 - t (flipped branch direction)
+                        alu_sub_ops = [
+                            ("-", alu_temps[j], c[2], alu_temps[j])
+                            for j in range(VLEN)
+                        ]
+                        self.emit(alu=alu_sub_ops)
+                        # Step 3: idx = idx * 2 (need temp for this)
+                        alu_mul_ops = [
+                            ("*", v_nv[it][i] + j, all_idx[g] + j, c[2])
+                            for j in range(VLEN)
+                        ]
+                        self.emit(alu=alu_mul_ops)
+                        # Step 4: idx = idx * 2 + t
+                        alu_add_ops = [
+                            ("+", all_idx[g] + j, v_nv[it][i] + j, alu_temps[j])
+                            for j in range(VLEN)
+                        ]
+                        self.emit(alu=alu_add_ops)
+
+                        # Only do bounds check when needed
+                        if needs_bounds_check:
+                            # in_bounds = idx < n_nodes
+                            alu_cmp_ops = [
+                                ("<", alu_temps[j], all_idx[g] + j, n_nodes_s)
+                                for j in range(VLEN)
+                            ]
+                            self.emit(alu=alu_cmp_ops)
+                            # idx = idx * in_bounds
+                            alu_mask_ops = [
+                                ("*", all_idx[g] + j, all_idx[g] + j, alu_temps[j])
+                                for j in range(VLEN)
+                            ]
+                            self.emit(alu=alu_mask_ops)
+                    else:
+                        # VALU branch path: original code
+                        t = v_t[it][i]  # Per-group temp
+                        # Stage 5 opt: t = 2 - (val & 1) = flipped branch
+                        self.emit(valu=[("&", t, all_val[g], v_1)])
+                        self.emit(valu=[("-", t, v_2, t)])
+                        # idx = idx * 2 + t (fused multiply_add saves 1 VALU op)
+                        self.emit(valu=[("multiply_add", all_idx[g], all_idx[g], v_2, t)])
+                        # Only do bounds check when needed (compile-time decision)
+                        if needs_bounds_check:
+                            # Reuse t for in_bounds (previous value no longer needed)
+                            self.emit(valu=[("<", t, all_idx[g], v_nn)])
+                            # idx = idx * in_bounds (zeroes if out of bounds)
+                            self.emit(valu=[("*", all_idx[g], all_idx[g], t)])
             # DEBUG: emit wrapped_idx comparison after branch/bounds
             for g in range(n_groups):
                 keys = [(rnd, g * VLEN + vi, "wrapped_idx") for vi in range(VLEN)]
@@ -556,7 +708,11 @@ class InterleavedUnrolledKernelBuilder:
             # Fast greedy scheduler - runs in seconds
             import time
             start = time.time()
-            num_cycles, scheduled_ops = schedule_greedy(ops, op_by_id, enable_valu_shift=enable_valu_shift)
+            if use_multipass_scheduler:
+                print("Using multipass greedy scheduler...")
+                num_cycles, scheduled_ops = schedule_greedy_multipass(ops, op_by_id, enable_valu_shift=enable_valu_shift)
+            else:
+                num_cycles, scheduled_ops = schedule_greedy(ops, op_by_id, enable_valu_shift=enable_valu_shift)
             scheduled = emit_scheduled(scheduled_ops, num_cycles)
             elapsed = time.time() - start
             print(f"Greedy scheduling completed in {elapsed:.2f}s")
