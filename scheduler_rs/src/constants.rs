@@ -425,6 +425,7 @@ pub fn emit_constant_generation_ops(
             reads,
             writes,
             dep_ids: HashSet::new(),
+            produces_constant: Some(value),
         });
 
         op_id += 1;

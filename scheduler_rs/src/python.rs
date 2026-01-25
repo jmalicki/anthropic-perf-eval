@@ -200,6 +200,7 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                     dep_ids: HashSet::new(),
                     reads,
                     writes,
+                    produces_constant: None,
                 });
                 op_id += 1;
             }

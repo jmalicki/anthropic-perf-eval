@@ -53,6 +53,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src1, src2].into_iter().collect(),
             writes: [dest].into_iter().collect(),
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -83,6 +84,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes,
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -109,6 +111,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src].into_iter().collect(),
             writes,
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -141,12 +144,17 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes,
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
     }
 
     /// Emit a const load: dest = immediate_value
+    ///
+    /// This annotates the op with `produces_constant = Some(value)` to enable
+    /// late-binding optimization where a scheduler pass can replace the Load
+    /// with an ALU derivation if slots are available.
     pub fn emit_const(&mut self, dest: i64, value: i64) {
         let op = Op {
             id: self.next_op_id,
@@ -162,6 +170,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: HashSet::new(),
             writes: [dest].into_iter().collect(),
+            produces_constant: Some(value),
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -183,6 +192,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr].into_iter().collect(),
             writes: [dest].into_iter().collect(),
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -209,6 +219,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr].into_iter().collect(),
             writes,
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -230,6 +241,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr, src].into_iter().collect(),
             writes: HashSet::new(),
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -256,6 +268,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes: HashSet::new(),
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);
@@ -271,6 +284,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: HashSet::new(),
             writes: HashSet::new(),
+            produces_constant: None,
         };
         self.next_op_id += 1;
         self.ops.push(op);

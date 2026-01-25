@@ -290,6 +290,12 @@ pub struct Op {
     pub dep_ids: HashSet<usize>,
     pub reads: HashSet<i64>,
     pub writes: HashSet<i64>,
+    /// If this op produces a known constant value, record it here.
+    /// This enables late-binding optimization - any pass can replace
+    /// this op with a cheaper method of producing the same constant.
+    /// For example, a Load("const", dest, 4) might be replaced with
+    /// ALU("+", dest, 2, 2) if ALU slots are available but Load slots are scarce.
+    pub produces_constant: Option<i64>,
 }
 
 /// Check if a VALU op can be converted to 8 scalar ALU ops
@@ -403,6 +409,7 @@ pub fn expand_valu_to_alu_smart(
             dep_ids: op.dep_ids.clone(),
             reads: [actual_src1, actual_src2].into_iter().collect(),
             writes: [dest + i_offset].into_iter().collect(),
+            produces_constant: None,
         };
         new_ops.push(new_op);
     }
