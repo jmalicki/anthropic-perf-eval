@@ -5,7 +5,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::constants::{
     analyze_constant_usage, build_constant_plan, emit_constant_generation_ops,
@@ -1222,6 +1222,53 @@ fn emit_unscheduled<'py>(py: Python<'py>, ops: &[Op]) -> PyResult<Bound<'py, PyL
 use crate::kernel_builder::{KernelConfig, TickTockKernelBuilder};
 use rayon::prelude::*;
 
+/// Format an op's compact string with an optional comment containing:
+/// - const=N if produces_constant is set
+/// - deps=[cycle1,cycle2,...] showing which cycles this op depends on
+/// - dependents=[cycle1,cycle2,...] showing which cycles depend on this op
+fn format_op_with_comment(
+    op: &Op,
+    compact: String,
+    op_id_to_cycle: &HashMap<usize, i32>,
+    dependents_map: &HashMap<usize, Vec<usize>>,
+) -> String {
+    let mut comment_parts: Vec<String> = Vec::new();
+
+    // Add constant value if known
+    if let Some(c) = op.produces_constant {
+        comment_parts.push(format!("const={}", c));
+    }
+
+    // Add dependency cycles (sorted for deterministic output)
+    let dep_cycles: BTreeSet<i32> = op
+        .dep_ids
+        .iter()
+        .filter_map(|id| op_id_to_cycle.get(id).copied())
+        .collect();
+    if !dep_cycles.is_empty() {
+        let cycles_vec: Vec<i32> = dep_cycles.into_iter().collect();
+        comment_parts.push(format!("deps={:?}", cycles_vec));
+    }
+
+    // Add dependent cycles (sorted for deterministic output)
+    if let Some(deps) = dependents_map.get(&op.id) {
+        let dependent_cycles: BTreeSet<i32> = deps
+            .iter()
+            .filter_map(|id| op_id_to_cycle.get(id).copied())
+            .collect();
+        if !dependent_cycles.is_empty() {
+            let cycles_vec: Vec<i32> = dependent_cycles.into_iter().collect();
+            comment_parts.push(format!("dependents={:?}", cycles_vec));
+        }
+    }
+
+    if comment_parts.is_empty() {
+        compact
+    } else {
+        format!("{} // {}", compact, comment_parts.join(" "))
+    }
+}
+
 /// Write schedule output in JSON format (schedule_output.json format)
 fn write_schedule_json(
     ops: &[Op],
@@ -1230,6 +1277,23 @@ fn write_schedule_json(
     best_mode: PriorityMode,
     output_path: &str,
 ) -> PyResult<()> {
+    // Build op_id -> cycle mapping for all ops
+    let mut op_id_to_cycle: HashMap<usize, i32> = HashMap::new();
+    for op in ops {
+        op_id_to_cycle.insert(op.id, op.cycle);
+    }
+    for op in expanded_ops {
+        op_id_to_cycle.insert(op.id, op.cycle);
+    }
+
+    // Build reverse dependency map: op_id -> list of dependent op_ids
+    let mut dependents_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops.iter().chain(expanded_ops.iter()) {
+        for &dep_id in &op.dep_ids {
+            dependents_map.entry(dep_id).or_default().push(op.id);
+        }
+    }
+
     // Build cycle-by-cycle output
     let mut cycles_output: Vec<CycleOutput> = Vec::new();
     let mut total_empty_load = 0usize;
@@ -1273,13 +1337,14 @@ fn write_schedule_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
+                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 match op.engine {
-                    Engine::Load => load_ops.push(compact),
-                    Engine::Store => store_ops.push(compact),
-                    Engine::Alu => alu_ops.push(compact),
-                    Engine::Valu => valu_ops.push(compact),
-                    Engine::Flow => flow_ops.push(compact),
+                    Engine::Load => load_ops.push(formatted),
+                    Engine::Store => store_ops.push(formatted),
+                    Engine::Alu => alu_ops.push(formatted),
+                    Engine::Valu => valu_ops.push(formatted),
+                    Engine::Flow => flow_ops.push(formatted),
                     _ => {}
                 }
             }
@@ -1307,8 +1372,9 @@ fn write_schedule_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
+                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
-                alu_ops.push(compact);
+                alu_ops.push(formatted);
             }
         }
 
