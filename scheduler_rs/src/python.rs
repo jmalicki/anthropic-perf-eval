@@ -8,13 +8,13 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::constants::{
-    analyze_constant_usage, build_constant_plan, emit_constant_generation_ops,
-    print_constant_plan_summary,
+    analyze_constant_usage, build_constant_plan, build_constant_plan_with_depth,
+    emit_constant_generation_ops, print_constant_plan_summary,
 };
 use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
 use crate::scheduler::{
     compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics,
-    schedule_with_pseudo_consts, PriorityMode, ALL_PRIORITY_MODES,
+    schedule_with_pseudo_consts, schedule_with_slot_filling, PriorityMode, ALL_PRIORITY_MODES,
 };
 use arrayvec::ArrayVec;
 
@@ -1491,8 +1491,18 @@ struct ScheduleAttempt {
 ///
 /// If `enable_pseudo_consts` is true, uses flexible constant generation where the scheduler
 /// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
+///
+/// Encoding flags (only relevant when enable_pseudo_consts=true):
+/// - `enable_add_imm`: Use add_imm via flow slot (default: true)
+/// - `enable_const_load`: Use const via load slot (default: true)
+/// - `enable_const_alu`: Use ALU derivation (Add, Sub, Mul, Shift) (default: true)
+///
+/// Slot filling mode (`enable_slot_filling=true`):
+/// - Schedules non-const ops first, then fills empty slots with const generation
+/// - Prefers Flow (add_imm) > Load (const) > ALU (derivation)
+/// - More efficient than pre-scheduling pseudo-consts
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1505,6 +1515,11 @@ pub fn build_tick_tock_kernel<'py>(
     enable_lazy_partition: bool,
     partition_frequency: usize,
     enable_pseudo_consts: bool,
+    enable_add_imm: bool,
+    enable_const_load: bool,
+    enable_const_alu: bool,
+    enable_slot_filling: bool,
+    max_alu_depth: Option<usize>,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1516,6 +1531,10 @@ pub fn build_tick_tock_kernel<'py>(
         enable_lazy_partition,
         partition_frequency,
         enable_pseudo_consts,
+        enable_add_imm,
+        enable_const_load,
+        enable_const_alu,
+        max_alu_depth,
     };
 
     // Build the kernel (generates unscheduled ops)
@@ -1553,7 +1572,33 @@ pub fn build_tick_tock_kernel<'py>(
         .collect();
 
     // Run all priority modes in parallel using Rayon
-    let results: Vec<ScheduleAttempt> = if enable_pseudo_consts && !pseudo_consts.is_empty() {
+    let results: Vec<ScheduleAttempt> = if enable_slot_filling {
+        // Use post-scheduling slot filling for constants
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
+
+                let result = schedule_with_slot_filling(
+                    &mut test_ops,
+                    &critical_path,
+                    enable_valu_shift,
+                    mode,
+                );
+
+                ScheduleAttempt {
+                    mode,
+                    cycles: result.cycles,
+                    ops: result.ops,
+                    expanded_ops: result.expanded_ops,
+                }
+            })
+            .collect()
+    } else if enable_pseudo_consts && !pseudo_consts.is_empty() {
         // Use pseudo-const aware scheduler
         ALL_PRIORITY_MODES
             .par_iter()
@@ -1650,8 +1695,20 @@ pub fn build_tick_tock_kernel<'py>(
 ///
 /// If `enable_pseudo_consts` is true, uses flexible constant generation where the scheduler
 /// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
+///
+/// Encoding flags (only relevant when enable_pseudo_consts=true):
+/// - `enable_add_imm`: Use add_imm via flow slot (default: true)
+/// - `enable_const_load`: Use const via load slot (default: true)
+/// - `enable_const_alu`: Use ALU derivation (Add, Sub, Mul, Shift) (default: true)
+/// - `max_alu_depth`: Max derivation depth for ALU constants (None = unlimited)
+///   Values requiring deeper chains use Load instead. Recommended: 4-6 to prevent
+///   long critical paths through constant derivation.
+///
+/// Slot filling mode (`enable_slot_filling=true`):
+/// - Schedules non-const ops first, then fills empty slots with const generation
+/// - Prefers Flow (add_imm) > Load (const) > ALU (derivation)
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None))]
 pub fn build_tick_tock_kernel_ops(
     _py: Python<'_>,
     forest_height: usize,
@@ -1663,6 +1720,11 @@ pub fn build_tick_tock_kernel_ops(
     enable_lazy_partition: bool,
     partition_frequency: usize,
     enable_pseudo_consts: bool,
+    enable_add_imm: bool,
+    enable_const_load: bool,
+    enable_const_alu: bool,
+    enable_slot_filling: bool,
+    max_alu_depth: Option<usize>,
 ) -> PyResult<usize> {
     let config = KernelConfig {
         forest_height,
@@ -1674,6 +1736,10 @@ pub fn build_tick_tock_kernel_ops(
         enable_lazy_partition,
         partition_frequency,
         enable_pseudo_consts,
+        enable_add_imm,
+        enable_const_load,
+        enable_const_alu,
+        max_alu_depth,
     };
 
     // Build the kernel (generates unscheduled ops)
@@ -1711,7 +1777,27 @@ pub fn build_tick_tock_kernel_ops(
         .collect();
 
     // Run all priority modes in parallel using Rayon
-    let results: Vec<(PriorityMode, usize)> = if enable_pseudo_consts && !pseudo_consts.is_empty() {
+    let results: Vec<(PriorityMode, usize)> = if enable_slot_filling {
+        // Use post-scheduling slot filling for constants
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
+
+                let result = schedule_with_slot_filling(
+                    &mut test_ops,
+                    &critical_path,
+                    enable_valu_shift,
+                    mode,
+                );
+                (mode, result.cycles)
+            })
+            .collect()
+    } else if enable_pseudo_consts && !pseudo_consts.is_empty() {
         // Use pseudo-const aware scheduler
         ALL_PRIORITY_MODES
             .par_iter()

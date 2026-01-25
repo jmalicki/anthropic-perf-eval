@@ -6,7 +6,7 @@
 use arrayvec::ArrayVec;
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{Engine, Op, Opcode, PseudoConst, SlotVal, MAX_SLOT_SIZE, VLEN};
+use crate::types::{Engine, Op, Opcode, PseudoConst, SlotVal, ConstEncodingFlags, MAX_SLOT_SIZE, VLEN};
 
 /// Broadcast cache entry - tracks where a scalar value has been broadcast to
 #[derive(Debug, Clone)]
@@ -40,6 +40,8 @@ pub struct EmitContext {
     pub value_to_pseudo_const_id: HashMap<i64, usize>,
     /// Maps constant value -> destination register
     pub value_to_register: HashMap<i64, i64>,
+    /// Encoding flags for pseudo-consts (which encoding methods are enabled)
+    pub encoding_flags: ConstEncodingFlags,
 }
 
 impl EmitContext {
@@ -53,6 +55,22 @@ impl EmitContext {
             pseudo_consts: Vec::new(),
             value_to_pseudo_const_id: HashMap::new(),
             value_to_register: HashMap::new(),
+            encoding_flags: ConstEncodingFlags::all(),
+        }
+    }
+
+    /// Create a new context with custom encoding flags
+    pub fn new_with_flags(flags: ConstEncodingFlags) -> Self {
+        EmitContext {
+            next_op_id: 0,
+            ops: Vec::new(),
+            known_constants: HashMap::new(),
+            broadcast_cache: HashMap::new(),
+            next_pseudo_const_id: 0,
+            pseudo_consts: Vec::new(),
+            value_to_pseudo_const_id: HashMap::new(),
+            value_to_register: HashMap::new(),
+            encoding_flags: flags,
         }
     }
 
@@ -76,7 +94,13 @@ impl EmitContext {
         self.next_pseudo_const_id = 0;
         self.value_to_pseudo_const_id.clear();
         self.value_to_register.clear();
+        // Keep encoding_flags unchanged - they're configuration
         (std::mem::take(&mut self.ops), std::mem::take(&mut self.pseudo_consts))
+    }
+
+    /// Set the encoding flags
+    pub fn set_encoding_flags(&mut self, flags: ConstEncodingFlags) {
+        self.encoding_flags = flags;
     }
 
     /// Declare that a constant value is needed.
@@ -92,8 +116,8 @@ impl EmitContext {
             return existing_dest;
         }
 
-        // Create a new pseudo-const
-        let pc = PseudoConst::new(self.next_pseudo_const_id, value, Some(dest));
+        // Create a new pseudo-const with configured encoding flags
+        let pc = PseudoConst::new_with_flags(self.next_pseudo_const_id, value, Some(dest), self.encoding_flags);
         let pc_id = pc.id;
         self.pseudo_consts.push(pc);
 
@@ -116,8 +140,8 @@ impl EmitContext {
             return existing_dest;
         }
 
-        // Create a new critical pseudo-const
-        let pc = PseudoConst::new_critical(self.next_pseudo_const_id, value, Some(dest));
+        // Create a new critical pseudo-const with configured encoding flags
+        let pc = PseudoConst::new_critical_with_flags(self.next_pseudo_const_id, value, Some(dest), self.encoding_flags);
         let pc_id = pc.id;
         self.pseudo_consts.push(pc);
 

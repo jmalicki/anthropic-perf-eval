@@ -160,10 +160,29 @@ pub fn can_derive(value: i64, available: &HashSet<i64>) -> Option<ConstantGenera
 }
 
 /// Build optimal constant derivation plan
+///
+/// # Parameters
+/// - `usage`: Map of constant values to their usage info
+/// - `threshold_hot`: Use count threshold for promoting to constant pool
+/// - `max_derivation_depth`: Maximum depth for derivation chains (None = unlimited)
+///
+///   Setting this limits the critical path through constant derivation.
+///   Constants that would exceed this depth are loaded directly instead.
+///   Recommended: 4-6 for workloads with long dependency chains.
 pub fn build_constant_plan(
     usage: &HashMap<i64, ConstantUsage>,
     threshold_hot: usize,
 ) -> ConstantPlan {
+    build_constant_plan_with_depth(usage, threshold_hot, None)
+}
+
+/// Build constant derivation plan with configurable depth limit
+pub fn build_constant_plan_with_depth(
+    usage: &HashMap<i64, ConstantUsage>,
+    threshold_hot: usize,
+    max_derivation_depth: Option<usize>,
+) -> ConstantPlan {
+    let effective_max_depth = max_derivation_depth.unwrap_or(10);
     let mut plan = ConstantPlan::default();
 
     // Collect all needed constants
@@ -225,9 +244,11 @@ pub fn build_constant_plan(
         .collect();
 
     let mut depth = 1;
-    let max_depth = 10; // Prevent infinite loops
 
-    while !remaining.is_empty() && depth < max_depth {
+    // Use effective_max_depth to limit derivation chain length
+    // When depth exceeds this, remaining constants are loaded directly
+    // This trades load slots for shorter critical paths
+    while !remaining.is_empty() && depth <= effective_max_depth {
         let mut derived_this_round: Vec<i64> = Vec::new();
 
         for &val in &remaining {

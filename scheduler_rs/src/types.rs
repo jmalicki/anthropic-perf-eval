@@ -135,6 +135,9 @@ pub enum Opcode {
 
     // Debug
     DebugPrint = 30,
+
+    // Immediate operations (flow engine)
+    AddImm = 31,
 }
 
 impl Opcode {
@@ -172,6 +175,7 @@ impl Opcode {
             "cond_jump" => Some(Opcode::CondJump),
             "halt" => Some(Opcode::Halt),
             "debug_print" => Some(Opcode::DebugPrint),
+            "add_imm" => Some(Opcode::AddImm),
             _ => None,
         }
     }
@@ -210,6 +214,7 @@ impl Opcode {
             Opcode::CondJump => "cond_jump",
             Opcode::Halt => "halt",
             Opcode::DebugPrint => "debug_print",
+            Opcode::AddImm => "add_imm",
         }
     }
 
@@ -318,9 +323,9 @@ pub enum ConstEncoding {
     /// Cost: 1 load slot, no dependencies
     Load,
 
-    /// XOR with self for zero: `xor dest src src`
-    /// Cost: 1 ALU slot, needs any value available
-    XorZero { source_value: i64 },
+    /// Flow add_imm: `add_imm dest s0 value`
+    /// Cost: 1 flow slot, needs ZERO_REG available
+    AddImm { value: i64 },
 
     /// ALU addition: `add dest srcA srcB`
     /// Cost: 1 ALU slot, needs both operands ready
@@ -344,6 +349,7 @@ impl ConstEncoding {
     pub fn engine(&self) -> Engine {
         match self {
             ConstEncoding::Load => Engine::Load,
+            ConstEncoding::AddImm { .. } => Engine::Flow,
             _ => Engine::Alu,
         }
     }
@@ -352,7 +358,7 @@ impl ConstEncoding {
     pub fn dependencies(&self) -> Vec<i64> {
         match self {
             ConstEncoding::Load => vec![],
-            ConstEncoding::XorZero { source_value } => vec![*source_value],
+            ConstEncoding::AddImm { .. } => vec![0], // Depends on ZERO_REG
             ConstEncoding::Add { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Sub { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Mul { a_value, b_value } => vec![*a_value, *b_value],
@@ -367,7 +373,7 @@ impl ConstEncoding {
     pub fn is_ready(&self, available_values: &HashSet<i64>) -> bool {
         match self {
             ConstEncoding::Load => true, // No dependencies
-            ConstEncoding::XorZero { source_value } => available_values.contains(source_value),
+            ConstEncoding::AddImm { .. } => available_values.contains(&0), // ZERO_REG must be available
             ConstEncoding::Add { a_value, b_value }
             | ConstEncoding::Sub { a_value, b_value }
             | ConstEncoding::Mul { a_value, b_value } => {
@@ -418,7 +424,12 @@ pub struct PseudoConst {
 impl PseudoConst {
     /// Create a new pseudo-const with computed encodings
     pub fn new(id: usize, value: i64, dest_register: Option<i64>) -> Self {
-        let encodings = compute_const_encodings(value);
+        Self::new_with_flags(id, value, dest_register, ConstEncodingFlags::all())
+    }
+
+    /// Create a new pseudo-const with configurable encoding flags
+    pub fn new_with_flags(id: usize, value: i64, dest_register: Option<i64>, flags: ConstEncodingFlags) -> Self {
+        let encodings = compute_const_encodings_with_flags(value, flags);
         PseudoConst {
             id,
             value,
@@ -433,10 +444,15 @@ impl PseudoConst {
 
     /// Create a pseudo-const marked as critical (will prefer Load encoding)
     pub fn new_critical(id: usize, value: i64, dest_register: Option<i64>) -> Self {
-        let mut pc = Self::new(id, value, dest_register);
+        Self::new_critical_with_flags(id, value, dest_register, ConstEncodingFlags::all())
+    }
+
+    /// Create a critical pseudo-const with configurable encoding flags
+    pub fn new_critical_with_flags(id: usize, value: i64, dest_register: Option<i64>, flags: ConstEncodingFlags) -> Self {
+        let mut pc = Self::new_with_flags(id, value, dest_register, flags);
         pc.is_critical = true;
-        // For critical constants, put Load first if not already
-        if !pc.encodings.is_empty() && pc.encodings[0] != ConstEncoding::Load {
+        // For critical constants, put Load first if not already (and if enabled)
+        if flags.enable_load && !pc.encodings.is_empty() && pc.encodings[0] != ConstEncoding::Load {
             pc.encodings.retain(|e| *e != ConstEncoding::Load);
             pc.encodings.insert(0, ConstEncoding::Load);
         }
@@ -454,77 +470,179 @@ impl PseudoConst {
     }
 }
 
+/// Flags to control which constant encodings are enabled
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConstEncodingFlags {
+    /// Enable AddImm via flow slot
+    pub enable_add_imm: bool,
+    /// Enable Load via load slot
+    pub enable_load: bool,
+    /// Enable ALU-based derivations (Add, Sub, Mul, Shift)
+    pub enable_alu: bool,
+    /// Maximum derivation depth for ALU-based constant generation.
+    /// Values requiring deeper derivation chains will use Load instead.
+    ///
+    /// Derivation depth is estimated as ceil(log2(max(value, smallest_dep))).
+    /// For example:
+    /// - Value 1: depth 0 (bootstrap)
+    /// - Value 2: depth 1 (1+1)
+    /// - Value 4: depth 2 (2+2)
+    /// - Value 32: depth 5 (16+16)
+    /// - Value 240: depth ~8 (requires 120, 60, 30, ...)
+    ///
+    /// Setting this to 4-5 prevents long critical paths through constant derivation.
+    /// None means unlimited (default).
+    pub max_alu_depth: Option<usize>,
+}
+
+impl ConstEncodingFlags {
+    /// All encodings enabled with no depth limit (default)
+    pub fn all() -> Self {
+        Self {
+            enable_add_imm: true,
+            enable_load: true,
+            enable_alu: true,
+            max_alu_depth: None,
+        }
+    }
+
+    /// Only load encoding enabled (baseline)
+    pub fn load_only() -> Self {
+        Self {
+            enable_add_imm: false,
+            enable_load: true,
+            enable_alu: false,
+            max_alu_depth: None,
+        }
+    }
+
+    /// All encodings enabled with a depth limit for ALU derivation
+    pub fn with_depth_limit(max_depth: usize) -> Self {
+        Self {
+            enable_add_imm: true,
+            enable_load: true,
+            enable_alu: true,
+            max_alu_depth: Some(max_depth),
+        }
+    }
+
+    /// Estimate the minimum derivation depth needed to compute a value via ALU.
+    ///
+    /// This is a heuristic based on the assumption that we start with 1 and
+    /// derive larger values through doubling (addition/shift).
+    /// For value V, the minimum depth is approximately ceil(log2(V)).
+    ///
+    /// Returns None for value 0 or 1 (bootstrap, no derivation needed).
+    pub fn estimate_derivation_depth(value: i64) -> Option<usize> {
+        let abs_val = value.unsigned_abs();
+        if abs_val <= 1 {
+            return None; // Bootstrap constant, depth 0
+        }
+        // Minimum depth is ceil(log2(value))
+        // e.g., 2 -> 1, 3 -> 2, 4 -> 2, 5-8 -> 3, 9-16 -> 4, etc.
+        Some((64 - abs_val.leading_zeros()) as usize)
+    }
+
+    /// Check if ALU derivation should be allowed for a given value based on depth limit.
+    pub fn allow_alu_for_value(&self, value: i64) -> bool {
+        if !self.enable_alu {
+            return false;
+        }
+        match (self.max_alu_depth, Self::estimate_derivation_depth(value)) {
+            (Some(max_depth), Some(est_depth)) => est_depth <= max_depth,
+            _ => true, // No limit or no depth estimate
+        }
+    }
+}
+
 /// Compute all valid encodings for a constant value.
 ///
 /// Returns encodings sorted by preference:
-/// 1. Load (always available, no deps)
-/// 2. XorZero (for value 0)
+/// 1. AddImm (uses flow slot, very high priority since flow slots are rarely used)
+/// 2. Load (always available, no deps)
 /// 3. Add (various decompositions)
 /// 4. Shift (if value is related to power of 2)
 /// 5. Mul (various decompositions)
 pub fn compute_const_encodings(value: i64) -> Vec<ConstEncoding> {
+    compute_const_encodings_with_flags(value, ConstEncodingFlags::all())
+}
+
+/// Compute valid encodings for a constant value with configurable flags.
+///
+/// Priority order:
+/// 1. ALU derivations (if dependencies available, saves both load and flow slots)
+/// 2. AddImm via flow slot (no dependencies, flow slots rarely used)
+/// 3. Load (fallback, uses precious load slots)
+pub fn compute_const_encodings_with_flags(value: i64, flags: ConstEncodingFlags) -> Vec<ConstEncoding> {
     let mut encodings = Vec::new();
 
-    // Load is always possible
-    encodings.push(ConstEncoding::Load);
-
-    // Special case: 0 can be generated via XOR
-    if value == 0 {
-        // Prefer XOR with 1 (likely to be available)
-        encodings.push(ConstEncoding::XorZero { source_value: 1 });
-        return encodings;
-    }
-
-    // For positive values, compute decompositions
-    if value > 0 {
-        // Add decompositions: value = a + b where a <= b
-        // Limit to reasonable operands to avoid combinatorial explosion
-        let max_operand = value.min(512);
-        for a in 0..=max_operand {
-            let b = value - a;
-            if b >= a && b >= 0 && b <= 512 {
-                encodings.push(ConstEncoding::Add {
-                    a_value: a,
-                    b_value: b,
-                });
-            }
-        }
-
-        // Shift decompositions: value = base << shift
-        for shift in 1..=9u8 {
-            let divisor = 1i64 << shift;
-            if value % divisor == 0 {
-                let base = value / divisor;
-                if base > 0 && base <= 256 {
-                    encodings.push(ConstEncoding::Shift {
-                        base_value: base,
-                        shift_amount: shift,
-                    });
-                }
-            }
-        }
-
-        // Mul decompositions: value = a * b where a <= b
-        // Only for small factors to avoid blowup
-        for a in 2..=16i64 {
-            if value % a == 0 {
-                let b = value / a;
-                if b >= a && b <= 256 {
-                    encodings.push(ConstEncoding::Mul {
+    // ALU-based derivations (highest priority when dependencies are ready)
+    // These save both load AND flow slots
+    // Use allow_alu_for_value() which checks both enable_alu and depth limit
+    if flags.allow_alu_for_value(value) {
+        // For positive values, compute decompositions
+        if value > 0 {
+            // Add decompositions: value = a + b where a <= b
+            // Limit to reasonable operands to avoid combinatorial explosion
+            let max_operand = value.min(512);
+            for a in 0..=max_operand {
+                let b = value - a;
+                if b >= a && b >= 0 && b <= 512 {
+                    encodings.push(ConstEncoding::Add {
                         a_value: a,
                         b_value: b,
                     });
                 }
             }
+
+            // Shift decompositions: value = base << shift
+            for shift in 1..=9u8 {
+                let divisor = 1i64 << shift;
+                if value % divisor == 0 {
+                    let base = value / divisor;
+                    if base > 0 && base <= 256 {
+                        encodings.push(ConstEncoding::Shift {
+                            base_value: base,
+                            shift_amount: shift,
+                        });
+                    }
+                }
+            }
+
+            // Mul decompositions: value = a * b where a <= b
+            // Only for small factors to avoid blowup
+            for a in 2..=16i64 {
+                if value % a == 0 {
+                    let b = value / a;
+                    if b >= a && b <= 256 {
+                        encodings.push(ConstEncoding::Mul {
+                            a_value: a,
+                            b_value: b,
+                        });
+                    }
+                }
+            }
+        }
+
+        // For negative values, use subtraction from 0
+        if value < 0 {
+            encodings.push(ConstEncoding::Sub {
+                a_value: 0,
+                b_value: -value,
+            });
         }
     }
 
-    // For negative values, use subtraction from 0
-    if value < 0 {
-        encodings.push(ConstEncoding::Sub {
-            a_value: 0,
-            b_value: -value,
-        });
+    // AddImm via flow slot (second priority - flow slots are rarely used)
+    // Works for any value since add_imm has immediate operand
+    // Requires ZERO_REG (value 0) to be available
+    if flags.enable_add_imm {
+        encodings.push(ConstEncoding::AddImm { value });
+    }
+
+    // Load is always possible (lowest priority - uses precious load slots)
+    if flags.enable_load {
+        encodings.push(ConstEncoding::Load);
     }
 
     encodings
@@ -681,18 +799,20 @@ pub fn resolve_pseudo_const(
             (Engine::Load, slot, HashSet::new())
         }
 
-        ConstEncoding::XorZero { source_value } => {
-            let src_reg = *value_to_register.get(source_value)?;
+        ConstEncoding::AddImm { value } => {
+            // add_imm dest, ZERO_REG, value
+            let zero_reg = *value_to_register.get(&0)
+                .expect("ZERO_REG must be available for AddImm");
             let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
-                SlotVal::Str("^".to_string()),
+                SlotVal::Str("add_imm".to_string()),
                 SlotVal::Int(dest),
-                SlotVal::Int(src_reg),
-                SlotVal::Int(src_reg),
+                SlotVal::Int(zero_reg),
+                SlotVal::Int(*value),
             ]
             .into_iter()
             .collect();
-            let reads: HashSet<i64> = [src_reg].into_iter().collect();
-            (Engine::Alu, slot, reads)
+            let reads: HashSet<i64> = [zero_reg].into_iter().collect();
+            (Engine::Flow, slot, reads)
         }
 
         ConstEncoding::Add { a_value, b_value } => {
@@ -783,7 +903,7 @@ mod tests {
     fn test_compute_encodings_zero() {
         let encodings = compute_const_encodings(0);
         assert!(encodings.contains(&ConstEncoding::Load));
-        assert!(encodings.contains(&ConstEncoding::XorZero { source_value: 1 }));
+        assert!(encodings.contains(&ConstEncoding::AddImm { value: 0 }));
     }
 
     #[test]
@@ -815,6 +935,9 @@ mod tests {
         let load = ConstEncoding::Load;
         assert!(load.dependencies().is_empty());
 
+        let add_imm = ConstEncoding::AddImm { value: 42 };
+        assert_eq!(add_imm.dependencies(), vec![0]); // Depends on ZERO_REG
+
         let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
         assert_eq!(add.dependencies(), vec![10, 20]);
 
@@ -828,6 +951,12 @@ mod tests {
 
         let load = ConstEncoding::Load;
         assert!(load.is_ready(&available)); // Load always ready
+
+        let add_imm = ConstEncoding::AddImm { value: 42 };
+        assert!(!add_imm.is_ready(&available)); // Needs ZERO_REG
+
+        available.insert(0); // ZERO_REG available
+        assert!(add_imm.is_ready(&available));
 
         let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
         assert!(!add.is_ready(&available));
@@ -844,15 +973,19 @@ mod tests {
         let pc = PseudoConst::new(0, 240, Some(100));
         let mut available: HashSet<i64> = HashSet::new();
 
-        // Initially only Load is available
+        // Initially only Load is available (ALU needs deps, AddImm needs ZERO_REG)
         let best = pc.best_available_encoding(&available);
         assert_eq!(best, Some(&ConstEncoding::Load));
 
-        // Add enough values for derivation
+        // Add ZERO_REG - now AddImm is preferred over Load
+        available.insert(0);
+        let best = pc.best_available_encoding(&available);
+        assert_eq!(best, Some(&ConstEncoding::AddImm { value: 240 }));
+
+        // Add 120 - now ALU Add is preferred (ALU > AddImm > Load)
         available.insert(120);
         let best = pc.best_available_encoding(&available);
-        // Still prefer Load (it's first)
-        assert_eq!(best, Some(&ConstEncoding::Load));
+        assert_eq!(best, Some(&ConstEncoding::Add { a_value: 120, b_value: 120 }));
     }
 
     #[test]
@@ -894,5 +1027,34 @@ mod tests {
         assert!(op.reads.contains(&60));
         assert!(op.writes.contains(&100));
         assert_eq!(op.produces_constant, Some(30));
+    }
+
+    #[test]
+    fn test_resolve_pseudo_const_add_imm() {
+        let pc = PseudoConst::new(0, 42, Some(100));
+        let mut value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        value_to_reg.insert(0, 0);  // ZERO_REG (value 0 is in register 0)
+
+        let encoding = ConstEncoding::AddImm { value: 42 };
+        let op = resolve_pseudo_const(&pc, &encoding, &value_to_reg, 1000);
+        assert!(op.is_some());
+
+        let op = op.unwrap();
+        assert_eq!(op.engine, Engine::Flow);
+        assert!(op.reads.contains(&0));  // Reads from ZERO_REG
+        assert!(op.writes.contains(&100));
+        assert_eq!(op.produces_constant, Some(42));
+    }
+
+    #[test]
+    fn test_add_imm_encoding_engine() {
+        let add_imm = ConstEncoding::AddImm { value: 123 };
+        assert_eq!(add_imm.engine(), Engine::Flow);
+
+        let load = ConstEncoding::Load;
+        assert_eq!(load.engine(), Engine::Load);
+
+        let add = ConstEncoding::Add { a_value: 1, b_value: 2 };
+        assert_eq!(add.engine(), Engine::Alu);
     }
 }

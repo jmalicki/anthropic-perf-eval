@@ -6,9 +6,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::SchedulingDiagnostics;
+use arrayvec::ArrayVec;
 use crate::types::{
     can_convert_valu_to_alu, expand_valu_to_alu_smart, Engine, Op, SlotVal, VLEN,
-    ConstEncoding, PseudoConst, resolve_pseudo_const,
+    ConstEncoding, PseudoConst, resolve_pseudo_const, MAX_SLOT_SIZE,
 };
 
 /// Result of scheduling
@@ -1236,7 +1237,7 @@ pub fn schedule_with_pseudo_consts(
     // ZERO_REG is register 63 in this architecture
     tracker.record_value(0, 63);
 
-    // Prepare pseudo-consts with assigned registers
+    // Assign registers to all pseudo-consts first (but don't mark as available yet)
     let mut pending_consts: Vec<PseudoConst> = pseudo_consts
         .into_iter()
         .map(|mut pc| {
@@ -1247,94 +1248,85 @@ pub fn schedule_with_pseudo_consts(
         })
         .collect();
 
-    // Sort pending consts by criticality (critical first)
-    pending_consts.sort_by_key(|pc| if pc.is_critical { 0 } else { 1 });
+    // Build value-to-register mapping for resolution (needed by resolve_pseudo_const)
+    let value_to_reg: HashMap<i64, i64> = pending_consts
+        .iter()
+        .filter_map(|pc| pc.dest_register.map(|dest| (pc.value, dest)))
+        .chain(std::iter::once((0, 63))) // ZERO_REG
+        .collect();
 
     // Ops generated from resolved pseudo-consts
     let mut const_ops: Vec<Op> = Vec::new();
     let mut next_const_op_id = ops.iter().map(|op| op.id).max().unwrap_or(0) + 10000;
 
-    // Track slot usage manually for the pre-scheduling phase
-    let mut slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
+    // TOPOLOGICAL RESOLUTION: Resolve constants in dependency order.
+    // Bootstrap constants (those that use Load or AddImm) can be resolved immediately.
+    // Derived constants (Add, Mul, etc.) must wait for their dependencies.
+    //
+    // This ensures the main scheduler sees proper dependencies between const ops.
+    let max_iterations = 100; // Safety limit
+    let mut iteration = 0;
 
-    // Phase 1: Resolve pseudo-consts before main scheduling
-    // This ensures constants are available when ops need them
-    let mut current_cycle = 0;
-    let max_const_cycles = 100; // Safety limit
-
-    while !pending_consts.is_empty() && current_cycle < max_const_cycles {
-        let mut resolved_this_cycle = Vec::new();
+    while !pending_consts.is_empty() && iteration < max_iterations {
+        let mut resolved_this_iteration = Vec::new();
 
         for (idx, pc) in pending_consts.iter().enumerate() {
-            match try_resolve_pseudo_const(pc, current_cycle, &tracker, &slot_usage, next_const_op_id) {
-                PseudoConstResolution::Resolved(mut op, encoding) => {
-                    // Set cycle and update tracking
-                    op.cycle = current_cycle as i32;
+            // Find first encoding whose dependencies are satisfied
+            let encoding = pc.encodings.iter()
+                .find(|enc| enc.is_ready(&tracker.available_values))
+                .cloned();
 
-                    // Update slot usage
-                    let engine = encoding.engine();
-                    *slot_usage.entry((current_cycle, engine)).or_insert(0) += 1;
+            if let Some(enc) = encoding {
+                if let Some(op) = resolve_pseudo_const(pc, &enc, &value_to_reg, next_const_op_id) {
+                    const_ops.push(op);
+                    next_const_op_id += 1;
 
-                    // Record the value as available
+                    // Mark this value as available for dependent constants
                     if let Some(dest) = pc.dest_register {
                         tracker.record_value(pc.value, dest);
                     }
 
-                    const_ops.push(op);
-                    next_const_op_id += 1;
-                    resolved_this_cycle.push(idx);
-                }
-                PseudoConstResolution::NotReady | PseudoConstResolution::NoEncoding => {
-                    // Try again next cycle or with different encoding
+                    resolved_this_iteration.push(idx);
                 }
             }
         }
 
-        // Check if we made progress
-        let made_progress = !resolved_this_cycle.is_empty();
+        if resolved_this_iteration.is_empty() {
+            // No progress - remaining constants have unsatisfiable dependencies
+            // Fall back to Load encoding for all remaining
+            for pc in &pending_consts {
+                let fallback_enc = ConstEncoding::Load;
+                if let Some(op) = resolve_pseudo_const(pc, &fallback_enc, &value_to_reg, next_const_op_id) {
+                    const_ops.push(op);
+                    next_const_op_id += 1;
+
+                    if let Some(dest) = pc.dest_register {
+                        tracker.record_value(pc.value, dest);
+                    }
+                }
+            }
+            break;
+        }
 
         // Remove resolved pseudo-consts (in reverse order to preserve indices)
-        for idx in resolved_this_cycle.into_iter().rev() {
+        for idx in resolved_this_iteration.into_iter().rev() {
             pending_consts.remove(idx);
         }
 
-        // Move to next cycle if we made progress or slots are exhausted
-        let load_used = slot_usage.get(&(current_cycle, Engine::Load)).copied().unwrap_or(0);
-        let alu_used = slot_usage.get(&(current_cycle, Engine::Alu)).copied().unwrap_or(0);
-
-        if load_used >= Engine::Load.slot_limit() && alu_used >= Engine::Alu.slot_limit() {
-            current_cycle += 1;
-        } else if !made_progress {
-            // No progress this cycle, try next
-            current_cycle += 1;
-        }
-
+        iteration += 1;
     }
-
-    // Update ops to use the constant registers
-    // (This would require updating op dependencies and reads - simplified for now)
-
-    // Phase 2: Schedule regular ops
-    // The const_ops are already scheduled, so we just need to schedule the rest
-    // For now, we combine them and let the regular scheduler handle it
 
     // Prepend const_ops to ops (not append!) so dependency computation works correctly.
     // The compute_dependencies function uses array index to determine order, so const ops
     // must come BEFORE the regular ops that depend on them.
-    // Reset cycle to -1 for all const ops since schedule_greedy will reassign them.
-    let mut reset_const_ops: Vec<Op> = const_ops.iter().cloned().map(|mut op| {
-        op.cycle = -1;
-        op
-    }).collect();
+    let mut all_ops: Vec<Op> = const_ops.clone();
+    all_ops.extend(std::mem::take(ops));
+    *ops = all_ops;
 
-    // Prepend: const_ops first, then regular ops
-    reset_const_ops.extend(std::mem::take(ops));
-    *ops = reset_const_ops;
-
-    // Recompute dependencies (simplified - in practice need proper dependency tracking)
+    // Recompute dependencies to properly link const ops with their consumers
     compute_dependencies(ops);
 
-    // Run regular scheduler
+    // Run regular scheduler - it will schedule everything optimally
     let result = schedule_greedy(ops, critical_path, enable_valu_shift, priority_mode);
 
     (result, const_ops)
@@ -1390,6 +1382,130 @@ pub fn compute_dependencies(ops: &mut [Op]) {
             readers_since_write.remove(addr);
             last_writer.insert(*addr, op_id);
         }
+    }
+}
+
+// ============================================================================
+// Post-Scheduling Slot Filling
+// ============================================================================
+
+/// Result of slot filling
+#[derive(Debug)]
+pub struct SlotFillResult {
+    /// The scheduled ops (with const ops filled in)
+    pub ops: Vec<Op>,
+    /// Number of cycles
+    pub cycles: usize,
+    /// Expanded ops from VALU→ALU shifting
+    pub expanded_ops: Vec<Op>,
+    /// Statistics about slot filling
+    pub stats: SlotFillStats,
+}
+
+/// Statistics about slot filling
+#[derive(Debug, Default)]
+pub struct SlotFillStats {
+    /// Number of consts placed via Flow (add_imm)
+    pub flow_placements: usize,
+    /// Number of consts placed via Load
+    pub load_placements: usize,
+    /// Number of consts placed via ALU derivation
+    pub alu_placements: usize,
+    /// Total constants placed
+    pub total_placed: usize,
+}
+
+/// Schedule with post-pass optimization to use add_imm for constants.
+///
+/// This approach:
+/// 1. Schedules normally (including const ops)
+/// 2. Post-processes: converts const loads to add_imm where flow slots are empty at the same cycle
+///
+/// This preserves the dependency structure while utilizing empty flow slots.
+pub fn schedule_with_slot_filling(
+    ops: &mut [Op],
+    critical_path: &HashMap<usize, usize>,
+    enable_valu_shift: bool,
+    mode: PriorityMode,
+) -> SlotFillResult {
+    // Step 1: Schedule normally with all ops
+    let result = schedule_greedy(ops, critical_path, enable_valu_shift, mode);
+    let max_cycle = result.cycles;
+
+    // Step 2: Build slot usage map and identify const loads
+    let mut flow_usage: HashMap<usize, usize> = HashMap::new();
+    let mut const_op_indices: Vec<usize> = Vec::new();
+
+    for (idx, op) in ops.iter().enumerate() {
+        if op.cycle >= 0 {
+            if op.engine == Engine::Flow {
+                *flow_usage.entry(op.cycle as usize).or_insert(0) += 1;
+            }
+            // Check if this is a const load
+            if op.engine == Engine::Load {
+                if let Some(SlotVal::Str(ref opcode)) = op.slot.get(0) {
+                    if opcode == "const" {
+                        const_op_indices.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also count flow usage from expanded ops
+    for op in &result.expanded_ops {
+        if op.cycle >= 0 && op.engine == Engine::Flow {
+            *flow_usage.entry(op.cycle as usize).or_insert(0) += 1;
+        }
+    }
+
+    // Step 3: Convert const loads to add_imm where flow slot is empty
+    let mut stats = SlotFillStats::default();
+
+    for &idx in &const_op_indices {
+        let op = &ops[idx];
+        let cycle = op.cycle as usize;
+
+        // Check if flow slot is available at this cycle
+        let flow_used = flow_usage.get(&cycle).copied().unwrap_or(0);
+        if flow_used >= Engine::Flow.slot_limit() {
+            stats.load_placements += 1;
+            continue;
+        }
+
+        // Get const value and dest
+        if let (Some(SlotVal::Int(dest)), Some(SlotVal::Int(value))) =
+            (op.slot.get(1), op.slot.get(2))
+        {
+            // Convert to add_imm: add_imm dest, 0, value
+            // Note: ZERO_REG is always register 0
+            let mut new_slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = ArrayVec::new();
+            new_slot.push(SlotVal::Str("add_imm".to_string()));
+            new_slot.push(SlotVal::Int(*dest));
+            new_slot.push(SlotVal::Int(0)); // ZERO_REG
+            new_slot.push(SlotVal::Int(*value));
+
+            // Update the op in place
+            let op_mut = &mut ops[idx];
+            op_mut.engine = Engine::Flow;
+            op_mut.slot = new_slot;
+            op_mut.reads.insert(0); // Now reads from ZERO_REG
+
+            // Update flow usage
+            *flow_usage.entry(cycle).or_insert(0) += 1;
+            stats.flow_placements += 1;
+        } else {
+            stats.load_placements += 1;
+        }
+    }
+
+    stats.total_placed = stats.flow_placements + stats.load_placements;
+
+    SlotFillResult {
+        ops: ops.to_vec(),
+        cycles: max_cycle,
+        expanded_ops: result.expanded_ops,
+        stats,
     }
 }
 

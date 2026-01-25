@@ -40,11 +40,12 @@ pub struct TickTockKernelBuilder {
 impl TickTockKernelBuilder {
     /// Create a new kernel builder with the given configuration
     pub fn new(config: KernelConfig) -> Self {
+        let encoding_flags = config.encoding_flags();
         TickTockKernelBuilder {
             config,
             ctx: ScratchContext::default(),
             alloc: ScratchAllocator::default(),
-            emit: EmitContext::new(),
+            emit: EmitContext::new_with_flags(encoding_flags),
         }
     }
 
