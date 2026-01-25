@@ -1222,6 +1222,167 @@ fn emit_unscheduled<'py>(py: Python<'py>, ops: &[Op]) -> PyResult<Bound<'py, PyL
 use crate::kernel_builder::{KernelConfig, TickTockKernelBuilder};
 use rayon::prelude::*;
 
+/// Write schedule output in JSON format (schedule_output.json format)
+fn write_schedule_json(
+    ops: &[Op],
+    expanded_ops: &[Op],
+    max_cycles: usize,
+    best_mode: PriorityMode,
+    output_path: &str,
+) -> PyResult<()> {
+    // Build cycle-by-cycle output
+    let mut cycles_output: Vec<CycleOutput> = Vec::new();
+    let mut total_empty_load = 0usize;
+    let mut total_empty_store = 0usize;
+    let mut total_empty_alu = 0usize;
+    let mut total_empty_valu = 0usize;
+    let mut total_load = 0usize;
+    let mut total_store = 0usize;
+    let mut total_alu = 0usize;
+    let mut total_valu = 0usize;
+
+    for cycle in 0..max_cycles {
+        let mut load_ops: Vec<String> = Vec::new();
+        let mut store_ops: Vec<String> = Vec::new();
+        let mut alu_ops: Vec<String> = Vec::new();
+        let mut valu_ops: Vec<String> = Vec::new();
+        let mut flow_ops: Vec<String> = Vec::new();
+
+        // Process regular ops
+        for op in ops {
+            if op.cycle == cycle as i32
+                && op.engine != Engine::ShiftedValu
+                && op.engine != Engine::EliminatedBroadcast
+            {
+                let opcode = op
+                    .slot
+                    .get(0)
+                    .map(|v| match v {
+                        SlotVal::Str(s) => s.as_str(),
+                        SlotVal::Int(_) => "",
+                    })
+                    .unwrap_or("");
+
+                let parts: Vec<String> = op
+                    .slot
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, v)| match v {
+                        SlotVal::Str(s) => s.clone(),
+                        SlotVal::Int(n) => format_addr(*n, opcode, idx),
+                    })
+                    .collect();
+                let compact = parts.join(" ");
+
+                match op.engine {
+                    Engine::Load => load_ops.push(compact),
+                    Engine::Store => store_ops.push(compact),
+                    Engine::Alu => alu_ops.push(compact),
+                    Engine::Valu => valu_ops.push(compact),
+                    Engine::Flow => flow_ops.push(compact),
+                    _ => {}
+                }
+            }
+        }
+
+        // Process expanded ALU ops
+        for op in expanded_ops {
+            if op.cycle == cycle as i32 {
+                let opcode = op
+                    .slot
+                    .get(0)
+                    .map(|v| match v {
+                        SlotVal::Str(s) => s.as_str(),
+                        SlotVal::Int(_) => "",
+                    })
+                    .unwrap_or("");
+
+                let parts: Vec<String> = op
+                    .slot
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, v)| match v {
+                        SlotVal::Str(s) => s.clone(),
+                        SlotVal::Int(n) => format_addr(*n, opcode, idx),
+                    })
+                    .collect();
+                let compact = parts.join(" ");
+
+                alu_ops.push(compact);
+            }
+        }
+
+        let load_empty = 2 - load_ops.len().min(2);
+        let store_empty = 2 - store_ops.len().min(2);
+        let alu_empty = 12 - alu_ops.len().min(12);
+        let valu_empty = 6 - valu_ops.len().min(6);
+        let flow_empty = 1 - flow_ops.len().min(1);
+
+        total_load += load_ops.len();
+        total_store += store_ops.len();
+        total_alu += alu_ops.len();
+        total_valu += valu_ops.len();
+        total_empty_load += load_empty;
+        total_empty_store += store_empty;
+        total_empty_alu += alu_empty;
+        total_empty_valu += valu_empty;
+
+        cycles_output.push(CycleOutput {
+            cycle,
+            load: load_ops,
+            load_empty,
+            store: store_ops,
+            store_empty,
+            alu: alu_ops,
+            alu_empty,
+            valu: valu_ops,
+            valu_empty,
+            flow: flow_ops,
+            flow_empty,
+        });
+    }
+
+    let total_load_slots = max_cycles * 2;
+    let total_store_slots = max_cycles * 2;
+    let total_alu_slots = max_cycles * 12;
+    let total_valu_slots = max_cycles * 6;
+
+    let summary = ScheduleSummary {
+        load_utilization_pct: (total_load as f64 / total_load_slots as f64) * 100.0,
+        store_utilization_pct: (total_store as f64 / total_store_slots as f64) * 100.0,
+        alu_utilization_pct: (total_alu as f64 / total_alu_slots as f64) * 100.0,
+        valu_utilization_pct: (total_valu as f64 / total_valu_slots as f64) * 100.0,
+        total_empty_load,
+        total_empty_store,
+        total_empty_alu,
+        total_empty_valu,
+    };
+
+    let mut slot_limits = HashMap::new();
+    slot_limits.insert("load".to_string(), 2);
+    slot_limits.insert("store".to_string(), 2);
+    slot_limits.insert("alu".to_string(), 12);
+    slot_limits.insert("valu".to_string(), 6);
+    slot_limits.insert("flow".to_string(), 1);
+
+    let output = ScheduleOutput {
+        total_cycles: max_cycles,
+        total_ops: ops.len() + expanded_ops.len(),
+        best_mode: format!("{:?}", best_mode),
+        slot_limits,
+        cycles: cycles_output,
+        summary,
+    };
+
+    let json = serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string());
+
+    std::fs::write(output_path, &json).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to write {}: {}", output_path, e))
+    })?;
+
+    Ok(())
+}
+
 /// Result of scheduling with a specific priority mode
 struct ScheduleAttempt {
     mode: PriorityMode,
@@ -1238,8 +1399,11 @@ struct ScheduleAttempt {
 /// Uses parallel multipass scheduling to try all priority modes concurrently.
 ///
 /// Returns a list of scheduled instruction dicts, ready for execution.
+///
+/// If `output_json` is provided, writes the schedule in schedule_output.json format
+/// with detailed slot utilization info per cycle.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1248,6 +1412,7 @@ pub fn build_tick_tock_kernel<'py>(
     rounds: usize,
     enable_valu_shift: bool,
     verbose: bool,
+    output_json: Option<String>,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1312,6 +1477,14 @@ pub fn build_tick_tock_kernel<'py>(
 
     if verbose {
         println!("Best: {:?} with {} cycles (parallel multipass)", best.mode, best.cycles);
+    }
+
+    // Write JSON output if requested
+    if let Some(ref path) = output_json {
+        write_schedule_json(&best.ops, &best.expanded_ops, best.cycles, best.mode, path)?;
+        if verbose {
+            println!("Wrote schedule to {}", path);
+        }
     }
 
     // Add pause instructions at start and end
