@@ -60,8 +60,8 @@ impl TickTockKernelBuilder {
 
         // Allocate scratch
         self.allocate_common(n_groups, n_iters);
-        self.allocate_partition();
         self.allocate_valu_selection();
+        self.allocate_partition();  // After valu_selection so we can reuse tc_r3/v_tc_r3
 
         let usage = self.alloc.usage();
         if usage > SCRATCH_SIZE as i64 {
@@ -223,46 +223,21 @@ impl TickTockKernelBuilder {
 
         // Only allocate lazy partition resources if enabled
         if self.config.enable_lazy_partition {
-            // Tree cache for sorted vload access
+            // Tree cache: 8 contiguous scalars for vloaded tree values
             ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", VLEN);
             ctx.tree_cache_base_s = alloc.alloc("tree_cache_base", 1);
-            ctx.v_cache_base = alloc.vec("v_cache_base_tt");
 
-            // Temp vector for tree operations
-            ctx.v_tree_temp = alloc.vec("v_tree_temp");
+            // Reuse existing vectors - v_tc_r3 and v_const_r3 are only for depth 3
+            // At depths 4+, they're free to reuse. This saves 5 vectors = 40 words!
+            ctx.v_cache_base = ctx.v_tc_r3[0];
+            ctx.v_tree_temp = ctx.v_tc_r3[1];
+            ctx.v_part_temp[0] = ctx.v_tc_r3[2];
+            ctx.v_part_temp[1] = ctx.v_tc_r3[3];
+            ctx.v_part_temp[2] = ctx.v_tc_r3[4];
+            ctx.v_part_temp[3] = ctx.v_tc_r3[5];
 
-            // Lazy partition buffers (stored in extra_room, just track offsets)
-            // Buffer A: idx at 0, val at 256
-            // Buffer B: idx at 512, val at 768
-            ctx.part_buffer_a_idx = alloc.alloc("part_buf_a_idx_off", 1);
-            ctx.part_buffer_a_val = alloc.alloc("part_buf_a_val_off", 1);
-            ctx.part_buffer_b_idx = alloc.alloc("part_buf_b_idx_off", 1);
-            ctx.part_buffer_b_val = alloc.alloc("part_buf_b_val_off", 1);
-
-            // Partition counters
-            ctx.part_left_count = alloc.alloc("part_left_count", 1);
-            ctx.part_right_count = alloc.alloc("part_right_count", 1);
-
-            // Constants for partition
-            ctx.part_mask_11bit = alloc.alloc("part_mask_11bit", 1);
-            ctx.part_batch_half = alloc.alloc("part_batch_half", 1);
-
-            // Temp vectors for partition operations
-            for i in 0..4 {
-                ctx.v_part_temp[i] = alloc.vec(&format!("v_part_temp_{}", i));
-            }
-
-            // Prefix sum support for stable partition
-            ctx.v_positions = alloc.vec("v_positions");
-            ctx.part_branch_scratch = alloc.alloc("part_branch_scratch", VLEN);
-            ctx.part_idx_scratch = alloc.alloc("part_idx_scratch", VLEN);
-            ctx.part_val_scratch = alloc.alloc("part_val_scratch", VLEN);
-            ctx.v_dest_pos = alloc.vec("v_dest_pos");
-            for i in 0..2 {
-                ctx.v_prefix_temp[i] = alloc.vec(&format!("v_prefix_temp_{}", i));
-            }
-            ctx.v_branch_broadcast = alloc.vec("v_branch_broadcast");
-            ctx.part_left_count_temp = alloc.alloc("part_left_count_temp", 1);
+            // Scratch for storing indices (reuse tree_cache_scalars)
+            ctx.part_idx_scratch = ctx.tree_cache_scalars;
         }
     }
 
@@ -418,13 +393,13 @@ impl TickTockKernelBuilder {
             .filter_map(|i| self.ctx.hash_fma_mult[i].map(|m| (i, m)))
             .collect();
 
-        for (i, mult) in fma_mults {
+        for (i, mult) in &fma_mults {
             let mult_s = self.alloc.alloc(&format!("hash_mult_{}", i), 1);
             let v_mult = self.alloc.vec(&format!("v_hash_mult_{}", i));
-            self.ctx.hash_fma_mult_s.insert(i, mult_s);
-            self.emit.emit_const(mult_s, mult);
+            self.ctx.hash_fma_mult_s.insert(*i, mult_s);
+            self.emit.emit_const(mult_s, *mult);
             let actual_v_mult = self.emit.emit_vbroadcast(v_mult, mult_s);
-            self.ctx.v_hash_mult.insert(i, actual_v_mult);
+            self.ctx.v_hash_mult.insert(*i, actual_v_mult);
         }
     }
 
@@ -456,17 +431,8 @@ impl TickTockKernelBuilder {
     }
 
     fn emit_partition_init(&mut self) {
-        if !self.config.enable_lazy_partition {
-            return;
-        }
-
-        // Initialize v_positions = [0, 1, 2, 3, 4, 5, 6, 7]
-        // Store constants c[0..7] to scratch, then vload
-        // This creates a vector where lane i contains the value i
-        for i in 0..VLEN {
-            self.emit.emit_store(self.ctx.part_branch_scratch + i as i64, self.ctx.c[i]);
-        }
-        self.emit.emit_vload(self.ctx.v_positions, self.ctx.part_branch_scratch);
+        // No initialization needed - we use v_const[0..7] for comparisons
+        // which are already initialized in emit_common_init
     }
 
     // =========================================================================
@@ -533,6 +499,14 @@ impl TickTockKernelBuilder {
 
     fn emit_round(&mut self, rnd: usize, tree_depth: usize, n_groups: usize, n_iters: usize) {
         // Determine if we're using lazy partition for sorted vload access
+        //
+        // NOTE: This optimization is currently DISABLED by default because:
+        // 1. The partition stores need to actually reorder data (stable partition)
+        // 2. Current implementation just copies data, so indices don't cluster
+        // 3. Without clustering, the 4-way selection adds overhead without benefit
+        //
+        // TODO: Implement proper stable partition using prefix-sum + scatter pattern
+        // to make this optimization effective.
         let use_sorted_vload = self.config.enable_lazy_partition
             && tree_depth >= 4
             && tree_depth <= 8
