@@ -776,6 +776,8 @@ struct ScheduleResult {
     #[allow(dead_code)]
     assignments: Vec<(usize, usize)>,
     diagnostics: Option<SchedulingDiagnostics>,
+    /// Expanded ALU ops from VALU→ALU shifting (these replace shifted VALU ops)
+    expanded_ops: Vec<Op>,
 }
 
 /// Compute critical path length for each op (longest path to any sink)
@@ -1041,7 +1043,7 @@ fn schedule_greedy_with_diagnostics(
 ) -> ScheduleResult {
     let n = ops.len();
     if n == 0 {
-        return ScheduleResult { cycles: 0, assignments: vec![], diagnostics: None };
+        return ScheduleResult { cycles: 0, assignments: vec![], diagnostics: None, expanded_ops: vec![] };
     }
 
     // Initialize diagnostics if collecting
@@ -1225,7 +1227,8 @@ fn schedule_greedy_with_diagnostics(
                         *slot_usage.entry((cycle, "alu".to_string())).or_insert(0) += 1;
                     }
 
-                    // Mark original VALU op as shifted (use max cycle of expanded ops)
+                    // Mark original VALU op as shifted - change engine to prevent emission
+                    ops[op_idx].engine = "shifted_valu".to_string();
                     ops[op_idx].cycle = cycle as i32;
                     expanded_op_cycles.insert(op_id, cycle as i32);
                     shifted_valu_ops.insert(op_id);
@@ -1321,6 +1324,7 @@ fn schedule_greedy_with_diagnostics(
         cycles: max_cycle + 1,
         assignments,
         diagnostics,
+        expanded_ops,
     }
 }
 
@@ -1548,12 +1552,49 @@ fn compute_dependencies(ops: &mut [Op]) {
 
 /// Emit scheduled ops back to Python instruction list
 fn emit_scheduled<'py>(py: Python<'py>, ops: &[Op], max_cycle: usize) -> PyResult<Bound<'py, PyList>> {
+    emit_scheduled_with_expanded(py, ops, &[], max_cycle)
+}
+
+/// Emit scheduled ops including expanded ALU ops from VALU→ALU shifting
+/// Skips ops with engine="shifted_valu" (these are replaced by expanded_ops)
+fn emit_scheduled_with_expanded<'py>(
+    py: Python<'py>,
+    ops: &[Op],
+    expanded_ops: &[Op],
+    max_cycle: usize,
+) -> PyResult<Bound<'py, PyList>> {
     let instrs = PyList::empty(py);
 
     for cycle in 0..max_cycle {
         let instr = PyDict::new(py);
 
+        // Emit regular ops, SKIP shifted_valu (these are replaced by expanded ALU ops)
         for op in ops {
+            if op.cycle == cycle as i32 && op.engine != "shifted_valu" {
+                let engine = &op.engine;
+
+                // Get or create the list for this engine
+                if !instr.contains(engine.as_str())? {
+                    instr.set_item(engine.as_str(), PyList::empty(py))?;
+                }
+
+                let slots = instr.get_item(engine.as_str())?.unwrap();
+                let slots_list = slots.downcast::<PyList>()?;
+
+                // Create tuple from slot
+                let py_items: Vec<PyObject> = op.slot.iter().map(|v| {
+                    match v {
+                        SlotVal::Str(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
+                        SlotVal::Int(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
+                    }
+                }).collect();
+                let slot_tuple = PyTuple::new(py, &py_items)?;
+                slots_list.append(slot_tuple)?;
+            }
+        }
+
+        // Emit expanded ALU ops from VALU→ALU shifting
+        for op in expanded_ops {
             if op.cycle == cycle as i32 {
                 let engine = &op.engine;
 
@@ -1609,8 +1650,8 @@ fn schedule<'py>(py: Python<'py>, instrs: &Bound<'py, PyList>, enable_valu_shift
     // Schedule with default priority mode
     let result = schedule_greedy(&mut ops, &critical_path, enable_valu_shift, PriorityMode::CriticalPath);
 
-    // Emit
-    emit_scheduled(py, &ops, result.cycles)
+    // Emit (include expanded ops from VALU→ALU shifting)
+    emit_scheduled_with_expanded(py, &ops, &result.expanded_ops, result.cycles)
 }
 
 /// Get just the cycle count without emitting (faster for testing)
@@ -1656,6 +1697,7 @@ fn schedule_multipass<'py>(py: Python<'py>, instrs: &Bound<'py, PyList>, enable_
 
     let mut best_cycles = usize::MAX;
     let mut best_ops: Option<Vec<Op>> = None;
+    let mut best_expanded_ops: Vec<Op> = Vec::new();
     let mut best_mode: Option<PriorityMode> = None;
 
     // Try all priority modes and keep the best result
@@ -1675,6 +1717,7 @@ fn schedule_multipass<'py>(py: Python<'py>, instrs: &Bound<'py, PyList>, enable_
         if result.cycles < best_cycles {
             best_cycles = result.cycles;
             best_ops = Some(ops);
+            best_expanded_ops = result.expanded_ops;
             best_mode = Some(mode);
         }
     }
@@ -1683,7 +1726,7 @@ fn schedule_multipass<'py>(py: Python<'py>, instrs: &Bound<'py, PyList>, enable_
         println!("Best: {:?} with {} cycles", best_mode.unwrap(), best_cycles);
     }
 
-    emit_scheduled(py, &best_ops.unwrap(), best_cycles)
+    emit_scheduled_with_expanded(py, &best_ops.unwrap(), &best_expanded_ops, best_cycles)
 }
 
 /// Count cycles for a program (simulates cycle counting without full memory simulation)
@@ -2303,6 +2346,7 @@ fn schedule_to_json(py: Python<'_>, instrs: &Bound<'_, PyList>, enable_valu_shif
     // Find best mode
     let mut best_cycles = usize::MAX;
     let mut best_ops: Option<Vec<Op>> = None;
+    let mut best_expanded_ops: Vec<Op> = Vec::new();
     let mut best_mode: Option<PriorityMode> = None;
 
     for &mode in ALL_PRIORITY_MODES.iter() {
@@ -2317,6 +2361,7 @@ fn schedule_to_json(py: Python<'_>, instrs: &Bound<'_, PyList>, enable_valu_shif
         if result.cycles < best_cycles {
             best_cycles = result.cycles;
             best_ops = Some(ops);
+            best_expanded_ops = result.expanded_ops;
             best_mode = Some(mode);
         }
     }
@@ -2342,8 +2387,9 @@ fn schedule_to_json(py: Python<'_>, instrs: &Bound<'_, PyList>, enable_valu_shif
         let mut valu_ops: Vec<String> = Vec::new();
         let mut flow_ops: Vec<String> = Vec::new();
 
+        // Process regular ops, SKIP shifted_valu (these are replaced by expanded ALU ops)
         for op in &ops {
-            if op.cycle == cycle as i32 {
+            if op.cycle == cycle as i32 && op.engine != "shifted_valu" {
                 // Get the opcode for context-aware formatting
                 let opcode = op.slot.get(0).map(|v| match v {
                     SlotVal::Str(s) => s.as_str(),
@@ -2365,6 +2411,25 @@ fn schedule_to_json(py: Python<'_>, instrs: &Bound<'_, PyList>, enable_valu_shif
                     "flow" => flow_ops.push(compact),
                     _ => {}
                 }
+            }
+        }
+
+        // Process expanded ALU ops from VALU→ALU shifting
+        for op in &best_expanded_ops {
+            if op.cycle == cycle as i32 {
+                let opcode = op.slot.get(0).map(|v| match v {
+                    SlotVal::Str(s) => s.as_str(),
+                    SlotVal::Int(_) => "",
+                }).unwrap_or("");
+
+                let parts: Vec<String> = op.slot.iter().enumerate().map(|(idx, v)| match v {
+                    SlotVal::Str(s) => s.clone(),
+                    SlotVal::Int(n) => format_addr(*n, opcode, idx),
+                }).collect();
+                let compact = parts.join(" ");
+
+                // Expanded ops are always ALU
+                alu_ops.push(compact);
             }
         }
 
@@ -2562,7 +2627,7 @@ fn optimize_constants<'py>(
         println!("Scheduled to {} cycles", result.cycles);
     }
 
-    emit_scheduled(py, &new_ops, result.cycles)
+    emit_scheduled_with_expanded(py, &new_ops, &result.expanded_ops, result.cycles)
 }
 
 #[pymodule]
