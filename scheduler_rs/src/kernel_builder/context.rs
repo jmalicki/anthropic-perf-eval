@@ -119,6 +119,28 @@ pub struct ScratchContext {
     pub tree_cache_base_s: i64,      // Base index of cache
     pub v_cache_base: i64,           // Vector broadcast of cache base
     pub v_tree_temp: i64,            // Temp vector for tree operations
+
+    // =========================================================================
+    // Lazy Partition Buffers (for sorted vload tree access)
+    // =========================================================================
+    /// Double-buffer base addresses in extra_room
+    /// Buffer A: indices at offset 0, values at offset 256
+    /// Buffer B: indices at offset 512, values at offset 768
+    pub part_buffer_a_idx: i64,      // Base address for buffer A indices
+    pub part_buffer_a_val: i64,      // Base address for buffer A values
+    pub part_buffer_b_idx: i64,      // Base address for buffer B indices
+    pub part_buffer_b_val: i64,      // Base address for buffer B values
+
+    /// Partition counters (for stable partition algorithm)
+    pub part_left_count: i64,        // Count of items going to left partition
+    pub part_right_count: i64,       // Count of items going to right partition
+
+    /// Constants for partition operations
+    pub part_mask_11bit: i64,        // 0x7FF for index extraction (if packed)
+    pub part_batch_half: i64,        // 128 (batch_size / 2)
+
+    /// Vector temps for partition operations
+    pub v_part_temp: [i64; 4],       // Temp vectors for partition computation
 }
 
 impl Default for ScratchContext {
@@ -183,6 +205,16 @@ impl Default for ScratchContext {
             tree_cache_base_s: 0,
             v_cache_base: 0,
             v_tree_temp: 0,
+
+            part_buffer_a_idx: 0,
+            part_buffer_a_val: 0,
+            part_buffer_b_idx: 0,
+            part_buffer_b_val: 0,
+            part_left_count: 0,
+            part_right_count: 0,
+            part_mask_11bit: 0,
+            part_batch_half: 0,
+            v_part_temp: [0; 4],
         }
     }
 }

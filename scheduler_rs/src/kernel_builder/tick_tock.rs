@@ -10,6 +10,7 @@ use super::config::{
 };
 use super::context::{ScratchAllocator, ScratchContext, ZERO_REG};
 use super::emit::EmitContext;
+use super::partition::{get_read_buffer, should_partition, PartitionHelper};
 
 /// Unroll factor - process 8 groups per iteration
 const UNROLL: usize = 8;
@@ -215,17 +216,41 @@ impl TickTockKernelBuilder {
         // Memory pointers
         ctx.extra_room_p = alloc.alloc("extra_room_p", 1);
 
-        // Tree cache for sorted vload access
-        ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", VLEN);
-        ctx.tree_cache_base_s = alloc.alloc("tree_cache_base", 1);
-        ctx.v_cache_base = alloc.vec("v_cache_base_tt");
-
-        // Temp vector for tree operations
-        ctx.v_tree_temp = alloc.vec("v_tree_temp");
-
-        // Partition buffer offsets
+        // Partition buffer offsets (for tick-tock stores)
         ctx.partition_idx_offset = alloc.alloc("part_idx_off", 1);
         ctx.partition_val_offset = alloc.alloc("part_val_off", 1);
+
+        // Only allocate lazy partition resources if enabled
+        if self.config.enable_lazy_partition {
+            // Tree cache for sorted vload access
+            ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", VLEN);
+            ctx.tree_cache_base_s = alloc.alloc("tree_cache_base", 1);
+            ctx.v_cache_base = alloc.vec("v_cache_base_tt");
+
+            // Temp vector for tree operations
+            ctx.v_tree_temp = alloc.vec("v_tree_temp");
+
+            // Lazy partition buffers (stored in extra_room, just track offsets)
+            // Buffer A: idx at 0, val at 256
+            // Buffer B: idx at 512, val at 768
+            ctx.part_buffer_a_idx = alloc.alloc("part_buf_a_idx_off", 1);
+            ctx.part_buffer_a_val = alloc.alloc("part_buf_a_val_off", 1);
+            ctx.part_buffer_b_idx = alloc.alloc("part_buf_b_idx_off", 1);
+            ctx.part_buffer_b_val = alloc.alloc("part_buf_b_val_off", 1);
+
+            // Partition counters
+            ctx.part_left_count = alloc.alloc("part_left_count", 1);
+            ctx.part_right_count = alloc.alloc("part_right_count", 1);
+
+            // Constants for partition
+            ctx.part_mask_11bit = alloc.alloc("part_mask_11bit", 1);
+            ctx.part_batch_half = alloc.alloc("part_batch_half", 1);
+
+            // Temp vectors for partition operations
+            for i in 0..4 {
+                ctx.v_part_temp[i] = alloc.vec(&format!("v_part_temp_{}", i));
+            }
+        }
     }
 
     fn allocate_valu_selection(&mut self) {
@@ -479,13 +504,29 @@ impl TickTockKernelBuilder {
     // Round Emission
     // =========================================================================
 
-    fn emit_round(&mut self, _rnd: usize, tree_depth: usize, n_groups: usize, n_iters: usize) {
+    fn emit_round(&mut self, rnd: usize, tree_depth: usize, n_groups: usize, n_iters: usize) {
+        // Determine if we're using lazy partition for sorted vload access
+        let use_sorted_vload = self.config.enable_lazy_partition
+            && tree_depth >= 4
+            && tree_depth <= 8
+            && rnd >= self.config.partition_frequency; // Need at least one partition done
+
         // Tree access based on depth
         match tree_depth {
             0 => self.emit_depth0_access(n_iters),
             1 => self.emit_depth1_access(n_iters),
             2 => self.emit_depth2_access(n_iters),
             3 => self.emit_depth3_access(n_iters),
+            _ if use_sorted_vload => {
+                // Use sorted vload access (experimental)
+                let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
+                let mut helper = PartitionHelper {
+                    ctx: &self.ctx,
+                    emit: &mut self.emit,
+                    config: &self.config,
+                };
+                helper.emit_sorted_vload_access(read_buffer, n_iters);
+            }
             _ => self.emit_scattered_access(n_iters),
         }
 
@@ -496,7 +537,7 @@ impl TickTockKernelBuilder {
         self.emit_hash(n_groups, n_iters);
 
         // Branch (includes partition stores)
-        self.emit_branch(n_groups, n_iters, tree_depth);
+        self.emit_branch_with_partition(n_groups, n_iters, tree_depth, rnd);
     }
 
     // =========================================================================
@@ -741,7 +782,7 @@ impl TickTockKernelBuilder {
     // Branch Phase
     // =========================================================================
 
-    fn emit_branch(&mut self, n_groups: usize, n_iters: usize, tree_depth: usize) {
+    fn emit_branch_with_partition(&mut self, n_groups: usize, n_iters: usize, tree_depth: usize, rnd: usize) {
         let ctx = &self.ctx;
         let is_wrap_round = tree_depth == self.config.forest_height;
 
@@ -764,13 +805,29 @@ impl TickTockKernelBuilder {
             }
         }
 
-        // Emit partition stores based on DEPTH
-        if TICK_STORE_DEPTHS.contains(&tree_depth) {
-            // Store first half: groups 0-15
-            self.emit_partition_stores_batch(0, n_groups / 2);
-        } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
-            // Store second half: groups 16-31
-            self.emit_partition_stores_batch(n_groups / 2, n_groups);
+        // Check if we should emit lazy partition stores
+        if self.config.enable_lazy_partition
+            && should_partition(rnd, self.config.rounds, self.config.partition_frequency)
+        {
+            // Emit partition stores to the write buffer
+            let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
+            let write_buffer = read_buffer.write_target();
+
+            let mut helper = PartitionHelper {
+                ctx: &self.ctx,
+                emit: &mut self.emit,
+                config: &self.config,
+            };
+            helper.emit_partition_stores(write_buffer, n_groups);
+        } else {
+            // Use original tick-tock stores for load balancing
+            if TICK_STORE_DEPTHS.contains(&tree_depth) {
+                // Store first half: groups 0-15
+                self.emit_partition_stores_batch(0, n_groups / 2);
+            } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
+                // Store second half: groups 16-31
+                self.emit_partition_stores_batch(n_groups / 2, n_groups);
+            }
         }
     }
 

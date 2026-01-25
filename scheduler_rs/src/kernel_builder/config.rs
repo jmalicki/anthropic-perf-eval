@@ -37,6 +37,14 @@ pub struct KernelConfig {
     pub enable_valu_shift: bool,
     /// Enable debug operations
     pub enable_debug: bool,
+    /// Enable lazy partition for sorted vload tree access (depths 4-8)
+    /// When enabled, items are sorted by tree index via stable partition every k rounds,
+    /// enabling sequential vloads instead of scattered loads.
+    pub enable_lazy_partition: bool,
+    /// Partition frequency: partition every k rounds (default: 3)
+    /// Lower k = more accurate sorting but higher overhead
+    /// k=2 or k=3 recommended for depths 4-8
+    pub partition_frequency: usize,
 }
 
 impl Default for KernelConfig {
@@ -48,6 +56,8 @@ impl Default for KernelConfig {
             rounds: 16,
             enable_valu_shift: true,
             enable_debug: false,
+            enable_lazy_partition: false,
+            partition_frequency: 3,
         }
     }
 }

@@ -1469,7 +1469,7 @@ struct ScheduleAttempt {
 /// If `output_json` is provided, writes the schedule in schedule_output.json format
 /// with detailed slot utilization info per cycle.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1479,6 +1479,8 @@ pub fn build_tick_tock_kernel<'py>(
     enable_valu_shift: bool,
     verbose: bool,
     output_json: Option<String>,
+    enable_lazy_partition: bool,
+    partition_frequency: usize,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1487,6 +1489,8 @@ pub fn build_tick_tock_kernel<'py>(
         rounds,
         enable_valu_shift,
         enable_debug: false,
+        enable_lazy_partition,
+        partition_frequency,
     };
 
     // Build the kernel (generates unscheduled ops)
@@ -1576,7 +1580,7 @@ pub fn build_tick_tock_kernel<'py>(
 /// This is a faster version that doesn't emit back to Python, just returns the cycle count.
 /// Uses parallel multipass scheduling.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3))]
 pub fn build_tick_tock_kernel_ops(
     _py: Python<'_>,
     forest_height: usize,
@@ -1585,6 +1589,8 @@ pub fn build_tick_tock_kernel_ops(
     rounds: usize,
     enable_valu_shift: bool,
     verbose: bool,
+    enable_lazy_partition: bool,
+    partition_frequency: usize,
 ) -> PyResult<usize> {
     let config = KernelConfig {
         forest_height,
@@ -1593,6 +1599,8 @@ pub fn build_tick_tock_kernel_ops(
         rounds,
         enable_valu_shift,
         enable_debug: false,
+        enable_lazy_partition,
+        partition_frequency,
     };
 
     // Build the kernel (generates unscheduled ops)
