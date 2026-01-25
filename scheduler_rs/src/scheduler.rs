@@ -126,14 +126,15 @@ fn compute_priority(
         PriorityMode::CriticalPathValu => (is_valu, -cp, op_id),
         PriorityMode::EngineBalance => {
             // Matches Python: -cp * load_factor where load_factor is 0.6, 0.8, 0.5, 1.0
-            // Use float conversion to match Python's rounding behavior
+            // Scale by 10000 to preserve float precision (Python uses actual floats)
             let load_factor: f64 = match engine {
                 "valu" => 0.6,
                 "load" | "store" => 0.8,
                 "flow" => 0.5,
                 _ => 1.0, // ALU and others
             };
-            let adjusted_cp = (-(cp as f64) * load_factor) as i32;
+            // Scale to preserve decimal precision - Python compares floats directly
+            let adjusted_cp = (-(cp as f64) * load_factor * 10000.0) as i32;
             (adjusted_cp, op_id as i32, op_id)
         }
         PriorityMode::Slack => (slack, -cp, op_id),
@@ -270,6 +271,140 @@ fn compute_slack(ops: &[Op], critical_path: &HashMap<usize, usize>) -> HashMap<u
         .collect()
 }
 
+/// Proactive lookahead analysis to identify broadcasts that can be eliminated
+/// before scheduling begins. This predicts which VALU ops will shift to ALU
+/// due to VALU saturation, and eliminates broadcasts whose ALL consumers
+/// are predicted to shift.
+pub fn compute_proactive_eliminations(ops: &[Op]) -> HashSet<usize> {
+    const VALU_SLOTS: usize = 6;
+
+    // Identify shiftable ops and broadcasts
+    let mut shiftable_ops: HashSet<usize> = HashSet::new();
+    let mut broadcast_ops: HashMap<usize, i64> = HashMap::new(); // bc_id -> scalar source
+    let mut broadcast_dest_to_id: HashMap<i64, usize> = HashMap::new(); // dest -> bc_id
+
+    for op in ops {
+        if can_convert_valu_to_alu(op) {
+            shiftable_ops.insert(op.id);
+        }
+        // Check for vbroadcast
+        if op.engine == "valu" && op.slot.len() >= 3 {
+            if let SlotVal::Str(op_type) = &op.slot[0] {
+                if op_type == "vbroadcast" {
+                    if let (SlotVal::Int(dest), SlotVal::Int(scalar)) =
+                        (&op.slot[1], &op.slot[2])
+                    {
+                        broadcast_ops.insert(op.id, *scalar);
+                        broadcast_dest_to_id.insert(*dest, op.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Find consumers of each broadcast (ops that depend on broadcast AND read its dest)
+    let mut broadcast_consumers: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for &bc_id in broadcast_ops.keys() {
+        broadcast_consumers.insert(bc_id, HashSet::new());
+    }
+
+    // Build op_by_id for broadcast dest lookup
+    let op_by_id: HashMap<usize, &Op> = ops.iter().map(|op| (op.id, op)).collect();
+
+    for op in ops {
+        for &bc_id in broadcast_ops.keys() {
+            // Must depend on this broadcast
+            if !op.dep_ids.contains(&bc_id) {
+                continue;
+            }
+            // Must read from broadcast dest range
+            let bc_op = op_by_id.get(&bc_id).unwrap();
+            if let SlotVal::Int(dest) = &bc_op.slot[1] {
+                let bc_dest_range: HashSet<i64> = (0..VLEN as i64).map(|i| dest + i).collect();
+                if op.reads.iter().any(|r| bc_dest_range.contains(r)) {
+                    broadcast_consumers.get_mut(&bc_id).unwrap().insert(op.id);
+                }
+            }
+        }
+    }
+
+    // Identify eliminable broadcasts (all consumers are shiftable)
+    let eliminable_broadcasts: HashSet<usize> = broadcast_consumers
+        .iter()
+        .filter(|(_, consumers)| {
+            !consumers.is_empty() && consumers.iter().all(|c| shiftable_ops.contains(c))
+        })
+        .map(|(&bc_id, _)| bc_id)
+        .collect();
+
+    // Predict which ops will shift due to VALU pressure
+    // Count VALU ops by category
+    let valu_ops: Vec<&Op> = ops.iter().filter(|op| op.engine == "valu").collect();
+    let shiftable_valu: Vec<&Op> = valu_ops
+        .iter()
+        .filter(|op| shiftable_ops.contains(&op.id))
+        .copied()
+        .collect();
+    let non_shiftable_valu: Vec<&Op> = valu_ops
+        .iter()
+        .filter(|op| {
+            !shiftable_ops.contains(&op.id)
+                && !matches!(&op.slot[0], SlotVal::Str(s) if s == "vbroadcast")
+        })
+        .copied()
+        .collect();
+
+    // Estimate minimum cycles for non-shiftable (they MUST use VALU)
+    let min_cycles_for_non_shiftable =
+        (non_shiftable_valu.len() + VALU_SLOTS - 1) / VALU_SLOTS;
+
+    // Total VALU capacity for shiftable ops
+    let total_valu_capacity = min_cycles_for_non_shiftable * VALU_SLOTS;
+    let valu_slots_for_shiftable = total_valu_capacity.saturating_sub(non_shiftable_valu.len());
+
+    // Excess shiftable ops that won't fit in VALU
+    let excess_shiftable = shiftable_valu.len().saturating_sub(valu_slots_for_shiftable);
+
+    if excess_shiftable == 0 || shiftable_valu.is_empty() {
+        return HashSet::new(); // No shifting needed
+    }
+
+    let shift_ratio = excess_shiftable as f64 / shiftable_valu.len() as f64;
+
+    if shift_ratio < 0.3 {
+        return HashSet::new(); // Too uncertain to predict
+    }
+
+    // Predict which ops will shift: last N by emission order (op.id)
+    let mut sorted_shiftable: Vec<&Op> = shiftable_valu.clone();
+    sorted_shiftable.sort_by_key(|op| op.id);
+
+    // 80% confidence margin
+    let confident_excess = (excess_shiftable as f64 * 0.8) as usize;
+    if confident_excess == 0 {
+        return HashSet::new();
+    }
+
+    let predicted_shifts: HashSet<usize> = sorted_shiftable
+        .iter()
+        .rev()
+        .take(confident_excess)
+        .map(|op| op.id)
+        .collect();
+
+    // Find broadcasts where ALL consumers are predicted to shift
+    let mut proactive_eliminations: HashSet<usize> = HashSet::new();
+
+    for &bc_id in &eliminable_broadcasts {
+        let consumers = broadcast_consumers.get(&bc_id).unwrap();
+        if !consumers.is_empty() && consumers.iter().all(|c| predicted_shifts.contains(c)) {
+            proactive_eliminations.insert(bc_id);
+        }
+    }
+
+    proactive_eliminations
+}
+
 /// Greedy list scheduler with configurable priority mode and VALU→ALU shifting
 pub fn schedule_greedy(
     ops: &mut [Op],
@@ -387,6 +522,13 @@ pub fn schedule_greedy_with_diagnostics(
         }
     }
 
+    // Proactive broadcast elimination is disabled by default (matches Python).
+    // Reactive elimination (when VALU is saturated) is more effective.
+    let proactive_eliminations: HashSet<usize> = HashSet::new();
+
+    // Track which broadcasts have been eliminated (their consumers MUST shift)
+    let mut eliminated_broadcast_ids: HashSet<usize> = HashSet::new();
+
     let get_slot_usage =
         |slot_usage: &HashMap<(usize, String), usize>, cycle: usize, engine: &str| -> usize {
             *slot_usage
@@ -498,68 +640,72 @@ pub fn schedule_greedy_with_diagnostics(
             }
         }
 
-        // Broadcast elimination: if this is a vbroadcast and VALU is saturated,
-        // check if all consumers are shiftable. If so, skip the broadcast entirely.
+        // Broadcast elimination: eliminate broadcasts when EITHER:
+        // 1. PROACTIVE: lookahead analysis predicted all consumers will shift
+        // 2. REACTIVE: VALU is saturated and all consumers are shiftable
         let is_vbroadcast = engine == "valu"
             && ops[op_idx].slot.len() >= 3
             && matches!(&ops[op_idx].slot[0], SlotVal::Str(s) if s == "vbroadcast");
 
         if enable_valu_shift && is_vbroadcast {
+            // Check proactive elimination (computed upfront via lookahead)
+            let is_proactive = proactive_eliminations.contains(&op_id);
+
+            // Check reactive elimination (VALU saturated at this cycle)
             let valu_usage = get_slot_usage(&slot_usage, cycle, "valu");
             let alu_usage = get_slot_usage(&slot_usage, cycle, "alu");
+            let is_reactive = valu_usage >= get_slot_limit("valu")
+                && alu_usage + VLEN <= get_slot_limit("alu")
+                && {
+                    let consumer_ids = consumers.get(&op_id).cloned().unwrap_or_default();
+                    let all_consumers_can_shift = consumer_ids.iter().all(|&cid| {
+                        shifted_valu_ops.contains(&cid) || {
+                            let cidx = *op_id_to_idx.get(&cid).unwrap();
+                            ops[cidx].engine == "valu" && can_convert_valu_to_alu(&ops[cidx])
+                        }
+                    });
+                    all_consumers_can_shift && !consumer_ids.is_empty()
+                };
 
-            // Check if VALU is saturated and ALU has capacity
-            if valu_usage >= get_slot_limit("valu") && alu_usage + VLEN <= get_slot_limit("alu") {
-                // Check if all consumers are shiftable VALU ops OR already shifted
+            if is_proactive || is_reactive {
+                // ELIMINATE: Don't emit anything, just mark as done
+                if let (SlotVal::Int(dest), SlotVal::Int(scalar)) =
+                    (&ops[op_idx].slot[1], &ops[op_idx].slot[2])
+                {
+                    broadcast_sources.insert(*dest, *scalar);
+                    broadcast_op_ids.insert(*dest, op_id);
+                }
+
+                // Mark original vbroadcast as eliminated
+                ops[op_idx].engine = "eliminated_broadcast".to_string();
+                ops[op_idx].cycle = cycle as i32;
+                eliminated_broadcast_ids.insert(op_id);
+                assignments.push((op_id, cycle));
+
+                if let Some(ref mut diag) = diagnostics {
+                    diag.broadcasts_eliminated += 1;
+                }
+
+                // Update consumers - they're now ready once their other deps are met
                 let consumer_ids = consumers.get(&op_id).cloned().unwrap_or_default();
-                let all_consumers_can_shift = consumer_ids.iter().all(|&cid| {
-                    // Consumer already shifted - OK
-                    if shifted_valu_ops.contains(&cid) {
-                        return true;
-                    }
-                    // Consumer is shiftable VALU op - OK
-                    let cidx = *op_id_to_idx.get(&cid).unwrap();
-                    ops[cidx].engine == "valu" && can_convert_valu_to_alu(&ops[cidx])
-                });
-
-                if all_consumers_can_shift && !consumer_ids.is_empty() {
-                    // ELIMINATE: Don't emit anything, just mark as done
-                    if let (SlotVal::Int(dest), SlotVal::Int(scalar)) =
-                        (&ops[op_idx].slot[1], &ops[op_idx].slot[2])
-                    {
-                        broadcast_sources.insert(*dest, *scalar);
-                        broadcast_op_ids.insert(*dest, op_id);
-                    }
-
-                    // Mark original vbroadcast as eliminated
-                    ops[op_idx].engine = "eliminated_broadcast".to_string();
-                    ops[op_idx].cycle = cycle as i32;
-                    assignments.push((op_id, cycle));
-
-                    if let Some(ref mut diag) = diagnostics {
-                        diag.broadcasts_eliminated += 1;
-                    }
-
-                    // Update consumers - they're now ready once their other deps are met
-                    for &consumer_id in &consumer_ids {
-                        if let Some(deg) = in_degree.get_mut(&consumer_id) {
-                            *deg -= 1;
-                            if *deg == 0 {
-                                let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
-                                let prio = compute_priority(
-                                    consumer_id,
-                                    consumer_idx,
-                                    &ops[consumer_idx].engine,
-                                    critical_path,
-                                    &slack_map,
-                                    priority_mode,
-                                );
-                                ready.push(Reverse((prio, consumer_id)));
-                            }
+                for &consumer_id in &consumer_ids {
+                    if let Some(deg) = in_degree.get_mut(&consumer_id) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
+                            let prio = compute_priority(
+                                consumer_id,
+                                consumer_idx,
+                                &ops[consumer_idx].engine,
+                                critical_path,
+                                &slack_map,
+                                priority_mode,
+                            );
+                            ready.push(Reverse((prio, consumer_id)));
                         }
                     }
-                    continue;
                 }
+                continue;
             }
         }
 
@@ -567,7 +713,76 @@ pub fn schedule_greedy_with_diagnostics(
         // This matches Python's behavior: check for shifting at each cycle where VALU is full
         let is_shiftable_valu =
             enable_valu_shift && engine == "valu" && can_convert_valu_to_alu(&ops[op_idx]);
+
+        // Check if this op MUST shift because it depends on an eliminated broadcast
+        // (eliminated broadcasts don't produce vector values, so consumers must use scalar)
+        let must_shift_for_eliminated_bc = is_shiftable_valu
+            && ops[op_idx]
+                .dep_ids
+                .iter()
+                .any(|d| eliminated_broadcast_ids.contains(d));
+
         let mut shifted = false;
+
+        // Force shift if consumer of eliminated broadcast (must use scalar forwarding)
+        if must_shift_for_eliminated_bc {
+            let (mut alu_ops, forward_count) = expand_valu_to_alu_smart(
+                &ops[op_idx],
+                next_expanded_id,
+                &broadcast_sources,
+                &broadcast_op_ids,
+            );
+            next_expanded_id += VLEN;
+
+            if let Some(ref mut diag) = diagnostics {
+                diag.broadcast_forwards += forward_count;
+            }
+
+            // Schedule each ALU op individually at earliest available cycle
+            let mut max_alu_cycle = cycle;
+            for alu_op in &mut alu_ops {
+                let mut alu_cycle = cycle;
+                while get_slot_usage(&slot_usage, alu_cycle, "alu") >= get_slot_limit("alu") {
+                    alu_cycle += 1;
+                }
+                alu_op.cycle = alu_cycle as i32;
+                *slot_usage.entry((alu_cycle, "alu".to_string())).or_insert(0) += 1;
+                max_alu_cycle = max_alu_cycle.max(alu_cycle);
+            }
+
+            ops[op_idx].engine = "shifted_valu".to_string();
+            ops[op_idx].cycle = max_alu_cycle as i32;
+            expanded_op_cycles.insert(op_id, max_alu_cycle as i32);
+            shifted_valu_ops.insert(op_id);
+            expanded_ops.extend(alu_ops);
+            assignments.push((op_id, max_alu_cycle));
+
+            if let Some(ref mut diag) = diagnostics {
+                diag.valu_shifted += 1;
+            }
+
+            // Update consumers
+            if let Some(consumer_ids) = consumers.get(&op_id) {
+                for &consumer_id in consumer_ids {
+                    if let Some(deg) = in_degree.get_mut(&consumer_id) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
+                            let prio = compute_priority(
+                                consumer_id,
+                                consumer_idx,
+                                &ops[consumer_idx].engine,
+                                critical_path,
+                                &slack_map,
+                                priority_mode,
+                            );
+                            ready.push(Reverse((prio, consumer_id)));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
         while get_slot_usage(&slot_usage, cycle, &engine) >= get_slot_limit(&engine) {
             // VALU→ALU shifting: if VALU is full but ALU has capacity
@@ -578,7 +793,9 @@ pub fn schedule_greedy_with_diagnostics(
                     diag.cycles_valu_saturated += 1;
                 }
 
-                if alu_usage + VLEN <= get_slot_limit("alu") {
+                // Only need at least 1 free ALU slot to start shifting
+                // (ALU ops spread across cycles like Python does)
+                if alu_usage < get_slot_limit("alu") {
                     // Expand VALU op to 8 ALU ops with smart broadcast forwarding
                     let (mut alu_ops, forward_count) = expand_valu_to_alu_smart(
                         &ops[op_idx],
@@ -592,19 +809,28 @@ pub fn schedule_greedy_with_diagnostics(
                         diag.broadcast_forwards += forward_count;
                     }
 
-                    // Schedule all 8 ALU ops at this cycle - SET THEIR CYCLE!
+                    // Schedule each ALU op individually at earliest available cycle
+                    // This matches Python's behavior and allows ops to spread across cycles
+                    let mut max_alu_cycle = cycle;
                     for alu_op in &mut alu_ops {
-                        alu_op.cycle = cycle as i32;
-                        *slot_usage.entry((cycle, "alu".to_string())).or_insert(0) += 1;
+                        let mut alu_cycle = cycle;
+                        while get_slot_usage(&slot_usage, alu_cycle, "alu")
+                            >= get_slot_limit("alu")
+                        {
+                            alu_cycle += 1;
+                        }
+                        alu_op.cycle = alu_cycle as i32;
+                        *slot_usage.entry((alu_cycle, "alu".to_string())).or_insert(0) += 1;
+                        max_alu_cycle = max_alu_cycle.max(alu_cycle);
                     }
 
-                    // Mark original VALU op as shifted - change engine to prevent emission
+                    // Mark original VALU op as shifted - cycle is max of all ALU ops
                     ops[op_idx].engine = "shifted_valu".to_string();
-                    ops[op_idx].cycle = cycle as i32;
-                    expanded_op_cycles.insert(op_id, cycle as i32);
+                    ops[op_idx].cycle = max_alu_cycle as i32;
+                    expanded_op_cycles.insert(op_id, max_alu_cycle as i32);
                     shifted_valu_ops.insert(op_id);
                     expanded_ops.extend(alu_ops);
-                    assignments.push((op_id, cycle));
+                    assignments.push((op_id, max_alu_cycle));
 
                     if let Some(ref mut diag) = diagnostics {
                         diag.valu_shifted += 1;
