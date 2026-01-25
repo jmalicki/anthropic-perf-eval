@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::diagnostics::SchedulingDiagnostics;
 use crate::types::{
     can_convert_valu_to_alu, expand_valu_to_alu_smart, Engine, Op, SlotVal, VLEN,
+    ConstEncoding, PseudoConst, resolve_pseudo_const,
 };
 
 /// Result of scheduling
@@ -651,6 +652,7 @@ pub fn schedule_greedy_with_diagnostics(
         }
     }
 
+
     // Track slot usage per cycle
     let mut slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
 
@@ -1084,5 +1086,373 @@ pub fn schedule_greedy_with_diagnostics(
         assignments,
         diagnostics,
         expanded_ops,
+    }
+}
+
+// ============================================================================
+// Pseudo-Const Scheduling
+// ============================================================================
+
+/// State for tracking constant values during scheduling
+#[derive(Debug, Default)]
+pub struct ConstValueTracker {
+    /// Values that are currently available (have been produced)
+    pub available_values: HashSet<i64>,
+
+    /// Map from constant value to the register holding it
+    pub value_to_register: HashMap<i64, i64>,
+
+    /// Map from register to the constant value it holds (if known)
+    pub register_to_value: HashMap<i64, i64>,
+
+    /// Next register to allocate for constants (if needed)
+    pub next_const_register: i64,
+}
+
+impl ConstValueTracker {
+    /// Create a new tracker with a starting register for constants
+    pub fn new(start_register: i64) -> Self {
+        Self {
+            available_values: HashSet::new(),
+            value_to_register: HashMap::new(),
+            register_to_value: HashMap::new(),
+            next_const_register: start_register,
+        }
+    }
+
+    /// Record that a value is now available in a register
+    pub fn record_value(&mut self, value: i64, register: i64) {
+        self.available_values.insert(value);
+        self.value_to_register.insert(value, register);
+        self.register_to_value.insert(register, value);
+    }
+
+    /// Allocate a register for a constant value
+    pub fn allocate_register(&mut self) -> i64 {
+        let reg = self.next_const_register;
+        self.next_const_register += 1;
+        reg
+    }
+
+    /// Check if a value is available
+    pub fn is_available(&self, value: i64) -> bool {
+        self.available_values.contains(&value)
+    }
+
+    /// Get the register holding a value (if available)
+    pub fn get_register(&self, value: i64) -> Option<i64> {
+        self.value_to_register.get(&value).copied()
+    }
+}
+
+/// Result of trying to resolve a pseudo-const
+pub enum PseudoConstResolution {
+    /// Successfully resolved to a concrete op
+    Resolved(Op, ConstEncoding),
+    /// Cannot resolve this cycle (dependencies not ready or no slots)
+    NotReady,
+    /// No valid encoding found (should not happen)
+    NoEncoding,
+}
+
+/// Try to resolve a pseudo-const at the given cycle.
+///
+/// Returns the resolved Op if successful, along with the encoding used.
+pub fn try_resolve_pseudo_const(
+    pc: &PseudoConst,
+    cycle: usize,
+    tracker: &ConstValueTracker,
+    slot_usage: &HashMap<(usize, Engine), usize>,
+    next_op_id: usize,
+) -> PseudoConstResolution {
+    // Helper to check slot availability
+    let slots_available = |engine: Engine| -> bool {
+        let used = slot_usage.get(&(cycle, engine)).copied().unwrap_or(0);
+        used < engine.slot_limit()
+    };
+
+    // Try each encoding in order of preference
+    for encoding in &pc.encodings {
+        // Check if dependencies are satisfied
+        if !encoding.is_ready(&tracker.available_values) {
+            continue;
+        }
+
+        // Check if slots are available
+        let engine = encoding.engine();
+        if !slots_available(engine) {
+            continue;
+        }
+
+        // Resolve to concrete op
+        if let Some(op) = resolve_pseudo_const(pc, encoding, &tracker.value_to_register, next_op_id) {
+            return PseudoConstResolution::Resolved(op, encoding.clone());
+        }
+    }
+
+    // Check if ANY encoding could work with more dependencies
+    let has_possible_encoding = pc.encodings.iter().any(|enc| {
+        let engine = enc.engine();
+        slots_available(engine)
+    });
+
+    if has_possible_encoding {
+        PseudoConstResolution::NotReady
+    } else {
+        // All encodings blocked by slots - also NotReady
+        PseudoConstResolution::NotReady
+    }
+}
+
+/// Schedule ops with dynamic pseudo-const resolution.
+///
+/// This function wraps the regular scheduler but adds:
+/// 1. Dynamic resolution of pseudo-consts based on available values and slots
+/// 2. Tracking of which constant values are available
+/// 3. Integration of resolved pseudo-const ops into the regular schedule
+///
+/// # Arguments
+/// * `ops` - Regular operations to schedule (may depend on pseudo-consts)
+/// * `pseudo_consts` - Pseudo-const operations to resolve dynamically
+/// * `critical_path` - Critical path information for priority
+/// * `enable_valu_shift` - Whether to enable VALU→ALU shifting
+/// * `priority_mode` - Priority mode for scheduling
+/// * `const_register_start` - Starting register number for constants
+///
+/// # Returns
+/// * Extended ScheduleResult with resolved pseudo-consts included
+pub fn schedule_with_pseudo_consts(
+    ops: &mut Vec<Op>,
+    pseudo_consts: Vec<PseudoConst>,
+    critical_path: &HashMap<usize, usize>,
+    enable_valu_shift: bool,
+    priority_mode: PriorityMode,
+    const_register_start: i64,
+) -> (ScheduleResult, Vec<Op>) {
+    // Initialize constant value tracker
+    let mut tracker = ConstValueTracker::new(const_register_start);
+
+    // Pre-populate with value 0 (always available via ZERO_REG or scratch initialization)
+    // ZERO_REG is register 63 in this architecture
+    tracker.record_value(0, 63);
+
+    // Prepare pseudo-consts with assigned registers
+    let mut pending_consts: Vec<PseudoConst> = pseudo_consts
+        .into_iter()
+        .map(|mut pc| {
+            if pc.dest_register.is_none() {
+                pc.dest_register = Some(tracker.allocate_register());
+            }
+            pc
+        })
+        .collect();
+
+    // Sort pending consts by criticality (critical first)
+    pending_consts.sort_by_key(|pc| if pc.is_critical { 0 } else { 1 });
+
+    // Ops generated from resolved pseudo-consts
+    let mut const_ops: Vec<Op> = Vec::new();
+    let mut next_const_op_id = ops.iter().map(|op| op.id).max().unwrap_or(0) + 10000;
+
+    // Track slot usage manually for the pre-scheduling phase
+    let mut slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
+
+    // Phase 1: Resolve pseudo-consts before main scheduling
+    // This ensures constants are available when ops need them
+    let mut current_cycle = 0;
+    let max_const_cycles = 100; // Safety limit
+
+    while !pending_consts.is_empty() && current_cycle < max_const_cycles {
+        let mut resolved_this_cycle = Vec::new();
+
+        for (idx, pc) in pending_consts.iter().enumerate() {
+            match try_resolve_pseudo_const(pc, current_cycle, &tracker, &slot_usage, next_const_op_id) {
+                PseudoConstResolution::Resolved(mut op, encoding) => {
+                    // Set cycle and update tracking
+                    op.cycle = current_cycle as i32;
+
+                    // Update slot usage
+                    let engine = encoding.engine();
+                    *slot_usage.entry((current_cycle, engine)).or_insert(0) += 1;
+
+                    // Record the value as available
+                    if let Some(dest) = pc.dest_register {
+                        tracker.record_value(pc.value, dest);
+                    }
+
+                    const_ops.push(op);
+                    next_const_op_id += 1;
+                    resolved_this_cycle.push(idx);
+                }
+                PseudoConstResolution::NotReady | PseudoConstResolution::NoEncoding => {
+                    // Try again next cycle or with different encoding
+                }
+            }
+        }
+
+        // Check if we made progress
+        let made_progress = !resolved_this_cycle.is_empty();
+
+        // Remove resolved pseudo-consts (in reverse order to preserve indices)
+        for idx in resolved_this_cycle.into_iter().rev() {
+            pending_consts.remove(idx);
+        }
+
+        // Move to next cycle if we made progress or slots are exhausted
+        let load_used = slot_usage.get(&(current_cycle, Engine::Load)).copied().unwrap_or(0);
+        let alu_used = slot_usage.get(&(current_cycle, Engine::Alu)).copied().unwrap_or(0);
+
+        if load_used >= Engine::Load.slot_limit() && alu_used >= Engine::Alu.slot_limit() {
+            current_cycle += 1;
+        } else if !made_progress {
+            // No progress this cycle, try next
+            current_cycle += 1;
+        }
+
+    }
+
+    // Update ops to use the constant registers
+    // (This would require updating op dependencies and reads - simplified for now)
+
+    // Phase 2: Schedule regular ops
+    // The const_ops are already scheduled, so we just need to schedule the rest
+    // For now, we combine them and let the regular scheduler handle it
+
+    // Prepend const_ops to ops (not append!) so dependency computation works correctly.
+    // The compute_dependencies function uses array index to determine order, so const ops
+    // must come BEFORE the regular ops that depend on them.
+    // Reset cycle to -1 for all const ops since schedule_greedy will reassign them.
+    let mut reset_const_ops: Vec<Op> = const_ops.iter().cloned().map(|mut op| {
+        op.cycle = -1;
+        op
+    }).collect();
+
+    // Prepend: const_ops first, then regular ops
+    reset_const_ops.extend(std::mem::take(ops));
+    *ops = reset_const_ops;
+
+    // Recompute dependencies (simplified - in practice need proper dependency tracking)
+    compute_dependencies(ops);
+
+    // Run regular scheduler
+    let result = schedule_greedy(ops, critical_path, enable_valu_shift, priority_mode);
+
+    (result, const_ops)
+}
+
+/// Compute dependencies between ops based on read/write sets.
+///
+/// This should be called after adding new ops (like resolved pseudo-consts)
+/// to ensure dependency information is up to date.
+///
+/// Properly tracks:
+/// - RAW (Read-After-Write): Op reads register another op wrote
+/// - WAR (Write-After-Read): Op writes register another op read
+/// - WAW (Write-After-Write): Op writes register another op wrote
+pub fn compute_dependencies(ops: &mut [Op]) {
+    // Map: address -> last op that wrote to it
+    let mut last_writer: HashMap<i64, usize> = HashMap::new();
+    // Map: address -> ops that read since last write
+    let mut readers_since_write: HashMap<i64, Vec<usize>> = HashMap::new();
+
+    for i in 0..ops.len() {
+        let reads = ops[i].reads.clone();
+        let writes = ops[i].writes.clone();
+        let op_id = ops[i].id;
+
+        ops[i].dep_ids.clear();
+
+        // RAW: depend on writers of values we read
+        for addr in &reads {
+            if let Some(&writer_id) = last_writer.get(addr) {
+                ops[i].dep_ids.insert(writer_id);
+            }
+            readers_since_write
+                .entry(*addr)
+                .or_default()
+                .push(op_id);
+        }
+
+        // WAR + WAW: depend on ops for values we write
+        for addr in &writes {
+            // WAW: depend on previous writer
+            if let Some(&writer_id) = last_writer.get(addr) {
+                ops[i].dep_ids.insert(writer_id);
+            }
+            // WAR: depend on all readers since last write
+            if let Some(readers) = readers_since_write.get(addr) {
+                for &reader_id in readers {
+                    if reader_id != op_id {
+                        ops[i].dep_ids.insert(reader_id);
+                    }
+                }
+            }
+            readers_since_write.remove(addr);
+            last_writer.insert(*addr, op_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pseudo_const_tests {
+    use super::*;
+    use crate::types::PseudoConst;
+
+    #[test]
+    fn test_const_value_tracker() {
+        let mut tracker = ConstValueTracker::new(1000);
+
+        assert!(!tracker.is_available(42));
+
+        tracker.record_value(42, 1000);
+        assert!(tracker.is_available(42));
+        assert_eq!(tracker.get_register(42), Some(1000));
+    }
+
+    #[test]
+    fn test_try_resolve_load() {
+        let pc = PseudoConst::new(0, 42, Some(100));
+        let tracker = ConstValueTracker::new(1000);
+        let slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
+
+        match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage, 1) {
+            PseudoConstResolution::Resolved(op, encoding) => {
+                assert_eq!(encoding, ConstEncoding::Load);
+                assert_eq!(op.engine, Engine::Load);
+            }
+            _ => panic!("Should resolve to Load"),
+        }
+    }
+
+    #[test]
+    fn test_try_resolve_with_deps() {
+        // Create pseudo-const for 4 = 2 + 2
+        let pc = PseudoConst::new(0, 4, Some(100));
+
+        // Initially, can only use Load (no deps available)
+        let mut tracker = ConstValueTracker::new(1000);
+        let slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
+
+        match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage, 1) {
+            PseudoConstResolution::Resolved(_, encoding) => {
+                assert_eq!(encoding, ConstEncoding::Load);
+            }
+            _ => panic!("Should resolve to Load"),
+        }
+
+        // Now make value 2 available
+        tracker.record_value(2, 50);
+
+        // With load slot full but ALU available, should use Add
+        let mut slot_usage_full_load: HashMap<(usize, Engine), usize> = HashMap::new();
+        slot_usage_full_load.insert((0, Engine::Load), 2); // Full
+
+        match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage_full_load, 1) {
+            PseudoConstResolution::Resolved(op, encoding) => {
+                assert_eq!(encoding, ConstEncoding::Add { a_value: 2, b_value: 2 });
+                assert_eq!(op.engine, Engine::Alu);
+            }
+            _ => panic!("Should resolve to Add"),
+        }
     }
 }

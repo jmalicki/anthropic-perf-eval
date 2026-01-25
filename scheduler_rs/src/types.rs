@@ -303,6 +303,237 @@ pub struct Op {
     pub produces_constant: Option<i64>,
 }
 
+// ============================================================================
+// Pseudo-Op Constants
+// ============================================================================
+
+/// Possible ways to materialize a constant value.
+///
+/// The scheduler can choose between these encodings dynamically based on
+/// resource availability (load slots, ALU slots, flow slots) and which
+/// operand values are already available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstEncoding {
+    /// Load directly: `const dest value`
+    /// Cost: 1 load slot, no dependencies
+    Load,
+
+    /// XOR with self for zero: `xor dest src src`
+    /// Cost: 1 ALU slot, needs any value available
+    XorZero { source_value: i64 },
+
+    /// ALU addition: `add dest srcA srcB`
+    /// Cost: 1 ALU slot, needs both operands ready
+    Add { a_value: i64, b_value: i64 },
+
+    /// ALU subtraction: `sub dest srcA srcB`
+    /// Cost: 1 ALU slot, needs both operands ready
+    Sub { a_value: i64, b_value: i64 },
+
+    /// ALU multiplication: `mul dest srcA srcB`
+    /// Cost: 1 ALU slot, needs both operands ready
+    Mul { a_value: i64, b_value: i64 },
+
+    /// ALU left shift: `shl dest src amount`
+    /// Cost: 1 ALU slot, needs base value ready + shift amount as constant
+    Shift { base_value: i64, shift_amount: u8 },
+}
+
+impl ConstEncoding {
+    /// Get the engine this encoding uses
+    pub fn engine(&self) -> Engine {
+        match self {
+            ConstEncoding::Load => Engine::Load,
+            _ => Engine::Alu,
+        }
+    }
+
+    /// Get the values this encoding depends on (must be available before scheduling)
+    pub fn dependencies(&self) -> Vec<i64> {
+        match self {
+            ConstEncoding::Load => vec![],
+            ConstEncoding::XorZero { source_value } => vec![*source_value],
+            ConstEncoding::Add { a_value, b_value } => vec![*a_value, *b_value],
+            ConstEncoding::Sub { a_value, b_value } => vec![*a_value, *b_value],
+            ConstEncoding::Mul { a_value, b_value } => vec![*a_value, *b_value],
+            ConstEncoding::Shift { base_value, shift_amount } => {
+                // Shift amount must also be available as a constant
+                vec![*base_value, *shift_amount as i64]
+            }
+        }
+    }
+
+    /// Check if this encoding's dependencies are satisfied
+    pub fn is_ready(&self, available_values: &HashSet<i64>) -> bool {
+        match self {
+            ConstEncoding::Load => true, // No dependencies
+            ConstEncoding::XorZero { source_value } => available_values.contains(source_value),
+            ConstEncoding::Add { a_value, b_value }
+            | ConstEncoding::Sub { a_value, b_value }
+            | ConstEncoding::Mul { a_value, b_value } => {
+                available_values.contains(a_value) && available_values.contains(b_value)
+            }
+            ConstEncoding::Shift { base_value, shift_amount } => {
+                available_values.contains(base_value)
+                    && available_values.contains(&(*shift_amount as i64))
+            }
+        }
+    }
+}
+
+/// A pseudo-operation representing "need constant value V available in a register".
+///
+/// Unlike concrete ops, a PseudoConst doesn't commit to how the constant is generated.
+/// The scheduler resolves it to a concrete encoding (Load, Add, etc.) based on:
+/// - Available resources (load slots, ALU slots)
+/// - Which operand values are already available
+/// - Critical path considerations (urgent consumers = higher priority)
+#[derive(Clone, Debug)]
+pub struct PseudoConst {
+    /// Unique identifier (separate namespace from Op ids)
+    pub id: usize,
+
+    /// The constant value to materialize
+    pub value: i64,
+
+    /// Destination register (assigned when resolved, or pre-assigned)
+    pub dest_register: Option<i64>,
+
+    /// Possible encodings, sorted by preference (index 0 = highest priority)
+    pub encodings: Vec<ConstEncoding>,
+
+    /// Operations that depend on this constant being ready
+    pub consumer_op_ids: Vec<usize>,
+
+    /// The encoding actually chosen (filled when scheduled)
+    pub resolved_encoding: Option<ConstEncoding>,
+
+    /// Cycle when this was scheduled (-1 if not yet scheduled)
+    pub scheduled_cycle: i32,
+
+    /// Whether this constant is on the critical path
+    pub is_critical: bool,
+}
+
+impl PseudoConst {
+    /// Create a new pseudo-const with computed encodings
+    pub fn new(id: usize, value: i64, dest_register: Option<i64>) -> Self {
+        let encodings = compute_const_encodings(value);
+        PseudoConst {
+            id,
+            value,
+            dest_register,
+            encodings,
+            consumer_op_ids: Vec::new(),
+            resolved_encoding: None,
+            scheduled_cycle: -1,
+            is_critical: false,
+        }
+    }
+
+    /// Create a pseudo-const marked as critical (will prefer Load encoding)
+    pub fn new_critical(id: usize, value: i64, dest_register: Option<i64>) -> Self {
+        let mut pc = Self::new(id, value, dest_register);
+        pc.is_critical = true;
+        // For critical constants, put Load first if not already
+        if !pc.encodings.is_empty() && pc.encodings[0] != ConstEncoding::Load {
+            pc.encodings.retain(|e| *e != ConstEncoding::Load);
+            pc.encodings.insert(0, ConstEncoding::Load);
+        }
+        pc
+    }
+
+    /// Check if this pseudo-const has been resolved
+    pub fn is_resolved(&self) -> bool {
+        self.resolved_encoding.is_some()
+    }
+
+    /// Get the best encoding that can be scheduled now
+    pub fn best_available_encoding(&self, available_values: &HashSet<i64>) -> Option<&ConstEncoding> {
+        self.encodings.iter().find(|enc| enc.is_ready(available_values))
+    }
+}
+
+/// Compute all valid encodings for a constant value.
+///
+/// Returns encodings sorted by preference:
+/// 1. Load (always available, no deps)
+/// 2. XorZero (for value 0)
+/// 3. Add (various decompositions)
+/// 4. Shift (if value is related to power of 2)
+/// 5. Mul (various decompositions)
+pub fn compute_const_encodings(value: i64) -> Vec<ConstEncoding> {
+    let mut encodings = Vec::new();
+
+    // Load is always possible
+    encodings.push(ConstEncoding::Load);
+
+    // Special case: 0 can be generated via XOR
+    if value == 0 {
+        // Prefer XOR with 1 (likely to be available)
+        encodings.push(ConstEncoding::XorZero { source_value: 1 });
+        return encodings;
+    }
+
+    // For positive values, compute decompositions
+    if value > 0 {
+        // Add decompositions: value = a + b where a <= b
+        // Limit to reasonable operands to avoid combinatorial explosion
+        let max_operand = value.min(512);
+        for a in 0..=max_operand {
+            let b = value - a;
+            if b >= a && b >= 0 && b <= 512 {
+                encodings.push(ConstEncoding::Add {
+                    a_value: a,
+                    b_value: b,
+                });
+            }
+        }
+
+        // Shift decompositions: value = base << shift
+        for shift in 1..=9u8 {
+            let divisor = 1i64 << shift;
+            if value % divisor == 0 {
+                let base = value / divisor;
+                if base > 0 && base <= 256 {
+                    encodings.push(ConstEncoding::Shift {
+                        base_value: base,
+                        shift_amount: shift,
+                    });
+                }
+            }
+        }
+
+        // Mul decompositions: value = a * b where a <= b
+        // Only for small factors to avoid blowup
+        for a in 2..=16i64 {
+            if value % a == 0 {
+                let b = value / a;
+                if b >= a && b <= 256 {
+                    encodings.push(ConstEncoding::Mul {
+                        a_value: a,
+                        b_value: b,
+                    });
+                }
+            }
+        }
+    }
+
+    // For negative values, use subtraction from 0
+    if value < 0 {
+        encodings.push(ConstEncoding::Sub {
+            a_value: 0,
+            b_value: -value,
+        });
+    }
+
+    encodings
+}
+
+// ============================================================================
+// VALU to ALU Conversion
+// ============================================================================
+
 /// Check if a VALU op can be converted to 8 scalar ALU ops
 pub fn can_convert_valu_to_alu(op: &Op) -> bool {
     if op.engine != Engine::Valu {
@@ -420,4 +651,248 @@ pub fn expand_valu_to_alu_smart(
         new_ops.push(new_op);
     }
     (new_ops, forward_count)
+}
+
+// ============================================================================
+// PseudoConst Resolution
+// ============================================================================
+
+/// Resolve a PseudoConst to a concrete Op.
+///
+/// Given the chosen encoding and register mappings, produces the actual
+/// instruction to execute.
+pub fn resolve_pseudo_const(
+    pc: &PseudoConst,
+    encoding: &ConstEncoding,
+    value_to_register: &std::collections::HashMap<i64, i64>,
+    next_op_id: usize,
+) -> Option<Op> {
+    let dest = pc.dest_register?;
+
+    let (engine, slot, reads) = match encoding {
+        ConstEncoding::Load => {
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("const".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(pc.value),
+            ]
+            .into_iter()
+            .collect();
+            (Engine::Load, slot, HashSet::new())
+        }
+
+        ConstEncoding::XorZero { source_value } => {
+            let src_reg = *value_to_register.get(source_value)?;
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("^".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(src_reg),
+                SlotVal::Int(src_reg),
+            ]
+            .into_iter()
+            .collect();
+            let reads: HashSet<i64> = [src_reg].into_iter().collect();
+            (Engine::Alu, slot, reads)
+        }
+
+        ConstEncoding::Add { a_value, b_value } => {
+            let a_reg = *value_to_register.get(a_value)?;
+            let b_reg = *value_to_register.get(b_value)?;
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("+".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(a_reg),
+                SlotVal::Int(b_reg),
+            ]
+            .into_iter()
+            .collect();
+            let reads: HashSet<i64> = [a_reg, b_reg].into_iter().collect();
+            (Engine::Alu, slot, reads)
+        }
+
+        ConstEncoding::Sub { a_value, b_value } => {
+            let a_reg = *value_to_register.get(a_value)?;
+            let b_reg = *value_to_register.get(b_value)?;
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("-".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(a_reg),
+                SlotVal::Int(b_reg),
+            ]
+            .into_iter()
+            .collect();
+            let reads: HashSet<i64> = [a_reg, b_reg].into_iter().collect();
+            (Engine::Alu, slot, reads)
+        }
+
+        ConstEncoding::Mul { a_value, b_value } => {
+            let a_reg = *value_to_register.get(a_value)?;
+            let b_reg = *value_to_register.get(b_value)?;
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("*".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(a_reg),
+                SlotVal::Int(b_reg),
+            ]
+            .into_iter()
+            .collect();
+            let reads: HashSet<i64> = [a_reg, b_reg].into_iter().collect();
+            (Engine::Alu, slot, reads)
+        }
+
+        ConstEncoding::Shift { base_value, shift_amount } => {
+            let base_reg = *value_to_register.get(base_value)?;
+            let shift_reg = *value_to_register.get(&(*shift_amount as i64))?;
+            let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
+                SlotVal::Str("<<".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(base_reg),
+                SlotVal::Int(shift_reg),
+            ]
+            .into_iter()
+            .collect();
+            let reads: HashSet<i64> = [base_reg, shift_reg].into_iter().collect();
+            (Engine::Alu, slot, reads)
+        }
+    };
+
+    let writes: HashSet<i64> = [dest].into_iter().collect();
+
+    Some(Op {
+        id: next_op_id,
+        engine,
+        slot,
+        cycle: -1,
+        dep_ids: HashSet::new(), // Will be filled by caller based on encoding deps
+        reads,
+        writes,
+        last_use_reads: HashSet::new(),
+        produces_constant: Some(pc.value),
+    })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_encodings_zero() {
+        let encodings = compute_const_encodings(0);
+        assert!(encodings.contains(&ConstEncoding::Load));
+        assert!(encodings.contains(&ConstEncoding::XorZero { source_value: 1 }));
+    }
+
+    #[test]
+    fn test_compute_encodings_small() {
+        let encodings = compute_const_encodings(4);
+        assert!(encodings.contains(&ConstEncoding::Load));
+        assert!(encodings.contains(&ConstEncoding::Add { a_value: 2, b_value: 2 }));
+        assert!(encodings.contains(&ConstEncoding::Mul { a_value: 2, b_value: 2 }));
+        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 1, shift_amount: 2 }));
+        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 2, shift_amount: 1 }));
+    }
+
+    #[test]
+    fn test_compute_encodings_240() {
+        let encodings = compute_const_encodings(240);
+        assert!(encodings.contains(&ConstEncoding::Load));
+        // 240 = 120 + 120
+        assert!(encodings.contains(&ConstEncoding::Add { a_value: 120, b_value: 120 }));
+        // 240 = 128 + 112
+        assert!(encodings.contains(&ConstEncoding::Add { a_value: 112, b_value: 128 }));
+        // 240 = 15 << 4
+        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 15, shift_amount: 4 }));
+        // 240 = 15 * 16
+        assert!(encodings.contains(&ConstEncoding::Mul { a_value: 15, b_value: 16 }));
+    }
+
+    #[test]
+    fn test_encoding_dependencies() {
+        let load = ConstEncoding::Load;
+        assert!(load.dependencies().is_empty());
+
+        let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        assert_eq!(add.dependencies(), vec![10, 20]);
+
+        let shift = ConstEncoding::Shift { base_value: 5, shift_amount: 3 };
+        assert_eq!(shift.dependencies(), vec![5, 3]);
+    }
+
+    #[test]
+    fn test_encoding_is_ready() {
+        let mut available: HashSet<i64> = HashSet::new();
+
+        let load = ConstEncoding::Load;
+        assert!(load.is_ready(&available)); // Load always ready
+
+        let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        assert!(!add.is_ready(&available));
+
+        available.insert(10);
+        assert!(!add.is_ready(&available));
+
+        available.insert(20);
+        assert!(add.is_ready(&available));
+    }
+
+    #[test]
+    fn test_pseudo_const_best_encoding() {
+        let pc = PseudoConst::new(0, 240, Some(100));
+        let mut available: HashSet<i64> = HashSet::new();
+
+        // Initially only Load is available
+        let best = pc.best_available_encoding(&available);
+        assert_eq!(best, Some(&ConstEncoding::Load));
+
+        // Add enough values for derivation
+        available.insert(120);
+        let best = pc.best_available_encoding(&available);
+        // Still prefer Load (it's first)
+        assert_eq!(best, Some(&ConstEncoding::Load));
+    }
+
+    #[test]
+    fn test_pseudo_const_critical() {
+        let pc = PseudoConst::new_critical(0, 240, Some(100));
+        assert!(pc.is_critical);
+        // Load should be first encoding for critical constants
+        assert_eq!(pc.encodings[0], ConstEncoding::Load);
+    }
+
+    #[test]
+    fn test_resolve_pseudo_const_load() {
+        let pc = PseudoConst::new(0, 42, Some(100));
+        let value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+
+        let op = resolve_pseudo_const(&pc, &ConstEncoding::Load, &value_to_reg, 1000);
+        assert!(op.is_some());
+
+        let op = op.unwrap();
+        assert_eq!(op.engine, Engine::Load);
+        assert_eq!(op.produces_constant, Some(42));
+        assert!(op.writes.contains(&100));
+    }
+
+    #[test]
+    fn test_resolve_pseudo_const_add() {
+        let pc = PseudoConst::new(0, 30, Some(100));
+        let mut value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        value_to_reg.insert(10, 50);  // value 10 is in register 50
+        value_to_reg.insert(20, 60);  // value 20 is in register 60
+
+        let encoding = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        let op = resolve_pseudo_const(&pc, &encoding, &value_to_reg, 1000);
+        assert!(op.is_some());
+
+        let op = op.unwrap();
+        assert_eq!(op.engine, Engine::Alu);
+        assert!(op.reads.contains(&50));
+        assert!(op.reads.contains(&60));
+        assert!(op.writes.contains(&100));
+        assert_eq!(op.produces_constant, Some(30));
+    }
 }

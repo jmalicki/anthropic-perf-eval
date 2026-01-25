@@ -6,7 +6,7 @@
 use arrayvec::ArrayVec;
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{Engine, Op, Opcode, SlotVal, MAX_SLOT_SIZE, VLEN};
+use crate::types::{Engine, Op, Opcode, PseudoConst, SlotVal, MAX_SLOT_SIZE, VLEN};
 
 /// Broadcast cache entry - tracks where a scalar value has been broadcast to
 #[derive(Debug, Clone)]
@@ -30,6 +30,16 @@ pub struct EmitContext {
     /// Maps source scalar address -> broadcast entry
     /// Used to detect duplicate broadcasts from the same scalar
     pub broadcast_cache: HashMap<i64, BroadcastEntry>,
+
+    // === Pseudo-constant support ===
+    /// Next pseudo-const ID to assign
+    pub next_pseudo_const_id: usize,
+    /// Pending pseudo-constants (not yet resolved)
+    pub pseudo_consts: Vec<PseudoConst>,
+    /// Maps constant value -> pseudo-const ID (for linking consumers)
+    pub value_to_pseudo_const_id: HashMap<i64, usize>,
+    /// Maps constant value -> destination register
+    pub value_to_register: HashMap<i64, i64>,
 }
 
 impl EmitContext {
@@ -39,6 +49,10 @@ impl EmitContext {
             ops: Vec::new(),
             known_constants: HashMap::new(),
             broadcast_cache: HashMap::new(),
+            next_pseudo_const_id: 0,
+            pseudo_consts: Vec::new(),
+            value_to_pseudo_const_id: HashMap::new(),
+            value_to_register: HashMap::new(),
         }
     }
 
@@ -47,7 +61,93 @@ impl EmitContext {
         self.next_op_id = 0;
         self.known_constants.clear();
         self.broadcast_cache.clear();
+        self.next_pseudo_const_id = 0;
+        self.pseudo_consts.clear();
+        self.value_to_pseudo_const_id.clear();
+        self.value_to_register.clear();
         std::mem::take(&mut self.ops)
+    }
+
+    /// Take all ops and pseudo-consts, resetting the context
+    pub fn take_ops_and_pseudo_consts(&mut self) -> (Vec<Op>, Vec<PseudoConst>) {
+        self.next_op_id = 0;
+        self.known_constants.clear();
+        self.broadcast_cache.clear();
+        self.next_pseudo_const_id = 0;
+        self.value_to_pseudo_const_id.clear();
+        self.value_to_register.clear();
+        (std::mem::take(&mut self.ops), std::mem::take(&mut self.pseudo_consts))
+    }
+
+    /// Declare that a constant value is needed.
+    ///
+    /// Creates a PseudoConst that the scheduler will resolve to a concrete
+    /// encoding (Load, Add, Mul, etc.) based on available resources.
+    ///
+    /// Returns the destination register where the value will be available.
+    /// If the same value was already requested, returns the existing register.
+    pub fn need_const(&mut self, value: i64, dest: i64) -> i64 {
+        // Check if this value is already requested
+        if let Some(&existing_dest) = self.value_to_register.get(&value) {
+            return existing_dest;
+        }
+
+        // Create a new pseudo-const
+        let pc = PseudoConst::new(self.next_pseudo_const_id, value, Some(dest));
+        let pc_id = pc.id;
+        self.pseudo_consts.push(pc);
+
+        self.value_to_pseudo_const_id.insert(value, pc_id);
+        self.value_to_register.insert(value, dest);
+        self.next_pseudo_const_id += 1;
+
+        // Also register in known_constants so ops can reference it
+        self.known_constants.insert(dest, value);
+
+        dest
+    }
+
+    /// Declare that a critical constant value is needed (will prefer Load encoding).
+    ///
+    /// Use this for constants on the critical path that need to be available ASAP.
+    pub fn need_const_critical(&mut self, value: i64, dest: i64) -> i64 {
+        // Check if this value is already requested
+        if let Some(&existing_dest) = self.value_to_register.get(&value) {
+            return existing_dest;
+        }
+
+        // Create a new critical pseudo-const
+        let pc = PseudoConst::new_critical(self.next_pseudo_const_id, value, Some(dest));
+        let pc_id = pc.id;
+        self.pseudo_consts.push(pc);
+
+        self.value_to_pseudo_const_id.insert(value, pc_id);
+        self.value_to_register.insert(value, dest);
+        self.next_pseudo_const_id += 1;
+
+        // Also register in known_constants so ops can reference it
+        self.known_constants.insert(dest, value);
+
+        dest
+    }
+
+    /// Link an op as a consumer of a pseudo-const value.
+    ///
+    /// Call this after emitting an op that reads from a constant value
+    /// to establish the dependency.
+    pub fn link_const_consumer(&mut self, value: i64, op_id: usize) {
+        if let Some(&pc_id) = self.value_to_pseudo_const_id.get(&value) {
+            if let Some(pc) = self.pseudo_consts.iter_mut().find(|p| p.id == pc_id) {
+                if !pc.consumer_op_ids.contains(&op_id) {
+                    pc.consumer_op_ids.push(op_id);
+                }
+            }
+        }
+    }
+
+    /// Get the register holding a constant value, if it was declared via need_const.
+    pub fn get_const_register(&self, value: i64) -> Option<i64> {
+        self.value_to_register.get(&value).copied()
     }
 
     /// Get number of ops

@@ -13,8 +13,8 @@ use crate::constants::{
 };
 use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
 use crate::scheduler::{
-    compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics, PriorityMode,
-    ALL_PRIORITY_MODES,
+    compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics,
+    schedule_with_pseudo_consts, PriorityMode, ALL_PRIORITY_MODES,
 };
 use arrayvec::ArrayVec;
 
@@ -1488,8 +1488,11 @@ struct ScheduleAttempt {
 ///
 /// If `output_json` is provided, writes the schedule in schedule_output.json format
 /// with detailed slot utilization info per cycle.
+///
+/// If `enable_pseudo_consts` is true, uses flexible constant generation where the scheduler
+/// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1501,6 +1504,7 @@ pub fn build_tick_tock_kernel<'py>(
     output_json: Option<String>,
     enable_lazy_partition: bool,
     partition_frequency: usize,
+    enable_pseudo_consts: bool,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1511,14 +1515,24 @@ pub fn build_tick_tock_kernel<'py>(
         enable_debug: false,
         enable_lazy_partition,
         partition_frequency,
+        enable_pseudo_consts,
     };
 
     // Build the kernel (generates unscheduled ops)
-    let mut builder = TickTockKernelBuilder::new(config);
-    let mut ops = builder.build();
+    let mut builder = TickTockKernelBuilder::new(config.clone());
+
+    // Get ops and optionally pseudo-consts
+    let (mut ops, pseudo_consts) = if enable_pseudo_consts {
+        builder.build_with_pseudo_consts()
+    } else {
+        (builder.build(), Vec::new())
+    };
 
     if verbose {
         println!("Generated {} ops", ops.len());
+        if !pseudo_consts.is_empty() {
+            println!("Generated {} pseudo-consts", pseudo_consts.len());
+        }
         println!("Scratch usage: {} / 1536", builder.alloc.usage());
     }
 
@@ -1539,25 +1553,59 @@ pub fn build_tick_tock_kernel<'py>(
         .collect();
 
     // Run all priority modes in parallel using Rayon
-    let results: Vec<ScheduleAttempt> = ALL_PRIORITY_MODES
-        .par_iter()
-        .map(|&mode| {
-            let mut test_ops = ops.clone();
-            for op in &mut test_ops {
-                op.cycle = -1;
-                op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
-            }
+    let results: Vec<ScheduleAttempt> = if enable_pseudo_consts && !pseudo_consts.is_empty() {
+        // Use pseudo-const aware scheduler
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
 
-            let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+                // Use schedule_with_pseudo_consts - start const registers at 2000 to avoid conflicts
+                // After this call, test_ops contains both const ops and regular ops (all scheduled)
+                let (result, _const_ops) = schedule_with_pseudo_consts(
+                    &mut test_ops,
+                    pseudo_consts.clone(),
+                    &critical_path,
+                    enable_valu_shift,
+                    mode,
+                    2000,  // const_register_start
+                );
 
-            ScheduleAttempt {
-                mode,
-                cycles: result.cycles,
-                ops: test_ops,
-                expanded_ops: result.expanded_ops,
-            }
-        })
-        .collect();
+                // test_ops now contains all scheduled ops including const ops
+                ScheduleAttempt {
+                    mode,
+                    cycles: result.cycles,
+                    ops: test_ops,
+                    expanded_ops: result.expanded_ops,
+                }
+            })
+            .collect()
+    } else {
+        // Use standard greedy scheduler
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
+
+                let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+
+                ScheduleAttempt {
+                    mode,
+                    cycles: result.cycles,
+                    ops: test_ops,
+                    expanded_ops: result.expanded_ops,
+                }
+            })
+            .collect()
+    };
 
     // Find the best result
     let best = results
@@ -1599,8 +1647,11 @@ pub fn build_tick_tock_kernel<'py>(
 ///
 /// This is a faster version that doesn't emit back to Python, just returns the cycle count.
 /// Uses parallel multipass scheduling.
+///
+/// If `enable_pseudo_consts` is true, uses flexible constant generation where the scheduler
+/// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false))]
 pub fn build_tick_tock_kernel_ops(
     _py: Python<'_>,
     forest_height: usize,
@@ -1611,6 +1662,7 @@ pub fn build_tick_tock_kernel_ops(
     verbose: bool,
     enable_lazy_partition: bool,
     partition_frequency: usize,
+    enable_pseudo_consts: bool,
 ) -> PyResult<usize> {
     let config = KernelConfig {
         forest_height,
@@ -1621,14 +1673,24 @@ pub fn build_tick_tock_kernel_ops(
         enable_debug: false,
         enable_lazy_partition,
         partition_frequency,
+        enable_pseudo_consts,
     };
 
     // Build the kernel (generates unscheduled ops)
-    let mut builder = TickTockKernelBuilder::new(config);
-    let mut ops = builder.build();
+    let mut builder = TickTockKernelBuilder::new(config.clone());
+
+    // Get ops and optionally pseudo-consts
+    let (mut ops, pseudo_consts) = if enable_pseudo_consts {
+        builder.build_with_pseudo_consts()
+    } else {
+        (builder.build(), Vec::new())
+    };
 
     if verbose {
         println!("Generated {} ops", ops.len());
+        if !pseudo_consts.is_empty() {
+            println!("Generated {} pseudo-consts", pseudo_consts.len());
+        }
         println!("Scratch usage: {} / 1536", builder.alloc.usage());
     }
 
@@ -1649,19 +1711,45 @@ pub fn build_tick_tock_kernel_ops(
         .collect();
 
     // Run all priority modes in parallel using Rayon
-    let results: Vec<(PriorityMode, usize)> = ALL_PRIORITY_MODES
-        .par_iter()
-        .map(|&mode| {
-            let mut test_ops = ops.clone();
-            for op in &mut test_ops {
-                op.cycle = -1;
-                op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
-            }
+    let results: Vec<(PriorityMode, usize)> = if enable_pseudo_consts && !pseudo_consts.is_empty() {
+        // Use pseudo-const aware scheduler
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
 
-            let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
-            (mode, result.cycles)
-        })
-        .collect();
+                // Use schedule_with_pseudo_consts - start const registers at 2000 to avoid conflicts
+                let (result, _const_ops) = schedule_with_pseudo_consts(
+                    &mut test_ops,
+                    pseudo_consts.clone(),
+                    &critical_path,
+                    enable_valu_shift,
+                    mode,
+                    2000,  // const_register_start
+                );
+                (mode, result.cycles)
+            })
+            .collect()
+    } else {
+        // Use standard greedy scheduler
+        ALL_PRIORITY_MODES
+            .par_iter()
+            .map(|&mode| {
+                let mut test_ops = ops.clone();
+                for op in &mut test_ops {
+                    op.cycle = -1;
+                    op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+                }
+
+                let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+                (mode, result.cycles)
+            })
+            .collect()
+    };
 
     // Find the best result
     let (best_mode, best_cycles) = results

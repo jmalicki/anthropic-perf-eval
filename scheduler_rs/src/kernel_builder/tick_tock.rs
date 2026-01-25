@@ -55,6 +55,21 @@ impl TickTockKernelBuilder {
 
     /// Build the kernel, returning the list of unscheduled ops
     pub fn build(&mut self) -> Vec<Op> {
+        self.build_internal();
+        self.emit.take_ops()
+    }
+
+    /// Build the kernel with pseudo-const support, returning both ops and pseudo-consts.
+    ///
+    /// Use this when enable_pseudo_consts is set to get the pseudo-const list
+    /// for the scheduler's schedule_with_pseudo_consts() function.
+    pub fn build_with_pseudo_consts(&mut self) -> (Vec<Op>, Vec<crate::types::PseudoConst>) {
+        self.build_internal();
+        self.emit.take_ops_and_pseudo_consts()
+    }
+
+    /// Internal build logic shared by both build() and build_with_pseudo_consts()
+    fn build_internal(&mut self) {
         let n_groups = self.config.n_groups();
         let n_iters = self.config.n_iters();
 
@@ -71,8 +86,12 @@ impl TickTockKernelBuilder {
             );
         }
 
-        // Emit initialization
-        self.emit_common_init();
+        // Emit initialization - choose method based on config
+        if self.config.enable_pseudo_consts {
+            self.emit_common_init_with_pseudo_consts();
+        } else {
+            self.emit_common_init();
+        }
         self.emit_valu_selection_init();
         self.emit_partition_init();
 
@@ -104,9 +123,6 @@ impl TickTockKernelBuilder {
 
         // Store data
         self.emit_store_data(n_groups);
-
-        // Return the ops
-        self.emit.take_ops()
     }
 
     // =========================================================================
@@ -403,6 +419,123 @@ impl TickTockKernelBuilder {
             self.ctx.hash_fma_mult_s.insert(*i, mult_s);
             self.emit.emit_const(mult_s, *mult);
             let actual_v_mult = self.emit.emit_vbroadcast(v_mult, mult_s);
+            self.ctx.v_hash_mult.insert(*i, actual_v_mult);
+        }
+    }
+
+    /// Emit common initialization using pseudo-consts for flexible constant generation.
+    ///
+    /// Instead of a fixed derivation chain (1 -> 2 -> 3 -> ...), this method
+    /// declares the needed constants via need_const() and lets the scheduler
+    /// dynamically choose between Load, Add, Mul, etc. based on resource availability.
+    ///
+    /// This reduces early cycle inefficiency by allowing the scheduler to:
+    /// - Load critical constants directly when load slots are available
+    /// - Derive constants via ALU when load slots are scarce
+    /// - Schedule constant generation just-in-time when consumers need them
+    ///
+    /// NOTE: Temporary address values (in st[0], st[1]) still use emit_const()
+    /// because they are reused for different values and don't need pseudo-const flexibility.
+    fn emit_common_init_with_pseudo_consts(&mut self) {
+        // Register ZERO_REG as known constant 0 (no load needed - scratch is initialized to 0)
+        self.emit.known_constants.insert(ZERO_REG, 0);
+        self.emit.value_to_register.insert(0, ZERO_REG);
+
+        // === DECLARE SMALL CONSTANTS (0-15) ===
+        // The scheduler will choose optimal encodings:
+        // - 0: use ZERO_REG (already available)
+        // - 1: must Load (no derivation possible)
+        // - 2-15: Load or derive from smaller constants
+        // NOTE: We must capture the return value from need_const because it may
+        // return a different register if the value was already registered.
+        self.ctx.c[0] = ZERO_REG;
+        for i in 1..16 {
+            self.ctx.c[i] = self.emit.need_const(i as i64, self.ctx.c[i]);
+        }
+
+        // === LOAD POINTERS ===
+        // Use emit_const for temporary address values (st[0], st[1] are reused)
+        // These are sequential operations that overwrite the same temporaries
+        self.emit.emit_const(self.ctx.st[0], 4);
+        self.emit.emit_const(self.ctx.st[1], 5);
+        self.emit.emit_load(self.ctx.forest_p, self.ctx.st[0]);
+        self.emit.emit_load(self.ctx.idx_p, self.ctx.st[1]);
+
+        self.emit.emit_const(self.ctx.st[0], 6);
+        self.emit.emit_const(self.ctx.st[1], 1);
+        self.emit.emit_load(self.ctx.val_p, self.ctx.st[0]);
+        self.emit.emit_load(self.ctx.n_nodes_s, self.ctx.st[1]);
+
+        // Load extra_room pointer
+        self.emit.emit_const(self.ctx.st[0], 7);
+        self.emit.emit_load(self.ctx.extra_room_p, self.ctx.st[0]);
+
+        // Compute partition buffer offsets (constant values, not addresses)
+        self.emit.emit_const(self.ctx.partition_idx_offset, 0);
+        self.emit.emit_const(self.ctx.partition_val_offset, 256);
+
+        // === HASH CONSTANTS ===
+        // These are large values that must be loaded directly.
+        // Using need_const allows the scheduler to defer them until needed.
+        // NOTE: Capture return values to handle potential value deduplication.
+        for i in 0..6 {
+            self.ctx.hc[i] = self.emit.need_const(HASH_STAGES[i].1, self.ctx.hc[i]);
+            self.ctx.hs[i] = self.emit.need_const(HASH_STAGES[i].4, self.ctx.hs[i]);
+        }
+
+        // === BROADCASTS ===
+        // Vector versions of scalar constants
+        self.ctx.v_0 = self.emit.emit_vbroadcast(self.ctx.v_0, self.ctx.c[0]);
+        self.ctx.v_1 = self.emit.emit_vbroadcast(self.ctx.v_1, self.ctx.c[1]);
+        self.ctx.v_2 = self.emit.emit_vbroadcast(self.ctx.v_2, self.ctx.c[2]);
+        self.ctx.v_nn = self.emit.emit_vbroadcast(self.ctx.v_nn, self.ctx.n_nodes_s);
+
+        for i in 0..8 {
+            self.ctx.v_const[i] = self.emit.emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
+        }
+
+        for i in 0..6 {
+            self.ctx.v_hc[i] = self.emit.emit_vbroadcast(self.ctx.v_hc[i], self.ctx.hc[i]);
+            self.ctx.v_hs[i] = self.emit.emit_vbroadcast(self.ctx.v_hs[i], self.ctx.hs[i]);
+        }
+
+        // Stage 5 XOR constant
+        // NOTE: Capture return value to handle potential value deduplication.
+        self.ctx.stage5_xor_s = self.emit.need_const(STAGE5_XOR_CONST, self.ctx.stage5_xor_s);
+        self.ctx.v_stage5_xor = self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
+
+        // === TREE CACHE ===
+        // Load tree[0..6] - these are critical for early tree access!
+        for i in 0..7 {
+            self.emit.emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c[i]);
+            self.emit.emit_load(self.ctx.tc[i], self.ctx.st[0]);
+        }
+
+        // Compute deltas
+        self.emit.emit_alu(Opcode::Sub, self.ctx.td_1, self.ctx.tc[1], self.ctx.tc[2]);
+        self.emit.emit_alu(Opcode::Sub, self.ctx.td_4, self.ctx.tc[4], self.ctx.tc[3]);
+        self.emit.emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
+        self.emit.emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
+
+        self.ctx.v_tc2 = self.emit.emit_vbroadcast(self.ctx.v_tc2, self.ctx.tc[2]);
+        self.ctx.v_td_1 = self.emit.emit_vbroadcast(self.ctx.v_td_1, self.ctx.td_1);
+        self.ctx.v_tc3 = self.emit.emit_vbroadcast(self.ctx.v_tc3, self.ctx.tc[3]);
+        self.ctx.v_td_4 = self.emit.emit_vbroadcast(self.ctx.v_td_4, self.ctx.td_4);
+        self.ctx.v_td_5 = self.emit.emit_vbroadcast(self.ctx.v_td_5, self.ctx.td_5);
+        self.ctx.v_td_6 = self.emit.emit_vbroadcast(self.ctx.v_td_6, self.ctx.td_6);
+
+        // === FMA MULTIPLIERS ===
+        let fma_mults: Vec<(usize, i64)> = (0..6)
+            .filter_map(|i| self.ctx.hash_fma_mult[i].map(|m| (i, m)))
+            .collect();
+
+        for (i, mult) in &fma_mults {
+            let mult_s = self.alloc.alloc(&format!("hash_mult_{}", i), 1);
+            let v_mult = self.alloc.vec(&format!("v_hash_mult_{}", i));
+            // NOTE: Capture return value to handle potential value deduplication.
+            let actual_mult_s = self.emit.need_const(*mult, mult_s);
+            self.ctx.hash_fma_mult_s.insert(*i, actual_mult_s);
+            let actual_v_mult = self.emit.emit_vbroadcast(v_mult, actual_mult_s);
             self.ctx.v_hash_mult.insert(*i, actual_v_mult);
         }
     }

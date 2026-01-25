@@ -47,6 +47,11 @@ pub struct KernelConfig {
     /// k=3 means partition every 3 rounds -> 8-way selection
     /// k=1 is optimal because 2-way select is cheap and partition stores are FREE
     pub partition_frequency: usize,
+    /// Enable pseudo-const mode for flexible constant generation.
+    /// When enabled, constants are declared via need_const() and the scheduler
+    /// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
+    /// This can reduce early cycle inefficiency by avoiding long derivation chains.
+    pub enable_pseudo_consts: bool,
 }
 
 impl Default for KernelConfig {
@@ -60,6 +65,7 @@ impl Default for KernelConfig {
             enable_debug: false,
             enable_lazy_partition: false,
             partition_frequency: 1,
+            enable_pseudo_consts: false,
         }
     }
 }
