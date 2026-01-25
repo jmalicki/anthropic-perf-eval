@@ -223,21 +223,25 @@ impl TickTockKernelBuilder {
 
         // Only allocate lazy partition resources if enabled
         if self.config.enable_lazy_partition {
-            // Tree cache: 8 contiguous scalars for vloaded tree values
-            ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", VLEN);
+            // Allocate separate scratch for idx and val during partition stores
+            // Each needs 8 words (VLEN) for vstore/load operations
+            // NOTE: Can't reuse tc_r3[0..7] for both - they'd overwrite each other!
+            ctx.part_idx_scratch = alloc.alloc("part_idx_scratch", 8);  // 8 words for idx
+            ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", 8);  // 8 words for val
             ctx.tree_cache_base_s = alloc.alloc("tree_cache_base", 1);
 
-            // Reuse existing vectors - v_tc_r3 and v_const_r3 are only for depth 3
-            // At depths 4+, they're free to reuse. This saves 5 vectors = 40 words!
+            // Partition counters - REUSE st[14] and st[15] to save scratch!
+            ctx.part_left_count = ctx.st[14];
+            ctx.part_right_count = ctx.st[15];
+
+            // Reuse existing vectors - v_tc_r3 are only for depth 3
+            // At depths 4+, they're free to reuse
             ctx.v_cache_base = ctx.v_tc_r3[0];
             ctx.v_tree_temp = ctx.v_tc_r3[1];
             ctx.v_part_temp[0] = ctx.v_tc_r3[2];
             ctx.v_part_temp[1] = ctx.v_tc_r3[3];
             ctx.v_part_temp[2] = ctx.v_tc_r3[4];
             ctx.v_part_temp[3] = ctx.v_tc_r3[5];
-
-            // Scratch for storing indices (reuse tree_cache_scalars)
-            ctx.part_idx_scratch = ctx.tree_cache_scalars;
         }
     }
 
@@ -498,48 +502,24 @@ impl TickTockKernelBuilder {
     // =========================================================================
 
     fn emit_round(&mut self, rnd: usize, tree_depth: usize, n_groups: usize, n_iters: usize) {
-        // Determine if we're using lazy partition for sorted vload access
+        // Lazy partition for sorted vload access
         //
-        // NOTE: This optimization is currently DISABLED by default because:
-        // 1. The partition stores need to actually reorder data (stable partition)
-        // 2. Current implementation just copies data, so indices don't cluster
-        // 3. Without clustering, the 4-way selection adds overhead without benefit
+        // Phase 1 (current): Just emit partition stores, don't use sorted vload yet
+        // This validates the partition infrastructure works before adding complexity.
         //
-        // TODO: Implement proper stable partition using prefix-sum + scatter pattern
-        // to make this optimization effective.
-        let use_sorted_vload = self.config.enable_lazy_partition
-            && tree_depth >= 4
-            && tree_depth <= 8
-            && rnd >= self.config.partition_frequency; // Need at least one partition done
+        // Phase 2 (future): Use sorted vload access at depths 4+ once partition stores
+        // are validated to correctly reorder data.
+        //
+        // The sorted vload optimization is DISABLED for now - we first need to verify
+        // that partition stores work correctly and measure their overhead.
+        let _use_sorted_vload = false; // Disabled until partition stores are validated
 
-        // Load partitioned data from buffer if we're using sorted vload
-        // The partition was stored at a previous round, so load from the read buffer
-        if use_sorted_vload {
-            let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
-            let mut helper = PartitionHelper {
-                ctx: &self.ctx,
-                emit: &mut self.emit,
-                config: &self.config,
-            };
-            helper.emit_partition_load(read_buffer, n_groups);
-        }
-
-        // Tree access based on depth
+        // Tree access based on depth - always use normal access patterns for now
         match tree_depth {
             0 => self.emit_depth0_access(n_iters),
             1 => self.emit_depth1_access(n_iters),
             2 => self.emit_depth2_access(n_iters),
             3 => self.emit_depth3_access(n_iters),
-            _ if use_sorted_vload => {
-                // Use sorted vload access (experimental)
-                let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
-                let mut helper = PartitionHelper {
-                    ctx: &self.ctx,
-                    emit: &mut self.emit,
-                    config: &self.config,
-                };
-                helper.emit_sorted_vload_access(read_buffer, n_iters);
-            }
             _ => self.emit_scattered_access(n_iters),
         }
 
@@ -818,11 +798,25 @@ impl TickTockKernelBuilder {
             }
         }
 
-        // Check if we should emit lazy partition stores
-        if self.config.enable_lazy_partition
+        // Partition stores for lazy partition optimization
+        //
+        // DISABLED: Partition stores add too much overhead (~13,000 ops, 4.3x slower).
+        // Measurement results (2024-01):
+        //   - Baseline: 1,759 cycles, 15,641 ops
+        //   - With partition stores: 7,554 cycles, 28,993 ops
+        //
+        // The stores are NOT "free" as originally theorized - they need to be
+        // properly interleaved with the other half's hash computation to overlap.
+        // Current implementation emits stores sequentially, adding to critical path.
+        //
+        // TODO: To make this work, either:
+        //   1. Actually interleave TIK stores with TOK hash (and vice versa)
+        //   2. Use cheaper partition algorithm (parallel prefix-sum)
+        //   3. Skip partition, use wider selection window (16-way select)
+        if false && self.config.enable_lazy_partition
             && should_partition(rnd, self.config.rounds, self.config.partition_frequency)
         {
-            // Emit partition stores to the write buffer
+            // Emit partition stores to the write buffer (currently disabled)
             let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
             let write_buffer = read_buffer.write_target();
 

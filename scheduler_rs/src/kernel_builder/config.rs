@@ -41,9 +41,11 @@ pub struct KernelConfig {
     /// When enabled, items are sorted by tree index via stable partition every k rounds,
     /// enabling sequential vloads instead of scattered loads.
     pub enable_lazy_partition: bool,
-    /// Partition frequency: partition every k rounds (default: 3)
-    /// Lower k = more accurate sorting but higher overhead
-    /// k=2 or k=3 recommended for depths 4-8
+    /// Partition frequency: partition every k rounds (default: 1)
+    /// k=1 means partition every round -> 2-way selection (trivial)
+    /// k=2 means partition every 2 rounds -> 4-way selection
+    /// k=3 means partition every 3 rounds -> 8-way selection
+    /// k=1 is optimal because 2-way select is cheap and partition stores are FREE
     pub partition_frequency: usize,
 }
 
@@ -57,7 +59,7 @@ impl Default for KernelConfig {
             enable_valu_shift: true,
             enable_debug: false,
             enable_lazy_partition: false,
-            partition_frequency: 3,
+            partition_frequency: 1,
         }
     }
 }
