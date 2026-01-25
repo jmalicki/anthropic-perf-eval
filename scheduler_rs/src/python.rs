@@ -279,7 +279,7 @@ pub fn emit_scheduled_with_expanded<'py>(
 
         // Emit regular ops, SKIP shifted_valu (these are replaced by expanded ALU ops)
         for op in ops {
-            if op.cycle == cycle as i32 && op.engine != "shifted_valu" {
+            if op.cycle == cycle as i32 && op.engine != "shifted_valu" && op.engine != "eliminated_broadcast" {
                 emit_op_to_dict(py, op, &instr)?;
             }
         }
@@ -929,7 +929,7 @@ pub fn schedule_to_json(
 
         // Process regular ops
         for op in &ops {
-            if op.cycle == cycle as i32 && op.engine != "shifted_valu" {
+            if op.cycle == cycle as i32 && op.engine != "shifted_valu" && op.engine != "eliminated_broadcast" {
                 let opcode = op
                     .slot
                     .get(0)

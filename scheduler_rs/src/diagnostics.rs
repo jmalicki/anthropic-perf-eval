@@ -41,6 +41,10 @@ pub struct SchedulingDiagnostics {
     pub valu_not_shiftable: usize,
     pub valu_alu_no_capacity: usize,
     pub cycles_valu_saturated: usize,
+
+    // Broadcast elimination stats
+    pub broadcasts_eliminated: usize,
+    pub broadcast_forwards: usize,
 }
 
 impl SchedulingDiagnostics {

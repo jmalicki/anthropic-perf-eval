@@ -67,42 +67,99 @@ pub fn can_convert_valu_to_alu(op: &Op) -> bool {
 
 /// Expand a VALU op into 8 scalar ALU ops
 pub fn expand_valu_to_alu(op: &Op, next_op_id: usize) -> Vec<Op> {
+    use std::collections::HashMap;
+    expand_valu_to_alu_smart(op, next_op_id, &HashMap::new(), &HashMap::new()).0
+}
+
+/// Broadcast source info for smart expansion
+#[derive(Clone, Debug, Default)]
+pub struct BroadcastInfo {
+    /// Maps broadcast dest base address -> original scalar source address
+    pub sources: std::collections::HashMap<i64, i64>,
+    /// Maps broadcast dest base address -> op ID of the broadcast
+    pub op_ids: std::collections::HashMap<i64, usize>,
+}
+
+/// Expand a VALU op into 8 scalar ALU ops with broadcast forwarding.
+///
+/// When a VALU op reads from a vbroadcast destination, instead of reading
+/// from the broadcast registers (which would be 8 identical values), we
+/// substitute the original scalar source directly. This eliminates 7
+/// redundant reads per forwarded operand.
+///
+/// Returns (expanded_ops, forward_count) where forward_count is the number
+/// of broadcast forwards applied (0, 1, or 2).
+pub fn expand_valu_to_alu_smart(
+    op: &Op,
+    next_op_id: usize,
+    broadcast_sources: &std::collections::HashMap<i64, i64>,
+    broadcast_op_ids: &std::collections::HashMap<i64, usize>,
+) -> (Vec<Op>, usize) {
     // slot format: (op_type, dest, src1, src2)
     let op_type = match &op.slot[0] {
         SlotVal::Str(s) => s.clone(),
-        _ => return vec![],
+        _ => return (vec![], 0),
     };
     let dest = match &op.slot[1] {
         SlotVal::Int(n) => *n,
-        _ => return vec![],
+        _ => return (vec![], 0),
     };
     let src1 = match &op.slot[2] {
         SlotVal::Int(n) => *n,
-        _ => return vec![],
+        _ => return (vec![], 0),
     };
     let src2 = match &op.slot[3] {
         SlotVal::Int(n) => *n,
-        _ => return vec![],
+        _ => return (vec![], 0),
     };
+
+    // Check if src1 or src2 came from a broadcast AND we depend on that broadcast
+    let src1_is_broadcast = broadcast_sources.contains_key(&src1)
+        && broadcast_op_ids
+            .get(&src1)
+            .map(|&bc_id| op.dep_ids.contains(&bc_id))
+            .unwrap_or(false);
+    let src2_is_broadcast = broadcast_sources.contains_key(&src2)
+        && broadcast_op_ids
+            .get(&src2)
+            .map(|&bc_id| op.dep_ids.contains(&bc_id))
+            .unwrap_or(false);
+
+    let forward_count =
+        (if src1_is_broadcast { 1 } else { 0 }) + (if src2_is_broadcast { 1 } else { 0 });
 
     let mut new_ops = Vec::with_capacity(VLEN);
     for i in 0..VLEN {
-        let i = i as i64;
+        let i_offset = i as i64;
+
+        // If source came from broadcast AND we depend on it, use scalar directly
+        let actual_src1 = if src1_is_broadcast {
+            *broadcast_sources.get(&src1).unwrap()
+        } else {
+            src1 + i_offset
+        };
+
+        let actual_src2 = if src2_is_broadcast {
+            *broadcast_sources.get(&src2).unwrap()
+        } else {
+            src2 + i_offset
+        };
+
         let new_op = Op {
-            id: next_op_id + i as usize,
+            id: next_op_id + i,
             engine: "alu".to_string(),
             slot: vec![
                 SlotVal::Str(op_type.clone()),
-                SlotVal::Int(dest + i),
-                SlotVal::Int(src1 + i),
-                SlotVal::Int(src2 + i),
+                SlotVal::Int(dest + i_offset),
+                SlotVal::Int(actual_src1),
+                SlotVal::Int(actual_src2),
             ],
             cycle: -1,
             dep_ids: op.dep_ids.clone(),
-            reads: [src1 + i, src2 + i].into_iter().collect(),
-            writes: [dest + i].into_iter().collect(),
+            reads: [actual_src1, actual_src2].into_iter().collect(),
+            writes: [dest + i_offset].into_iter().collect(),
         };
         new_ops.push(new_op);
     }
-    new_ops
+    (new_ops, forward_count)
 }
