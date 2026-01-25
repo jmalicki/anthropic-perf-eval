@@ -1,6 +1,18 @@
 """
 Re-scheduler for VLIW kernels.
 
+DEPRECATED: For new code, use the Rust scheduler (scheduler_rs module) instead.
+The kernel builders (tick_tock.py, modular.py) now use scheduler_rs by default.
+
+This module is kept for:
+- Legacy tools and analysis scripts
+- CPSAT_OPTIMAL mode (constraint solver uses extract_ops/compute_dependencies)
+- Test utilities
+
+For scheduling, prefer:
+    import scheduler_rs
+    scheduled = scheduler_rs.schedule_multipass(instrs, enable_valu_shift=True)
+
 Takes a list of instructions and re-schedules them for better packing
 while respecting data dependencies.
 
