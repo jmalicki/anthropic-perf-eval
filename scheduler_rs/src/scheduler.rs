@@ -370,7 +370,7 @@ pub fn schedule_greedy_with_diagnostics(
                 .unwrap_or(&0)
         };
 
-    let can_schedule_n = |slot_usage: &HashMap<(usize, String), usize>,
+    let _can_schedule_n = |slot_usage: &HashMap<(usize, String), usize>,
                           cycle: usize,
                           engine: &str,
                           count: usize|
@@ -474,29 +474,29 @@ pub fn schedule_greedy_with_diagnostics(
             }
         }
 
-        // VALU→ALU shifting: if VALU is full but we can shift to ALU
-        if enable_valu_shift && engine == "valu" && can_convert_valu_to_alu(&ops[op_idx]) {
-            let valu_usage = get_slot_usage(&slot_usage, cycle, "valu");
-            let alu_usage = get_slot_usage(&slot_usage, cycle, "alu");
+        // Normal scheduling with VALU→ALU shifting integrated into the loop
+        // This matches Python's behavior: check for shifting at each cycle where VALU is full
+        let is_shiftable_valu =
+            enable_valu_shift && engine == "valu" && can_convert_valu_to_alu(&ops[op_idx]);
+        let mut shifted = false;
 
-            // Check if VALU is saturated at this cycle
-            if valu_usage >= get_slot_limit("valu") {
+        while get_slot_usage(&slot_usage, cycle, &engine) >= get_slot_limit(&engine) {
+            // VALU→ALU shifting: if VALU is full but ALU has capacity
+            if is_shiftable_valu {
+                let alu_usage = get_slot_usage(&slot_usage, cycle, "alu");
+
                 if let Some(ref mut diag) = diagnostics {
                     diag.cycles_valu_saturated += 1;
                 }
 
                 if alu_usage + VLEN <= get_slot_limit("alu") {
                     // Expand VALU op to 8 ALU ops
-                    let alu_ops = expand_valu_to_alu(&ops[op_idx], next_expanded_id);
+                    let mut alu_ops = expand_valu_to_alu(&ops[op_idx], next_expanded_id);
                     next_expanded_id += VLEN;
 
-                    // Find cycle where all 8 ALU ops fit
-                    while !can_schedule_n(&slot_usage, cycle, "alu", VLEN) {
-                        cycle += 1;
-                    }
-
-                    // Schedule all 8 ALU ops at this cycle
-                    for _alu_op in &alu_ops {
+                    // Schedule all 8 ALU ops at this cycle - SET THEIR CYCLE!
+                    for alu_op in &mut alu_ops {
+                        alu_op.cycle = cycle as i32;
                         *slot_usage.entry((cycle, "alu".to_string())).or_insert(0) += 1;
                     }
 
@@ -532,26 +532,30 @@ pub fn schedule_greedy_with_diagnostics(
                             }
                         }
                     }
-                    continue;
+                    shifted = true;
+                    break;
                 } else {
                     if let Some(ref mut diag) = diagnostics {
                         diag.valu_alu_no_capacity += 1;
                     }
                 }
-            } else {
-                if let Some(ref mut diag) = diagnostics {
+            }
+            cycle += 1;
+        }
+
+        if shifted {
+            continue;
+        }
+
+        // Track diagnostics for non-shifted VALU ops
+        if enable_valu_shift && engine == "valu" {
+            if let Some(ref mut diag) = diagnostics {
+                if !can_convert_valu_to_alu(&ops[op_idx]) {
+                    diag.valu_not_shiftable += 1;
+                } else {
                     diag.valu_slot_available += 1;
                 }
             }
-        } else if enable_valu_shift && engine == "valu" && !can_convert_valu_to_alu(&ops[op_idx]) {
-            if let Some(ref mut diag) = diagnostics {
-                diag.valu_not_shiftable += 1;
-            }
-        }
-
-        // Normal scheduling (find first cycle with available slot)
-        while get_slot_usage(&slot_usage, cycle, &engine) >= get_slot_limit(&engine) {
-            cycle += 1;
         }
 
         // Schedule the op

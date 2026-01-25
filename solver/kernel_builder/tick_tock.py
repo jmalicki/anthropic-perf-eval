@@ -739,25 +739,19 @@ class TickTockKernelBuilder(BaseKernelBuilder):
                 ])
 
     def _schedule(self):
-        """Apply scheduling."""
-        from solver.reschedule import (
-            extract_ops, compute_dependencies,
-            schedule_greedy_multipass, emit_scheduled
-        )
-
-        ops = extract_ops(self.instrs)
-        op_by_id = compute_dependencies(ops)
-        print(f"Scheduling {len(ops)} ops...")
-
+        """Apply scheduling using Rust scheduler."""
+        import scheduler_rs
         import time
+
+        print(f"Scheduling with Rust scheduler...")
+
         start = time.time()
-        num_cycles, scheduled_ops = schedule_greedy_multipass(
-            ops, op_by_id,
+        scheduled = scheduler_rs.schedule_multipass(
+            self.instrs,
             enable_valu_shift=self.config.enable_valu_shift,
-            enable_broadcast_lookahead=self.config.enable_broadcast_lookahead
         )
-        scheduled = emit_scheduled(scheduled_ops, num_cycles)
+        num_cycles = len(scheduled)
         print(f"Multipass greedy scheduling completed in {time.time() - start:.2f}s")
 
-        self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
+        self.instrs = [{"flow": [("pause",)]}] + list(scheduled) + [{"flow": [("pause",)]}]
         print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")

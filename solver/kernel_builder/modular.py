@@ -343,41 +343,36 @@ class ModularKernelBuilder(BaseKernelBuilder):
             self.emit(store=[("vstore", ctx.st[4], ctx.all_val[g]), ("vstore", ctx.st[5], ctx.all_val[g+1])])
 
     def _schedule(self):
-        """Apply scheduling based on config."""
-        from solver.reschedule import (
-            extract_ops, compute_dependencies,
-            schedule_greedy, schedule_greedy_multipass, emit_scheduled
-        )
+        """Apply scheduling based on config using Rust scheduler."""
+        import scheduler_rs
+        import time
 
-        ops = extract_ops(self.instrs)
-        op_by_id = compute_dependencies(ops)
-        print(f"Scheduling {len(ops)} ops...")
+        print(f"Scheduling with Rust scheduler...")
 
         mode = self.config.scheduling_mode
         if mode == SchedulingMode.GREEDY_SINGLE:
-            import time
             start = time.time()
-            num_cycles, scheduled_ops = schedule_greedy(
-                ops, op_by_id,
+            scheduled = scheduler_rs.schedule(
+                self.instrs,
                 enable_valu_shift=self.config.enable_valu_shift,
-                enable_broadcast_lookahead=self.config.enable_broadcast_lookahead
             )
-            scheduled = emit_scheduled(scheduled_ops, num_cycles)
+            num_cycles = len(scheduled)
             print(f"Greedy scheduling completed in {time.time() - start:.2f}s")
 
         elif mode == SchedulingMode.GREEDY_MULTIPASS:
-            import time
             start = time.time()
-            num_cycles, scheduled_ops = schedule_greedy_multipass(
-                ops, op_by_id,
+            scheduled = scheduler_rs.schedule_multipass(
+                self.instrs,
                 enable_valu_shift=self.config.enable_valu_shift,
-                enable_broadcast_lookahead=self.config.enable_broadcast_lookahead
             )
-            scheduled = emit_scheduled(scheduled_ops, num_cycles)
+            num_cycles = len(scheduled)
             print(f"Multipass greedy scheduling completed in {time.time() - start:.2f}s")
 
-        else:  # CPSAT_OPTIMAL
+        else:  # CPSAT_OPTIMAL - uses constraint solver, keep Python implementation
             from solver.round_chunked_scheduler import schedule_round_chunked
+            from solver.reschedule import extract_ops, compute_dependencies
+            ops = extract_ops(self.instrs)
+            op_by_id = compute_dependencies(ops)
             n_groups = self.config.batch_size // VLEN
             n_iters = n_groups // self.UNROLL
             num_cycles, scheduled = schedule_round_chunked(
@@ -389,5 +384,5 @@ class ModularKernelBuilder(BaseKernelBuilder):
                 valu_shift_time=self.config.valu_shift_time
             )
 
-        self.instrs = [{"flow": [("pause",)]}] + scheduled + [{"flow": [("pause",)]}]
+        self.instrs = [{"flow": [("pause",)]}] + list(scheduled) + [{"flow": [("pause",)]}]
         print(f"Final scheduling: {len(self.instrs)} instructions ({num_cycles} cycles)")
