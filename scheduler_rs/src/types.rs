@@ -1,9 +1,251 @@
 //! Core types and constants for the scheduler.
 
+use arrayvec::ArrayVec;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+/// Maximum number of elements in an operation's slot (opcode + operands)
+/// Most ops have 4 (opcode, dest, src1, src2), multiply_add has 5
+pub const MAX_SLOT_SIZE: usize = 6;
 
 /// Vector length for SIMD operations
 pub const VLEN: usize = 8;
+
+// ============================================================================
+// Engine Enum
+// ============================================================================
+
+/// Execution engine type - uses u8 backing for minimal size
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Engine {
+    Load = 0,
+    Store = 1,
+    Alu = 2,
+    Valu = 3,
+    Flow = 4,
+    Debug = 5,
+    // Scheduling-internal states (not real hardware engines)
+    EliminatedBroadcast = 6,
+    ShiftedValu = 7,
+}
+
+impl Engine {
+    /// Parse engine from string (used at Python boundary)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "load" => Some(Engine::Load),
+            "store" => Some(Engine::Store),
+            "alu" => Some(Engine::Alu),
+            "valu" => Some(Engine::Valu),
+            "flow" => Some(Engine::Flow),
+            "debug" => Some(Engine::Debug),
+            "eliminated_broadcast" => Some(Engine::EliminatedBroadcast),
+            "shifted_valu" => Some(Engine::ShiftedValu),
+            _ => None,
+        }
+    }
+
+    /// Convert engine to string (used at Python boundary)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Engine::Load => "load",
+            Engine::Store => "store",
+            Engine::Alu => "alu",
+            Engine::Valu => "valu",
+            Engine::Flow => "flow",
+            Engine::Debug => "debug",
+            Engine::EliminatedBroadcast => "eliminated_broadcast",
+            Engine::ShiftedValu => "shifted_valu",
+        }
+    }
+
+    /// Get the slot limit for this engine
+    pub fn slot_limit(&self) -> usize {
+        match self {
+            Engine::Load => 2,
+            Engine::Store => 2,
+            Engine::Alu => 12,
+            Engine::Valu => 6,
+            Engine::Flow => 1,
+            Engine::Debug => 64,
+            // Internal states have no slots in bundles
+            Engine::EliminatedBroadcast => 0,
+            Engine::ShiftedValu => 0,
+        }
+    }
+
+    /// Check if this is a real hardware engine (vs scheduling-internal)
+    pub fn is_hardware(&self) -> bool {
+        !matches!(self, Engine::EliminatedBroadcast | Engine::ShiftedValu)
+    }
+}
+
+// ============================================================================
+// Opcode Enum
+// ============================================================================
+
+/// Operation opcode - uses u8 backing for minimal size
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Opcode {
+    // Arithmetic operations
+    Add = 0,       // "+"
+    Sub = 1,       // "-"
+    Mul = 2,       // "*"
+    Div = 3,       // "/"
+    Mod = 4,       // "%"
+    Cdiv = 5,      // "cdiv" (ceiling division)
+
+    // Bitwise operations
+    And = 6,       // "&"
+    Or = 7,        // "|"
+    Xor = 8,       // "^"
+    Shl = 9,       // "<<"
+    Shr = 10,      // ">>"
+
+    // Comparison operations
+    Eq = 11,       // "=="
+    Ne = 12,       // "!="
+    Lt = 13,       // "<"
+    Le = 14,       // "<="
+    Gt = 15,       // ">"
+    Ge = 16,       // ">="
+
+    // Vector-specific operations
+    Vbroadcast = 17,
+    MultiplyAdd = 18,  // "multiply_add"
+
+    // Load operations
+    Load = 19,
+    Vload = 20,
+    Const = 21,
+    LoadOffset = 22,
+
+    // Store operations
+    Store = 23,
+    Vstore = 24,
+
+    // Flow control
+    Select = 25,
+    Vselect = 26,
+    Jump = 27,
+    CondJump = 28,
+    Halt = 29,
+
+    // Debug
+    DebugPrint = 30,
+}
+
+impl Opcode {
+    /// Parse opcode from string (used at Python boundary)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "+" => Some(Opcode::Add),
+            "-" => Some(Opcode::Sub),
+            "*" => Some(Opcode::Mul),
+            "/" => Some(Opcode::Div),
+            "%" => Some(Opcode::Mod),
+            "cdiv" => Some(Opcode::Cdiv),
+            "&" => Some(Opcode::And),
+            "|" => Some(Opcode::Or),
+            "^" => Some(Opcode::Xor),
+            "<<" => Some(Opcode::Shl),
+            ">>" => Some(Opcode::Shr),
+            "==" => Some(Opcode::Eq),
+            "!=" => Some(Opcode::Ne),
+            "<" => Some(Opcode::Lt),
+            "<=" => Some(Opcode::Le),
+            ">" => Some(Opcode::Gt),
+            ">=" => Some(Opcode::Ge),
+            "vbroadcast" => Some(Opcode::Vbroadcast),
+            "multiply_add" => Some(Opcode::MultiplyAdd),
+            "load" => Some(Opcode::Load),
+            "vload" => Some(Opcode::Vload),
+            "const" => Some(Opcode::Const),
+            "load_offset" => Some(Opcode::LoadOffset),
+            "store" => Some(Opcode::Store),
+            "vstore" => Some(Opcode::Vstore),
+            "select" => Some(Opcode::Select),
+            "vselect" => Some(Opcode::Vselect),
+            "jump" => Some(Opcode::Jump),
+            "cond_jump" => Some(Opcode::CondJump),
+            "halt" => Some(Opcode::Halt),
+            "debug_print" => Some(Opcode::DebugPrint),
+            _ => None,
+        }
+    }
+
+    /// Convert opcode to string (used at Python boundary)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Opcode::Add => "+",
+            Opcode::Sub => "-",
+            Opcode::Mul => "*",
+            Opcode::Div => "/",
+            Opcode::Mod => "%",
+            Opcode::Cdiv => "cdiv",
+            Opcode::And => "&",
+            Opcode::Or => "|",
+            Opcode::Xor => "^",
+            Opcode::Shl => "<<",
+            Opcode::Shr => ">>",
+            Opcode::Eq => "==",
+            Opcode::Ne => "!=",
+            Opcode::Lt => "<",
+            Opcode::Le => "<=",
+            Opcode::Gt => ">",
+            Opcode::Ge => ">=",
+            Opcode::Vbroadcast => "vbroadcast",
+            Opcode::MultiplyAdd => "multiply_add",
+            Opcode::Load => "load",
+            Opcode::Vload => "vload",
+            Opcode::Const => "const",
+            Opcode::LoadOffset => "load_offset",
+            Opcode::Store => "store",
+            Opcode::Vstore => "vstore",
+            Opcode::Select => "select",
+            Opcode::Vselect => "vselect",
+            Opcode::Jump => "jump",
+            Opcode::CondJump => "cond_jump",
+            Opcode::Halt => "halt",
+            Opcode::DebugPrint => "debug_print",
+        }
+    }
+
+    /// Check if this VALU opcode can be converted to 8 scalar ALU ops
+    /// Note: multiply_add is excluded because it's a fused operation
+    pub fn can_shift_to_alu(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Mod
+                | Opcode::And
+                | Opcode::Or
+                | Opcode::Xor
+                | Opcode::Shl
+                | Opcode::Shr
+                | Opcode::Eq
+                | Opcode::Ne
+                | Opcode::Lt
+                | Opcode::Le
+                | Opcode::Gt
+                | Opcode::Ge
+        )
+    }
+
+    /// Check if this is an arithmetic/bitwise/comparison op (binary operation)
+    pub fn is_binary_op(&self) -> bool {
+        (*self as u8) <= (Opcode::Ge as u8)
+    }
+}
+
+// ============================================================================
+// Legacy compatibility (slot limits by string)
+// ============================================================================
 
 /// Slot limits per engine per cycle
 pub const SLOT_LIMITS: [(&str, usize); 6] = [
@@ -15,14 +257,9 @@ pub const SLOT_LIMITS: [(&str, usize); 6] = [
     ("debug", 64),
 ];
 
-/// Get the slot limit for an engine
+/// Get the slot limit for an engine (legacy string-based version)
 pub fn get_slot_limit(engine: &str) -> usize {
-    for (e, limit) in SLOT_LIMITS.iter() {
-        if *e == engine {
-            return *limit;
-        }
-    }
-    1
+    Engine::from_str(engine).map(|e| e.slot_limit()).unwrap_or(1)
 }
 
 /// VALU ops that can be converted to scalar ALU ops (binary operations)
@@ -31,10 +268,14 @@ pub const VALU_TO_ALU_OPS: &[&str] = &[
     "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "==", "!=", "<", "<=", ">", ">=",
 ];
 
-/// Slot value - can be string or int
+// ============================================================================
+// SlotVal and Op
+// ============================================================================
+
+/// Slot value - can be opcode or int
 #[derive(Clone, Debug)]
 pub enum SlotVal {
-    Str(String),
+    Str(String),  // Legacy: will be replaced with Op(Opcode)
     Int(i64),
 }
 
@@ -42,8 +283,9 @@ pub enum SlotVal {
 #[derive(Clone, Debug)]
 pub struct Op {
     pub id: usize,
-    pub engine: String,
-    pub slot: Vec<SlotVal>,
+    pub engine: Engine,
+    /// Slot contents: [opcode, dest, src1, src2, ...] - inline array, no heap allocation
+    pub slot: ArrayVec<SlotVal, MAX_SLOT_SIZE>,
     pub cycle: i32,
     pub dep_ids: HashSet<usize>,
     pub reads: HashSet<i64>,
@@ -52,14 +294,17 @@ pub struct Op {
 
 /// Check if a VALU op can be converted to 8 scalar ALU ops
 pub fn can_convert_valu_to_alu(op: &Op) -> bool {
-    if op.engine != "valu" {
+    if op.engine != Engine::Valu {
         return false;
     }
     if op.slot.is_empty() {
         return false;
     }
     if let SlotVal::Str(op_type) = &op.slot[0] {
-        VALU_TO_ALU_OPS.contains(&op_type.as_str())
+        // Check via Opcode enum for better performance
+        Opcode::from_str(op_type)
+            .map(|opc| opc.can_shift_to_alu())
+            .unwrap_or(false)
     } else {
         false
     }
@@ -147,13 +392,13 @@ pub fn expand_valu_to_alu_smart(
 
         let new_op = Op {
             id: next_op_id + i,
-            engine: "alu".to_string(),
-            slot: vec![
+            engine: Engine::Alu,
+            slot: [
                 SlotVal::Str(op_type.clone()),
                 SlotVal::Int(dest + i_offset),
                 SlotVal::Int(actual_src1),
                 SlotVal::Int(actual_src2),
-            ],
+            ].into_iter().collect(),
             cycle: -1,
             dep_ids: op.dep_ids.clone(),
             reads: [actual_src1, actual_src2].into_iter().collect(),

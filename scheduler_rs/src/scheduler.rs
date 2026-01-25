@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::SchedulingDiagnostics;
 use crate::types::{
-    can_convert_valu_to_alu, expand_valu_to_alu_smart, get_slot_limit, Op, SlotVal, VLEN,
+    can_convert_valu_to_alu, expand_valu_to_alu_smart, Engine, Op, SlotVal, VLEN,
 };
 
 /// Result of scheduling
@@ -110,15 +110,15 @@ pub fn compute_critical_path(ops: &[Op]) -> HashMap<usize, usize> {
 fn compute_priority(
     op_id: usize,
     op_idx: usize,
-    engine: &str,
+    engine: Engine,
     critical_path: &HashMap<usize, usize>,
     slack_map: &HashMap<usize, i32>,
     mode: PriorityMode,
 ) -> (i32, i32, usize) {
     let cp = *critical_path.get(&op_id).unwrap_or(&1) as i32;
     let slack = *slack_map.get(&op_id).unwrap_or(&0);
-    let is_valu = if engine == "valu" { 0 } else { 1 };
-    let is_load = if engine == "load" { 0 } else { 1 };
+    let is_valu = if engine == Engine::Valu { 0 } else { 1 };
+    let is_load = if engine == Engine::Load { 0 } else { 1 };
 
     match mode {
         PriorityMode::CriticalPath => (-cp, is_valu, op_id),
@@ -127,9 +127,9 @@ fn compute_priority(
             // Matches Python: -cp * load_factor where load_factor is 0.6, 0.8, 0.5, 1.0
             // Scale by 10000 to preserve float precision (Python uses actual floats)
             let load_factor: f64 = match engine {
-                "valu" => 0.6,
-                "load" | "store" => 0.8,
-                "flow" => 0.5,
+                Engine::Valu => 0.6,
+                Engine::Load | Engine::Store => 0.8,
+                Engine::Flow => 0.5,
                 _ => 1.0, // ALU and others
             };
             // Scale to preserve decimal precision - Python compares floats directly
@@ -287,7 +287,7 @@ pub fn compute_proactive_eliminations(ops: &[Op]) -> HashSet<usize> {
             shiftable_ops.insert(op.id);
         }
         // Check for vbroadcast
-        if op.engine == "valu" && op.slot.len() >= 3 {
+        if op.engine == Engine::Valu && op.slot.len() >= 3 {
             if let SlotVal::Str(op_type) = &op.slot[0] {
                 if op_type == "vbroadcast" {
                     if let (SlotVal::Int(dest), SlotVal::Int(scalar)) =
@@ -338,7 +338,7 @@ pub fn compute_proactive_eliminations(ops: &[Op]) -> HashSet<usize> {
 
     // Predict which ops will shift due to VALU pressure
     // Count VALU ops by category
-    let valu_ops: Vec<&Op> = ops.iter().filter(|op| op.engine == "valu").collect();
+    let valu_ops: Vec<&Op> = ops.iter().filter(|op| op.engine == Engine::Valu).collect();
     let shiftable_valu: Vec<&Op> = valu_ops
         .iter()
         .filter(|op| shiftable_ops.contains(&op.id))
@@ -483,7 +483,7 @@ pub fn schedule_greedy_with_diagnostics(
     }
 
     // Track slot usage per cycle
-    let mut slot_usage: HashMap<(usize, String), usize> = HashMap::new();
+    let mut slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
 
     // For VALU→ALU shifting: track expanded ops and their schedules
     let mut expanded_ops: Vec<Op> = Vec::new();
@@ -499,7 +499,7 @@ pub fn schedule_greedy_with_diagnostics(
 
     // Pre-scan for vbroadcast ops to build broadcast_sources mapping
     for op in ops.iter() {
-        if op.engine == "valu" && op.slot.len() >= 3 {
+        if op.engine == Engine::Valu && op.slot.len() >= 3 {
             if let SlotVal::Str(op_type) = &op.slot[0] {
                 if op_type == "vbroadcast" {
                     if let (SlotVal::Int(dest), SlotVal::Int(scalar_src)) =
@@ -521,19 +521,19 @@ pub fn schedule_greedy_with_diagnostics(
     let mut eliminated_broadcast_ids: HashSet<usize> = HashSet::new();
 
     let get_slot_usage =
-        |slot_usage: &HashMap<(usize, String), usize>, cycle: usize, engine: &str| -> usize {
+        |slot_usage: &HashMap<(usize, Engine), usize>, cycle: usize, engine: Engine| -> usize {
             *slot_usage
-                .get(&(cycle, engine.to_string()))
+                .get(&(cycle, engine))
                 .unwrap_or(&0)
         };
 
-    let _can_schedule_n = |slot_usage: &HashMap<(usize, String), usize>,
+    let _can_schedule_n = |slot_usage: &HashMap<(usize, Engine), usize>,
                           cycle: usize,
-                          engine: &str,
+                          engine: Engine,
                           count: usize|
      -> bool {
         let usage = get_slot_usage(slot_usage, cycle, engine);
-        let limit = get_slot_limit(engine);
+        let limit = engine.slot_limit();
         usage + count <= limit
     };
 
@@ -566,13 +566,13 @@ pub fn schedule_greedy_with_diagnostics(
     let mut assignments: Vec<(usize, usize)> = Vec::with_capacity(n);
 
     // Cache engine info for priority computation (since ops may be mutated)
-    let engine_map: HashMap<usize, String> = ops.iter().map(|op| (op.id, op.engine.clone())).collect();
+    let engine_map: HashMap<usize, Engine> = ops.iter().map(|op| (op.id, op.engine)).collect();
 
     while !ready.is_empty() {
         // Sort ready queue by priority (lower = higher priority) - matches Python's sort
         ready.sort_by_key(|&id| {
             let op_idx = *op_id_to_idx.get(&id).unwrap();
-            let engine = engine_map.get(&id).unwrap();
+            let engine = *engine_map.get(&id).unwrap();
             compute_priority(
                 id,
                 op_idx,
@@ -586,7 +586,7 @@ pub fn schedule_greedy_with_diagnostics(
         // Pop first (highest priority) op
         let op_id = ready.remove(0);
         let op_idx = *op_id_to_idx.get(&op_id).unwrap();
-        let engine = ops[op_idx].engine.clone();
+        let engine = ops[op_idx].engine;
         let mut cycle = earliest_cycle_fn(ops, op_id, &op_id_to_idx, &expanded_op_cycles);
 
         // DIAGNOSTICS: Track slack and blocked ops
@@ -598,11 +598,11 @@ pub fn schedule_greedy_with_diagnostics(
             let mut blocked_this_cycle = false;
             for &other_id in ready.iter() {
                 let other_idx = *op_id_to_idx.get(&other_id).unwrap();
-                let other_engine = &ops[other_idx].engine;
+                let other_engine = ops[other_idx].engine;
                 let other_cycle = earliest_cycle_fn(ops, other_id, &op_id_to_idx, &expanded_op_cycles);
 
                 if get_slot_usage(&slot_usage, other_cycle, other_engine)
-                    >= get_slot_limit(other_engine)
+                    >= other_engine.slot_limit()
                 {
                     diag.record_blocked(other_engine);
                     blocked_this_cycle = true;
@@ -640,7 +640,7 @@ pub fn schedule_greedy_with_diagnostics(
                         if other.cycle == -1 && !ready.contains(&other.id) {
                             if let Some(&remaining) = in_degree.get(&other.id) {
                                 if remaining >= 1 && remaining <= 2 {
-                                    diag.record_almost_ready(&other.engine);
+                                    diag.record_almost_ready(other.engine);
                                 }
                             }
                         }
@@ -652,7 +652,7 @@ pub fn schedule_greedy_with_diagnostics(
         // Broadcast elimination: eliminate broadcasts when EITHER:
         // 1. PROACTIVE: lookahead analysis predicted all consumers will shift
         // 2. REACTIVE: VALU is saturated and all consumers are shiftable
-        let is_vbroadcast = engine == "valu"
+        let is_vbroadcast = engine == Engine::Valu
             && ops[op_idx].slot.len() >= 3
             && matches!(&ops[op_idx].slot[0], SlotVal::Str(s) if s == "vbroadcast");
 
@@ -661,16 +661,16 @@ pub fn schedule_greedy_with_diagnostics(
             let is_proactive = proactive_eliminations.contains(&op_id);
 
             // Check reactive elimination (VALU saturated at this cycle)
-            let valu_usage = get_slot_usage(&slot_usage, cycle, "valu");
-            let alu_usage = get_slot_usage(&slot_usage, cycle, "alu");
-            let is_reactive = valu_usage >= get_slot_limit("valu")
-                && alu_usage + VLEN <= get_slot_limit("alu")
+            let valu_usage = get_slot_usage(&slot_usage, cycle, Engine::Valu);
+            let alu_usage = get_slot_usage(&slot_usage, cycle, Engine::Alu);
+            let is_reactive = valu_usage >= Engine::Valu.slot_limit()
+                && alu_usage + VLEN <= Engine::Alu.slot_limit()
                 && {
                     let consumer_ids = consumers.get(&op_id).cloned().unwrap_or_default();
                     let all_consumers_can_shift = consumer_ids.iter().all(|&cid| {
                         shifted_valu_ops.contains(&cid) || {
                             let cidx = *op_id_to_idx.get(&cid).unwrap();
-                            ops[cidx].engine == "valu" && can_convert_valu_to_alu(&ops[cidx])
+                            ops[cidx].engine == Engine::Valu && can_convert_valu_to_alu(&ops[cidx])
                         }
                     });
                     all_consumers_can_shift && !consumer_ids.is_empty()
@@ -686,7 +686,7 @@ pub fn schedule_greedy_with_diagnostics(
                 }
 
                 // Mark original vbroadcast as eliminated
-                ops[op_idx].engine = "eliminated_broadcast".to_string();
+                ops[op_idx].engine = Engine::EliminatedBroadcast;
                 ops[op_idx].cycle = cycle as i32;
                 eliminated_broadcast_ids.insert(op_id);
                 assignments.push((op_id, cycle));
@@ -701,7 +701,6 @@ pub fn schedule_greedy_with_diagnostics(
                     if let Some(deg) = in_degree.get_mut(&consumer_id) {
                         *deg -= 1;
                         if *deg == 0 {
-                            let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
                             ready.push(consumer_id);
                         }
                     }
@@ -713,7 +712,7 @@ pub fn schedule_greedy_with_diagnostics(
         // Normal scheduling with VALU→ALU shifting integrated into the loop
         // This matches Python's behavior: check for shifting at each cycle where VALU is full
         let is_shiftable_valu =
-            enable_valu_shift && engine == "valu" && can_convert_valu_to_alu(&ops[op_idx]);
+            enable_valu_shift && engine == Engine::Valu && can_convert_valu_to_alu(&ops[op_idx]);
 
         // Check if this op MUST shift because it depends on an eliminated broadcast
         // (eliminated broadcasts don't produce vector values, so consumers must use scalar)
@@ -743,15 +742,15 @@ pub fn schedule_greedy_with_diagnostics(
             let mut max_alu_cycle = cycle;
             for alu_op in &mut alu_ops {
                 let mut alu_cycle = cycle;
-                while get_slot_usage(&slot_usage, alu_cycle, "alu") >= get_slot_limit("alu") {
+                while get_slot_usage(&slot_usage, alu_cycle, Engine::Alu) >= Engine::Alu.slot_limit() {
                     alu_cycle += 1;
                 }
                 alu_op.cycle = alu_cycle as i32;
-                *slot_usage.entry((alu_cycle, "alu".to_string())).or_insert(0) += 1;
+                *slot_usage.entry((alu_cycle, Engine::Alu)).or_insert(0) += 1;
                 max_alu_cycle = max_alu_cycle.max(alu_cycle);
             }
 
-            ops[op_idx].engine = "shifted_valu".to_string();
+            ops[op_idx].engine = Engine::ShiftedValu;
             ops[op_idx].cycle = max_alu_cycle as i32;
             expanded_op_cycles.insert(op_id, max_alu_cycle as i32);
             shifted_valu_ops.insert(op_id);
@@ -768,7 +767,6 @@ pub fn schedule_greedy_with_diagnostics(
                     if let Some(deg) = in_degree.get_mut(&consumer_id) {
                         *deg -= 1;
                         if *deg == 0 {
-                            let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
                             ready.push(consumer_id);
                         }
                     }
@@ -777,10 +775,10 @@ pub fn schedule_greedy_with_diagnostics(
             continue;
         }
 
-        while get_slot_usage(&slot_usage, cycle, &engine) >= get_slot_limit(&engine) {
+        while get_slot_usage(&slot_usage, cycle, engine) >= engine.slot_limit() {
             // VALU→ALU shifting: if VALU is full but ALU has capacity
             if is_shiftable_valu {
-                let alu_usage = get_slot_usage(&slot_usage, cycle, "alu");
+                let alu_usage = get_slot_usage(&slot_usage, cycle, Engine::Alu);
 
                 if let Some(ref mut diag) = diagnostics {
                     diag.cycles_valu_saturated += 1;
@@ -788,7 +786,7 @@ pub fn schedule_greedy_with_diagnostics(
 
                 // Only need at least 1 free ALU slot to start shifting
                 // (ALU ops spread across cycles like Python does)
-                if alu_usage < get_slot_limit("alu") {
+                if alu_usage < Engine::Alu.slot_limit() {
                     // Expand VALU op to 8 ALU ops with smart broadcast forwarding
                     let (mut alu_ops, forward_count) = expand_valu_to_alu_smart(
                         &ops[op_idx],
@@ -807,18 +805,18 @@ pub fn schedule_greedy_with_diagnostics(
                     let mut max_alu_cycle = cycle;
                     for alu_op in &mut alu_ops {
                         let mut alu_cycle = cycle;
-                        while get_slot_usage(&slot_usage, alu_cycle, "alu")
-                            >= get_slot_limit("alu")
+                        while get_slot_usage(&slot_usage, alu_cycle, Engine::Alu)
+                            >= Engine::Alu.slot_limit()
                         {
                             alu_cycle += 1;
                         }
                         alu_op.cycle = alu_cycle as i32;
-                        *slot_usage.entry((alu_cycle, "alu".to_string())).or_insert(0) += 1;
+                        *slot_usage.entry((alu_cycle, Engine::Alu)).or_insert(0) += 1;
                         max_alu_cycle = max_alu_cycle.max(alu_cycle);
                     }
 
                     // Mark original VALU op as shifted - cycle is max of all ALU ops
-                    ops[op_idx].engine = "shifted_valu".to_string();
+                    ops[op_idx].engine = Engine::ShiftedValu;
                     ops[op_idx].cycle = max_alu_cycle as i32;
                     expanded_op_cycles.insert(op_id, max_alu_cycle as i32);
                     shifted_valu_ops.insert(op_id);
@@ -835,7 +833,6 @@ pub fn schedule_greedy_with_diagnostics(
                             if let Some(deg) = in_degree.get_mut(&consumer_id) {
                                 *deg -= 1;
                                 if *deg == 0 {
-                                    let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
                                     ready.push(consumer_id);
                                 }
                             }
@@ -857,7 +854,7 @@ pub fn schedule_greedy_with_diagnostics(
         }
 
         // Track diagnostics for non-shifted VALU ops
-        if enable_valu_shift && engine == "valu" {
+        if enable_valu_shift && engine == Engine::Valu {
             if let Some(ref mut diag) = diagnostics {
                 if !can_convert_valu_to_alu(&ops[op_idx]) {
                     diag.valu_not_shiftable += 1;
@@ -869,7 +866,7 @@ pub fn schedule_greedy_with_diagnostics(
 
         // Schedule the op
         ops[op_idx].cycle = cycle as i32;
-        *slot_usage.entry((cycle, engine.clone())).or_insert(0) += 1;
+        *slot_usage.entry((cycle, engine)).or_insert(0) += 1;
         assignments.push((op_id, cycle));
 
         // Update ready queue for dependent ops

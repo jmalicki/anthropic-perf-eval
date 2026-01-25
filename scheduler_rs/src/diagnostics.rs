@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::types::Op;
+use crate::types::{Engine, Op};
 
 /// Diagnostic information collected during scheduling
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -15,12 +15,12 @@ pub struct SchedulingDiagnostics {
     // Ready but blocked (slot was full)
     pub cycles_with_blocked_ops: usize,
     pub total_blocked_ops: usize,
-    pub blocked_by_engine: HashMap<String, usize>,
+    pub blocked_by_engine: HashMap<Engine, usize>,
 
     // "Almost ready" ops (waiting on 1-2 dependencies)
     pub cycles_with_almost_ready: usize,
     pub total_almost_ready_ops: usize,
-    pub almost_ready_by_engine: HashMap<String, usize>,
+    pub almost_ready_by_engine: HashMap<Engine, usize>,
 
     // Priority inversions (high-slack op scheduled while low-slack waited)
     pub priority_inversions: usize,
@@ -50,10 +50,10 @@ pub struct SchedulingDiagnostics {
 impl SchedulingDiagnostics {
     pub fn new() -> Self {
         let mut diag = Self::default();
-        // Initialize engine maps
-        for engine in ["alu", "valu", "load", "store", "flow"] {
-            diag.blocked_by_engine.insert(engine.to_string(), 0);
-            diag.almost_ready_by_engine.insert(engine.to_string(), 0);
+        // Initialize engine maps for all hardware engines
+        for engine in [Engine::Alu, Engine::Valu, Engine::Load, Engine::Store, Engine::Flow] {
+            diag.blocked_by_engine.insert(engine, 0);
+            diag.almost_ready_by_engine.insert(engine, 0);
         }
         diag
     }
@@ -70,19 +70,19 @@ impl SchedulingDiagnostics {
         }
     }
 
-    pub fn record_blocked(&mut self, engine: &str) {
+    pub fn record_blocked(&mut self, engine: Engine) {
         self.total_blocked_ops += 1;
         *self
             .blocked_by_engine
-            .entry(engine.to_string())
+            .entry(engine)
             .or_insert(0) += 1;
     }
 
-    pub fn record_almost_ready(&mut self, engine: &str) {
+    pub fn record_almost_ready(&mut self, engine: Engine) {
         self.total_almost_ready_ops += 1;
         *self
             .almost_ready_by_engine
-            .entry(engine.to_string())
+            .entry(engine)
             .or_insert(0) += 1;
     }
 
@@ -102,7 +102,7 @@ impl SchedulingDiagnostics {
             lines.push("Blocked by engine:".to_string());
             for (engine, count) in &self.blocked_by_engine {
                 if *count > 0 {
-                    lines.push(format!("  {}: {}", engine, count));
+                    lines.push(format!("  {}: {}", engine.as_str(), count));
                 }
             }
         }
@@ -121,7 +121,7 @@ impl SchedulingDiagnostics {
             lines.push("Almost-ready by engine:".to_string());
             for (engine, count) in &self.almost_ready_by_engine {
                 if *count > 0 {
-                    lines.push(format!("  {}: {}", engine, count));
+                    lines.push(format!("  {}: {}", engine.as_str(), count));
                 }
             }
         }

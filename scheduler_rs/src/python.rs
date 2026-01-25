@@ -16,7 +16,9 @@ use crate::scheduler::{
     compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics, PriorityMode,
     ALL_PRIORITY_MODES,
 };
-use crate::types::{Op, SlotVal, VLEN};
+use arrayvec::ArrayVec;
+
+use crate::types::{Engine, Op, SlotVal, MAX_SLOT_SIZE, VLEN};
 
 // =============================================================================
 // Parsing: Python -> Rust
@@ -173,8 +175,8 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                     _ => {}
                 }
 
-                // Store slot as native Rust values
-                let mut slot_vec: Vec<SlotVal> = Vec::new();
+                // Store slot as native Rust values (inline array, no heap allocation)
+                let mut slot_vec: ArrayVec<SlotVal, MAX_SLOT_SIZE> = ArrayVec::new();
                 for i in 0..slot_tuple.len() {
                     let item = slot_tuple.get_item(i)?;
                     if let Ok(s) = item.extract::<String>() {
@@ -187,9 +189,12 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                     }
                 }
 
+                // Convert engine string to enum
+                let engine_enum = Engine::from_str(&engine).unwrap_or(Engine::Alu);
+
                 ops.push(Op {
                     id: op_id,
-                    engine: engine.clone(),
+                    engine: engine_enum,
                     slot: slot_vec,
                     cycle: cycle as i32,
                     dep_ids: HashSet::new(),
@@ -279,7 +284,7 @@ pub fn emit_scheduled_with_expanded<'py>(
 
         // Emit regular ops, SKIP shifted_valu (these are replaced by expanded ALU ops)
         for op in ops {
-            if op.cycle == cycle as i32 && op.engine != "shifted_valu" && op.engine != "eliminated_broadcast" {
+            if op.cycle == cycle as i32 && op.engine != Engine::ShiftedValu && op.engine != Engine::EliminatedBroadcast {
                 emit_op_to_dict(py, op, &instr)?;
             }
         }
@@ -305,14 +310,14 @@ fn emit_op_to_dict<'py>(
     op: &Op,
     instr: &Bound<'py, PyDict>,
 ) -> PyResult<()> {
-    let engine = &op.engine;
+    let engine_str = op.engine.as_str();
 
     // Get or create the list for this engine
-    if !instr.contains(engine.as_str())? {
-        instr.set_item(engine.as_str(), PyList::empty(py))?;
+    if !instr.contains(engine_str)? {
+        instr.set_item(engine_str, PyList::empty(py))?;
     }
 
-    let slots = instr.get_item(engine.as_str())?.unwrap();
+    let slots = instr.get_item(engine_str)?.unwrap();
     let slots_list = slots.downcast::<PyList>()?;
 
     // Create tuple from slot
@@ -794,7 +799,7 @@ pub fn schedule_to_json(
             let const_op_ids: HashSet<usize> = base_ops
                 .iter()
                 .filter(|op| {
-                    op.engine == "load"
+                    op.engine == Engine::Load
                         && op
                             .slot
                             .get(0)
@@ -929,7 +934,7 @@ pub fn schedule_to_json(
 
         // Process regular ops
         for op in &ops {
-            if op.cycle == cycle as i32 && op.engine != "shifted_valu" && op.engine != "eliminated_broadcast" {
+            if op.cycle == cycle as i32 && op.engine != Engine::ShiftedValu && op.engine != Engine::EliminatedBroadcast {
                 let opcode = op
                     .slot
                     .get(0)
@@ -950,12 +955,12 @@ pub fn schedule_to_json(
                     .collect();
                 let compact = parts.join(" ");
 
-                match op.engine.as_str() {
-                    "load" => load_ops.push(compact),
-                    "store" => store_ops.push(compact),
-                    "alu" => alu_ops.push(compact),
-                    "valu" => valu_ops.push(compact),
-                    "flow" => flow_ops.push(compact),
+                match op.engine {
+                    Engine::Load => load_ops.push(compact),
+                    Engine::Store => store_ops.push(compact),
+                    Engine::Alu => alu_ops.push(compact),
+                    Engine::Valu => valu_ops.push(compact),
+                    Engine::Flow => flow_ops.push(compact),
                     _ => {}
                 }
             }
@@ -1101,14 +1106,16 @@ pub fn analyze_constants(
 }
 
 /// Apply constant derivation optimization and return optimized ops
+/// If skip_scheduling is true, returns unscheduled ops (for use with schedule_multipass)
 #[pyfunction]
-#[pyo3(signature = (instrs, enable_valu_shift, hot_threshold=3, verbose=false))]
+#[pyo3(signature = (instrs, enable_valu_shift, hot_threshold=3, verbose=false, skip_scheduling=false))]
 pub fn optimize_constants<'py>(
     py: Python<'py>,
     instrs: &Bound<'py, PyList>,
     enable_valu_shift: bool,
     hot_threshold: usize,
     verbose: bool,
+    skip_scheduling: bool,
 ) -> PyResult<Bound<'py, PyList>> {
     let mut ops = parse_ops(py, instrs)?;
 
@@ -1119,6 +1126,10 @@ pub fn optimize_constants<'py>(
     let usage = analyze_constant_usage(&ops);
 
     if usage.is_empty() {
+        if skip_scheduling {
+            // Return unscheduled ops as-is
+            return emit_unscheduled(py, &ops);
+        }
         let max_cycle = ops.iter().map(|op| op.cycle.max(0) as usize).max().unwrap_or(0);
         return emit_scheduled(py, &ops, max_cycle + 1);
     }
@@ -1141,7 +1152,7 @@ pub fn optimize_constants<'py>(
     let const_op_ids: HashSet<usize> = ops
         .iter()
         .filter(|op| {
-            op.engine == "load"
+            op.engine == Engine::Load
                 && op
                     .slot
                     .get(0)
@@ -1170,6 +1181,11 @@ pub fn optimize_constants<'py>(
 
     compute_dependencies(&mut new_ops);
 
+    // If skip_scheduling, return unscheduled ops for caller to schedule with multipass
+    if skip_scheduling {
+        return emit_unscheduled(py, &new_ops);
+    }
+
     let critical_path = compute_critical_path(&new_ops);
     let result = schedule_greedy(
         &mut new_ops,
@@ -1183,4 +1199,17 @@ pub fn optimize_constants<'py>(
     }
 
     emit_scheduled_with_expanded(py, &new_ops, &result.expanded_ops, result.cycles)
+}
+
+/// Emit unscheduled ops back to Python (one op per "cycle" bundle)
+fn emit_unscheduled<'py>(py: Python<'py>, ops: &[Op]) -> PyResult<Bound<'py, PyList>> {
+    let result = PyList::empty(py);
+
+    for op in ops {
+        let instr = PyDict::new(py);
+        emit_op_to_dict(py, op, &instr)?;
+        result.append(instr)?;
+    }
+
+    Ok(result)
 }

@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{Op, SlotVal};
+use arrayvec::ArrayVec;
+
+use crate::types::{Engine, Op, SlotVal, MAX_SLOT_SIZE};
 
 /// A symbolic operand that may or may not have a physical register assigned
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -81,7 +83,7 @@ pub fn analyze_constant_usage(ops: &[Op]) -> HashMap<i64, ConstantUsage> {
 
     for op in ops {
         // Find const loads
-        if op.engine == "load" {
+        if op.engine == Engine::Load {
             if let Some(SlotVal::Str(opcode)) = op.slot.get(0) {
                 if opcode == "const" {
                     if let (Some(SlotVal::Int(dest)), Some(SlotVal::Int(val))) =
@@ -313,51 +315,51 @@ pub fn emit_constant_generation_ops(
             None => continue,
         };
 
-        let (engine, slot) = match &node.generation {
+        let (engine, slot): (Engine, ArrayVec<SlotVal, MAX_SLOT_SIZE>) = match &node.generation {
             ConstantGeneration::DirectLoad => (
-                "load".to_string(),
-                vec![
+                Engine::Load,
+                [
                     SlotVal::Str("const".to_string()),
                     SlotVal::Int(dest),
                     SlotVal::Int(value),
-                ],
+                ].into_iter().collect(),
             ),
             ConstantGeneration::XorSelf { source } => {
                 let src_reg = value_to_register.get(source).copied().unwrap_or(*source);
                 (
-                    "alu".to_string(),
-                    vec![
+                    Engine::Alu,
+                    [
                         SlotVal::Str("^".to_string()),
                         SlotVal::Int(dest),
                         SlotVal::Int(src_reg),
                         SlotVal::Int(src_reg),
-                    ],
+                    ].into_iter().collect(),
                 )
             }
             ConstantGeneration::Add { src1, src2 } => {
                 let r1 = value_to_register.get(src1).copied().unwrap_or(*src1);
                 let r2 = value_to_register.get(src2).copied().unwrap_or(*src2);
                 (
-                    "alu".to_string(),
-                    vec![
+                    Engine::Alu,
+                    [
                         SlotVal::Str("+".to_string()),
                         SlotVal::Int(dest),
                         SlotVal::Int(r1),
                         SlotVal::Int(r2),
-                    ],
+                    ].into_iter().collect(),
                 )
             }
             ConstantGeneration::Mul { src1, src2 } => {
                 let r1 = value_to_register.get(src1).copied().unwrap_or(*src1);
                 let r2 = value_to_register.get(src2).copied().unwrap_or(*src2);
                 (
-                    "alu".to_string(),
-                    vec![
+                    Engine::Alu,
+                    [
                         SlotVal::Str("*".to_string()),
                         SlotVal::Int(dest),
                         SlotVal::Int(r1),
                         SlotVal::Int(r2),
-                    ],
+                    ].into_iter().collect(),
                 )
             }
             ConstantGeneration::Shift { src, amount } => {
@@ -368,23 +370,23 @@ pub fn emit_constant_generation_ops(
                 let multiplier = 1i64 << amount;
                 if let Some(&mult_reg) = value_to_register.get(&multiplier) {
                     (
-                        "alu".to_string(),
-                        vec![
+                        Engine::Alu,
+                        [
                             SlotVal::Str("*".to_string()),
                             SlotVal::Int(dest),
                             SlotVal::Int(r1),
                             SlotVal::Int(mult_reg),
-                        ],
+                        ].into_iter().collect(),
                     )
                 } else {
                     // Fall back to direct load
                     (
-                        "load".to_string(),
-                        vec![
+                        Engine::Load,
+                        [
                             SlotVal::Str("const".to_string()),
                             SlotVal::Int(dest),
                             SlotVal::Int(value),
-                        ],
+                        ].into_iter().collect(),
                     )
                 }
             }
