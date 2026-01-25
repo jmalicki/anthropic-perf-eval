@@ -8,7 +8,7 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 **Performance Status:**
 - Baseline: 147,734 cycles
-- Current best: ~2,390 cycles (61.8x speedup)
+- Current best: 1,764 cycles (83.7x speedup)
 - Target: 1,487 cycles (100x speedup)
 
 ## Build & Development Commands
@@ -78,17 +78,39 @@ python run_experiment.py --offline # Without W&B
          ┌────────────────────┴────────────────────┐
          │                                         │
 ┌────────▼─────────────────────┐   ┌───────────────▼───────────────┐
-│   Kernel Builders             │   │   Scheduling Engines          │
-│   (solver/kernel_builder/)    │   │                               │
-│                               │   │   scheduler_rs/ (Rust)        │
-│   • TickTockKernelBuilder     │   │   └── scheduler.rs (greedy)   │
-│   • ModularKernelBuilder      │   │   └── constants.rs (derive)   │
-│   • Strategies:               │   │                               │
-│     - tree_access.py          │   │   solver/ (Python, deprecated)│
-│     - hash.py                 │   │   └── cp_scheduler.py         │
-│     - chunked.py              │   │   └── flexible_scheduler.py   │
+│   Kernel Builders             │   │   Rust Module (scheduler_rs/) │
+│                               │   │                               │
+│   scheduler_rs/ (RECOMMENDED) │   │   kernel_builder/             │
+│   └── build_tick_tock_kernel  │   │   └── tick_tock.rs (builder)  │
+│                               │   │   └── emit.rs (Op emission)   │
+│   solver/kernel_builder/      │   │                               │
+│   (Python, DEPRECATED)        │   │   scheduler.rs (parallel)     │
+│   └── tick_tock.py            │   │   constants.rs (derivation)   │
 └───────────────────────────────┘   └───────────────────────────────┘
 ```
+
+### Rust Kernel Builder (Recommended)
+
+The fastest way to generate and schedule kernels:
+
+```python
+import scheduler_rs
+
+# Build and schedule in ~2 seconds (vs 80+ seconds with Python)
+instrs = scheduler_rs.build_tick_tock_kernel(
+    forest_height=10,
+    n_nodes=2047,
+    batch_size=256,
+    rounds=16,
+    enable_valu_shift=True,
+    verbose=True
+)
+```
+
+Benefits:
+- **40x faster** than Python builder (parallel multipass scheduling)
+- No Python→Rust parsing overhead (ops created as native Rust structs)
+- Identical output quality (same cycle count as Python builder)
 
 ## ISA Quick Reference
 
@@ -133,12 +155,11 @@ Each cycle executes one bundle (dict of engine → list of operations):
 |------|---------|
 | `problem.py` | Machine simulator, ISA definition, reference kernel |
 | `perf_takehome.py` | Main test harness for performance measurement |
-| `generate_precomputed_kernel.py` | Offline kernel generation with all optimizations |
-| `solver/precomputed_kernel.py` | The generated optimized kernel (compressed) |
-| `solver/kernel_builder/tick_tock.py` | Current best kernel builder |
-| `scheduler_rs/src/scheduler.rs` | Rust greedy list scheduler |
+| `test_optimized.py` | Test kernel correctness and performance |
+| `scheduler_rs/src/kernel_builder/` | **Rust kernel builder (recommended)** |
+| `scheduler_rs/src/scheduler.rs` | Rust greedy list scheduler with parallel multipass |
+| `solver/kernel_builder/tick_tock.py` | Python kernel builder (deprecated) |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
-| `docs/OPTIMIZATION_PLAN.md` | Current optimization state and roadmap |
 
 ## Important Constraints
 
@@ -152,6 +173,9 @@ Each cycle executes one bundle (dict of engine → list of operations):
 All kernels are validated against `reference_kernel2()` in `problem.py`. The kernel must produce identical outputs to be considered correct.
 
 ```bash
-# Validate current kernel
-python test_optimized.py
+# Validate with Rust builder (fastest, ~2 seconds)
+python test_optimized.py --rust-builder
+
+# Validate with Python builder (slower, ~80 seconds)
+python test_optimized.py --tick-tock
 ```

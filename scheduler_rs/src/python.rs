@@ -1213,3 +1213,197 @@ fn emit_unscheduled<'py>(py: Python<'py>, ops: &[Op]) -> PyResult<Bound<'py, PyL
 
     Ok(result)
 }
+
+// =============================================================================
+// Kernel Building Functions
+// =============================================================================
+
+use crate::kernel_builder::{KernelConfig, TickTockKernelBuilder};
+use rayon::prelude::*;
+
+/// Result of scheduling with a specific priority mode
+struct ScheduleAttempt {
+    mode: PriorityMode,
+    cycles: usize,
+    ops: Vec<Op>,
+    expanded_ops: Vec<Op>,
+}
+
+/// Build a tick-tock kernel entirely in Rust and return scheduled instructions.
+///
+/// This eliminates the Python→Rust parsing overhead by generating ops directly
+/// as Rust structs, then scheduling them and emitting back to Python.
+///
+/// Uses parallel multipass scheduling to try all priority modes concurrently.
+///
+/// Returns a list of scheduled instruction dicts, ready for execution.
+#[pyfunction]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
+pub fn build_tick_tock_kernel<'py>(
+    py: Python<'py>,
+    forest_height: usize,
+    n_nodes: usize,
+    batch_size: usize,
+    rounds: usize,
+    enable_valu_shift: bool,
+    verbose: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let config = KernelConfig {
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift,
+        enable_debug: false,
+    };
+
+    // Build the kernel (generates unscheduled ops)
+    let mut builder = TickTockKernelBuilder::new(config);
+    let mut ops = builder.build();
+
+    if verbose {
+        println!("Generated {} ops", ops.len());
+        println!("Scratch usage: {} / 1536", builder.alloc.usage());
+    }
+
+    if ops.is_empty() {
+        return Ok(PyList::empty(py));
+    }
+
+    // Compute dependencies
+    compute_dependencies(&mut ops);
+
+    // Compute critical path
+    let critical_path = compute_critical_path(&ops);
+
+    // Clone dep_ids for reuse
+    let dep_ids_map: HashMap<usize, HashSet<usize>> = ops
+        .iter()
+        .map(|op| (op.id, op.dep_ids.clone()))
+        .collect();
+
+    // Run all priority modes in parallel using Rayon
+    let results: Vec<ScheduleAttempt> = ALL_PRIORITY_MODES
+        .par_iter()
+        .map(|&mode| {
+            let mut test_ops = ops.clone();
+            for op in &mut test_ops {
+                op.cycle = -1;
+                op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+            }
+
+            let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+
+            ScheduleAttempt {
+                mode,
+                cycles: result.cycles,
+                ops: test_ops,
+                expanded_ops: result.expanded_ops,
+            }
+        })
+        .collect();
+
+    // Find the best result
+    let best = results
+        .into_iter()
+        .min_by_key(|r| r.cycles)
+        .expect("No scheduling results");
+
+    if verbose {
+        println!("Best: {:?} with {} cycles (parallel multipass)", best.mode, best.cycles);
+    }
+
+    // Add pause instructions at start and end
+    let scheduled = emit_scheduled_with_expanded(py, &best.ops, &best.expanded_ops, best.cycles)?;
+
+    // Build final list with pause wrappers
+    let result = PyList::empty(py);
+    let pause_dict = PyDict::new(py);
+    pause_dict.set_item("flow", PyList::new(py, &[PyTuple::new(py, &["pause".into_pyobject(py).unwrap().into_any()])?])?)?;
+    result.append(&pause_dict)?;
+
+    for item in scheduled.iter() {
+        result.append(item)?;
+    }
+
+    result.append(&pause_dict)?;
+
+    Ok(result)
+}
+
+/// Build a tick-tock kernel and return the number of cycles (for benchmarking).
+///
+/// This is a faster version that doesn't emit back to Python, just returns the cycle count.
+/// Uses parallel multipass scheduling.
+#[pyfunction]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
+pub fn build_tick_tock_kernel_ops(
+    _py: Python<'_>,
+    forest_height: usize,
+    n_nodes: usize,
+    batch_size: usize,
+    rounds: usize,
+    enable_valu_shift: bool,
+    verbose: bool,
+) -> PyResult<usize> {
+    let config = KernelConfig {
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift,
+        enable_debug: false,
+    };
+
+    // Build the kernel (generates unscheduled ops)
+    let mut builder = TickTockKernelBuilder::new(config);
+    let mut ops = builder.build();
+
+    if verbose {
+        println!("Generated {} ops", ops.len());
+        println!("Scratch usage: {} / 1536", builder.alloc.usage());
+    }
+
+    if ops.is_empty() {
+        return Ok(0);
+    }
+
+    // Compute dependencies
+    compute_dependencies(&mut ops);
+
+    // Compute critical path
+    let critical_path = compute_critical_path(&ops);
+
+    // Clone dep_ids for reuse
+    let dep_ids_map: HashMap<usize, HashSet<usize>> = ops
+        .iter()
+        .map(|op| (op.id, op.dep_ids.clone()))
+        .collect();
+
+    // Run all priority modes in parallel using Rayon
+    let results: Vec<(PriorityMode, usize)> = ALL_PRIORITY_MODES
+        .par_iter()
+        .map(|&mode| {
+            let mut test_ops = ops.clone();
+            for op in &mut test_ops {
+                op.cycle = -1;
+                op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
+            }
+
+            let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+            (mode, result.cycles)
+        })
+        .collect();
+
+    // Find the best result
+    let (best_mode, best_cycles) = results
+        .into_iter()
+        .min_by_key(|(_, cycles)| *cycles)
+        .expect("No scheduling results");
+
+    if verbose {
+        println!("Best: {:?} with {} cycles (parallel multipass)", best_mode, best_cycles);
+    }
+
+    Ok(best_cycles)
+}

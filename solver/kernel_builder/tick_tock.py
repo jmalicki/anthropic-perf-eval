@@ -3,8 +3,22 @@ Tick-Tock Partition Kernel Builder.
 
 This module contains the TickTockKernelBuilder that implements the tick-tock
 lazy partition strategy for optimized tree access.
+
+DEPRECATED: This Python implementation is deprecated in favor of the Rust
+kernel builder. Use `scheduler_rs.build_tick_tock_kernel()` instead for:
+- 40x faster build times (parallel multipass scheduling)
+- No Python→Rust parsing overhead
+- Same output quality (identical cycle count)
+
+Example:
+    import scheduler_rs
+    instrs = scheduler_rs.build_tick_tock_kernel(
+        forest_height=10, n_nodes=2047, batch_size=256, rounds=16,
+        enable_valu_shift=True
+    )
 """
 
+import warnings
 from typing import List
 
 from problem import VLEN, HASH_STAGES, SCRATCH_SIZE
@@ -12,6 +26,9 @@ from problem import VLEN, HASH_STAGES, SCRATCH_SIZE
 from .base import BaseKernelBuilder
 from .config import KernelConfig, TreeAccessMode, SchedulingMode
 from .context import ScratchContext
+
+# Deprecation warning flag - set to False to suppress warning
+_SHOW_DEPRECATION_WARNING = True
 
 
 class TickTockKernelBuilder(BaseKernelBuilder):
@@ -95,7 +112,18 @@ class TickTockKernelBuilder(BaseKernelBuilder):
         rounds: int,
         **kwargs
     ):
-        """Build the tick-tock partition kernel."""
+        """Build the tick-tock partition kernel.
+
+        DEPRECATED: Use scheduler_rs.build_tick_tock_kernel() for 40x faster builds.
+        """
+        if _SHOW_DEPRECATION_WARNING:
+            warnings.warn(
+                "TickTockKernelBuilder is deprecated. Use scheduler_rs.build_tick_tock_kernel() "
+                "for 40x faster builds with parallel scheduling.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+
         self.config = KernelConfig(
             forest_height=forest_height,
             n_nodes=n_nodes,

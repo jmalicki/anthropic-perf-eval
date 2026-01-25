@@ -5,6 +5,7 @@
 //! - VALU→ALU shifting when VALU slots are saturated
 //! - Constant derivation optimization
 //! - Comprehensive diagnostics
+//! - Native kernel building (eliminating Python→Rust parsing overhead)
 //!
 //! ## Module Organization
 //!
@@ -12,12 +13,14 @@
 //! - `diagnostics` - Scheduling diagnostics and shared temp analysis
 //! - `constants` - Constant analysis and derivation planning
 //! - `scheduler` - Core scheduling algorithms
+//! - `kernel_builder` - Native Rust kernel generation
 //! - `python` - PyO3 bindings and Python interface
 
 use pyo3::prelude::*;
 
 pub mod constants;
 pub mod diagnostics;
+pub mod kernel_builder;
 pub mod python;
 pub mod scheduler;
 pub mod types;
@@ -38,5 +41,8 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Constant optimization functions
     m.add_function(wrap_pyfunction!(python::analyze_constants, m)?)?;
     m.add_function(wrap_pyfunction!(python::optimize_constants, m)?)?;
+    // Kernel building functions
+    m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ops, m)?)?;
     Ok(())
 }

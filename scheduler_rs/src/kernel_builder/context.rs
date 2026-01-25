@@ -1,0 +1,222 @@
+//! Scratch memory allocation context.
+//!
+//! This module contains the ScratchContext struct that tracks all allocated
+//! scratch memory locations across kernel building phases.
+
+use std::collections::HashMap;
+
+use super::config::VLEN;
+
+/// Holds all allocated scratch memory locations.
+///
+/// This is a Rust port of the Python ScratchContext class, tracking all
+/// scratch addresses needed for kernel execution.
+#[derive(Debug, Clone)]
+pub struct ScratchContext {
+    // =========================================================================
+    // Pointers (loaded from memory at init)
+    // =========================================================================
+    pub forest_p: i64,      // Pointer to forest data
+    pub idx_p: i64,         // Pointer to indices
+    pub val_p: i64,         // Pointer to values
+    pub n_nodes_s: i64,     // Number of nodes (scalar)
+
+    // =========================================================================
+    // Scalar Temporaries
+    // =========================================================================
+    pub st: [i64; 16],      // General-purpose scalar temps
+    pub c: [i64; 16],       // Constants 0-15
+
+    // =========================================================================
+    // Hash Constants
+    // =========================================================================
+    pub hc: [i64; 6],       // Hash constants (scalar)
+    pub hs: [i64; 6],       // Hash shifts (scalar)
+
+    // =========================================================================
+    // Tree Cache (depths 0-2)
+    // =========================================================================
+    pub tc: [i64; 7],       // tree[0..6] cached values
+    pub td_1: i64,          // tree[1] - tree[2] (delta for depth 1)
+    pub td_4: i64,          // tree[4] - tree[3] (delta for depth 2)
+    pub td_5: i64,          // tree[5] - tree[3]
+    pub td_6: i64,          // tree[6] - tree[3]
+
+    // =========================================================================
+    // Depth 3 Cache
+    // =========================================================================
+    pub tc_r3: [i64; 8],    // tree[7..14] for depth 3 VALU selection
+    pub c_r3: [i64; 8],     // Constants 7-14
+
+    // =========================================================================
+    // Stage 5 XOR Optimization
+    // =========================================================================
+    pub stage5_xor_s: i64,  // 0xB55A4F09 scalar
+
+    // =========================================================================
+    // Per-Group Vectors
+    // These are dynamically sized based on n_groups
+    // =========================================================================
+    pub all_idx: Vec<i64>,  // [n_groups] - base addresses for idx vectors
+    pub all_val: Vec<i64>,  // [n_groups] - base addresses for val vectors
+    pub v_nv: Vec<Vec<i64>>, // [n_iters][UNROLL] - tree value vectors
+    pub v_t: Vec<Vec<i64>>,  // [n_iters][UNROLL] - temp vectors
+
+    // =========================================================================
+    // Vector Constants
+    // =========================================================================
+    pub v_0: i64,           // Vector of 0s
+    pub v_1: i64,           // Vector of 1s
+    pub v_2: i64,           // Vector of 2s
+    pub v_nn: i64,          // Vector of n_nodes
+    pub v_const: [i64; 8],  // Vector constants 0-7
+
+    // =========================================================================
+    // Vector Hash Constants
+    // =========================================================================
+    pub v_hc: [i64; 6],     // Vector hash constants
+    pub v_hs: [i64; 6],     // Vector hash shifts
+
+    // =========================================================================
+    // Vector Tree Cache
+    // =========================================================================
+    pub v_td_1: i64,        // Vector td_1
+    pub v_td_4: i64,        // Vector td_4
+    pub v_td_5: i64,        // Vector td_5
+    pub v_td_6: i64,        // Vector td_6
+    pub v_tc2: i64,         // Vector tc[2]
+    pub v_tc3: i64,         // Vector tc[3]
+
+    // =========================================================================
+    // Depth 3 Vectors
+    // =========================================================================
+    pub v_tc_r3: [i64; 8],  // Vector broadcasts of tc_r3
+    pub v_const_r3: [i64; 8], // Vector broadcasts of c_r3
+
+    // =========================================================================
+    // Stage 5 XOR Vector
+    // =========================================================================
+    pub v_stage5_xor: i64,
+
+    // =========================================================================
+    // FMA Multipliers for Hash Optimization
+    // =========================================================================
+    pub hash_fma_mult: [Option<i64>; 6],  // Pre-computed FMA multipliers
+    pub hash_fma_mult_s: HashMap<usize, i64>,  // stage -> scalar address
+    pub v_hash_mult: HashMap<usize, i64>,      // stage -> vector address
+
+    // =========================================================================
+    // Partition-specific (TickTock)
+    // =========================================================================
+    pub extra_room_p: i64,           // Pointer to extra_room memory
+    pub partition_idx_offset: i64,   // Offset to idx section in partition buffer
+    pub partition_val_offset: i64,   // Offset to val section in partition buffer
+    pub tree_cache_scalars: i64,     // Scalar storage for sorted vload cache
+    pub tree_cache_base_s: i64,      // Base index of cache
+    pub v_cache_base: i64,           // Vector broadcast of cache base
+    pub v_tree_temp: i64,            // Temp vector for tree operations
+}
+
+impl Default for ScratchContext {
+    fn default() -> Self {
+        ScratchContext {
+            forest_p: 0,
+            idx_p: 0,
+            val_p: 0,
+            n_nodes_s: 0,
+
+            st: [0; 16],
+            c: [0; 16],
+
+            hc: [0; 6],
+            hs: [0; 6],
+
+            tc: [0; 7],
+            td_1: 0,
+            td_4: 0,
+            td_5: 0,
+            td_6: 0,
+
+            tc_r3: [0; 8],
+            c_r3: [0; 8],
+
+            stage5_xor_s: 0,
+
+            all_idx: Vec::new(),
+            all_val: Vec::new(),
+            v_nv: Vec::new(),
+            v_t: Vec::new(),
+
+            v_0: 0,
+            v_1: 0,
+            v_2: 0,
+            v_nn: 0,
+            v_const: [0; 8],
+
+            v_hc: [0; 6],
+            v_hs: [0; 6],
+
+            v_td_1: 0,
+            v_td_4: 0,
+            v_td_5: 0,
+            v_td_6: 0,
+            v_tc2: 0,
+            v_tc3: 0,
+
+            v_tc_r3: [0; 8],
+            v_const_r3: [0; 8],
+
+            v_stage5_xor: 0,
+
+            hash_fma_mult: [None; 6],
+            hash_fma_mult_s: HashMap::new(),
+            v_hash_mult: HashMap::new(),
+
+            extra_room_p: 0,
+            partition_idx_offset: 0,
+            partition_val_offset: 0,
+            tree_cache_scalars: 0,
+            tree_cache_base_s: 0,
+            v_cache_base: 0,
+            v_tree_temp: 0,
+        }
+    }
+}
+
+/// Scratch allocator - tracks allocation pointer and debug info
+#[derive(Debug, Clone)]
+pub struct ScratchAllocator {
+    /// Current allocation pointer
+    pub ptr: i64,
+    /// Debug map: address -> (name, length)
+    pub debug_map: HashMap<i64, (String, usize)>,
+}
+
+impl Default for ScratchAllocator {
+    fn default() -> Self {
+        ScratchAllocator {
+            ptr: 0,
+            debug_map: HashMap::new(),
+        }
+    }
+}
+
+impl ScratchAllocator {
+    /// Allocate scratch memory
+    pub fn alloc(&mut self, name: &str, length: usize) -> i64 {
+        let addr = self.ptr;
+        self.debug_map.insert(addr, (name.to_string(), length));
+        self.ptr += length as i64;
+        addr
+    }
+
+    /// Allocate a vector (VLEN words)
+    pub fn vec(&mut self, name: &str) -> i64 {
+        self.alloc(name, VLEN)
+    }
+
+    /// Get current usage
+    pub fn usage(&self) -> i64 {
+        self.ptr
+    }
+}
