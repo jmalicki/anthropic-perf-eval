@@ -255,9 +255,59 @@ impl TickTockKernelBuilder {
         // Register ZERO_REG as known constant 0 (no load needed - scratch is initialized to 0)
         self.emit.known_constants.insert(ZERO_REG, 0);
 
-        // Load constants 1-15 (c[0] = ZERO_REG is already 0, no load needed)
+        // === CONSTANT DERIVATION: 1 Load op + 14 ALU ops (vs 15 Load ops before) ===
+        // This frees 14 Load slots for actual data fetches!
+        //
+        // Derivation tree (minimum depth = 4 cycles):
+        //   Cycle 0: Load 1
+        //   Cycle 1: 2 = 1+1
+        //   Cycle 2: 3 = 2+1, 4 = 2+2
+        //   Cycle 3: 5 = 4+1, 6 = 3+3, 7 = 4+3, 8 = 4+4
+        //   Cycle 4: 9=8+1, 10=5+5, 11=8+3, 12=6+6, 13=8+5, 14=7+7, 15=8+7
+
+        // Bootstrap: Load only constant 1
+        self.emit.emit_const(self.ctx.c[1], 1);
+
+        // Derive 2-15 using ALU (scheduler will parallelize these as dependencies allow)
+        // Cycle +1: 2 = 1+1
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[2], self.ctx.c[1], self.ctx.c[1]);
+
+        // Cycle +2: 3 = 2+1, 4 = 2+2 (parallel)
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[3], self.ctx.c[2], self.ctx.c[1]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[4], self.ctx.c[2], self.ctx.c[2]);
+
+        // Cycle +3: 5, 6, 7, 8 (parallel)
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[5], self.ctx.c[4], self.ctx.c[1]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[6], self.ctx.c[3], self.ctx.c[3]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[7], self.ctx.c[4], self.ctx.c[3]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[8], self.ctx.c[4], self.ctx.c[4]);
+
+        // Cycle +4: 9, 10, 11, 12, 13, 14, 15 (parallel)
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[9], self.ctx.c[8], self.ctx.c[1]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[10], self.ctx.c[5], self.ctx.c[5]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[11], self.ctx.c[8], self.ctx.c[3]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[12], self.ctx.c[6], self.ctx.c[6]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[13], self.ctx.c[8], self.ctx.c[5]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[14], self.ctx.c[7], self.ctx.c[7]);
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[15], self.ctx.c[8], self.ctx.c[7]);
+
+        // Register all constants in known_constants for later derivation use
         for i in 1..16 {
-            self.emit.emit_const(self.ctx.c[i], i as i64);
+            self.emit.known_constants.insert(self.ctx.c[i], i as i64);
         }
 
         // Load pointers
@@ -284,24 +334,27 @@ impl TickTockKernelBuilder {
             self.emit.emit_const(self.ctx.hs[i], HASH_STAGES[i].4);
         }
 
-        // Broadcast vector constants
-        self.emit.emit_vbroadcast(self.ctx.v_0, self.ctx.c[0]);
-        self.emit.emit_vbroadcast(self.ctx.v_1, self.ctx.c[1]);
-        self.emit.emit_vbroadcast(self.ctx.v_2, self.ctx.c[2]);
-        self.emit.emit_vbroadcast(self.ctx.v_nn, self.ctx.n_nodes_s);
+        // Broadcast vector constants - use CSE to avoid duplicate broadcasts
+        // v_0, v_1, v_2 are broadcast first, then v_const[0..8] will reuse them via CSE
+        self.ctx.v_0 = self.emit.emit_vbroadcast(self.ctx.v_0, self.ctx.c[0]);
+        self.ctx.v_1 = self.emit.emit_vbroadcast(self.ctx.v_1, self.ctx.c[1]);
+        self.ctx.v_2 = self.emit.emit_vbroadcast(self.ctx.v_2, self.ctx.c[2]);
+        self.ctx.v_nn = self.emit.emit_vbroadcast(self.ctx.v_nn, self.ctx.n_nodes_s);
 
+        // v_const[0], [1], [2] will be CSE'd to v_0, v_1, v_2 (no new ops emitted)
+        // v_const[3..8] will emit new broadcasts
         for i in 0..8 {
-            self.emit.emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
+            self.ctx.v_const[i] = self.emit.emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
         }
 
         for i in 0..6 {
-            self.emit.emit_vbroadcast(self.ctx.v_hc[i], self.ctx.hc[i]);
-            self.emit.emit_vbroadcast(self.ctx.v_hs[i], self.ctx.hs[i]);
+            self.ctx.v_hc[i] = self.emit.emit_vbroadcast(self.ctx.v_hc[i], self.ctx.hc[i]);
+            self.ctx.v_hs[i] = self.emit.emit_vbroadcast(self.ctx.v_hs[i], self.ctx.hs[i]);
         }
 
         // Load Stage 5 XOR constant
         self.emit.emit_const(self.ctx.stage5_xor_s, STAGE5_XOR_CONST);
-        self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
+        self.ctx.v_stage5_xor = self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
 
         // Load tree cache
         for i in 0..7 {
@@ -315,12 +368,12 @@ impl TickTockKernelBuilder {
         self.emit.emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
         self.emit.emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
 
-        self.emit.emit_vbroadcast(self.ctx.v_tc2, self.ctx.tc[2]);
-        self.emit.emit_vbroadcast(self.ctx.v_td_1, self.ctx.td_1);
-        self.emit.emit_vbroadcast(self.ctx.v_tc3, self.ctx.tc[3]);
-        self.emit.emit_vbroadcast(self.ctx.v_td_4, self.ctx.td_4);
-        self.emit.emit_vbroadcast(self.ctx.v_td_5, self.ctx.td_5);
-        self.emit.emit_vbroadcast(self.ctx.v_td_6, self.ctx.td_6);
+        self.ctx.v_tc2 = self.emit.emit_vbroadcast(self.ctx.v_tc2, self.ctx.tc[2]);
+        self.ctx.v_td_1 = self.emit.emit_vbroadcast(self.ctx.v_td_1, self.ctx.td_1);
+        self.ctx.v_tc3 = self.emit.emit_vbroadcast(self.ctx.v_tc3, self.ctx.tc[3]);
+        self.ctx.v_td_4 = self.emit.emit_vbroadcast(self.ctx.v_td_4, self.ctx.td_4);
+        self.ctx.v_td_5 = self.emit.emit_vbroadcast(self.ctx.v_td_5, self.ctx.td_5);
+        self.ctx.v_td_6 = self.emit.emit_vbroadcast(self.ctx.v_td_6, self.ctx.td_6);
 
         // FMA multipliers - copy multipliers first to avoid borrow issues
         let fma_mults: Vec<(usize, i64)> = (0..6)
@@ -331,32 +384,36 @@ impl TickTockKernelBuilder {
             let mult_s = self.alloc.alloc(&format!("hash_mult_{}", i), 1);
             let v_mult = self.alloc.vec(&format!("v_hash_mult_{}", i));
             self.ctx.hash_fma_mult_s.insert(i, mult_s);
-            self.ctx.v_hash_mult.insert(i, v_mult);
             self.emit.emit_const(mult_s, mult);
-            self.emit.emit_vbroadcast(v_mult, mult_s);
+            let actual_v_mult = self.emit.emit_vbroadcast(v_mult, mult_s);
+            self.ctx.v_hash_mult.insert(i, actual_v_mult);
         }
     }
 
     fn emit_valu_selection_init(&mut self) {
-        // Load constants 7-14
+        // Reuse c[7..14] which we derived via ALU (no additional loads needed!)
+        // c_r3[i] aliases to c[7+i] for broadcast sources
         for i in 0..8 {
-            self.emit.emit_const(self.ctx.c_r3[i], (7 + i) as i64);
+            self.ctx.c_r3[i] = self.ctx.c[7 + i];
         }
 
         // Load tree[7..14]
         for i in 0..8 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c_r3[i]);
+            self.emit
+                .emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c_r3[i]);
             self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.st[0]);
         }
 
         // Broadcast tree values
         for i in 0..8 {
-            self.emit.emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
+            self.ctx.v_tc_r3[i] =
+                self.emit.emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
         }
 
-        // Broadcast constants
+        // Broadcast constants - use CSE, some may already be broadcast (e.g., c[7] to v_const[7])
         for i in 0..8 {
-            self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
+            self.ctx.v_const_r3[i] =
+                self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
         }
     }
 
@@ -450,9 +507,10 @@ impl TickTockKernelBuilder {
         let ctx = &self.ctx;
 
         // Depth 0: All at root - broadcast tree[0]
+        // Use _force to bypass CSE since we need the value in each specific v_nv location
         for it in 0..n_iters {
             for i in 0..UNROLL {
-                self.emit.emit_vbroadcast(ctx.v_nv[it][i], ctx.tc[0]);
+                self.emit.emit_vbroadcast_force(ctx.v_nv[it][i], ctx.tc[0]);
             }
         }
 

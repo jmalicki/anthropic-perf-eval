@@ -122,10 +122,22 @@ impl EmitContext {
 
     /// Emit a vbroadcast: dest[0..8] = scalar_src
     ///
-    /// Caches the broadcast so that subsequent broadcasts from the same scalar
-    /// can be detected. If the source scalar has a known constant value,
-    /// propagates that to `produces_constant`.
-    pub fn emit_vbroadcast(&mut self, dest: i64, src: i64) {
+    /// **Returns:** The actual vector destination used. If this scalar was already
+    /// broadcast, returns the existing destination (CSE deduplication). Otherwise,
+    /// returns the provided `dest`.
+    ///
+    /// Callers should use the returned address instead of their requested `dest`
+    /// when the scalar has already been broadcast - this eliminates duplicate
+    /// broadcast operations.
+    ///
+    /// If the source scalar has a known constant value, propagates that to
+    /// `produces_constant`.
+    pub fn emit_vbroadcast(&mut self, dest: i64, src: i64) -> i64 {
+        // CSE: If this scalar was already broadcast, return existing destination
+        if let Some(entry) = self.broadcast_cache.get(&src) {
+            return entry.dest;
+        }
+
         let mut writes = HashSet::new();
         for i in 0..VLEN as i64 {
             writes.insert(dest + i);
@@ -156,6 +168,45 @@ impl EmitContext {
             dest,
             op_id: self.next_op_id,
         });
+
+        self.next_op_id += 1;
+        self.ops.push(op);
+
+        dest
+    }
+
+    /// Emit a vbroadcast without CSE - always emits to the specified destination.
+    ///
+    /// Use this when the destination matters (e.g., working temporaries that need
+    /// the value in a specific location for subsequent operations to read from).
+    ///
+    /// Does NOT update the broadcast cache, so subsequent CSE-enabled broadcasts
+    /// from the same source will still emit.
+    pub fn emit_vbroadcast_force(&mut self, dest: i64, src: i64) {
+        let mut writes = HashSet::new();
+        for i in 0..VLEN as i64 {
+            writes.insert(dest + i);
+        }
+
+        // Propagate constant info if source is a known constant
+        let produces_constant = self.known_constants.get(&src).copied();
+
+        let op = Op {
+            id: self.next_op_id,
+            engine: Engine::Valu,
+            slot: [
+                SlotVal::Str("vbroadcast".to_string()),
+                SlotVal::Int(dest),
+                SlotVal::Int(src),
+            ]
+            .into_iter()
+            .collect(),
+            cycle: -1,
+            dep_ids: HashSet::new(),
+            reads: [src].into_iter().collect(),
+            writes,
+            produces_constant,
+        };
 
         self.next_op_id += 1;
         self.ops.push(op);
