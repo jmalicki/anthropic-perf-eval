@@ -41,6 +41,7 @@ pub struct ScratchContext {
     // Tree Cache (depths 0-2)
     // =========================================================================
     pub tc: [i64; 7],       // tree[0..6] cached values
+    pub tc_addr: [i64; 7],  // Address registers for parallel tree cache load
     pub td_1: i64,          // tree[1] - tree[2] (delta for depth 1)
     pub td_4: i64,          // tree[4] - tree[3] (delta for depth 2)
     pub td_5: i64,          // tree[5] - tree[3]
@@ -50,6 +51,7 @@ pub struct ScratchContext {
     // Depth 3 Cache
     // =========================================================================
     pub tc_r3: [i64; 8],    // tree[7..14] for depth 3 VALU selection
+    pub tc_r3_addr: [i64; 8], // Address registers for parallel depth 3 cache load
     pub c_r3: [i64; 8],     // Constants 7-14
 
     // =========================================================================
@@ -178,12 +180,14 @@ impl Default for ScratchContext {
             hs: [0; 6],
 
             tc: [0; 7],
+            tc_addr: [0; 7],
             td_1: 0,
             td_4: 0,
             td_5: 0,
             td_6: 0,
 
             tc_r3: [0; 8],
+            tc_r3_addr: [0; 8],
             c_r3: [0; 8],
 
             stage5_xor_s: 0,

@@ -163,6 +163,10 @@ impl TickTockKernelBuilder {
         for i in 0..7 {
             ctx.tc[i] = alloc.alloc(&format!("tc{}", i), 1);
         }
+        // Tree cache address registers for parallel computation
+        for i in 0..7 {
+            ctx.tc_addr[i] = alloc.alloc(&format!("tc_addr{}", i), 1);
+        }
         ctx.td_1 = alloc.alloc("td_1", 1);
         ctx.td_4 = alloc.alloc("td_4", 1);
         ctx.td_5 = alloc.alloc("td_5", 1);
@@ -270,6 +274,10 @@ impl TickTockKernelBuilder {
         for i in 0..8 {
             ctx.tc_r3[i] = alloc.alloc(&format!("tc_r3_{}", i), 1);
         }
+        // Depth 3 address registers for parallel computation
+        for i in 0..8 {
+            ctx.tc_r3_addr[i] = alloc.alloc(&format!("tc_r3_addr_{}", i), 1);
+        }
         for i in 0..8 {
             ctx.v_tc_r3[i] = alloc.vec(&format!("v_tc_r3_{}", i));
         }
@@ -289,41 +297,37 @@ impl TickTockKernelBuilder {
         // Register ZERO_REG as known constant 0 (no load needed - scratch is initialized to 0)
         self.emit.known_constants.insert(ZERO_REG, 0);
 
-        // === CONSTANT DERIVATION: 1 Load op + 14 ALU ops (vs 15 Load ops before) ===
-        // This frees 14 Load slots for actual data fetches!
+        // === CONSTANT DERIVATION: 3 Load ops + 12 ALU ops ===
+        // Bootstrap c[1], c[2], c[4] to break dependency chain.
+        // This enables earlier availability of key constants used for tree cache:
+        //   - c[0..6] available by cycle 2 (was cycle 4)
+        //   - All c[0..15] available by cycle 4 (was cycle 5)
         //
-        // Derivation tree (minimum depth = 4 cycles):
-        //   Cycle 0: Load 1
-        //   Cycle 1: 2 = 1+1
-        //   Cycle 2: 3 = 2+1, 4 = 2+2
-        //   Cycle 3: 5 = 4+1, 6 = 3+3, 7 = 4+3, 8 = 4+4
-        //   Cycle 4: 9=8+1, 10=5+5, 11=8+3, 12=6+6, 13=8+5, 14=7+7, 15=8+7
+        // Derivation tree:
+        //   Cycle 0: Load c[1]=1, c[2]=2, c[4]=4
+        //   Cycle +1: c[3]=2+1, c[5]=4+1, c[6]=4+2, c[8]=4+4 (parallel)
+        //   Cycle +2: c[7]=4+3, c[9..13] (parallel)
+        //   Cycle +3: c[14]=7+7, c[15]=8+7 (parallel)
 
-        // Bootstrap: Load only constant 1
+        // Bootstrap: Load constants 1, 2, 4 to break dependency chain
         self.emit.emit_const(self.ctx.c[1], 1);
+        self.emit.emit_const(self.ctx.c[2], 2);
+        self.emit.emit_const(self.ctx.c[4], 4);
 
-        // Derive 2-15 using ALU (scheduler will parallelize these as dependencies allow)
-        // Cycle +1: 2 = 1+1
-        self.emit
-            .emit_alu(Opcode::Add, self.ctx.c[2], self.ctx.c[1], self.ctx.c[1]);
-
-        // Cycle +2: 3 = 2+1, 4 = 2+2 (parallel)
+        // Derive remaining constants using ALU (scheduler will parallelize)
+        // Cycle +1: 3, 5, 6, 8 (all depend only on bootstrapped constants)
         self.emit
             .emit_alu(Opcode::Add, self.ctx.c[3], self.ctx.c[2], self.ctx.c[1]);
         self.emit
-            .emit_alu(Opcode::Add, self.ctx.c[4], self.ctx.c[2], self.ctx.c[2]);
-
-        // Cycle +3: 5, 6, 7, 8 (parallel)
-        self.emit
             .emit_alu(Opcode::Add, self.ctx.c[5], self.ctx.c[4], self.ctx.c[1]);
         self.emit
-            .emit_alu(Opcode::Add, self.ctx.c[6], self.ctx.c[3], self.ctx.c[3]);
-        self.emit
-            .emit_alu(Opcode::Add, self.ctx.c[7], self.ctx.c[4], self.ctx.c[3]);
+            .emit_alu(Opcode::Add, self.ctx.c[6], self.ctx.c[4], self.ctx.c[2]);
         self.emit
             .emit_alu(Opcode::Add, self.ctx.c[8], self.ctx.c[4], self.ctx.c[4]);
 
-        // Cycle +4: 9, 10, 11, 12, 13, 14, 15 (parallel)
+        // Cycle +2: 7, 9, 10, 11, 12, 13, 14, 15 (depend on cycle +1 constants)
+        self.emit
+            .emit_alu(Opcode::Add, self.ctx.c[7], self.ctx.c[4], self.ctx.c[3]);
         self.emit
             .emit_alu(Opcode::Add, self.ctx.c[9], self.ctx.c[8], self.ctx.c[1]);
         self.emit
@@ -390,10 +394,14 @@ impl TickTockKernelBuilder {
         self.emit.emit_const(self.ctx.stage5_xor_s, STAGE5_XOR_CONST);
         self.ctx.v_stage5_xor = self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
 
-        // Load tree cache
+        // Load tree cache - parallel address computation
+        // First compute all addresses (can parallelize in ALU)
         for i in 0..7 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c[i]);
-            self.emit.emit_load(self.ctx.tc[i], self.ctx.st[0]);
+            self.emit.emit_alu(Opcode::Add, self.ctx.tc_addr[i], self.ctx.forest_p, self.ctx.c[i]);
+        }
+        // Then load all values (2 loads per cycle)
+        for i in 0..7 {
+            self.emit.emit_load(self.ctx.tc[i], self.ctx.tc_addr[i]);
         }
 
         // Compute deltas
@@ -507,9 +515,13 @@ impl TickTockKernelBuilder {
 
         // === TREE CACHE ===
         // Load tree[0..6] - these are critical for early tree access!
+        // Parallel address computation (can parallelize in ALU)
         for i in 0..7 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c[i]);
-            self.emit.emit_load(self.ctx.tc[i], self.ctx.st[0]);
+            self.emit.emit_alu(Opcode::Add, self.ctx.tc_addr[i], self.ctx.forest_p, self.ctx.c[i]);
+        }
+        // Then load all values (2 loads per cycle)
+        for i in 0..7 {
+            self.emit.emit_load(self.ctx.tc[i], self.ctx.tc_addr[i]);
         }
 
         // Compute deltas
@@ -548,11 +560,14 @@ impl TickTockKernelBuilder {
             self.ctx.c_r3[i] = self.ctx.c[7 + i];
         }
 
-        // Load tree[7..14]
+        // Load tree[7..14] - parallel address computation
+        // First compute all addresses (can parallelize in ALU)
         for i in 0..8 {
-            self.emit
-                .emit_alu(Opcode::Add, self.ctx.st[0], self.ctx.forest_p, self.ctx.c_r3[i]);
-            self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.st[0]);
+            self.emit.emit_alu(Opcode::Add, self.ctx.tc_r3_addr[i], self.ctx.forest_p, self.ctx.c_r3[i]);
+        }
+        // Then load all values (2 loads per cycle)
+        for i in 0..8 {
+            self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.tc_r3_addr[i]);
         }
 
         // Broadcast tree values
