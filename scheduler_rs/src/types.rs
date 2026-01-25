@@ -290,6 +290,11 @@ pub struct Op {
     pub dep_ids: HashSet<usize>,
     pub reads: HashSet<i64>,
     pub writes: HashSet<i64>,
+    /// Which addresses in `reads` are their LAST use across the entire program.
+    /// This is computed by `compute_last_uses()` in the scheduler before scheduling.
+    /// Used for scratch pressure tracking - when this op executes, these addresses
+    /// can be freed from scratch since no later op will read them.
+    pub last_use_reads: HashSet<i64>,
     /// If this op produces a known constant value, record it here.
     /// This enables late-binding optimization - any pass can replace
     /// this op with a cheaper method of producing the same constant.
@@ -409,6 +414,7 @@ pub fn expand_valu_to_alu_smart(
             dep_ids: op.dep_ids.clone(),
             reads: [actual_src1, actual_src2].into_iter().collect(),
             writes: [dest + i_offset].into_iter().collect(),
+            last_use_reads: HashSet::new(), // Computed later by compute_last_uses
             produces_constant: None,
         };
         new_ops.push(new_op);

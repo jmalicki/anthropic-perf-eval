@@ -45,6 +45,14 @@ pub struct SchedulingDiagnostics {
     // Broadcast elimination stats
     pub broadcasts_eliminated: usize,
     pub broadcast_forwards: usize,
+
+    // Scratch pressure tracking
+    /// Peak scratch pressure (max live addresses at any point)
+    pub peak_scratch_pressure: usize,
+    /// Scratch budget limit
+    pub scratch_budget: usize,
+    /// Number of times pressure exceeded budget during scheduling
+    pub pressure_exceeded_count: usize,
 }
 
 impl SchedulingDiagnostics {
@@ -157,6 +165,24 @@ impl SchedulingDiagnostics {
                 "  Cycles VALU saturated: {}",
                 self.cycles_valu_saturated
             ));
+        }
+
+        // Scratch pressure (always show if we tracked it)
+        if self.scratch_budget > 0 {
+            lines.push(String::new());
+            lines.push("--- Scratch Pressure ---".to_string());
+            lines.push(format!(
+                "  Peak pressure: {} / {} ({:.1}%)",
+                self.peak_scratch_pressure,
+                self.scratch_budget,
+                (self.peak_scratch_pressure as f64 / self.scratch_budget as f64) * 100.0
+            ));
+            if self.pressure_exceeded_count > 0 {
+                lines.push(format!(
+                    "  WARNING: Pressure exceeded budget {} times!",
+                    self.pressure_exceeded_count
+                ));
+            }
         }
 
         lines.join("\n")

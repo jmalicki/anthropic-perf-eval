@@ -30,9 +30,10 @@ pub enum PriorityMode {
     LoadEarly,        // Prioritize loads
     LoadEarlySlack,   // Combine load-early with slack
     OriginalOrder,    // Schedule in original emission order
+    ScratchPressure,  // Prioritize ops that free scratch (high LUC = Last Use Count)
 }
 
-pub const ALL_PRIORITY_MODES: [PriorityMode; 7] = [
+pub const ALL_PRIORITY_MODES: [PriorityMode; 8] = [
     PriorityMode::CriticalPath,
     PriorityMode::CriticalPathValu,
     PriorityMode::EngineBalance,
@@ -40,7 +41,147 @@ pub const ALL_PRIORITY_MODES: [PriorityMode; 7] = [
     PriorityMode::LoadEarly,
     PriorityMode::LoadEarlySlack,
     PriorityMode::OriginalOrder,
+    PriorityMode::ScratchPressure,
 ];
+
+// ============================================================================
+// Scratch Pressure Tracking
+// ============================================================================
+
+/// Scratch memory budget (matches config.rs)
+pub const SCRATCH_BUDGET: usize = 1536;
+
+/// Compute which reads are "last uses" for each op.
+///
+/// An address's last use is the op with the highest ID that reads it.
+/// When that op executes, the address can be freed from scratch because
+/// no later op will read from it.
+///
+/// This is used for scratch pressure tracking - we can compute how many
+/// addresses are "live" at any point by tracking allocations (writes)
+/// and deallocations (last uses).
+pub fn compute_last_uses(ops: &mut [Op]) {
+    // Map: address -> op_id with latest use (highest ID that reads this address)
+    let mut last_reader: HashMap<i64, usize> = HashMap::new();
+
+    // First pass: find the latest reader for each address
+    for op in ops.iter() {
+        for &addr in &op.reads {
+            last_reader
+                .entry(addr)
+                .and_modify(|existing| {
+                    if op.id > *existing {
+                        *existing = op.id;
+                    }
+                })
+                .or_insert(op.id);
+        }
+    }
+
+    // Second pass: mark last uses on each op
+    for op in ops.iter_mut() {
+        op.last_use_reads.clear();
+        for &addr in &op.reads {
+            if last_reader.get(&addr) == Some(&op.id) {
+                op.last_use_reads.insert(addr);
+            }
+        }
+    }
+}
+
+/// Track live scratch addresses during scheduling.
+///
+/// This implements register pressure tracking adapted for scratch memory.
+/// Each address is "live" from when it's written until its last read.
+///
+/// Key concepts:
+/// - **Pressure**: Count of currently live addresses
+/// - **Peak**: Maximum pressure seen during scheduling
+/// - **Budget**: Maximum allowed pressure (1536 for this architecture)
+#[derive(Debug)]
+pub struct ScratchPressureTracker {
+    /// Currently live addresses (written but not yet last-used)
+    live: HashSet<i64>,
+    /// Peak pressure observed
+    peak: usize,
+    /// Budget limit
+    limit: usize,
+    /// Count of times pressure exceeded budget
+    exceeded_count: usize,
+}
+
+impl ScratchPressureTracker {
+    /// Create a new pressure tracker with the given limit
+    pub fn new(limit: usize) -> Self {
+        Self {
+            live: HashSet::new(),
+            peak: 0,
+            limit,
+            exceeded_count: 0,
+        }
+    }
+
+    /// Get current pressure (number of live addresses)
+    pub fn current_pressure(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Get peak pressure observed so far
+    pub fn peak_pressure(&self) -> usize {
+        self.peak
+    }
+
+    /// Compute the pressure change if we schedule this op.
+    ///
+    /// Returns (addresses_added, addresses_freed, net_change)
+    /// - Positive net = pressure increases
+    /// - Negative net = pressure decreases (good!)
+    pub fn pressure_delta(&self, op: &Op) -> (usize, usize, i64) {
+        let added = op.writes.len();
+        let freed = op.last_use_reads.len();
+        let net = added as i64 - freed as i64;
+        (added, freed, net)
+    }
+
+    /// Check if scheduling this op would exceed the budget.
+    ///
+    /// Note: This is a soft check - we allow scheduling even if exceeded,
+    /// but track how often this happens for diagnostics.
+    pub fn would_exceed(&self, op: &Op) -> bool {
+        let (added, freed, _) = self.pressure_delta(op);
+        let new_pressure = self.live.len() + added - freed.min(self.live.len());
+        new_pressure > self.limit
+    }
+
+    /// Apply the pressure changes from scheduling an op.
+    /// Call this after the op is scheduled.
+    pub fn apply(&mut self, op: &Op) {
+        // Add written addresses (they become live)
+        for &addr in &op.writes {
+            self.live.insert(addr);
+        }
+
+        // Remove last-used addresses (they are no longer needed)
+        for &addr in &op.last_use_reads {
+            self.live.remove(&addr);
+        }
+
+        // Track peak
+        if self.live.len() > self.peak {
+            self.peak = self.live.len();
+        }
+
+        // Track exceeded count
+        if self.live.len() > self.limit {
+            self.exceeded_count += 1;
+        }
+    }
+
+    /// Get count of times pressure exceeded budget
+    pub fn exceeded_count(&self) -> usize {
+        self.exceeded_count
+    }
+}
 
 /// Compute critical path length for each op (longest path to any sink)
 pub fn compute_critical_path(ops: &[Op]) -> HashMap<usize, usize> {
@@ -106,23 +247,34 @@ pub fn compute_critical_path(ops: &[Op]) -> HashMap<usize, usize> {
     critical_path
 }
 
-/// Priority for scheduling (lower tuple = higher priority in min-heap with Reverse)
+/// Priority for scheduling.
+///
+/// Returns (primary, secondary, luc_tiebreaker, op_id) where lower = higher priority.
+///
+/// The LUC (Last Use Count) is used as a tie-breaker for ALL modes to help
+/// reduce scratch pressure. When ops have equal priority, we prefer those
+/// that free more scratch addresses.
 fn compute_priority(
     op_id: usize,
     op_idx: usize,
     engine: Engine,
     critical_path: &HashMap<usize, usize>,
     slack_map: &HashMap<usize, i32>,
+    luc_map: &HashMap<usize, usize>,
     mode: PriorityMode,
-) -> (i32, i32, usize) {
+) -> (i32, i32, i32, usize) {
     let cp = *critical_path.get(&op_id).unwrap_or(&1) as i32;
     let slack = *slack_map.get(&op_id).unwrap_or(&0);
+    let luc = *luc_map.get(&op_id).unwrap_or(&0) as i32;
     let is_valu = if engine == Engine::Valu { 0 } else { 1 };
     let is_load = if engine == Engine::Load { 0 } else { 1 };
 
+    // LUC as tie-breaker: negative because higher LUC = higher priority = lower sort key
+    let luc_tiebreaker = -luc;
+
     match mode {
-        PriorityMode::CriticalPath => (-cp, is_valu, op_id),
-        PriorityMode::CriticalPathValu => (is_valu, -cp, op_id),
+        PriorityMode::CriticalPath => (-cp, is_valu, luc_tiebreaker, op_id),
+        PriorityMode::CriticalPathValu => (is_valu, -cp, luc_tiebreaker, op_id),
         PriorityMode::EngineBalance => {
             // Matches Python: -cp * load_factor where load_factor is 0.6, 0.8, 0.5, 1.0
             // Scale by 10000 to preserve float precision (Python uses actual floats)
@@ -134,12 +286,17 @@ fn compute_priority(
             };
             // Scale to preserve decimal precision - Python compares floats directly
             let adjusted_cp = (-(cp as f64) * load_factor * 10000.0) as i32;
-            (adjusted_cp, op_id as i32, op_id)
+            (adjusted_cp, luc_tiebreaker, 0, op_id)
         }
-        PriorityMode::Slack => (slack, -cp, op_id),
-        PriorityMode::LoadEarly => (is_load, -cp, op_id),
-        PriorityMode::LoadEarlySlack => (is_load, slack, op_id),
-        PriorityMode::OriginalOrder => (op_idx as i32, is_valu, op_id),
+        PriorityMode::Slack => (slack, -cp, luc_tiebreaker, op_id),
+        PriorityMode::LoadEarly => (is_load, -cp, luc_tiebreaker, op_id),
+        PriorityMode::LoadEarlySlack => (is_load, slack, luc_tiebreaker, op_id),
+        PriorityMode::OriginalOrder => (op_idx as i32, is_valu, luc_tiebreaker, op_id),
+        PriorityMode::ScratchPressure => {
+            // LUC is the PRIMARY criterion - schedule ops that free the most scratch first
+            // Then critical path, then op_id for stability
+            (-luc, -cp, 0, op_id)
+        }
     }
 }
 
@@ -447,6 +604,18 @@ pub fn schedule_greedy_with_diagnostics(
             HashMap::new()
         };
 
+    // Compute last-use information for scratch pressure tracking
+    compute_last_uses(ops);
+
+    // Build LUC (Last Use Count) map for ScratchPressure priority mode
+    let luc_map: HashMap<usize, usize> = ops
+        .iter()
+        .map(|op| (op.id, op.last_use_reads.len()))
+        .collect();
+
+    // Initialize scratch pressure tracker
+    let mut pressure_tracker = ScratchPressureTracker::new(SCRATCH_BUDGET);
+
     // Build op lookup (by index for mutation)
     let op_id_to_idx: HashMap<usize, usize> = ops
         .iter()
@@ -579,6 +748,7 @@ pub fn schedule_greedy_with_diagnostics(
                 engine,
                 critical_path,
                 &slack_map,
+                &luc_map,
                 priority_mode,
             )
         });
@@ -757,6 +927,9 @@ pub fn schedule_greedy_with_diagnostics(
             expanded_ops.extend(alu_ops);
             assignments.push((op_id, max_alu_cycle));
 
+            // Track scratch pressure (use original op's reads/writes)
+            pressure_tracker.apply(&ops[op_idx]);
+
             if let Some(ref mut diag) = diagnostics {
                 diag.valu_shifted += 1;
             }
@@ -823,6 +996,9 @@ pub fn schedule_greedy_with_diagnostics(
                     expanded_ops.extend(alu_ops);
                     assignments.push((op_id, max_alu_cycle));
 
+                    // Track scratch pressure (use original op's reads/writes)
+                    pressure_tracker.apply(&ops[op_idx]);
+
                     if let Some(ref mut diag) = diagnostics {
                         diag.valu_shifted += 1;
                     }
@@ -869,6 +1045,9 @@ pub fn schedule_greedy_with_diagnostics(
         *slot_usage.entry((cycle, engine)).or_insert(0) += 1;
         assignments.push((op_id, cycle));
 
+        // Track scratch pressure
+        pressure_tracker.apply(&ops[op_idx]);
+
         // Update ready queue for dependent ops
         if let Some(consumer_ids) = consumers.get(&op_id) {
             for &consumer_id in consumer_ids {
@@ -893,6 +1072,11 @@ pub fn schedule_greedy_with_diagnostics(
     if let Some(ref mut diag) = diagnostics {
         diag.total_cycles = max_cycle + 1;
         diag.total_ops_scheduled = assignments.len();
+
+        // Scratch pressure stats
+        diag.peak_scratch_pressure = pressure_tracker.peak_pressure();
+        diag.scratch_budget = SCRATCH_BUDGET;
+        diag.pressure_exceeded_count = pressure_tracker.exceeded_count();
     }
 
     ScheduleResult {

@@ -424,6 +424,7 @@ pub fn emit_constant_generation_ops(
             slot,
             reads,
             writes,
+            last_use_reads: HashSet::new(),
             dep_ids: HashSet::new(),
             produces_constant: Some(value),
         });

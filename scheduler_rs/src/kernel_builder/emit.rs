@@ -83,6 +83,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src1, src2].into_iter().collect(),
             writes: [dest].into_iter().collect(),
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -114,6 +115,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes,
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -160,6 +162,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src].into_iter().collect(),
             writes,
+            last_use_reads: HashSet::new(),
             produces_constant,
         };
 
@@ -205,6 +208,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src].into_iter().collect(),
             writes,
+            last_use_reads: HashSet::new(),
             produces_constant,
         };
 
@@ -239,6 +243,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes,
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -270,6 +275,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: HashSet::new(),
             writes: [dest].into_iter().collect(),
+            last_use_reads: HashSet::new(),
             produces_constant: Some(value),
         };
         self.next_op_id += 1;
@@ -292,6 +298,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr].into_iter().collect(),
             writes: [dest].into_iter().collect(),
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -319,6 +326,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr].into_iter().collect(),
             writes,
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -341,6 +349,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [addr, src].into_iter().collect(),
             writes: HashSet::new(),
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -368,6 +377,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads,
             writes: HashSet::new(),
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
@@ -384,6 +394,7 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: HashSet::new(),
             writes: HashSet::new(),
+            last_use_reads: HashSet::new(),
             produces_constant: None,
         };
         self.next_op_id += 1;
