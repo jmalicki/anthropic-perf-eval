@@ -364,10 +364,15 @@ fn analyze_constant_usage(ops: &[Op]) -> HashMap<i64, ConstantUsage> {
 /// Check if a value can be derived from available values
 fn can_derive(value: i64, available: &HashSet<i64>) -> Option<ConstantGeneration> {
     // Special case: 0 can always be derived via XOR if we have ANY value
+    // Prefer using 1 since it's always our primary bootstrap constant
     if value == 0 && !available.is_empty() {
-        let any_val = *available.iter().next().unwrap();
-        // Find a register that holds this value (we'll need to look this up later)
-        return Some(ConstantGeneration::XorSelf { source: any_val });
+        // Prefer 1, then smallest available value for determinism
+        let source = if available.contains(&1) {
+            1
+        } else {
+            *available.iter().min().unwrap()
+        };
+        return Some(ConstantGeneration::XorSelf { source });
     }
 
     // Try addition: value = a + b
@@ -2154,14 +2159,126 @@ fn schedule_to_json(py: Python<'_>, instrs: &Bound<'_, PyList>, enable_valu_shif
         return Ok("{}".to_string());
     }
 
-    // Optimize const loads to ALU ops FIRST (modifies reads/writes)
-    let (const_removed, _alu_added) = if optimize_consts {
-        let result = optimize_const_to_alu(&mut base_ops);
-        println!("Const optimization: {} loads → ALU, {} ALU ops added", result.0, result.1);
-        result
-    } else {
-        (0, 0)
-    };
+    // Apply constant derivation optimization
+    if optimize_consts {
+        // Analyze constant usage
+        let usage = analyze_constant_usage(&base_ops);
+
+        if !usage.is_empty() {
+            // Build derivation plan
+            let plan = build_constant_plan(&usage, 3);  // hot_threshold = 3
+
+            println!("Const derivation: {} unique values, {} bootstrap loads, {} derivable",
+                     usage.len(), plan.bootstrap_loads.len(),
+                     plan.derivations.len() - plan.bootstrap_loads.len());
+
+            // Find highest used register to allocate fresh constant registers above it
+            let max_reg = base_ops.iter()
+                .flat_map(|op| op.reads.iter().chain(op.writes.iter()))
+                .max()
+                .copied()
+                .unwrap_or(0);
+
+            // Allocate FRESH registers for constants to avoid clobbering
+            // These won't conflict with any existing register usage
+            let mut value_to_register: HashMap<i64, i64> = HashMap::new();
+            let mut register_rename: HashMap<i64, i64> = HashMap::new();  // old_dest -> fresh_reg
+            let mut next_fresh_reg = max_reg + 1000;  // Start well above existing registers
+
+            // Sort values for deterministic allocation
+            let mut sorted_values: Vec<_> = usage.keys().copied().collect();
+            sorted_values.sort();
+
+            for value in sorted_values {
+                let u = &usage[&value];
+                // Allocate a fresh register for this constant
+                let fresh_reg = next_fresh_reg;
+                next_fresh_reg += 1;
+                value_to_register.insert(value, fresh_reg);
+
+                // Map ALL old destinations to the fresh register
+                for &dest in &u.destinations {
+                    register_rename.insert(dest, fresh_reg);
+                }
+            }
+
+            let renames_count = register_rename.len();
+
+            // Identify and remove const load ops
+            let const_op_ids: HashSet<usize> = base_ops.iter()
+                .filter(|op| {
+                    op.engine == "load" &&
+                    op.slot.get(0).map(|s| matches!(s, SlotVal::Str(ref o) if o == "const")).unwrap_or(false)
+                })
+                .map(|op| op.id)
+                .collect();
+
+            let original_const_count = const_op_ids.len();
+            base_ops.retain(|op| !const_op_ids.contains(&op.id));
+
+            // Apply register renaming to remaining ops - READS ONLY
+            // We only rename reads because writes define new values that might
+            // legitimately reuse a register that previously held a constant
+            for op in &mut base_ops {
+                // Rename reads in slot values (the instruction encoding)
+                // For most ops: slot[0]=opcode, slot[1]=dest, slot[2..]=sources
+                // We need to rename sources but NOT destinations
+                let opcode: String = op.slot.get(0).and_then(|v| match v {
+                    SlotVal::Str(s) => Some(s.clone()),
+                    _ => None,
+                }).unwrap_or_default();
+
+                for (idx, slot_val) in op.slot.iter_mut().enumerate() {
+                    if let SlotVal::Int(reg) = slot_val {
+                        // Determine if this slot is a source (read) or destination (write)
+                        let is_source = match opcode.as_str() {
+                            // ALU/VALU binary ops: dest at 1, sources at 2,3
+                            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" |
+                            "==" | "!=" | "<" | "<=" | ">" | ">=" => idx >= 2,
+                            // multiply_add: dest at 1, sources at 2,3,4
+                            "multiply_add" | "vmultiply_add" => idx >= 2,
+                            // vbroadcast: dest at 1, source at 2
+                            "vbroadcast" => idx == 2,
+                            // vselect: dest at 1, sources at 2,3,4
+                            "vselect" => idx >= 2,
+                            // load: dest at 1, addr at 2
+                            "load" | "vload" => idx == 2,
+                            // store: value at 1, addr at 2 (both are sources)
+                            "store" | "vstore" => idx >= 1,
+                            // const: dest at 1, value at 2 (value is immediate, not register)
+                            "const" => false,  // No sources to rename
+                            _ => idx >= 2,  // Default: assume dest at 1
+                        };
+
+                        if is_source {
+                            if let Some(&fresh) = register_rename.get(reg) {
+                                *reg = fresh;
+                            }
+                        }
+                    }
+                }
+
+                // Rename in reads set
+                let renamed_reads: HashSet<i64> = op.reads.iter()
+                    .map(|r| *register_rename.get(r).unwrap_or(r))
+                    .collect();
+                op.reads = renamed_reads;
+            }
+
+            // Generate constant derivation ops
+            let max_id = base_ops.iter().map(|op| op.id).max().unwrap_or(0);
+            let const_ops = emit_constant_generation_ops(&plan, &value_to_register, max_id + 1);
+
+            println!("Const optimization: {} loads removed, {} generation ops added, {} registers renamed (saves {})",
+                     original_const_count, const_ops.len(), renames_count,
+                     original_const_count.saturating_sub(const_ops.len()));
+
+            // Insert constant ops at the beginning
+            let mut new_ops = const_ops;
+            new_ops.extend(base_ops);
+            base_ops = new_ops;
+        }
+    }
 
     // Compute dependencies AFTER optimization (so new ALU ops get proper deps)
     let mut ops_for_deps = base_ops.clone();

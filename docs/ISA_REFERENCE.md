@@ -137,6 +137,41 @@ Each cycle executes one instruction bundle (dict of engine → list of slots):
 4. **Minimize gathers**: Restructure data or precompute addresses
 5. **Unroll loops**: Reduce branch overhead, enable more packing
 6. **VALU→ALU shifting**: Move vector ops to scalar when ALU has earlier free slots
+7. **Constant derivation**: Generate small constants via ALU instead of const loads
+
+### Scratch Space Initialization
+
+**UNSPECIFIED**: The initial value of scratch space registers is not guaranteed.
+Do not assume registers are zero-initialized.
+
+However, the **XOR self-identity** (`x ^ x = 0`) can be used to generate zero
+without any dependencies:
+
+```python
+# Generate zero in cycle 0 - NO dependency on r's actual value!
+{"alu": [("^", dest, r, r)]}  # dest = r ^ r = 0 (always)
+```
+
+This works because `x ^ x = 0` regardless of x's value - the scheduler
+treats this as having **zero read dependencies**.
+
+### Constant Derivation Tree
+
+Instead of using `const` loads (which consume load slots), small constants
+can be derived via ALU operations:
+
+```
+Bootstrap: const s1 = 1          # Only load we need
+Derive:    s0 = s1 ^ s1          # 0 (no deps!)
+           s2 = s1 + s1          # 2
+           s4 = s2 + s2          # 4
+           s8 = s4 + s4          # 8
+           s3 = s2 + s1          # 3
+           ...
+```
+
+**Benefits**: Frees load slots for actual memory operations, can start
+deriving constants immediately in cycle 0.
 
 ### Current Performance
 
