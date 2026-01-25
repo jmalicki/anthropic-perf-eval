@@ -74,6 +74,7 @@ impl TickTockKernelBuilder {
         // Emit initialization
         self.emit_common_init();
         self.emit_valu_selection_init();
+        self.emit_partition_init();
 
         // Load data
         self.emit_load_data(n_groups);
@@ -250,6 +251,18 @@ impl TickTockKernelBuilder {
             for i in 0..4 {
                 ctx.v_part_temp[i] = alloc.vec(&format!("v_part_temp_{}", i));
             }
+
+            // Prefix sum support for stable partition
+            ctx.v_positions = alloc.vec("v_positions");
+            ctx.part_branch_scratch = alloc.alloc("part_branch_scratch", VLEN);
+            ctx.part_idx_scratch = alloc.alloc("part_idx_scratch", VLEN);
+            ctx.part_val_scratch = alloc.alloc("part_val_scratch", VLEN);
+            ctx.v_dest_pos = alloc.vec("v_dest_pos");
+            for i in 0..2 {
+                ctx.v_prefix_temp[i] = alloc.vec(&format!("v_prefix_temp_{}", i));
+            }
+            ctx.v_branch_broadcast = alloc.vec("v_branch_broadcast");
+            ctx.part_left_count_temp = alloc.alloc("part_left_count_temp", 1);
         }
     }
 
@@ -442,6 +455,20 @@ impl TickTockKernelBuilder {
         }
     }
 
+    fn emit_partition_init(&mut self) {
+        if !self.config.enable_lazy_partition {
+            return;
+        }
+
+        // Initialize v_positions = [0, 1, 2, 3, 4, 5, 6, 7]
+        // Store constants c[0..7] to scratch, then vload
+        // This creates a vector where lane i contains the value i
+        for i in 0..VLEN {
+            self.emit.emit_store(self.ctx.part_branch_scratch + i as i64, self.ctx.c[i]);
+        }
+        self.emit.emit_vload(self.ctx.v_positions, self.ctx.part_branch_scratch);
+    }
+
     // =========================================================================
     // Data Load/Store
     // =========================================================================
@@ -510,6 +537,18 @@ impl TickTockKernelBuilder {
             && tree_depth >= 4
             && tree_depth <= 8
             && rnd >= self.config.partition_frequency; // Need at least one partition done
+
+        // Load partitioned data from buffer if we're using sorted vload
+        // The partition was stored at a previous round, so load from the read buffer
+        if use_sorted_vload {
+            let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
+            let mut helper = PartitionHelper {
+                ctx: &self.ctx,
+                emit: &mut self.emit,
+                config: &self.config,
+            };
+            helper.emit_partition_load(read_buffer, n_groups);
+        }
 
         // Tree access based on depth
         match tree_depth {

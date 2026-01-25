@@ -141,6 +141,26 @@ pub struct ScratchContext {
 
     /// Vector temps for partition operations
     pub v_part_temp: [i64; 4],       // Temp vectors for partition computation
+
+    // =========================================================================
+    // Partition Prefix Sum Support
+    // =========================================================================
+    /// Vector holding [0,1,2,3,4,5,6,7] for position-based comparisons
+    pub v_positions: i64,
+    /// Scratch space for storing branch bits during partition (8 scalars)
+    pub part_branch_scratch: i64,
+    /// Scratch space for storing indices during partition scatter
+    pub part_idx_scratch: i64,
+    /// Scratch space for storing values during partition scatter
+    pub part_val_scratch: i64,
+    /// Destination position vector (computed from prefix sums)
+    pub v_dest_pos: i64,
+    /// Additional temp vectors for prefix sum computation
+    pub v_prefix_temp: [i64; 2],
+    /// Vector for broadcasting individual branch bits
+    pub v_branch_broadcast: i64,
+    /// Left count for current group (scalar)
+    pub part_left_count_temp: i64,
 }
 
 impl Default for ScratchContext {
@@ -215,6 +235,15 @@ impl Default for ScratchContext {
             part_mask_11bit: 0,
             part_batch_half: 0,
             v_part_temp: [0; 4],
+
+            v_positions: 0,
+            part_branch_scratch: 0,
+            part_idx_scratch: 0,
+            part_val_scratch: 0,
+            v_dest_pos: 0,
+            v_prefix_temp: [0; 2],
+            v_branch_broadcast: 0,
+            part_left_count_temp: 0,
         }
     }
 }

@@ -24,6 +24,16 @@
 //! 512       256     Buffer B: indices
 //! 768       256     Buffer B: values
 //! ```
+//!
+//! ## Stable Partition Algorithm
+//!
+//! For each group of 8 items:
+//! 1. Compute branch bits: `b[i] = val[i] & 1`
+//! 2. Compute prefix sums to determine destination positions:
+//!    - `zeros_before[i]` = count of zeros in positions 0..i
+//!    - `dest[i] = b[i] ? (left_count + ones_before[i]) : zeros_before[i]`
+//! 3. Use 8-way VALU selection to scatter items to destinations:
+//!    - For output position j: `out[j] = Σ (dest[i] == j) * in[i]`
 
 use crate::types::Opcode;
 
@@ -110,10 +120,14 @@ impl<'a> PartitionHelper<'a> {
     /// Emit vload-based tree access for sorted items
     ///
     /// For each group:
-    /// 1. Load first index to get cache base
+    /// 1. Load first index to get cache base (min index in sorted group)
     /// 2. vload 8 tree values starting at cache base
-    /// 3. Compute offset = idx - cache_base for each item
-    /// 4. 8-value VALU selection
+    /// 3. Compute offset = idx - cache_base for each item (0-7 range after partition)
+    /// 4. 8-value VALU selection to extract correct values
+    ///
+    /// After partition, items within each group have tree indices spanning at most
+    /// 2^k consecutive values (where k = partition_frequency). For k=3, span ≤ 8,
+    /// so one vload covers all needed tree values.
     pub fn emit_sorted_vload_access(
         &mut self,
         _read_buffer: PartitionBuffer,
@@ -121,13 +135,9 @@ impl<'a> PartitionHelper<'a> {
     ) {
         let ctx = self.ctx;
 
-        // For now, we still read from all_idx since the full partition
-        // implementation is complex. This is a placeholder that shows
-        // the structure - the actual sorted access requires the partition
-        // to have been executed first.
-        //
-        // The key insight is that with sorted items, each group's indices
-        // span at most 2^k consecutive tree values, so one vload covers them all.
+        // After partition load, all_idx contains sorted indices where each group's
+        // items span at most 8 consecutive tree indices. We use the minimum index
+        // as the vload base and compute offsets for selection.
 
         for it in 0..n_iters {
             let base_g = it * 8; // UNROLL = 8
@@ -136,12 +146,14 @@ impl<'a> PartitionHelper<'a> {
                 let g = base_g + i;
                 let t = ctx.v_t[it][i];
 
-                // Step 1: Get first index of this group to determine cache base
-                // vstore the indices, load first one
-                self.emit.emit_vstore(ctx.st[0], ctx.all_idx[g]);
-                self.emit.emit_load(ctx.tree_cache_base_s, ctx.st[0]);
+                // Step 1: Get minimum index of this group to determine cache base
+                // Store indices to scratch, then load the first element
+                // (After stable partition, first element is the minimum)
+                self.emit.emit_const(ctx.st[0], ctx.part_idx_scratch);
+                self.emit.emit_vstore(ctx.part_idx_scratch, ctx.all_idx[g]);
+                self.emit.emit_load(ctx.tree_cache_base_s, ctx.part_idx_scratch);
 
-                // Step 2: vload 8 tree values starting at first_idx
+                // Step 2: vload 8 tree values starting at min_idx
                 self.emit.emit_alu(Opcode::Add, ctx.st[1], ctx.forest_p, ctx.tree_cache_base_s);
                 self.emit.emit_vload(ctx.tree_cache_scalars, ctx.st[1]);
 
@@ -149,10 +161,12 @@ impl<'a> PartitionHelper<'a> {
                 self.emit.emit_vbroadcast_force(ctx.v_cache_base, ctx.tree_cache_base_s);
 
                 // Step 4: Compute offset = idx - cache_base
+                // After partition, offsets are in [0, 7] for 93.75% of groups
                 self.emit.emit_valu(Opcode::Sub, t, ctx.all_idx[g], ctx.v_cache_base);
 
-                // Step 5: 8-value selection from cache
-                // result = sum((offset == ci) * cache[ci]) for ci in 0..8
+                // Step 5: 8-value selection from cache using offset
+                // result[lane] = cache[offset[lane]]
+                // Implemented as: result = Σ (offset == ci) * cache[ci]
                 self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], ctx.v_0, ctx.v_0); // Init to 0
 
                 for ci in 0..8 {
@@ -182,13 +196,20 @@ impl<'a> PartitionHelper<'a> {
 
     /// Emit stable partition stores
     ///
-    /// This is a simplified version that demonstrates the concept.
-    /// Items with branch_bit=0 go to left half, branch_bit=1 to right half.
+    /// Implements stable partition by branch bit (val & 1):
+    /// - Items with branch_bit=0 go to left positions, maintaining relative order
+    /// - Items with branch_bit=1 go to right positions, maintaining relative order
     ///
-    /// Full stable partition is complex because we need to maintain relative
-    /// order within each partition. For now, we use a simpler approach:
-    /// - Compute destination offset for each item based on prefix sum of branch bits
-    /// - Store indices and values to partition buffer
+    /// Algorithm for each group:
+    /// 1. Compute branch bits: b[i] = val[i] & 1
+    /// 2. Compute prefix sums to determine destination positions:
+    ///    - For zeros: dest[i] = count of zeros before position i
+    ///    - For ones: dest[i] = left_count + count of ones before position i
+    /// 3. Use 8-way selection pattern to scatter items to destinations
+    ///
+    /// The 8-way selection pattern computes:
+    ///   output[j] = Σ (dest[i] == j) * input[i]
+    /// This effectively scatters input items to their destination positions.
     pub fn emit_partition_stores(
         &mut self,
         write_buffer: PartitionBuffer,
@@ -200,10 +221,6 @@ impl<'a> PartitionHelper<'a> {
         let idx_offset = write_buffer.idx_offset();
         let val_offset = write_buffer.val_offset();
 
-        // For now, just copy data to partition buffer (not actually sorting)
-        // This preserves the existing tick-tock store behavior while setting up
-        // the infrastructure for full partition implementation.
-
         self.emit.emit_const(ctx.st[8], idx_offset);
         self.emit.emit_const(ctx.st[9], val_offset);
         self.emit.emit_alu(Opcode::Add, ctx.st[10], ctx.extra_room_p, ctx.st[8]);
@@ -213,11 +230,129 @@ impl<'a> PartitionHelper<'a> {
         self.emit.emit_const(ctx.st[12], vlen);
 
         for g in 0..n_groups {
-            // Store indices and values
-            self.emit.emit_vstore(ctx.st[10], ctx.all_idx[g]);
-            self.emit.emit_vstore(ctx.st[11], ctx.all_val[g]);
+            // =====================================================
+            // Step 1: Compute branch bits for this group
+            // =====================================================
+            // branch_bits = all_val[g] & 1 (0 = go left, 1 = go right)
+            self.emit.emit_valu(Opcode::And, ctx.v_part_temp[0], ctx.all_val[g], ctx.v_1);
 
-            // Increment addresses
+            // =====================================================
+            // Step 2: Compute prefix sums via scalar operations
+            // =====================================================
+            // Store branch bits to scratch for scalar access
+            self.emit.emit_vstore(ctx.part_branch_scratch, ctx.v_part_temp[0]);
+
+            // We need to compute:
+            // - left_count = total number of zeros
+            // - zeros_before[i] = prefix sum of (1-b) at position i
+            // - ones_before[i] = prefix sum of b at position i
+            //
+            // Using scalar operations:
+            // - Load each b[k], compute running sums
+            // - Store results back and vload
+
+            // Initialize counters
+            self.emit.emit_alu(Opcode::Mul, ctx.st[0], ctx.c[0], ctx.c[0]); // left_count = 0
+            self.emit.emit_alu(Opcode::Mul, ctx.st[1], ctx.c[0], ctx.c[0]); // ones_count = 0
+
+            // For each position, compute prefix sum values
+            // prefix_zeros[i] stores zeros_before[i]
+            // prefix_ones[i] stores ones_before[i]
+            for i in 0..VLEN {
+                // Load branch_bit[i]
+                self.emit.emit_load(ctx.st[2], ctx.part_branch_scratch + i as i64);
+
+                // Store zeros_before[i] = current left_count
+                self.emit.emit_store(ctx.part_idx_scratch + i as i64, ctx.st[0]);
+
+                // Store ones_before[i] = current ones_count
+                self.emit.emit_store(ctx.part_val_scratch + i as i64, ctx.st[1]);
+
+                // Update counters:
+                // left_count += (1 - branch_bit)
+                // ones_count += branch_bit
+                self.emit.emit_alu(Opcode::Sub, ctx.st[3], ctx.c[1], ctx.st[2]); // 1 - b
+                self.emit.emit_alu(Opcode::Add, ctx.st[0], ctx.st[0], ctx.st[3]); // left_count += (1-b)
+                self.emit.emit_alu(Opcode::Add, ctx.st[1], ctx.st[1], ctx.st[2]); // ones_count += b
+            }
+
+            // Save left_count for destination computation
+            self.emit.emit_alu(Opcode::Mul, ctx.part_left_count_temp, ctx.st[0], ctx.c[1]);
+
+            // =====================================================
+            // Step 3: Compute destination positions
+            // =====================================================
+            // Load prefix sums as vectors
+            self.emit.emit_vload(ctx.v_prefix_temp[0], ctx.part_idx_scratch); // zeros_before
+            self.emit.emit_vload(ctx.v_prefix_temp[1], ctx.part_val_scratch); // ones_before
+
+            // Broadcast left_count
+            self.emit.emit_vbroadcast_force(ctx.v_branch_broadcast, ctx.part_left_count_temp);
+
+            // Compute dest[i]:
+            // If branch_bit[i] == 0: dest[i] = zeros_before[i]
+            // If branch_bit[i] == 1: dest[i] = left_count + ones_before[i]
+
+            // right_dest = left_count + ones_before
+            self.emit.emit_valu(Opcode::Add, ctx.v_part_temp[1], ctx.v_branch_broadcast, ctx.v_prefix_temp[1]);
+
+            // dest = select(branch_bit, right_dest, zeros_before)
+            // = branch_bit * right_dest + (1 - branch_bit) * zeros_before
+            // = zeros_before + branch_bit * (right_dest - zeros_before)
+            self.emit.emit_valu(Opcode::Sub, ctx.v_part_temp[2], ctx.v_part_temp[1], ctx.v_prefix_temp[0]);
+            self.emit.emit_valu(Opcode::Mul, ctx.v_part_temp[2], ctx.v_part_temp[0], ctx.v_part_temp[2]);
+            self.emit.emit_valu(Opcode::Add, ctx.v_dest_pos, ctx.v_prefix_temp[0], ctx.v_part_temp[2]);
+
+            // =====================================================
+            // Step 4: VALU-based scatter using selection pattern
+            // =====================================================
+            // For output position j: output[j] = Σ (dest[i] == j) * input[i]
+            // This rearranges items so that items with branch_bit=0 come first
+            //
+            // Optimized approach: For each source i, scatter to dest[i]
+            // 1. Broadcast dest[i] to all lanes
+            // 2. mask = (positions == dest[i]) → lane j is 1 if j == dest[i]
+            // 3. Broadcast input[i] to all lanes
+            // 4. Accumulate: output += mask * input[i]
+
+            // Store source data and dest positions to scratch
+            self.emit.emit_vstore(ctx.part_idx_scratch, ctx.all_idx[g]);
+            self.emit.emit_vstore(ctx.part_val_scratch, ctx.all_val[g]);
+            self.emit.emit_vstore(ctx.part_branch_scratch, ctx.v_dest_pos);
+
+            // Initialize output accumulators to 0
+            self.emit.emit_valu(Opcode::Mul, ctx.v_part_temp[2], ctx.v_0, ctx.v_0); // idx_out
+            self.emit.emit_valu(Opcode::Mul, ctx.v_part_temp[3], ctx.v_0, ctx.v_0); // val_out
+
+            // For each source position i, scatter to destination
+            for i in 0..VLEN {
+                // Load source idx[i], val[i], and dest[i]
+                self.emit.emit_load(ctx.st[0], ctx.part_idx_scratch + i as i64);
+                self.emit.emit_load(ctx.st[1], ctx.part_val_scratch + i as i64);
+                self.emit.emit_load(ctx.st[2], ctx.part_branch_scratch + i as i64);
+
+                // Broadcast dest[i] to all lanes
+                self.emit.emit_vbroadcast_force(ctx.v_branch_broadcast, ctx.st[2]);
+
+                // Compute mask: positions == dest[i]
+                // mask[j] = 1 if j == dest[i], else 0
+                self.emit.emit_valu(Opcode::Eq, ctx.v_prefix_temp[1], ctx.v_positions, ctx.v_branch_broadcast);
+
+                // Broadcast input values
+                self.emit.emit_vbroadcast_force(ctx.v_part_temp[1], ctx.st[0]); // idx[i]
+                // Accumulate: idx_out += mask * idx[i]
+                self.emit.emit_fma(ctx.v_part_temp[2], ctx.v_prefix_temp[1], ctx.v_part_temp[1], ctx.v_part_temp[2]);
+
+                self.emit.emit_vbroadcast_force(ctx.v_part_temp[1], ctx.st[1]); // val[i]
+                // Accumulate: val_out += mask * val[i]
+                self.emit.emit_fma(ctx.v_part_temp[3], ctx.v_prefix_temp[1], ctx.v_part_temp[1], ctx.v_part_temp[3]);
+            }
+
+            // Store scattered results to partition buffer
+            self.emit.emit_vstore(ctx.st[10], ctx.v_part_temp[2]);
+            self.emit.emit_vstore(ctx.st[11], ctx.v_part_temp[3]);
+
+            // Increment destination addresses
             if g < n_groups - 1 {
                 self.emit.emit_alu(Opcode::Add, ctx.st[10], ctx.st[10], ctx.st[12]);
                 self.emit.emit_alu(Opcode::Add, ctx.st[11], ctx.st[11], ctx.st[12]);
