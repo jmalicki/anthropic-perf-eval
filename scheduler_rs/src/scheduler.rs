@@ -3,8 +3,7 @@
 //! This module contains the greedy list scheduler with multiple priority modes
 //! and support for VALU→ALU shifting when VALU slots are saturated.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::SchedulingDiagnostics;
 use crate::types::{
@@ -474,20 +473,12 @@ pub fn schedule_greedy_with_diagnostics(
         in_degree.insert(op.id, op.dep_ids.len());
     }
 
-    // Ready queue: ops with in_degree == 0, using priority tuples
-    // Format: (priority_tuple, op_id) - lower tuple = higher priority
-    let mut ready: BinaryHeap<Reverse<((i32, i32, usize), usize)>> = BinaryHeap::new();
-    for (idx, op) in ops.iter().enumerate() {
+    // Ready queue: ops with in_degree == 0
+    // Use Vec + sort to match Python's stable sorting behavior (rather than BinaryHeap)
+    let mut ready: Vec<usize> = Vec::new();
+    for op in ops.iter() {
         if op.dep_ids.is_empty() {
-            let prio = compute_priority(
-                op.id,
-                idx,
-                &op.engine,
-                critical_path,
-                &slack_map,
-                priority_mode,
-            );
-            ready.push(Reverse((prio, op.id)));
+            ready.push(op.id);
         }
     }
 
@@ -574,7 +565,26 @@ pub fn schedule_greedy_with_diagnostics(
 
     let mut assignments: Vec<(usize, usize)> = Vec::with_capacity(n);
 
-    while let Some(Reverse((_prio, op_id))) = ready.pop() {
+    // Cache engine info for priority computation (since ops may be mutated)
+    let engine_map: HashMap<usize, String> = ops.iter().map(|op| (op.id, op.engine.clone())).collect();
+
+    while !ready.is_empty() {
+        // Sort ready queue by priority (lower = higher priority) - matches Python's sort
+        ready.sort_by_key(|&id| {
+            let op_idx = *op_id_to_idx.get(&id).unwrap();
+            let engine = engine_map.get(&id).unwrap();
+            compute_priority(
+                id,
+                op_idx,
+                engine,
+                critical_path,
+                &slack_map,
+                priority_mode,
+            )
+        });
+
+        // Pop first (highest priority) op
+        let op_id = ready.remove(0);
         let op_idx = *op_id_to_idx.get(&op_id).unwrap();
         let engine = ops[op_idx].engine.clone();
         let mut cycle = earliest_cycle_fn(ops, op_id, &op_id_to_idx, &expanded_op_cycles);
@@ -586,8 +596,7 @@ pub fn schedule_greedy_with_diagnostics(
 
             // Check for blocked ops in ready queue
             let mut blocked_this_cycle = false;
-            for other in ready.iter() {
-                let other_id = other.0 .1;
+            for &other_id in ready.iter() {
                 let other_idx = *op_id_to_idx.get(&other_id).unwrap();
                 let other_engine = &ops[other_idx].engine;
                 let other_cycle = earliest_cycle_fn(ops, other_id, &op_id_to_idx, &expanded_op_cycles);
@@ -616,7 +625,7 @@ pub fn schedule_greedy_with_diagnostics(
             if assignments.len() % 100 == 0 {
                 let mut almost_ready_count = 0;
                 for other in ops.iter() {
-                    if other.cycle == -1 && !ready.iter().any(|r| r.0 .1 == other.id) {
+                    if other.cycle == -1 && !ready.contains(&other.id) {
                         if let Some(&remaining) = in_degree.get(&other.id) {
                             if remaining >= 1 && remaining <= 2 {
                                 almost_ready_count += 1;
@@ -628,7 +637,7 @@ pub fn schedule_greedy_with_diagnostics(
                     diag.cycles_with_almost_ready += 1;
                     // Record by engine for the first few to get distribution
                     for other in ops.iter().take(1000) {
-                        if other.cycle == -1 && !ready.iter().any(|r| r.0 .1 == other.id) {
+                        if other.cycle == -1 && !ready.contains(&other.id) {
                             if let Some(&remaining) = in_degree.get(&other.id) {
                                 if remaining >= 1 && remaining <= 2 {
                                     diag.record_almost_ready(&other.engine);
@@ -693,15 +702,7 @@ pub fn schedule_greedy_with_diagnostics(
                         *deg -= 1;
                         if *deg == 0 {
                             let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
-                            let prio = compute_priority(
-                                consumer_id,
-                                consumer_idx,
-                                &ops[consumer_idx].engine,
-                                critical_path,
-                                &slack_map,
-                                priority_mode,
-                            );
-                            ready.push(Reverse((prio, consumer_id)));
+                            ready.push(consumer_id);
                         }
                     }
                 }
@@ -768,15 +769,7 @@ pub fn schedule_greedy_with_diagnostics(
                         *deg -= 1;
                         if *deg == 0 {
                             let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
-                            let prio = compute_priority(
-                                consumer_id,
-                                consumer_idx,
-                                &ops[consumer_idx].engine,
-                                critical_path,
-                                &slack_map,
-                                priority_mode,
-                            );
-                            ready.push(Reverse((prio, consumer_id)));
+                            ready.push(consumer_id);
                         }
                     }
                 }
@@ -843,15 +836,7 @@ pub fn schedule_greedy_with_diagnostics(
                                 *deg -= 1;
                                 if *deg == 0 {
                                     let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
-                                    let prio = compute_priority(
-                                        consumer_id,
-                                        consumer_idx,
-                                        &ops[consumer_idx].engine,
-                                        critical_path,
-                                        &slack_map,
-                                        priority_mode,
-                                    );
-                                    ready.push(Reverse((prio, consumer_id)));
+                                    ready.push(consumer_id);
                                 }
                             }
                         }
@@ -893,16 +878,7 @@ pub fn schedule_greedy_with_diagnostics(
                 if let Some(deg) = in_degree.get_mut(&consumer_id) {
                     *deg -= 1;
                     if *deg == 0 {
-                        let consumer_idx = *op_id_to_idx.get(&consumer_id).unwrap();
-                        let prio = compute_priority(
-                            consumer_id,
-                            consumer_idx,
-                            &ops[consumer_idx].engine,
-                            critical_path,
-                            &slack_map,
-                            priority_mode,
-                        );
-                        ready.push(Reverse((prio, consumer_id)));
+                        ready.push(consumer_id);
                     }
                 }
             }
