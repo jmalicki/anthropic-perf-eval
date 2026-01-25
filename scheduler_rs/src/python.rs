@@ -916,6 +916,23 @@ pub fn schedule_to_json(
     let best_mode = best_mode.unwrap();
     let ops = best_ops.unwrap();
 
+    // Build op_id -> cycle mapping for comments
+    let mut op_id_to_cycle: HashMap<usize, i32> = HashMap::new();
+    for op in &ops {
+        op_id_to_cycle.insert(op.id, op.cycle);
+    }
+    for op in &best_expanded_ops {
+        op_id_to_cycle.insert(op.id, op.cycle);
+    }
+
+    // Build reverse dependency map: op_id -> list of dependent op_ids
+    let mut dependents_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops.iter().chain(best_expanded_ops.iter()) {
+        for &dep_id in &op.dep_ids {
+            dependents_map.entry(dep_id).or_default().push(op.id);
+        }
+    }
+
     // Build cycle-by-cycle output
     let mut cycles_output: Vec<CycleOutput> = Vec::new();
     let mut total_empty_load = 0usize;
@@ -956,13 +973,14 @@ pub fn schedule_to_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
+                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 match op.engine {
-                    Engine::Load => load_ops.push(compact),
-                    Engine::Store => store_ops.push(compact),
-                    Engine::Alu => alu_ops.push(compact),
-                    Engine::Valu => valu_ops.push(compact),
-                    Engine::Flow => flow_ops.push(compact),
+                    Engine::Load => load_ops.push(formatted),
+                    Engine::Store => store_ops.push(formatted),
+                    Engine::Alu => alu_ops.push(formatted),
+                    Engine::Valu => valu_ops.push(formatted),
+                    Engine::Flow => flow_ops.push(formatted),
                     _ => {}
                 }
             }
@@ -990,8 +1008,9 @@ pub fn schedule_to_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
+                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
-                alu_ops.push(compact);
+                alu_ops.push(formatted);
             }
         }
 
