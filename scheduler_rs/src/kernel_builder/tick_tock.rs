@@ -8,7 +8,7 @@ use crate::types::{Op, Opcode};
 use super::config::{
     fma_multiplier, KernelConfig, HASH_STAGES, SCRATCH_SIZE, STAGE5_XOR_CONST, VLEN,
 };
-use super::context::{ScratchAllocator, ScratchContext};
+use super::context::{ScratchAllocator, ScratchContext, ZERO_REG};
 use super::emit::EmitContext;
 
 /// Unroll factor - process 8 groups per iteration
@@ -125,7 +125,10 @@ impl TickTockKernelBuilder {
         for i in 0..16 {
             ctx.st[i] = alloc.alloc(&format!("st{}", i), 1);
         }
-        for i in 0..16 {
+
+        // Constants 0-15: c[0] uses reserved ZERO_REG, allocate c[1..16]
+        ctx.c[0] = ZERO_REG;
+        for i in 1..16 {
             ctx.c[i] = alloc.alloc(&format!("c{}", i), 1);
         }
 
@@ -249,8 +252,11 @@ impl TickTockKernelBuilder {
     // =========================================================================
 
     fn emit_common_init(&mut self) {
-        // Load constants 0-15
-        for i in 0..16 {
+        // Register ZERO_REG as known constant 0 (no load needed - scratch is initialized to 0)
+        self.emit.known_constants.insert(ZERO_REG, 0);
+
+        // Load constants 1-15 (c[0] = ZERO_REG is already 0, no load needed)
+        for i in 1..16 {
             self.emit.emit_const(self.ctx.c[i], i as i64);
         }
 

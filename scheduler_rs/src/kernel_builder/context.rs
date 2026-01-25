@@ -7,6 +7,10 @@ use std::collections::HashMap;
 
 use super::config::VLEN;
 
+/// Reserved address 0 always contains zero (scratch memory is initialized to 0).
+/// This eliminates the need to load constant 0 - it's always available.
+pub const ZERO_REG: i64 = 0;
+
 /// Holds all allocated scratch memory locations.
 ///
 /// This is a Rust port of the Python ScratchContext class, tracking all
@@ -195,7 +199,8 @@ pub struct ScratchAllocator {
 impl Default for ScratchAllocator {
     fn default() -> Self {
         ScratchAllocator {
-            ptr: 0,
+            // Start at 1 to reserve address 0 as the zero constant (ZERO_REG)
+            ptr: 1,
             debug_map: HashMap::new(),
         }
     }

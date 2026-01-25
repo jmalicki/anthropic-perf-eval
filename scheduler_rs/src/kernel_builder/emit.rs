@@ -4,17 +4,32 @@
 //! reads/writes tracking, eliminating the need for Python-side emission.
 
 use arrayvec::ArrayVec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{Engine, Op, Opcode, SlotVal, MAX_SLOT_SIZE, VLEN};
 
-/// Emission context - tracks op IDs and collects emitted ops
+/// Broadcast cache entry - tracks where a scalar value has been broadcast to
+#[derive(Debug, Clone)]
+pub struct BroadcastEntry {
+    /// Destination vector base address
+    pub dest: i64,
+    /// Op ID of the broadcast operation
+    pub op_id: usize,
+}
+
+/// Emission context - tracks op IDs, constants, and collects emitted ops
 #[derive(Debug, Default)]
 pub struct EmitContext {
     /// Next op ID to assign
     pub next_op_id: usize,
     /// Collected ops (unscheduled)
     pub ops: Vec<Op>,
+    /// Maps addresses to their known constant values (for derivation)
+    /// Updated when emit_const is called
+    pub known_constants: HashMap<i64, i64>,
+    /// Maps source scalar address -> broadcast entry
+    /// Used to detect duplicate broadcasts from the same scalar
+    pub broadcast_cache: HashMap<i64, BroadcastEntry>,
 }
 
 impl EmitContext {
@@ -22,18 +37,33 @@ impl EmitContext {
         EmitContext {
             next_op_id: 0,
             ops: Vec::new(),
+            known_constants: HashMap::new(),
+            broadcast_cache: HashMap::new(),
         }
     }
 
     /// Take all ops, resetting the context
     pub fn take_ops(&mut self) -> Vec<Op> {
         self.next_op_id = 0;
+        self.known_constants.clear();
+        self.broadcast_cache.clear();
         std::mem::take(&mut self.ops)
     }
 
     /// Get number of ops
     pub fn len(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Check if a scalar address has already been broadcast to a vector
+    /// Returns the existing vector destination if found
+    pub fn get_broadcast(&self, src: i64) -> Option<i64> {
+        self.broadcast_cache.get(&src).map(|e| e.dest)
+    }
+
+    /// Get the constant value at an address, if known
+    pub fn get_constant(&self, addr: i64) -> Option<i64> {
+        self.known_constants.get(&addr).copied()
     }
 
     /// Emit an ALU operation: dest = src1 op src2
@@ -91,11 +121,18 @@ impl EmitContext {
     }
 
     /// Emit a vbroadcast: dest[0..8] = scalar_src
+    ///
+    /// Caches the broadcast so that subsequent broadcasts from the same scalar
+    /// can be detected. If the source scalar has a known constant value,
+    /// propagates that to `produces_constant`.
     pub fn emit_vbroadcast(&mut self, dest: i64, src: i64) {
         let mut writes = HashSet::new();
         for i in 0..VLEN as i64 {
             writes.insert(dest + i);
         }
+
+        // Propagate constant info if source is a known constant
+        let produces_constant = self.known_constants.get(&src).copied();
 
         let op = Op {
             id: self.next_op_id,
@@ -111,8 +148,15 @@ impl EmitContext {
             dep_ids: HashSet::new(),
             reads: [src].into_iter().collect(),
             writes,
-            produces_constant: None,
+            produces_constant,
         };
+
+        // Cache this broadcast for deduplication
+        self.broadcast_cache.insert(src, BroadcastEntry {
+            dest,
+            op_id: self.next_op_id,
+        });
+
         self.next_op_id += 1;
         self.ops.push(op);
     }
@@ -155,7 +199,12 @@ impl EmitContext {
     /// This annotates the op with `produces_constant = Some(value)` to enable
     /// late-binding optimization where a scheduler pass can replace the Load
     /// with an ALU derivation if slots are available.
+    ///
+    /// Also registers the constant in `known_constants` for derivation tracking.
     pub fn emit_const(&mut self, dest: i64, value: i64) {
+        // Register this constant for potential derivation use
+        self.known_constants.insert(dest, value);
+
         let op = Op {
             id: self.next_op_id,
             engine: Engine::Load,

@@ -16,5 +16,5 @@ pub mod emit;
 pub mod tick_tock;
 
 pub use config::KernelConfig;
-pub use context::ScratchContext;
+pub use context::{ScratchContext, ZERO_REG};
 pub use tick_tock::TickTockKernelBuilder;
