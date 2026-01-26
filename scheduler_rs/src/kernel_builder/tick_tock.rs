@@ -793,22 +793,23 @@ impl TickTockKernelBuilder {
         let ctx = &self.ctx;
 
         // Depth 3: Compare/select from preloaded tree[7..14]
-        // Uses FMA accumulation: v_nv = v_nv + (idx == ti) * tree[7+ti]
+        // For 8 possible index values, only ONE comparison will be true (exact match).
+        // We use: first iteration with Mul to initialize, then FMA to accumulate.
+        // This avoids the useless `* v_0 v_0` zero-initialization.
         //
-        // NOTE: A parallel approach was attempted (8 parallel compares + multiplies
-        // + tree reduction) but required 128 extra words of scratch for temp vectors,
-        // exceeding the 1536 word budget. The scheduler effectively hides the
-        // FMA dependency chain by interleaving operations across groups.
+        // Old approach: 1 zero-init + 8*(eq + fma) = 17 ops
+        // New approach: (eq + mul) + 7*(eq + fma) = 16 ops, no wasted zero-init
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let t = ctx.v_t[it][i];
 
-                // Initialize result to 0
-                self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], ctx.v_0, ctx.v_0);
+                // First iteration: initialize result with t * tree_value (no zero-init needed)
+                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[0]);
+                self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], t, ctx.v_tc_r3[0]);
 
-                // For each of 8 possible values
-                for ti in 0..8 {
+                // Remaining iterations: FMA to accumulate
+                for ti in 1..8 {
                     self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[ti]);
                     self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_tc_r3[ti], ctx.v_nv[it][i]);
                 }
@@ -960,7 +961,8 @@ impl TickTockKernelBuilder {
 
                 if is_wrap_round {
                     // At leaf level: ALL items wrap to index 0
-                    self.emit.emit_valu(Opcode::Mul, ctx.all_idx[g], ctx.v_0, ctx.v_0);
+                    // Use vbroadcast_force to write 0 directly, avoiding useless `* v_0 v_0`
+                    self.emit.emit_vbroadcast_force(ctx.all_idx[g], ZERO_REG);
                 } else {
                     // Normal branching
                     self.emit.emit_valu(Opcode::And, t, ctx.all_val[g], ctx.v_1);

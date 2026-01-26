@@ -11,6 +11,7 @@ use crate::constants::{
     analyze_constant_usage, build_constant_plan, build_constant_plan_with_depth,
     emit_constant_generation_ops, print_constant_plan_summary,
 };
+use crate::peephole::{optimize as peephole_optimize, PeepholeConfig};
 use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
 use crate::scheduler::{
     compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics,
@@ -1562,6 +1563,23 @@ pub fn build_tick_tock_kernel<'py>(
     // Compute dependencies
     compute_dependencies(&mut ops);
 
+    // Peephole optimization pass
+    let peephole_config = PeepholeConfig::default();
+    let peephole_stats = peephole_optimize(&mut ops, &peephole_config);
+
+    if verbose && peephole_stats.total_eliminated > 0 {
+        println!(
+            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {})",
+            peephole_stats.total_eliminated,
+            peephole_stats.cse_eliminated,
+            peephole_stats.algebraic_simplified,
+            peephole_stats.zero_ops_eliminated
+        );
+    }
+
+    // Recompute dependencies after peephole transformations
+    compute_dependencies(&mut ops);
+
     // Compute critical path
     let critical_path = compute_critical_path(&ops);
 
@@ -1765,6 +1783,23 @@ pub fn build_tick_tock_kernel_ops(
     }
 
     // Compute dependencies
+    compute_dependencies(&mut ops);
+
+    // Peephole optimization pass
+    let peephole_config = PeepholeConfig::default();
+    let peephole_stats = peephole_optimize(&mut ops, &peephole_config);
+
+    if verbose && peephole_stats.total_eliminated > 0 {
+        println!(
+            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {})",
+            peephole_stats.total_eliminated,
+            peephole_stats.cse_eliminated,
+            peephole_stats.algebraic_simplified,
+            peephole_stats.zero_ops_eliminated
+        );
+    }
+
+    // Recompute dependencies after peephole transformations
     compute_dependencies(&mut ops);
 
     // Compute critical path

@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 pub mod constants;
 pub mod diagnostics;
 pub mod kernel_builder;
+pub mod peephole;
 pub mod python;
 pub mod scheduler;
 pub mod types;

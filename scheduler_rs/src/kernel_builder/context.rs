@@ -104,6 +104,12 @@ pub struct ScratchContext {
     // =========================================================================
     pub v_stage5_xor: i64,
 
+    // NOTE: Parallel selection optimizations for depths 3 and 4 were explored
+    // but disabled due to scratch budget constraints. The extra temp vectors
+    // required (128+ words for depth 3, 400+ for depth 4) exceed the 1536 word
+    // limit. The current serialized FMA approach works well because the scheduler
+    // effectively hides dependency chains through group-level interleaving.
+
     // =========================================================================
     // FMA Multipliers for Hash Optimization
     // =========================================================================
