@@ -7,6 +7,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::allocator::{allocate_registers, rewrite_addresses, AllocationResult};
 use crate::constants::{
     analyze_constant_usage, build_constant_plan, build_constant_plan_with_depth,
     emit_constant_generation_ops, print_constant_plan_summary,
@@ -14,7 +15,7 @@ use crate::constants::{
 use crate::peephole::{optimize as peephole_optimize, PeepholeConfig};
 use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
 use crate::scheduler::{
-    compute_critical_path, schedule_greedy, schedule_greedy_with_diagnostics,
+    compute_critical_path, compute_last_uses, schedule_greedy, schedule_greedy_with_diagnostics,
     schedule_with_pseudo_consts, schedule_with_slot_filling, PriorityMode, ALL_PRIORITY_MODES,
 };
 use arrayvec::ArrayVec;
@@ -1476,6 +1477,40 @@ struct ScheduleAttempt {
     cycles: usize,
     ops: Vec<Op>,
     expanded_ops: Vec<Op>,
+    allocation_result: Option<AllocationResult>,
+}
+
+/// Apply register allocation to scheduled ops if enabled.
+/// Returns the allocation result (or None if disabled).
+fn apply_register_allocation(
+    ops: &mut Vec<Op>,
+    expanded_ops: &mut Vec<Op>,
+    enable: bool,
+    budget: usize,
+    fixed_addrs: &HashSet<i64>,
+) -> Option<AllocationResult> {
+    if !enable {
+        return None;
+    }
+
+    // Compute last uses for allocation
+    compute_last_uses(ops);
+    compute_last_uses(expanded_ops);
+
+    // Combine ops for interval building (need to see all reads/writes)
+    let mut all_ops: Vec<Op> = ops.iter().cloned().collect();
+    all_ops.extend(expanded_ops.iter().cloned());
+
+    // Run register allocation on combined ops
+    let alloc_result = allocate_registers(&mut all_ops, budget, fixed_addrs);
+
+    // Only apply mapping if within budget
+    if !alloc_result.budget_exceeded {
+        rewrite_addresses(ops, &alloc_result.addr_mapping);
+        rewrite_addresses(expanded_ops, &alloc_result.addr_mapping);
+    }
+
+    Some(alloc_result)
 }
 
 /// Build a tick-tock kernel entirely in Rust and return scheduled instructions.
@@ -1502,8 +1537,13 @@ struct ScheduleAttempt {
 /// - Schedules non-const ops first, then fills empty slots with const generation
 /// - Prefers Flow (add_imm) > Load (const) > ALU (derivation)
 /// - More efficient than pre-scheduling pseudo-consts
+///
+/// Register allocation (`enable_register_allocation=true`):
+/// - Post-scheduling optimization that rewrites addresses based on liveness
+/// - Compacts scratch usage by reusing addresses when live ranges don't overlap
+/// - Uses linear scan algorithm for efficient allocation
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1521,6 +1561,7 @@ pub fn build_tick_tock_kernel<'py>(
     enable_const_alu: bool,
     enable_slot_filling: bool,
     max_alu_depth: Option<usize>,
+    enable_register_allocation: bool,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1590,6 +1631,9 @@ pub fn build_tick_tock_kernel<'py>(
         .map(|op| (op.id, op.dep_ids.clone()))
         .collect();
 
+    // Fixed addresses that should not be remapped during register allocation
+    let fixed_addrs: HashSet<i64> = [0i64].into_iter().collect(); // ZERO_REG
+
     // Run all priority modes in parallel using Rayon
     let results: Vec<ScheduleAttempt> = if enable_slot_filling {
         // Use post-scheduling slot filling for constants
@@ -1609,11 +1653,22 @@ pub fn build_tick_tock_kernel<'py>(
                     mode,
                 );
 
+                let mut final_ops = result.ops;
+                let mut final_expanded = result.expanded_ops;
+                let allocation_result = apply_register_allocation(
+                    &mut final_ops,
+                    &mut final_expanded,
+                    enable_register_allocation,
+                    1536,
+                    &fixed_addrs,
+                );
+
                 ScheduleAttempt {
                     mode,
                     cycles: result.cycles,
-                    ops: result.ops,
-                    expanded_ops: result.expanded_ops,
+                    ops: final_ops,
+                    expanded_ops: final_expanded,
+                    allocation_result,
                 }
             })
             .collect()
@@ -1639,12 +1694,22 @@ pub fn build_tick_tock_kernel<'py>(
                     2000,  // const_register_start
                 );
 
+                let mut final_expanded = result.expanded_ops;
+                let allocation_result = apply_register_allocation(
+                    &mut test_ops,
+                    &mut final_expanded,
+                    enable_register_allocation,
+                    1536,
+                    &fixed_addrs,
+                );
+
                 // test_ops now contains all scheduled ops including const ops
                 ScheduleAttempt {
                     mode,
                     cycles: result.cycles,
                     ops: test_ops,
-                    expanded_ops: result.expanded_ops,
+                    expanded_ops: final_expanded,
+                    allocation_result,
                 }
             })
             .collect()
@@ -1661,11 +1726,21 @@ pub fn build_tick_tock_kernel<'py>(
 
                 let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
 
+                let mut final_expanded = result.expanded_ops;
+                let allocation_result = apply_register_allocation(
+                    &mut test_ops,
+                    &mut final_expanded,
+                    enable_register_allocation,
+                    1536,
+                    &fixed_addrs,
+                );
+
                 ScheduleAttempt {
                     mode,
                     cycles: result.cycles,
                     ops: test_ops,
-                    expanded_ops: result.expanded_ops,
+                    expanded_ops: final_expanded,
+                    allocation_result,
                 }
             })
             .collect()
@@ -1679,6 +1754,14 @@ pub fn build_tick_tock_kernel<'py>(
 
     if verbose {
         println!("Best: {:?} with {} cycles (parallel multipass)", best.mode, best.cycles);
+        if let Some(ref alloc) = best.allocation_result {
+            let status = if alloc.budget_exceeded { " EXCEEDED BUDGET!" } else { "" };
+            println!(
+                "Register allocation: max addr {} -> {} (peak live: {}/{}, {} remapped, {} fixed){}",
+                alloc.max_addr_before, alloc.max_addr_after, alloc.peak_live, alloc.budget,
+                alloc.remapped_count, alloc.fixed_count, status
+            );
+        }
     }
 
     // Write JSON output if requested
@@ -1726,8 +1809,12 @@ pub fn build_tick_tock_kernel<'py>(
 /// Slot filling mode (`enable_slot_filling=true`):
 /// - Schedules non-const ops first, then fills empty slots with const generation
 /// - Prefers Flow (add_imm) > Load (const) > ALU (derivation)
+///
+/// Register allocation (`enable_register_allocation=true`):
+/// - Post-scheduling optimization that rewrites addresses based on liveness
+/// - Compacts scratch usage by reusing addresses when live ranges don't overlap
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false))]
 pub fn build_tick_tock_kernel_ops(
     _py: Python<'_>,
     forest_height: usize,
@@ -1744,6 +1831,7 @@ pub fn build_tick_tock_kernel_ops(
     enable_const_alu: bool,
     enable_slot_filling: bool,
     max_alu_depth: Option<usize>,
+    enable_register_allocation: bool,
 ) -> PyResult<usize> {
     let config = KernelConfig {
         forest_height,
@@ -1882,6 +1970,10 @@ pub fn build_tick_tock_kernel_ops(
 
     if verbose {
         println!("Best: {:?} with {} cycles (parallel multipass)", best_mode, best_cycles);
+        if enable_register_allocation {
+            println!("Note: Register allocation enabled but only affects address layout, not cycle count");
+            println!("Use build_tick_tock_kernel() for full allocation statistics");
+        }
     }
 
     Ok(best_cycles)

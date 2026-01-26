@@ -18,6 +18,7 @@
 
 use pyo3::prelude::*;
 
+pub mod allocator;
 pub mod constants;
 pub mod diagnostics;
 pub mod kernel_builder;
