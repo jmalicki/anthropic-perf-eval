@@ -114,16 +114,17 @@ pub struct ScratchContext {
     pub v_td_r3_45: i64,
     pub v_td_r3_67: i64,
 
+    // Per-group scratch registers for tree-reduce (allocated like v_t)
+    // These are needed to avoid inter-group dependencies when using tree-reduce
+    pub v_tr_s1: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit0, then p67
+    pub v_tr_s2: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit1
+    pub v_tr_s3: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit2
+    pub v_tr_s4: Vec<Vec<i64>>,  // [n_iters][UNROLL] - p45, then q47
+
     // =========================================================================
     // Stage 5 XOR Vector
     // =========================================================================
     pub v_stage5_xor: i64,
-
-    // NOTE: Parallel selection optimizations for depths 3 and 4 were explored
-    // but disabled due to scratch budget constraints. The extra temp vectors
-    // required (128+ words for depth 3, 400+ for depth 4) exceed the 1536 word
-    // limit. The current serialized FMA approach works well because the scheduler
-    // effectively hides dependency chains through group-level interleaving.
 
     // =========================================================================
     // FMA Multipliers for Hash Optimization
@@ -246,6 +247,11 @@ impl Default for ScratchContext {
             v_td_r3_23: 0,
             v_td_r3_45: 0,
             v_td_r3_67: 0,
+
+            v_tr_s1: Vec::new(),
+            v_tr_s2: Vec::new(),
+            v_tr_s3: Vec::new(),
+            v_tr_s4: Vec::new(),
 
             v_stage5_xor: 0,
 

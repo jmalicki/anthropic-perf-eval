@@ -310,31 +310,53 @@ impl TickTockKernelBuilder {
             }
             // c_r3[i] will alias to c[7+i] in emit_valu_selection_init - no separate allocation needed
 
-            // Tree-reduce deltas for depth 3 - only allocate if enabled
-            // This uses 36 additional words (4 scalars + 4 vectors) but saves 1 op per group.
-            // DISABLED BY DEFAULT because it exceeds the 1536 word scratch budget.
+            // Tree-reduce resources - only allocate if enabled
             if self.config.enable_tree_reduce_depth3 {
+                // Scalar deltas (4 words)
                 ctx.td_r3_01 = alloc.alloc("td_r3_01", 1);
                 ctx.td_r3_23 = alloc.alloc("td_r3_23", 1);
                 ctx.td_r3_45 = alloc.alloc("td_r3_45", 1);
                 ctx.td_r3_67 = alloc.alloc("td_r3_67", 1);
 
+                // Vector delta broadcasts (32 words)
                 ctx.v_td_r3_01 = alloc.vec("v_td_r3_01");
                 ctx.v_td_r3_23 = alloc.vec("v_td_r3_23");
                 ctx.v_td_r3_45 = alloc.vec("v_td_r3_45");
                 ctx.v_td_r3_67 = alloc.vec("v_td_r3_67");
+
+                // Per-group scratch registers for tree-reduce
+                // These avoid inter-group dependencies that would serialize the groups
+                let n_iters = self.config.n_iters();
+                ctx.v_tr_s1 = (0..n_iters)
+                    .map(|it| {
+                        (0..UNROLL)
+                            .map(|i| alloc.vec(&format!("v_tr_s1_{}_{}", it, i)))
+                            .collect()
+                    })
+                    .collect();
+                ctx.v_tr_s2 = (0..n_iters)
+                    .map(|it| {
+                        (0..UNROLL)
+                            .map(|i| alloc.vec(&format!("v_tr_s2_{}_{}", it, i)))
+                            .collect()
+                    })
+                    .collect();
+                ctx.v_tr_s3 = (0..n_iters)
+                    .map(|it| {
+                        (0..UNROLL)
+                            .map(|i| alloc.vec(&format!("v_tr_s3_{}_{}", it, i)))
+                            .collect()
+                    })
+                    .collect();
+                ctx.v_tr_s4 = (0..n_iters)
+                    .map(|it| {
+                        (0..UNROLL)
+                            .map(|i| alloc.vec(&format!("v_tr_s4_{}_{}", it, i)))
+                            .collect()
+                    })
+                    .collect();
             }
         }
-
-        // NOTE: Parallel selection optimization for depths 3 and 4 was explored but
-        // disabled due to scratch budget constraints. The extra temp vectors for
-        // parallel comparison and reduction (16+ vectors = 128+ words) push scratch
-        // usage over the 1536 word limit.
-        //
-        // The current serialized approach (FMA accumulation) works well because:
-        // 1. The scheduler effectively interleaves operations across groups
-        // 2. No extra scratch required for parallel temps
-        // 3. Dependency chains are hidden by group-level parallelism
     }
 
     // =========================================================================
@@ -887,23 +909,17 @@ impl TickTockKernelBuilder {
             //   Level 1: 2 SUB + 2 FMA combining pairs using bit1
             //   Level 2: 1 SUB + 1 FMA for final result using bit2
             //
-            // Register allocation per group:
+            // Per-group register allocation (enables parallel execution):
             //   t = v_t[it][i] - general temp
             //   nv = v_nv[it][i] - result (also used for p01, then q03)
-            //   s1 = v_tc_r3[1] - scratch (bit0, then p67)
-            //   s2 = v_tc_r3[3] - scratch (bit1)
-            //   s3 = v_tc_r3[5] - scratch (bit2)
-            //   s4 = v_tc_r3[7] - scratch (p45, then q47)
+            //   s1 = v_tr_s1[it][i] - scratch (bit0, then p67)
+            //   s2 = v_tr_s2[it][i] - scratch (bit1)
+            //   s3 = v_tr_s3[it][i] - scratch (bit2)
+            //   s4 = v_tr_s4[it][i] - scratch (p45, then q47)
             //
-            // Note: We use v_tc_r3[1,3,5,7] as scratch because tree-reduce only needs
-            // the EVEN indexed tree values (v_tc_r3[0,2,4,6]) as bases for level 0 FMAs.
-            // The odd-indexed values are implicit in the pre-computed deltas.
-
-            // Scratch register aliases
-            let s1 = ctx.v_tc_r3[1]; // bit0, then p67
-            let s2 = ctx.v_tc_r3[3]; // bit1
-            let s3 = ctx.v_tc_r3[5]; // bit2
-            let s4 = ctx.v_tc_r3[7]; // p45, then q47
+            // Using per-group scratch avoids inter-group dependencies, allowing
+            // the scheduler to fully interleave operations across groups.
+            // The register allocator can compact these if live ranges don't overlap.
 
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
@@ -911,6 +927,10 @@ impl TickTockKernelBuilder {
                     let t = ctx.v_t[it][i];
                     let nv = ctx.v_nv[it][i];
                     let idx = ctx.all_idx[base_g + i];
+                    let s1 = ctx.v_tr_s1[it][i];
+                    let s2 = ctx.v_tr_s2[it][i];
+                    let s3 = ctx.v_tr_s3[it][i];
+                    let s4 = ctx.v_tr_s4[it][i];
 
                     // === Bit extraction (5 VALU ops) ===
                     // idx_adj = idx - 7 gives 0-7 for indices 7-14

@@ -1543,7 +1543,7 @@ fn apply_register_allocation(
 /// - Compacts scratch usage by reusing addresses when live ranges don't overlap
 /// - Uses linear scan algorithm for efficient allocation
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false, enable_tree_reduce_depth3=false))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1562,6 +1562,7 @@ pub fn build_tick_tock_kernel<'py>(
     enable_slot_filling: bool,
     max_alu_depth: Option<usize>,
     enable_register_allocation: bool,
+    enable_tree_reduce_depth3: bool,
 ) -> PyResult<Bound<'py, PyList>> {
     let config = KernelConfig {
         forest_height,
@@ -1577,7 +1578,7 @@ pub fn build_tick_tock_kernel<'py>(
         enable_const_load,
         enable_const_alu,
         max_alu_depth,
-        enable_tree_reduce_depth3: false, // Disabled - exceeds scratch budget
+        enable_tree_reduce_depth3,
     };
 
     // Build the kernel (generates unscheduled ops)
