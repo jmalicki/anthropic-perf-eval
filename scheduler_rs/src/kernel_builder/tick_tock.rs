@@ -287,6 +287,16 @@ impl TickTockKernelBuilder {
         for i in 0..8 {
             ctx.c_r3[i] = alloc.alloc(&format!("c_r3_{}", i), 1);
         }
+
+        // NOTE: Parallel selection optimization for depths 3 and 4 was explored but
+        // disabled due to scratch budget constraints. The extra temp vectors for
+        // parallel comparison and reduction (16+ vectors = 128+ words) push scratch
+        // usage over the 1536 word limit.
+        //
+        // The current serialized approach (FMA accumulation) works well because:
+        // 1. The scheduler effectively interleaves operations across groups
+        // 2. No extra scratch required for parallel temps
+        // 3. Dependency chains are hidden by group-level parallelism
     }
 
     // =========================================================================
@@ -581,6 +591,9 @@ impl TickTockKernelBuilder {
             self.ctx.v_const_r3[i] =
                 self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
         }
+
+        // Depth 4 cache initialization DISABLED - see allocate_valu_selection() for details.
+        // The 16-way cached selection would exceed the scratch budget.
     }
 
     fn emit_partition_init(&mut self) {
@@ -664,6 +677,8 @@ impl TickTockKernelBuilder {
         let _use_sorted_vload = false; // Disabled until partition stores are validated
 
         // Tree access based on depth - always use normal access patterns for now
+        // Note: Depth 4 optimization disabled due to scratch budget constraints.
+        // See allocate_valu_selection() for details.
         match tree_depth {
             0 => self.emit_depth0_access(n_iters),
             1 => self.emit_depth1_access(n_iters),
@@ -713,14 +728,14 @@ impl TickTockKernelBuilder {
     fn emit_depth1_access(&mut self, n_iters: usize) {
         let ctx = &self.ctx;
 
-        // Depth 1: Delta selection for 2 values
+        // Depth 1: Delta selection for 2 values using FMA
+        // select(cond, a, b) = FMA(cond, a-b, b) = cond * (a-b) + b
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let t = ctx.v_t[it][i];
                 self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_1);
-                self.emit.emit_valu(Opcode::Mul, t, ctx.v_td_1, t);
-                self.emit.emit_valu(Opcode::Add, ctx.v_nv[it][i], ctx.v_tc2, t);
+                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_1, ctx.v_tc2);
             }
         }
 
@@ -740,26 +755,24 @@ impl TickTockKernelBuilder {
     fn emit_depth2_access(&mut self, n_iters: usize) {
         let ctx = &self.ctx;
 
-        // Depth 2: Delta selection for 4 values
+        // Depth 2: Delta selection for 4 values using FMA
+        // select(cond, a, b) = FMA(cond, a-b, b) = cond * (a-b) + b
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let t = ctx.v_t[it][i];
 
-                // Start with tc[3]
+                // Start with tc[3], add delta if idx == 4
                 self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[4]);
-                self.emit.emit_valu(Opcode::Mul, t, ctx.v_td_4, t);
-                self.emit.emit_valu(Opcode::Add, ctx.v_nv[it][i], ctx.v_tc3, t);
+                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_4, ctx.v_tc3);
 
                 // Add td_5 if idx == 5
                 self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[5]);
-                self.emit.emit_valu(Opcode::Mul, t, ctx.v_td_5, t);
-                self.emit.emit_valu(Opcode::Add, ctx.v_nv[it][i], ctx.v_nv[it][i], t);
+                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_5, ctx.v_nv[it][i]);
 
                 // Add td_6 if idx == 6
                 self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[6]);
-                self.emit.emit_valu(Opcode::Mul, t, ctx.v_td_6, t);
-                self.emit.emit_valu(Opcode::Add, ctx.v_nv[it][i], ctx.v_nv[it][i], t);
+                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_6, ctx.v_nv[it][i]);
             }
         }
 
@@ -780,6 +793,12 @@ impl TickTockKernelBuilder {
         let ctx = &self.ctx;
 
         // Depth 3: Compare/select from preloaded tree[7..14]
+        // Uses FMA accumulation: v_nv = v_nv + (idx == ti) * tree[7+ti]
+        //
+        // NOTE: A parallel approach was attempted (8 parallel compares + multiplies
+        // + tree reduction) but required 128 extra words of scratch for temp vectors,
+        // exceeding the 1536 word budget. The scheduler effectively hides the
+        // FMA dependency chain by interleaving operations across groups.
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
@@ -809,10 +828,14 @@ impl TickTockKernelBuilder {
         }
     }
 
+    // NOTE: emit_depth4_access was removed - the parallel 16-way cached selection
+    // approach exceeded scratch budget (400+ words for cached tree values and temps).
+    // Depth 4+ continues to use emit_scattered_access().
+
     fn emit_scattered_access(&mut self, n_iters: usize) {
         let ctx = &self.ctx;
 
-        // Scattered loads for depths 4+
+        // Scattered loads for depths 5+
         for vi in 0..VLEN {
             for i in (0..UNROLL).step_by(2) {
                 for it in 0..n_iters {
