@@ -892,6 +892,208 @@ pub fn resolve_pseudo_const(
 }
 
 // ============================================================================
+// SSA Virtual Registers
+// ============================================================================
+
+/// Virtual register width - scalar (1 word) or vector (VLEN words)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VRegWidth {
+    Scalar,
+    Vector,
+}
+
+/// Virtual register - represents a value, not a physical location.
+///
+/// Unlike concrete scratch addresses, VRegs have SSA semantics:
+/// - Each VReg is defined exactly once
+/// - Dependencies are only true data dependencies (RAW)
+/// - No false WAW or WAR dependencies
+///
+/// Physical addresses are assigned after scheduling via linear scan allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VReg {
+    /// Unique identifier within the kernel
+    pub id: u32,
+    /// Width: scalar (1 word) or vector (VLEN=8 words)
+    pub width: VRegWidth,
+}
+
+impl VReg {
+    /// Create a scalar VReg
+    pub fn scalar(id: u32) -> Self {
+        Self { id, width: VRegWidth::Scalar }
+    }
+
+    /// Create a vector VReg
+    pub fn vector(id: u32) -> Self {
+        Self { id, width: VRegWidth::Vector }
+    }
+
+    /// Get the size in words (1 for scalar, VLEN for vector)
+    pub fn size(&self) -> usize {
+        match self.width {
+            VRegWidth::Scalar => 1,
+            VRegWidth::Vector => VLEN,
+        }
+    }
+
+    /// Check if this is a scalar VReg
+    pub fn is_scalar(&self) -> bool {
+        self.width == VRegWidth::Scalar
+    }
+
+    /// Check if this is a vector VReg
+    pub fn is_vector(&self) -> bool {
+        self.width == VRegWidth::Vector
+    }
+}
+
+/// Operand for SSA operations - either a VReg reference or an immediate value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Operand {
+    /// Reference to a virtual register
+    VReg(VReg),
+    /// Immediate value (constant embedded in instruction)
+    Imm(i64),
+}
+
+impl Operand {
+    /// Create a VReg operand from a scalar VReg
+    pub fn scalar(id: u32) -> Self {
+        Self::VReg(VReg::scalar(id))
+    }
+
+    /// Create a VReg operand from a vector VReg
+    pub fn vector(id: u32) -> Self {
+        Self::VReg(VReg::vector(id))
+    }
+
+    /// Create an immediate operand
+    pub fn imm(value: i64) -> Self {
+        Self::Imm(value)
+    }
+
+    /// Get the VReg if this is a VReg operand
+    pub fn as_vreg(&self) -> Option<VReg> {
+        match self {
+            Self::VReg(v) => Some(*v),
+            Self::Imm(_) => None,
+        }
+    }
+
+    /// Get the immediate value if this is an immediate operand
+    pub fn as_imm(&self) -> Option<i64> {
+        match self {
+            Self::Imm(v) => Some(*v),
+            Self::VReg(_) => None,
+        }
+    }
+}
+
+/// SSA Operation - uses virtual registers instead of concrete addresses.
+///
+/// This is the SSA form used during kernel construction and scheduling.
+/// After scheduling, VRegs are mapped to physical addresses via linear scan.
+///
+/// Key differences from `Op`:
+/// - `dest`: Optional VReg (SSA: each value defined once)
+/// - `srcs`: Vec of Operands (VReg or Imm)
+/// - No `reads`/`writes` HashSets (derived from VRegs)
+/// - Dependencies are RAW-only (true data flow)
+#[derive(Clone, Debug)]
+pub struct SsaOp {
+    /// Unique identifier
+    pub id: usize,
+
+    /// Execution engine
+    pub engine: Engine,
+
+    /// Operation opcode
+    pub opcode: Opcode,
+
+    /// Destination VReg (if any - stores have no dest)
+    pub dest: Option<VReg>,
+
+    /// Source operands (VRegs or immediates)
+    pub srcs: Vec<Operand>,
+
+    /// Op IDs this op depends on (RAW dependencies only)
+    pub dep_ids: HashSet<usize>,
+
+    /// Scheduled cycle (-1 if unscheduled)
+    pub cycle: i32,
+
+    /// If this op produces a known constant value
+    pub produces_constant: Option<i64>,
+}
+
+impl SsaOp {
+    /// Create a new unscheduled SsaOp
+    pub fn new(id: usize, engine: Engine, opcode: Opcode, dest: Option<VReg>, srcs: Vec<Operand>) -> Self {
+        Self {
+            id,
+            engine,
+            opcode,
+            dest,
+            srcs,
+            dep_ids: HashSet::new(),
+            cycle: -1,
+            produces_constant: None,
+        }
+    }
+
+    /// Get all VRegs read by this op
+    pub fn reads(&self) -> impl Iterator<Item = VReg> + '_ {
+        self.srcs.iter().filter_map(|op| op.as_vreg())
+    }
+
+    /// Get the destination VReg if any
+    pub fn writes(&self) -> Option<VReg> {
+        self.dest
+    }
+
+    /// Check if this op is scheduled
+    pub fn is_scheduled(&self) -> bool {
+        self.cycle >= 0
+    }
+
+    /// Check if this is a vector operation (dest is a vector VReg)
+    pub fn is_vector(&self) -> bool {
+        self.dest.map(|v| v.is_vector()).unwrap_or(false)
+    }
+}
+
+/// Live interval for a VReg - from definition cycle to last use cycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveInterval {
+    /// Cycle when the VReg is defined
+    pub start: i32,
+    /// Cycle when the VReg is last used (inclusive)
+    pub end: i32,
+}
+
+impl LiveInterval {
+    pub fn new(start: i32, end: i32) -> Self {
+        Self { start, end }
+    }
+
+    /// Check if this interval overlaps with another
+    pub fn overlaps(&self, other: &LiveInterval) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+
+    /// Check if this interval contains a specific cycle
+    pub fn contains(&self, cycle: i32) -> bool {
+        self.start <= cycle && cycle <= self.end
+    }
+
+    /// Get the length of the interval (end - start + 1)
+    pub fn len(&self) -> i32 {
+        self.end - self.start + 1
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1056,5 +1258,125 @@ mod tests {
 
         let add = ConstEncoding::Add { a_value: 1, b_value: 2 };
         assert_eq!(add.engine(), Engine::Alu);
+    }
+
+    // ========================================================================
+    // VReg and SSA Tests
+    // ========================================================================
+
+    #[test]
+    fn test_vreg_size() {
+        assert_eq!(VReg::scalar(0).size(), 1);
+        assert_eq!(VReg::vector(0).size(), 8);
+    }
+
+    #[test]
+    fn test_vreg_equality() {
+        let v1 = VReg::scalar(5);
+        let v2 = VReg::scalar(5);
+        let v3 = VReg::scalar(6);
+        let v4 = VReg::vector(5);
+        assert_eq!(v1, v2);
+        assert_ne!(v1, v3);
+        assert_ne!(v1, v4); // Same ID but different width
+    }
+
+    #[test]
+    fn test_vreg_is_scalar_vector() {
+        let s = VReg::scalar(0);
+        let v = VReg::vector(0);
+        assert!(s.is_scalar());
+        assert!(!s.is_vector());
+        assert!(!v.is_scalar());
+        assert!(v.is_vector());
+    }
+
+    #[test]
+    fn test_operand_vreg() {
+        let op = Operand::scalar(5);
+        assert!(op.as_vreg().is_some());
+        assert!(op.as_imm().is_none());
+        assert_eq!(op.as_vreg().unwrap(), VReg::scalar(5));
+    }
+
+    #[test]
+    fn test_operand_imm() {
+        let op = Operand::imm(42);
+        assert!(op.as_imm().is_some());
+        assert!(op.as_vreg().is_none());
+        assert_eq!(op.as_imm().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_ssa_op_reads() {
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::scalar(0), Operand::scalar(1)],
+        );
+        let reads: Vec<_> = op.reads().collect();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.contains(&VReg::scalar(0)));
+        assert!(reads.contains(&VReg::scalar(1)));
+    }
+
+    #[test]
+    fn test_ssa_op_writes() {
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::scalar(0), Operand::scalar(1)],
+        );
+        assert_eq!(op.writes(), Some(VReg::scalar(2)));
+    }
+
+    #[test]
+    fn test_ssa_op_is_vector() {
+        let scalar_op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(0)),
+            vec![],
+        );
+        let vector_op = SsaOp::new(
+            1,
+            Engine::Valu,
+            Opcode::Add,
+            Some(VReg::vector(0)),
+            vec![],
+        );
+        assert!(!scalar_op.is_vector());
+        assert!(vector_op.is_vector());
+    }
+
+    #[test]
+    fn test_live_interval_overlaps() {
+        let i1 = LiveInterval::new(0, 5);
+        let i2 = LiveInterval::new(3, 8);
+        let i3 = LiveInterval::new(6, 10);
+        assert!(i1.overlaps(&i2)); // 3-5 overlap
+        assert!(i2.overlaps(&i3)); // 6-8 overlap
+        assert!(!i1.overlaps(&i3)); // no overlap
+    }
+
+    #[test]
+    fn test_live_interval_contains() {
+        let interval = LiveInterval::new(2, 7);
+        assert!(!interval.contains(1));
+        assert!(interval.contains(2));
+        assert!(interval.contains(5));
+        assert!(interval.contains(7));
+        assert!(!interval.contains(8));
+    }
+
+    #[test]
+    fn test_live_interval_len() {
+        let interval = LiveInterval::new(3, 7);
+        assert_eq!(interval.len(), 5); // 3, 4, 5, 6, 7
     }
 }

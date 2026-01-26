@@ -8,16 +8,19 @@
 //! - `config` - Kernel configuration (forest height, batch size, etc.)
 //! - `context` - Scratch memory allocation context
 //! - `emit` - Op creation helpers for clean emission patterns
+//! - `emit_ssa` - SSA-based op emission using virtual registers
 //! - `partition` - Lazy partition for sorted vload tree access
 //! - `tick_tock` - TickTock kernel builder (main implementation)
 
 pub mod config;
 pub mod context;
 pub mod emit;
+pub mod emit_ssa;
 pub mod partition;
 pub mod tick_tock;
 
 pub use config::KernelConfig;
 pub use context::{ScratchContext, ZERO_REG};
+pub use emit_ssa::SsaEmitContext;
 pub use partition::{PartitionBuffer, PartitionHelper};
 pub use tick_tock::TickTockKernelBuilder;

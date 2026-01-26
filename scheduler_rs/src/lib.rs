@@ -6,18 +6,21 @@
 //! - Constant derivation optimization
 //! - Comprehensive diagnostics
 //! - Native kernel building (eliminating Python→Rust parsing overhead)
+//! - SSA-based virtual registers for false dependency elimination
 //!
 //! ## Module Organization
 //!
-//! - `types` - Core types: Op, SlotVal, ScheduleResult, slot limits
+//! - `types` - Core types: Op, SsaOp, VReg, SlotVal, ScheduleResult, slot limits
 //! - `diagnostics` - Scheduling diagnostics and shared temp analysis
 //! - `constants` - Constant analysis and derivation planning
 //! - `scheduler` - Core scheduling algorithms
+//! - `address_assign` - SSA address assignment via linear scan allocation
 //! - `kernel_builder` - Native Rust kernel generation
 //! - `python` - PyO3 bindings and Python interface
 
 use pyo3::prelude::*;
 
+pub mod address_assign;
 pub mod allocator;
 pub mod constants;
 pub mod cpsat_scheduler;

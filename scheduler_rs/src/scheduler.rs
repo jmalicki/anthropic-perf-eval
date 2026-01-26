@@ -1523,6 +1523,721 @@ pub fn schedule_with_slot_filling(
     }
 }
 
+// ============================================================================
+// SSA Scheduling Support
+// ============================================================================
+
+use crate::types::{Operand, SsaOp, VReg};
+
+/// Result of SSA scheduling
+#[derive(Debug)]
+pub struct SsaScheduleResult {
+    /// Number of cycles used
+    pub cycles: usize,
+    /// Peak live words (from liveness analysis)
+    pub peak_live: usize,
+}
+
+/// Compute RAW-only dependencies for SSA ops.
+///
+/// Unlike `compute_dependencies` which tracks WAW and WAR dependencies based on
+/// concrete addresses, SSA ops only have true data dependencies (RAW) since each
+/// VReg is defined exactly once.
+pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usize>) {
+    for op in ops.iter_mut() {
+        op.dep_ids.clear();
+
+        // RAW: depend on producers of values we read
+        for src in &op.srcs {
+            if let Operand::VReg(vreg) = src {
+                if let Some(&def_id) = vreg_def.get(vreg) {
+                    op.dep_ids.insert(def_id);
+                }
+            }
+        }
+    }
+}
+
+/// Liveness tracker for SSA scheduling.
+///
+/// Tracks which VRegs are live at each cycle during incremental scheduling.
+/// A VReg is live from its definition cycle until all its consumers are scheduled.
+struct SsaLivenessTracker {
+    /// VReg -> (def_cycle, size, remaining_consumer_count)
+    vreg_info: HashMap<VReg, (i32, usize, usize)>,
+    /// Current live words (sum of sizes of live VRegs)
+    live_words: usize,
+    /// Peak live words seen so far
+    peak_live: usize,
+    /// Scratch budget
+    budget: usize,
+}
+
+impl SsaLivenessTracker {
+    fn new(budget: usize) -> Self {
+        Self {
+            vreg_info: HashMap::new(),
+            live_words: 0,
+            peak_live: 0,
+            budget,
+        }
+    }
+
+    /// Initialize consumer counts for all VRegs.
+    fn init_consumer_counts(&mut self, ops: &[SsaOp]) {
+        // Count how many ops consume each VReg
+        let mut consumer_counts: HashMap<VReg, usize> = HashMap::new();
+        for op in ops {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    *consumer_counts.entry(*vreg).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Initialize vreg_info with consumer counts
+        for op in ops {
+            if let Some(dest) = op.dest {
+                let count = consumer_counts.get(&dest).copied().unwrap_or(0);
+                // def_cycle = -1 means not yet scheduled
+                self.vreg_info.insert(dest, (-1, dest.size(), count));
+            }
+        }
+    }
+
+    /// Check if scheduling an op at the given cycle would exceed the budget.
+    /// Returns the projected live words after scheduling.
+    fn projected_live_after_schedule(&self, op: &SsaOp, _cycle: i32) -> usize {
+        let mut projected = self.live_words;
+
+        // The op's destination VReg becomes live (if it has one)
+        if let Some(dest) = op.dest {
+            projected += dest.size();
+        }
+
+        // VRegs consumed by this op that have no other consumers will die
+        // But they're still live *during* this cycle (read happens before write)
+        // So for pressure calculation, we add the new VReg first
+
+        projected
+    }
+
+    /// Record that an op has been scheduled at the given cycle.
+    fn schedule_op(&mut self, op: &SsaOp, cycle: i32) {
+        // First, handle consumed VRegs - decrement consumer counts
+        // VRegs die when their last consumer is scheduled
+        for src in &op.srcs {
+            if let Operand::VReg(vreg) = src {
+                if let Some((def_cycle, size, ref mut remaining)) = self.vreg_info.get_mut(vreg) {
+                    if *def_cycle >= 0 && *remaining > 0 {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            // This VReg just died - free its space
+                            self.live_words = self.live_words.saturating_sub(*size);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Then, the op's destination VReg becomes live
+        if let Some(dest) = op.dest {
+            if let Some((ref mut def_cycle, size, remaining)) = self.vreg_info.get_mut(&dest) {
+                *def_cycle = cycle;
+                // Only add to live words if someone will consume it
+                // (dead definitions don't consume scratch)
+                if *remaining > 0 {
+                    self.live_words += *size;
+                }
+            }
+        }
+
+        self.peak_live = self.peak_live.max(self.live_words);
+    }
+
+    /// Check if scheduling would exceed the budget.
+    fn would_exceed_budget(&self, op: &SsaOp, cycle: i32) -> bool {
+        self.projected_live_after_schedule(op, cycle) > self.budget
+    }
+}
+
+/// Schedule SSA ops using a greedy list scheduler with liveness constraints.
+///
+/// This scheduler:
+/// 1. Uses only RAW dependencies (no false WAW/WAR deps)
+/// 2. Respects slot limits per engine per cycle
+/// 3. Enforces scratch budget constraints via liveness tracking
+/// 4. Delays ops if scheduling them would exceed the scratch budget
+///
+/// Returns the scheduled ops (with cycle assignments) and scheduling statistics.
+pub fn schedule_ssa_greedy(ops: &mut [SsaOp]) -> SsaScheduleResult {
+    schedule_ssa_greedy_with_budget(ops, SCRATCH_BUDGET)
+}
+
+/// Schedule SSA ops with a custom scratch budget.
+pub fn schedule_ssa_greedy_with_budget(ops: &mut [SsaOp], budget: usize) -> SsaScheduleResult {
+    if ops.is_empty() {
+        return SsaScheduleResult { cycles: 0, peak_live: 0 };
+    }
+
+    // Build VReg -> defining op ID map
+    let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
+    for op in ops.iter() {
+        if let Some(dest) = op.dest {
+            vreg_def.insert(dest, op.id);
+        }
+    }
+
+    // Compute dependencies
+    compute_ssa_dependencies(ops, &vreg_def);
+
+    // Initialize liveness tracker
+    let mut liveness = SsaLivenessTracker::new(budget);
+    liveness.init_consumer_counts(ops);
+
+    // Build adjacency lists for dependents
+    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+
+    for op in ops.iter() {
+        in_degree.insert(op.id, op.dep_ids.len());
+        for &dep_id in &op.dep_ids {
+            dependents.entry(dep_id).or_default().push(op.id);
+        }
+    }
+
+    // Initialize ready queue with ops that have no dependencies
+    // Priority: (earliest_ready, op_id) - schedule earlier-ready ops first
+    let mut ready: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
+    let mut op_index: HashMap<usize, usize> = HashMap::new(); // op_id -> index in ops
+
+    for (idx, op) in ops.iter().enumerate() {
+        op_index.insert(op.id, idx);
+        if op.dep_ids.is_empty() {
+            ready.push(Reverse((0, op.id)));
+        }
+    }
+
+    // Track slot usage per cycle per engine
+    let mut slot_usage: HashMap<(i32, Engine), usize> = HashMap::new();
+
+    // Track earliest ready cycle per op (based on when deps complete)
+    let mut earliest_ready: HashMap<usize, i32> = HashMap::new();
+    for op in ops.iter() {
+        earliest_ready.insert(op.id, 0);
+    }
+
+    // Track ops that were deferred due to liveness constraints
+    let mut deferred: VecDeque<usize> = VecDeque::new();
+
+    let mut max_cycle: i32 = 0;
+    let max_attempts = ops.len() * 100; // Prevent infinite loops
+    let mut attempts = 0;
+
+    // Schedule ops
+    while !ready.is_empty() || !deferred.is_empty() {
+        attempts += 1;
+        if attempts > max_attempts {
+            // Fallback: schedule remaining ops ignoring liveness constraints
+            // This shouldn't happen in practice with reasonable programs
+            break;
+        }
+
+        // Try to schedule from ready queue first, then deferred
+        let op_id = if let Some(Reverse((_, id))) = ready.pop() {
+            id
+        } else if let Some(id) = deferred.pop_front() {
+            id
+        } else {
+            break;
+        };
+
+        let idx = *op_index.get(&op_id).unwrap();
+        let op = &ops[idx];
+        let engine = op.engine;
+        let earliest = *earliest_ready.get(&op_id).unwrap_or(&0);
+
+        // Find earliest cycle where:
+        // 1. This engine has a free slot
+        // 2. Scheduling wouldn't exceed liveness budget
+        let slot_limit = engine.slot_limit();
+        let mut cycle = earliest;
+        let mut found = false;
+        let max_search_cycles = max_cycle + 100; // Don't search too far ahead
+
+        while cycle <= max_search_cycles {
+            let used = *slot_usage.get(&(cycle, engine)).unwrap_or(&0);
+            if used < slot_limit {
+                // Check liveness constraint
+                if !liveness.would_exceed_budget(op, cycle) {
+                    found = true;
+                    break;
+                }
+            }
+            cycle += 1;
+        }
+
+        if !found {
+            // Couldn't find a valid cycle - defer this op
+            // It might become schedulable after other ops free up liveness
+            deferred.push_back(op_id);
+            continue;
+        }
+
+        // Schedule the op
+        ops[idx].cycle = cycle;
+        *slot_usage.entry((cycle, engine)).or_insert(0) += 1;
+        max_cycle = max_cycle.max(cycle);
+
+        // Update liveness tracker
+        liveness.schedule_op(&ops[idx], cycle);
+
+        // Update dependents
+        if let Some(deps) = dependents.get(&op_id) {
+            for &dep_id in deps {
+                // Update earliest ready time (result available next cycle)
+                let ready_time = earliest_ready.entry(dep_id).or_insert(0);
+                *ready_time = (*ready_time).max(cycle + 1);
+
+                // Decrement in-degree
+                let deg = in_degree.get_mut(&dep_id).unwrap();
+                *deg -= 1;
+                if *deg == 0 {
+                    let dep_earliest = *earliest_ready.get(&dep_id).unwrap_or(&0);
+                    ready.push(Reverse((dep_earliest, dep_id)));
+                }
+            }
+        }
+
+        // Re-add deferred ops to ready queue since liveness may have decreased
+        while let Some(deferred_id) = deferred.pop_front() {
+            let deferred_earliest = *earliest_ready.get(&deferred_id).unwrap_or(&0);
+            ready.push(Reverse((deferred_earliest, deferred_id)));
+        }
+    }
+
+    // Handle any remaining ops that couldn't be scheduled within constraints
+    // Schedule them anyway (program correctness over optimality)
+    for &deferred_id in &deferred {
+        let idx = *op_index.get(&deferred_id).unwrap();
+        if ops[idx].cycle < 0 {
+            let engine = ops[idx].engine;
+            let earliest = *earliest_ready.get(&deferred_id).unwrap_or(&0);
+            let slot_limit = engine.slot_limit();
+
+            let mut cycle = earliest;
+            loop {
+                let used = *slot_usage.get(&(cycle, engine)).unwrap_or(&0);
+                if used < slot_limit {
+                    break;
+                }
+                cycle += 1;
+            }
+
+            ops[idx].cycle = cycle;
+            *slot_usage.entry((cycle, engine)).or_insert(0) += 1;
+            max_cycle = max_cycle.max(cycle);
+            liveness.schedule_op(&ops[idx], cycle);
+        }
+    }
+
+    SsaScheduleResult {
+        cycles: (max_cycle + 1) as usize,
+        peak_live: liveness.peak_live,
+    }
+}
+
+/// Full result of SSA scheduling pipeline
+#[derive(Debug)]
+pub struct SsaFullScheduleResult {
+    /// Lowered concrete ops with physical addresses
+    pub ops: Vec<Op>,
+    /// Number of cycles
+    pub cycles: usize,
+    /// Peak live words
+    pub peak_live: usize,
+    /// VReg to address mapping
+    pub vreg_to_addr: HashMap<VReg, i64>,
+    /// Maximum address used
+    pub max_addr: i64,
+}
+
+/// Full SSA scheduling pipeline: schedule -> assign addresses -> lower to concrete Ops.
+///
+/// This is the main entry point for SSA-based scheduling:
+/// 1. Compute RAW dependencies from VReg definitions
+/// 2. Schedule ops using greedy list scheduler
+/// 3. Assign physical addresses via linear scan
+/// 4. Lower SsaOps to concrete Ops
+///
+/// Returns concrete Ops ready for execution.
+pub fn schedule_ssa_full(ssa_ops: &mut [SsaOp]) -> Result<SsaFullScheduleResult, String> {
+    use crate::address_assign::{assign_addresses, lower_ssa_ops, AddressAssignConfig};
+
+    if ssa_ops.is_empty() {
+        return Ok(SsaFullScheduleResult {
+            ops: Vec::new(),
+            cycles: 0,
+            peak_live: 0,
+            vreg_to_addr: HashMap::new(),
+            max_addr: 0,
+        });
+    }
+
+    // Step 1: Schedule
+    let schedule_result = schedule_ssa_greedy(ssa_ops);
+
+    // Step 2: Assign addresses
+    let config = AddressAssignConfig::default();
+    let assign_result = assign_addresses(ssa_ops, &config);
+
+    if assign_result.budget_exceeded {
+        return Err(format!(
+            "Scratch budget exceeded: peak {} > budget {}",
+            assign_result.peak_live, assign_result.budget
+        ));
+    }
+
+    // Step 3: Lower to concrete Ops
+    let ops = lower_ssa_ops(ssa_ops, &assign_result.vreg_to_addr);
+
+    Ok(SsaFullScheduleResult {
+        ops,
+        cycles: schedule_result.cycles,
+        peak_live: schedule_result.peak_live,
+        vreg_to_addr: assign_result.vreg_to_addr,
+        max_addr: assign_result.max_addr,
+    })
+}
+
+#[cfg(test)]
+mod ssa_tests {
+    use super::*;
+    use crate::kernel_builder::emit_ssa::SsaEmitContext;
+    use crate::types::Opcode;
+
+    #[test]
+    fn test_schedule_ssa_simple_chain() {
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_alu(Opcode::Add, v1, v1);
+        let _v3 = emit.emit_alu(Opcode::Mul, v2, v2);
+
+        let result = schedule_ssa_greedy(&mut emit.ops);
+
+        // Chain of 3 ops should take 3 cycles
+        assert_eq!(result.cycles, 3);
+
+        // Verify cycle assignments: 0 -> 1 -> 2
+        assert_eq!(emit.ops[0].cycle, 0);
+        assert_eq!(emit.ops[1].cycle, 1);
+        assert_eq!(emit.ops[2].cycle, 2);
+    }
+
+    #[test]
+    fn test_schedule_ssa_parallel_consts() {
+        let mut emit = SsaEmitContext::new();
+        let _v1 = emit.emit_const(1);
+        let _v2 = emit.emit_const(2);
+
+        let result = schedule_ssa_greedy(&mut emit.ops);
+
+        // Two independent consts can both be at cycle 0 (2 load slots)
+        assert_eq!(result.cycles, 1);
+        assert_eq!(emit.ops[0].cycle, 0);
+        assert_eq!(emit.ops[1].cycle, 0);
+    }
+
+    #[test]
+    fn test_schedule_ssa_slot_limit() {
+        let mut emit = SsaEmitContext::new();
+        // Create 3 independent const loads - Load engine has limit of 2
+        let _v1 = emit.emit_const(1);
+        let _v2 = emit.emit_const(2);
+        let _v3 = emit.emit_const(3);
+
+        let result = schedule_ssa_greedy(&mut emit.ops);
+
+        // 2 can fit in cycle 0, 1 must go to cycle 1
+        assert_eq!(result.cycles, 2);
+    }
+
+    #[test]
+    fn test_schedule_ssa_no_false_deps() {
+        let mut emit = SsaEmitContext::new();
+        // In non-SSA, these would have WAW/WAR deps
+        // In SSA, they're independent
+        let v1 = emit.emit_const(1);
+        let v2 = emit.emit_const(2);
+        let _sum1 = emit.emit_alu(Opcode::Add, v1, v1);
+        let _sum2 = emit.emit_alu(Opcode::Add, v2, v2);
+
+        let result = schedule_ssa_greedy(&mut emit.ops);
+
+        // v1, v2 at cycle 0 (2 loads)
+        // sum1, sum2 at cycle 1 (parallel since independent, 2 ALU ops)
+        assert_eq!(result.cycles, 2);
+        assert_eq!(emit.ops[0].cycle, 0); // v1
+        assert_eq!(emit.ops[1].cycle, 0); // v2
+        assert_eq!(emit.ops[2].cycle, 1); // sum1
+        assert_eq!(emit.ops[3].cycle, 1); // sum2
+    }
+
+    #[test]
+    fn test_schedule_ssa_full_pipeline() {
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_const(10);
+        let sum = emit.emit_alu(Opcode::Add, v1, v2);
+        let _result = emit.emit_alu(Opcode::Mul, sum, sum);
+
+        let result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
+
+        // Verify scheduling
+        assert_eq!(result.cycles, 3); // const, const -> add -> mul
+
+        // Verify we got concrete ops
+        assert_eq!(result.ops.len(), 4);
+
+        // Verify addresses were assigned
+        assert!(!result.vreg_to_addr.is_empty());
+
+        // Verify concrete ops have valid addresses in reads/writes
+        for op in &result.ops {
+            assert!(op.cycle >= 0);
+            // At least one address in reads or writes (except for loads with imm)
+            // Ops should have proper engine assignments
+            assert!(op.engine.is_hardware());
+        }
+    }
+
+    #[test]
+    fn test_schedule_ssa_full_with_vectors() {
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let s2 = emit.emit_const(2);
+        let v1 = emit.emit_vbroadcast(s1);
+        let v2 = emit.emit_vbroadcast(s2);
+        let _vsum = emit.emit_valu(Opcode::Add, v1, v2);
+
+        let result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
+
+        // Verify scheduling happened
+        assert!(result.cycles > 0);
+
+        // Verify vector ops got 8-word allocations
+        for (vreg, _addr) in &result.vreg_to_addr {
+            if vreg.is_vector() {
+                // Vector VRegs should exist in the mapping
+                assert!(vreg.size() == 8);
+            }
+        }
+    }
+
+    #[test]
+    fn test_schedule_ssa_respects_liveness_budget() {
+        // Create overlapping vectors that would exceed a small budget
+        // The scheduler should delay some ops to reduce peak liveness
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let v1 = emit.emit_vbroadcast_force(s1); // 8 words
+        let v2 = emit.emit_vbroadcast_force(s1); // 8 words
+        let v3 = emit.emit_vbroadcast_force(s1); // 8 words
+        // Consumer that uses all vectors - forces them to be live simultaneously
+        // if scheduled naively
+        let _ = emit.emit_valu(Opcode::Add, v1, v2);
+        let _ = emit.emit_valu(Opcode::Add, v2, v3);
+
+        // With a budget of 20, we can't have all 3 vectors (24 words) live at once
+        // The scheduler should sequence them
+        let result = schedule_ssa_greedy_with_budget(&mut emit.ops, 20);
+
+        // Peak liveness should respect the budget (or be close to it)
+        // The exact value depends on scheduling order, but it shouldn't be 24+
+        assert!(
+            result.peak_live <= 20,
+            "Peak liveness {} should not exceed budget 20",
+            result.peak_live
+        );
+    }
+
+    #[test]
+    fn test_schedule_ssa_liveness_decreases_after_last_use() {
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let v1 = emit.emit_vbroadcast(s1);
+        // v1 is consumed here and dies
+        let v2 = emit.emit_valu(Opcode::Add, v1, v1);
+        // v2 is consumed here and dies
+        let _v3 = emit.emit_valu(Opcode::Mul, v2, v2);
+
+        let result = schedule_ssa_greedy(&mut emit.ops);
+
+        // After each use, liveness decreases, so peak should be reasonable
+        // s1 (1) + v1 (8) = 9 at peak
+        // Then v1 dies, v2 (8) is created: 1 + 8 = 9
+        // Then v2 dies, v3 (8) is created: 1 + 8 = 9
+        assert!(result.peak_live <= 10, "Peak liveness should be around 9-10");
+    }
+
+    /// Test SSA full pipeline produces valid concrete Ops.
+    /// This verifies that:
+    /// 1. SSA scheduling assigns valid cycle numbers
+    /// 2. Address assignment produces valid physical addresses
+    /// 3. Lowered Ops have correct reads/writes sets
+    #[test]
+    fn test_schedule_ssa_full_produces_valid_ops() {
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_const(10);
+        let sum = emit.emit_alu(Opcode::Add, v1, v2);
+        let product = emit.emit_alu(Opcode::Mul, sum, v1);
+        let _final_result = emit.emit_alu(Opcode::Sub, product, v2);
+
+        let result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
+
+        // Verify all ops have valid cycles
+        for op in &result.ops {
+            assert!(op.cycle >= 0, "All ops should have valid cycle >= 0");
+        }
+
+        // Verify precedence constraints are respected
+        // Find ops by their produces_constant or check cycle ordering
+        let cycles: Vec<i32> = result.ops.iter().map(|op| op.cycle).collect();
+
+        // v1, v2 can be parallel (cycle 0)
+        // sum depends on v1, v2 (cycle >= 1)
+        // product depends on sum, v1 (cycle >= 2)
+        // final depends on product, v2 (cycle >= 3)
+        assert!(cycles[2] > cycles[0], "sum must come after v1");
+        assert!(cycles[2] > cycles[1], "sum must come after v2");
+        assert!(cycles[3] > cycles[2], "product must come after sum");
+        assert!(cycles[4] > cycles[3], "final must come after product");
+
+        // Verify addresses are non-negative and within bounds
+        for (&vreg, &addr) in &result.vreg_to_addr {
+            assert!(addr >= 0, "Address should be non-negative");
+            if vreg.is_vector() {
+                assert!(addr + 7 <= result.max_addr, "Vector should fit within allocation");
+            }
+        }
+
+        // Verify lowered ops have proper reads/writes
+        for op in &result.ops {
+            // Loads have no reads (or immediate), everything else should have reads
+            if op.engine != Engine::Load {
+                assert!(!op.reads.is_empty(), "Non-load ops should have reads: {:?}", op);
+            }
+            // All ops except stores should have writes
+            if op.engine != Engine::Store {
+                assert!(!op.writes.is_empty(), "Non-store ops should have writes: {:?}", op);
+            }
+        }
+    }
+
+    /// Test SSA pipeline with vectors verifies correct 8-word allocations.
+    #[test]
+    fn test_schedule_ssa_full_vector_allocation() {
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let s2 = emit.emit_const(2);
+        let v1 = emit.emit_vbroadcast(s1);
+        let v2 = emit.emit_vbroadcast(s2);
+        let vsum = emit.emit_valu(Opcode::Add, v1, v2);
+        let _vresult = emit.emit_valu(Opcode::Mul, vsum, v1);
+
+        let result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
+
+        // Find vector VRegs and verify they got 8-word allocations
+        let vector_vregs: Vec<_> = result.vreg_to_addr.iter()
+            .filter(|(vreg, _)| vreg.is_vector())
+            .collect();
+
+        assert!(!vector_vregs.is_empty(), "Should have vector VRegs");
+
+        // Verify vector ops have 8 addresses in writes
+        for op in &result.ops {
+            if op.engine == Engine::Valu && !op.writes.is_empty() {
+                assert_eq!(op.writes.len(), 8, "VALU op should write 8 addresses");
+            }
+        }
+    }
+
+    /// Test that SSA scheduling + lowering produces ops that can be re-scheduled.
+    /// This is a "round trip" test: SSA -> lower -> verify schedulable.
+    #[test]
+    fn test_schedule_ssa_lowered_ops_are_schedulable() {
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_const(10);
+        let sum = emit.emit_alu(Opcode::Add, v1, v2);
+        let _result = emit.emit_alu(Opcode::Mul, sum, sum);
+
+        // SSA schedule + lower
+        let ssa_result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
+        let mut lowered_ops = ssa_result.ops;
+
+        // Clear cycle assignments to re-schedule
+        for op in &mut lowered_ops {
+            op.cycle = -1;
+        }
+
+        // Recompute dependencies for lowered ops (based on reads/writes)
+        recompute_dependencies(&mut lowered_ops);
+
+        // Schedule with regular greedy scheduler
+        let critical_path = compute_critical_path(&lowered_ops);
+        let greedy_result = schedule_greedy(&mut lowered_ops, &critical_path, false, PriorityMode::CriticalPath);
+
+        // Should produce valid schedule
+        assert!(greedy_result.cycles > 0, "Should produce valid schedule");
+
+        // All ops should have valid cycles
+        for op in &lowered_ops {
+            assert!(op.cycle >= 0, "All ops should be scheduled");
+        }
+
+        // Cycle count should be similar to SSA result
+        // (may differ slightly due to different scheduling heuristics)
+        assert!(
+            greedy_result.cycles <= ssa_result.cycles + 2,
+            "Greedy on lowered ops ({}) should be close to SSA result ({})",
+            greedy_result.cycles, ssa_result.cycles
+        );
+    }
+}
+
+/// Recompute dependencies for ops based on reads/writes (for testing lowered ops).
+/// This creates RAW dependencies: if op B reads address X and op A wrote X, B depends on A.
+#[cfg(test)]
+fn recompute_dependencies(ops: &mut [Op]) {
+    use std::collections::HashMap;
+
+    // Build write map: address -> op_id (which op writes this address)
+    // We need the FIRST writer for each address
+    let mut write_map: HashMap<i64, usize> = HashMap::new();
+
+    // Record which op writes each address (use original ordering)
+    for op in ops.iter() {
+        for &addr in &op.writes {
+            // Only record first writer
+            write_map.entry(addr).or_insert(op.id);
+        }
+    }
+
+    // Compute dependencies based on reads
+    for op in ops.iter_mut() {
+        op.dep_ids.clear();
+        for &addr in &op.reads {
+            if let Some(&writer_id) = write_map.get(&addr) {
+                if writer_id != op.id {
+                    op.dep_ids.insert(writer_id);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod pseudo_const_tests {
     use super::*;

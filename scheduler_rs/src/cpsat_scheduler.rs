@@ -1343,4 +1343,162 @@ mod tests {
             "Should return exactly the hinted solution"
         );
     }
+
+    /// Test CP-SAT round trip with SSA-lowered ops.
+    /// This verifies that:
+    /// 1. SSA ops can be scheduled and lowered to concrete Ops
+    /// 2. Those concrete Ops can be scheduled by CP-SAT
+    /// 3. The greedy schedule from SSA serves as valid hints for CP-SAT
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_cpsat_roundtrip_with_ssa_lowered_ops() {
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+        use crate::scheduler::schedule_ssa_full;
+        use crate::types::Opcode;
+
+        // Create SSA ops
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_const(10);
+        let sum = emit.emit_alu(Opcode::Add, v1, v2);
+        let _result = emit.emit_alu(Opcode::Mul, sum, sum);
+
+        // SSA schedule + lower
+        let ssa_result = schedule_ssa_full(&mut emit.ops).expect("SSA scheduling should succeed");
+        let lowered_ops = ssa_result.ops;
+
+        // Extract cycle hints from SSA result
+        let hints: Vec<i32> = lowered_ops.iter().map(|op| op.cycle).collect();
+
+        // Run CP-SAT with the SSA-derived hints
+        let cpsat_result = schedule_cpsat(
+            &lowered_ops,
+            CpsatConfig::new()
+                .with_time_limit(10.0)
+                .with_hints(&hints)
+                .with_stop_after_first_solution(true),
+        );
+
+        assert!(cpsat_result.is_some(), "CP-SAT should accept SSA-lowered ops with hints");
+
+        let r = cpsat_result.unwrap();
+        assert!(
+            r.result.status == CpsatStatus::Feasible || r.result.status == CpsatStatus::Optimal,
+            "Should return feasible or optimal, got {:?}",
+            r.result.status
+        );
+
+        // The hints should be valid (produce same or better makespan)
+        assert!(
+            r.result.makespan <= ssa_result.cycles + 1,
+            "CP-SAT makespan ({}) should be close to SSA result ({})",
+            r.result.makespan, ssa_result.cycles
+        );
+    }
+
+    /// Test CP-SAT round trip with SSA vectors.
+    /// Vectors use 8 contiguous addresses, which creates more complex dependency patterns.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_cpsat_roundtrip_with_ssa_vectors() {
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+        use crate::scheduler::schedule_ssa_full;
+        use crate::types::Opcode;
+
+        // Create SSA ops with vectors
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let s2 = emit.emit_const(2);
+        let v1 = emit.emit_vbroadcast(s1);
+        let v2 = emit.emit_vbroadcast(s2);
+        let vsum = emit.emit_valu(Opcode::Add, v1, v2);
+        let _vresult = emit.emit_valu(Opcode::Mul, vsum, v1);
+
+        // SSA schedule + lower
+        let ssa_result = schedule_ssa_full(&mut emit.ops).expect("SSA scheduling should succeed");
+        let lowered_ops = ssa_result.ops;
+
+        // Extract cycle hints
+        let hints: Vec<i32> = lowered_ops.iter().map(|op| op.cycle).collect();
+
+        // Run CP-SAT
+        let cpsat_result = schedule_cpsat(
+            &lowered_ops,
+            CpsatConfig::new()
+                .with_time_limit(10.0)
+                .with_hints(&hints)
+                .with_stop_after_first_solution(true),
+        );
+
+        assert!(cpsat_result.is_some(), "CP-SAT should accept SSA vector ops");
+
+        let r = cpsat_result.unwrap();
+        assert!(
+            r.result.status == CpsatStatus::Feasible || r.result.status == CpsatStatus::Optimal,
+            "Should find feasible solution for vector ops"
+        );
+
+        // Verify all ops are scheduled
+        assert_eq!(
+            r.result.cycle_assignments.len(),
+            lowered_ops.len(),
+            "All ops should have cycle assignments"
+        );
+    }
+
+    /// Test that SSA-lowered ops with a larger dependency chain work correctly.
+    /// This exercises the full SSA pipeline with more complex patterns.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_cpsat_ssa_complex_deps() {
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+        use crate::scheduler::schedule_ssa_full;
+        use crate::types::Opcode;
+
+        // Create SSA ops with diamond dependency pattern:
+        //       v1  v2  v3
+        //        \  /\  /
+        //       sum12  sum23
+        //          \  /
+        //         final
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);
+        let v2 = emit.emit_const(10);
+        let v3 = emit.emit_const(15);
+        let sum12 = emit.emit_alu(Opcode::Add, v1, v2);
+        let sum23 = emit.emit_alu(Opcode::Add, v2, v3);
+        let _final_sum = emit.emit_alu(Opcode::Add, sum12, sum23);
+
+        // SSA schedule + lower
+        let ssa_result = schedule_ssa_full(&mut emit.ops).expect("SSA scheduling should succeed");
+        let ssa_lowered_ops = ssa_result.ops;
+        let ssa_hints: Vec<i32> = ssa_lowered_ops.iter().map(|op| op.cycle).collect();
+
+        // Run CP-SAT on SSA-lowered ops
+        let cpsat_result = schedule_cpsat(
+            &ssa_lowered_ops,
+            CpsatConfig::new()
+                .with_time_limit(10.0)
+                .with_hints(&ssa_hints)
+                .with_stop_after_first_solution(true),
+        );
+
+        assert!(cpsat_result.is_some(), "CP-SAT should work with SSA diamond pattern");
+
+        let r = cpsat_result.unwrap();
+        assert!(
+            r.result.status == CpsatStatus::Feasible || r.result.status == CpsatStatus::Optimal,
+            "Should find feasible solution"
+        );
+
+        // Critical path: v1/v2/v3 (0) -> sum12/sum23 (1) -> final (2) = 3 cycles
+        // But v3 is load and only 2 load slots, so might need cycle 1
+        // Final schedule: v1,v2 (0) -> v3,sum12 (1) -> sum23 (2) -> final (3) = 4 cycles
+        // Or: v1,v2 (0) -> v3,sum12,sum23 (1) -> final (2) = 3 cycles if sum12/sum23 can run same cycle
+        assert!(
+            r.result.makespan >= 3,
+            "Makespan ({}) should be at least 3 (critical path)",
+            r.result.makespan
+        );
+    }
 }
