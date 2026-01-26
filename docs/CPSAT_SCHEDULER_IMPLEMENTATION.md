@@ -489,20 +489,64 @@ def test_cpsat_timeout():
         assert result['status'] in ['optimal', 'feasible']
 ```
 
+## Lower Bound Strengthening
+
+CP-SAT's cumulative constraint has a weak LP relaxation. The LP doesn't enforce that at most `capacity` intervals can overlap—it only sees a "fractional" view. This causes the solver to report overly optimistic lower bounds (e.g., critical path = 825 when the true optimum is ~1900).
+
+We strengthen bounds explicitly with two techniques:
+
+### Capacity Bounds
+
+For each engine, we add the constraint:
+```
+makespan >= ceil(num_ops / capacity)
+```
+
+Example calculation:
+- VALU: 9838 ops / 6 slots = ceil(9838/6) = 1640 cycles minimum
+- Load: 2252 ops / 2 slots = ceil(2252/2) = 1126 cycles minimum
+- ALU: 2687 ops / 12 slots = ceil(2687/12) = 224 cycles minimum
+
+The VALU bound (1640) is much tighter than the critical path (825).
+
+### Profile Bounds (Energy-Based)
+
+For each engine and each deadline `d`, we count how many ops must complete by cycle `d` (i.e., have ALAP <= d). These ops must fit in `(d + 1) * capacity` total slots.
+
+If the count exceeds this capacity:
+```
+mandatory_count > (d + 1) * capacity
+```
+
+Then the schedule is infeasible, and we can derive a tighter lower bound:
+```
+makespan >= ceil(mandatory_count / capacity)
+```
+
+This catches situations where ops are "bunched up" in tight ASAP/ALAP windows that the simple capacity bound misses.
+
+### Impact
+
+With these bounds:
+- The solver's initial lower bound is much tighter
+- Branch-and-bound prunes more aggressively
+- Time to prove optimality is reduced
+
 ## Scalability Considerations
 
 ### Problem Size
-- ~13,000 ops for the full kernel
+- ~15,000 ops for the full kernel
 - Each op: 1 cycle variable + 1 interval variable
 - 5 cumulative constraints (one per hardware engine)
-- ~40,000+ precedence constraints
+- ~85,000+ precedence constraints
 
 ### Mitigation Strategies
 
-1. **Tight Bounds**: Use ASAP/ALAP to minimize variable domains
+1. **Tight Bounds**: Use ASAP/ALAP to minimize variable domains, plus capacity/profile bounds
 2. **Greedy Warm-Start**: Provide greedy solution as hint
 3. **Time Limits**: Set reasonable timeout (60-300s)
 4. **Incremental Approach**: If timeout, return best feasible solution found
+5. **Early Stopping**: Stop when solution is within 2% of lower bound
 
 ### Expected Performance
 - Small kernels (<1000 ops): Optimal in <10s

@@ -1120,6 +1120,36 @@ This is O(n log n) for sorting + O(n) sweep = O(n log n) total. No need for edge
 
 We use CP-SAT (via `cp_sat` Rust crate) for optimal scheduling with allocation feasibility constraints.
 
+### 7.0 Note: cp_sat Crate Limitations
+
+**Important:** The [`cp_sat`](https://crates.io/crates/cp_sat) Rust crate's builder API is **incomplete** for scheduling problems. As of v0.3, it lacks:
+
+- `new_interval_var()` / `new_fixed_size_interval_var()`
+- `add_cumulative()`
+- `add_no_overlap()`
+
+GitHub issue [#21](https://github.com/KardinalAI/cp_sat/issues/21) has been open since September 2021.
+
+**Our solution:** Fork the crate and add the missing functionality. The proto types exist (`IntervalConstraintProto`, `CumulativeConstraintProto`), so we add builder methods that construct these protos:
+
+```rust
+// IntervalConstraintProto fields:
+message IntervalConstraintProto {
+  LinearExpressionProto start = 4;
+  LinearExpressionProto end = 5;
+  LinearExpressionProto size = 6;
+}
+
+// CumulativeConstraintProto fields:
+message CumulativeConstraintProto {
+  LinearExpressionProto capacity = 1;
+  repeated int32 intervals = 2;
+  repeated LinearExpressionProto demands = 3;
+}
+```
+
+The forked crate will be used via git dependency in `Cargo.toml`.
+
 ### 7.1 Core Model
 
 ```rust

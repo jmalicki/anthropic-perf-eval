@@ -2038,16 +2038,33 @@ pub fn schedule_cpsat<'py>(
     // NOTE: We disable VALU-shift for hints because CP-SAT doesn't model it.
     // With VALU-shift, greedy might schedule 7+ VALU ops at a cycle by shifting
     // some to ALU, but CP-SAT would see this as violating VALU capacity=6.
+    // Use multipass scheduling to get the best hint (same as schedule_multipass).
     let greedy_hints: Option<Vec<i32>> = if use_greedy_hint {
         let critical_path = compute_critical_path(&ops);
-        let mut hint_ops = ops.clone();
-        schedule_greedy(
-            &mut hint_ops,
-            &critical_path,
-            false, // disable VALU-shift for CP-SAT compatible hints
-            PriorityMode::CriticalPath,
-        );
-        Some(hint_ops.iter().map(|op| op.cycle).collect())
+
+        // Try all priority modes and keep the best result (like schedule_multipass)
+        let mut best_cycles = usize::MAX;
+        let mut best_hint: Option<Vec<i32>> = None;
+
+        for &mode in ALL_PRIORITY_MODES.iter() {
+            let mut hint_ops = ops.clone();
+            let result = schedule_greedy(
+                &mut hint_ops,
+                &critical_path,
+                false, // disable VALU-shift for CP-SAT compatible hints
+                mode,
+            );
+            if result.cycles < best_cycles {
+                best_cycles = result.cycles;
+                best_hint = Some(hint_ops.iter().map(|op| op.cycle).collect());
+            }
+        }
+
+        if verbose {
+            eprintln!("CP-SAT hint: {} cycles (multipass, no VALU-shift)", best_cycles);
+        }
+
+        best_hint
     } else {
         None
     };

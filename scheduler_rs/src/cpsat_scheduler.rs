@@ -1,14 +1,64 @@
 //! CP-SAT based scheduler using Google OR-Tools.
 //!
 //! This module provides an optimal scheduler using constraint programming.
-//! It models the scheduling problem with:
-//! - Cycle variables for each op with [ASAP, ALAP] bounds
-//! - Precedence constraints from dependencies
-//! - Cumulative constraints for engine slot limits
-//! - Optional allocation feasibility constraints for scratch memory
 //!
-//! The CP-SAT scheduler can be used as an alternative to the greedy scheduler
-//! when optimal solutions are needed, though it may be slower for large problems.
+//! # Problem Model
+//!
+//! We model the VLIW scheduling problem as a resource-constrained scheduling problem:
+//!
+//! ## Decision Variables
+//!
+//! - **Cycle variable per op**: `cycle[i]` ∈ [ASAP[i], ALAP[i]] is the cycle when op i executes
+//! - **Makespan**: `makespan` = max(cycle[i]) + 1 is the total number of cycles
+//!
+//! ## Constraints
+//!
+//! 1. **Precedence constraints**: If op j depends on op i, then `cycle[j] >= cycle[i] + 1`
+//!    (results are available the cycle after execution)
+//!
+//! 2. **Resource constraints (cumulative)**: Each engine has a limited number of slots per cycle:
+//!    - ALU: 12 slots/cycle
+//!    - VALU: 6 slots/cycle
+//!    - Load: 2 slots/cycle
+//!    - Store: 2 slots/cycle
+//!    - Flow: 1 slot/cycle
+//!
+//!    We model this with cumulative constraints: the sum of ops executing in any cycle
+//!    must not exceed the engine's capacity.
+//!
+//! 3. **Optional scratch memory constraint**: At most `scratch_budget` addresses can be live
+//!    simultaneously (live = written but not yet consumed).
+//!
+//! ## Lower Bound Strengthening
+//!
+//! CP-SAT's cumulative constraint has a weak LP relaxation (the LP doesn't "see" that
+//! ops can't share the same slot). We strengthen bounds explicitly:
+//!
+//! ### Capacity Bounds
+//!
+//! For each engine: `makespan >= ceil(num_ops / capacity)`
+//!
+//! Example: 9838 VALU ops with 6 slots/cycle requires at least ceil(9838/6) = 1640 cycles.
+//! This is often tighter than the critical path bound.
+//!
+//! ### Profile Bounds (Energy-Based)
+//!
+//! For each deadline d, count ops that must complete by d (i.e., ALAP <= d).
+//! These ops require `ceil(count / capacity)` cycles, so:
+//!   - If `ceil(count / capacity) > d + 1`, the schedule is infeasible
+//!   - The tightest such bound across all deadlines is a valid lower bound
+//!
+//! This catches situations where ops are "bunched up" in tight ASAP/ALAP windows.
+//!
+//! ## Objective
+//!
+//! Minimize makespan (total cycles).
+//!
+//! ## Warm Start (Hints)
+//!
+//! We provide the greedy schedule as hints to help CP-SAT find good solutions quickly.
+//! The greedy schedule is feasible, so CP-SAT can start from a known good point and
+//! focus on proving optimality or finding improvements.
 //!
 //! # Build Requirements
 //!
@@ -444,6 +494,131 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         }
     }
 
+    // 6b. Compute capacity-based lower bounds (used when creating makespan)
+    // The cumulative constraint's LP relaxation is weak; we compute tight bounds here
+    let mut capacity_lower_bound = critical_path_len as i64;
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity > 0 && !op_indices.is_empty() {
+            let num_ops = op_indices.len() as i64;
+            // ceil(num_ops / capacity) is a lower bound on makespan
+            let min_cycles = (num_ops + capacity - 1) / capacity;
+            if min_cycles > capacity_lower_bound {
+                if verbose {
+                    eprintln!(
+                        "  Capacity bound: {:?} has {} ops / {} slots = {} min cycles",
+                        engine, num_ops, capacity, min_cycles
+                    );
+                }
+                capacity_lower_bound = min_cycles;
+            }
+        }
+    }
+
+    // 6c. Compute profile-based bounds (mandatory ops in time windows)
+    // For each engine, analyze ASAP/ALAP windows to find tight spots
+    let mut profile_lower_bound = capacity_lower_bound;
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity <= 0 || op_indices.is_empty() {
+            continue;
+        }
+
+        // Collect (asap, alap) for each op on this engine
+        let bounds: Vec<(i64, i64)> = op_indices
+            .iter()
+            .map(|&idx| {
+                let op = &ops[idx];
+                let lb = *asap.get(&op.id).unwrap_or(&0) as i64;
+                let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
+                (lb, ub)
+            })
+            .collect();
+
+        // Find the max ALAP to define the window range
+        let max_alap = bounds.iter().map(|(_, a)| *a).max().unwrap_or(horizon);
+
+        // For each deadline d, count how many ops must complete by cycle d
+        // (i.e., have ALAP <= d). These must fit in (d+1) * capacity slots.
+        // So we need makespan >= ceil(mandatory_count / capacity) for all such deadlines.
+        // Also, ops with ALAP = d contribute "energy" that must finish by d+1.
+        for d in 0..=max_alap.min(horizon) {
+            // Count ops that must complete by cycle d (ALAP <= d)
+            let mandatory_count: i64 = bounds
+                .iter()
+                .filter(|(_, alap_val)| *alap_val <= d)
+                .count() as i64;
+
+            if mandatory_count > 0 {
+                // mandatory_count ops must fit in (d+1) cycles with capacity slots each
+                let available_slots = (d + 1) * capacity;
+                if mandatory_count > available_slots {
+                    // Infeasibility - more ops than slots available by deadline
+                    let needed_cycles = (mandatory_count + capacity - 1) / capacity;
+                    if needed_cycles > profile_lower_bound {
+                        if verbose {
+                            eprintln!(
+                                "  Profile bound: {:?} has {} ops with ALAP <= {} needing {} cycles",
+                                engine, mandatory_count, d, needed_cycles
+                            );
+                        }
+                        profile_lower_bound = needed_cycles;
+                    }
+                }
+            }
+        }
+    }
+
+    // 6d. Compute suffix-based bounds
+    // For each starting cycle t, count ops that must start at or after t (ASAP >= t).
+    // These ops need ceil(count/capacity) more cycles, so makespan >= t + ceil(count/capacity).
+    let mut suffix_lower_bound = profile_lower_bound;
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity <= 0 || op_indices.is_empty() {
+            continue;
+        }
+
+        // Collect ASAP values for ops on this engine
+        let asap_values: Vec<i64> = op_indices
+            .iter()
+            .map(|&idx| {
+                let op = &ops[idx];
+                *asap.get(&op.id).unwrap_or(&0) as i64
+            })
+            .collect();
+
+        let max_asap = asap_values.iter().max().copied().unwrap_or(0);
+
+        // For each possible starting cycle, count suffix ops
+        for t in 0..=max_asap {
+            let suffix_count: i64 = asap_values.iter().filter(|&&a| a >= t).count() as i64;
+            if suffix_count > 0 {
+                // These ops must execute in cycles [t, makespan-1], so:
+                // makespan >= t + ceil(suffix_count / capacity)
+                let required_cycles_after_t = (suffix_count + capacity - 1) / capacity;
+                let min_makespan = t + required_cycles_after_t;
+                if min_makespan > suffix_lower_bound {
+                    if verbose {
+                        eprintln!(
+                            "  Suffix bound: {:?} has {} ops with ASAP >= {} needing {} more cycles = {} total",
+                            engine, suffix_count, t, required_cycles_after_t, min_makespan
+                        );
+                    }
+                    suffix_lower_bound = min_makespan;
+                }
+            }
+        }
+    }
+
+    let computed_lower_bound = suffix_lower_bound;
+    if verbose && computed_lower_bound > critical_path_len as i64 {
+        eprintln!(
+            "  Lower bound improved: critical_path={}, capacity={}, profile={}, suffix={}",
+            critical_path_len, capacity_lower_bound, profile_lower_bound, suffix_lower_bound
+        );
+    }
+
     // 7. Optional: Add scratch budget constraint
     if scratch_budget > 0 {
         let live_intervals = compute_live_intervals(ops);
@@ -495,11 +670,12 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
     }
 
     // 9. Create makespan variable and minimize it
-    // Use tighter bounds: greedy hint provides good upper bound
+    // Use tight bounds: computed_lower_bound from capacity/profile analysis,
+    // greedy hint provides good upper bound
     let greedy_ub = greedy_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) as i64 + 1)
         .unwrap_or(horizon);
-    let makespan = model.new_int_var([(critical_path_len as i64, greedy_ub)]);
+    let makespan = model.new_int_var([(computed_lower_bound, greedy_ub)]);
     for &cv in &cycle_vars {
         model.add_le(cv, LinearExpr::from(makespan) - 1);
     }
@@ -541,8 +717,8 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
 
-    // Disable LP - it's not helping for this problem structure
-    params.linearization_level = Some(0);
+    // Let CP-SAT use its default LP behavior (linearization_level=1)
+    // LP relaxation helps with bounds and reduced-cost fixing for scheduling
 
     // Stop early if we find a good solution (within 2% of greedy)
     params.relative_gap_limit = Some(0.02);
