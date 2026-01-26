@@ -2124,3 +2124,101 @@ pub fn schedule_cpsat<'py>(
 pub fn cpsat_available() -> bool {
     crate::cpsat_scheduler::cpsat_available()
 }
+
+// =============================================================================
+// SSA Kernel Building Functions
+// =============================================================================
+
+use crate::kernel_builder::SsaTickTockKernelBuilder;
+
+/// Build a tick-tock kernel using SSA-based emission.
+///
+/// This builder uses virtual registers (VRegs) instead of pre-allocated
+/// addresses, eliminating false WAW/WAR dependencies for better scheduling.
+///
+/// Returns a tuple (instructions, stats_dict) where:
+/// - instructions: List of scheduled instruction dicts
+/// - stats_dict: Dictionary with keys:
+///   - cycles: Total scheduled cycles
+///   - vreg_count: Number of virtual registers used
+///   - peak_live: Peak simultaneous live words
+///   - max_addr: Highest scratch address used
+///   - budget_exceeded: Whether scratch budget was exceeded
+///
+/// If verbose is true, prints progress information.
+#[pyfunction]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, verbose=false))]
+pub fn build_tick_tock_kernel_ssa<'py>(
+    py: Python<'py>,
+    forest_height: usize,
+    n_nodes: usize,
+    batch_size: usize,
+    rounds: usize,
+    verbose: bool,
+) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+    let config = KernelConfig {
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift: false, // SSA uses internal scheduler
+        enable_debug: false,
+        enable_lazy_partition: false,
+        partition_frequency: 3,
+        enable_pseudo_consts: false,
+        enable_add_imm: true,
+        enable_const_load: true,
+        enable_const_alu: true,
+        max_alu_depth: None,
+        enable_tree_reduce_depth3: false,
+    };
+
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+
+    if verbose {
+        println!("Building SSA kernel...");
+    }
+
+    let result = builder.build_and_schedule().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
+    })?;
+
+    if verbose {
+        println!(
+            "SSA kernel: {} cycles, {} ops, {} VRegs, peak_live={}, max_addr={}",
+            result.cycles,
+            result.ops.len(),
+            result.vreg_count,
+            result.address_result.peak_live,
+            result.address_result.max_addr
+        );
+    }
+
+    // Emit scheduled ops
+    let scheduled = emit_scheduled(py, &result.ops, result.cycles)?;
+
+    // Build final list with pause wrappers
+    let instrs = PyList::empty(py);
+    let pause_dict = PyDict::new(py);
+    pause_dict.set_item(
+        "flow",
+        PyList::new(py, &[PyTuple::new(py, &["pause".into_pyobject(py).unwrap().into_any()])?])?,
+    )?;
+    instrs.append(&pause_dict)?;
+
+    for item in scheduled.iter() {
+        instrs.append(item)?;
+    }
+
+    instrs.append(&pause_dict)?;
+
+    // Build stats dict
+    let stats = PyDict::new(py);
+    stats.set_item("cycles", result.cycles)?;
+    stats.set_item("vreg_count", result.vreg_count)?;
+    stats.set_item("peak_live", result.address_result.peak_live)?;
+    stats.set_item("max_addr", result.address_result.max_addr)?;
+    stats.set_item("budget_exceeded", result.address_result.budget_exceeded)?;
+
+    Ok((instrs, stats))
+}

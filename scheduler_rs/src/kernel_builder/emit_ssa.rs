@@ -324,10 +324,10 @@ impl SsaEmitContext {
         dest
     }
 
-    /// Emit vector load (gather): result[0..8] = mem[addr[0..8]]
-    /// Each element of addr VReg holds an address to load from.
+    /// Emit vector load (contiguous): result[0..8] = mem[addr..addr+8]
+    /// The addr VReg is a scalar holding the base address.
     pub fn emit_vload(&mut self, addr: VReg) -> VReg {
-        assert!(addr.is_vector(), "vload addr must be vector");
+        assert!(addr.is_scalar(), "vload addr must be scalar");
 
         let dest = self.fresh_vector();
         let op = SsaOp::new(
@@ -336,6 +336,20 @@ impl SsaEmitContext {
             Opcode::Vload,
             Some(dest),
             vec![Operand::VReg(addr)],
+        );
+        self.emit(op);
+        dest
+    }
+
+    /// Emit vector load from immediate address: result[0..8] = mem[addr..addr+8]
+    pub fn emit_vload_imm(&mut self, addr: i64) -> VReg {
+        let dest = self.fresh_vector();
+        let op = SsaOp::new(
+            0,
+            Engine::Load,
+            Opcode::Vload,
+            Some(dest),
+            vec![Operand::Imm(addr)],
         );
         self.emit(op);
         dest
@@ -375,9 +389,10 @@ impl SsaEmitContext {
         self.emit(op);
     }
 
-    /// Emit vector store (scatter): mem[addr[0..8]] = src[0..8]
+    /// Emit vector store (contiguous): mem[addr..addr+8] = src[0..8]
+    /// The addr VReg is a scalar holding the base address.
     pub fn emit_vstore(&mut self, addr: VReg, src: VReg) {
-        assert!(addr.is_vector(), "vstore addr must be vector");
+        assert!(addr.is_scalar(), "vstore addr must be scalar");
         assert!(src.is_vector(), "vstore src must be vector");
 
         let op = SsaOp::new(
@@ -386,6 +401,20 @@ impl SsaEmitContext {
             Opcode::Vstore,
             None,
             vec![Operand::VReg(addr), Operand::VReg(src)],
+        );
+        self.emit(op);
+    }
+
+    /// Emit vector store to immediate address: mem[addr..addr+8] = src[0..8]
+    pub fn emit_vstore_imm(&mut self, addr: i64, src: VReg) {
+        assert!(src.is_vector(), "vstore src must be vector");
+
+        let op = SsaOp::new(
+            0,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::Imm(addr), Operand::VReg(src)],
         );
         self.emit(op);
     }

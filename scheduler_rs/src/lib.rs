@@ -53,5 +53,7 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CP-SAT scheduler functions
     m.add_function(wrap_pyfunction!(python::schedule_cpsat, m)?)?;
     m.add_function(wrap_pyfunction!(python::cpsat_available, m)?)?;
+    // SSA kernel building functions
+    m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ssa, m)?)?;
     Ok(())
 }
