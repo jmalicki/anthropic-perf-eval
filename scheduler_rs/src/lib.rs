@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 
 pub mod allocator;
 pub mod constants;
+pub mod cpsat_scheduler;
 pub mod diagnostics;
 pub mod kernel_builder;
 pub mod peephole;
@@ -46,5 +47,8 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Kernel building functions
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel, m)?)?;
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ops, m)?)?;
+    // CP-SAT scheduler functions
+    m.add_function(wrap_pyfunction!(python::schedule_cpsat, m)?)?;
+    m.add_function(wrap_pyfunction!(python::cpsat_available, m)?)?;
     Ok(())
 }

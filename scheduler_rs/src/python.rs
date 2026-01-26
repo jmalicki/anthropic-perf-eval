@@ -9,8 +9,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::allocator::{allocate_registers, rewrite_addresses, AllocationResult};
 use crate::constants::{
-    analyze_constant_usage, build_constant_plan, build_constant_plan_with_depth,
-    emit_constant_generation_ops, print_constant_plan_summary,
+    analyze_constant_usage, build_constant_plan, emit_constant_generation_ops,
+    print_constant_plan_summary,
 };
 use crate::peephole::{optimize as peephole_optimize, PeepholeConfig};
 use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
@@ -1980,4 +1980,121 @@ pub fn build_tick_tock_kernel_ops(
     }
 
     Ok(best_cycles)
+}
+
+// =============================================================================
+// CP-SAT Scheduler Functions
+// =============================================================================
+
+/// Schedule operations using CP-SAT constraint programming solver.
+///
+/// This function provides optimal scheduling using Google's CP-SAT solver.
+/// It models the problem with cycle variables, precedence constraints from
+/// dependencies, and cumulative constraints for engine slot limits.
+///
+/// Arguments:
+///   instrs: List of instruction bundles (same format as schedule_multipass)
+///   scratch_budget: Maximum scratch memory addresses (0 = no constraint)
+///   time_limit_secs: Maximum solving time in seconds
+///   use_greedy_hint: If true, use greedy scheduler result as starting hint
+///   verbose: Print solver progress
+///
+/// Returns:
+///   A tuple (scheduled_instrs, result_dict) where result_dict contains:
+///   - makespan: Total cycles
+///   - status: "optimal", "feasible", "infeasible", or "unknown"
+///   - solve_time_secs: Time spent solving
+///   - gap: Optimality gap (0.0 = optimal)
+///
+/// Build requirements:
+///   Compile with `--features cpsat` and set environment:
+///   ORTOOLS_PREFIX=$(brew --prefix or-tools) RUSTFLAGS='-Clink-arg=-lprotobuf'
+#[pyfunction]
+#[pyo3(signature = (instrs, scratch_budget=0, time_limit_secs=60.0, use_greedy_hint=true, verbose=false))]
+pub fn schedule_cpsat<'py>(
+    py: Python<'py>,
+    instrs: &Bound<'py, PyList>,
+    scratch_budget: usize,
+    time_limit_secs: f64,
+    use_greedy_hint: bool,
+    verbose: bool,
+) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+    use crate::cpsat_scheduler;
+
+    let mut ops = parse_ops(py, instrs)?;
+
+    if ops.is_empty() {
+        let empty_result = PyDict::new(py);
+        empty_result.set_item("makespan", 0)?;
+        empty_result.set_item("status", "optimal")?;
+        empty_result.set_item("solve_time_secs", 0.0)?;
+        empty_result.set_item("gap", 0.0)?;
+        return Ok((PyList::empty(py), empty_result));
+    }
+
+    compute_dependencies(&mut ops);
+
+    // Get greedy hints if requested
+    let greedy_hints: Option<Vec<i32>> = if use_greedy_hint {
+        let critical_path = compute_critical_path(&ops);
+        let mut hint_ops = ops.clone();
+        schedule_greedy(
+            &mut hint_ops,
+            &critical_path,
+            true, // enable_valu_shift
+            PriorityMode::CriticalPath,
+        );
+        Some(hint_ops.iter().map(|op| op.cycle).collect())
+    } else {
+        None
+    };
+
+    // Run CP-SAT scheduler
+    let result = cpsat_scheduler::schedule_cpsat(
+        &ops,
+        scratch_budget,
+        time_limit_secs,
+        greedy_hints.as_deref(),
+        verbose,
+    );
+
+    let result_dict = PyDict::new(py);
+
+    match result {
+        Some(cpsat_result) => {
+            // Apply cycle assignments
+            for (idx, &cycle) in cpsat_result.cycle_assignments.iter().enumerate() {
+                if idx < ops.len() {
+                    ops[idx].cycle = cycle;
+                }
+            }
+
+            let status_str = cpsat_result.status.to_string();
+
+            result_dict.set_item("makespan", cpsat_result.makespan)?;
+            result_dict.set_item("status", status_str)?;
+            result_dict.set_item("solve_time_secs", cpsat_result.solve_time_secs)?;
+            result_dict.set_item("gap", cpsat_result.gap)?;
+
+            let scheduled = emit_scheduled(py, &ops, cpsat_result.makespan)?;
+            Ok((scheduled, result_dict))
+        }
+        None => {
+            result_dict.set_item("makespan", 0)?;
+            result_dict.set_item("status", "error")?;
+            result_dict.set_item("solve_time_secs", 0.0)?;
+            result_dict.set_item("gap", 1.0)?;
+            result_dict.set_item(
+                "error",
+                "CP-SAT scheduler failed. Ensure --features cpsat is enabled.",
+            )?;
+            Ok((PyList::empty(py), result_dict))
+        }
+    }
+}
+
+/// Check if CP-SAT scheduler is available (compiled with --features cpsat)
+#[pyfunction]
+pub fn cpsat_available() -> bool {
+    crate::cpsat_scheduler::cpsat_available()
 }
