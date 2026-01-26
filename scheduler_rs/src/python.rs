@@ -1577,6 +1577,7 @@ pub fn build_tick_tock_kernel<'py>(
         enable_const_load,
         enable_const_alu,
         max_alu_depth,
+        enable_tree_reduce_depth3: false, // Disabled - exceeds scratch budget
     };
 
     // Build the kernel (generates unscheduled ops)
@@ -1847,6 +1848,7 @@ pub fn build_tick_tock_kernel_ops(
         enable_const_load,
         enable_const_alu,
         max_alu_depth,
+        enable_tree_reduce_depth3: false, // Disabled - exceeds scratch budget
     };
 
     // Build the kernel (generates unscheduled ops)

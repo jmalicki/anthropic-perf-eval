@@ -309,6 +309,21 @@ impl TickTockKernelBuilder {
                 ctx.v_const_r3[i] = alloc.vec(&format!("v_const_r3_{}", i));
             }
             // c_r3[i] will alias to c[7+i] in emit_valu_selection_init - no separate allocation needed
+
+            // Tree-reduce deltas for depth 3 - only allocate if enabled
+            // This uses 36 additional words (4 scalars + 4 vectors) but saves 1 op per group.
+            // DISABLED BY DEFAULT because it exceeds the 1536 word scratch budget.
+            if self.config.enable_tree_reduce_depth3 {
+                ctx.td_r3_01 = alloc.alloc("td_r3_01", 1);
+                ctx.td_r3_23 = alloc.alloc("td_r3_23", 1);
+                ctx.td_r3_45 = alloc.alloc("td_r3_45", 1);
+                ctx.td_r3_67 = alloc.alloc("td_r3_67", 1);
+
+                ctx.v_td_r3_01 = alloc.vec("v_td_r3_01");
+                ctx.v_td_r3_23 = alloc.vec("v_td_r3_23");
+                ctx.v_td_r3_45 = alloc.vec("v_td_r3_45");
+                ctx.v_td_r3_67 = alloc.vec("v_td_r3_67");
+            }
         }
 
         // NOTE: Parallel selection optimization for depths 3 and 4 was explored but
@@ -609,6 +624,16 @@ impl TickTockKernelBuilder {
             self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.tc_r3_addr[i]);
         }
 
+        // Compute tree-reduce deltas for depth 3 (only if tree-reduce enabled)
+        // d01 = tree[8] - tree[7], d23 = tree[10] - tree[9], etc.
+        // tc_r3[0] = tree[7], tc_r3[1] = tree[8], tc_r3[2] = tree[9], ...
+        if self.config.enable_tree_reduce_depth3 {
+            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_01, self.ctx.tc_r3[1], self.ctx.tc_r3[0]);
+            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_23, self.ctx.tc_r3[3], self.ctx.tc_r3[2]);
+            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_45, self.ctx.tc_r3[5], self.ctx.tc_r3[4]);
+            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_67, self.ctx.tc_r3[7], self.ctx.tc_r3[6]);
+        }
+
         // NOTE: Broadcasts are deferred to ensure_depth3_broadcasts() which is called
         // lazily from emit_depth3_access(). This avoids emitting broadcasts if depth 3
         // is never actually used (e.g., early termination).
@@ -627,7 +652,8 @@ impl TickTockKernelBuilder {
         }
         self.depth3_broadcasts_initialized = true;
 
-        // Broadcast tree values for depth 3
+        // Broadcast tree values for depth 3 (only even indices needed for tree-reduce base values)
+        // v_tc_r3[0], [2], [4], [6] are the bases for FMA at level 0
         for i in 0..8 {
             self.ctx.v_tc_r3[i] =
                 self.emit.emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
@@ -637,6 +663,18 @@ impl TickTockKernelBuilder {
         for i in 0..8 {
             self.ctx.v_const_r3[i] =
                 self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
+        }
+
+        // Broadcast tree-reduce deltas (only if tree-reduce enabled)
+        if self.config.enable_tree_reduce_depth3 {
+            self.ctx.v_td_r3_01 =
+                self.emit.emit_vbroadcast(self.ctx.v_td_r3_01, self.ctx.td_r3_01);
+            self.ctx.v_td_r3_23 =
+                self.emit.emit_vbroadcast(self.ctx.v_td_r3_23, self.ctx.td_r3_23);
+            self.ctx.v_td_r3_45 =
+                self.emit.emit_vbroadcast(self.ctx.v_td_r3_45, self.ctx.td_r3_45);
+            self.ctx.v_td_r3_67 =
+                self.emit.emit_vbroadcast(self.ctx.v_td_r3_67, self.ctx.td_r3_67);
         }
     }
 
@@ -839,26 +877,93 @@ impl TickTockKernelBuilder {
 
         let ctx = &self.ctx;
 
-        // Depth 3: Compare/select from preloaded tree[7..14]
-        // For 8 possible index values, only ONE comparison will be true (exact match).
-        // We use: first iteration with Mul to initialize, then FMA to accumulate.
-        // This avoids the useless `* v_0 v_0` zero-initialization.
-        //
-        // Old approach: 1 zero-init + 8*(eq + fma) = 17 ops
-        // New approach: (eq + mul) + 7*(eq + fma) = 16 ops, no wasted zero-init
-        for it in 0..n_iters {
-            let base_g = it * UNROLL;
-            for i in 0..UNROLL {
-                let t = ctx.v_t[it][i];
+        if self.config.enable_tree_reduce_depth3 {
+            // Tree-reduce approach for 8-way selection (15 VALU ops vs 16)
+            //
+            // Indices 7-14 -> idx_adj = idx - 7 gives 0-7 (3 bits)
+            //
+            // Tree-reduce structure:
+            //   Level 0: 4 FMAs for leaf pairs using bit0
+            //   Level 1: 2 SUB + 2 FMA combining pairs using bit1
+            //   Level 2: 1 SUB + 1 FMA for final result using bit2
+            //
+            // Register allocation per group:
+            //   t = v_t[it][i] - general temp
+            //   nv = v_nv[it][i] - result (also used for p01, then q03)
+            //   s1 = v_tc_r3[1] - scratch (bit0, then p67)
+            //   s2 = v_tc_r3[3] - scratch (bit1)
+            //   s3 = v_tc_r3[5] - scratch (bit2)
+            //   s4 = v_tc_r3[7] - scratch (p45, then q47)
+            //
+            // Note: We use v_tc_r3[1,3,5,7] as scratch because tree-reduce only needs
+            // the EVEN indexed tree values (v_tc_r3[0,2,4,6]) as bases for level 0 FMAs.
+            // The odd-indexed values are implicit in the pre-computed deltas.
 
-                // First iteration: initialize result with t * tree_value (no zero-init needed)
-                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[0]);
-                self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], t, ctx.v_tc_r3[0]);
+            // Scratch register aliases
+            let s1 = ctx.v_tc_r3[1]; // bit0, then p67
+            let s2 = ctx.v_tc_r3[3]; // bit1
+            let s3 = ctx.v_tc_r3[5]; // bit2
+            let s4 = ctx.v_tc_r3[7]; // p45, then q47
 
-                // Remaining iterations: FMA to accumulate
-                for ti in 1..8 {
-                    self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[ti]);
-                    self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_tc_r3[ti], ctx.v_nv[it][i]);
+            for it in 0..n_iters {
+                let base_g = it * UNROLL;
+                for i in 0..UNROLL {
+                    let t = ctx.v_t[it][i];
+                    let nv = ctx.v_nv[it][i];
+                    let idx = ctx.all_idx[base_g + i];
+
+                    // === Bit extraction (5 VALU ops) ===
+                    // idx_adj = idx - 7 gives 0-7 for indices 7-14
+                    self.emit.emit_valu(Opcode::Sub, t, idx, ctx.v_const[7]); // idx_adj
+                    self.emit.emit_valu(Opcode::And, s1, t, ctx.v_1);         // bit0
+                    self.emit.emit_valu(Opcode::Shr, t, t, ctx.v_1);          // idx_adj >> 1
+                    self.emit.emit_valu(Opcode::And, s2, t, ctx.v_1);         // bit1
+                    self.emit.emit_valu(Opcode::Shr, s3, t, ctx.v_1);         // bit2
+
+                    // === Level 0: 4 FMAs for leaf pairs (4 VALU ops) ===
+                    // p01 = bit0 * d01 + tree[7]
+                    // p23 = bit0 * d23 + tree[9]
+                    // p45 = bit0 * d45 + tree[11]
+                    // p67 = bit0 * d67 + tree[13]
+                    self.emit.emit_fma(nv, s1, ctx.v_td_r3_01, ctx.v_tc_r3[0]); // p01 in nv
+                    self.emit.emit_fma(t, s1, ctx.v_td_r3_23, ctx.v_tc_r3[2]);  // p23 in t
+                    self.emit.emit_fma(s4, s1, ctx.v_td_r3_45, ctx.v_tc_r3[4]); // p45 in s4
+                    self.emit.emit_fma(s1, s1, ctx.v_td_r3_67, ctx.v_tc_r3[6]); // p67 in s1 (reuse)
+
+                    // === Level 1: Combine pairs (4 VALU ops: 2 SUB + 2 FMA) ===
+                    // q03 = bit1 * (p23 - p01) + p01
+                    // q47 = bit1 * (p67 - p45) + p45
+                    self.emit.emit_valu(Opcode::Sub, t, t, nv);     // dp03 = p23 - p01
+                    self.emit.emit_fma(nv, s2, t, nv);              // q03 = bit1 * dp03 + p01
+                    self.emit.emit_valu(Opcode::Sub, t, s1, s4);    // dp47 = p67 - p45
+                    self.emit.emit_fma(s4, s2, t, s4);              // q47 = bit1 * dp47 + p45
+
+                    // === Level 2: Final result (2 VALU ops: 1 SUB + 1 FMA) ===
+                    // result = bit2 * (q47 - q03) + q03
+                    self.emit.emit_valu(Opcode::Sub, t, s4, nv);    // d_final = q47 - q03
+                    self.emit.emit_fma(nv, s3, t, nv);              // result = bit2 * d_final + q03
+                }
+            }
+        } else {
+            // Original serialized FMA approach (16 VALU ops)
+            // Compare/select from preloaded tree[7..14]
+            // For 8 possible index values, only ONE comparison will be true (exact match).
+            // We use: first iteration with Mul to initialize, then FMA to accumulate.
+            // This avoids the useless `* v_0 v_0` zero-initialization.
+            for it in 0..n_iters {
+                let base_g = it * UNROLL;
+                for i in 0..UNROLL {
+                    let t = ctx.v_t[it][i];
+
+                    // First iteration: initialize result with t * tree_value (no zero-init needed)
+                    self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[0]);
+                    self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], t, ctx.v_tc_r3[0]);
+
+                    // Remaining iterations: FMA to accumulate
+                    for ti in 1..8 {
+                        self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[ti]);
+                        self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_tc_r3[ti], ctx.v_nv[it][i]);
+                    }
                 }
             }
         }

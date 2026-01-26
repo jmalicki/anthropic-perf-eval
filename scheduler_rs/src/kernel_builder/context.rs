@@ -100,6 +100,21 @@ pub struct ScratchContext {
     pub v_const_r3: [i64; 8], // Vector broadcasts of c_r3
 
     // =========================================================================
+    // Depth 3 Tree-Reduce Deltas
+    // =========================================================================
+    // Scalar deltas: d01 = tree[8]-tree[7], d23 = tree[10]-tree[9], etc.
+    pub td_r3_01: i64,  // tree[8] - tree[7]
+    pub td_r3_23: i64,  // tree[10] - tree[9]
+    pub td_r3_45: i64,  // tree[12] - tree[11]
+    pub td_r3_67: i64,  // tree[14] - tree[13]
+
+    // Vector broadcasts of tree-reduce deltas
+    pub v_td_r3_01: i64,
+    pub v_td_r3_23: i64,
+    pub v_td_r3_45: i64,
+    pub v_td_r3_67: i64,
+
+    // =========================================================================
     // Stage 5 XOR Vector
     // =========================================================================
     pub v_stage5_xor: i64,
@@ -221,6 +236,16 @@ impl Default for ScratchContext {
 
             v_tc_r3: [0; 8],
             v_const_r3: [0; 8],
+
+            td_r3_01: 0,
+            td_r3_23: 0,
+            td_r3_45: 0,
+            td_r3_67: 0,
+
+            v_td_r3_01: 0,
+            v_td_r3_23: 0,
+            v_td_r3_45: 0,
+            v_td_r3_67: 0,
 
             v_stage5_xor: 0,
 

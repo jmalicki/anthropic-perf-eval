@@ -66,6 +66,13 @@ pub struct KernelConfig {
     /// Values requiring deeper derivation chains will use Load/AddImm instead.
     /// None means unlimited (default). Recommended: 4-6 to prevent long critical paths.
     pub max_alu_depth: Option<usize>,
+
+    /// Enable tree-reduce approach for depth 3 selects.
+    /// This saves 1 VALU op per group (15 vs 16 ops) but uses 36 additional
+    /// words of scratch (4 scalars + 4 vectors for delta broadcasts).
+    /// DISABLED BY DEFAULT because it exceeds the 1536 word scratch budget.
+    /// Enable only if other optimizations free up sufficient scratch space.
+    pub enable_tree_reduce_depth3: bool,
 }
 
 impl Default for KernelConfig {
@@ -85,6 +92,8 @@ impl Default for KernelConfig {
             enable_const_load: true,
             enable_const_alu: true,
             max_alu_depth: None, // No limit by default
+            // Tree-reduce disabled by default (exceeds scratch budget)
+            enable_tree_reduce_depth3: false,
         }
     }
 }
