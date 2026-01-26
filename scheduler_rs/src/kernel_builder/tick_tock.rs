@@ -35,17 +35,29 @@ pub struct TickTockKernelBuilder {
     pub alloc: ScratchAllocator,
     /// Emission context
     pub emit: EmitContext,
+    /// Whether depth 3 broadcasts have been initialized (lazy init)
+    depth3_broadcasts_initialized: bool,
+    /// Whether any round will use depth 3 (pre-computed)
+    uses_depth3: bool,
 }
 
 impl TickTockKernelBuilder {
     /// Create a new kernel builder with the given configuration
     pub fn new(config: KernelConfig) -> Self {
         let encoding_flags = config.encoding_flags();
+        // Pre-compute whether any round will use depth 3
+        let tree_height = config.forest_height;
+        let uses_depth3 = (0..config.rounds).any(|r| {
+            let tree_depth = r % tree_height;
+            tree_depth == 3
+        });
         TickTockKernelBuilder {
             config,
             ctx: ScratchContext::default(),
             alloc: ScratchAllocator::default(),
             emit: EmitContext::new_with_flags(encoding_flags),
+            depth3_broadcasts_initialized: false,
+            uses_depth3,
         }
     }
 
@@ -257,12 +269,22 @@ impl TickTockKernelBuilder {
 
             // Reuse existing vectors - v_tc_r3 are only for depth 3
             // At depths 4+, they're free to reuse
-            ctx.v_cache_base = ctx.v_tc_r3[0];
-            ctx.v_tree_temp = ctx.v_tc_r3[1];
-            ctx.v_part_temp[0] = ctx.v_tc_r3[2];
-            ctx.v_part_temp[1] = ctx.v_tc_r3[3];
-            ctx.v_part_temp[2] = ctx.v_tc_r3[4];
-            ctx.v_part_temp[3] = ctx.v_tc_r3[5];
+            // But only if depth 3 vectors were actually allocated!
+            if self.uses_depth3 {
+                ctx.v_cache_base = ctx.v_tc_r3[0];
+                ctx.v_tree_temp = ctx.v_tc_r3[1];
+                ctx.v_part_temp[0] = ctx.v_tc_r3[2];
+                ctx.v_part_temp[1] = ctx.v_tc_r3[3];
+                ctx.v_part_temp[2] = ctx.v_tc_r3[4];
+                ctx.v_part_temp[3] = ctx.v_tc_r3[5];
+            } else {
+                // Allocate fresh vectors if depth 3 wasn't allocated
+                ctx.v_cache_base = alloc.vec("v_cache_base");
+                ctx.v_tree_temp = alloc.vec("v_tree_temp");
+                for i in 0..4 {
+                    ctx.v_part_temp[i] = alloc.vec(&format!("v_part_temp_{}", i));
+                }
+            }
         }
     }
 
@@ -270,22 +292,23 @@ impl TickTockKernelBuilder {
         let alloc = &mut self.alloc;
         let ctx = &mut self.ctx;
 
-        // Depth 3 cache
-        for i in 0..8 {
-            ctx.tc_r3[i] = alloc.alloc(&format!("tc_r3_{}", i), 1);
-        }
-        // Depth 3 address registers for parallel computation
-        for i in 0..8 {
-            ctx.tc_r3_addr[i] = alloc.alloc(&format!("tc_r3_addr_{}", i), 1);
-        }
-        for i in 0..8 {
-            ctx.v_tc_r3[i] = alloc.vec(&format!("v_tc_r3_{}", i));
-        }
-        for i in 0..8 {
-            ctx.v_const_r3[i] = alloc.vec(&format!("v_const_r3_{}", i));
-        }
-        for i in 0..8 {
-            ctx.c_r3[i] = alloc.alloc(&format!("c_r3_{}", i), 1);
+        // Depth 3 cache - only allocate if depth 3 will be used
+        // This saves 128 words of scratch when depth 3 is never used.
+        if self.uses_depth3 {
+            for i in 0..8 {
+                ctx.tc_r3[i] = alloc.alloc(&format!("tc_r3_{}", i), 1);
+            }
+            // Depth 3 address registers for parallel computation
+            for i in 0..8 {
+                ctx.tc_r3_addr[i] = alloc.alloc(&format!("tc_r3_addr_{}", i), 1);
+            }
+            for i in 0..8 {
+                ctx.v_tc_r3[i] = alloc.vec(&format!("v_tc_r3_{}", i));
+            }
+            for i in 0..8 {
+                ctx.v_const_r3[i] = alloc.vec(&format!("v_const_r3_{}", i));
+            }
+            // c_r3[i] will alias to c[7+i] in emit_valu_selection_init - no separate allocation needed
         }
 
         // NOTE: Parallel selection optimization for depths 3 and 4 was explored but
@@ -564,6 +587,12 @@ impl TickTockKernelBuilder {
     }
 
     fn emit_valu_selection_init(&mut self) {
+        // Skip depth 3 initialization if it won't be used
+        // Broadcasts will be done lazily in ensure_depth3_broadcasts()
+        if !self.uses_depth3 {
+            return;
+        }
+
         // Reuse c[7..14] which we derived via ALU (no additional loads needed!)
         // c_r3[i] aliases to c[7+i] for broadcast sources
         for i in 0..8 {
@@ -580,7 +609,25 @@ impl TickTockKernelBuilder {
             self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.tc_r3_addr[i]);
         }
 
-        // Broadcast tree values
+        // NOTE: Broadcasts are deferred to ensure_depth3_broadcasts() which is called
+        // lazily from emit_depth3_access(). This avoids emitting broadcasts if depth 3
+        // is never actually used (e.g., early termination).
+
+        // Depth 4 cache initialization DISABLED - see allocate_valu_selection() for details.
+        // The 16-way cached selection would exceed the scratch budget.
+    }
+
+    /// Ensure depth 3 broadcasts are initialized.
+    ///
+    /// This is called lazily from emit_depth3_access() to avoid emitting broadcasts
+    /// for depth 3 values if depth 3 is never actually used.
+    fn ensure_depth3_broadcasts(&mut self) {
+        if self.depth3_broadcasts_initialized {
+            return;
+        }
+        self.depth3_broadcasts_initialized = true;
+
+        // Broadcast tree values for depth 3
         for i in 0..8 {
             self.ctx.v_tc_r3[i] =
                 self.emit.emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
@@ -591,9 +638,6 @@ impl TickTockKernelBuilder {
             self.ctx.v_const_r3[i] =
                 self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
         }
-
-        // Depth 4 cache initialization DISABLED - see allocate_valu_selection() for details.
-        // The 16-way cached selection would exceed the scratch budget.
     }
 
     fn emit_partition_init(&mut self) {
@@ -790,6 +834,9 @@ impl TickTockKernelBuilder {
     }
 
     fn emit_depth3_access(&mut self, n_iters: usize) {
+        // Ensure depth 3 broadcasts are initialized (lazy init)
+        self.ensure_depth3_broadcasts();
+
         let ctx = &self.ctx;
 
         // Depth 3: Compare/select from preloaded tree[7..14]

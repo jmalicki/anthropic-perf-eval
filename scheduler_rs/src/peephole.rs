@@ -20,6 +20,8 @@ pub struct PeepholeStats {
     pub algebraic_simplified: usize,
     /// Operations eliminated by zero-op optimization
     pub zero_ops_eliminated: usize,
+    /// Operations eliminated by dead code elimination
+    pub dce_eliminated: usize,
     /// Reads remapped to use ZERO_REG
     pub reads_remapped_to_zero: usize,
     /// Total operations eliminated
@@ -35,6 +37,8 @@ pub struct PeepholeConfig {
     pub enable_algebraic: bool,
     /// Enable zero register optimization
     pub enable_zero_opt: bool,
+    /// Enable dead code elimination
+    pub enable_dce: bool,
     /// The zero register address (default: 0)
     pub zero_reg: i64,
 }
@@ -42,9 +46,19 @@ pub struct PeepholeConfig {
 impl Default for PeepholeConfig {
     fn default() -> Self {
         PeepholeConfig {
-            enable_cse: true,
-            enable_algebraic: true,
-            enable_zero_opt: true,
+            // CSE is DISABLED by default because it doesn't track value versions.
+            // It incorrectly treats ops with same operand addresses as duplicates
+            // even when the values at those addresses have changed.
+            // TODO: Implement proper value versioning to enable safe CSE.
+            enable_cse: false,
+            enable_algebraic: false,
+            enable_zero_opt: false,
+            // DCE is DISABLED by default because it breaks correctness.
+            // The current implementation doesn't properly track which ops are needed
+            // for final output (stores to external memory). It eliminates ops that
+            // are part of the computation chain leading to those stores.
+            // TODO: Implement proper liveness analysis that respects store operations.
+            enable_dce: false,
             zero_reg: 0, // ZERO_REG
         }
     }
@@ -78,8 +92,14 @@ pub fn optimize(ops: &mut Vec<Op>, config: &PeepholeConfig) -> PeepholeStats {
         stats.cse_eliminated = eliminate_cse(ops);
     }
 
+    // Phase 4: Dead Code Elimination
+    // Run this last since other optimizations may create dead code
+    if config.enable_dce {
+        stats.dce_eliminated = eliminate_dead_code(ops);
+    }
+
     stats.total_eliminated =
-        stats.cse_eliminated + stats.algebraic_simplified + stats.zero_ops_eliminated;
+        stats.cse_eliminated + stats.algebraic_simplified + stats.zero_ops_eliminated + stats.dce_eliminated;
 
     stats
 }
@@ -458,6 +478,83 @@ fn eliminate_cse(ops: &mut Vec<Op>) -> usize {
     ops.retain(|op| !to_eliminate.contains(&op.id));
 
     eliminated
+}
+
+/// Eliminate dead code - operations whose results are never read.
+///
+/// An operation is dead if ALL of its writes are never read by any subsequent operation.
+/// This includes stores to memory that are never loaded.
+///
+/// DCE runs iteratively since removing dead ops may make other ops dead
+/// (e.g., if op A writes to X, op B reads X and writes Y, and Y is never read,
+/// removing B makes A dead too).
+///
+/// Returns total number of ops eliminated.
+fn eliminate_dead_code(ops: &mut Vec<Op>) -> usize {
+    let mut total_eliminated = 0usize;
+
+    // Debug: check op 42's reads
+    for op in ops.iter() {
+        if op.id == 42 {
+            println!("DEBUG op 42: slot={:?}, reads={:?}, writes={:?}", op.slot, op.reads, op.writes);
+        }
+        if op.id == 22 {
+            println!("DEBUG op 22: slot={:?}, reads={:?}, writes={:?}", op.slot, op.reads, op.writes);
+        }
+    }
+
+    // Iterate until no more dead code is found
+    loop {
+        // Collect all addresses that are read by ANY op
+        let mut all_reads: HashSet<i64> = HashSet::new();
+        for op in ops.iter() {
+            all_reads.extend(&op.reads);
+        }
+
+        // Find ops where ALL writes are never read
+        let mut to_eliminate: HashSet<usize> = HashSet::new();
+
+        for op in ops.iter() {
+            // Skip ops with no writes (e.g., flow control without dest)
+            if op.writes.is_empty() {
+                continue;
+            }
+
+            // Skip store operations - they have external side effects
+            if op.engine == Engine::Store {
+                continue;
+            }
+
+            // Skip flow operations - they may have control flow effects
+            if op.engine == Engine::Flow {
+                continue;
+            }
+
+            // Check if ANY write is read by another op
+            let has_live_write = op.writes.iter().any(|w| all_reads.contains(w));
+
+            if !has_live_write {
+                // All writes are dead - this op can be eliminated
+                to_eliminate.insert(op.id);
+            }
+        }
+
+        if to_eliminate.is_empty() {
+            break;
+        }
+
+        // Debug: print what we're eliminating
+        for op in ops.iter() {
+            if to_eliminate.contains(&op.id) {
+                println!("DCE: eliminating op {} {:?}", op.id, op.slot);
+            }
+        }
+
+        total_eliminated += to_eliminate.len();
+        ops.retain(|op| !to_eliminate.contains(&op.id));
+    }
+
+    total_eliminated
 }
 
 #[cfg(test)]

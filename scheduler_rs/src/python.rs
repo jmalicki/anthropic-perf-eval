@@ -1569,11 +1569,12 @@ pub fn build_tick_tock_kernel<'py>(
 
     if verbose && peephole_stats.total_eliminated > 0 {
         println!(
-            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {})",
+            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {}, DCE: {})",
             peephole_stats.total_eliminated,
             peephole_stats.cse_eliminated,
             peephole_stats.algebraic_simplified,
-            peephole_stats.zero_ops_eliminated
+            peephole_stats.zero_ops_eliminated,
+            peephole_stats.dce_eliminated
         );
     }
 
@@ -1791,11 +1792,12 @@ pub fn build_tick_tock_kernel_ops(
 
     if verbose && peephole_stats.total_eliminated > 0 {
         println!(
-            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {})",
+            "Peephole: {} ops eliminated (CSE: {}, algebraic: {}, zero: {}, DCE: {})",
             peephole_stats.total_eliminated,
             peephole_stats.cse_eliminated,
             peephole_stats.algebraic_simplified,
-            peephole_stats.zero_ops_eliminated
+            peephole_stats.zero_ops_eliminated,
+            peephole_stats.dce_eliminated
         );
     }
 
