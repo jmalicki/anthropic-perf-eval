@@ -2035,13 +2035,16 @@ pub fn schedule_cpsat<'py>(
     compute_dependencies(&mut ops);
 
     // Get greedy hints if requested
+    // NOTE: We disable VALU-shift for hints because CP-SAT doesn't model it.
+    // With VALU-shift, greedy might schedule 7+ VALU ops at a cycle by shifting
+    // some to ALU, but CP-SAT would see this as violating VALU capacity=6.
     let greedy_hints: Option<Vec<i32>> = if use_greedy_hint {
         let critical_path = compute_critical_path(&ops);
         let mut hint_ops = ops.clone();
         schedule_greedy(
             &mut hint_ops,
             &critical_path,
-            true, // enable_valu_shift
+            false, // disable VALU-shift for CP-SAT compatible hints
             PriorityMode::CriticalPath,
         );
         Some(hint_ops.iter().map(|op| op.cycle).collect())

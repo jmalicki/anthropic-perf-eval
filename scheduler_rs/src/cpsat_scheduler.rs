@@ -412,15 +412,58 @@ pub fn schedule_cpsat(
     }
 
     // 9. Create makespan variable and minimize it
-    let makespan = model.new_int_var([(critical_path_len as i64, horizon)]);
+    // Use tighter bounds: greedy hint provides good upper bound
+    let greedy_ub = greedy_hints
+        .map(|h| h.iter().max().copied().unwrap_or(0) as i64 + 1)
+        .unwrap_or(horizon);
+    let makespan = model.new_int_var([(critical_path_len as i64, greedy_ub)]);
     for &cv in &cycle_vars {
         model.add_le(cv, LinearExpr::from(makespan) - 1);
     }
     model.minimize(makespan);
 
-    // 10. Configure solver parameters
+    // 10. Add makespan hint if we have greedy solution
+    if let Some(hints) = greedy_hints {
+        let greedy_makespan = hints.iter().max().copied().unwrap_or(0) as i64 + 1;
+        model.add_hint(makespan, greedy_makespan);
+
+        // Debug: check for hints outside variable domains
+        if verbose {
+            let mut violations = 0;
+            for (idx, &hint_cycle) in hints.iter().enumerate() {
+                if idx < ops.len() {
+                    let op = &ops[idx];
+                    let lb = *asap.get(&op.id).unwrap_or(&0);
+                    let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1));
+                    if hint_cycle < lb || hint_cycle > ub {
+                        violations += 1;
+                        if violations <= 10 {
+                            eprintln!(
+                                "  Hint violation: op {} (idx={}) hint={} but domain=[{}, {}]",
+                                op.id, idx, hint_cycle, lb, ub
+                            );
+                        }
+                    }
+                }
+            }
+            if violations > 0 {
+                eprintln!("  Total hint violations: {} / {}", violations, hints.len());
+            } else {
+                eprintln!("  All {} hints are within variable domains", hints.len());
+            }
+        }
+    }
+
+    // 11. Configure solver parameters
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
+
+    // Disable LP - it's not helping for this problem structure
+    params.linearization_level = Some(0);
+
+    // Stop early if we find a good solution (within 2% of greedy)
+    params.relative_gap_limit = Some(0.02);
+
     if verbose {
         params.log_search_progress = Some(true);
     }
@@ -772,5 +815,108 @@ mod tests {
         // When compiled with --features cpsat, this should be true
         // When compiled without, this should be false
         assert!(available == cfg!(feature = "cpsat"));
+    }
+
+    /// Test that a valid hint round-trips correctly.
+    /// This verifies our hint encoding matches the constraint encoding.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_hint_roundtrip() {
+        // Create a simple chain: op0 -> op1 -> op2
+        let ops = vec![
+            make_op(0, Engine::Alu, vec![]),
+            make_op(1, Engine::Alu, vec![0]),
+            make_op(2, Engine::Alu, vec![1]),
+        ];
+
+        // Valid schedule: op0 at cycle 0, op1 at cycle 1, op2 at cycle 2
+        let hints = vec![0, 1, 2];
+
+        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints), true);
+        assert!(result.is_some(), "CP-SAT should accept valid hints");
+
+        let result = result.unwrap();
+        // With a valid hint and sufficient time, should return the hinted solution or better
+        assert!(
+            result.status == CpsatStatus::Optimal || result.status == CpsatStatus::Feasible,
+            "Should find feasible solution with valid hints"
+        );
+        assert_eq!(result.makespan, 3, "Makespan should be 3 for this chain");
+
+        // Verify the cycle assignments respect dependencies
+        assert!(
+            result.cycle_assignments[1] > result.cycle_assignments[0],
+            "op1 must come after op0"
+        );
+        assert!(
+            result.cycle_assignments[2] > result.cycle_assignments[1],
+            "op2 must come after op1"
+        );
+    }
+
+    /// Test that hints within ASAP/ALAP bounds are accepted.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_hint_bounds_check() {
+        // Create ops and compute ASAP/ALAP
+        let ops = vec![
+            make_op(0, Engine::Alu, vec![]),
+            make_op(1, Engine::Alu, vec![0]),
+            make_op(2, Engine::Alu, vec![1]),
+        ];
+
+        let asap = compute_asap(&ops);
+        let alap = compute_alap(&ops, 10);
+
+        // Verify our understanding of ASAP/ALAP
+        assert_eq!(*asap.get(&0).unwrap(), 0, "op0 ASAP should be 0");
+        assert_eq!(*asap.get(&1).unwrap(), 1, "op1 ASAP should be 1");
+        assert_eq!(*asap.get(&2).unwrap(), 2, "op2 ASAP should be 2");
+
+        // Create hints that are exactly at ASAP (should be valid)
+        let hints_at_asap = vec![0, 1, 2];
+
+        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints_at_asap), false);
+        assert!(result.is_some(), "Hints at ASAP should be valid");
+
+        // Create hints that are within bounds but not at ASAP
+        let hints_later = vec![2, 3, 4];
+
+        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints_later), false);
+        assert!(result.is_some(), "Hints within ALAP should be valid");
+    }
+
+    /// Test that hint indices match cycle_vars indices.
+    /// This catches the bug where op.id != slice index.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_hint_index_mapping() {
+        // Create ops with non-sequential IDs to test index mapping
+        let mut ops = vec![
+            make_op(100, Engine::Alu, vec![]),      // slice idx 0, op.id 100
+            make_op(200, Engine::Alu, vec![100]),   // slice idx 1, op.id 200
+            make_op(300, Engine::Alu, vec![200]),   // slice idx 2, op.id 300
+        ];
+
+        // Verify the ops have the expected structure
+        assert_eq!(ops[0].id, 100);
+        assert_eq!(ops[1].id, 200);
+        assert_eq!(ops[2].id, 300);
+
+        // Hints are indexed by slice position, not op.id
+        // So hints[0] is for ops[0] (which has id=100)
+        let hints = vec![0, 1, 2];
+
+        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints), true);
+        assert!(
+            result.is_some(),
+            "Should handle non-sequential op.id correctly"
+        );
+
+        let result = result.unwrap();
+        assert_eq!(result.cycle_assignments.len(), 3);
+        // The assignments should respect the dependency chain
+        assert!(result.cycle_assignments[1] > result.cycle_assignments[0]);
+        assert!(result.cycle_assignments[2] > result.cycle_assignments[1]);
     }
 }
