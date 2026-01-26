@@ -2146,14 +2146,16 @@ use crate::kernel_builder::SsaTickTockKernelBuilder;
 ///   - budget_exceeded: Whether scratch budget was exceeded
 ///
 /// If verbose is true, prints progress information.
+/// If enable_valu_shift is true (default), VALU ops are shifted to ALU when VALU is saturated.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, verbose=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
     n_nodes: usize,
     batch_size: usize,
     rounds: usize,
+    enable_valu_shift: bool,
     verbose: bool,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
@@ -2161,7 +2163,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         n_nodes,
         batch_size,
         rounds,
-        enable_valu_shift: false, // SSA uses internal scheduler
+        enable_valu_shift,
         enable_debug: false,
         enable_lazy_partition: false,
         partition_frequency: 3,
@@ -2185,12 +2187,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
 
     if verbose {
         println!(
-            "SSA kernel: {} cycles, {} ops, {} VRegs, peak_live={}, max_addr={}",
+            "SSA kernel: {} cycles, {} ops, {} VRegs, peak_live={}, max_addr={}, valu_shifted={}",
             result.cycles,
             result.ops.len(),
             result.vreg_count,
             result.address_result.peak_live,
-            result.address_result.max_addr
+            result.address_result.max_addr,
+            result.valu_shifted
         );
     }
 
@@ -2219,6 +2222,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("peak_live", result.address_result.peak_live)?;
     stats.set_item("max_addr", result.address_result.max_addr)?;
     stats.set_item("budget_exceeded", result.address_result.budget_exceeded)?;
+    stats.set_item("valu_shifted", result.valu_shifted)?;
 
     Ok((instrs, stats))
 }

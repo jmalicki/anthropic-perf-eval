@@ -7,18 +7,18 @@
 //!
 //! 1. `build()` - Emit SsaOps using VRegs (no concrete addresses)
 //! 2. `compute_ssa_dependencies()` - Only RAW dependencies (true data flow)
-//! 3. `schedule_ssa_greedy()` - Schedule with more freedom than concrete ops
+//! 3. `schedule_ssa_greedy()` - Schedule with VALU→ALU shifting
 //! 4. `assign_addresses()` - Linear scan allocation based on live ranges
-//! 5. `lower_ssa_ops()` - Convert to concrete Ops
+//! 5. `lower_ssa_ops()` - Convert to concrete Ops (expanding shifted VALU ops)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::{
-    assign_addresses, lower_ssa_ops, AddressAssignConfig, AddressAssignmentResult,
+    assign_addresses, lower_ssa_op, AddressAssignConfig, AddressAssignmentResult,
 };
-use crate::types::{Op, Opcode, SsaOp, VReg};
+use crate::types::{Engine, Op, Opcode, Operand, SlotVal, SsaOp, VReg, VLEN};
 
-use super::config::{fma_multiplier, KernelConfig, HASH_STAGES, STAGE5_XOR_CONST, VLEN};
+use super::config::{fma_multiplier, KernelConfig, HASH_STAGES, STAGE5_XOR_CONST};
 use super::context_ssa::SsaScratchContext;
 use super::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
 
@@ -42,6 +42,8 @@ pub struct SsaScheduleResult {
     pub address_result: AddressAssignmentResult,
     /// Number of VRegs used
     pub vreg_count: u32,
+    /// Number of VALU ops shifted to ALU
+    pub valu_shifted: usize,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -106,10 +108,18 @@ impl SsaTickTockKernelBuilder {
     /// This performs:
     /// 1. SSA op emission
     /// 2. SSA dependency computation (RAW only)
-    /// 3. Greedy scheduling
+    /// 3. Greedy scheduling with VALU→ALU shifting
     /// 4. Address assignment via linear scan
-    /// 5. Lowering to concrete ops
+    /// 5. Lowering to concrete ops (expanding shifted VALU ops)
     pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, String> {
+        self.build_and_schedule_with_options(self.config.enable_valu_shift)
+    }
+
+    /// Build and schedule with explicit VALU shift option.
+    pub fn build_and_schedule_with_options(
+        &mut self,
+        enable_valu_shift: bool,
+    ) -> Result<SsaScheduleResult, String> {
         // Build SSA ops
         self.build_internal();
 
@@ -121,8 +131,13 @@ impl SsaTickTockKernelBuilder {
         // Compute dependencies (RAW only - no false WAW/WAR)
         compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
 
-        // Schedule using greedy scheduler
-        let cycles = self.schedule_ssa_greedy(&mut ssa_ops)?;
+        // Schedule using greedy scheduler with VALU→ALU shifting
+        let mut shifted_ops: HashSet<usize> = HashSet::new();
+        let cycles = self.schedule_ssa_greedy_with_shift(
+            &mut ssa_ops,
+            enable_valu_shift,
+            &mut shifted_ops,
+        )?;
 
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();
@@ -141,35 +156,49 @@ impl SsaTickTockKernelBuilder {
             ));
         }
 
-        // Lower to concrete ops
-        let ops = lower_ssa_ops(&ssa_ops, &address_result.vreg_to_addr);
+        // Lower to concrete ops, expanding shifted VALU ops to ALU
+        let ops = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &address_result.vreg_to_addr,
+            &shifted_ops,
+        );
+
+        let valu_shifted = shifted_ops.len();
 
         Ok(SsaScheduleResult {
             ops,
             cycles,
             address_result,
             vreg_count,
+            valu_shifted,
         })
     }
 
-    /// Schedule SSA ops using a greedy list scheduler.
+    /// Schedule SSA ops using a greedy list scheduler with VALU→ALU shifting.
     ///
-    /// This is a simplified scheduler that assigns cycles based on dependencies.
-    /// Returns the total number of cycles.
-    fn schedule_ssa_greedy(&self, ops: &mut [SsaOp]) -> Result<usize, String> {
-        use crate::types::Engine;
-        use std::collections::HashSet;
-
+    /// When VALU slots are saturated but ALU has capacity, shiftable VALU ops
+    /// (arithmetic ops that can be expanded to 8 scalar ALU ops) are shifted.
+    ///
+    /// Returns the total number of cycles and populates shifted_ops with IDs
+    /// of ops that were shifted.
+    fn schedule_ssa_greedy_with_shift(
+        &self,
+        ops: &mut [SsaOp],
+        enable_valu_shift: bool,
+        shifted_ops: &mut HashSet<usize>,
+    ) -> Result<usize, String> {
         if ops.is_empty() {
             return Ok(0);
         }
 
         // Build op_id -> index mapping
-        let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate()
+        let id_to_idx: HashMap<usize, usize> = ops
+            .iter()
+            .enumerate()
             .map(|(idx, op)| (op.id, idx))
             .collect();
 
-        // Track scheduled ops by cycle
+        // Track scheduled ops
         let mut scheduled: HashSet<usize> = HashSet::new();
         let mut cycle = 0;
         let max_cycles = 50000; // Safety limit
@@ -183,19 +212,21 @@ impl SsaTickTockKernelBuilder {
             let mut flow_used = 0;
 
             // Find ready ops (all deps scheduled at earlier cycles)
-            let ready: Vec<usize> = ops.iter().enumerate()
+            let ready: Vec<usize> = ops
+                .iter()
+                .enumerate()
                 .filter(|(idx, op)| {
                     // Not yet scheduled
-                    !scheduled.contains(idx) &&
-                    // All dependencies scheduled in earlier cycles
-                    op.dep_ids.iter().all(|dep_id| {
-                        if let Some(&dep_idx) = id_to_idx.get(dep_id) {
-                            let dep_cycle = ops[dep_idx].cycle;
-                            dep_cycle >= 0 && dep_cycle < cycle as i32
-                        } else {
-                            true // Unknown dep, assume ready
-                        }
-                    })
+                    !scheduled.contains(idx)
+                        // All dependencies scheduled in earlier cycles
+                        && op.dep_ids.iter().all(|dep_id| {
+                            if let Some(&dep_idx) = id_to_idx.get(dep_id) {
+                                let dep_cycle = ops[dep_idx].cycle;
+                                dep_cycle >= 0 && dep_cycle < cycle as i32
+                            } else {
+                                true // Unknown dep, assume ready
+                            }
+                        })
                 })
                 .map(|(idx, _)| idx)
                 .collect();
@@ -203,21 +234,59 @@ impl SsaTickTockKernelBuilder {
             // Schedule ready ops that fit in slots
             for idx in ready {
                 let op = &ops[idx];
-                let fits = match op.engine {
+                let engine = op.engine;
+
+                // Check if this VALU op can be shifted to ALU
+                let can_shift = enable_valu_shift
+                    && engine == Engine::Valu
+                    && can_ssa_valu_shift_to_alu(op);
+
+                let fits = match engine {
                     Engine::Load => {
-                        if load_used < 2 { load_used += 1; true } else { false }
+                        if load_used < 2 {
+                            load_used += 1;
+                            true
+                        } else {
+                            false
+                        }
                     }
                     Engine::Store => {
-                        if store_used < 2 { store_used += 1; true } else { false }
+                        if store_used < 2 {
+                            store_used += 1;
+                            true
+                        } else {
+                            false
+                        }
                     }
                     Engine::Alu => {
-                        if alu_used < 12 { alu_used += 1; true } else { false }
+                        if alu_used < 12 {
+                            alu_used += 1;
+                            true
+                        } else {
+                            false
+                        }
                     }
                     Engine::Valu => {
-                        if valu_used < 6 { valu_used += 1; true } else { false }
+                        if valu_used < 6 {
+                            valu_used += 1;
+                            true
+                        } else if can_shift && alu_used + VLEN <= 12 {
+                            // VALU is full, but we can shift to ALU
+                            // Shifted VALU op uses 8 ALU slots
+                            alu_used += VLEN;
+                            shifted_ops.insert(op.id);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     Engine::Flow => {
-                        if flow_used < 1 { flow_used += 1; true } else { false }
+                        if flow_used < 1 {
+                            flow_used += 1;
+                            true
+                        } else {
+                            false
+                        }
                     }
                     _ => true,
                 };
@@ -234,7 +303,9 @@ impl SsaTickTockKernelBuilder {
         if scheduled.len() < ops.len() {
             return Err(format!(
                 "Scheduling failed: only scheduled {}/{} ops in {} cycles",
-                scheduled.len(), ops.len(), max_cycles
+                scheduled.len(),
+                ops.len(),
+                max_cycles
             ));
         }
 
@@ -843,6 +914,102 @@ impl SsaTickTockKernelBuilder {
             }
         }
     }
+}
+
+// ============================================================================
+// VALU→ALU Shifting Helpers
+// ============================================================================
+
+/// Check if an SSA VALU op can be shifted to ALU.
+///
+/// Shiftable ops are binary arithmetic operations that can be expanded
+/// to 8 scalar ALU ops (one per vector lane).
+fn can_ssa_valu_shift_to_alu(op: &SsaOp) -> bool {
+    if op.engine != Engine::Valu {
+        return false;
+    }
+
+    // Check if the opcode supports shifting
+    op.opcode.can_shift_to_alu()
+}
+
+/// Lower SSA ops to concrete ops, expanding shifted VALU ops to ALU.
+///
+/// Shifted VALU ops are expanded to 8 scalar ALU ops, one per lane.
+/// Each ALU op reads from src[i] and writes to dest[i].
+fn lower_ssa_ops_with_shift(
+    ssa_ops: &[SsaOp],
+    vreg_to_addr: &HashMap<VReg, i64>,
+    shifted_ops: &HashSet<usize>,
+) -> Vec<Op> {
+    use arrayvec::ArrayVec;
+
+    let mut result = Vec::new();
+
+    for ssa_op in ssa_ops {
+        if shifted_ops.contains(&ssa_op.id) {
+            // Expand shifted VALU op to 8 ALU ops
+            let expanded = expand_ssa_valu_to_alu(ssa_op, vreg_to_addr);
+            result.extend(expanded);
+        } else {
+            // Normal lowering
+            result.push(lower_ssa_op(ssa_op, vreg_to_addr));
+        }
+    }
+
+    result
+}
+
+/// Expand a shifted SSA VALU op into 8 scalar ALU ops.
+fn expand_ssa_valu_to_alu(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
+    use arrayvec::ArrayVec;
+
+    let dest = ssa_op.dest.expect("VALU op must have dest");
+    let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
+
+    // Get source addresses
+    let (src1_addr, src2_addr) = match (&ssa_op.srcs[..], ssa_op.opcode) {
+        ([Operand::VReg(s1), Operand::VReg(s2)], _) => {
+            let a1 = *vreg_to_addr.get(s1).expect("src1 VReg not in mapping");
+            let a2 = *vreg_to_addr.get(s2).expect("src2 VReg not in mapping");
+            (a1, a2)
+        }
+        _ => return vec![], // Can't expand non-binary ops
+    };
+
+    // Create 8 ALU ops
+    let mut ops = Vec::with_capacity(VLEN);
+    for i in 0..VLEN {
+        let i_offset = i as i64;
+
+        let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+        slot.push(SlotVal::Str(ssa_op.opcode.as_str().to_string()));
+        slot.push(SlotVal::Int(dest_addr + i_offset));
+        slot.push(SlotVal::Int(src1_addr + i_offset));
+        slot.push(SlotVal::Int(src2_addr + i_offset));
+
+        // Build reads/writes sets
+        let mut reads = HashSet::new();
+        reads.insert(src1_addr + i_offset);
+        reads.insert(src2_addr + i_offset);
+
+        let mut writes = HashSet::new();
+        writes.insert(dest_addr + i_offset);
+
+        ops.push(Op {
+            id: ssa_op.id * 1000 + i, // Unique ID for expanded op
+            engine: Engine::Alu,
+            slot,
+            cycle: ssa_op.cycle,
+            dep_ids: ssa_op.dep_ids.clone(),
+            reads,
+            writes,
+            last_use_reads: HashSet::new(),
+            produces_constant: None,
+        });
+    }
+
+    ops
 }
 
 // ============================================================================
