@@ -50,6 +50,21 @@
 //!
 //! This catches situations where ops are "bunched up" in tight ASAP/ALAP windows.
 //!
+//! ### Suffix Bounds
+//!
+//! For each starting cycle t, count ops with ASAP >= t (ops that can't start before t).
+//! These ops need `ceil(count / capacity)` cycles starting from t, so:
+//!   - `makespan >= t + ceil(count / capacity)`
+//!
+//! Example: If 9837 VALU ops have ASAP >= 1, they need ceil(9837/6) = 1640 cycles
+//! starting from cycle 1, giving makespan >= 1641.
+//!
+//! ### Sparse Window Bounds
+//!
+//! For each cycle t, count ops that CAN run at t (ASAP <= t <= ALAP).
+//! Cycles with fewer than `capacity` available ops have "wasted" slots.
+//! The bound accounts for this wasted capacity to find the minimum makespan.
+//!
 //! ## Objective
 //!
 //! Minimize makespan (total cycles).
@@ -611,11 +626,79 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         }
     }
 
-    let computed_lower_bound = suffix_lower_bound;
+    // 6e. Compute sparse window bounds
+    // For each cycle, count how many ops CAN run there (ASAP <= t <= ALAP).
+    // Cycles with fewer than `capacity` available ops have "wasted" slots.
+    // We find the minimum makespan needed to complete all ops given this constraint.
+    let mut sparse_lower_bound = suffix_lower_bound;
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity <= 0 || op_indices.is_empty() {
+            continue;
+        }
+
+        let num_ops = op_indices.len() as i64;
+
+        // Collect (asap, alap) for each op on this engine
+        let bounds: Vec<(i64, i64)> = op_indices
+            .iter()
+            .map(|&idx| {
+                let op = &ops[idx];
+                let lb = *asap.get(&op.id).unwrap_or(&0) as i64;
+                let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
+                (lb, ub)
+            })
+            .collect();
+
+        let min_asap = bounds.iter().map(|(a, _)| *a).min().unwrap_or(0);
+        let max_alap = bounds.iter().map(|(_, a)| *a).max().unwrap_or(horizon);
+
+        // Compute availability profile: for each cycle, how many ops can run there
+        // Then find minimum makespan to fit all ops
+        let window_size = (max_alap - min_asap + 1) as usize;
+        if window_size > 10000 {
+            // Skip very large windows to avoid O(n*m) computation
+            continue;
+        }
+
+        // Count ops available at each cycle in the window
+        let mut available: Vec<i64> = vec![0; window_size];
+        for (op_asap, op_alap) in &bounds {
+            let start = (*op_asap - min_asap) as usize;
+            let end = (*op_alap - min_asap) as usize;
+            for t in start..=end.min(window_size - 1) {
+                available[t] += 1;
+            }
+        }
+
+        // Compute cumulative capacity: total ops we can schedule in cycles [0, m-1]
+        // At each cycle t, we can schedule min(available[t], capacity) ops
+        let mut cumulative_capacity = 0i64;
+        for (m, &avail) in available.iter().enumerate() {
+            cumulative_capacity += avail.min(capacity);
+            // Check if we can fit all ops by cycle m (inclusive)
+            // makespan = min_asap + m + 1
+            if cumulative_capacity >= num_ops {
+                let min_makespan = min_asap + (m as i64) + 1;
+                if min_makespan > sparse_lower_bound {
+                    if verbose {
+                        eprintln!(
+                            "  Sparse window bound: {:?} needs makespan >= {} (min_asap={}, window_cycles={})",
+                            engine, min_makespan, min_asap, m + 1
+                        );
+                    }
+                    sparse_lower_bound = min_makespan;
+                }
+                break;
+            }
+        }
+    }
+
+    let computed_lower_bound = sparse_lower_bound;
     if verbose && computed_lower_bound > critical_path_len as i64 {
         eprintln!(
-            "  Lower bound improved: critical_path={}, capacity={}, profile={}, suffix={}",
-            critical_path_len, capacity_lower_bound, profile_lower_bound, suffix_lower_bound
+            "  Lower bound improved: critical_path={}, capacity={}, profile={}, suffix={}, sparse={}",
+            critical_path_len, capacity_lower_bound, profile_lower_bound, suffix_lower_bound, sparse_lower_bound
         );
     }
 
