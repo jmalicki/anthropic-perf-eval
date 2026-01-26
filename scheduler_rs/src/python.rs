@@ -2055,16 +2055,22 @@ pub fn schedule_cpsat<'py>(
     // Run CP-SAT scheduler
     let result = cpsat_scheduler::schedule_cpsat(
         &ops,
-        scratch_budget,
-        time_limit_secs,
-        greedy_hints.as_deref(),
-        verbose,
+        cpsat_scheduler::CpsatConfig {
+            scratch_budget,
+            time_limit_secs,
+            greedy_hints: greedy_hints.as_deref(),
+            shift_hints: None,
+            enable_valu_shift: false,
+            verbose,
+            stop_after_first_solution: false,
+        },
     );
 
     let result_dict = PyDict::new(py);
 
     match result {
-        Some(cpsat_result) => {
+        Some(cpsat_result_with_shift) => {
+            let cpsat_result = cpsat_result_with_shift.result;
             // Apply cycle assignments
             for (idx, &cycle) in cpsat_result.cycle_assignments.iter().enumerate() {
                 if idx < ops.len() {

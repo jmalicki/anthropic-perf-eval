@@ -254,36 +254,119 @@ pub fn compute_live_intervals(ops: &[Op]) -> Vec<LiveInterval> {
 // CP-SAT Scheduling (feature-gated)
 // ============================================================================
 
+/// Result including VALU-shift decisions
+#[derive(Debug, Clone)]
+pub struct CpsatResultWithShift {
+    /// Base result
+    pub result: CpsatResult,
+    /// For each op index, true if the VALU op was shifted to ALU
+    /// (empty if op is not VALU or VALU-shift not enabled)
+    pub valu_shifted: Vec<bool>,
+}
+
+/// Configuration for CP-SAT scheduling
+#[derive(Debug, Clone)]
+pub struct CpsatConfig<'a> {
+    /// Maximum scratch memory budget (0 = no constraint)
+    pub scratch_budget: usize,
+    /// Maximum solving time in seconds (default: 60.0)
+    pub time_limit_secs: f64,
+    /// Hints from greedy scheduler (op_idx -> cycle)
+    pub greedy_hints: Option<&'a [i32]>,
+    /// Hints for VALU-shift decisions (op_idx -> should_shift)
+    pub shift_hints: Option<&'a [bool]>,
+    /// If true, model VALU->ALU shifting in CP-SAT
+    pub enable_valu_shift: bool,
+    /// Print solver progress
+    pub verbose: bool,
+    /// If true, stop after finding the first feasible solution (useful for testing hints)
+    pub stop_after_first_solution: bool,
+}
+
+impl<'a> Default for CpsatConfig<'a> {
+    fn default() -> Self {
+        Self {
+            scratch_budget: 0,
+            time_limit_secs: 60.0, // Sensible default: 60 seconds
+            greedy_hints: None,
+            shift_hints: None,
+            enable_valu_shift: false,
+            verbose: false,
+            stop_after_first_solution: false,
+        }
+    }
+}
+
+impl<'a> CpsatConfig<'a> {
+    /// Create a new config with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set scratch budget
+    pub fn with_scratch_budget(mut self, budget: usize) -> Self {
+        self.scratch_budget = budget;
+        self
+    }
+
+    /// Set time limit
+    pub fn with_time_limit(mut self, secs: f64) -> Self {
+        self.time_limit_secs = secs;
+        self
+    }
+
+    /// Set greedy hints
+    pub fn with_hints(mut self, hints: &'a [i32]) -> Self {
+        self.greedy_hints = Some(hints);
+        self
+    }
+
+    /// Set verbose output
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    /// Stop after finding the first feasible solution (useful for testing hints)
+    pub fn with_stop_after_first_solution(mut self, stop: bool) -> Self {
+        self.stop_after_first_solution = stop;
+        self
+    }
+}
+
 /// Schedule operations using CP-SAT solver.
 ///
 /// # Arguments
 /// * `ops` - Operations to schedule (must have dependencies computed)
-/// * `scratch_budget` - Maximum scratch memory budget (0 = no constraint)
-/// * `time_limit_secs` - Maximum solving time in seconds
-/// * `greedy_hints` - Optional hints from greedy scheduler (op_idx -> cycle)
-/// * `verbose` - Print solver progress
+/// * `config` - Configuration for the CP-SAT scheduler
 ///
 /// # Returns
-/// * `Some(CpsatResult)` if a solution was found
+/// * `Some(CpsatResultWithShift)` if a solution was found
 /// * `None` if no solution found or feature not enabled
 #[cfg(feature = "cpsat")]
-pub fn schedule_cpsat(
-    ops: &[Op],
-    scratch_budget: usize,
-    time_limit_secs: f64,
-    greedy_hints: Option<&[i32]>,
-    verbose: bool,
-) -> Option<CpsatResult> {
+pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResultWithShift> {
+    let CpsatConfig {
+        scratch_budget,
+        time_limit_secs,
+        greedy_hints,
+        shift_hints: _,
+        enable_valu_shift: _,
+        verbose,
+        stop_after_first_solution,
+    } = config;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
     if n == 0 {
-        return Some(CpsatResult {
-            cycle_assignments: vec![],
-            makespan: 0,
-            status: CpsatStatus::Optimal,
-            solve_time_secs: 0.0,
-            gap: 0.0,
+        return Some(CpsatResultWithShift {
+            result: CpsatResult {
+                cycle_assignments: vec![],
+                makespan: 0,
+                status: CpsatStatus::Optimal,
+                solve_time_secs: 0.0,
+                gap: 0.0,
+            },
+            valu_shifted: vec![],
         });
     }
 
@@ -464,6 +547,11 @@ pub fn schedule_cpsat(
     // Stop early if we find a good solution (within 2% of greedy)
     params.relative_gap_limit = Some(0.02);
 
+    // Option to stop after finding first feasible solution (useful for testing hints)
+    if stop_after_first_solution {
+        params.stop_after_first_solution = Some(true);
+    }
+
     if verbose {
         params.log_search_progress = Some(true);
     }
@@ -500,12 +588,19 @@ pub fn schedule_cpsat(
                 }
             };
 
-            Some(CpsatResult {
-                cycle_assignments,
-                makespan: actual_makespan as usize,
-                status,
-                solve_time_secs: solve_time,
-                gap,
+            // TODO: When enable_valu_shift is true, extract shift decisions from solver
+            // For now, return empty valu_shifted (no shifting in CP-SAT)
+            let valu_shifted = vec![false; n];
+
+            Some(CpsatResultWithShift {
+                result: CpsatResult {
+                    cycle_assignments,
+                    makespan: actual_makespan as usize,
+                    status,
+                    solve_time_secs: solve_time,
+                    gap,
+                },
+                valu_shifted,
             })
         }
         _ => None,
@@ -514,13 +609,7 @@ pub fn schedule_cpsat(
 
 /// Stub implementation when cpsat feature is not enabled
 #[cfg(not(feature = "cpsat"))]
-pub fn schedule_cpsat(
-    _ops: &[Op],
-    _scratch_budget: usize,
-    _time_limit_secs: f64,
-    _greedy_hints: Option<&[i32]>,
-    _verbose: bool,
-) -> Option<CpsatResult> {
+pub fn schedule_cpsat(_ops: &[Op], _config: CpsatConfig<'_>) -> Option<CpsatResultWithShift> {
     eprintln!("CP-SAT scheduler not available: compile with --features cpsat");
     None
 }
@@ -564,31 +653,36 @@ pub fn schedule_optimal(
         op.cycle = -1;
     }
 
-    // Try CP-SAT with greedy hints
+    // Try CP-SAT with greedy hints (no VALU-shift in model, will apply as post-pass)
     let cpsat_result = schedule_cpsat(
         ops,
-        scratch_budget,
-        cpsat_time_limit,
-        Some(&greedy_cycles),
-        verbose,
+        CpsatConfig {
+            scratch_budget,
+            time_limit_secs: cpsat_time_limit,
+            greedy_hints: Some(&greedy_cycles),
+            shift_hints: None,
+            enable_valu_shift: false,
+            verbose,
+            stop_after_first_solution: false,
+        },
     );
 
-    if let Some(result) = cpsat_result {
+    if let Some(result_with_shift) = cpsat_result {
         // Apply CP-SAT solution to ops
         for (idx, op) in ops.iter_mut().enumerate() {
-            if idx < result.cycle_assignments.len() {
-                op.cycle = result.cycle_assignments[idx];
+            if idx < result_with_shift.result.cycle_assignments.len() {
+                op.cycle = result_with_shift.result.cycle_assignments[idx];
             }
         }
 
         if verbose {
             eprintln!(
                 "CP-SAT result: {} cycles (greedy was {})",
-                result.makespan, greedy_result.cycles
+                result_with_shift.result.makespan, greedy_result.cycles
             );
         }
 
-        result
+        result_with_shift.result
     } else {
         // Fall back to greedy
         if verbose {
@@ -720,11 +814,11 @@ mod tests {
     #[test]
     fn test_schedule_cpsat_empty() {
         let ops: Vec<Op> = vec![];
-        let result = schedule_cpsat(&ops, 0, 10.0, None, false);
+        let result = schedule_cpsat(&ops, CpsatConfig::new().with_time_limit(10.0));
         assert!(result.is_some());
-        let result = result.unwrap();
-        assert_eq!(result.makespan, 0);
-        assert_eq!(result.status, CpsatStatus::Optimal);
+        let r = result.unwrap();
+        assert_eq!(r.result.makespan, 0);
+        assert_eq!(r.result.status, CpsatStatus::Optimal);
     }
 
     #[cfg(feature = "cpsat")]
@@ -736,16 +830,16 @@ mod tests {
             make_op(2, Engine::Alu, vec![1]),
         ];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, None, false);
+        let result = schedule_cpsat(&ops, CpsatConfig::new().with_time_limit(10.0));
         assert!(result.is_some());
 
-        let result = result.unwrap();
-        assert!(result.makespan >= 3); // At least 3 cycles due to dependencies
-        assert_eq!(result.cycle_assignments.len(), 3);
+        let r = result.unwrap();
+        assert!(r.result.makespan >= 3); // At least 3 cycles due to dependencies
+        assert_eq!(r.result.cycle_assignments.len(), 3);
 
         // Verify precedence: cycle[1] > cycle[0], cycle[2] > cycle[1]
-        assert!(result.cycle_assignments[1] > result.cycle_assignments[0]);
-        assert!(result.cycle_assignments[2] > result.cycle_assignments[1]);
+        assert!(r.result.cycle_assignments[1] > r.result.cycle_assignments[0]);
+        assert!(r.result.cycle_assignments[2] > r.result.cycle_assignments[1]);
     }
 
     #[cfg(feature = "cpsat")]
@@ -759,12 +853,12 @@ mod tests {
             make_op(3, Engine::Alu, vec![1]),
         ];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, None, false);
+        let result = schedule_cpsat(&ops, CpsatConfig::new().with_time_limit(10.0));
         assert!(result.is_some());
 
-        let result = result.unwrap();
+        let r = result.unwrap();
         // Should be able to schedule in 2 cycles since chains are independent
-        assert!(result.makespan <= 2);
+        assert!(r.result.makespan <= 2);
     }
 
     #[cfg(feature = "cpsat")]
@@ -779,12 +873,12 @@ mod tests {
             })
             .collect();
 
-        let result = schedule_cpsat(&ops, 0, 10.0, None, false);
+        let result = schedule_cpsat(&ops, CpsatConfig::new().with_time_limit(10.0));
         assert!(result.is_some());
 
-        let result = result.unwrap();
+        let r = result.unwrap();
         // 15 ops with 12 ALU slots = at least 2 cycles
-        assert!(result.makespan >= 2);
+        assert!(r.result.makespan >= 2);
     }
 
     #[cfg(feature = "cpsat")]
@@ -799,13 +893,16 @@ mod tests {
         // Provide hints
         let hints = vec![0, 1, 2];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints), false);
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig::new().with_time_limit(10.0).with_hints(&hints),
+        );
         assert!(result.is_some());
 
-        let result = result.unwrap();
-        assert_eq!(result.makespan, 3);
+        let r = result.unwrap();
+        assert_eq!(r.result.makespan, 3);
         // With hints, should find the optimal solution quickly
-        assert!(result.status == CpsatStatus::Optimal);
+        assert!(r.result.status == CpsatStatus::Optimal);
     }
 
     #[test]
@@ -832,24 +929,30 @@ mod tests {
         // Valid schedule: op0 at cycle 0, op1 at cycle 1, op2 at cycle 2
         let hints = vec![0, 1, 2];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints), true);
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig::new()
+                .with_time_limit(10.0)
+                .with_hints(&hints)
+                .with_verbose(true),
+        );
         assert!(result.is_some(), "CP-SAT should accept valid hints");
 
-        let result = result.unwrap();
+        let r = result.unwrap();
         // With a valid hint and sufficient time, should return the hinted solution or better
         assert!(
-            result.status == CpsatStatus::Optimal || result.status == CpsatStatus::Feasible,
+            r.result.status == CpsatStatus::Optimal || r.result.status == CpsatStatus::Feasible,
             "Should find feasible solution with valid hints"
         );
-        assert_eq!(result.makespan, 3, "Makespan should be 3 for this chain");
+        assert_eq!(r.result.makespan, 3, "Makespan should be 3 for this chain");
 
         // Verify the cycle assignments respect dependencies
         assert!(
-            result.cycle_assignments[1] > result.cycle_assignments[0],
+            r.result.cycle_assignments[1] > r.result.cycle_assignments[0],
             "op1 must come after op0"
         );
         assert!(
-            result.cycle_assignments[2] > result.cycle_assignments[1],
+            r.result.cycle_assignments[2] > r.result.cycle_assignments[1],
             "op2 must come after op1"
         );
     }
@@ -876,13 +979,25 @@ mod tests {
         // Create hints that are exactly at ASAP (should be valid)
         let hints_at_asap = vec![0, 1, 2];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints_at_asap), false);
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig {
+                greedy_hints: Some(&hints_at_asap),
+                ..Default::default()
+            },
+        );
         assert!(result.is_some(), "Hints at ASAP should be valid");
 
         // Create hints that are within bounds but not at ASAP
         let hints_later = vec![2, 3, 4];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints_later), false);
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig {
+                greedy_hints: Some(&hints_later),
+                ..Default::default()
+            },
+        );
         assert!(result.is_some(), "Hints within ALAP should be valid");
     }
 
@@ -892,7 +1007,7 @@ mod tests {
     #[test]
     fn test_hint_index_mapping() {
         // Create ops with non-sequential IDs to test index mapping
-        let mut ops = vec![
+        let ops = vec![
             make_op(100, Engine::Alu, vec![]),      // slice idx 0, op.id 100
             make_op(200, Engine::Alu, vec![100]),   // slice idx 1, op.id 200
             make_op(300, Engine::Alu, vec![200]),   // slice idx 2, op.id 300
@@ -907,16 +1022,66 @@ mod tests {
         // So hints[0] is for ops[0] (which has id=100)
         let hints = vec![0, 1, 2];
 
-        let result = schedule_cpsat(&ops, 0, 10.0, Some(&hints), true);
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig::new()
+                .with_time_limit(10.0)
+                .with_hints(&hints)
+                .with_verbose(true),
+        );
         assert!(
             result.is_some(),
             "Should handle non-sequential op.id correctly"
         );
 
-        let result = result.unwrap();
-        assert_eq!(result.cycle_assignments.len(), 3);
+        let r = result.unwrap();
+        assert_eq!(r.result.cycle_assignments.len(), 3);
         // The assignments should respect the dependency chain
-        assert!(result.cycle_assignments[1] > result.cycle_assignments[0]);
-        assert!(result.cycle_assignments[2] > result.cycle_assignments[1]);
+        assert!(r.result.cycle_assignments[1] > r.result.cycle_assignments[0]);
+        assert!(r.result.cycle_assignments[2] > r.result.cycle_assignments[1]);
+    }
+
+    /// Test that stop_after_first_solution returns exactly the hint.
+    /// This ensures hint encoding/decoding is correct.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_hint_roundtrip_stop_after_first() {
+        // Create a simple chain: op0 -> op1 -> op2
+        let ops = vec![
+            make_op(0, Engine::Alu, vec![]),
+            make_op(1, Engine::Alu, vec![0]),
+            make_op(2, Engine::Alu, vec![1]),
+        ];
+
+        // Valid schedule: op0 at cycle 0, op1 at cycle 1, op2 at cycle 2
+        let hints = vec![0, 1, 2];
+
+        // Run solver with stop_after_first_solution - should return hint immediately
+        let result = schedule_cpsat(
+            &ops,
+            CpsatConfig::new()
+                .with_hints(&hints)
+                .with_stop_after_first_solution(true)
+                .with_verbose(true),
+        );
+
+        assert!(result.is_some(), "Should return a solution with hint");
+
+        let r = result.unwrap();
+        // With stop_after_first_solution, we get exactly the hint back
+        assert_eq!(
+            r.result.makespan, 3,
+            "Makespan should be 3 (the hinted value)"
+        );
+        // May be optimal if proved during presolve, or feasible if stopped early
+        assert!(
+            r.result.status == CpsatStatus::Feasible || r.result.status == CpsatStatus::Optimal,
+            "Should return feasible or optimal"
+        );
+        // The cycle assignments should equal the hints exactly
+        assert_eq!(
+            r.result.cycle_assignments, hints,
+            "Should return exactly the hinted solution"
+        );
     }
 }
