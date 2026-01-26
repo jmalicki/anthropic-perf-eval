@@ -2147,8 +2147,10 @@ use crate::kernel_builder::SsaTickTockKernelBuilder;
 ///
 /// If verbose is true, prints progress information.
 /// If enable_valu_shift is true (default), VALU ops are shifted to ALU when VALU is saturated.
+/// If use_cpsat is true, uses CP-SAT scheduler instead of greedy (operates on SSA before register allocation).
+/// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 60 seconds).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=60.0))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2157,6 +2159,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     rounds: usize,
     enable_valu_shift: bool,
     verbose: bool,
+    use_cpsat: bool,
+    cpsat_time_limit: f64,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
         forest_height,
@@ -2178,12 +2182,18 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let mut builder = SsaTickTockKernelBuilder::new(config);
 
     if verbose {
-        println!("Building SSA kernel...");
+        println!("Building SSA kernel{}...", if use_cpsat { " (CP-SAT)" } else { "" });
     }
 
-    let result = builder.build_and_schedule().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
-    })?;
+    let result = if use_cpsat {
+        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
+        })?
+    } else {
+        builder.build_and_schedule().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
+        })?
+    };
 
     if verbose {
         println!(

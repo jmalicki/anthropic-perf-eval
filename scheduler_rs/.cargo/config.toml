@@ -1,0 +1,11 @@
+# Cargo configuration for automatic OR-Tools detection
+# This eliminates the need to manually set environment variables
+
+[env]
+# OR-Tools prefix - uses brew symlink for version independence
+# Run `brew --prefix or-tools` to verify this path on your system
+ORTOOLS_PREFIX = "/opt/homebrew/opt/or-tools"
+
+# Library search paths for protobuf linking
+# The actual link flags are added by build.rs to avoid affecting build scripts
+LIBRARY_PATH = "/opt/homebrew/lib"

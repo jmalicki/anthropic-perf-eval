@@ -92,7 +92,7 @@ use cp_sat::proto::{CpSolverStatus, SatParameters};
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::types::{Engine, Op};
+use crate::types::{Engine, Op, SsaOp};
 
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
@@ -870,6 +870,372 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
 #[cfg(not(feature = "cpsat"))]
 pub fn schedule_cpsat(_ops: &[Op], _config: CpsatConfig<'_>) -> Option<CpsatResultWithShift> {
     eprintln!("CP-SAT scheduler not available: compile with --features cpsat");
+    None
+}
+
+// ============================================================================
+// SSA CP-SAT Scheduling
+// ============================================================================
+
+/// Configuration for SSA CP-SAT scheduling
+#[derive(Debug, Clone)]
+pub struct SsaCpsatConfig {
+    /// Maximum solving time in seconds (default: 60.0)
+    pub time_limit_secs: f64,
+    /// Print solver progress
+    pub verbose: bool,
+    /// If true, stop after finding the first feasible solution
+    pub stop_after_first_solution: bool,
+}
+
+impl Default for SsaCpsatConfig {
+    fn default() -> Self {
+        Self {
+            time_limit_secs: 60.0,
+            verbose: false,
+            stop_after_first_solution: false,
+        }
+    }
+}
+
+/// Compute ASAP (As Soon As Possible) cycle for each SSA op.
+/// Uses the RAW-only dependencies from dep_ids.
+pub fn compute_ssa_asap(ops: &[SsaOp]) -> HashMap<usize, i32> {
+    let mut asap: HashMap<usize, i32> = HashMap::new();
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+
+    for op in ops {
+        in_degree.insert(op.id, op.dep_ids.len());
+    }
+
+    // Start with ops that have no dependencies
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for op in ops {
+        if op.dep_ids.is_empty() {
+            queue.push_back(op.id);
+            asap.insert(op.id, 0);
+        }
+    }
+
+    // Build successor map for efficient lookup
+    let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops {
+        for &dep_id in &op.dep_ids {
+            successors.entry(dep_id).or_default().push(op.id);
+        }
+    }
+
+    // Process in topological order
+    while let Some(op_id) = queue.pop_front() {
+        let my_asap = *asap.get(&op_id).unwrap_or(&0);
+
+        if let Some(succs) = successors.get(&op_id) {
+            for &succ_id in succs {
+                let new_asap = my_asap + 1;
+                let current = asap.entry(succ_id).or_insert(0);
+                if new_asap > *current {
+                    *current = new_asap;
+                }
+
+                if let Some(deg) = in_degree.get_mut(&succ_id) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(succ_id);
+                    }
+                }
+            }
+        }
+    }
+
+    asap
+}
+
+/// Compute ALAP (As Late As Possible) cycle for each SSA op.
+pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
+    let mut alap: HashMap<usize, i32> = HashMap::new();
+
+    // Build consumer map (ops that depend on each op)
+    let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops {
+        consumers.insert(op.id, Vec::new());
+    }
+    for op in ops {
+        for &dep_id in &op.dep_ids {
+            if let Some(c) = consumers.get_mut(&dep_id) {
+                c.push(op.id);
+            }
+        }
+    }
+
+    // Build out-degree
+    let mut out_degree: HashMap<usize, usize> = HashMap::new();
+    for op in ops {
+        out_degree.insert(
+            op.id,
+            consumers.get(&op.id).map(|c| c.len()).unwrap_or(0),
+        );
+    }
+
+    // Start with sinks (ops with no consumers)
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for op in ops {
+        if consumers.get(&op.id).map(|c| c.is_empty()).unwrap_or(true) {
+            queue.push_back(op.id);
+            alap.insert(op.id, horizon - 1);
+        }
+    }
+
+    let op_by_id: HashMap<usize, &SsaOp> = ops.iter().map(|op| (op.id, op)).collect();
+
+    // Process in reverse topological order
+    while let Some(op_id) = queue.pop_front() {
+        let my_alap = *alap.get(&op_id).unwrap_or(&(horizon - 1));
+
+        if let Some(op) = op_by_id.get(&op_id) {
+            for &dep_id in &op.dep_ids {
+                let new_alap = my_alap - 1;
+                let current = alap.entry(dep_id).or_insert(horizon - 1);
+                if new_alap < *current {
+                    *current = new_alap;
+                }
+
+                if let Some(deg) = out_degree.get_mut(&dep_id) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(dep_id);
+                    }
+                }
+            }
+        }
+    }
+
+    alap
+}
+
+/// Schedule SSA operations using CP-SAT solver.
+///
+/// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
+/// This avoids false WAW/WAR dependencies introduced by register allocation.
+///
+/// # Arguments
+/// * `ops` - SSA operations to schedule (with dep_ids computed)
+/// * `config` - Configuration for the CP-SAT scheduler
+/// * `greedy_hints` - Optional cycle assignments from greedy scheduler
+///
+/// # Returns
+/// * `Some(CpsatResult)` if a solution was found
+/// * `None` if no solution found or feature not enabled
+#[cfg(feature = "cpsat")]
+pub fn schedule_ssa_cpsat(
+    ops: &[SsaOp],
+    config: SsaCpsatConfig,
+    greedy_hints: Option<&[i32]>,
+) -> Option<CpsatResult> {
+    let SsaCpsatConfig {
+        time_limit_secs,
+        verbose,
+        stop_after_first_solution,
+    } = config;
+    let start_time = std::time::Instant::now();
+    let n = ops.len();
+
+    if n == 0 {
+        return Some(CpsatResult {
+            cycle_assignments: vec![],
+            makespan: 0,
+            status: CpsatStatus::Optimal,
+            solve_time_secs: 0.0,
+            gap: 0.0,
+        });
+    }
+
+    // 1. Compute ASAP/ALAP bounds using RAW-only dependencies
+    let asap = compute_ssa_asap(ops);
+    let critical_path_len = asap.values().max().copied().unwrap_or(0) + 1;
+
+    // Use a reasonable horizon (2x critical path or greedy hint max)
+    let greedy_max = greedy_hints
+        .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
+        .unwrap_or(0);
+    let horizon = (critical_path_len * 2).max(greedy_max).max(n as i32) as i64;
+
+    let alap = compute_ssa_alap(ops, horizon as i32);
+
+    if verbose {
+        eprintln!(
+            "SSA CP-SAT: {} ops, critical path {}, horizon {}",
+            n, critical_path_len, horizon
+        );
+    }
+
+    // 2. Build the CP model
+    let mut model = CpModelBuilder::default();
+
+    // Build op_id to index mapping
+    let op_id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+
+    // 3. Create cycle variable for each op with [asap, alap] domain
+    let cycle_vars: Vec<IntVar> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| {
+            let lb = *asap.get(&op.id).unwrap_or(&0) as i64;
+            let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
+            model.new_int_var_with_name([(lb, ub)], format!("c{}", idx))
+        })
+        .collect();
+
+    // 4. Add precedence constraints from RAW dependencies
+    for (idx, op) in ops.iter().enumerate() {
+        for &dep_id in &op.dep_ids {
+            if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                // cycle[idx] >= cycle[dep_idx] + 1
+                model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+            }
+        }
+    }
+
+    // 5. Create interval variables for slot consumption
+    let intervals: Vec<IntervalVar> = cycle_vars
+        .iter()
+        .map(|&cv| model.new_fixed_size_interval_var(cv, 1))
+        .collect();
+
+    // 6. Group ops by engine and add cumulative constraints
+    let mut ops_by_engine: HashMap<Engine, Vec<usize>> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if op.engine.is_hardware() {
+            ops_by_engine.entry(op.engine).or_default().push(idx);
+        }
+    }
+
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity > 0 && !op_indices.is_empty() {
+            let engine_intervals: Vec<IntervalVar> =
+                op_indices.iter().map(|&idx| intervals[idx]).collect();
+            let demands: Vec<i64> = vec![1; op_indices.len()];
+            model.add_cumulative(engine_intervals, demands, capacity);
+        }
+    }
+
+    // 6b. Compute capacity-based lower bounds
+    let mut capacity_lower_bound = critical_path_len as i64;
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity > 0 && !op_indices.is_empty() {
+            let num_ops = op_indices.len() as i64;
+            let min_cycles = (num_ops + capacity - 1) / capacity;
+            if min_cycles > capacity_lower_bound {
+                if verbose {
+                    eprintln!(
+                        "  Capacity bound: {:?} has {} ops / {} slots = {} min cycles",
+                        engine, num_ops, capacity, min_cycles
+                    );
+                }
+                capacity_lower_bound = min_cycles;
+            }
+        }
+    }
+
+    // 7. Create makespan variable and objective
+    let makespan = model.new_int_var_with_name(
+        [(capacity_lower_bound, horizon)],
+        "makespan".to_string(),
+    );
+
+    // makespan >= max(cycle[i]) + 1 for all ops
+    for &cv in &cycle_vars {
+        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+    }
+
+    model.minimize(makespan);
+
+    // 8. Add hints from greedy scheduler
+    if let Some(hints) = greedy_hints {
+        for (idx, &hint_cycle) in hints.iter().enumerate() {
+            if idx < cycle_vars.len() && hint_cycle >= 0 {
+                model.add_hint(cycle_vars[idx], hint_cycle as i64);
+            }
+        }
+        // Hint the makespan too
+        let hint_makespan = hints.iter().max().copied().unwrap_or(0) + 1;
+        model.add_hint(makespan, hint_makespan as i64);
+    }
+
+    // 9. Configure solver
+    let mut params = SatParameters::default();
+    params.max_time_in_seconds = Some(time_limit_secs);
+    params.log_search_progress = Some(verbose);
+    params.num_workers = Some(8);
+
+    if stop_after_first_solution {
+        params.stop_after_first_solution = Some(true);
+    }
+
+    // 10. Solve
+    let response = model.solve_with_parameters(&params);
+    let solve_time = start_time.elapsed().as_secs_f64();
+
+    let status: CpsatStatus = response.status().into();
+
+    match status {
+        CpsatStatus::Optimal | CpsatStatus::Feasible => {
+            let cycle_assignments: Vec<i32> = cycle_vars
+                .iter()
+                .map(|&cv| cv.solution_value(&response) as i32)
+                .collect();
+
+            let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
+
+            let gap = if status == CpsatStatus::Optimal {
+                0.0
+            } else {
+                let best = response.objective_value;
+                let bound = response.best_objective_bound;
+                if best > 0.0 {
+                    (best - bound).abs() / best
+                } else {
+                    0.0
+                }
+            };
+
+            if verbose {
+                eprintln!(
+                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s",
+                    actual_makespan, status, gap * 100.0, solve_time
+                );
+            }
+
+            Some(CpsatResult {
+                cycle_assignments,
+                makespan: actual_makespan as usize,
+                status,
+                solve_time_secs: solve_time,
+                gap,
+            })
+        }
+        _ => {
+            if verbose {
+                eprintln!("SSA CP-SAT: no solution found, status {:?}", status);
+            }
+            None
+        }
+    }
+}
+
+/// Stub implementation when cpsat feature is not enabled
+#[cfg(not(feature = "cpsat"))]
+pub fn schedule_ssa_cpsat(
+    _ops: &[SsaOp],
+    _config: SsaCpsatConfig,
+    _greedy_hints: Option<&[i32]>,
+) -> Option<CpsatResult> {
+    eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
     None
 }
 

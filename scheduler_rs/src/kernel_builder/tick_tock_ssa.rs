@@ -174,6 +174,108 @@ impl SsaTickTockKernelBuilder {
         })
     }
 
+    /// Build and schedule using CP-SAT on SSA ops (before register allocation).
+    ///
+    /// This performs:
+    /// 1. SSA op emission
+    /// 2. SSA dependency computation (RAW only)
+    /// 3. Optionally: Greedy scheduling to get hints
+    /// 4. CP-SAT scheduling on SsaOps
+    /// 5. Address assignment via linear scan
+    /// 6. Lowering to concrete ops
+    ///
+    /// Note: VALU→ALU shifting is not yet supported with CP-SAT.
+    pub fn build_and_schedule_cpsat(
+        &mut self,
+        time_limit_secs: f64,
+        verbose: bool,
+    ) -> Result<SsaScheduleResult, String> {
+        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
+
+        // Build SSA ops
+        self.build_internal();
+
+        // Get ops and dependency info
+        let mut ssa_ops = self.emit.take_ops();
+        let vreg_def = std::mem::take(&mut self.emit.vreg_def);
+        let vreg_count = self.emit.next_vreg_id;
+
+        // Compute dependencies (RAW only)
+        compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
+
+        // Get greedy hints first (for warm-starting CP-SAT)
+        let mut dummy_shifted = HashSet::new();
+        let greedy_cycles = self.schedule_ssa_greedy_with_shift(
+            &mut ssa_ops,
+            false, // No VALU shift for hints (CP-SAT doesn't model it)
+            &mut dummy_shifted,
+        )?;
+        let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
+
+        if verbose {
+            eprintln!("SSA Greedy hint: {} cycles", greedy_cycles);
+        }
+
+        // Reset cycles before CP-SAT
+        for op in &mut ssa_ops {
+            op.cycle = -1;
+        }
+
+        // Run CP-SAT on SSA ops
+        let cpsat_config = SsaCpsatConfig {
+            time_limit_secs,
+            verbose,
+            stop_after_first_solution: false,
+        };
+
+        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, Some(&greedy_hints))
+            .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
+
+        // Apply cycle assignments
+        for (idx, op) in ssa_ops.iter_mut().enumerate() {
+            if idx < cpsat_result.cycle_assignments.len() {
+                op.cycle = cpsat_result.cycle_assignments[idx];
+            }
+        }
+
+        let cycles = cpsat_result.makespan;
+
+        if verbose {
+            eprintln!(
+                "SSA CP-SAT result: {} cycles (greedy was {})",
+                cycles, greedy_cycles
+            );
+        }
+
+        // Assign addresses via linear scan
+        let mut assign_config = AddressAssignConfig::default();
+
+        // Reserve address 0 for ZERO constant
+        if let Some(zero) = self.zero_vreg {
+            assign_config.fixed_vregs.insert(zero, 0);
+        }
+
+        let address_result = assign_addresses(&ssa_ops, &assign_config);
+
+        if address_result.budget_exceeded {
+            return Err(format!(
+                "Address assignment exceeded budget: peak_live={} > budget={}",
+                address_result.peak_live, address_result.budget
+            ));
+        }
+
+        // Lower to concrete ops (no VALU shifting for now)
+        let ops = lower_ssa_ops(&ssa_ops, &address_result.vreg_to_addr);
+
+        Ok(SsaScheduleResult {
+            ops,
+            cycles,
+            address_result,
+            vreg_count,
+            valu_shifted: 0,
+        })
+    }
+
     /// Schedule SSA ops using a greedy list scheduler with VALU→ALU shifting.
     ///
     /// When VALU slots are saturated but ALU has capacity, shiftable VALU ops
@@ -931,6 +1033,14 @@ fn can_ssa_valu_shift_to_alu(op: &SsaOp) -> bool {
 
     // Check if the opcode supports shifting
     op.opcode.can_shift_to_alu()
+}
+
+/// Lower SSA ops to concrete ops (no VALU shifting).
+fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
+    ssa_ops
+        .iter()
+        .map(|op| lower_ssa_op(op, vreg_to_addr))
+        .collect()
 }
 
 /// Lower SSA ops to concrete ops, expanding shifted VALU ops to ALU.
