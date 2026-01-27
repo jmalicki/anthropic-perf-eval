@@ -1077,9 +1077,11 @@ impl LiveInterval {
         Self { start, end }
     }
 
-    /// Check if this interval overlaps with another
+    /// Check if this interval overlaps with another.
+    /// Uses exclusive end: intervals [0,5] and [5,10] do NOT overlap
+    /// (A dies at end of cycle 5, B born at end of cycle 5, no simultaneous liveness)
     pub fn overlaps(&self, other: &LiveInterval) -> bool {
-        self.start <= other.end && other.start <= self.end
+        self.start < other.end && other.start < self.end
     }
 
     /// Check if this interval contains a specific cycle

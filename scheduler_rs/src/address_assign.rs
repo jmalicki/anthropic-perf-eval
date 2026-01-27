@@ -4,12 +4,40 @@
 //! assigns physical scratch addresses to virtual registers (VRegs) using
 //! linear scan allocation.
 //!
+//! ## Liveness Model: Same-Cycle Reuse
+//!
+//! The liveness model allows **same-cycle reuse**: a VReg that ends at cycle C
+//! can share storage with a VReg that starts at cycle C. This is valid because
+//! within a VLIW cycle, reads happen before writes:
+//!
+//! ```text
+//! Cycle 5:  [Read A] ... [Write B]
+//!           ^^^^^^^       ^^^^^^^
+//!           A is read     B is written
+//!
+//! Storage can be reused: A dies, then B is born in the same cycle.
+//! ```
+//!
+//! **Key implementation details:**
+//!
+//! - Live interval: `[def_cycle, last_use_cycle]` (both inclusive)
+//! - Intervals `[0,5]` and `[5,10]` do **NOT** overlap (5 is the transition point)
+//! - `LiveInterval::overlaps()` uses `<` comparison: `self.start < other.end`
+//! - Linear scan expires VRegs where `end_cycle <= current_start` (note: `<=`)
+//! - Peak liveness: births before deaths at same cycle (conservative for capacity check)
+//!
+//! This model must be consistent across:
+//! - `LiveInterval::overlaps()` in `types.rs`
+//! - `compute_peak_liveness()` event ordering
+//! - Linear scan expiration condition
+//! - Scheduler budget tracking (VRegs freed mid-cycle)
+//!
 //! ## Algorithm: Linear Scan Allocation
 //!
 //! 1. Compute live intervals: [def_cycle, last_use_cycle] for each VReg
 //! 2. Sort intervals by def_cycle (start)
 //! 3. For each VReg:
-//!    - Expire VRegs that ended before current def_cycle
+//!    - Expire VRegs that ended at or before current def_cycle (same-cycle reuse)
 //!    - Return expired addresses to free pool
 //!    - Allocate from free pool or extend allocation
 //!    - Record VReg -> address mapping
@@ -109,13 +137,14 @@ pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
     for (vreg, interval) in intervals {
         let size = vreg.size() as i64;
         events.push((interval.start, size));       // VReg becomes live
-        events.push((interval.end + 1, -size));    // VReg dies (after last use)
+        events.push((interval.end, -size));        // VReg dies at end of last use cycle
     }
 
-    // Sort by (cycle, delta) so deaths (negative) come before births (positive) at same cycle
-    // This correctly handles the boundary: a value dying and another being born at the same
-    // cycle means the dying value's space can be reused.
-    events.sort_by_key(|(cycle, delta)| (*cycle, *delta));
+    // Sort by cycle, then births before deaths at the same cycle.
+    // This ensures single-cycle intervals [N, N] are counted correctly (birth before death).
+    // For peak calculation, this is conservative (may overcount when A dies and B born at same cycle).
+    // The linear scan allocator uses separate logic to allow same-cycle reuse.
+    events.sort_by_key(|(cycle, delta)| (*cycle, if *delta > 0 { 0 } else { 1 }));
 
     let mut current = 0i64;
     let mut peak = 0i64;
@@ -196,9 +225,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
 
         let size = vreg.size();
 
-        // Expire intervals that ended before this one starts
+        // Expire intervals that ended at or before this one starts (allowing same-cycle reuse)
         while let Some(&Reverse((end_cycle, freed_addr, freed_size))) = active.peek() {
-            if end_cycle < interval.start {
+            if end_cycle <= interval.start {
                 active.pop();
                 // Return freed range to pool (don't free fixed ranges)
                 if !is_in_fixed_range(freed_addr, freed_size, &config.fixed_vregs) {

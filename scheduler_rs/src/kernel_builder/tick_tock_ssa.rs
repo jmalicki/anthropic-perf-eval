@@ -356,6 +356,13 @@ impl SsaTickTockKernelBuilder {
         let mut live_words: usize = 0;
         let mut live_vregs: HashSet<VReg> = HashSet::new();
 
+        // FIX: Track when each VReg was defined and last used (by scheduled cycle)
+        // This matches the linear scan allocator's liveness model:
+        // - VReg is live from def_cycle to last_use_cycle (inclusive)
+        // - VReg is dead starting at last_use_cycle + 1
+        let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
+        let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
+
         // Deferred ops that couldn't fit due to budget
         let mut deferred: VecDeque<usize> = VecDeque::new();
 
@@ -363,12 +370,36 @@ impl SsaTickTockKernelBuilder {
         let max_cycles = 50000;
 
         while scheduled.len() < ops.len() && cycle < max_cycles {
+            // FIX: At the START of each cycle, free VRegs whose last use was in a PREVIOUS cycle
+            // This matches the allocator's model: VReg is live at cycle C if start <= C <= end
+            // So if last_use_cycle < current_cycle, the VReg is no longer live
+            let vregs_to_free: Vec<VReg> = live_vregs
+                .iter()
+                .filter(|vreg| {
+                    // VReg can be freed if:
+                    // 1. All users have been scheduled (no remaining unscheduled users)
+                    // 2. The last use cycle is before the current cycle
+                    let no_remaining_users = vreg_remaining_users
+                        .get(vreg)
+                        .map_or(true, |&n| n == 0);
+                    let last_use_before_current = vreg_last_use_cycle
+                        .get(vreg)
+                        .map_or(false, |&c| c < cycle as i32);
+                    no_remaining_users && last_use_before_current
+                })
+                .cloned()
+                .collect();
+
+            for vreg in vregs_to_free {
+                live_vregs.remove(&vreg);
+                live_words = live_words.saturating_sub(vreg.size());
+            }
+
             let mut load_used = 0;
             let mut store_used = 0;
             let mut alu_used = 0;
             let mut valu_used = 0;
             let mut flow_used = 0;
-            let mut dying_vregs: Vec<VReg> = Vec::new();
             let mut scheduled_this_cycle = false;
 
             // Find ready ops (deps satisfied)
@@ -414,9 +445,22 @@ impl SsaTickTockKernelBuilder {
                     continue;
                 }
 
-                // Check scratch budget
+                // Check scratch budget with same-cycle reuse model:
+                // VRegs that will be freed when this op runs (their last use) reduce pressure.
                 let words_added = dest.map_or(0, |d| d.size());
-                let projected_live = live_words + words_added;
+                let mut words_freed = 0usize;
+                for src in &srcs {
+                    if let Operand::VReg(vreg) = src {
+                        // If this is the last use of vreg, it will be freed after this op
+                        if let Some(&remaining) = vreg_remaining_users.get(vreg) {
+                            if remaining == 1 && live_vregs.contains(vreg) {
+                                words_freed += vreg.size();
+                            }
+                        }
+                    }
+                }
+                // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
+                let projected_live = live_words + words_added - words_freed;
                 if projected_live > scratch_budget {
                     // Defer this op - it might fit later when liveness decreases
                     if !deferred.contains(&idx) {
@@ -446,33 +490,43 @@ impl SsaTickTockKernelBuilder {
                 scheduled.insert(idx);
                 scheduled_this_cycle = true;
 
-                // Update live tracking
+                // Update live tracking for destination VReg
                 if let Some(d) = dest {
                     if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
                         live_vregs.insert(d);
                         live_words += d.size();
                     }
+                    // Track when this VReg was defined
+                    vreg_def_cycle.insert(d, cycle as i32);
                 }
 
-                // Update remaining users and track deaths
+                // Update remaining users and last use cycle for source VRegs
+                // With same-cycle reuse model: VRegs can be freed immediately after their
+                // last use is scheduled, allowing other ops in the same cycle to reuse the space.
+                // This matches the allocator's model where A[0,5] and B[5,10] can share storage.
                 for src in &srcs {
                     if let Operand::VReg(vreg) = src {
+                        // Update last use cycle
+                        vreg_last_use_cycle
+                            .entry(*vreg)
+                            .and_modify(|c| *c = (*c).max(cycle as i32))
+                            .or_insert(cycle as i32);
+
+                        // Decrement remaining users count
                         if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
                             *remaining = remaining.saturating_sub(1);
+                            // Free VReg immediately when last user is scheduled (same-cycle reuse)
+                            // This is safe because reads happen before writes within a cycle.
                             if *remaining == 0 && live_vregs.contains(vreg) {
-                                dying_vregs.push(*vreg);
+                                live_vregs.remove(vreg);
+                                live_words = live_words.saturating_sub(vreg.size());
                             }
                         }
                     }
                 }
             }
 
-            // Process deaths at end of cycle
-            for vreg in dying_vregs {
-                if live_vregs.remove(&vreg) {
-                    live_words = live_words.saturating_sub(vreg.size());
-                }
-            }
+            // VRegs that were freed mid-cycle can be reused by ops scheduled later in the same cycle.
 
             // If we scheduled something, re-try deferred ops (liveness may have decreased)
             if scheduled_this_cycle {
@@ -492,11 +546,7 @@ impl SsaTickTockKernelBuilder {
                 let srcs: Vec<Operand> = ops[idx].srcs.clone();
 
                 // Find a cycle with available slots
-                let mut target_cycle = cycle;
-                loop {
-                    // Simple slot check (not tracking per-cycle usage here)
-                    break;
-                }
+                let target_cycle = cycle;
 
                 ops[idx].cycle = target_cycle as i32;
                 scheduled.insert(idx);
@@ -512,17 +562,18 @@ impl SsaTickTockKernelBuilder {
                         live_vregs.insert(d);
                         live_words += d.size();
                     }
+                    vreg_def_cycle.insert(d, target_cycle as i32);
                 }
 
                 for src in &srcs {
                     if let Operand::VReg(vreg) = src {
+                        vreg_last_use_cycle
+                            .entry(*vreg)
+                            .and_modify(|c| *c = (*c).max(target_cycle as i32))
+                            .or_insert(target_cycle as i32);
+
                         if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
                             *remaining = remaining.saturating_sub(1);
-                            if *remaining == 0 {
-                                if live_vregs.remove(vreg) {
-                                    live_words = live_words.saturating_sub(vreg.size());
-                                }
-                            }
                         }
                     }
                 }
@@ -1453,22 +1504,27 @@ mod tests {
 
     /// Test that greedy scheduler delays ops when scratch budget would be exceeded.
     ///
-    /// Simple sequential chain where each op depends on the previous.
+    /// Sequential chain where VRegs overlap (no same-cycle reuse opportunity).
     #[test]
     fn test_greedy_scratch_budget_delays_ops() {
-        // Simple sequential chain - no complex liveness interactions:
+        // Sequential chain where v0 is used by MULTIPLE ops:
         // op0: broadcast -> v0 (8 words)
-        // op1: valu(v0) -> v1 (8 words), dep on 0 (v0 dies)
-        // op2: valu(v1) -> v2 (8 words), dep on 1 (v1 dies)
+        // op1: valu(v0) -> v1 (8 words), dep on 0 (v0 still live - used by op2)
+        // op2: valu(v0, v1) -> v2 (8 words), dep on 1 (v0, v1 die via same-cycle reuse)
         //
-        // Peak: 16 words (at op1: v0 live + v1 born)
+        // With same-cycle reuse model:
+        // - Cycle 0: op0, v0 born (8 words)
+        // - Cycle 1: op1, v0 still live (used by op2), v1 born (16 words) PEAK
+        // - Cycle 2: op2, v0+v1 die, v2 born (8 words)
+        //
+        // Peak: 16 words (at cycle 1: v0 + v1)
         let mut ops = vec![
             make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            // Use Add with same VReg twice to simulate unary op
             make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
                 vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            // op2 uses BOTH v0 and v1 - this creates the peak at cycle 1
             make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![1]),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1481,7 +1537,7 @@ mod tests {
         );
         assert!(result.is_ok(), "Budget=16 should succeed: {:?}", result.err());
 
-        // With budget=8, should fail (peak is 16)
+        // With budget=8, should fail (peak is 16, can't schedule op1 which needs v0+v1 space)
         let mut shifted2 = HashSet::new();
         let result2 = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops.clone(), false, &mut shifted2, 8
@@ -1590,11 +1646,11 @@ mod tests {
         println!("Tight budget: {} cycles", cycles_tight);
     }
 
-    /// Test that greedy scheduler's liveness counting matches verification.
-    /// VRegs are live from def_cycle through last_use_cycle (inclusive).
+    /// Test that greedy scheduler's liveness counting with same-cycle reuse.
     ///
-    /// This test verifies that the scheduler correctly counts live words
-    /// at the moment of scheduling (not freeing space prematurely).
+    /// With same-cycle reuse model: VRegs that die when an op runs (their last use)
+    /// are freed BEFORE the new VReg's space is needed. This correctly models
+    /// that reads happen before writes within a cycle.
     #[test]
     fn test_greedy_liveness_matches_verification() {
         // Simple chain where we can verify the peak liveness:
@@ -1602,13 +1658,14 @@ mod tests {
         // op1: broadcast -> v1 (8 words), depends on op0 (forces sequential)
         // op2: valu(v0, v1) -> v2 (8 words)
         //
-        // Timeline:
+        // Timeline with same-cycle reuse:
         // Cycle 0: op0 runs, v0 live = 8 words
-        // Cycle 1: op1 runs, v0 still live (used by op2), v1 born = 16 words
-        // Cycle 2: op2 runs, v0 (last use), v1 (last use), v2 born
-        //          At this moment: v0 + v1 + v2 = 24 words PEAK
+        // Cycle 1: op1 runs, v0 still live (used by op2), v1 born = 16 words PEAK
+        // Cycle 2: op2 runs, v0 and v1 are last used (freed via same-cycle reuse), v2 born
+        //          Net pressure change: +8 (v2) - 16 (v0+v1) = 8 words
         //
-        // With budget=24, this should succeed. With budget=16, it should fail.
+        // Peak is 16 words (at cycle 1). With same-cycle reuse, op2 can schedule
+        // even with budget=16 because it frees v0+v1 before needing v2's space.
         let mut ops = vec![
             make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
             make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![0]), // dep on 0
@@ -1619,38 +1676,41 @@ mod tests {
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
 
-        // With budget=24, should succeed
+        // With budget=16, should succeed (peak is 16 at cycle 1)
         let mut shifted = HashSet::new();
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted, 24
+            &mut ops.clone(), false, &mut shifted, 16
         );
-        assert!(result.is_ok(), "Budget=24 should succeed, peak is 24");
+        assert!(result.is_ok(), "Budget=16 should succeed, peak is 16");
 
-        // With budget=16, should fail because peak is 24
+        // With budget=8, should fail because peak is 16 (v0+v1 at cycle 1)
         let mut shifted2 = HashSet::new();
         let result2 = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted2, 16
+            &mut ops.clone(), false, &mut shifted2, 8
         );
-        assert!(result2.is_err(), "Budget=16 should fail because peak is 24 (v0+v1+v2 during op2)");
+        assert!(result2.is_err(), "Budget=8 should fail because peak is 16 (v0+v1 at cycle 1)");
     }
 
     /// Test that greedy scheduler correctly tracks VReg deaths.
     /// When a VReg's last user is scheduled, that VReg should no longer count
-    /// against the live budget.
+    /// against the live budget (same-cycle reuse).
     #[test]
     fn test_greedy_scratch_budget_vreg_death() {
         // Create a chain where early VRegs are consumed, freeing space for later ones.
         // op0: broadcast -> v0 (8 words)
         // op1: broadcast -> v1 (8 words)
-        // op2: valu(v0, v1) -> v2 (8 words) - v0, v1 die here
-        // op3: broadcast -> v3 (8 words) - can now fit because v0, v1 are dead
+        // op2: valu(v0, v1) -> v2 (8 words) - v0, v1 die here (same-cycle reuse)
+        // op3: broadcast -> v3 (8 words) - depends on op0, so ready at cycle 1
         // op4: valu(v2, v3) -> v4 (8 words)
+        //
+        // NOTE: op3 needs a dependency so it's not greedily scheduled at cycle 0.
+        // We add dep on op0 so op3 becomes ready at cycle 1.
         let mut ops = vec![
             make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
             make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
             make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
                 vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)), vec![Operand::Imm(3)], vec![]),
+            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)), vec![Operand::Imm(3)], vec![0]), // dep on op0
             make_test_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)),
                 vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
         ];
@@ -1659,13 +1719,13 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        // With budget=24 (3 vectors), if death tracking works:
+        // With budget=24 (3 vectors) and same-cycle reuse:
         // - Cycle 0: op0, op1 -> v0, v1 live (16 words)
-        // - Cycle 1: op2 -> v0, v1 die, v2 born (8 words)
-        //            op3 -> v3 born (16 words total) - fits!
+        // - Cycle 1: op2 -> v0, v1 die (same-cycle reuse), v2 born (8 words)
+        //            op3 -> v3 born (v2 + v3 = 16 words) - fits!
         // - Cycle 2: op4 -> v2, v3 die, v4 born
         //
-        // If death tracking doesn't work, op3 would be delayed unnecessarily.
+        // Without same-cycle reuse, op3 would be delayed to cycle 2.
         let cycles = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops, false, &mut shifted, 24
         ).expect("Should find feasible schedule");
@@ -1675,9 +1735,9 @@ mod tests {
             println!("  op{}: {:?} -> cycle {}", op.id, op.engine, op.cycle);
         }
 
-        // With proper death tracking, schedule should be 3 cycles (critical path)
-        // Without death tracking, it would be longer
-        assert!(cycles <= 3, "With death tracking, schedule should be at most 3 cycles, got {}", cycles);
+        // With same-cycle reuse, schedule should be 3 cycles (critical path)
+        // Without same-cycle reuse, it would be longer
+        assert!(cycles <= 3, "With same-cycle reuse, schedule should be at most 3 cycles, got {}", cycles);
     }
 
     // =========================================================================
@@ -1796,11 +1856,22 @@ mod tests {
     fn test_non_overlapping_vregs_can_share_addresses() {
         use crate::address_assign::{assign_addresses, AddressAssignConfig};
 
-        // Create ops where s0 dies before s2 is born:
+        // Create ops where VRegs have non-overlapping lifetimes:
         // op0: const -> s0 (def cycle 0)
-        // op1: alu(s0, s0) -> s1 (cycle 1, s0 dies)
-        // op2: const -> s2 (def cycle 5, s0 already dead)
-        // op3: alu(s1, s2) -> s3 (cycle 6)
+        // op1: alu(s0, s0) -> s1 (cycle 1, s0 last used)
+        // op2: const -> s2 (def cycle 5)
+        // op3: alu(s1, s2) -> s3 (cycle 6, s1 and s2 last used)
+        //
+        // Intervals:
+        // - s0: [0, 1] - dies when s1 is born
+        // - s1: [1, 6] - lives through to op3
+        // - s2: [5, 6] - overlaps with s1 at cycles 5-6
+        // - s3: [6, 6] - can reuse after s1 and s2 die
+        //
+        // With same-cycle reuse (< comparison for overlaps):
+        // - s0 and s1 do NOT overlap (0 < 6 && 1 < 1 is false) -> s1 CAN reuse s0
+        // - s1 and s2 overlap (1 < 6 && 5 < 6 is true) -> different addresses
+        // - s1/s2 and s3 do NOT overlap -> s3 CAN reuse s1 or s2
         let mut ops = vec![
             make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
             make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
@@ -1812,19 +1883,31 @@ mod tests {
 
         ops[0].cycle = 0;
         ops[1].cycle = 1;  // s0 last used here
-        ops[2].cycle = 5;  // s2 defined here (s0 dead since cycle 1)
+        ops[2].cycle = 5;  // s2 defined here
         ops[3].cycle = 6;
 
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&ops, &config);
 
         let addr_s0 = result.vreg_to_addr.get(&VReg::scalar(0)).expect("s0 should have address");
+        let addr_s1 = result.vreg_to_addr.get(&VReg::scalar(1)).expect("s1 should have address");
         let addr_s2 = result.vreg_to_addr.get(&VReg::scalar(2)).expect("s2 should have address");
+        let addr_s3 = result.vreg_to_addr.get(&VReg::scalar(3)).expect("s3 should have address");
 
-        // s0 and s2 CAN share addresses (non-overlapping), but don't have to
-        // The allocator should be able to reuse s0's address for s2
-        println!("Non-overlapping VRegs: s0={}, s2={}", addr_s0, addr_s2);
-        assert_eq!(addr_s0, addr_s2,
-            "Non-overlapping VRegs s0 and s2 should share address for efficiency");
+        println!("Addresses: s0={}, s1={}, s2={}, s3={}", addr_s0, addr_s1, addr_s2, addr_s3);
+
+        // With same-cycle reuse, s0 and s1 can share (s1 reuses s0's address when s0 dies)
+        // s2 needs its own address (overlaps with s1)
+        // s3 can reuse after s1 and s2 die
+        assert_eq!(addr_s0, addr_s1,
+            "s0 and s1 should share address (s1 born when s0 dies via same-cycle reuse)");
+        assert_ne!(addr_s1, addr_s2,
+            "s1 and s2 should have different addresses (they overlap at cycles 5-6)");
+
+        // Verify efficient reuse: max_addr should be 2 (addresses 1 and 2 used)
+        // 4 VRegs, 2 unique addresses = good reuse
+        assert!(result.max_addr <= 2,
+            "Should use at most 2 addresses for 4 non-simultaneous-live scalars, got max_addr={}",
+            result.max_addr);
     }
 }

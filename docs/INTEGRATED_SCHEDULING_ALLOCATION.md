@@ -352,22 +352,39 @@ for o in topo_order.iter().rev() {
 
 Since we only need *feasible* allocation (not optimal), we don't need address assignment variables in the CP model. We only need to track live ranges to check capacity.
 
+**Liveness Model: Same-Cycle Reuse**
+
+The liveness model allows **same-cycle reuse**: a VReg ending at cycle C can share storage with a VReg starting at cycle C. This is valid because within a VLIW cycle, reads happen before writes:
+
+```text
+Cycle 5:  [Read A] ... [Write B]
+          ^^^^^^^       ^^^^^^^
+          A is read     B is written
+
+Storage can be reused: A dies, then B is born in the same cycle.
+Intervals [0,5] and [5,10] do NOT overlap at cycle 5.
+```
+
+**Key implication for CP-SAT:** Interval end times should be `last_use_cycle` (not `last_use_cycle + 1`), and the cumulative constraint should use **exclusive end** semantics where intervals ending at time T do not contribute to capacity at time T.
+
 **Live Range Intervals:**
 
 ```rust
-// Each temporary has a live range from definition to last use
-// This is used ONLY for capacity checking via cumulative constraint
+// Each temporary has a live range from definition to last use (inclusive)
+// Same-cycle reuse: intervals [0,5] and [5,10] do NOT overlap
 let live_interval: Vec<IntervalVar> = temporaries.iter().enumerate().map(|(i, temp)| {
     let def_cycle = cycle[temp.def_op];
-    let end_cycle = cycle[temp.last_use_op] + 1;
+    let end_cycle = cycle[temp.last_use_op];  // NOT +1: same-cycle reuse model
     model.new_interval_var(
         def_cycle,
-        end_cycle - def_cycle,  // duration of live range
-        end_cycle,
+        end_cycle - def_cycle + 1,  // duration includes last use cycle
+        end_cycle + 1,              // exclusive end for cumulative constraint
         format!("live_{}", i)
     )
 }).collect();
 ```
+
+**Note:** The cumulative constraint in CP-SAT uses half-open intervals `[start, end)`. A VReg last used at cycle 5 should have `end=6` in the interval variable so it contributes to capacity through cycle 5 but not cycle 6. This allows another VReg starting at cycle 5 to reuse the storage (they briefly coexist at cycle 5, but reads-before-writes makes this safe).
 
 **No Address Variables Needed:** We don't create `addr[t]` variables in the CP model. The cumulative constraint checks that `Σ sizes ≤ budget` at every cycle—this guarantees a valid allocation *exists*. Actual address assignment happens post-scheduling with linear scan.
 

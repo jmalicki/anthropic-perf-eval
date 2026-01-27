@@ -1607,6 +1607,10 @@ impl SsaLivenessTracker {
 
     /// Check if scheduling an op at the given cycle would exceed the budget.
     /// Returns the projected live words after scheduling.
+    ///
+    /// Uses same-cycle reuse model: VRegs that are last consumed by this op will be
+    /// freed, reducing pressure. This correctly models that reads happen before writes
+    /// within a cycle, so dying VRegs' storage can be reused for new VRegs.
     fn projected_live_after_schedule(&self, op: &SsaOp, _cycle: i32) -> usize {
         let mut projected = self.live_words;
 
@@ -1615,9 +1619,18 @@ impl SsaLivenessTracker {
             projected += dest.size();
         }
 
-        // VRegs consumed by this op that have no other consumers will die
-        // But they're still live *during* this cycle (read happens before write)
-        // So for pressure calculation, we add the new VReg first
+        // VRegs consumed by this op that have no other consumers will die.
+        // With same-cycle reuse, we subtract their space since reads happen before writes.
+        for src in &op.srcs {
+            if let Operand::VReg(vreg) = src {
+                if let Some((_def_cycle, size, remaining)) = self.vreg_info.get(vreg) {
+                    // If this is the last consumer (remaining == 1), the VReg dies
+                    if *remaining == 1 {
+                        projected = projected.saturating_sub(*size);
+                    }
+                }
+            }
+        }
 
         projected
     }
