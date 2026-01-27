@@ -11,6 +11,15 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 - Current best: 1,764 cycles (83.7x speedup)
 - Target: 1,487 cycles (100x speedup)
 
+## Default Problem Size
+
+The benchmark uses these default parameters:
+- `forest_height=10` - Tree depth (2^10 - 1 = 2047 nodes)
+- `batch_size=256` - Number of parallel traversals
+- `rounds=16` - Hash rounds per traversal
+
+These values are consistent across all test scripts and should be used when benchmarking.
+
 ## Build & Development Commands
 
 ### Python Setup
@@ -49,7 +58,10 @@ python test_optimized.py
 # Generate with default settings (greedy scheduler - fast)
 python generate_precomputed_kernel.py --use-greedy
 
-# Generate with CP-SAT optimization (slow but better)
+# Generate with CP-SAT optimization (10 min recommended - worth the wait)
+python generate_precomputed_kernel.py --full-solve-time 600
+
+# For best results (1 hour, diminishing returns after 10 min)
 python generate_precomputed_kernel.py --full-solve-time 3600
 
 # Common options:
@@ -59,6 +71,11 @@ python generate_precomputed_kernel.py --full-solve-time 3600
 #   --enable-chunked-gather     Use chunked vload for tree access
 #   --output PATH               Output file (default: solver/precomputed_kernel.py)
 ```
+
+**Scheduler Selection Guide:**
+- **Greedy** (`--use-greedy`): Development iteration, testing (2-3 seconds)
+- **CP-SAT 10 min** (`--full-solve-time 600`): Production runs, benchmarking (recommended)
+- **CP-SAT 1 hour** (`--full-solve-time 3600`): Final optimization attempts (diminishing returns)
 
 ### Running Experiments
 ```bash

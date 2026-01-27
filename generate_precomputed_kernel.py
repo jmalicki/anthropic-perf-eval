@@ -21,7 +21,7 @@ def generate_precomputed_kernel(
     n_nodes: int = 2047,
     batch_size: int = 256,
     rounds: int = 16,
-    full_solve_time: float = 3600.0,
+    full_solve_time: float = 600.0,
     require_optimal: bool = True,
     enable_valu_shift: bool = True,
     valu_shift_time: float = None,
@@ -214,8 +214,8 @@ def main():
     parser.add_argument("--n-nodes", type=int, default=2047)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=16)
-    parser.add_argument("--full-solve-time", type=float, default=3600.0,
-                        help="Time limit for CP-SAT full solve in seconds (default: 3600)")
+    parser.add_argument("--full-solve-time", type=float, default=600.0,
+                        help="Time limit for CP-SAT full solve in seconds (default: 600, i.e. 10 min; recommended starting point)")
     parser.add_argument("--require-optimal", action="store_true", default=True,
                         help="Require OPTIMAL status from CP-SAT (default: True)")
     parser.add_argument("--no-require-optimal", action="store_false", dest="require_optimal",
