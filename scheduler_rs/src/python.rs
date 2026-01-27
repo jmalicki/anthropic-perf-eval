@@ -2148,9 +2148,9 @@ use crate::kernel_builder::SsaTickTockKernelBuilder;
 /// If verbose is true, prints progress information.
 /// If enable_valu_shift is true (default), VALU ops are shifted to ALU when VALU is saturated.
 /// If use_cpsat is true, uses CP-SAT scheduler instead of greedy (operates on SSA before register allocation).
-/// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 60 seconds).
+/// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=60.0))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=600.0))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,

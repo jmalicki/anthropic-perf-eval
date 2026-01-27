@@ -353,7 +353,7 @@ impl<'a> Default for CpsatConfig<'a> {
     fn default() -> Self {
         Self {
             scratch_budget: 0,
-            time_limit_secs: 60.0, // Sensible default: 60 seconds
+            time_limit_secs: 600.0, // Default: 10 minutes
             greedy_hints: None,
             shift_hints: None,
             enable_valu_shift: false,
@@ -812,9 +812,8 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         params.stop_after_first_solution = Some(true);
     }
 
-    if verbose {
-        params.log_search_progress = Some(true);
-    }
+    // Always log search progress by default - user must go out of their way to suppress
+    params.log_search_progress = Some(true);
 
     // 11. Solve
     let response = model.solve_with_parameters(&params);
@@ -1627,7 +1626,8 @@ pub fn schedule_ssa_cpsat(
     // 12. Configure solver
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
-    params.log_search_progress = Some(verbose);
+    // Always log search progress by default - user must go out of their way to suppress
+    params.log_search_progress = Some(true);
     params.num_workers = Some(8);
 
     if stop_after_first_solution {
