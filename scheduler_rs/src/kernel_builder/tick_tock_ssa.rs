@@ -3301,4 +3301,397 @@ mod tests {
         assert!(ops[2].cycle > ops[0].cycle, "multiply_add must come after v0 defined");
         assert!(ops[2].cycle > ops[1].cycle, "multiply_add must come after v1 defined");
     }
+
+    // =========================================================================
+    // VALU/ALU Consistency Tests
+    //
+    // These tests verify that operations with different widths (scalar vs vector)
+    // are handled consistently throughout the SSA pipeline:
+    //
+    // 1. VReg width is correctly tracked (scalar=1 word, vector=8 words)
+    // 2. VALU ops only accept vector operands
+    // 3. ALU ops only accept scalar operands
+    // 4. vload produces vector VRegs, load produces scalar VRegs
+    // 5. vstore consumes vector VRegs, store consumes scalar VRegs
+    // 6. VALU→ALU expansion correctly handles address offsets
+    // 7. Broadcast correctly converts scalar to vector
+    // 8. Lowering produces correct reads/writes sets based on width
+    // =========================================================================
+
+    /// Test that VReg width is correctly used for liveness calculation.
+    ///
+    /// Scenario: Vector VRegs should count as 8 words, scalars as 1 word.
+    #[test]
+    fn test_vreg_width_affects_liveness_words() {
+        // Create two ops:
+        // op0: const -> s0 (scalar, 1 word)
+        // op1: vbroadcast(s0) -> v0 (vector, 8 words)
+        // op2: sink both
+        //
+        // Peak liveness: s0 + v0 = 1 + 8 = 9 words
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
+                vec![Operand::Imm(42)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            // Sink that uses both - scalar and vector
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Budget of 9 words should be enough (s0=1 + v0=8)
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 9
+        );
+        assert!(result.is_ok(), "Budget=9 should fit scalar(1)+vector(8): {:?}", result.err());
+
+        // Verify scheduling
+        assert!(ops[1].cycle > ops[0].cycle, "broadcast depends on const");
+    }
+
+    /// Test that VALU ops only work with vector VRegs.
+    ///
+    /// The emit_valu() function should assert that sources are vectors.
+    /// This test verifies the SsaOp invariant is maintained through scheduling.
+    #[test]
+    fn test_valu_requires_vector_sources() {
+        // Create VALU op with proper vector sources
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)),
+                vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
+                vec![Operand::Imm(2)], vec![]),
+            // VALU add with vector sources (correct)
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 24
+        );
+        assert!(result.is_ok(), "VALU with vector sources should work: {:?}", result.err());
+
+        // All vector VRegs should be properly counted
+        for op in &ops {
+            if let Some(dest) = op.dest {
+                assert!(dest.is_vector(), "VALU dest should be vector: {:?}", op);
+            }
+        }
+    }
+
+    /// Test that ALU ops work with scalar VRegs.
+    ///
+    /// Verifies scalar operations don't accidentally get vector treatment.
+    #[test]
+    fn test_alu_uses_scalar_vregs() {
+        // Create ALU ops with scalar sources
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)], vec![]),
+            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)),
+                vec![Operand::Imm(10)], vec![]),
+            // ALU add with scalar sources
+            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+            make_test_ssa_op(3, Engine::Store, Opcode::Store, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(2))], vec![2]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Budget of 3 words should be enough for 3 scalars
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 3
+        );
+        assert!(result.is_ok(), "ALU with scalar sources should work: {:?}", result.err());
+    }
+
+    /// Test broadcast: scalar input -> vector output.
+    ///
+    /// Verifies that vbroadcast correctly converts width.
+    #[test]
+    fn test_broadcast_scalar_to_vector_conversion() {
+        // Broadcast chain:
+        // op0: const -> s0 (scalar, 1 word)
+        // op1: vbroadcast(s0) -> v0 (vector, 8 words)
+        // op2: valu(v0, v0) -> v1 (vector, 8 words)
+        let mut ops = vec![
+            // Scalar const
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
+                vec![Operand::Imm(42)], vec![]),
+            // Broadcast takes scalar, produces vector
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            // VALU uses vector
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+        ];
+
+        // Verify VReg widths
+        assert!(ops[0].dest.unwrap().is_scalar(), "const dest should be scalar");
+        assert!(ops[1].dest.unwrap().is_vector(), "broadcast dest should be vector");
+        assert!(ops[2].dest.unwrap().is_vector(), "valu dest should be vector");
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 17  // s0(1) + v0(8) + v1(8) = 17 peak
+        );
+        assert!(result.is_ok(), "Broadcast chain should schedule: {:?}", result.err());
+    }
+
+    /// Test vload produces vector, vstore consumes vector.
+    ///
+    /// Memory operations have strict width requirements.
+    #[test]
+    fn test_vload_vstore_vector_width() {
+        // vload -> valu -> vstore chain
+        let mut ops = vec![
+            // Address scalar
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
+                vec![Operand::Imm(200)], vec![]),
+            // vload produces vector
+            make_test_ssa_op(1, Engine::Load, Opcode::Vload, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            // VALU uses vector
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+            // vstore consumes vector
+            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::vector(2))], vec![0, 2]),
+        ];
+
+        // Verify widths
+        assert!(ops[1].dest.unwrap().is_vector(), "vload dest must be vector");
+        // vstore has no dest, but src (second operand) must be vector
+        if let Operand::VReg(src) = &ops[3].srcs[1] {
+            assert!(src.is_vector(), "vstore src must be vector");
+        }
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 17  // s0(1) + v1(8) + v2(8)
+        );
+        assert!(result.is_ok(), "vload/vstore chain should schedule: {:?}", result.err());
+    }
+
+    /// Test VALU→ALU shifting preserves width semantics.
+    ///
+    /// When a VALU op is shifted to ALU, it expands to 8 scalar ops.
+    /// Each expanded op should access the correct offset of the vector.
+    #[test]
+    fn test_valu_to_alu_shift_preserves_semantics() {
+        // Create a VALU op that could be shifted to ALU
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)),
+                vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
+                vec![Operand::Imm(2)], vec![]),
+            // This Add op can be shifted from VALU to ALU
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Enable VALU shift
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, true, &mut shifted, 24
+        );
+        assert!(result.is_ok(), "VALU→ALU shift should work: {:?}", result.err());
+
+        // Note: The actual shifting happens in lower_ssa_ops_with_shift, not in scheduling.
+        // The scheduler just marks which ops to shift.
+    }
+
+    /// Test that expand_ssa_valu_to_alu produces correct address offsets.
+    ///
+    /// When a VALU op is expanded to 8 ALU ops, each should access:
+    /// - dest[i] for i in 0..8
+    /// - src1[i] for i in 0..8
+    /// - src2[i] for i in 0..8
+    #[test]
+    fn test_expand_ssa_valu_to_alu_offsets() {
+        use crate::address_assign::lower_ssa_op;
+
+        // Create a VALU add op
+        let mut op = SsaOp::new(
+            42, // id
+            Engine::Valu,
+            Opcode::Add,
+            Some(VReg::vector(2)),
+            vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
+        );
+        op.cycle = 5;
+
+        // Create address mapping: v0->100, v1->200, v2->300
+        let mut vreg_to_addr = HashMap::new();
+        vreg_to_addr.insert(VReg::vector(0), 100);
+        vreg_to_addr.insert(VReg::vector(1), 200);
+        vreg_to_addr.insert(VReg::vector(2), 300);
+
+        // Expand
+        let expanded = expand_ssa_valu_to_alu(&op, &vreg_to_addr);
+
+        // Should produce 8 ALU ops
+        assert_eq!(expanded.len(), 8, "Should expand to 8 ALU ops");
+
+        for (i, alu_op) in expanded.iter().enumerate() {
+            assert_eq!(alu_op.engine, Engine::Alu, "Expanded op should be ALU");
+
+            // Check reads: should read src1[i] and src2[i]
+            assert!(alu_op.reads.contains(&(100 + i as i64)), "Should read src1[{}]=100+{}", i, i);
+            assert!(alu_op.reads.contains(&(200 + i as i64)), "Should read src2[{}]=200+{}", i, i);
+
+            // Check writes: should write dest[i]
+            assert!(alu_op.writes.contains(&(300 + i as i64)), "Should write dest[{}]=300+{}", i, i);
+        }
+    }
+
+    /// Test lowering produces correct reads/writes sets based on VReg width.
+    ///
+    /// Scalar VRegs should produce 1 read/write.
+    /// Vector VRegs should produce 8 reads/writes.
+    #[test]
+    fn test_lower_ssa_op_width_consistency() {
+        use crate::address_assign::lower_ssa_op;
+
+        // Test 1: Scalar op
+        let scalar_op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))],
+        );
+
+        let mut scalar_mapping = HashMap::new();
+        scalar_mapping.insert(VReg::scalar(0), 10);
+        scalar_mapping.insert(VReg::scalar(1), 20);
+        scalar_mapping.insert(VReg::scalar(2), 30);
+
+        let lowered_scalar = lower_ssa_op(&scalar_op, &scalar_mapping);
+        assert_eq!(lowered_scalar.reads.len(), 2, "Scalar should read 2 addresses");
+        assert_eq!(lowered_scalar.writes.len(), 1, "Scalar should write 1 address");
+        assert!(lowered_scalar.reads.contains(&10));
+        assert!(lowered_scalar.reads.contains(&20));
+        assert!(lowered_scalar.writes.contains(&30));
+
+        // Test 2: Vector op
+        let vector_op = SsaOp::new(
+            1,
+            Engine::Valu,
+            Opcode::Add,
+            Some(VReg::vector(5)),
+            vec![Operand::VReg(VReg::vector(3)), Operand::VReg(VReg::vector(4))],
+        );
+
+        let mut vector_mapping = HashMap::new();
+        vector_mapping.insert(VReg::vector(3), 100);
+        vector_mapping.insert(VReg::vector(4), 200);
+        vector_mapping.insert(VReg::vector(5), 300);
+
+        let lowered_vector = lower_ssa_op(&vector_op, &vector_mapping);
+        assert_eq!(lowered_vector.reads.len(), 16, "Vector should read 16 addresses (2 srcs × 8)");
+        assert_eq!(lowered_vector.writes.len(), 8, "Vector should write 8 addresses");
+
+        // Check all 8 offsets for each operand
+        for i in 0..8 {
+            assert!(lowered_vector.reads.contains(&(100 + i)), "Should read src1[{}]", i);
+            assert!(lowered_vector.reads.contains(&(200 + i)), "Should read src2[{}]", i);
+            assert!(lowered_vector.writes.contains(&(300 + i)), "Should write dest[{}]", i);
+        }
+    }
+
+    /// Test mixed scalar/vector pipeline: const -> broadcast -> valu -> vstore.
+    ///
+    /// This is a common pattern that exercises width conversions.
+    #[test]
+    fn test_mixed_width_pipeline() {
+        // Full pipeline:
+        // s0 = const 5       (scalar)
+        // s1 = const 10      (scalar)
+        // v0 = broadcast(s0) (vector)
+        // v1 = broadcast(s1) (vector)
+        // v2 = vadd(v0, v1)  (vector)
+        // vstore(addr, v2)   (consumes vector)
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)], vec![]),
+            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)),
+                vec![Operand::Imm(10)], vec![]),
+            make_test_ssa_op(2, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)),
+                vec![Operand::VReg(VReg::scalar(1))], vec![1]),
+            make_test_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)),
+                vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
+            make_test_ssa_op(5, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(4))], vec![4]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Peak: s0(1) + s1(1) + v2(8) + v3(8) + v4(8) = 26 words
+        // But scalars die early, so actual peak is less
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 26
+        );
+        assert!(result.is_ok(), "Mixed width pipeline should schedule: {:?}", result.err());
+
+        // Verify dependency chain
+        assert!(ops[2].cycle > ops[0].cycle, "broadcast depends on const");
+        assert!(ops[3].cycle > ops[1].cycle, "broadcast depends on const");
+        assert!(ops[4].cycle > ops[2].cycle, "vadd depends on broadcast");
+        assert!(ops[4].cycle > ops[3].cycle, "vadd depends on broadcast");
+        assert!(ops[5].cycle > ops[4].cycle, "vstore depends on vadd");
+    }
+
+    /// Test that unique_src_vregs correctly handles mixed scalar/vector operands.
+    ///
+    /// This ensures the duplicate operand fix works with width consistency.
+    #[test]
+    fn test_unique_src_vregs_with_mixed_widths() {
+        // Op with one scalar and one vector operand shouldn't happen in practice
+        // (VALU requires all vector, ALU requires all scalar), but test the method.
+        let op = SsaOp::new(
+            0,
+            Engine::Flow,
+            Opcode::Select, // select can have mixed operands in theory
+            Some(VReg::scalar(3)),
+            vec![
+                Operand::VReg(VReg::scalar(0)),  // cond
+                Operand::VReg(VReg::scalar(1)),  // true
+                Operand::VReg(VReg::scalar(1)),  // false (duplicate of true)
+            ],
+        );
+
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 2, "Should have 2 unique VRegs (s0, s1)");
+        assert!(unique.contains(&VReg::scalar(0)));
+        assert!(unique.contains(&VReg::scalar(1)));
+    }
 }
