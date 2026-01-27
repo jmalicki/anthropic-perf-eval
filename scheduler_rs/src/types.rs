@@ -896,7 +896,7 @@ pub fn resolve_pseudo_const(
 // ============================================================================
 
 /// Virtual register width - scalar (1 word) or vector (VLEN words)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum VRegWidth {
     Scalar,
     Vector,
@@ -910,7 +910,7 @@ pub enum VRegWidth {
 /// - No false WAW or WAR dependencies
 ///
 /// Physical addresses are assigned after scheduling via linear scan allocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VReg {
     /// Unique identifier within the kernel
     pub id: u32,
@@ -1025,6 +1025,9 @@ pub struct SsaOp {
 
     /// If this op produces a known constant value
     pub produces_constant: Option<i64>,
+
+    /// Source location for debugging (file:line where this op was emitted)
+    pub source: Option<&'static std::panic::Location<'static>>,
 }
 
 impl SsaOp {
@@ -1039,6 +1042,7 @@ impl SsaOp {
             dep_ids: HashSet::new(),
             cycle: -1,
             produces_constant: None,
+            source: None,
         }
     }
 

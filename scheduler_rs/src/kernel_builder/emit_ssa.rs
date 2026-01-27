@@ -103,9 +103,11 @@ impl SsaEmitContext {
     }
 
     /// Emit an op and return its ID
+    #[track_caller]
     fn emit(&mut self, mut op: SsaOp) -> usize {
         let op_id = self.next_op_id;
         op.id = op_id;
+        op.source = Some(std::panic::Location::caller());
         self.next_op_id += 1;
 
         // Record VReg definition
@@ -123,6 +125,7 @@ impl SsaEmitContext {
 
     /// Emit ALU operation: result = src1 op src2
     /// Returns the destination VReg
+    #[track_caller]
     pub fn emit_alu(&mut self, opcode: Opcode, src1: VReg, src2: VReg) -> VReg {
         let dest = self.fresh_scalar();
         let op = SsaOp::new(
@@ -137,6 +140,7 @@ impl SsaEmitContext {
     }
 
     /// Emit ALU operation with immediate: result = src op imm
+    #[track_caller]
     pub fn emit_alu_imm(&mut self, opcode: Opcode, src: VReg, imm: i64) -> VReg {
         let dest = self.fresh_scalar();
         let op = SsaOp::new(
@@ -156,6 +160,7 @@ impl SsaEmitContext {
 
     /// Emit VALU operation: result[0..8] = src1[0..8] op src2[0..8]
     /// Returns the destination vector VReg
+    #[track_caller]
     pub fn emit_valu(&mut self, opcode: Opcode, src1: VReg, src2: VReg) -> VReg {
         assert!(src1.is_vector(), "VALU src1 must be vector");
         assert!(src2.is_vector(), "VALU src2 must be vector");
@@ -177,6 +182,7 @@ impl SsaEmitContext {
     ///
     /// Uses CSE deduplication - if the same scalar was already broadcast,
     /// returns the existing vector VReg.
+    #[track_caller]
     pub fn emit_vbroadcast(&mut self, src: VReg) -> VReg {
         assert!(src.is_scalar(), "vbroadcast src must be scalar");
 
@@ -206,6 +212,7 @@ impl SsaEmitContext {
 
     /// Emit vbroadcast without CSE - always creates a new broadcast.
     /// Use when the destination matters for subsequent operations.
+    #[track_caller]
     pub fn emit_vbroadcast_force(&mut self, src: VReg) -> VReg {
         assert!(src.is_scalar(), "vbroadcast src must be scalar");
 
@@ -226,6 +233,7 @@ impl SsaEmitContext {
     }
 
     /// Emit multiply_add (FMA): result[0..8] = src1[0..8] * src2[0..8] + src3[0..8]
+    #[track_caller]
     pub fn emit_fma(&mut self, src1: VReg, src2: VReg, src3: VReg) -> VReg {
         assert!(src1.is_vector(), "FMA src1 must be vector");
         assert!(src2.is_vector(), "FMA src2 must be vector");
@@ -248,6 +256,7 @@ impl SsaEmitContext {
     }
 
     /// Emit vselect: result[i] = cond[i] ? true_val[i] : false_val[i]
+    #[track_caller]
     pub fn emit_vselect(&mut self, cond: VReg, true_val: VReg, false_val: VReg) -> VReg {
         assert!(cond.is_vector(), "vselect cond must be vector");
         assert!(true_val.is_vector(), "vselect true_val must be vector");
@@ -275,6 +284,7 @@ impl SsaEmitContext {
 
     /// Emit const load: result = immediate_value
     /// Returns the destination scalar VReg.
+    #[track_caller]
     pub fn emit_const(&mut self, value: i64) -> VReg {
         let dest = self.fresh_scalar();
         let mut op = SsaOp::new(
@@ -295,6 +305,7 @@ impl SsaEmitContext {
 
     /// Emit scalar load from memory address VReg: result = mem[addr]
     /// The addr VReg holds the memory address to load from.
+    #[track_caller]
     pub fn emit_load(&mut self, addr: VReg) -> VReg {
         assert!(addr.is_scalar(), "load addr must be scalar");
 
@@ -311,6 +322,7 @@ impl SsaEmitContext {
     }
 
     /// Emit scalar load from immediate address: result = mem[addr]
+    #[track_caller]
     pub fn emit_load_imm(&mut self, addr: i64) -> VReg {
         let dest = self.fresh_scalar();
         let op = SsaOp::new(
@@ -326,6 +338,7 @@ impl SsaEmitContext {
 
     /// Emit vector load (contiguous): result[0..8] = mem[addr..addr+8]
     /// The addr VReg is a scalar holding the base address.
+    #[track_caller]
     pub fn emit_vload(&mut self, addr: VReg) -> VReg {
         assert!(addr.is_scalar(), "vload addr must be scalar");
 
@@ -342,6 +355,7 @@ impl SsaEmitContext {
     }
 
     /// Emit vector load from immediate address: result[0..8] = mem[addr..addr+8]
+    #[track_caller]
     pub fn emit_vload_imm(&mut self, addr: i64) -> VReg {
         let dest = self.fresh_vector();
         let op = SsaOp::new(
@@ -361,6 +375,7 @@ impl SsaEmitContext {
 
     /// Emit scalar store: mem[addr] = src
     /// No return value (stores don't produce VRegs).
+    #[track_caller]
     pub fn emit_store(&mut self, addr: VReg, src: VReg) {
         assert!(addr.is_scalar(), "store addr must be scalar");
         assert!(src.is_scalar(), "store src must be scalar");
@@ -376,6 +391,7 @@ impl SsaEmitContext {
     }
 
     /// Emit scalar store to immediate address: mem[addr] = src
+    #[track_caller]
     pub fn emit_store_imm(&mut self, addr: i64, src: VReg) {
         assert!(src.is_scalar(), "store src must be scalar");
 
@@ -391,6 +407,7 @@ impl SsaEmitContext {
 
     /// Emit vector store (contiguous): mem[addr..addr+8] = src[0..8]
     /// The addr VReg is a scalar holding the base address.
+    #[track_caller]
     pub fn emit_vstore(&mut self, addr: VReg, src: VReg) {
         assert!(addr.is_scalar(), "vstore addr must be scalar");
         assert!(src.is_vector(), "vstore src must be vector");
@@ -406,6 +423,7 @@ impl SsaEmitContext {
     }
 
     /// Emit vector store to immediate address: mem[addr..addr+8] = src[0..8]
+    #[track_caller]
     pub fn emit_vstore_imm(&mut self, addr: i64, src: VReg) {
         assert!(src.is_vector(), "vstore src must be vector");
 
@@ -424,6 +442,7 @@ impl SsaEmitContext {
     // ========================================================================
 
     /// Emit select: result = cond ? true_val : false_val
+    #[track_caller]
     pub fn emit_select(&mut self, cond: VReg, true_val: VReg, false_val: VReg) -> VReg {
         assert!(cond.is_scalar(), "select cond must be scalar");
         assert!(true_val.is_scalar(), "select true_val must be scalar");
@@ -447,6 +466,7 @@ impl SsaEmitContext {
 
     /// Emit add_imm via flow slot: result = src + imm
     /// Uses the flow engine's add_imm instruction.
+    #[track_caller]
     pub fn emit_add_imm(&mut self, src: VReg, imm: i64) -> VReg {
         assert!(src.is_scalar(), "add_imm src must be scalar");
 

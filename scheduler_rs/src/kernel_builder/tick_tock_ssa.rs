@@ -11,7 +11,8 @@
 //! 4. `assign_addresses()` - Linear scan allocation based on live ranges
 //! 5. `lower_ssa_ops()` - Convert to concrete Ops (expanding shifted VALU ops)
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::address_assign::{
     assign_addresses, lower_ssa_op, AddressAssignConfig, AddressAssignmentResult,
@@ -319,8 +320,6 @@ impl SsaTickTockKernelBuilder {
         shifted_ops: &mut HashSet<usize>,
         scratch_budget: usize,
     ) -> Result<usize, String> {
-        use std::collections::VecDeque;
-
         if ops.is_empty() {
             return Ok(0);
         }
@@ -347,6 +346,46 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
+        // Detect dead stores - ops with destinations that have no users
+        // This is likely a bug in the kernel builder
+        for (idx, op) in ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                let user_count = vreg_users.get(&dest).map_or(0, |s| s.len());
+                if user_count == 0 {
+                    panic!(
+                        "Dead store detected: op[{}] id={} defines {:?} with 0 users.\n\
+                         Source: {:?}\n\
+                         Engine: {:?}, Opcode: {:?}\n\
+                         Srcs: {:?}",
+                        idx, op.id, dest, op.source, op.engine, op.opcode, op.srcs
+                    );
+                }
+            }
+        }
+
+        // Build reverse dependency map: op_idx -> list of consumer indices
+        // This enables O(1) lookup of which ops depend on a given op
+        let mut consumers: Vec<Vec<usize>> = vec![vec![]; ops.len()];
+        for (idx, op) in ops.iter().enumerate() {
+            for &dep_id in &op.dep_ids {
+                if let Some(&dep_idx) = id_to_idx.get(&dep_id) {
+                    consumers[dep_idx].push(idx);
+                }
+            }
+        }
+
+        // Track remaining unscheduled dependencies per op
+        // Only count deps that exist in id_to_idx (external/missing deps are treated as satisfied)
+        let mut remaining_deps: Vec<usize> = ops
+            .iter()
+            .map(|op| {
+                op.dep_ids
+                    .iter()
+                    .filter(|dep_id| id_to_idx.contains_key(dep_id))
+                    .count()
+            })
+            .collect();
+
         // Track scheduling state
         let mut scheduled: HashSet<usize> = HashSet::new();
         let mut vreg_remaining_users: HashMap<VReg, usize> = vreg_users
@@ -356,43 +395,39 @@ impl SsaTickTockKernelBuilder {
         let mut live_words: usize = 0;
         let mut live_vregs: HashSet<VReg> = HashSet::new();
 
-        // FIX: Track when each VReg was defined and last used (by scheduled cycle)
-        // This matches the linear scan allocator's liveness model:
-        // - VReg is live from def_cycle to last_use_cycle (inclusive)
-        // - VReg is dead starting at last_use_cycle + 1
+        // Track when each VReg was defined (used for debugging/validation)
         let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
-        let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
 
-        // Deferred ops that couldn't fit due to budget
-        let mut deferred: VecDeque<usize> = VecDeque::new();
+        // Ready heap: (priority, op_idx) - min-heap via Reverse
+        // Priority is the earliest cycle this op can be scheduled (ASAP)
+        let mut ready_heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
+
+        // Initialize with ops that have no dependencies
+        for (idx, _op) in ops.iter().enumerate() {
+            if remaining_deps[idx] == 0 {
+                ready_heap.push(Reverse((0, idx)));
+            }
+        }
+
+        // VReg expiry heap: (expiry_cycle, vreg) - min-heap via Reverse
+        // VRegs expire (can be freed) at the cycle AFTER their last use
+        let mut vreg_expiry_heap: BinaryHeap<Reverse<(i32, VReg)>> = BinaryHeap::new();
 
         let mut cycle = 0;
         let max_cycles = 50000;
 
         while scheduled.len() < ops.len() && cycle < max_cycles {
-            // FIX: At the START of each cycle, free VRegs whose last use was in a PREVIOUS cycle
-            // This matches the allocator's model: VReg is live at cycle C if start <= C <= end
-            // So if last_use_cycle < current_cycle, the VReg is no longer live
-            let vregs_to_free: Vec<VReg> = live_vregs
-                .iter()
-                .filter(|vreg| {
-                    // VReg can be freed if:
-                    // 1. All users have been scheduled (no remaining unscheduled users)
-                    // 2. The last use cycle is before the current cycle
-                    let no_remaining_users = vreg_remaining_users
-                        .get(vreg)
-                        .map_or(true, |&n| n == 0);
-                    let last_use_before_current = vreg_last_use_cycle
-                        .get(vreg)
-                        .map_or(false, |&c| c < cycle as i32);
-                    no_remaining_users && last_use_before_current
-                })
-                .cloned()
-                .collect();
-
-            for vreg in vregs_to_free {
-                live_vregs.remove(&vreg);
-                live_words = live_words.saturating_sub(vreg.size());
+            // Free expired VRegs (O(log n) per VReg)
+            // VRegs expire at the cycle AFTER their last use
+            while let Some(&Reverse((expiry_cycle, vreg))) = vreg_expiry_heap.peek() {
+                if expiry_cycle <= cycle as i32 {
+                    vreg_expiry_heap.pop();
+                    if live_vregs.remove(&vreg) {
+                        live_words = live_words.saturating_sub(vreg.size());
+                    }
+                } else {
+                    break;
+                }
             }
 
             let mut load_used = 0;
@@ -400,194 +435,230 @@ impl SsaTickTockKernelBuilder {
             let mut alu_used = 0;
             let mut valu_used = 0;
             let mut flow_used = 0;
-            let mut scheduled_this_cycle = false;
 
-            // Find ready ops (deps satisfied)
-            let ready: Vec<usize> = ops
-                .iter()
-                .enumerate()
-                .filter(|(idx, op)| {
-                    !scheduled.contains(idx)
-                        && op.dep_ids.iter().all(|dep_id| {
-                            if let Some(&dep_idx) = id_to_idx.get(dep_id) {
-                                let dep_cycle = ops[dep_idx].cycle;
-                                dep_cycle >= 0 && dep_cycle < cycle as i32
-                            } else {
-                                true
-                            }
+            // Collect ready ops from heap
+            // Ops in the heap may need to be deferred if their deps aren't truly ready
+            // (scheduled in previous cycle) or if slots/budget are exhausted
+            let mut ready_this_cycle: Vec<usize> = Vec::new();
+            let mut reinsert: Vec<(i32, usize)> = Vec::new();
+
+            while let Some(Reverse((priority, idx))) = ready_heap.pop() {
+                if scheduled.contains(&idx) {
+                    continue; // Already scheduled (shouldn't happen but defensive)
+                }
+
+                // Check if deps are truly satisfied (scheduled in previous cycle)
+                let deps_ready = ops[idx].dep_ids.iter().all(|dep_id| {
+                    id_to_idx
+                        .get(dep_id)
+                        .map_or(true, |&dep_idx| {
+                            ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32
                         })
-                })
-                .map(|(idx, _)| idx)
-                .collect();
+                });
 
-            // Try to schedule ready ops
-            for idx in ready {
-                let engine = ops[idx].engine;
-                let dest = ops[idx].dest;
-                let op_id = ops[idx].id;
-                let srcs: Vec<Operand> = ops[idx].srcs.clone();
-
-                let can_shift = enable_valu_shift
-                    && engine == Engine::Valu
-                    && can_ssa_valu_shift_to_alu(&ops[idx]);
-
-                // Check slot availability
-                let fits_slots = match engine {
-                    Engine::Load => load_used < 2,
-                    Engine::Store => store_used < 2,
-                    Engine::Alu => alu_used < 12,
-                    Engine::Valu => valu_used < 6 || (can_shift && alu_used + VLEN <= 12),
-                    Engine::Flow => flow_used < 1,
-                    _ => true,
-                };
-
-                if !fits_slots {
-                    continue;
+                if deps_ready {
+                    ready_this_cycle.push(idx);
+                } else {
+                    // Not ready yet - reinsert with updated priority
+                    reinsert.push((priority.max(cycle as i32), idx));
                 }
+            }
 
-                // Check scratch budget with same-cycle reuse model:
-                // VRegs that will be freed when this op runs (their last use) reduce pressure.
-                let words_added = dest.map_or(0, |d| d.size());
-                let mut words_freed = 0usize;
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
-                        // If this is the last use of vreg, it will be freed after this op
-                        if let Some(&remaining) = vreg_remaining_users.get(vreg) {
-                            if remaining == 1 && live_vregs.contains(vreg) {
-                                words_freed += vreg.size();
+            // Put deferred ops back into heap
+            for (priority, idx) in reinsert {
+                ready_heap.push(Reverse((priority, idx)));
+            }
+
+            // Try to schedule ready ops with retry for budget-constrained ops.
+            // When an op frees VRegs, previously budget-failed ops may now fit.
+            let mut budget_deferred: Vec<usize> = Vec::new();
+            let mut made_progress = true;
+
+            // Keep retrying as long as we make progress (schedule something or free VRegs)
+            while made_progress {
+                made_progress = false;
+
+                // Process ready_this_cycle first, then budget_deferred
+                let ops_to_try: Vec<usize> = ready_this_cycle
+                    .drain(..)
+                    .chain(budget_deferred.drain(..))
+                    .collect();
+
+                for idx in ops_to_try {
+                    if scheduled.contains(&idx) {
+                        continue;
+                    }
+
+                    let engine = ops[idx].engine;
+                    let dest = ops[idx].dest;
+                    let op_id = ops[idx].id;
+                    let srcs: Vec<Operand> = ops[idx].srcs.clone();
+
+                    let can_shift = enable_valu_shift
+                        && engine == Engine::Valu
+                        && can_ssa_valu_shift_to_alu(&ops[idx]);
+
+                    // Check slot availability
+                    let fits_slots = match engine {
+                        Engine::Load => load_used < 2,
+                        Engine::Store => store_used < 2,
+                        Engine::Alu => alu_used < 12,
+                        Engine::Valu => valu_used < 6 || (can_shift && alu_used + VLEN <= 12),
+                        Engine::Flow => flow_used < 1,
+                        _ => true,
+                    };
+
+                    if !fits_slots {
+                        // Reinsert to heap for next cycle
+                        ready_heap.push(Reverse(((cycle + 1) as i32, idx)));
+                        continue;
+                    }
+
+                    // Check scratch budget with same-cycle reuse model:
+                    // VRegs that will be freed when this op runs (their last use) reduce pressure.
+                    let words_added = dest.map_or(0, |d| d.size());
+                    let mut words_freed = 0usize;
+                    for src in &srcs {
+                        if let Operand::VReg(vreg) = src {
+                            // If this is the last use of vreg, it will be freed after this op
+                            if let Some(&remaining) = vreg_remaining_users.get(vreg) {
+                                if remaining == 1 && live_vregs.contains(vreg) {
+                                    words_freed += vreg.size();
+                                }
                             }
                         }
                     }
-                }
-                // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
-                let projected_live = live_words + words_added - words_freed;
-                if projected_live > scratch_budget {
-                    // Defer this op - it might fit later when liveness decreases
-                    if !deferred.contains(&idx) {
-                        deferred.push_back(idx);
+                    // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
+                    let projected_live = live_words + words_added - words_freed;
+                    if projected_live > scratch_budget {
+                        // Defer for retry - liveness may decrease after other ops scheduled
+                        budget_deferred.push(idx);
+                        continue;
                     }
-                    continue;
-                }
 
-                // Schedule the op
-                match engine {
-                    Engine::Load => load_used += 1,
-                    Engine::Store => store_used += 1,
-                    Engine::Alu => alu_used += 1,
-                    Engine::Valu => {
-                        if can_shift && valu_used >= 6 {
-                            alu_used += VLEN;
-                            shifted_ops.insert(op_id);
-                        } else {
-                            valu_used += 1;
+                    // Schedule the op
+                    match engine {
+                        Engine::Load => load_used += 1,
+                        Engine::Store => store_used += 1,
+                        Engine::Alu => alu_used += 1,
+                        Engine::Valu => {
+                            if can_shift && valu_used >= 6 {
+                                alu_used += VLEN;
+                                shifted_ops.insert(op_id);
+                            } else {
+                                valu_used += 1;
+                            }
+                        }
+                        Engine::Flow => flow_used += 1,
+                        _ => {}
+                    }
+
+                    ops[idx].cycle = cycle as i32;
+                    scheduled.insert(idx);
+                    made_progress = true;
+
+                    // Update live tracking for destination VReg
+                    if let Some(d) = dest {
+                        if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
+                            live_vregs.insert(d);
+                            live_words += d.size();
+                        }
+                        // Track when this VReg was defined
+                        vreg_def_cycle.insert(d, cycle as i32);
+                    }
+
+                    // Update remaining users and last use cycle for source VRegs
+                    // With same-cycle reuse model: VRegs can be freed immediately after their
+                    // last use is scheduled, allowing other ops in the same cycle to reuse the space.
+                    for src in &srcs {
+                        if let Operand::VReg(vreg) = src {
+                            // Decrement remaining users count
+                            if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
+                                *remaining = remaining.saturating_sub(1);
+                                // Free VReg immediately when last user is scheduled (same-cycle reuse)
+                                // This is safe because reads happen before writes within a cycle.
+                                if *remaining == 0 && live_vregs.contains(vreg) {
+                                    live_vregs.remove(vreg);
+                                    live_words = live_words.saturating_sub(vreg.size());
+                                    // Add to expiry heap for cleanup (in case it gets re-added)
+                                    // Expiry is at next cycle
+                                    vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, *vreg)));
+                                }
+                            }
                         }
                     }
-                    Engine::Flow => flow_used += 1,
-                    _ => {}
-                }
 
-                ops[idx].cycle = cycle as i32;
-                scheduled.insert(idx);
-                scheduled_this_cycle = true;
-
-                // Update live tracking for destination VReg
-                if let Some(d) = dest {
-                    if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
-                        live_vregs.insert(d);
-                        live_words += d.size();
-                    }
-                    // Track when this VReg was defined
-                    vreg_def_cycle.insert(d, cycle as i32);
-                }
-
-                // Update remaining users and last use cycle for source VRegs
-                // With same-cycle reuse model: VRegs can be freed immediately after their
-                // last use is scheduled, allowing other ops in the same cycle to reuse the space.
-                // This matches the allocator's model where A[0,5] and B[5,10] can share storage.
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
-                        // Update last use cycle
-                        vreg_last_use_cycle
-                            .entry(*vreg)
-                            .and_modify(|c| *c = (*c).max(cycle as i32))
-                            .or_insert(cycle as i32);
-
-                        // Decrement remaining users count
-                        if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                            *remaining = remaining.saturating_sub(1);
-                            // Free VReg immediately when last user is scheduled (same-cycle reuse)
-                            // This is safe because reads happen before writes within a cycle.
-                            if *remaining == 0 && live_vregs.contains(vreg) {
-                                live_vregs.remove(vreg);
-                                live_words = live_words.saturating_sub(vreg.size());
-                            }
+                    // Add newly-ready consumers to heap (O(log n) per consumer)
+                    for &consumer_idx in &consumers[idx] {
+                        remaining_deps[consumer_idx] -= 1;
+                        if remaining_deps[consumer_idx] == 0 {
+                            // Priority: earliest possible cycle is next cycle (since dep just scheduled)
+                            let priority = (cycle + 1) as i32;
+                            ready_heap.push(Reverse((priority, consumer_idx)));
                         }
                     }
                 }
             }
 
-            // VRegs that were freed mid-cycle can be reused by ops scheduled later in the same cycle.
-
-            // If we scheduled something, re-try deferred ops (liveness may have decreased)
-            if scheduled_this_cycle {
-                // Clear deferred - they'll be reconsidered in next iteration
-                deferred.clear();
+            // Push remaining budget-deferred ops back to heap for next cycle
+            for idx in budget_deferred {
+                ready_heap.push(Reverse(((cycle + 1) as i32, idx)));
             }
 
             cycle += 1;
         }
 
-        // Handle remaining deferred ops - schedule them anyway (correctness > optimality)
-        for idx in deferred {
-            if !scheduled.contains(&idx) {
-                let engine = ops[idx].engine;
-                let dest = ops[idx].dest;
-                let op_id = ops[idx].id;
-                let srcs: Vec<Operand> = ops[idx].srcs.clone();
-
-                // Find a cycle with available slots
-                let target_cycle = cycle;
-
-                ops[idx].cycle = target_cycle as i32;
-                scheduled.insert(idx);
-
-                // Track shift
-                if enable_valu_shift && engine == Engine::Valu && can_ssa_valu_shift_to_alu(&ops[idx]) {
-                    shifted_ops.insert(op_id);
-                }
-
-                // Update live tracking
-                if let Some(d) = dest {
-                    if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
-                        live_vregs.insert(d);
-                        live_words += d.size();
-                    }
-                    vreg_def_cycle.insert(d, target_cycle as i32);
-                }
-
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
-                        vreg_last_use_cycle
-                            .entry(*vreg)
-                            .and_modify(|c| *c = (*c).max(target_cycle as i32))
-                            .or_insert(target_cycle as i32);
-
-                        if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                            *remaining = remaining.saturating_sub(1);
-                        }
-                    }
-                }
-
-                cycle = target_cycle + 1;
-            }
-        }
-
         if scheduled.len() < ops.len() {
+            // Diagnose why scheduling failed
+            let unscheduled: Vec<usize> = (0..ops.len())
+                .filter(|i| !scheduled.contains(i))
+                .collect();
+            let ready_count = ready_heap.len();
+            let blocked_count = unscheduled.iter()
+                .filter(|&&i| remaining_deps[i] > 0)
+                .count();
+
+            // Find a sample blocked op and trace its dependency chain
+            let sample_blocked = unscheduled.iter()
+                .find(|&&i| remaining_deps[i] > 0)
+                .map(|&i| {
+                    let op = &ops[i];
+                    let missing_deps: Vec<_> = op.dep_ids.iter()
+                        .filter_map(|dep_id| {
+                            id_to_idx.get(dep_id)
+                                .filter(|&dep_idx| !scheduled.contains(dep_idx))
+                                .map(|&dep_idx| {
+                                    let dep_remaining = remaining_deps[dep_idx];
+                                    format!("dep_id={} (idx={}, remaining_deps={})",
+                                        dep_id, dep_idx, dep_remaining)
+                                })
+                        })
+                        .collect();
+                    format!("op[{}] id={} has {} remaining deps, missing: {:?}",
+                        i, op.id, remaining_deps[i], missing_deps)
+                });
+
+            // Also show first few ready (remaining_deps==0) but unscheduled ops
+            let ready_unscheduled: Vec<_> = unscheduled.iter()
+                .filter(|&&i| remaining_deps[i] == 0)
+                .take(5)
+                .map(|&i| format!("op[{}] id={}", i, ops[i].id))
+                .collect();
+
             return Err(format!(
-                "Scheduling failed: only scheduled {}/{} ops in {} cycles",
+                "Scheduling failed: only scheduled {}/{} ops in {} cycles. \
+                Ready heap: {}, Blocked (deps>0): {}, Ready but unscheduled: {:?}, Sample blocked: {:?}, \
+                live_words: {}/{}, live_vregs: {}",
                 scheduled.len(),
                 ops.len(),
-                max_cycles
+                max_cycles,
+                ready_count,
+                blocked_count,
+                ready_unscheduled,
+                sample_blocked,
+                live_words,
+                scratch_budget,
+                live_vregs.len()
             ));
         }
 
@@ -1909,5 +1980,501 @@ mod tests {
         assert!(result.max_addr <= 2,
             "Should use at most 2 addresses for 4 non-simultaneous-live scalars, got max_addr={}",
             result.max_addr);
+    }
+
+    /// Test that ops with external/missing dep_ids are handled correctly.
+    ///
+    /// In the original code, if a dep_id doesn't exist in id_to_idx, it's treated
+    /// as satisfied (returns true). The optimized heap-based scheduler must also
+    /// handle this case correctly by not counting such deps in remaining_deps.
+    #[test]
+    fn test_greedy_handles_external_deps() {
+        // Create ops where some dep_ids don't exist in the ops array
+        // op0: no deps
+        // op1: depends on op0 AND on op 999 (which doesn't exist)
+        // op2: depends on op1
+        //
+        // The non-existent dep (999) should be treated as satisfied.
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))],
+                vec![0, 999]),  // 999 doesn't exist - should be treated as satisfied
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Should schedule all 3 ops successfully
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Should handle external deps: {:?}", result.err());
+
+        let cycles = result.unwrap();
+        assert_eq!(cycles, 3, "Chain of 3 ops should take 3 cycles");
+
+        // Verify all ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", i);
+        }
+
+        // Verify scheduling order respects real dependencies
+        assert!(ops[1].cycle > ops[0].cycle, "Op1 should be after op0");
+        assert!(ops[2].cycle > ops[1].cycle, "Op2 should be after op1");
+    }
+
+    /// Test that a long dependency chain schedules all ops.
+    ///
+    /// This tests that ops which become ready mid-scheduling are properly
+    /// added to the ready heap and eventually scheduled.
+    #[test]
+    fn test_greedy_long_chain_all_scheduled() {
+        // Create a chain: op0 -> op1 -> op2 -> ... -> op9
+        // Each op depends on the previous one.
+        let mut ops: Vec<SsaOp> = Vec::new();
+        for i in 0..10 {
+            let deps = if i == 0 { vec![] } else { vec![i - 1] };
+            let srcs = if i == 0 {
+                vec![Operand::Imm(1)]
+            } else {
+                vec![Operand::VReg(VReg::vector((i - 1) as u32)),
+                     Operand::VReg(VReg::vector((i - 1) as u32))]
+            };
+            let opcode = if i == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+            ops.push(make_test_ssa_op(
+                i, Engine::Valu, opcode,
+                Some(VReg::vector(i as u32)), srcs, deps
+            ));
+        }
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Long chain should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled, got cycle {}", i, op.cycle);
+        }
+
+        // Verify scheduling order
+        for i in 1..10 {
+            assert!(ops[i].cycle > ops[i-1].cycle,
+                "Op {} (cycle {}) should be after op {} (cycle {})",
+                i, ops[i].cycle, i-1, ops[i-1].cycle);
+        }
+    }
+
+    /// Test diamond-shaped dependency graph where multiple paths converge.
+    ///
+    /// This tests that ops with multiple dependencies are properly tracked
+    /// and become ready when ALL dependencies are satisfied.
+    #[test]
+    fn test_greedy_diamond_deps_all_scheduled() {
+        // Diamond pattern:
+        //     op0
+        //    /    \
+        //  op1    op2
+        //    \    /
+        //     op3
+        //      |
+        //     op4
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(1)], vec![0]),
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(2)], vec![0]),
+            // op3 depends on BOTH op1 and op2
+            make_test_ssa_op(3, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(3)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(2))],
+                vec![1, 2]),
+            make_test_ssa_op(4, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(4)),
+                vec![Operand::VReg(VReg::vector(3)), Operand::Imm(1)], vec![3]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Diamond should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", i);
+        }
+
+        // Verify dependency ordering
+        assert!(ops[1].cycle > ops[0].cycle, "op1 after op0");
+        assert!(ops[2].cycle > ops[0].cycle, "op2 after op0");
+        assert!(ops[3].cycle > ops[1].cycle, "op3 after op1");
+        assert!(ops[3].cycle > ops[2].cycle, "op3 after op2");
+        assert!(ops[4].cycle > ops[3].cycle, "op4 after op3");
+    }
+
+    /// Test many parallel independent chains.
+    ///
+    /// This tests that the heap correctly handles many ops becoming ready
+    /// at the same time and that they all eventually get scheduled.
+    #[test]
+    fn test_greedy_parallel_chains_all_scheduled() {
+        // 10 independent chains, each with 3 ops
+        // Chain i: op[i*3] -> op[i*3+1] -> op[i*3+2]
+        let mut ops: Vec<SsaOp> = Vec::new();
+        for chain in 0..10 {
+            let base = chain * 3;
+            // First op in chain - no deps
+            ops.push(make_test_ssa_op(
+                base, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(base as u32)),
+                vec![Operand::Imm(chain as i64)], vec![]
+            ));
+            // Second op - depends on first
+            ops.push(make_test_ssa_op(
+                base + 1, Engine::Valu, Opcode::Add,
+                Some(VReg::vector((base + 1) as u32)),
+                vec![Operand::VReg(VReg::vector(base as u32)), Operand::Imm(1)],
+                vec![base]
+            ));
+            // Third op - depends on second
+            ops.push(make_test_ssa_op(
+                base + 2, Engine::Valu, Opcode::Add,
+                Some(VReg::vector((base + 2) as u32)),
+                vec![Operand::VReg(VReg::vector((base + 1) as u32)), Operand::Imm(1)],
+                vec![base + 1]
+            ));
+        }
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Parallel chains should schedule: {:?}", result.err());
+
+        // Verify ALL 30 ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled, got cycle {}", i, op.cycle);
+        }
+    }
+
+    /// Test that slot limits don't cause ops to get stuck.
+    ///
+    /// When slot limits prevent scheduling, ops should be deferred and
+    /// tried again in later cycles.
+    #[test]
+    fn test_greedy_slot_overflow_all_scheduled() {
+        // Create 12 independent VALU ops (more than the 6 VALU slots)
+        // All should eventually be scheduled across multiple cycles.
+        let mut ops: Vec<SsaOp> = Vec::new();
+        for i in 0..12 {
+            ops.push(make_test_ssa_op(
+                i, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(i as u32)),
+                vec![Operand::Imm(i as i64)], vec![]
+            ));
+        }
+        // Add a final op that depends on all 12
+        let final_deps: Vec<usize> = (0..12).collect();
+        ops.push(make_test_ssa_op(
+            12, Engine::Valu, Opcode::Add,
+            Some(VReg::vector(12)),
+            vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
+            final_deps
+        ));
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Slot overflow should still schedule all: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", i);
+        }
+
+        // With 6 VALU slots, 12 independent ops need at least 2 cycles
+        let cycles = result.unwrap();
+        assert!(cycles >= 3, "12 VALU ops + 1 dependent should need at least 3 cycles");
+    }
+
+    /// Test that budget limits don't cause ops to get stuck.
+    ///
+    /// When budget limits prevent scheduling, ops should be deferred and
+    /// tried again when liveness decreases.
+    #[test]
+    fn test_greedy_budget_overflow_all_scheduled() {
+        // Create a sequence where budget pressure builds and releases
+        // op0, op1: produce 16 words
+        // op2: consumes op0, op1 (frees 16), produces 8 words
+        // op3, op4: produce 16 words (now 24 total - might exceed tight budget)
+        // op5: consumes op2, op3, op4
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
+                vec![0, 1]),
+            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(3)), vec![Operand::Imm(3)], vec![2]),
+            make_test_ssa_op(4, Engine::Valu, Opcode::Vbroadcast,
+                Some(VReg::vector(4)), vec![Operand::Imm(4)], vec![2]),
+            make_test_ssa_op(5, Engine::Valu, Opcode::Add,
+                Some(VReg::vector(5)),
+                vec![Operand::VReg(VReg::vector(3)), Operand::VReg(VReg::vector(4))],
+                vec![2, 3, 4]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Use a moderate budget that requires careful scheduling
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 32  // 4 vectors worth
+        );
+
+        assert!(result.is_ok(), "Budget pressure should still schedule all: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", i);
+        }
+    }
+
+    /// Test that a larger scale schedule works - catches bugs that only appear at scale.
+    ///
+    /// This creates 1000+ ops to test heap behavior with many ops.
+    #[test]
+    fn test_greedy_large_scale_all_scheduled() {
+        // Create 100 chains of 10 ops each = 1000 ops
+        // This tests the scheduler at a larger scale
+        let mut ops: Vec<SsaOp> = Vec::new();
+        let mut id = 0;
+        for chain in 0..100 {
+            for pos in 0..10 {
+                let deps = if pos == 0 { vec![] } else { vec![id - 1] };
+                let srcs = if pos == 0 {
+                    vec![Operand::Imm(chain as i64)]
+                } else {
+                    vec![Operand::VReg(VReg::vector((id - 1) as u32)), Operand::Imm(1)]
+                };
+                let opcode = if pos == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+                ops.push(make_test_ssa_op(
+                    id, Engine::Valu, opcode,
+                    Some(VReg::vector(id as u32)), srcs, deps
+                ));
+                id += 1;
+            }
+        }
+
+        assert_eq!(ops.len(), 1000, "Should have 1000 ops");
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 10000  // Large budget
+        );
+
+        assert!(result.is_ok(), "Large scale should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        let unscheduled: Vec<_> = ops.iter().enumerate()
+            .filter(|(_, op)| op.cycle < 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(unscheduled.is_empty(),
+            "All 1000 ops should be scheduled, unscheduled: {:?}", &unscheduled[..unscheduled.len().min(10)]);
+    }
+
+    /// Test that cross-chain dependencies work correctly.
+    ///
+    /// Creates chains where later chains depend on earlier chains,
+    /// mimicking the interleaved structure of the real kernel.
+    #[test]
+    fn test_greedy_cross_chain_deps_all_scheduled() {
+        // 10 chains, where chain N's first op depends on chain N-1's last op
+        let mut ops: Vec<SsaOp> = Vec::new();
+        let mut id = 0;
+        for chain in 0..10 {
+            for pos in 0..5 {
+                let deps = if pos == 0 {
+                    if chain == 0 {
+                        vec![]  // First chain, first op: no deps
+                    } else {
+                        // Depends on previous chain's last op
+                        vec![chain * 5 - 1]
+                    }
+                } else {
+                    vec![id - 1]  // Depends on previous op in chain
+                };
+                let srcs = if pos == 0 && chain == 0 {
+                    vec![Operand::Imm(1)]
+                } else {
+                    vec![Operand::VReg(VReg::vector((id - 1).max(0) as u32)), Operand::Imm(1)]
+                };
+                let opcode = if pos == 0 && chain == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+                ops.push(make_test_ssa_op(
+                    id, Engine::Valu, opcode,
+                    Some(VReg::vector(id as u32)), srcs, deps
+                ));
+                id += 1;
+            }
+        }
+
+        assert_eq!(ops.len(), 50, "Should have 50 ops");
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 1000
+        );
+
+        assert!(result.is_ok(), "Cross-chain deps should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", i);
+        }
+    }
+
+    /// Test that the actual SSA kernel builder produces schedulable ops.
+    ///
+    /// This uses the real SSA builder with a smaller config to catch
+    /// bugs in the interaction between op generation and scheduling.
+    #[test]
+    fn test_greedy_real_kernel_small() {
+        // Use a small config that should produce ~100-200 ops
+        let config = KernelConfig::new(3, 15, 16, 2);  // height=3, nodes=15, batch=16, rounds=2
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+
+        // Build SSA ops
+        builder.build_internal();
+        let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut ops = builder.emit.take_ops();
+
+        // Compute dependencies
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+
+        println!("Generated {} ops", ops.len());
+
+        let mut shifted = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, true, &mut shifted, 1536
+        );
+
+        assert!(result.is_ok(), "Real kernel (small) should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        let unscheduled: Vec<_> = ops.iter().enumerate()
+            .filter(|(_, op)| op.cycle < 0)
+            .map(|(i, op)| format!("op[{}] id={}", i, op.id))
+            .collect();
+        assert!(unscheduled.is_empty(),
+            "All ops should be scheduled, {} unscheduled: {:?}",
+            unscheduled.len(), &unscheduled[..unscheduled.len().min(10)]);
+    }
+
+    /// Test that the actual SSA kernel builder produces schedulable ops at medium scale.
+    #[test]
+    fn test_greedy_real_kernel_medium() {
+        // Medium config: ~1000-2000 ops
+        let config = KernelConfig::new(5, 63, 64, 4);  // height=5, nodes=63, batch=64, rounds=4
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+
+        // Build SSA ops
+        builder.build_internal();
+        let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut ops = builder.emit.take_ops();
+
+        // Compute dependencies
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+
+        println!("Generated {} ops", ops.len());
+
+        let mut shifted = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, true, &mut shifted, 1536
+        );
+
+        assert!(result.is_ok(), "Real kernel (medium) should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        let unscheduled: Vec<_> = ops.iter().enumerate()
+            .filter(|(_, op)| op.cycle < 0)
+            .map(|(i, op)| format!("op[{}] id={}", i, op.id))
+            .collect();
+        assert!(unscheduled.is_empty(),
+            "All ops should be scheduled, {} unscheduled: {:?}",
+            unscheduled.len(), &unscheduled[..unscheduled.len().min(10)]);
+    }
+
+    /// Test the exact failing configuration: forest_height=10, n_nodes=2047, batch_size=256, rounds=16.
+    ///
+    /// This is the production config that triggers the scheduling failure.
+    #[test]
+    fn test_greedy_real_kernel_full_scale() {
+        let config = KernelConfig::new(10, 2047, 256, 16);
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+
+        // Build SSA ops
+        builder.build_internal();
+        let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut ops = builder.emit.take_ops();
+
+        // Compute dependencies
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+
+        println!("Generated {} ops for full-scale kernel", ops.len());
+
+        let mut shifted = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, true, &mut shifted, 1536
+        );
+
+        assert!(result.is_ok(), "Full-scale kernel should schedule: {:?}", result.err());
+
+        // Verify ALL ops were scheduled
+        let unscheduled: Vec<_> = ops.iter().enumerate()
+            .filter(|(_, op)| op.cycle < 0)
+            .map(|(i, op)| format!("op[{}] id={}", i, op.id))
+            .collect();
+        assert!(unscheduled.is_empty(),
+            "All {} ops should be scheduled, {} unscheduled: {:?}",
+            ops.len(), unscheduled.len(), &unscheduled[..unscheduled.len().min(10)]);
     }
 }
