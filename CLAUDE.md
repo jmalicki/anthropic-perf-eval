@@ -54,28 +54,59 @@ python test_optimized.py
 ```
 
 ### Generating Kernels
+
+**Recommended: SSA builder with CP-SAT** (best quality):
 ```bash
-# Generate with default settings (greedy scheduler - fast)
+# Default: 10 min CP-SAT, VALU shift disabled
+# Shows full optimization progress (solver stats, cycle improvements)
+python generate_ssa_kernel.py
+
+# With validation against reference kernel
+python generate_ssa_kernel.py --validate
+
+# Quick iteration with greedy scheduler (~2 seconds, may exceed budget)
+python generate_ssa_kernel.py --use-greedy
+
+# Longer optimization (diminishing returns after 10 min)
+python generate_ssa_kernel.py --cpsat-time-limit 3600
+
+# Output schedule JSON for analysis
+python generate_ssa_kernel.py --output-json schedule.json
+```
+
+**CP-SAT solver output:** The script shows full CP-SAT progress by default, including:
+- Kernel building phase (SSA ops, dead code elimination)
+- Solver progress (objective bounds, conflicts, branches)
+- Final statistics (cycles, speedup, scratch usage)
+
+**Options for `generate_ssa_kernel.py`:**
+- `--use-greedy` - Use greedy scheduler instead of CP-SAT (fast, ~2s, may exceed budget)
+- `--cpsat-time-limit SECONDS` - CP-SAT time limit (default: 600 = 10 min)
+- `--enable-valu-shift` - Enable VALU→ALU shifting (disabled by default)
+- `--output-json PATH` - Write schedule JSON for analysis
+- `--validate` - Validate against reference kernel
+- `-q, --quiet` - Suppress verbose Rust scheduler output
+
+**Why SSA builder?**
+- Eliminates false dependencies between operations
+- Enables better scheduling with CP-SAT
+- VALU shift disabled by default to avoid scratch budget issues
+
+**Important limitations:**
+- The **greedy scheduler** (`--use-greedy`) does not respect the scratch budget (1536 words) and will produce incorrect results. Use it only for quick iteration, not for correct output.
+- **CP-SAT** (default) is required for correct results with the SSA builder.
+- VALU shift is disabled by default because it increases scratch pressure.
+
+**Legacy: Python builder** (deprecated):
+```bash
 python generate_precomputed_kernel.py --use-greedy
-
-# Generate with CP-SAT optimization (10 min recommended - worth the wait)
 python generate_precomputed_kernel.py --full-solve-time 600
-
-# For best results (1 hour, diminishing returns after 10 min)
-python generate_precomputed_kernel.py --full-solve-time 3600
-
-# Common options:
-#   --use-greedy                Use fast greedy scheduler
-#   --enable-valu-shift         Enable VALU→ALU shifting (default)
-#   --enable-alu-hash-parallel  Parallel hash using ALU and VALU
-#   --enable-chunked-gather     Use chunked vload for tree access
-#   --output PATH               Output file (default: solver/precomputed_kernel.py)
 ```
 
 **Scheduler Selection Guide:**
-- **Greedy** (`--use-greedy`): Development iteration, testing (2-3 seconds)
-- **CP-SAT 10 min** (`--full-solve-time 600`): Production runs, benchmarking (recommended)
-- **CP-SAT 1 hour** (`--full-solve-time 3600`): Final optimization attempts (diminishing returns)
+- **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), results may exceed budget
+- **SSA + CP-SAT 10 min** (default): Production runs, benchmarking (recommended, correct output)
+- **SSA + CP-SAT 1 hour** (`--cpsat-time-limit 3600`): Final optimization (diminishing returns)
 
 ### Running Experiments
 ```bash
@@ -106,14 +137,32 @@ python run_experiment.py --offline # Without W&B
 └───────────────────────────────┘   └───────────────────────────────┘
 ```
 
-### Rust Kernel Builder (Recommended)
+### Rust Kernel Builders
 
-The fastest way to generate and schedule kernels:
+Two Rust kernel builders are available via `scheduler_rs`:
 
+**SSA Builder (Recommended)** - Eliminates false dependencies for better scheduling:
 ```python
 import scheduler_rs
 
-# Build and schedule in ~2 seconds (vs 80+ seconds with Python)
+# SSA builder with CP-SAT (best quality)
+instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+    forest_height=10,
+    n_nodes=2047,
+    batch_size=256,
+    rounds=16,
+    enable_valu_shift=False,  # Disabled to avoid budget issues
+    verbose=True,
+    use_cpsat=True,
+    cpsat_time_limit=600.0,   # 10 minutes
+    output_json=None
+)
+print(f"Cycles: {stats['cycles']}, Budget exceeded: {stats['budget_exceeded']}")
+```
+
+**Non-SSA Builder** - Fast greedy scheduling:
+```python
+# Non-SSA with greedy scheduler (~2 seconds)
 instrs = scheduler_rs.build_tick_tock_kernel(
     forest_height=10,
     n_nodes=2047,
@@ -124,10 +173,10 @@ instrs = scheduler_rs.build_tick_tock_kernel(
 )
 ```
 
-Benefits:
+Benefits of Rust builders:
 - **40x faster** than Python builder (parallel multipass scheduling)
 - No Python→Rust parsing overhead (ops created as native Rust structs)
-- Identical output quality (same cycle count as Python builder)
+- SSA builder enables optimal CP-SAT scheduling
 
 ## ISA Quick Reference
 
@@ -173,7 +222,8 @@ Each cycle executes one bundle (dict of engine → list of operations):
 | `problem.py` | Machine simulator, ISA definition, reference kernel |
 | `perf_takehome.py` | Main test harness for performance measurement |
 | `test_optimized.py` | Test kernel correctness and performance |
-| `scheduler_rs/src/kernel_builder/` | **Rust kernel builder (recommended)** |
+| `generate_ssa_kernel.py` | **Generate kernels with SSA builder + CP-SAT (recommended)** |
+| `scheduler_rs/src/kernel_builder/` | Rust kernel builders (SSA and non-SSA) |
 | `scheduler_rs/src/scheduler.rs` | Rust greedy list scheduler with parallel multipass |
 | `solver/kernel_builder/tick_tock.py` | Python kernel builder (deprecated) |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
