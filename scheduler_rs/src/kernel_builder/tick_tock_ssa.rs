@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::address_assign::{
     assign_addresses, lower_ssa_op, AddressAssignConfig, AddressAssignmentResult,
 };
-use crate::types::{Engine, Op, Opcode, Operand, SlotVal, SsaOp, VReg, VLEN};
+use crate::types::{EmissionPhase, Engine, Op, Opcode, Operand, SlotVal, SsaOp, UsageAccounting, VarType, VReg, VLEN};
 
 use super::config::{fma_multiplier, KernelConfig, HASH_STAGES, STAGE5_XOR_CONST};
 use super::context_ssa::SsaScratchContext;
@@ -47,6 +47,8 @@ pub struct SsaScheduleResult {
     pub valu_shifted: usize,
     /// True if scratch budget was exceeded (force-scheduling or address assignment)
     pub budget_exceeded: bool,
+    /// Usage accounting: breakdown by round and var_type
+    pub usage_accounting: UsageAccounting,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -164,6 +166,10 @@ impl SsaTickTockKernelBuilder {
             );
         }
 
+        // Compute usage accounting from SSA ops (before lowering loses metadata)
+        let mut usage_accounting = UsageAccounting::from_ssa_ops(&ssa_ops);
+        usage_accounting.set_peak_live(address_result.peak_live);
+
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         let ops = lower_ssa_ops_with_shift(
             &ssa_ops,
@@ -180,6 +186,7 @@ impl SsaTickTockKernelBuilder {
             vreg_count,
             valu_shifted,
             budget_exceeded,
+            usage_accounting,
         })
     }
 
@@ -312,6 +319,10 @@ impl SsaTickTockKernelBuilder {
             );
         }
 
+        // Compute usage accounting from SSA ops
+        let mut usage_accounting = UsageAccounting::from_ssa_ops(&ssa_ops);
+        usage_accounting.set_peak_live(address_result.peak_live);
+
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         let valu_shifted = shifted_ops.len();
         let ops = lower_ssa_ops_with_shift(&ssa_ops, &address_result.vreg_to_addr, &shifted_ops);
@@ -323,7 +334,86 @@ impl SsaTickTockKernelBuilder {
             vreg_count,
             valu_shifted,
             budget_exceeded, // CP-SAT should not exceed budget
+            usage_accounting,
         })
+    }
+
+    /// Dump usage breakdown for currently live VRegs when budget is exceeded.
+    ///
+    /// This helps diagnose which rounds/var_types are consuming the most scratch
+    /// when the scheduler is forced to exceed the budget.
+    fn dump_live_usage_breakdown(
+        ops: &[SsaOp],
+        live_vregs: &HashSet<VReg>,
+        cycle: usize,
+        live_words: usize,
+        scratch_budget: usize,
+    ) {
+        use std::collections::BTreeMap;
+
+        eprintln!("\n=== Budget Exceeded at Cycle {} ===", cycle);
+        eprintln!("Live: {} words / {} budget ({} VRegs)", live_words, scratch_budget, live_vregs.len());
+
+        // Find the ops that define each live VReg
+        let mut by_round: BTreeMap<i32, (usize, usize)> = BTreeMap::new(); // round -> (count, words)
+        let mut by_type: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // type -> (count, words)
+        let mut by_phase: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // phase -> (count, words)
+
+        for op in ops {
+            if let Some(dest) = op.dest {
+                if live_vregs.contains(&dest) {
+                    let words = dest.size();
+
+                    // By round
+                    let round = op.source_info.as_ref()
+                        .and_then(|s| s.round)
+                        .map(|r| r as i32)
+                        .unwrap_or(-1);
+                    let entry = by_round.entry(round).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += words;
+
+                    // By var_type
+                    let var_type = op.var_type.map(|t| t.as_str()).unwrap_or("temporary");
+                    let entry = by_type.entry(var_type).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += words;
+
+                    // By phase
+                    let phase = op.source_info.as_ref()
+                        .map(|s| s.phase.as_str())
+                        .unwrap_or("unknown");
+                    let entry = by_phase.entry(phase).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += words;
+                }
+            }
+        }
+
+        // Print by round
+        eprintln!("\nLive by Round:");
+        for (round, (count, words)) in &by_round {
+            let round_str = if *round < 0 { "init".to_string() } else { format!("{}", round) };
+            eprintln!("  Round {:>4}: {:>4} vregs, {:>5} words", round_str, count, words);
+        }
+
+        // Print by var_type
+        eprintln!("\nLive by VarType:");
+        let mut type_vec: Vec<_> = by_type.iter().collect();
+        type_vec.sort_by(|a, b| b.1.1.cmp(&a.1.1)); // Sort by words descending
+        for (var_type, (count, words)) in type_vec {
+            eprintln!("  {:>15}: {:>4} vregs, {:>5} words", var_type, count, words);
+        }
+
+        // Print by phase
+        eprintln!("\nLive by Phase:");
+        let mut phase_vec: Vec<_> = by_phase.iter().collect();
+        phase_vec.sort_by(|a, b| b.1.1.cmp(&a.1.1)); // Sort by words descending
+        for (phase, (count, words)) in phase_vec {
+            eprintln!("  {:>20}: {:>4} vregs, {:>5} words", phase, count, words);
+        }
+
+        eprintln!("=== End Budget Exceeded Dump ===\n");
     }
 
     /// Schedule SSA ops using a greedy list scheduler with VALU→ALU shifting
@@ -432,6 +522,7 @@ impl SsaTickTockKernelBuilder {
         // Budget tracking
         let mut peak_live_words: usize = 0;
         let mut budget_exceeded = false;
+        let mut last_budget_dump_cycle: Option<usize> = None;
 
         // Track when each VReg was defined (used for debugging/validation)
         let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
@@ -699,6 +790,11 @@ impl SsaTickTockKernelBuilder {
 
                 if fits_slots {
                     // Force schedule, ignoring budget constraint - this exceeds budget!
+                    // Dump usage breakdown once per cycle with budget violation
+                    if last_budget_dump_cycle != Some(cycle) {
+                        Self::dump_live_usage_breakdown(ops, &live_vregs, cycle, live_words, scratch_budget);
+                        last_budget_dump_cycle = Some(cycle);
+                    }
                     budget_exceeded = true;
                     match engine {
                         Engine::Load => load_used += 1,
@@ -975,11 +1071,16 @@ impl SsaTickTockKernelBuilder {
         let n_groups = self.config.n_groups();
         let n_iters = self.config.n_iters();
 
-        // Emit initialization
+        // Emit initialization (phase already set to Init by default)
+        self.emit.set_phase(EmissionPhase::Init);
         self.emit_common_init();
+
+        self.emit.set_phase(EmissionPhase::ValuSelectionInit);
         self.emit_valu_selection_init();
 
         // Load data
+        self.emit.set_phase(EmissionPhase::LoadData);
+        self.emit.clear_round_context();
         self.emit_load_data(n_groups);
 
         // Main loop
@@ -987,6 +1088,7 @@ impl SsaTickTockKernelBuilder {
         let mut tree_depth = 0;
         for rnd in 0..self.config.rounds {
             let is_last_round = rnd == self.config.rounds - 1;
+            self.emit.set_round_context(rnd, tree_depth);
             self.emit_round(rnd, tree_depth, n_groups, n_iters, is_last_round);
 
             // Update tree depth with wrap
@@ -996,9 +1098,12 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
-        // Convert values back from optimized form
+        // Convert values back from optimized form (finalization)
+        self.emit.clear_round_context();
+        self.emit.set_phase(EmissionPhase::StoreData);
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
         for g in 0..n_groups {
+            self.emit.set_next_var_type(VarType::BatchData);
             let val = self.ctx.all_val[g].unwrap();
             self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_stage5_xor));
         }
@@ -1014,13 +1119,17 @@ impl SsaTickTockKernelBuilder {
     fn emit_common_init(&mut self) {
         // Emit constant 0 - this VReg will be fixed at address 0
         // (scratch memory is initialized to 0)
+        self.emit.set_next_var_type(VarType::Constant);
         let zero = self.emit.emit_const(0);
         self.zero_vreg = Some(zero);
         self.ctx.c[0] = Some(zero);
 
         // Bootstrap constants 1, 2, 4
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.c[1] = Some(self.emit.emit_const(1));
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.c[2] = Some(self.emit.emit_const(2));
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.c[4] = Some(self.emit.emit_const(4));
 
         // Derive remaining constants via ALU
@@ -1053,13 +1162,18 @@ impl SsaTickTockKernelBuilder {
 
         // Load pointers from memory (addresses 4, 5, 6, 7)
         // Note: n_nodes_s not needed in SSA version (was only for v_nn which is unused)
+        self.emit.set_next_var_type(VarType::Pointer);
         self.ctx.forest_p = Some(self.emit.emit_load_imm(4));
+        self.emit.set_next_var_type(VarType::Pointer);
         self.ctx.idx_p = Some(self.emit.emit_load_imm(5));
+        self.emit.set_next_var_type(VarType::Pointer);
         self.ctx.val_p = Some(self.emit.emit_load_imm(6));
+        self.emit.set_next_var_type(VarType::Pointer);
         self.ctx.extra_room_p = Some(self.emit.emit_load_imm(7));
 
         // Partition buffer offsets
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.partition_val_offset = Some(self.emit.emit_const(256));
 
         // Load hash constants and create broadcasts.
@@ -1070,34 +1184,45 @@ impl SsaTickTockKernelBuilder {
         for i in 0..6 {
             // v_hc needed for stages 0, 1, 2, 3, 4 (not 5)
             if i != 5 {
+                self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.hc[i] = Some(self.emit.emit_const(HASH_STAGES[i].1));
+                self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.v_hc[i] = Some(self.emit.emit_vbroadcast(self.ctx.hc[i].unwrap()));
             }
             // v_hs needed for stages 1, 3, 5 (not 0, 2, 4 which use FMA)
             if i == 1 || i == 3 || i == 5 {
+                self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.hs[i] = Some(self.emit.emit_const(HASH_STAGES[i].4));
+                self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.v_hs[i] = Some(self.emit.emit_vbroadcast(self.ctx.hs[i].unwrap()));
             }
         }
 
         // Broadcast vector constants
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.v_1 = Some(self.emit.emit_vbroadcast(self.ctx.c[1].unwrap()));
+        self.emit.set_next_var_type(VarType::Constant);
         self.ctx.v_2 = Some(self.emit.emit_vbroadcast(self.ctx.c[2].unwrap()));
 
         // Only broadcast v_const[4..8], as [0..3] are unused
         for i in 4..8 {
+            self.emit.set_next_var_type(VarType::Constant);
             self.ctx.v_const[i] = Some(self.emit.emit_vbroadcast(self.ctx.c[i].unwrap()));
         }
 
         // Stage 5 XOR constant
+        self.emit.set_next_var_type(VarType::HashState);
         self.ctx.stage5_xor_s = Some(self.emit.emit_const(STAGE5_XOR_CONST));
+        self.emit.set_next_var_type(VarType::HashState);
         self.ctx.v_stage5_xor = Some(self.emit.emit_vbroadcast(self.ctx.stage5_xor_s.unwrap()));
 
         // Load tree cache
         let forest_p = self.ctx.forest_p.unwrap();
         for i in 0..7 {
+            self.emit.set_next_var_type(VarType::Address);
             let addr = self.emit.emit_alu(Opcode::Add, forest_p, self.ctx.c[i].unwrap());
             self.ctx.tc_addr[i] = Some(addr);
+            self.emit.set_next_var_type(VarType::TreeCache);
             self.ctx.tc[i] = Some(self.emit.emit_load(addr));
         }
 
@@ -1109,23 +1234,35 @@ impl SsaTickTockKernelBuilder {
         let tc5 = self.ctx.tc[5].unwrap();
         let tc6 = self.ctx.tc[6].unwrap();
 
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.td_1 = Some(self.emit.emit_alu(Opcode::Sub, tc1, tc2));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.td_4 = Some(self.emit.emit_alu(Opcode::Sub, tc4, tc3));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.td_5 = Some(self.emit.emit_alu(Opcode::Sub, tc5, tc3));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.td_6 = Some(self.emit.emit_alu(Opcode::Sub, tc6, tc3));
 
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_tc2 = Some(self.emit.emit_vbroadcast(tc2));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_1 = Some(self.emit.emit_vbroadcast(self.ctx.td_1.unwrap()));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_tc3 = Some(self.emit.emit_vbroadcast(tc3));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_4 = Some(self.emit.emit_vbroadcast(self.ctx.td_4.unwrap()));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_5 = Some(self.emit.emit_vbroadcast(self.ctx.td_5.unwrap()));
+        self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_6 = Some(self.emit.emit_vbroadcast(self.ctx.td_6.unwrap()));
 
         // FMA multipliers
         for i in 0..6 {
             if let Some(mult) = self.ctx.hash_fma_mult[i] {
+                self.emit.set_next_var_type(VarType::HashState);
                 let mult_s = self.emit.emit_const(mult);
                 self.ctx.hash_fma_mult_s.insert(i, mult_s);
+                self.emit.set_next_var_type(VarType::HashState);
                 let v_mult = self.emit.emit_vbroadcast(mult_s);
                 self.ctx.v_hash_mult.insert(i, v_mult);
             }
@@ -1203,23 +1340,34 @@ impl SsaTickTockKernelBuilder {
             let offset_a = (g * VLEN) as i64;
             let offset_b = ((g + 1) * VLEN) as i64;
 
+            self.emit.set_next_var_type(VarType::Constant);
             let off_a = self.emit.emit_const(offset_a);
+            self.emit.set_next_var_type(VarType::Constant);
             let off_b = self.emit.emit_const(offset_b);
 
+            self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
+            self.emit.set_next_var_type(VarType::Address);
             let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+            self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
+            self.emit.set_next_var_type(VarType::Address);
             let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
 
+            self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr_a));
+            self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
+            self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr_a));
+            self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_val[g + 1] = Some(self.emit.emit_vload(val_addr_b));
         }
 
         // Convert initial values to optimized form
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
         for g in 0..n_groups {
+            self.emit.set_next_var_type(VarType::BatchData);
             let val = self.ctx.all_val[g].unwrap();
             self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_stage5_xor));
         }
@@ -1233,12 +1381,18 @@ impl SsaTickTockKernelBuilder {
             let offset_a = (g * VLEN) as i64;
             let offset_b = ((g + 1) * VLEN) as i64;
 
+            self.emit.set_next_var_type(VarType::Constant);
             let off_a = self.emit.emit_const(offset_a);
+            self.emit.set_next_var_type(VarType::Constant);
             let off_b = self.emit.emit_const(offset_b);
 
+            self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
+            self.emit.set_next_var_type(VarType::Address);
             let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+            self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
+            self.emit.set_next_var_type(VarType::Address);
             let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
 
             self.emit.emit_vstore(idx_addr_a, self.ctx.all_idx[g].unwrap());
@@ -1254,6 +1408,7 @@ impl SsaTickTockKernelBuilder {
 
     fn emit_round(&mut self, _rnd: usize, tree_depth: usize, n_groups: usize, n_iters: usize, is_last_round: bool) {
         // Tree access based on depth
+        self.emit.set_phase(EmissionPhase::TreeAccess);
         match tree_depth {
             0 => self.emit_depth0_access(n_iters),
             1 => self.emit_depth1_access(n_iters),
@@ -1263,12 +1418,15 @@ impl SsaTickTockKernelBuilder {
         }
 
         // XOR
+        self.emit.set_phase(EmissionPhase::Xor);
         self.emit_xor(n_groups);
 
         // Hash
+        self.emit.set_phase(EmissionPhase::Hash);
         self.emit_hash(n_groups, n_iters);
 
         // Branch
+        self.emit.set_phase(EmissionPhase::Branch);
         self.emit_branch(n_groups, n_iters, tree_depth, is_last_round);
     }
 
@@ -1283,10 +1441,14 @@ impl SsaTickTockKernelBuilder {
 
         for it in 0..n_iters {
             for i in 0..UNROLL {
+                self.emit.set_iter_group(it, i);
+                self.emit.set_next_var_type(VarType::Temporary);
                 let v_nv = self.emit.emit_vbroadcast_force(tc0);
+                self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
         }
+        self.emit.clear_iter_group();
     }
 
     fn emit_depth1_access(&mut self, n_iters: usize) {
@@ -1299,12 +1461,17 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
+                self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
+                self.emit.set_next_var_type(VarType::Condition);
                 let cond = self.emit.emit_valu(Opcode::Eq, idx, v_1);
+                self.emit.set_next_var_type(VarType::Temporary);
                 let v_nv = self.emit.emit_fma(cond, v_td_1, v_tc2);
+                self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
         }
+        self.emit.clear_iter_group();
     }
 
     fn emit_depth2_access(&mut self, n_iters: usize) {
@@ -1321,23 +1488,32 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
+                self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                 // Start with tc[3], add delta if idx == 4
+                self.emit.set_next_var_type(VarType::Condition);
                 let cond4 = self.emit.emit_valu(Opcode::Eq, idx, v_const_4);
+                self.emit.set_next_var_type(VarType::Temporary);
                 let mut v_nv = self.emit.emit_fma(cond4, v_td_4, v_tc3);
 
                 // Add td_5 if idx == 5
+                self.emit.set_next_var_type(VarType::Condition);
                 let cond5 = self.emit.emit_valu(Opcode::Eq, idx, v_const_5);
+                self.emit.set_next_var_type(VarType::Temporary);
                 v_nv = self.emit.emit_fma(cond5, v_td_5, v_nv);
 
                 // Add td_6 if idx == 6
+                self.emit.set_next_var_type(VarType::Condition);
                 let cond6 = self.emit.emit_valu(Opcode::Eq, idx, v_const_6);
+                self.emit.set_next_var_type(VarType::Temporary);
                 v_nv = self.emit.emit_fma(cond6, v_td_6, v_nv);
 
+                self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
         }
+        self.emit.clear_iter_group();
     }
 
     fn emit_depth3_access(&mut self, n_iters: usize) {
