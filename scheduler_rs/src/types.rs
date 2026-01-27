@@ -1222,6 +1222,59 @@ impl SsaOp {
     pub fn is_vector(&self) -> bool {
         self.dest.map(|v| v.is_vector()).unwrap_or(false)
     }
+
+    /// Get unique VRegs read by this op (deduplicated).
+    ///
+    /// # Why This Matters: The Duplicate Operand Bug
+    ///
+    /// Operations can have the same VReg appear multiple times as operands.
+    /// For example, `add(v1, v1)` doubles a value using v1 twice. Without
+    /// deduplication, several bugs can occur:
+    ///
+    /// ## Bug 1: LUC (Last-Use-Count) Miscalculation
+    ///
+    /// When computing how many VRegs an op will free (for scheduling priority),
+    /// `add(v1, v1)` would incorrectly report LUC=2 instead of LUC=1, since v1
+    /// only needs to be freed once.
+    ///
+    /// ## Bug 2: `vreg_remaining_users` Double-Decrement
+    ///
+    /// Each VReg tracks how many ops still need to read it. When scheduling
+    /// `add(v1, v1)`, if we decrement the counter for each operand (twice),
+    /// we'd prematurely mark v1 as having 0 remaining users, causing:
+    /// - Early deallocation of v1's storage
+    /// - Potential data corruption if another op still needs v1
+    ///
+    /// ## Bug 3: `words_freed` Over-Estimation
+    ///
+    /// When checking if an op fits the scratch budget, we calculate how many
+    /// words it will free. `add(v1, v1)` where v1 is a vector (8 words) would
+    /// incorrectly report 16 words freed instead of 8.
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// Op: add(v1, v1) -> v2   // v1 appears twice
+    /// reads():           [v1, v1]  // Returns both occurrences
+    /// unique_src_vregs(): [v1]     // Returns v1 only once
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// A Vec of unique VRegs in first-seen order. Vec is used instead of HashSet
+    /// to maintain deterministic ordering for reproducible scheduling.
+    pub fn unique_src_vregs(&self) -> Vec<VReg> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for src in &self.srcs {
+            if let Operand::VReg(vreg) = src {
+                if seen.insert(*vreg) {
+                    result.push(*vreg);
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Live interval for a VReg - from definition cycle to last use cycle.
@@ -1783,5 +1836,117 @@ mod tests {
     fn test_live_interval_len() {
         let interval = LiveInterval::new(3, 7);
         assert_eq!(interval.len(), 5); // 3, 4, 5, 6, 7
+    }
+
+    // ========================================================================
+    // unique_src_vregs Tests (Duplicate Operand Handling)
+    // ========================================================================
+
+    #[test]
+    fn test_unique_src_vregs_distinct_operands() {
+        // add(v0, v1) -> dest v2: should return [v0, v1]
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::scalar(0), Operand::scalar(1)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 2);
+        assert!(unique.contains(&VReg::scalar(0)));
+        assert!(unique.contains(&VReg::scalar(1)));
+    }
+
+    #[test]
+    fn test_unique_src_vregs_duplicate_operands() {
+        // add(v1, v1) -> dest v2: should return [v1] (not [v1, v1])
+        // This is the key bug fix - duplicate operands should be deduplicated
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::scalar(1), Operand::scalar(1)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 1, "Duplicate operands should be deduplicated");
+        assert_eq!(unique[0], VReg::scalar(1));
+    }
+
+    #[test]
+    fn test_unique_src_vregs_with_immediates() {
+        // add(v1, imm 5) -> dest v2: should return [v1]
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(2)),
+            vec![Operand::scalar(1), Operand::imm(5)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0], VReg::scalar(1));
+    }
+
+    #[test]
+    fn test_unique_src_vregs_all_immediates() {
+        // const 5 -> dest v0: no VReg sources
+        let op = SsaOp::new(
+            0,
+            Engine::Load,
+            Opcode::Const,
+            Some(VReg::scalar(0)),
+            vec![Operand::imm(5)],
+        );
+        let unique = op.unique_src_vregs();
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn test_unique_src_vregs_vector_duplicate() {
+        // Vector add(v1, v1) where v1 is a vector VReg
+        let op = SsaOp::new(
+            0,
+            Engine::Valu,
+            Opcode::Add,
+            Some(VReg::vector(2)),
+            vec![Operand::vector(1), Operand::vector(1)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 1, "Vector duplicate operands should be deduplicated");
+        assert_eq!(unique[0], VReg::vector(1));
+    }
+
+    #[test]
+    fn test_unique_src_vregs_three_operands_with_duplicates() {
+        // multiply_add(v1, v1, v2) -> dest v3: should return [v1, v2]
+        let op = SsaOp::new(
+            0,
+            Engine::Valu,
+            Opcode::MultiplyAdd,
+            Some(VReg::vector(3)),
+            vec![Operand::vector(1), Operand::vector(1), Operand::vector(2)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 2);
+        assert!(unique.contains(&VReg::vector(1)));
+        assert!(unique.contains(&VReg::vector(2)));
+    }
+
+    #[test]
+    fn test_unique_src_vregs_preserves_order() {
+        // Verify that unique_src_vregs preserves first-seen order
+        let op = SsaOp::new(
+            0,
+            Engine::Valu,
+            Opcode::MultiplyAdd,
+            Some(VReg::vector(4)),
+            vec![Operand::vector(3), Operand::vector(1), Operand::vector(3)],
+        );
+        let unique = op.unique_src_vregs();
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0], VReg::vector(3), "First unique VReg should be v3");
+        assert_eq!(unique[1], VReg::vector(1), "Second unique VReg should be v1");
     }
 }
