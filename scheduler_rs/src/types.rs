@@ -1225,6 +1225,38 @@ impl SsaOp {
 }
 
 /// Live interval for a VReg - from definition cycle to last use cycle.
+///
+/// # Liveness Model: Same-Cycle Reuse
+///
+/// Hardware semantics: reads before writes within a cycle.
+/// A VReg live during `[def_cycle, last_use_cycle]` can share storage
+/// with another VReg starting at `last_use_cycle` (same-cycle reuse).
+///
+/// ## Comparison Semantics
+///
+/// - **Expiration**: use `end <= start` (VReg ending at 5 is expired by cycle 5)
+/// - **Overlap**: intervals `[a,b)` and `[b,c)` do NOT overlap
+/// - **Peak**: count births before deaths at same cycle (conservative)
+///
+/// ## Example
+///
+/// ```text
+/// VReg A: [0, 5]  - defined at cycle 0, last used at cycle 5
+/// VReg B: [5, 10] - defined at cycle 5, last used at cycle 10
+///
+/// These do NOT overlap - A dies at end of cycle 5, B born at end of cycle 5.
+/// Linear scan expires A before allocating B (end 5 <= start 5).
+/// ```
+///
+/// ## Consistency
+///
+/// This model must be consistent across:
+/// - `LiveInterval::overlaps()` (uses `<` comparison)
+/// - `compute_peak_liveness()` event ordering in `address_assign.rs`
+/// - Linear scan expiration condition in `address_assign.rs`
+/// - Greedy scheduler budget tracking (VRegs freed mid-cycle)
+///
+/// Note: CP-SAT uses a slightly more conservative model (see `cpsat_scheduler.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveInterval {
     /// Cycle when the VReg is defined
@@ -1703,6 +1735,38 @@ mod tests {
         assert!(i1.overlaps(&i2)); // 3-5 overlap
         assert!(i2.overlaps(&i3)); // 6-8 overlap
         assert!(!i1.overlaps(&i3)); // no overlap
+    }
+
+    #[test]
+    fn test_live_interval_same_cycle_boundary_no_overlap() {
+        // LIVENESS MODEL: Same-cycle reuse
+        // Intervals [0,5] and [5,10] should NOT overlap because:
+        // - VReg A ends at cycle 5 (last read happens at cycle 5)
+        // - VReg B starts at cycle 5 (defined at cycle 5, result visible next cycle)
+        // - Within cycle 5: A is read, then B is written
+        // - A's storage can be reused for B (same-cycle reuse)
+        let i1 = LiveInterval::new(0, 5);
+        let i2 = LiveInterval::new(5, 10);
+        assert!(!i1.overlaps(&i2), "Adjacent intervals [0,5] and [5,10] should not overlap (same-cycle reuse)");
+        assert!(!i2.overlaps(&i1), "Overlap check should be symmetric");
+    }
+
+    #[test]
+    fn test_live_interval_adjacent_cycles_no_overlap() {
+        // Intervals [0,4] and [5,10] definitely don't overlap (gap of 1 cycle)
+        let i1 = LiveInterval::new(0, 4);
+        let i2 = LiveInterval::new(5, 10);
+        assert!(!i1.overlaps(&i2));
+        assert!(!i2.overlaps(&i1));
+    }
+
+    #[test]
+    fn test_live_interval_single_cycle_adjacent() {
+        // Single-cycle interval [5,5] and [5,10] should NOT overlap
+        // The single-cycle VReg is used at cycle 5, then immediately freed
+        let i1 = LiveInterval::new(5, 5);
+        let i2 = LiveInterval::new(5, 10);
+        assert!(!i1.overlaps(&i2), "Single-cycle interval should not overlap with adjacent start");
     }
 
     #[test]

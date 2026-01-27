@@ -1,5 +1,28 @@
 //! Register allocator for scratch memory.
 //!
+//! # DEPRECATED
+//!
+//! **This module is deprecated.** It is used only by the legacy non-SSA kernel builder
+//! (`build_tick_tock_kernel`). New code should use the SSA path with
+//! [`crate::address_assign`] instead, which:
+//!
+//! - Works with virtual registers (VRegs) instead of pre-assigned addresses
+//! - Correctly implements same-cycle reuse semantics
+//! - Is used by the recommended `build_tick_tock_kernel_ssa` function
+//!
+//! ## Known Issues
+//!
+//! This module has inconsistent liveness semantics compared to `address_assign`:
+//!
+//! - **Overlap check uses `>=`** instead of `<`, preventing same-cycle reuse
+//! - **Peak calculation uses +1 offset** for death events, which is more conservative
+//!
+//! These issues mean intervals `[0,5]` and `[5,10]` are considered overlapping here,
+//! but non-overlapping in `address_assign`. The hardware actually allows same-cycle
+//! reuse (reads before writes within a cycle), so `address_assign` is correct.
+//!
+//! ---
+//!
 //! This module implements post-scheduling address rewriting based on variable liveness.
 //! After scheduling completes (when cycle assignments are known), we can compute exact
 //! live ranges and reuse addresses when their live ranges don't overlap.
@@ -15,12 +38,16 @@
 //!    - Record mapping: old_addr -> new_addr
 //! 4. Rewrite all addresses in ops using mapping
 
+// Allow deprecated usage within this module (internal consistency)
+#![allow(deprecated)]
+
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Reverse;
 
 use crate::types::{Op, SlotVal, VLEN};
 
 /// A live interval representing the lifetime of a scratch address.
+#[deprecated(since = "0.1.0", note = "Use types::LiveInterval with address_assign module instead")]
 #[derive(Clone, Debug)]
 pub struct LiveInterval {
     /// Original address assigned during kernel building
@@ -70,6 +97,7 @@ pub struct AllocationResult {
 }
 
 /// Scratch register allocator using linear scan algorithm.
+#[deprecated(since = "0.1.0", note = "Use address_assign::assign_addresses instead")]
 pub struct ScratchRegisterAllocator {
     /// All live intervals
     intervals: Vec<LiveInterval>,
@@ -413,6 +441,7 @@ fn is_vector_address(op: &Op, addr: i64) -> bool {
 /// - reads set
 /// - last_use_reads set
 /// - slot values (only ADDRESS operands, not literal values)
+#[deprecated(since = "0.1.0", note = "Use the SSA path with address_assign::lower_ssa_ops instead")]
 pub fn rewrite_addresses(ops: &mut [Op], mapping: &HashMap<i64, i64>) {
     for op in ops {
         // Rewrite writes
@@ -480,6 +509,7 @@ pub fn rewrite_addresses(ops: &mut [Op], mapping: &HashMap<i64, i64>) {
 ///
 /// # Returns
 /// Allocation result with statistics. Check `budget_exceeded` to see if allocation is valid.
+#[deprecated(since = "0.1.0", note = "Use the SSA path with address_assign::assign_addresses instead")]
 pub fn allocate_registers(
     ops: &mut [Op],
     budget: usize,

@@ -1346,6 +1346,29 @@ pub fn schedule_ssa_cpsat(
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
 
+            // =========================================================================
+            // CP-SAT LIVENESS MODEL: Slightly More Conservative than Greedy
+            // =========================================================================
+            //
+            // The cumulative constraint models scratch usage over time. We use
+            // `end = last_use_cycle + 1` so intervals are half-open: [start, end).
+            //
+            // KEY DIFFERENCE FROM GREEDY/ADDRESS_ASSIGN:
+            // - Here: interval [0,5] has end=6, and [5,10] has start=5, end=11
+            //   These OVERLAP in the cumulative constraint (both include the 5-6 region)
+            // - In address_assign.rs: intervals [0,5] and [5,10] do NOT overlap
+            //   because we use `end_cycle <= start_cycle` for expiration (same-cycle reuse)
+            //
+            // This makes CP-SAT slightly more conservative than greedy allocation.
+            // In practice, this rarely matters because:
+            // 1. Same-cycle reuse is only possible for def/use at exact same cycle
+            // 2. CP-SAT's goal is to avoid exceeding budget, not minimize peak
+            // 3. The greedy scheduler's peak is an upper bound; CP-SAT can improve it
+            //
+            // RESULT: If CP-SAT says schedule X fits in budget, it definitely does.
+            // But CP-SAT may reject schedules that greedy+address_assign could fit.
+            // =========================================================================
+
             for vreg in &live_vregs {
                 let def_idx = vreg_def_op[vreg];
                 let last_use_idx = vreg_last_use[vreg];

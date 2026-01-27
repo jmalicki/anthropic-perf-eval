@@ -609,4 +609,117 @@ mod tests {
         // v2 should use a different address
         assert_ne!(result.vreg_to_addr[&v2], 500);
     }
+
+    // ========================================================================
+    // Liveness Model Boundary Tests
+    // ========================================================================
+
+    #[test]
+    fn test_same_cycle_reuse_boundary() {
+        // LIVENESS MODEL: Same-cycle reuse
+        // Intervals [0,5] and [5,10] should NOT overlap and can share storage.
+        //
+        // Scenario: VReg A is defined at cycle 0, last used at cycle 5.
+        //           VReg B is defined at cycle 5, last used at cycle 10.
+        //
+        // Within cycle 5, hardware executes: read A, then write B.
+        // So A's storage is freed AFTER being read but BEFORE B needs it.
+        // Linear scan should expire A (end 5 <= start 5) before allocating B.
+
+        let mut emit = SsaEmitContext::new();
+
+        // Create VReg A: defined at cycle 0
+        let a = emit.emit_const(100);
+        // Create a use of A at cycle 5 (this will be an ALU op with result C)
+        let c = emit.emit_alu(Opcode::Add, a, a);
+
+        // Create VReg B: defined at cycle 5 (same cycle A is last used)
+        let b = emit.emit_const(200);
+        // Create a use of B at cycle 10
+        let _d = emit.emit_alu(Opcode::Add, b, b);
+
+        // Schedule: A defined at 0, C (which uses A) at 5, B defined at 5, D at 10
+        emit.ops[0].cycle = 0;  // A defined
+        emit.ops[1].cycle = 5;  // C = A + A (last use of A)
+        emit.ops[2].cycle = 5;  // B defined (same cycle as A's last use)
+        emit.ops[3].cycle = 10; // D = B + B (last use of B)
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&emit.ops, &config);
+
+        // A and B should be able to share storage (same address)
+        // because A's interval [0,5] does not overlap with B's interval [5,10]
+        assert_eq!(
+            result.vreg_to_addr[&a], result.vreg_to_addr[&b],
+            "VRegs with adjacent intervals [0,5] and [5,10] should share storage (same-cycle reuse)"
+        );
+
+        // Verify peak liveness is correct (should be 2 at most: A or B + C or D)
+        // At cycle 5: A is being read (still live), B is being written, C is being written
+        // But with same-cycle reuse, A expires before B is allocated
+        assert!(result.peak_live <= 3, "Peak should be reasonable with same-cycle reuse");
+    }
+
+    #[test]
+    fn test_same_cycle_reuse_vectors() {
+        // Same test but with vectors (8 words each)
+        // This is more impactful because vectors are 8x the size
+
+        let mut emit = SsaEmitContext::new();
+
+        // Create scalar to broadcast
+        let s = emit.emit_const(1);
+
+        // VReg A: vector defined at cycle 0
+        let a = emit.emit_vbroadcast_force(s);
+        // Use A at cycle 5
+        let c = emit.emit_valu(Opcode::Add, a, a);
+
+        // VReg B: vector defined at cycle 5 (same cycle A is last used)
+        let b = emit.emit_vbroadcast_force(s);
+        // Use B at cycle 10
+        let _d = emit.emit_valu(Opcode::Add, b, b);
+
+        emit.ops[0].cycle = 0;  // s defined
+        emit.ops[1].cycle = 0;  // A defined (broadcast)
+        emit.ops[2].cycle = 5;  // C = A + A (last use of A)
+        emit.ops[3].cycle = 5;  // B defined (same cycle as A's last use)
+        emit.ops[4].cycle = 10; // D = B + B
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&emit.ops, &config);
+
+        // Vectors A and B should share storage due to same-cycle reuse
+        // This saves 8 words of scratch space
+        assert_eq!(
+            result.vreg_to_addr[&a], result.vreg_to_addr[&b],
+            "Vector VRegs with adjacent intervals should share storage"
+        );
+    }
+
+    #[test]
+    fn test_peak_liveness_same_cycle_boundary() {
+        // Verify that compute_peak_liveness correctly handles the boundary case
+        //
+        // With intervals [0,5] and [5,10]:
+        // - At cycle 5, using same-cycle reuse model:
+        //   - [0,5] is expiring (end 5 <= current 5)
+        //   - [5,10] is being allocated
+        //   - Peak should NOT count both simultaneously
+
+        use crate::types::LiveInterval;
+
+        let mut intervals = HashMap::new();
+        let v1 = VReg::scalar(1);
+        let v2 = VReg::scalar(2);
+
+        intervals.insert(v1, LiveInterval::new(0, 5));
+        intervals.insert(v2, LiveInterval::new(5, 10));
+
+        let peak = compute_peak_liveness(&intervals);
+
+        // With same-cycle reuse, peak should be 1 (not 2)
+        // Because v1 expires before v2 is allocated at cycle 5
+        assert_eq!(peak, 1, "Peak should be 1 with same-cycle reuse (intervals [0,5] and [5,10] don't overlap)");
+    }
 }
