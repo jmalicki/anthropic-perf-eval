@@ -20,6 +20,9 @@ pub mod context_ssa;
 pub mod emit;
 pub mod emit_ssa;
 pub mod partition;
+pub mod ssa_emit;
+pub mod ssa_greedy;
+pub mod ssa_lower;
 pub mod tick_tock;
 pub mod tick_tock_ssa;
 
