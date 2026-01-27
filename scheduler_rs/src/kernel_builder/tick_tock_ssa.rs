@@ -263,22 +263,21 @@ impl SsaTickTockKernelBuilder {
             scratch_budget: 1536, // Hardware limit
         };
 
-        // Pass shift hints if enabled (but not if greedy exceeded budget - infeasible hints hurt CP-SAT)
-        let shift_hints = if enable_valu_shift && !greedy_budget_exceeded {
+        // Pass shift hints if VALU shift is enabled
+        // When disabled, no shift variables are created so no hints needed
+        // (The 16 "unhinted" variables in CP-SAT are symmetry-breaking variables from preprocessing)
+        let shift_hints = if enable_valu_shift {
             Some(&greedy_shifted)
         } else {
             None
         };
 
-        // Don't pass greedy hints if they exceed budget - infeasible hints make CP-SAT slower
-        let greedy_hints_opt = if greedy_budget_exceeded {
-            if verbose {
-                eprintln!("  Skipping greedy hints (exceeded budget) - CP-SAT will search from scratch");
-            }
-            None
-        } else {
-            Some(&greedy_hints)
-        };
+        // Always pass greedy hints - CP-SAT handles infeasible hints gracefully
+        // The cycle timings are still valuable even if budget was exceeded
+        if greedy_budget_exceeded && verbose {
+            eprintln!("  Passing greedy hints despite budget exceeded (CP-SAT handles infeasible hints)");
+        }
+        let greedy_hints_opt = Some(&greedy_hints);
 
         let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, greedy_hints_opt.map(|v| v.as_slice()), shift_hints)
             .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
