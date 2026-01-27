@@ -603,16 +603,13 @@ impl SsaTickTockKernelBuilder {
             let mut budget_deferred: Vec<usize> = Vec::new();
             let mut made_progress = true;
 
-            // Helper: compute LUC (Last-Use-Count) for an op - count of source VRegs
+            // Helper: compute LUC (Last-Use-Count) for an op - count of unique source VRegs
             // where this op is their last reader. Higher LUC = frees more scratch space.
+            // Uses unique_src_vregs() to avoid double-counting duplicate operands (e.g., add(v1, v1)).
             fn compute_luc(ops: &[SsaOp], vreg_remaining_users: &HashMap<VReg, usize>, idx: usize) -> usize {
-                ops[idx].srcs.iter()
-                    .filter(|src| {
-                        if let Operand::VReg(vreg) = src {
-                            vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
-                        } else {
-                            false
-                        }
+                ops[idx].unique_src_vregs().iter()
+                    .filter(|vreg| {
+                        vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                     })
                     .count()
             }
@@ -648,7 +645,6 @@ impl SsaTickTockKernelBuilder {
                     let engine = ops[idx].engine;
                     let dest = ops[idx].dest;
                     let op_id = ops[idx].id;
-                    let srcs: Vec<Operand> = ops[idx].srcs.clone();
 
                     let can_shift = enable_valu_shift
                         && engine == Engine::Valu
@@ -672,15 +668,14 @@ impl SsaTickTockKernelBuilder {
 
                     // Check scratch budget with same-cycle reuse model:
                     // VRegs that will be freed when this op runs (their last use) reduce pressure.
+                    // Use unique VRegs to avoid double-counting (e.g., add(v1, v1) frees v1 once, not twice).
                     let words_added = dest.map_or(0, |d| d.size());
                     let mut words_freed = 0usize;
-                    for src in &srcs {
-                        if let Operand::VReg(vreg) = src {
-                            // If this is the last use of vreg, it will be freed after this op
-                            if let Some(&remaining) = vreg_remaining_users.get(vreg) {
-                                if remaining == 1 && live_vregs.contains(vreg) {
-                                    words_freed += vreg.size();
-                                }
+                    for vreg in ops[idx].unique_src_vregs() {
+                        // If this is the last use of vreg, it will be freed after this op
+                        if let Some(&remaining) = vreg_remaining_users.get(&vreg) {
+                            if remaining == 1 && live_vregs.contains(&vreg) {
+                                words_freed += vreg.size();
                             }
                         }
                     }
@@ -727,20 +722,19 @@ impl SsaTickTockKernelBuilder {
                     // Update remaining users and last use cycle for source VRegs
                     // With same-cycle reuse model: VRegs can be freed immediately after their
                     // last use is scheduled, allowing other ops in the same cycle to reuse the space.
-                    for src in &srcs {
-                        if let Operand::VReg(vreg) = src {
-                            // Decrement remaining users count
-                            if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                                *remaining = remaining.saturating_sub(1);
-                                // Free VReg immediately when last user is scheduled (same-cycle reuse)
-                                // This is safe because reads happen before writes within a cycle.
-                                if *remaining == 0 && live_vregs.contains(vreg) {
-                                    live_vregs.remove(vreg);
-                                    live_words = live_words.saturating_sub(vreg.size());
-                                    // Add to expiry heap for cleanup (in case it gets re-added)
-                                    // Expiry is at next cycle
-                                    vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, *vreg)));
-                                }
+                    // Use unique VRegs to avoid double-decrementing (e.g., add(v1, v1) uses v1 once).
+                    for vreg in ops[idx].unique_src_vregs() {
+                        // Decrement remaining users count (once per unique VReg, not per operand)
+                        if let Some(remaining) = vreg_remaining_users.get_mut(&vreg) {
+                            *remaining = remaining.saturating_sub(1);
+                            // Free VReg immediately when last user is scheduled (same-cycle reuse)
+                            // This is safe because reads happen before writes within a cycle.
+                            if *remaining == 0 && live_vregs.contains(&vreg) {
+                                live_vregs.remove(&vreg);
+                                live_words = live_words.saturating_sub(vreg.size());
+                                // Add to expiry heap for cleanup (in case it gets re-added)
+                                // Expiry is at next cycle
+                                vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, vreg)));
                             }
                         }
                     }
@@ -771,7 +765,6 @@ impl SsaTickTockKernelBuilder {
                 let engine = ops[force_idx].engine;
                 let dest = ops[force_idx].dest;
                 let op_id = ops[force_idx].id;
-                let srcs: Vec<Operand> = ops[force_idx].srcs.clone();
 
                 // Check slot availability - we still respect slot limits
                 let can_shift = enable_valu_shift
@@ -822,15 +815,14 @@ impl SsaTickTockKernelBuilder {
                         vreg_def_cycle.insert(dest_vreg, cycle as i32);
                     }
 
-                    for src in &srcs {
-                        if let Operand::VReg(vreg) = src {
-                            if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                                *remaining = remaining.saturating_sub(1);
-                                if *remaining == 0 && live_vregs.contains(vreg) {
-                                    live_vregs.remove(vreg);
-                                    live_words = live_words.saturating_sub(vreg.size());
-                                    vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, *vreg)));
-                                }
+                    // Use unique VRegs to avoid double-decrementing (e.g., add(v1, v1) uses v1 once)
+                    for vreg in ops[force_idx].unique_src_vregs() {
+                        if let Some(remaining) = vreg_remaining_users.get_mut(&vreg) {
+                            *remaining = remaining.saturating_sub(1);
+                            if *remaining == 0 && live_vregs.contains(&vreg) {
+                                live_vregs.remove(&vreg);
+                                live_words = live_words.saturating_sub(vreg.size());
+                                vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, vreg)));
                             }
                         }
                     }
@@ -3084,5 +3076,229 @@ mod tests {
         for (i, op) in ops.iter().enumerate() {
             assert!(op.cycle >= 0, "op{} should be scheduled, cycle={}", i, op.cycle);
         }
+    }
+
+    // =========================================================================
+    // Duplicate Operand Bug Tests
+    //
+    // These tests verify that operations with duplicate operands (e.g., add(v1, v1))
+    // are handled correctly by the greedy scheduler. Without proper deduplication,
+    // several bugs can occur:
+    //
+    // 1. LUC (Last-Use-Count) miscalculation: add(v1, v1) would report LUC=2
+    //    instead of LUC=1, affecting scheduling priority.
+    //
+    // 2. vreg_remaining_users double-decrement: The use counter for v1 would be
+    //    decremented twice, causing premature VReg deallocation.
+    //
+    // 3. words_freed over-estimation: For a vector v1 (8 words), add(v1, v1)
+    //    would incorrectly report 16 words freed instead of 8.
+    // =========================================================================
+
+    /// Test that duplicate operands are correctly counted for LUC calculation.
+    ///
+    /// Bug scenario: add(v1, v1) where v1 is the last use.
+    /// - WRONG: LUC = 2 (counting v1 twice)
+    /// - CORRECT: LUC = 1 (v1 is freed once)
+    #[test]
+    fn test_duplicate_operand_luc_calculation() {
+        // Create a simple chain:
+        // op0: broadcast -> v0 (8 words)
+        // op1: add(v0, v0) -> v1 (8 words), DUPLICATE OPERAND
+        // op2: sink v1
+        //
+        // v0 has 1 user (op1, which uses it twice but counts as 1 use)
+        // So when op1 runs, LUC should be 1, not 2.
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            // DUPLICATE OPERAND: v0 appears twice
+            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            make_test_ssa_op(2, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(1))], vec![1]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Schedule with a budget that requires accurate liveness tracking
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 16  // Just enough for v0 + v1
+        );
+        assert!(result.is_ok(), "Should schedule with duplicate operands: {:?}", result.err());
+
+        // Verify all ops were scheduled correctly
+        assert!(ops[0].cycle >= 0, "op0 should be scheduled");
+        assert!(ops[1].cycle >= 0, "op1 should be scheduled");
+        assert!(ops[2].cycle >= 0, "op2 should be scheduled");
+
+        // Verify dependency order
+        assert!(ops[1].cycle > ops[0].cycle, "op1 must come after op0");
+        assert!(ops[2].cycle > ops[1].cycle, "op2 must come after op1");
+    }
+
+    /// Test that vreg_remaining_users is not double-decremented for duplicate operands.
+    ///
+    /// Bug scenario: If add(v1, v1) decrements v1's user count twice, then:
+    /// - After op with add(v1, v1) runs, v1's remaining_users becomes -1 or underflows
+    /// - v1 gets freed prematurely, corrupting later ops that need v1
+    #[test]
+    fn test_duplicate_operand_remaining_users_not_double_decremented() {
+        // Create a chain where v0 is used by TWO different ops:
+        // op0: broadcast -> v0 (8 words)
+        // op1: add(v0, v0) -> v1 (8 words), DUPLICATE OPERAND, first use of v0
+        // op2: add(v0, v1) -> v2 (8 words), second use of v0
+        // op3: sink v2
+        //
+        // v0 has 2 users: op1 and op2
+        // If op1 double-decrements v0's user count, it would go from 2 -> 0,
+        // causing v0 to be freed before op2 runs!
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            // DUPLICATE OPERAND: v0 appears twice - should only count as 1 use
+            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            // op2 also uses v0 - this should still work after op1 runs
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Schedule with a tight budget that requires accurate liveness
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 24  // v0 + v1 + v2 = 24 words peak
+        );
+        assert!(result.is_ok(), "Should schedule without double-decrement bug: {:?}", result.err());
+
+        // All ops should be scheduled in dependency order
+        assert!(ops[0].cycle >= 0, "op0 should be scheduled");
+        assert!(ops[1].cycle > ops[0].cycle, "op1 must come after op0");
+        assert!(ops[2].cycle > ops[1].cycle, "op2 must come after op1 (and needs v0!)");
+        assert!(ops[3].cycle > ops[2].cycle, "op3 must come after op2");
+    }
+
+    /// Test that words_freed is not over-estimated for duplicate operands.
+    ///
+    /// Bug scenario: When checking scratch budget, add(v1, v1) where v1 is a
+    /// vector (8 words) and is the last use would incorrectly calculate:
+    /// - WRONG: words_freed = 16 (counting v1 twice)
+    /// - CORRECT: words_freed = 8 (v1 is freed once)
+    ///
+    /// This could cause the scheduler to think an op fits when it doesn't.
+    #[test]
+    fn test_duplicate_operand_words_freed_not_over_estimated() {
+        // Create a scenario where accurate words_freed matters:
+        // op0: broadcast -> v0 (8 words)
+        // op1: broadcast -> v1 (8 words)
+        // op2: add(v0, v0) -> v2 (8 words), DUPLICATE OPERAND, last use of v0
+        // op3: add(v1, v2) -> v3 (8 words), consumes v1 and v2
+        //
+        // With correct calculation at op2:
+        // - Before op2: live = v0 + v1 = 16 words
+        // - Op2 adds v2 (8 words), frees v0 (8 words)
+        // - After op2: live = v1 + v2 = 16 words
+        //
+        // With buggy over-estimation (counting v0 freed twice):
+        // - Scheduler would think words_freed = 16, projected_live = 8
+        // - But reality: projected_live = 16
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
+            // DUPLICATE OPERAND: v0 appears twice
+            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            make_test_ssa_op(3, Engine::Valu, Opcode::Add, Some(VReg::vector(3)),
+                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(2))], vec![1, 2]),
+            make_test_ssa_op(4, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(3))], vec![3]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        // Use a budget of exactly 16 words - this should work with correct calculation
+        // Peak liveness: v0 + v1 after cycle 0, or v1 + v2 after cycle 1 = 16 words
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 16
+        );
+        assert!(result.is_ok(), "Should schedule with accurate words_freed: {:?}", result.err());
+
+        // Verify scheduling succeeded
+        for (i, op) in ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "op{} should be scheduled, cycle={}", i, op.cycle);
+        }
+    }
+
+    /// Test scalar duplicate operands (not just vectors).
+    ///
+    /// Verifies the fix works for scalar VRegs too, not just vectors.
+    #[test]
+    fn test_duplicate_operand_scalar() {
+        // Scalar chain with duplicate operand:
+        // op0: const -> s0 (1 word)
+        // op1: add(s0, s0) -> s1 (1 word), DUPLICATE OPERAND
+        // op2: sink s1
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(42)], vec![]),
+            // DUPLICATE OPERAND: s0 appears twice
+            make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(2, Engine::Store, Opcode::Store, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(1))], vec![1]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 10  // Generous budget for scalars
+        );
+        assert!(result.is_ok(), "Should schedule scalar duplicate operands: {:?}", result.err());
+
+        // Verify scheduling order
+        assert!(ops[1].cycle > ops[0].cycle, "op1 must come after op0");
+        assert!(ops[2].cycle > ops[1].cycle, "op2 must come after op1");
+    }
+
+    /// Test multiply_add with mixed duplicate and unique operands.
+    ///
+    /// multiply_add(a, b, c) computes a * b + c. Test cases:
+    /// - multiply_add(v0, v0, v1): v0 duplicated, v1 unique
+    /// - multiply_add(v0, v1, v0): v0 at positions 0 and 2, v1 unique
+    #[test]
+    fn test_duplicate_operand_multiply_add() {
+        // Test multiply_add(v0, v0, v1) - v0 appears twice
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(3)], vec![]),
+            // multiply_add(v0, v0, v1) = v0 * v0 + v1
+            // v0 appears twice, v1 once -> 2 unique VRegs
+            make_test_ssa_op(2, Engine::Valu, Opcode::MultiplyAdd, Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
+                vec![0, 1]),
+            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+        ];
+
+        let config = KernelConfig::new(10, 2047, 256, 1);
+        let builder = SsaTickTockKernelBuilder::new(config);
+        let mut shifted = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut ops, false, &mut shifted, 24  // v0 + v1 + v2 = 24 words
+        );
+        assert!(result.is_ok(), "Should schedule multiply_add with duplicate operand: {:?}", result.err());
+
+        // Verify correct scheduling
+        assert!(ops[2].cycle > ops[0].cycle, "multiply_add must come after v0 defined");
+        assert!(ops[2].cycle > ops[1].cycle, "multiply_add must come after v1 defined");
     }
 }
