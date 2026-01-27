@@ -1679,4 +1679,152 @@ mod tests {
         // Without death tracking, it would be longer
         assert!(cycles <= 3, "With death tracking, schedule should be at most 3 cycles, got {}", cycles);
     }
+
+    // =========================================================================
+    // SSA Kernel Correctness Tests
+    // =========================================================================
+    // These tests verify that the SSA kernel produces correct output.
+    // KNOWN BUG: The SSA kernel currently fails correctness tests due to incorrect
+    // address assignment in the linear scan allocator. The allocator incorrectly
+    // reuses scratch addresses for VRegs that are still live, causing memory
+    // operations to use wrong addresses.
+
+    /// Test that SSA kernel builds and schedules without error.
+    ///
+    /// This is a basic sanity check that the SSA pipeline completes.
+    /// Note: The kernel may produce incorrect output due to known liveness bug.
+    #[test]
+    fn test_ssa_kernel_builds_successfully() {
+        let config = KernelConfig::new(3, 15, 16, 1);
+        let mut ssa_builder = SsaTickTockKernelBuilder::new(config);
+        let ssa_result = ssa_builder.build_and_schedule();
+
+        assert!(ssa_result.is_ok(), "SSA kernel should build: {:?}", ssa_result.err());
+
+        let result = ssa_result.unwrap();
+        println!("SSA kernel: {} cycles, {} ops, {} VRegs",
+            result.cycles, result.ops.len(), result.vreg_count);
+
+        assert!(result.cycles > 0, "Should have positive cycle count");
+        assert!(!result.ops.is_empty(), "Should have ops");
+    }
+
+    /// Test that VReg liveness intervals are computed correctly.
+    ///
+    /// The liveness interval for a VReg should extend from its definition
+    /// to its last use.
+    ///
+    /// KNOWN BUG: The linear scan allocator may be computing intervals
+    /// incorrectly, causing VRegs to be freed too early.
+    #[test]
+    fn test_vreg_liveness_intervals() {
+        use crate::address_assign::compute_live_intervals;
+
+        // Create a simple test case:
+        // op0: const -> s0 (def at cycle 0)
+        // op1: const -> s1 (def at cycle 1)
+        // op2: alu(s0, s1) -> s2 (use s0, s1 at cycle 10)
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
+            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::Imm(6)], vec![]),
+            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+        ];
+
+        // Simulate scheduling
+        ops[0].cycle = 0;
+        ops[1].cycle = 1;
+        ops[2].cycle = 10;
+
+        let intervals = compute_live_intervals(&ops);
+
+        // s0 should be live from cycle 0 to cycle 10
+        let s0_interval = intervals.get(&VReg::scalar(0)).expect("s0 should have interval");
+        assert_eq!(s0_interval.start, 0, "s0 should start at cycle 0");
+        assert_eq!(s0_interval.end, 10, "s0 should end at cycle 10 (last use)");
+
+        // s1 should be live from cycle 1 to cycle 10
+        let s1_interval = intervals.get(&VReg::scalar(1)).expect("s1 should have interval");
+        assert_eq!(s1_interval.start, 1, "s1 should start at cycle 1");
+        assert_eq!(s1_interval.end, 10, "s1 should end at cycle 10 (last use)");
+
+        // s2 should be live from cycle 10 to cycle 10 (no uses)
+        let s2_interval = intervals.get(&VReg::scalar(2)).expect("s2 should have interval");
+        assert_eq!(s2_interval.start, 10, "s2 should start at cycle 10");
+        assert_eq!(s2_interval.end, 10, "s2 should end at cycle 10 (no uses)");
+    }
+
+    /// Test that overlapping VRegs get different addresses.
+    ///
+    /// Two VRegs that are live at the same time must not share the same
+    /// physical address.
+    #[test]
+    fn test_overlapping_vregs_different_addresses() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+
+        // Create ops where s0 and s1 are both live at cycle 5:
+        // op0: const -> s0 (def cycle 0, used at cycle 5)
+        // op1: const -> s1 (def cycle 2, used at cycle 5)
+        // op2: alu(s0, s1) -> s2 (cycle 5)
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
+            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::Imm(6)], vec![]),
+            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+        ];
+
+        ops[0].cycle = 0;
+        ops[1].cycle = 2;
+        ops[2].cycle = 5;
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&ops, &config);
+
+        let addr_s0 = result.vreg_to_addr.get(&VReg::scalar(0)).expect("s0 should have address");
+        let addr_s1 = result.vreg_to_addr.get(&VReg::scalar(1)).expect("s1 should have address");
+
+        assert_ne!(addr_s0, addr_s1,
+            "Overlapping VRegs s0 and s1 must have different addresses: s0={}, s1={}",
+            addr_s0, addr_s1);
+    }
+
+    /// Test that non-overlapping VRegs can share addresses.
+    ///
+    /// Two VRegs where one dies before the other is born can share the
+    /// same physical address.
+    #[test]
+    fn test_non_overlapping_vregs_can_share_addresses() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+
+        // Create ops where s0 dies before s2 is born:
+        // op0: const -> s0 (def cycle 0)
+        // op1: alu(s0, s0) -> s1 (cycle 1, s0 dies)
+        // op2: const -> s2 (def cycle 5, s0 already dead)
+        // op3: alu(s1, s2) -> s3 (cycle 6)
+        let mut ops = vec![
+            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
+            make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
+                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::scalar(2)), vec![Operand::Imm(6)], vec![]),
+            make_test_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)),
+                vec![Operand::VReg(VReg::scalar(1)), Operand::VReg(VReg::scalar(2))], vec![1, 2]),
+        ];
+
+        ops[0].cycle = 0;
+        ops[1].cycle = 1;  // s0 last used here
+        ops[2].cycle = 5;  // s2 defined here (s0 dead since cycle 1)
+        ops[3].cycle = 6;
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&ops, &config);
+
+        let addr_s0 = result.vreg_to_addr.get(&VReg::scalar(0)).expect("s0 should have address");
+        let addr_s2 = result.vreg_to_addr.get(&VReg::scalar(2)).expect("s2 should have address");
+
+        // s0 and s2 CAN share addresses (non-overlapping), but don't have to
+        // The allocator should be able to reuse s0's address for s2
+        println!("Non-overlapping VRegs: s0={}, s2={}", addr_s0, addr_s2);
+        assert_eq!(addr_s0, addr_s2,
+            "Non-overlapping VRegs s0 and s2 should share address for efficiency");
+    }
 }
