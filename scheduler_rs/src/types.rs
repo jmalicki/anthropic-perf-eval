@@ -990,6 +990,155 @@ impl Operand {
     }
 }
 
+// ============================================================================
+// Variable Type and Source Tracking
+// ============================================================================
+
+/// Classification of what a variable represents in the kernel.
+///
+/// Used for usage accounting to understand scratch space consumption
+/// by different categories of values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VarType {
+    /// Scalar constants (c[i], hash constants/shifts like hc[i], hs[i])
+    Constant,
+    /// Memory pointers (forest_p, idx_p, val_p, extra_room_p)
+    Pointer,
+    /// Cached tree values (tc[i], tc_r3[i], td_* deltas)
+    TreeCache,
+    /// Hash-related state (v_hc, v_hs, v_hash_mult, v_stage5_xor)
+    HashState,
+    /// Batch data vectors (all_idx, all_val - the input/output data)
+    BatchData,
+    /// Per-round intermediate state (v_nv, v_t - tree values and temps)
+    RoundState,
+    /// True temporaries (intermediate computation values)
+    Temporary,
+    /// Address computations (for loads/stores)
+    Address,
+    /// Condition flags from comparisons
+    Condition,
+}
+
+impl VarType {
+    /// Parse from string (for deserialization)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "constant" | "Constant" => Some(VarType::Constant),
+            "pointer" | "Pointer" => Some(VarType::Pointer),
+            "tree_cache" | "TreeCache" => Some(VarType::TreeCache),
+            "hash_state" | "HashState" => Some(VarType::HashState),
+            "batch_data" | "BatchData" => Some(VarType::BatchData),
+            "round_state" | "RoundState" => Some(VarType::RoundState),
+            "temporary" | "Temporary" => Some(VarType::Temporary),
+            "address" | "Address" => Some(VarType::Address),
+            "condition" | "Condition" => Some(VarType::Condition),
+            _ => None,
+        }
+    }
+
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VarType::Constant => "constant",
+            VarType::Pointer => "pointer",
+            VarType::TreeCache => "tree_cache",
+            VarType::HashState => "hash_state",
+            VarType::BatchData => "batch_data",
+            VarType::RoundState => "round_state",
+            VarType::Temporary => "temporary",
+            VarType::Address => "address",
+            VarType::Condition => "condition",
+        }
+    }
+}
+
+/// Phase of kernel emission.
+///
+/// Tracks which logical section of the kernel generated a variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EmissionPhase {
+    /// Common initialization (constants, pointers, hash setup)
+    Init,
+    /// VALU selection setup (depth 3 tree cache)
+    ValuSelectionInit,
+    /// Loading batch data (idx/val vectors)
+    LoadData,
+    /// Tree access within a round
+    TreeAccess,
+    /// XOR step within a round
+    Xor,
+    /// Hash computation within a round
+    Hash,
+    /// Branch/index update within a round
+    Branch,
+    /// Storing results
+    StoreData,
+}
+
+impl EmissionPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmissionPhase::Init => "init",
+            EmissionPhase::ValuSelectionInit => "valu_selection_init",
+            EmissionPhase::LoadData => "load_data",
+            EmissionPhase::TreeAccess => "tree_access",
+            EmissionPhase::Xor => "xor",
+            EmissionPhase::Hash => "hash",
+            EmissionPhase::Branch => "branch",
+            EmissionPhase::StoreData => "store_data",
+        }
+    }
+}
+
+/// Source information for a variable - tracks where/when it was created.
+///
+/// This metadata enables usage accounting by round and category.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VarSource {
+    /// Which round generated this (0-15), or None for init/finalization
+    pub round: Option<usize>,
+    /// Tree depth when this was created (0-9)
+    pub tree_depth: Option<usize>,
+    /// Iteration index within round (for unrolled loops)
+    pub iter: Option<usize>,
+    /// Group index
+    pub group: Option<usize>,
+    /// Phase of emission
+    pub phase: EmissionPhase,
+}
+
+impl VarSource {
+    /// Create source info for initialization phase
+    pub fn init() -> Self {
+        Self {
+            round: None,
+            tree_depth: None,
+            iter: None,
+            group: None,
+            phase: EmissionPhase::Init,
+        }
+    }
+
+    /// Create source info for a specific round and phase
+    pub fn round(round: usize, tree_depth: usize, phase: EmissionPhase) -> Self {
+        Self {
+            round: Some(round),
+            tree_depth: Some(tree_depth),
+            iter: None,
+            group: None,
+            phase,
+        }
+    }
+
+    /// Set iteration and group indices
+    pub fn with_iter_group(mut self, iter: usize, group: usize) -> Self {
+        self.iter = Some(iter);
+        self.group = Some(group);
+        self
+    }
+}
+
 /// SSA Operation - uses virtual registers instead of concrete addresses.
 ///
 /// This is the SSA form used during kernel construction and scheduling.
@@ -1028,6 +1177,12 @@ pub struct SsaOp {
 
     /// Source location for debugging (file:line where this op was emitted)
     pub source: Option<&'static std::panic::Location<'static>>,
+
+    /// Classification of what this variable represents (for usage accounting)
+    pub var_type: Option<VarType>,
+
+    /// Source information: which round/phase/iteration generated this op
+    pub source_info: Option<VarSource>,
 }
 
 impl SsaOp {
@@ -1043,6 +1198,8 @@ impl SsaOp {
             cycle: -1,
             produces_constant: None,
             source: None,
+            var_type: None,
+            source_info: None,
         }
     }
 
@@ -1096,6 +1253,184 @@ impl LiveInterval {
     /// Get the length of the interval (end - start + 1)
     pub fn len(&self) -> i32 {
         self.end - self.start + 1
+    }
+}
+
+// ============================================================================
+// Usage Accounting
+// ============================================================================
+
+/// Statistics about scratch space usage for a single category.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageStats {
+    /// Total number of VRegs in this category
+    pub vreg_count: usize,
+    /// Total words allocated (scalars count as 1, vectors as 8)
+    pub total_words: usize,
+    /// Number of scalar VRegs
+    pub scalar_count: usize,
+    /// Number of vector VRegs
+    pub vector_count: usize,
+    /// Peak words live at any cycle
+    pub peak_words: usize,
+}
+
+impl UsageStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a VReg's contribution
+    pub fn add_vreg(&mut self, vreg: VReg) {
+        self.vreg_count += 1;
+        self.total_words += vreg.size();
+        if vreg.is_scalar() {
+            self.scalar_count += 1;
+        } else {
+            self.vector_count += 1;
+        }
+    }
+}
+
+/// Usage statistics by round.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RoundUsage {
+    /// Round number (or -1 for init/finalization)
+    pub round: i32,
+    /// Stats for this round
+    pub stats: UsageStats,
+}
+
+/// Usage statistics by variable type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VarTypeUsage {
+    /// Variable type
+    pub var_type: String,
+    /// Stats for this type
+    pub stats: UsageStats,
+}
+
+/// Bivariate usage statistics (round × var_type).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BivariateUsage {
+    /// Round number (or -1 for init)
+    pub round: i32,
+    /// Variable type
+    pub var_type: String,
+    /// Stats for this combination
+    pub stats: UsageStats,
+}
+
+/// Complete usage accounting for a scheduled kernel.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageAccounting {
+    /// Total VRegs
+    pub total_vregs: usize,
+    /// Total words allocated
+    pub total_words: usize,
+    /// Peak words live at any cycle (from address assignment)
+    pub peak_live_words: usize,
+    /// Breakdown by round
+    pub by_round: Vec<RoundUsage>,
+    /// Breakdown by variable type
+    pub by_var_type: Vec<VarTypeUsage>,
+    /// Bivariate breakdown (round × var_type)
+    pub bivariate: Vec<BivariateUsage>,
+}
+
+impl UsageAccounting {
+    /// Compute usage accounting from scheduled SSA ops.
+    pub fn from_ssa_ops(ops: &[SsaOp]) -> Self {
+        use std::collections::HashMap;
+
+        let mut total_vregs = 0usize;
+        let mut total_words = 0usize;
+
+        // Maps for aggregation
+        let mut by_round_map: HashMap<i32, UsageStats> = HashMap::new();
+        let mut by_type_map: HashMap<VarType, UsageStats> = HashMap::new();
+        let mut bivariate_map: HashMap<(i32, VarType), UsageStats> = HashMap::new();
+
+        // Track seen VRegs to avoid double-counting
+        let mut seen_vregs: HashSet<VReg> = HashSet::new();
+
+        for op in ops {
+            // Only count ops that define a VReg
+            if let Some(dest) = op.dest {
+                // Skip if already seen (CSE can create multiple refs to same VReg)
+                if seen_vregs.contains(&dest) {
+                    continue;
+                }
+                seen_vregs.insert(dest);
+
+                total_vregs += 1;
+                total_words += dest.size();
+
+                // Determine round (-1 for init/finalization)
+                let round = op.source_info.as_ref()
+                    .and_then(|s| s.round)
+                    .map(|r| r as i32)
+                    .unwrap_or(-1);
+
+                // Determine var_type (default to Temporary if not set)
+                let var_type = op.var_type.unwrap_or(VarType::Temporary);
+
+                // Aggregate by round
+                by_round_map.entry(round)
+                    .or_insert_with(UsageStats::new)
+                    .add_vreg(dest);
+
+                // Aggregate by var_type
+                by_type_map.entry(var_type)
+                    .or_insert_with(UsageStats::new)
+                    .add_vreg(dest);
+
+                // Aggregate bivariate
+                bivariate_map.entry((round, var_type))
+                    .or_insert_with(UsageStats::new)
+                    .add_vreg(dest);
+            }
+        }
+
+        // Convert maps to sorted vectors
+        let mut by_round: Vec<RoundUsage> = by_round_map.into_iter()
+            .map(|(round, stats)| RoundUsage { round, stats })
+            .collect();
+        by_round.sort_by_key(|r| r.round);
+
+        let mut by_var_type: Vec<VarTypeUsage> = by_type_map.into_iter()
+            .map(|(var_type, stats)| VarTypeUsage {
+                var_type: var_type.as_str().to_string(),
+                stats,
+            })
+            .collect();
+        by_var_type.sort_by(|a, b| a.var_type.cmp(&b.var_type));
+
+        let mut bivariate: Vec<BivariateUsage> = bivariate_map.into_iter()
+            .map(|((round, var_type), stats)| BivariateUsage {
+                round,
+                var_type: var_type.as_str().to_string(),
+                stats,
+            })
+            .collect();
+        bivariate.sort_by(|a, b| {
+            a.round.cmp(&b.round)
+                .then_with(|| a.var_type.cmp(&b.var_type))
+        });
+
+        UsageAccounting {
+            total_vregs,
+            total_words,
+            peak_live_words: 0, // Will be set separately
+            by_round,
+            by_var_type,
+            bivariate,
+        }
+    }
+
+    /// Set peak live words from address assignment result.
+    pub fn set_peak_live(&mut self, peak: usize) {
+        self.peak_live_words = peak;
     }
 }
 

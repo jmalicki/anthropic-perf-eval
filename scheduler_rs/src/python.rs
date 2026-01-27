@@ -20,7 +20,7 @@ use crate::scheduler::{
 };
 use arrayvec::ArrayVec;
 
-use crate::types::{Engine, Op, SlotVal, MAX_SLOT_SIZE, VLEN};
+use crate::types::{Engine, Op, SlotVal, UsageAccounting, MAX_SLOT_SIZE, VLEN};
 
 // =============================================================================
 // Parsing: Python -> Rust
@@ -1471,6 +1471,39 @@ fn write_schedule_json(
     Ok(())
 }
 
+/// Output structure for SSA schedule with usage accounting.
+#[derive(Serialize)]
+struct SsaScheduleOutput {
+    total_cycles: usize,
+    total_ops: usize,
+    vreg_count: u32,
+    peak_live_words: usize,
+    max_addr: i64,
+    budget_exceeded: bool,
+    valu_shifted: usize,
+    usage_accounting: crate::types::UsageAccounting,
+}
+
+/// Write SSA schedule output with usage accounting to JSON file.
+fn write_ssa_schedule_json(result: &SsaScheduleResult, output_path: &str) -> Result<(), String> {
+    let output = SsaScheduleOutput {
+        total_cycles: result.cycles,
+        total_ops: result.ops.len(),
+        vreg_count: result.vreg_count,
+        peak_live_words: result.address_result.peak_live,
+        max_addr: result.address_result.max_addr,
+        budget_exceeded: result.budget_exceeded,
+        valu_shifted: result.valu_shifted,
+        usage_accounting: result.usage_accounting.clone(),
+    };
+
+    let json = serde_json::to_string_pretty(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
+
+    std::fs::write(output_path, &json).map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
+
+    Ok(())
+}
+
 /// Result of scheduling with a specific priority mode
 struct ScheduleAttempt {
     mode: PriorityMode,
@@ -2129,7 +2162,7 @@ pub fn cpsat_available() -> bool {
 // SSA Kernel Building Functions
 // =============================================================================
 
-use crate::kernel_builder::SsaTickTockKernelBuilder;
+use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 
 /// Build a tick-tock kernel using SSA-based emission.
 ///
@@ -2149,8 +2182,9 @@ use crate::kernel_builder::SsaTickTockKernelBuilder;
 /// If enable_valu_shift is true (default), VALU ops are shifted to ALU when VALU is saturated.
 /// If use_cpsat is true, uses CP-SAT scheduler instead of greedy (operates on SSA before register allocation).
 /// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
+/// If output_json is provided, writes schedule with usage accounting to the specified path.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=600.0))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=600.0, output_json=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2161,6 +2195,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     verbose: bool,
     use_cpsat: bool,
     cpsat_time_limit: f64,
+    output_json: Option<String>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
         forest_height,
@@ -2233,6 +2268,26 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("max_addr", result.address_result.max_addr)?;
     stats.set_item("budget_exceeded", result.budget_exceeded)?;
     stats.set_item("valu_shifted", result.valu_shifted)?;
+
+    // Add usage accounting as JSON
+    let usage_json = serde_json::to_string(&result.usage_accounting).unwrap_or_else(|_| "{}".to_string());
+    stats.set_item("usage_accounting_json", usage_json)?;
+
+    // Also add summary stats for easy access
+    let usage = &result.usage_accounting;
+    stats.set_item("usage_total_vregs", usage.total_vregs)?;
+    stats.set_item("usage_total_words", usage.total_words)?;
+    stats.set_item("usage_peak_live_words", usage.peak_live_words)?;
+
+    // Write output JSON if requested
+    if let Some(output_path) = output_json {
+        write_ssa_schedule_json(&result, &output_path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to write output JSON: {}", e))
+        })?;
+        if verbose {
+            println!("Wrote schedule output with usage accounting to {}", output_path);
+        }
+    }
 
     Ok((instrs, stats))
 }

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{Engine, LiveInterval, Opcode, Operand, SsaOp, VReg};
+use crate::types::{EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, VarSource, VarType, VReg};
 
 /// SSA Emission context - tracks VReg IDs and collects emitted ops.
 ///
@@ -28,6 +28,22 @@ pub struct SsaEmitContext {
     pub vreg_constants: HashMap<VReg, i64>,
     /// Broadcast cache: scalar VReg -> vector VReg (CSE deduplication)
     pub broadcast_cache: HashMap<VReg, VReg>,
+
+    // =========================================================================
+    // Context Tracking for Usage Accounting
+    // =========================================================================
+    /// Current round number (0-15), None during init/finalization
+    pub current_round: Option<usize>,
+    /// Current tree depth (0-9)
+    pub current_tree_depth: Option<usize>,
+    /// Current iteration index (for unrolled loops)
+    pub current_iter: Option<usize>,
+    /// Current group index
+    pub current_group: Option<usize>,
+    /// Current emission phase
+    pub current_phase: EmissionPhase,
+    /// VarType to use for the next emitted op (if set)
+    pub next_var_type: Option<VarType>,
 }
 
 impl Default for SsaEmitContext {
@@ -45,6 +61,13 @@ impl SsaEmitContext {
             vreg_def: HashMap::new(),
             vreg_constants: HashMap::new(),
             broadcast_cache: HashMap::new(),
+            // Context tracking
+            current_round: None,
+            current_tree_depth: None,
+            current_iter: None,
+            current_group: None,
+            current_phase: EmissionPhase::Init,
+            next_var_type: None,
         }
     }
 
@@ -84,7 +107,65 @@ impl SsaEmitContext {
         self.vreg_def.clear();
         self.vreg_constants.clear();
         self.broadcast_cache.clear();
+        // Reset context tracking
+        self.current_round = None;
+        self.current_tree_depth = None;
+        self.current_iter = None;
+        self.current_group = None;
+        self.current_phase = EmissionPhase::Init;
+        self.next_var_type = None;
         std::mem::take(&mut self.ops)
+    }
+
+    // =========================================================================
+    // Context Tracking Methods
+    // =========================================================================
+
+    /// Set the emission phase
+    pub fn set_phase(&mut self, phase: EmissionPhase) {
+        self.current_phase = phase;
+    }
+
+    /// Set round context for a specific round
+    pub fn set_round_context(&mut self, round: usize, tree_depth: usize) {
+        self.current_round = Some(round);
+        self.current_tree_depth = Some(tree_depth);
+    }
+
+    /// Clear round context (for init/finalization)
+    pub fn clear_round_context(&mut self) {
+        self.current_round = None;
+        self.current_tree_depth = None;
+        self.current_iter = None;
+        self.current_group = None;
+    }
+
+    /// Set iteration and group context
+    pub fn set_iter_group(&mut self, iter: usize, group: usize) {
+        self.current_iter = Some(iter);
+        self.current_group = Some(group);
+    }
+
+    /// Clear iteration and group context
+    pub fn clear_iter_group(&mut self) {
+        self.current_iter = None;
+        self.current_group = None;
+    }
+
+    /// Set the VarType for the next emitted op
+    pub fn set_next_var_type(&mut self, var_type: VarType) {
+        self.next_var_type = Some(var_type);
+    }
+
+    /// Build current VarSource from context
+    fn current_var_source(&self) -> VarSource {
+        VarSource {
+            round: self.current_round,
+            tree_depth: self.current_tree_depth,
+            iter: self.current_iter,
+            group: self.current_group,
+            phase: self.current_phase,
+        }
     }
 
     /// Record that a VReg is defined by a specific op
@@ -108,6 +189,13 @@ impl SsaEmitContext {
         let op_id = self.next_op_id;
         op.id = op_id;
         op.source = Some(std::panic::Location::caller());
+
+        // Capture current context for usage accounting
+        op.source_info = Some(self.current_var_source());
+        if let Some(var_type) = self.next_var_type.take() {
+            op.var_type = Some(var_type);
+        }
+
         self.next_op_id += 1;
 
         // Record VReg definition
