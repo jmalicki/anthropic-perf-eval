@@ -28,6 +28,8 @@ pub struct SsaEmitContext {
     pub vreg_constants: HashMap<VReg, i64>,
     /// Broadcast cache: scalar VReg -> vector VReg (CSE deduplication)
     pub broadcast_cache: HashMap<VReg, VReg>,
+    /// Const cache: constant value -> scalar VReg (CSE deduplication)
+    pub const_cache: HashMap<i64, VReg>,
 }
 
 impl Default for SsaEmitContext {
@@ -45,6 +47,7 @@ impl SsaEmitContext {
             vreg_def: HashMap::new(),
             vreg_constants: HashMap::new(),
             broadcast_cache: HashMap::new(),
+            const_cache: HashMap::new(),
         }
     }
 
@@ -84,6 +87,7 @@ impl SsaEmitContext {
         self.vreg_def.clear();
         self.vreg_constants.clear();
         self.broadcast_cache.clear();
+        self.const_cache.clear();
         std::mem::take(&mut self.ops)
     }
 
@@ -284,8 +288,38 @@ impl SsaEmitContext {
 
     /// Emit const load: result = immediate_value
     /// Returns the destination scalar VReg.
+    ///
+    /// Uses CSE deduplication - if the same constant value was already emitted,
+    /// returns the existing VReg.
     #[track_caller]
     pub fn emit_const(&mut self, value: i64) -> VReg {
+        // CSE: check if already emitted
+        if let Some(&existing) = self.const_cache.get(&value) {
+            return existing;
+        }
+
+        let dest = self.fresh_scalar();
+        let mut op = SsaOp::new(
+            0,
+            Engine::Load,
+            Opcode::Const,
+            Some(dest),
+            vec![Operand::Imm(value)],
+        );
+        op.produces_constant = Some(value);
+        self.emit(op);
+
+        // Track that this VReg holds a constant
+        self.vreg_constants.insert(dest, value);
+        self.const_cache.insert(value, dest);
+
+        dest
+    }
+
+    /// Emit const load without CSE - always creates a new const op.
+    /// Use when the destination matters or you specifically need a separate VReg.
+    #[track_caller]
+    pub fn emit_const_force(&mut self, value: i64) -> VReg {
         let dest = self.fresh_scalar();
         let mut op = SsaOp::new(
             0,
@@ -573,15 +607,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_emit_const_returns_fresh_vreg() {
+    fn test_emit_const_cse() {
         let mut emit = SsaEmitContext::new();
         let v1 = emit.emit_const(5);
         let v2 = emit.emit_const(6);
-        let v3 = emit.emit_const(5); // same value, different VReg
+        let v3 = emit.emit_const(5); // same value, CSE returns same VReg
 
         assert_ne!(v1, v2);
-        assert_ne!(v2, v3);
-        assert_ne!(v1, v3); // SSA: each def is unique
+        assert_eq!(v1, v3); // CSE: same constant value returns same VReg
+        assert_eq!(emit.ops.len(), 2); // only 2 ops: const(5) + const(6)
+    }
+
+    #[test]
+    fn test_emit_const_force_no_cse() {
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const_force(5);
+        let v2 = emit.emit_const_force(5); // same value, but force creates new VReg
+
+        assert_ne!(v1, v2); // force creates new VReg
+        assert_eq!(emit.ops.len(), 2); // 2 ops: const(5) + const(5)
     }
 
     #[test]

@@ -3166,4 +3166,99 @@ mod tests {
         assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
         eprintln!("test_vreg_last_use_multiple_readers: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
     }
+
+    /// Test that CP-SAT can schedule with a small scratch budget.
+    ///
+    /// NOTE: CP-SAT's cumulative constraint does NOT model same-cycle reuse.
+    /// At cycle 1, both v0 (being read) and v1 (being written) are counted as live.
+    /// So CP-SAT requires budget >= 2 for this program.
+    ///
+    /// The greedy scheduler DOES support same-cycle reuse and can handle budget=1.
+    /// See test_ssa_greedy_minimal_budget_1_word for that test.
+    ///
+    /// Program:
+    ///   v0 = const(5)        -- scalar, 1 word, born cycle 0
+    ///   v1 = add(v0, v0)     -- scalar, 1 word, born cycle 1, v0 dies here
+    ///   store(0, v1)         -- v1 dies here (cycle 2)
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_minimal_budget_2_words() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+        use crate::types::Opcode;
+
+        // Create ops: const -> add -> store
+        // v0 = const(5)
+        // v1 = add(v0, v0)  -- v0's last use
+        // store(0, v1)      -- v1's last use
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::scalar(0)], vec![0]),
+            make_ssa_op(2, Engine::Store, Opcode::Store, None, vec![Operand::imm(0), Operand::scalar(1)], vec![1]),
+        ];
+
+        // Schedule with CP-SAT and budget of 2 (CP-SAT doesn't support same-cycle reuse)
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 2,  // CP-SAT needs 2 because no same-cycle reuse
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+
+        // CP-SAT should find a solution with budget=2
+        assert!(
+            result.is_some(),
+            "CP-SAT should find a schedule with 2-word budget"
+        );
+
+        let r = result.unwrap();
+        eprintln!(
+            "test_ssa_cpsat_minimal_budget_2_words: makespan={}, assignments={:?}",
+            r.makespan, r.cycle_assignments
+        );
+
+        // Verify all ops are scheduled
+        assert_eq!(r.cycle_assignments.len(), 3, "All 3 ops should be scheduled");
+
+        // Apply cycle assignments to a mutable copy for address assignment
+        let mut scheduled_ops = ops.clone();
+        for (idx, &cycle) in r.cycle_assignments.iter().enumerate() {
+            scheduled_ops[idx].cycle = cycle;
+        }
+
+        // Address assignment with same-cycle reuse should fit in budget of 1
+        // (even though CP-SAT required budget=2)
+        let config = AddressAssignConfig {
+            budget: 2,
+            start_addr: 1,  // Reserve 0 for ZERO_REG
+            ..Default::default()
+        };
+        let assign_result = assign_addresses(&scheduled_ops, &config);
+
+        // With same-cycle reuse, linear scan should achieve max_addr=1
+        // (even though CP-SAT conservatively required budget=2)
+        assert_eq!(
+            assign_result.max_addr, 1,
+            "With same-cycle reuse, only 1 address should be needed, got max_addr={}",
+            assign_result.max_addr
+        );
+
+        // peak_live should be 1 with same-cycle reuse
+        assert_eq!(
+            assign_result.peak_live, 1,
+            "With same-cycle reuse, peak_live should be 1, got {}",
+            assign_result.peak_live
+        );
+
+        // Should not exceed budget
+        assert!(
+            !assign_result.budget_exceeded,
+            "Should fit in budget of 2: peak_live={}, budget={}",
+            assign_result.peak_live, assign_result.budget
+        );
+    }
 }

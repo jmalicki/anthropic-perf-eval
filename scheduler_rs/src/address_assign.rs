@@ -125,35 +125,51 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
     intervals
 }
 
-/// Compute peak liveness in words at any cycle.
+/// Compute peak liveness in words at any cycle using the same-cycle reuse model.
+///
+/// This uses the same model as linear scan allocation:
+/// - At cycle C, VRegs with end_cycle < C are expired (freed) BEFORE new VRegs are allocated
+/// - At cycle C, VRegs with end_cycle == C are still alive during C (for reads)
+/// - Same-cycle reuse: interval [0,1] and [1,2] can share storage because [0,1] is
+///   expired (end_cycle 1 <= start_cycle 1) before [1,2] is allocated
+///
+/// This correctly counts single-cycle intervals [N, N] as 1 word.
 pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
     if intervals.is_empty() {
         return 0;
     }
 
-    // Collect events: (cycle, delta_words)
-    // Negative deltas are deaths, positive are births.
-    let mut events: Vec<(i32, i64)> = Vec::new();
-    for (vreg, interval) in intervals {
-        let size = vreg.size() as i64;
-        events.push((interval.start, size));       // VReg becomes live
-        events.push((interval.end, -size));        // VReg dies at end of last use cycle
+    // Sort intervals by start cycle (same as linear scan)
+    let mut sorted: Vec<(&VReg, &LiveInterval)> = intervals.iter().collect();
+    sorted.sort_by_key(|(_, interval)| (interval.start, interval.end));
+
+    // Simulate linear scan to track actual peak
+    // Active set: (end_cycle, size)
+    let mut active: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
+    let mut current_words: usize = 0;
+    let mut peak_words: usize = 0;
+
+    for (vreg, interval) in sorted {
+        // Expire intervals that ended at or before this one starts (same-cycle reuse)
+        while let Some(&Reverse((end_cycle, size))) = active.peek() {
+            if end_cycle <= interval.start {
+                active.pop();
+                current_words = current_words.saturating_sub(size);
+            } else {
+                break;
+            }
+        }
+
+        // Allocate this VReg
+        let size = vreg.size();
+        current_words += size;
+        peak_words = peak_words.max(current_words);
+
+        // Add to active set
+        active.push(Reverse((interval.end, size)));
     }
 
-    // Sort by cycle, then births before deaths at the same cycle.
-    // This ensures single-cycle intervals [N, N] are counted correctly (birth before death).
-    // For peak calculation, this is conservative (may overcount when A dies and B born at same cycle).
-    // The linear scan allocator uses separate logic to allow same-cycle reuse.
-    events.sort_by_key(|(cycle, delta)| (*cycle, if *delta > 0 { 0 } else { 1 }));
-
-    let mut current = 0i64;
-    let mut peak = 0i64;
-    for (_, delta) in events {
-        current += delta;
-        peak = peak.max(current);
-    }
-
-    peak as usize
+    peak_words
 }
 
 /// Assign physical addresses to VRegs using linear scan allocation.

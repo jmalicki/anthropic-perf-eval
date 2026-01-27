@@ -1619,15 +1619,22 @@ impl SsaLivenessTracker {
             projected += dest.size();
         }
 
-        // VRegs consumed by this op that have no other consumers will die.
-        // With same-cycle reuse, we subtract their space since reads happen before writes.
+        // Count how many times each VReg is used by this op.
+        // A VReg dies if uses_by_this_op >= remaining consumers.
+        let mut uses_by_op: HashMap<VReg, usize> = HashMap::new();
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
-                if let Some((_def_cycle, size, remaining)) = self.vreg_info.get(vreg) {
-                    // If this is the last consumer (remaining == 1), the VReg dies
-                    if *remaining == 1 {
-                        projected = projected.saturating_sub(*size);
-                    }
+                *uses_by_op.entry(*vreg).or_insert(0) += 1;
+            }
+        }
+
+        // VRegs consumed by this op that have no other consumers will die.
+        // With same-cycle reuse, we subtract their space since reads happen before writes.
+        for (vreg, uses) in &uses_by_op {
+            if let Some((_def_cycle, size, remaining)) = self.vreg_info.get(vreg) {
+                // If this op uses all remaining consumers, the VReg dies
+                if *uses >= *remaining {
+                    projected = projected.saturating_sub(*size);
                 }
             }
         }
@@ -2216,6 +2223,77 @@ mod ssa_tests {
             greedy_result.cycles <= ssa_result.cycles + 2,
             "Greedy on lowered ops ({}) should be close to SSA result ({})",
             greedy_result.cycles, ssa_result.cycles
+        );
+    }
+
+    /// Test that SSA scheduling can work with a minimal 1-word scratch budget.
+    ///
+    /// This verifies same-cycle reuse: when v0's last use is in the same cycle
+    /// that v1 is defined, v1 can reuse v0's address.
+    ///
+    /// Program:
+    ///   v0 = const(5)        -- scalar, 1 word, born cycle 0
+    ///   v1 = add(v0, v0)     -- scalar, 1 word, born cycle 1, v0 dies here
+    ///   store(0, v1)         -- v1 dies here (cycle 2)
+    ///
+    /// With same-cycle reuse:
+    ///   - v0 lives [0, 1], v1 lives [1, 2]
+    ///   - At cycle 1: v0 read (last use), then v1 written. v0's address is freed.
+    ///   - v1 can reuse v0's address. Peak = 1 word.
+    #[test]
+    fn test_ssa_greedy_minimal_budget_1_word() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+
+        let mut emit = SsaEmitContext::new();
+        let v0 = emit.emit_const(5);
+        let v1 = emit.emit_alu(Opcode::Add, v0, v0);
+        emit.emit_store_imm(0, v1);  // Store to address 0, consumes v1
+
+        // Schedule with budget of 1
+        let result = schedule_ssa_greedy_with_budget(&mut emit.ops, 1);
+
+        // Greedy scheduler should report peak_live = 1
+        // (same-cycle reuse: v0 dies, v1 born in same cycle)
+        assert!(
+            result.peak_live <= 1,
+            "With same-cycle reuse, peak should be 1, got {}",
+            result.peak_live
+        );
+
+        // Verify all ops are scheduled
+        for op in &emit.ops {
+            assert!(op.cycle >= 0, "Op {} should be scheduled", op.id);
+        }
+
+        // Address assignment should fit in budget of 1
+        let config = AddressAssignConfig {
+            budget: 1,
+            start_addr: 1,  // Reserve 0 for ZERO_REG
+            ..Default::default()
+        };
+        let assign_result = assign_addresses(&emit.ops, &config);
+
+        // max_addr should be 1 (only one address used)
+        assert_eq!(
+            assign_result.max_addr, 1,
+            "With same-cycle reuse, only 1 address should be needed, got max_addr={}",
+            assign_result.max_addr
+        );
+
+        // peak_live should be 1 with same-cycle reuse:
+        // v0 is consumed at cycle 1 (dies), v1 is produced at cycle 1 (born)
+        // Since reads happen before writes within a cycle, v0's space is freed before v1 needs it.
+        assert_eq!(
+            assign_result.peak_live, 1,
+            "With same-cycle reuse, peak_live should be 1, got {}",
+            assign_result.peak_live
+        );
+
+        // Should not exceed budget
+        assert!(
+            !assign_result.budget_exceeded,
+            "Should fit in budget of 1: peak_live={}, budget={}",
+            assign_result.peak_live, assign_result.budget
         );
     }
 }
