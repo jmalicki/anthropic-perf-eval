@@ -9,6 +9,22 @@ The CP-SAT scheduler models instruction scheduling as a constraint satisfaction 
 - **Constraints**: Dependencies (precedence), slot limits (cumulative), optionally scratch budget
 - **Objective**: Minimize makespan (total cycles)
 
+## Why CP-SAT is Necessary
+
+Scheduling with scratch budget constraints is equivalent to the **black pebbling game** on DAGs, which is **PSPACE-complete** (Gilbert, Lengauer, Tarjan 1980). This means:
+
+1. **No polynomial-time greedy algorithm can guarantee finding a valid schedule** when one exists
+2. Greedy heuristics may get stuck even when valid schedules exist
+3. Only complete solvers (with backtracking) can guarantee finding solutions
+
+Our approach:
+- **Fast path**: Greedy scheduler with "lowest net_change first" heuristic
+- **Fallback**: CP-SAT solver when greedy exceeds budget
+
+CP-SAT is essentially "backtracking done right" - it uses conflict-driven clause learning (CDCL) and constraint propagation to efficiently search the exponential space.
+
+See `docs/SCRATCH_PRESSURE.md` section "Theoretical Background: Pebbling Games" for details.
+
 ## Dependencies
 
 ### Rust Crate
@@ -280,6 +296,11 @@ pub fn schedule_cpsat(
 
 #### 4. Scratch Budget Constraints (Optional)
 
+**Important**: The interval `[def_cycle, last_use_cycle)` models same-cycle reuse.
+At `last_use_cycle`, the VReg is being consumed and its space becomes available
+for other VRegs defined in the same cycle. See `docs/SCRATCH_PRESSURE.md` for
+detailed timing semantics.
+
 ```rust
 fn add_scratch_constraints(
     model: &mut CpModelBuilder,
@@ -296,13 +317,13 @@ fn add_scratch_constraints(
         let def_var = cycle_vars[li.def_op_idx];
         let last_use_var = cycle_vars[li.last_use_op_idx];
 
-        // Size = last_use - def + 1
+        // Size = last_use - def (same-cycle reuse: VReg freed at last_use, not after)
         let size_var = model.new_int_var([(1, horizon)]);
-        model.add_eq(size_var, LinearExpr::from(last_use_var) - def_var + 1);
+        model.add_eq(size_var, LinearExpr::from(last_use_var) - def_var);
 
-        // End = last_use + 1
-        let end_var = model.new_int_var([(0, horizon + 1)]);
-        model.add_eq(end_var, LinearExpr::from(last_use_var) + 1);
+        // End = last_use (half-open interval [def, last_use))
+        let end_var = model.new_int_var([(1, horizon + 1)]);
+        model.add_eq(end_var, LinearExpr::from(last_use_var));
 
         let interval = model.new_interval_var(def_var, size_var, end_var);
         scratch_intervals.push(interval);

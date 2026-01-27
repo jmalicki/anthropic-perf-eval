@@ -2231,7 +2231,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("vreg_count", result.vreg_count)?;
     stats.set_item("peak_live", result.address_result.peak_live)?;
     stats.set_item("max_addr", result.address_result.max_addr)?;
-    stats.set_item("budget_exceeded", result.address_result.budget_exceeded)?;
+    stats.set_item("budget_exceeded", result.budget_exceeded)?;
     stats.set_item("valu_shifted", result.valu_shifted)?;
 
     Ok((instrs, stats))

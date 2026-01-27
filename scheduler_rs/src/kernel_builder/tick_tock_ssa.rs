@@ -45,6 +45,8 @@ pub struct SsaScheduleResult {
     pub vreg_count: u32,
     /// Number of VALU ops shifted to ALU
     pub valu_shifted: usize,
+    /// True if scratch budget was exceeded (force-scheduling or address assignment)
+    pub budget_exceeded: bool,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -135,7 +137,7 @@ impl SsaTickTockKernelBuilder {
 
         // Schedule using greedy scheduler with VALU→ALU shifting
         let mut shifted_ops: HashSet<usize> = HashSet::new();
-        let cycles = self.schedule_ssa_greedy_with_shift(
+        let (cycles, sched_budget_exceeded, _sched_peak_live) = self.schedule_ssa_greedy_with_shift(
             &mut ssa_ops,
             enable_valu_shift,
             &mut shifted_ops,
@@ -151,11 +153,15 @@ impl SsaTickTockKernelBuilder {
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
 
-        if address_result.budget_exceeded {
-            return Err(format!(
-                "Address assignment exceeded budget: peak_live={} > budget={}",
+        // Track if budget was exceeded (either in scheduling or address assignment)
+        let budget_exceeded = sched_budget_exceeded || address_result.budget_exceeded;
+
+        if budget_exceeded {
+            eprintln!(
+                "Budget exceeded: sched={}, addr_assign={}, peak_live={}, budget={}",
+                sched_budget_exceeded, address_result.budget_exceeded,
                 address_result.peak_live, address_result.budget
-            ));
+            );
         }
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
@@ -173,6 +179,7 @@ impl SsaTickTockKernelBuilder {
             address_result,
             vreg_count,
             valu_shifted,
+            budget_exceeded,
         })
     }
 
@@ -211,7 +218,7 @@ impl SsaTickTockKernelBuilder {
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
         let mut greedy_shifted = HashSet::new();
-        let greedy_cycles = self.schedule_ssa_greedy_with_shift(
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = self.schedule_ssa_greedy_with_shift(
             &mut ssa_ops,
             enable_valu_shift, // Match CP-SAT shift setting for hints
             &mut greedy_shifted,
@@ -220,10 +227,15 @@ impl SsaTickTockKernelBuilder {
 
         if verbose {
             eprintln!(
-                "SSA Greedy hint: {} cycles{}",
+                "SSA Greedy hint: {} cycles{}{}",
                 greedy_cycles,
                 if enable_valu_shift {
                     format!(" ({} VALU shifted)", greedy_shifted.len())
+                } else {
+                    String::new()
+                },
+                if greedy_budget_exceeded {
+                    format!(" [BUDGET EXCEEDED: peak={}]", greedy_peak_live)
                 } else {
                     String::new()
                 }
@@ -244,14 +256,24 @@ impl SsaTickTockKernelBuilder {
             scratch_budget: 1536, // Hardware limit
         };
 
-        // Pass shift hints if enabled
-        let shift_hints = if enable_valu_shift {
+        // Pass shift hints if enabled (but not if greedy exceeded budget - infeasible hints hurt CP-SAT)
+        let shift_hints = if enable_valu_shift && !greedy_budget_exceeded {
             Some(&greedy_shifted)
         } else {
             None
         };
 
-        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, Some(&greedy_hints), shift_hints)
+        // Don't pass greedy hints if they exceed budget - infeasible hints make CP-SAT slower
+        let greedy_hints_opt = if greedy_budget_exceeded {
+            if verbose {
+                eprintln!("  Skipping greedy hints (exceeded budget) - CP-SAT will search from scratch");
+            }
+            None
+        } else {
+            Some(&greedy_hints)
+        };
+
+        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, greedy_hints_opt.map(|v| v.as_slice()), shift_hints)
             .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
         // Apply cycle assignments
@@ -280,12 +302,14 @@ impl SsaTickTockKernelBuilder {
         }
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
+        let budget_exceeded = address_result.budget_exceeded;
 
-        if address_result.budget_exceeded {
-            return Err(format!(
-                "Address assignment exceeded budget: peak_live={} > budget={}",
+        if budget_exceeded {
+            // CP-SAT should respect budget, so this indicates a bug in CP-SAT solver
+            eprintln!(
+                "Warning: CP-SAT address assignment exceeded budget: peak_live={} > budget={}",
                 address_result.peak_live, address_result.budget
-            ));
+            );
         }
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
@@ -298,6 +322,7 @@ impl SsaTickTockKernelBuilder {
             address_result,
             vreg_count,
             valu_shifted,
+            budget_exceeded, // CP-SAT should not exceed budget
         })
     }
 
@@ -311,17 +336,19 @@ impl SsaTickTockKernelBuilder {
     /// be live simultaneously. If scheduling an op would exceed this budget,
     /// the op is delayed to a later cycle.
     ///
-    /// Returns the total number of cycles and populates shifted_ops with IDs
-    /// of ops that were shifted.
+    /// Returns `(cycles, budget_exceeded, peak_live)` where:
+    /// - `cycles`: Total number of cycles in the schedule
+    /// - `budget_exceeded`: True if force-scheduling was needed (budget violated)
+    /// - `peak_live`: Peak number of live words observed during scheduling
     fn schedule_ssa_greedy_with_shift_budget(
         &self,
         ops: &mut [SsaOp],
         enable_valu_shift: bool,
         shifted_ops: &mut HashSet<usize>,
         scratch_budget: usize,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, bool, usize), String> {
         if ops.is_empty() {
-            return Ok(0);
+            return Ok((0, false, 0));
         }
 
         // Build op_id -> index mapping
@@ -401,6 +428,10 @@ impl SsaTickTockKernelBuilder {
             .collect();
         let mut live_words: usize = 0;
         let mut live_vregs: HashSet<VReg> = HashSet::new();
+
+        // Budget tracking
+        let mut peak_live_words: usize = 0;
+        let mut budget_exceeded = false;
 
         // Track when each VReg was defined (used for debugging/validation)
         let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
@@ -597,6 +628,7 @@ impl SsaTickTockKernelBuilder {
                         if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
                             live_vregs.insert(d);
                             live_words += d.size();
+                            peak_live_words = peak_live_words.max(live_words);
                         }
                         // Track when this VReg was defined
                         vreg_def_cycle.insert(d, cycle as i32);
@@ -666,7 +698,8 @@ impl SsaTickTockKernelBuilder {
                 };
 
                 if fits_slots {
-                    // Force schedule, ignoring budget constraint
+                    // Force schedule, ignoring budget constraint - this exceeds budget!
+                    budget_exceeded = true;
                     match engine {
                         Engine::Load => load_used += 1,
                         Engine::Store => store_used += 1,
@@ -690,6 +723,7 @@ impl SsaTickTockKernelBuilder {
                     if let Some(dest_vreg) = dest {
                         live_vregs.insert(dest_vreg);
                         live_words += dest_vreg.size();
+                        peak_live_words = peak_live_words.max(live_words);
                         vreg_def_cycle.insert(dest_vreg, cycle as i32);
                     }
 
@@ -779,17 +813,27 @@ impl SsaTickTockKernelBuilder {
             ));
         }
 
-        Ok(cycle)
+        if budget_exceeded {
+            eprintln!(
+                "Greedy scheduler exceeded budget: peak_live={} > budget={} (force-scheduled to break deadlock)",
+                peak_live_words, scratch_budget
+            );
+        }
+
+        Ok((cycle, budget_exceeded, peak_live_words))
     }
 
     /// Schedule SSA ops using a greedy list scheduler with VALU→ALU shifting.
     /// Uses default scratch budget of 1536 (hardware limit).
+    ///
+    /// Returns `(cycles, budget_exceeded, peak_live)`. If budget was exceeded,
+    /// logs a warning but returns success - caller can decide whether to use CP-SAT.
     fn schedule_ssa_greedy_with_shift(
         &self,
         ops: &mut [SsaOp],
         enable_valu_shift: bool,
         shifted_ops: &mut HashSet<usize>,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, bool, usize), String> {
         // Use hardware scratch budget
         self.schedule_ssa_greedy_with_shift_budget(ops, enable_valu_shift, shifted_ops, 1536)
     }
@@ -1787,7 +1831,7 @@ mod tests {
         let mut shifted = HashSet::new();
 
         // Schedule with generous budget (1000 words)
-        let cycles = builder.schedule_ssa_greedy_with_shift_budget(
+        let (cycles, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops, false, &mut shifted, 1000
         ).expect("Should find feasible schedule");
 
@@ -1842,12 +1886,12 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
 
         let mut shifted_generous = HashSet::new();
-        let cycles_generous = builder.schedule_ssa_greedy_with_shift_budget(
+        let (cycles_generous, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops_generous, false, &mut shifted_generous, 1000
         ).expect("Should find feasible schedule with generous budget");
 
         let mut shifted_tight = HashSet::new();
-        let cycles_tight = builder.schedule_ssa_greedy_with_shift_budget(
+        let (cycles_tight, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops_tight, false, &mut shifted_tight, 24  // Only 3 vectors
         ).expect("Should find feasible schedule with tight budget");
 
@@ -1951,7 +1995,7 @@ mod tests {
         // - Cycle 2: op4 -> v2, v3 die, v4 born
         //
         // Without same-cycle reuse, op3 would be delayed to cycle 2.
-        let cycles = builder.schedule_ssa_greedy_with_shift_budget(
+        let (cycles, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
             &mut ops, false, &mut shifted, 24
         ).expect("Should find feasible schedule");
 
@@ -2173,7 +2217,7 @@ mod tests {
 
         assert!(result.is_ok(), "Should handle external deps: {:?}", result.err());
 
-        let cycles = result.unwrap();
+        let (cycles, _, _) = result.unwrap();
         assert_eq!(cycles, 4, "Chain of 4 ops should take 4 cycles");
 
         // Verify all ops were scheduled
@@ -2393,13 +2437,14 @@ mod tests {
 
         assert!(result.is_ok(), "Slot overflow should still schedule all: {:?}", result.err());
 
+        let (cycles, _, _) = result.unwrap();
+
         // Verify ALL ops were scheduled
         for (i, op) in ops.iter().enumerate() {
             assert!(op.cycle >= 0, "Op {} should be scheduled", i);
         }
 
         // With 6 VALU slots, 12 independent ops need at least 2 cycles
-        let cycles = result.unwrap();
         assert!(cycles >= 2, "12 VALU ops + sinks should need at least 2 cycles");
     }
 

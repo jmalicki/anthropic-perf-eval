@@ -41,6 +41,8 @@ Total memory: ~2600 words minimum
 | Vector allocation | VLEN=8 words per vector |
 | Effective vectors | 1536/8 = 192 vector registers |
 
+**Hard Constraint**: The scratch budget is a strict limit that cannot be exceeded. Scheduling with this constraint is equivalent to the "black pebbling game" on DAGs, which is **PSPACE-complete** (Gilbert, Lengauer, Tarjan 1980). Our greedy scheduler uses heuristics to stay within budget, with CP-SAT fallback when needed. See `docs/SCRATCH_PRESSURE.md` for theoretical details.
+
 ### Current Scratch Usage
 
 From `interleaved_unrolled_kernel.py`:

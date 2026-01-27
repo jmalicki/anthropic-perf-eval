@@ -59,7 +59,17 @@ Tree-reduce at depth 3:
 
 The fundamental issue: our greedy scheduler optimizes for minimum cycles without considering register pressure. When peak liveness exceeds the scratch budget, no valid allocation exists.
 
-### 1.3 Current Architecture
+### 1.3 Theoretical Complexity
+
+Scheduling with scratch budget constraints is equivalent to the **black pebbling game** on DAGs. This problem is **PSPACE-complete** (Gilbert, Lengauer, Tarjan 1980), meaning:
+
+- No polynomial-time algorithm can guarantee finding a valid schedule
+- Greedy heuristics may fail even when valid schedules exist
+- Complete solvers (with backtracking, like CP-SAT) are required for guaranteed solutions
+
+See `docs/SCRATCH_PRESSURE.md` section "Theoretical Background: Pebbling Games" for detailed analysis, references, and our greedy + CP-SAT fallback approach.
+
+### 1.4 Current Architecture
 
 <svg viewBox="0 0 300 200" xmlns="http://www.w3.org/2000/svg">
   <defs>
