@@ -124,9 +124,10 @@ impl SsaTickTockKernelBuilder {
         self.build_internal();
 
         // Get ops and dependency info
-        let mut ssa_ops = self.emit.take_ops();
+        // IMPORTANT: Take vreg_def BEFORE take_ops() since take_ops() clears it
         let vreg_def = std::mem::take(&mut self.emit.vreg_def);
         let vreg_count = self.emit.next_vreg_id;
+        let mut ssa_ops = self.emit.take_ops();
 
         // Compute dependencies (RAW only - no false WAW/WAR)
         compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
@@ -180,15 +181,17 @@ impl SsaTickTockKernelBuilder {
     /// 1. SSA op emission
     /// 2. SSA dependency computation (RAW only)
     /// 3. Optionally: Greedy scheduling to get hints
-    /// 4. CP-SAT scheduling on SsaOps
+    /// 4. CP-SAT scheduling on SsaOps (with optional VALU→ALU shift modeling)
     /// 5. Address assignment via linear scan
-    /// 6. Lowering to concrete ops
+    /// 6. Lowering to concrete ops (expanding shifted VALU ops)
     ///
-    /// Note: VALU→ALU shifting is not yet supported with CP-SAT.
+    /// When `enable_valu_shift` is true, the CP-SAT solver models VALU→ALU shifting
+    /// as decision variables, allowing it to find globally optimal shift decisions.
     pub fn build_and_schedule_cpsat(
         &mut self,
         time_limit_secs: f64,
         verbose: bool,
+        enable_valu_shift: bool,
     ) -> Result<SsaScheduleResult, String> {
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
 
@@ -196,24 +199,34 @@ impl SsaTickTockKernelBuilder {
         self.build_internal();
 
         // Get ops and dependency info
-        let mut ssa_ops = self.emit.take_ops();
+        // IMPORTANT: Take vreg_def BEFORE take_ops() since take_ops() clears it
         let vreg_def = std::mem::take(&mut self.emit.vreg_def);
         let vreg_count = self.emit.next_vreg_id;
+        let mut ssa_ops = self.emit.take_ops();
 
         // Compute dependencies (RAW only)
         compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
 
         // Get greedy hints first (for warm-starting CP-SAT)
-        let mut dummy_shifted = HashSet::new();
+        // If shift is enabled, also get shift hints from greedy scheduler
+        let mut greedy_shifted = HashSet::new();
         let greedy_cycles = self.schedule_ssa_greedy_with_shift(
             &mut ssa_ops,
-            false, // No VALU shift for hints (CP-SAT doesn't model it)
-            &mut dummy_shifted,
+            enable_valu_shift, // Match CP-SAT shift setting for hints
+            &mut greedy_shifted,
         )?;
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
 
         if verbose {
-            eprintln!("SSA Greedy hint: {} cycles", greedy_cycles);
+            eprintln!(
+                "SSA Greedy hint: {} cycles{}",
+                greedy_cycles,
+                if enable_valu_shift {
+                    format!(" ({} VALU shifted)", greedy_shifted.len())
+                } else {
+                    String::new()
+                }
+            );
         }
 
         // Reset cycles before CP-SAT
@@ -221,14 +234,23 @@ impl SsaTickTockKernelBuilder {
             op.cycle = -1;
         }
 
-        // Run CP-SAT on SSA ops
+        // Run CP-SAT on SSA ops with scratch budget constraint
         let cpsat_config = SsaCpsatConfig {
             time_limit_secs,
             verbose,
             stop_after_first_solution: false,
+            enable_valu_shift,
+            scratch_budget: 1536, // Hardware limit
         };
 
-        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, Some(&greedy_hints))
+        // Pass shift hints if enabled
+        let shift_hints = if enable_valu_shift {
+            Some(&greedy_shifted)
+        } else {
+            None
+        };
+
+        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, Some(&greedy_hints), shift_hints)
             .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
         // Apply cycle assignments
@@ -239,11 +261,12 @@ impl SsaTickTockKernelBuilder {
         }
 
         let cycles = cpsat_result.makespan;
+        let shifted_ops = cpsat_result.shifted_ops;
 
         if verbose {
             eprintln!(
-                "SSA CP-SAT result: {} cycles (greedy was {})",
-                cycles, greedy_cycles
+                "SSA CP-SAT result: {} cycles (greedy was {}), {} VALU ops shifted",
+                cycles, greedy_cycles, shifted_ops.len()
             );
         }
 
@@ -264,15 +287,16 @@ impl SsaTickTockKernelBuilder {
             ));
         }
 
-        // Lower to concrete ops (no VALU shifting for now)
-        let ops = lower_ssa_ops(&ssa_ops, &address_result.vreg_to_addr);
+        // Lower to concrete ops, expanding shifted VALU ops to ALU
+        let valu_shifted = shifted_ops.len();
+        let ops = lower_ssa_ops_with_shift(&ssa_ops, &address_result.vreg_to_addr, &shifted_ops);
 
         Ok(SsaScheduleResult {
             ops,
             cycles,
             address_result,
             vreg_count,
-            valu_shifted: 0,
+            valu_shifted,
         })
     }
 

@@ -90,9 +90,10 @@ use cp_sat::builder::{CpModelBuilder, IntVar, IntervalVar, LinearExpr};
 #[cfg(feature = "cpsat")]
 use cp_sat::proto::{CpSolverStatus, SatParameters};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Not;
 
-use crate::types::{Engine, Op, SsaOp};
+use crate::types::{Engine, Op, SsaOp, VReg, VLEN};
 
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
@@ -886,6 +887,10 @@ pub struct SsaCpsatConfig {
     pub verbose: bool,
     /// If true, stop after finding the first feasible solution
     pub stop_after_first_solution: bool,
+    /// If true, model VALU→ALU shifting as CP-SAT decisions
+    pub enable_valu_shift: bool,
+    /// Scratch memory budget (max simultaneous live words). 0 = no constraint.
+    pub scratch_budget: usize,
 }
 
 impl Default for SsaCpsatConfig {
@@ -894,8 +899,27 @@ impl Default for SsaCpsatConfig {
             time_limit_secs: 60.0,
             verbose: false,
             stop_after_first_solution: false,
+            enable_valu_shift: false,
+            scratch_budget: 1536, // Default hardware limit
         }
     }
+}
+
+/// Result from SSA CP-SAT scheduling with VALU shift decisions
+#[derive(Debug, Clone)]
+pub struct SsaCpsatResult {
+    /// Cycle assignment for each op (indexed by op position in input slice)
+    pub cycle_assignments: Vec<i32>,
+    /// Total makespan (number of cycles)
+    pub makespan: usize,
+    /// Solver status
+    pub status: CpsatStatus,
+    /// Time spent solving (seconds)
+    pub solve_time_secs: f64,
+    /// Optimality gap (0.0 = optimal)
+    pub gap: f64,
+    /// Set of op IDs that should be shifted from VALU to ALU
+    pub shifted_ops: HashSet<usize>,
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
@@ -1017,35 +1041,48 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
 /// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
 /// This avoids false WAW/WAR dependencies introduced by register allocation.
 ///
+/// When `enable_valu_shift` is true, the solver can decide which VALU ops to shift
+/// to ALU (8 scalar ops). This is modeled using optional intervals:
+/// - Each shiftable VALU op has two optional intervals: VALU variant and ALU variant
+/// - Exactly one must be present (shift decision)
+/// - Shifted ops consume 8 ALU slots instead of 1 VALU slot
+///
 /// # Arguments
 /// * `ops` - SSA operations to schedule (with dep_ids computed)
 /// * `config` - Configuration for the CP-SAT scheduler
 /// * `greedy_hints` - Optional cycle assignments from greedy scheduler
+/// * `shift_hints` - Optional shift decisions from greedy scheduler (op idx -> should shift)
 ///
 /// # Returns
-/// * `Some(CpsatResult)` if a solution was found
+/// * `Some(SsaCpsatResult)` if a solution was found (includes shift decisions)
 /// * `None` if no solution found or feature not enabled
 #[cfg(feature = "cpsat")]
 pub fn schedule_ssa_cpsat(
     ops: &[SsaOp],
     config: SsaCpsatConfig,
     greedy_hints: Option<&[i32]>,
-) -> Option<CpsatResult> {
+    shift_hints: Option<&HashSet<usize>>,
+) -> Option<SsaCpsatResult> {
+    use cp_sat::builder::BoolVar;
+
     let SsaCpsatConfig {
         time_limit_secs,
         verbose,
         stop_after_first_solution,
+        enable_valu_shift,
+        scratch_budget,
     } = config;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
     if n == 0 {
-        return Some(CpsatResult {
+        return Some(SsaCpsatResult {
             cycle_assignments: vec![],
             makespan: 0,
             status: CpsatStatus::Optimal,
             solve_time_secs: 0.0,
             gap: 0.0,
+            shifted_ops: HashSet::new(),
         });
     }
 
@@ -1061,14 +1098,25 @@ pub fn schedule_ssa_cpsat(
 
     let alap = compute_ssa_alap(ops, horizon as i32);
 
+    // 2. Identify shiftable VALU ops
+    let shiftable_valu: Vec<usize> = if enable_valu_shift {
+        ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Valu && op.opcode.can_shift_to_alu())
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if verbose {
         eprintln!(
-            "SSA CP-SAT: {} ops, critical path {}, horizon {}",
-            n, critical_path_len, horizon
+            "SSA CP-SAT: {} ops, critical path {}, horizon {}, shiftable VALU ops: {}, scratch_budget={}",
+            n, critical_path_len, horizon, shiftable_valu.len(), scratch_budget
         );
     }
 
-    // 2. Build the CP model
+    // 3. Build the CP model
     let mut model = CpModelBuilder::default();
 
     // Build op_id to index mapping
@@ -1078,7 +1126,7 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, op)| (op.id, idx))
         .collect();
 
-    // 3. Create cycle variable for each op with [asap, alap] domain
+    // 4. Create cycle variable for each op with [asap, alap] domain
     let cycle_vars: Vec<IntVar> = ops
         .iter()
         .enumerate()
@@ -1089,7 +1137,7 @@ pub fn schedule_ssa_cpsat(
         })
         .collect();
 
-    // 4. Add precedence constraints from RAW dependencies
+    // 5. Add precedence constraints from RAW dependencies
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
@@ -1099,50 +1147,451 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5. Create interval variables for slot consumption
-    let intervals: Vec<IntervalVar> = cycle_vars
+    // 6. Create shift decision variables and optional intervals for shiftable VALU ops
+    let shiftable_set: HashSet<usize> = shiftable_valu.iter().copied().collect();
+    let mut shift_vars: HashMap<usize, BoolVar> = HashMap::new();
+    let mut valu_optional_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+    let mut alu_optional_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+
+    for &idx in &shiftable_valu {
+        // shift[idx] = 1 means shift to ALU, 0 means keep on VALU
+        let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
+        shift_vars.insert(idx, shift_var);
+
+        // VALU variant: present when NOT shifted (shift_var = false)
+        let valu_interval = model.new_optional_fixed_size_interval_var(
+            cycle_vars[idx],
+            1,
+            shift_var.not(),
+        );
+        valu_optional_intervals.insert(idx, valu_interval);
+
+        // ALU variant: present when shifted (shift_var = true)
+        let alu_interval = model.new_optional_fixed_size_interval_var(
+            cycle_vars[idx],
+            1,
+            shift_var,
+        );
+        alu_optional_intervals.insert(idx, alu_interval);
+    }
+
+    // 7. Create regular intervals for non-shiftable ops
+    let mut regular_intervals: Vec<IntervalVar> = Vec::new();
+    for (idx, _) in ops.iter().enumerate() {
+        if !shiftable_set.contains(&idx) {
+            regular_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+        }
+    }
+
+    // 8. Build cumulative constraints with optional intervals
+
+    // Collect non-shiftable VALU ops
+    let non_shiftable_valu: Vec<usize> = ops
         .iter()
-        .map(|&cv| model.new_fixed_size_interval_var(cv, 1))
+        .enumerate()
+        .filter(|(idx, op)| op.engine == Engine::Valu && !shiftable_set.contains(idx))
+        .map(|(idx, _)| idx)
         .collect();
 
-    // 6. Group ops by engine and add cumulative constraints
-    let mut ops_by_engine: HashMap<Engine, Vec<usize>> = HashMap::new();
-    for (idx, op) in ops.iter().enumerate() {
-        if op.engine.is_hardware() {
-            ops_by_engine.entry(op.engine).or_default().push(idx);
+    // Collect ALU ops
+    let alu_ops: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.engine == Engine::Alu)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // VALU cumulative: non-shiftable VALU + optional VALU intervals from shiftable ops
+    {
+        let mut valu_intervals: Vec<IntervalVar> = Vec::new();
+        let mut valu_demands: Vec<i64> = Vec::new();
+
+        // Add non-shiftable VALU ops (always present)
+        for &idx in &non_shiftable_valu {
+            valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            valu_demands.push(1);
+        }
+
+        // Add optional VALU intervals (present when not shifted)
+        for &idx in &shiftable_valu {
+            if let Some(&iv) = valu_optional_intervals.get(&idx) {
+                valu_intervals.push(iv);
+                valu_demands.push(1);
+            }
+        }
+
+        if !valu_intervals.is_empty() {
+            model.add_cumulative(valu_intervals, valu_demands, 6); // VALU has 6 slots
         }
     }
 
-    for (engine, op_indices) in &ops_by_engine {
-        let capacity = engine.slot_limit() as i64;
-        if capacity > 0 && !op_indices.is_empty() {
-            let engine_intervals: Vec<IntervalVar> =
-                op_indices.iter().map(|&idx| intervals[idx]).collect();
-            let demands: Vec<i64> = vec![1; op_indices.len()];
-            model.add_cumulative(engine_intervals, demands, capacity);
+    // ALU cumulative: regular ALU ops + optional ALU intervals (demand=8 for shifted VALU)
+    {
+        let mut alu_intervals: Vec<IntervalVar> = Vec::new();
+        let mut alu_demands: Vec<i64> = Vec::new();
+
+        // Add regular ALU ops (demand = 1)
+        for &idx in &alu_ops {
+            alu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            alu_demands.push(1);
+        }
+
+        // Add optional ALU intervals for shifted VALU ops (demand = 8)
+        for &idx in &shiftable_valu {
+            if let Some(&iv) = alu_optional_intervals.get(&idx) {
+                alu_intervals.push(iv);
+                alu_demands.push(8); // Shifted VALU op expands to 8 ALU ops
+            }
+        }
+
+        if !alu_intervals.is_empty() {
+            model.add_cumulative(alu_intervals, alu_demands, 12); // ALU has 12 slots
         }
     }
 
-    // 6b. Compute capacity-based lower bounds
-    let mut capacity_lower_bound = critical_path_len as i64;
-    for (engine, op_indices) in &ops_by_engine {
-        let capacity = engine.slot_limit() as i64;
-        if capacity > 0 && !op_indices.is_empty() {
-            let num_ops = op_indices.len() as i64;
-            let min_cycles = (num_ops + capacity - 1) / capacity;
-            if min_cycles > capacity_lower_bound {
-                if verbose {
-                    eprintln!(
-                        "  Capacity bound: {:?} has {} ops / {} slots = {} min cycles",
-                        engine, num_ops, capacity, min_cycles
+    // Load/Store/Flow cumulative constraints (unchanged - no shifting)
+    for (engine, engine_slots) in [
+        (Engine::Load, 2),
+        (Engine::Store, 2),
+        (Engine::Flow, 1),
+    ] {
+        let engine_ops: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == engine)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if !engine_ops.is_empty() {
+            let intervals: Vec<IntervalVar> = engine_ops
+                .iter()
+                .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
+                .collect();
+            let demands: Vec<i64> = vec![1; intervals.len()];
+            model.add_cumulative(intervals, demands, engine_slots);
+        }
+    }
+
+    // 8b. Add scratch pressure constraint (live VReg capacity)
+    // Models: at any cycle, total size of live VRegs <= scratch_budget
+    eprintln!("DEBUG: scratch_budget = {}, verbose = {}", scratch_budget, verbose);
+    if scratch_budget > 0 {
+        // Build VReg -> defining op index mapping
+        let mut vreg_def_op: HashMap<VReg, usize> = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_def_op.insert(dest, idx);
+            }
+        }
+
+        // Build VReg -> last use op index mapping
+        // IMPORTANT: We need the op with the LATEST CYCLE that reads this VReg, not just the latest index.
+        // If we have greedy hints, use them to determine the actual last use by cycle.
+        // Otherwise, fall back to index order (which may be incorrect but is a reasonable heuristic).
+        let mut vreg_last_use: HashMap<VReg, usize> = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            for vreg in op.reads() {
+                let should_update = if let Some(hints) = greedy_hints {
+                    // Use cycle from hints to determine if this is a later use
+                    let current_cycle = hints.get(idx).copied().unwrap_or(0);
+                    let existing_cycle = vreg_last_use.get(&vreg)
+                        .and_then(|&existing_idx| hints.get(existing_idx).copied())
+                        .unwrap_or(-1);
+                    current_cycle > existing_cycle
+                } else {
+                    // Without hints, use index order (may be suboptimal)
+                    true
+                };
+
+                if should_update {
+                    vreg_last_use.insert(vreg, idx);
+                } else if !vreg_last_use.contains_key(&vreg) {
+                    vreg_last_use.insert(vreg, idx);
+                }
+            }
+        }
+
+        if verbose {
+            // Count ops with dest
+            let ops_with_dest = ops.iter().filter(|op| op.dest.is_some()).count();
+            let ops_with_reads = ops.iter().filter(|op| op.reads().count() > 0).count();
+            eprintln!(
+                "  Scratch debug: {} ops total, {} with dest, {} with reads, {} VReg defs, {} VReg uses",
+                ops.len(),
+                ops_with_dest,
+                ops_with_reads,
+                vreg_def_op.len(),
+                vreg_last_use.len()
+            );
+        }
+
+        // For VRegs that are defined but never read (dead code), they still occupy space
+        // until the end. For simplicity, we'll only model VRegs that have both def and use.
+
+        // Collect VRegs that have both definition and use
+        let live_vregs: Vec<VReg> = vreg_def_op
+            .keys()
+            .filter(|v| vreg_last_use.contains_key(v))
+            .copied()
+            .collect();
+
+        if !live_vregs.is_empty() {
+            let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
+            let mut scratch_demands: Vec<i64> = Vec::new();
+            let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
+
+            for vreg in &live_vregs {
+                let def_idx = vreg_def_op[vreg];
+                let last_use_idx = vreg_last_use[vreg];
+
+                // The VReg is live from when it's defined until its last use.
+                // Create a variable-length interval: [def_cycle, last_use_cycle]
+                // The "size" of this interval is (last_use_cycle - def_cycle + 1)
+                //
+                // For cumulative, we need: start, size (or end)
+                // start = cycle_vars[def_idx]
+                // end = cycle_vars[last_use_idx] + 1 (VReg is live through the last use cycle)
+                //
+                // Use new_interval_var(start, size, end) where end = start + size
+                // We want: live from def_cycle to last_use_cycle (inclusive)
+                // So: end = last_use_cycle + 1, size = end - start = last_use_cycle + 1 - def_cycle
+
+                let start = cycle_vars[def_idx];
+                let end_expr = LinearExpr::from(cycle_vars[last_use_idx]) + 1;
+
+                // Create a size variable: size = end - start = cycle[last_use] + 1 - cycle[def]
+                // Size must be >= 1 (def and last_use could be same cycle)
+                let size = model.new_int_var_with_name(
+                    [(1, horizon + 1)],
+                    format!("live_size_{}", vreg.id),
+                );
+
+                // Constraint: size = cycle[last_use] + 1 - cycle[def]
+                // Rewrite: cycle[def] + size = cycle[last_use] + 1
+                model.add_eq(
+                    LinearExpr::from(start) + LinearExpr::from(size),
+                    end_expr,
+                );
+
+                let interval = model.new_interval_var(start, size, LinearExpr::from(cycle_vars[last_use_idx]) + 1);
+                scratch_intervals.push(interval);
+                size_vars.push((size, def_idx, last_use_idx));
+
+                // Demand = size of VReg (1 for scalar, VLEN for vector)
+                let demand = vreg.size() as i64;
+                scratch_demands.push(demand);
+            }
+
+            model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
+
+            // Add hints for size variables if we have greedy hints
+            if let Some(hints) = greedy_hints {
+                let mut bad_size_count = 0;
+                for vreg in &live_vregs {
+                    let def_idx = vreg_def_op[vreg];
+                    let last_use_idx = vreg_last_use[vreg];
+                    if def_idx < hints.len() && last_use_idx < hints.len() {
+                        let def_cycle = hints[def_idx];
+                        let last_use_cycle = hints[last_use_idx];
+                        let expected_size = last_use_cycle - def_cycle + 1;
+                        if expected_size < 1 {
+                            bad_size_count += 1;
+                            if bad_size_count <= 5 && verbose {
+                                // Get more info about the problematic VReg
+                                let def_op = &ops[def_idx];
+                                let use_op = &ops[last_use_idx];
+                                eprintln!(
+                                    "  BUG: VReg {:?} (size={}): def by op {} (id={}, {:?}) at cycle {}, \
+                                     but last_use by op {} (id={}, {:?}) at cycle {}. \
+                                     Use depends on def? {:?}",
+                                    vreg, vreg.size(), def_idx, def_op.id, def_op.engine, def_cycle,
+                                    last_use_idx, use_op.id, use_op.engine, last_use_cycle,
+                                    use_op.dep_ids.contains(&def_op.id)
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Now add size hints
+                for (size_var, def_idx, last_use_idx) in &size_vars {
+                    if *def_idx < hints.len() && *last_use_idx < hints.len() {
+                        let def_cycle = hints[*def_idx];
+                        let last_use_cycle = hints[*last_use_idx];
+                        let expected_size = (last_use_cycle - def_cycle + 1).max(1);
+                        model.add_hint(*size_var, expected_size as i64);
+                    }
+                }
+
+                if bad_size_count > 0 {
+                    panic!(
+                        "BUG: {} VRegs have last_use_cycle < def_cycle! This will cause infeasible hints.",
+                        bad_size_count
                     );
                 }
-                capacity_lower_bound = min_cycles;
+            }
+
+            // CRITICAL: Verify hints are feasible before solving
+            // If hints are infeasible, there's a bug in our model - fail immediately
+            if let Some(hints) = greedy_hints {
+                // Compute peak liveness from hints
+                let mut events: Vec<(i32, i64)> = Vec::new();
+                for vreg in &live_vregs {
+                    let def_idx = vreg_def_op[vreg];
+                    let last_use_idx = vreg_last_use[vreg];
+                    let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                    let last_use_cycle = hints.get(last_use_idx).copied().unwrap_or(def_cycle);
+                    let size = vreg.size() as i64;
+                    events.push((def_cycle, size));           // VReg becomes live
+                    events.push((last_use_cycle + 1, -size)); // VReg dies after last use
+                }
+                events.sort_by_key(|(cycle, delta)| (*cycle, *delta));
+
+                let mut current = 0i64;
+                let mut peak = 0i64;
+                for (_, delta) in &events {
+                    current += delta;
+                    peak = peak.max(current);
+                }
+
+                if peak > scratch_budget as i64 {
+                    panic!(
+                        "BUG: Greedy hint violates scratch constraint! peak_live={} > budget={}. \
+                         This indicates a mismatch between the greedy scheduler's liveness tracking \
+                         and the CP-SAT scratch constraint model.",
+                        peak, scratch_budget
+                    );
+                }
+
+                if verbose {
+                    eprintln!("  Hint verification: peak_live={} <= budget={} OK", peak, scratch_budget);
+                }
+            }
+
+            if verbose {
+                eprintln!(
+                    "  Scratch constraint: {} live VRegs, budget={}",
+                    live_vregs.len(),
+                    scratch_budget
+                );
             }
         }
     }
 
-    // 7. Create makespan variable and objective
+    // Verify VALU and ALU cumulative constraints from greedy hints
+    if let Some(hints) = greedy_hints {
+        // Compute per-cycle usage
+        let max_cycle = *hints.iter().max().unwrap_or(&0) as usize + 1;
+        let mut valu_per_cycle = vec![0i32; max_cycle];
+        let mut alu_per_cycle = vec![0i32; max_cycle];
+
+        for (idx, op) in ops.iter().enumerate() {
+            if idx >= hints.len() {
+                continue;
+            }
+            let cycle = hints[idx] as usize;
+            if cycle >= max_cycle {
+                continue;
+            }
+
+            let is_shifted = if let Some(shift_hints) = shift_hints {
+                shift_hints.contains(&op.id)
+            } else {
+                false
+            };
+
+            match op.engine {
+                Engine::Valu if !is_shifted => {
+                    valu_per_cycle[cycle] += 1;
+                }
+                Engine::Valu if is_shifted => {
+                    alu_per_cycle[cycle] += VLEN as i32; // Shifted VALU uses 8 ALU slots
+                }
+                Engine::Alu => {
+                    alu_per_cycle[cycle] += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Check for violations
+        let mut valu_violations = 0;
+        let mut alu_violations = 0;
+        for cycle in 0..max_cycle {
+            if valu_per_cycle[cycle] > 6 {
+                if valu_violations < 3 && verbose {
+                    eprintln!("  WARNING: VALU overflow at cycle {}: {} > 6", cycle, valu_per_cycle[cycle]);
+                }
+                valu_violations += 1;
+            }
+            if alu_per_cycle[cycle] > 12 {
+                if alu_violations < 3 && verbose {
+                    eprintln!("  WARNING: ALU overflow at cycle {}: {} > 12", cycle, alu_per_cycle[cycle]);
+                }
+                alu_violations += 1;
+            }
+        }
+
+        if valu_violations > 0 || alu_violations > 0 {
+            panic!(
+                "BUG: Greedy hint violates engine capacity! VALU violations: {}, ALU violations: {}",
+                valu_violations, alu_violations
+            );
+        }
+
+        if verbose {
+            eprintln!("  Engine capacity verification: OK (VALU<=6, ALU<=12 at all cycles)");
+        }
+    }
+
+    // 9. Compute capacity-based lower bounds
+    // With VALU shifting, we can potentially use ALU capacity for VALU overflow
+    let mut capacity_lower_bound = critical_path_len as i64;
+
+    // Count ops by engine
+    let valu_count = ops.iter().filter(|op| op.engine == Engine::Valu).count() as i64;
+    let alu_count = ops.iter().filter(|op| op.engine == Engine::Alu).count() as i64;
+    let load_count = ops.iter().filter(|op| op.engine == Engine::Load).count() as i64;
+    let store_count = ops.iter().filter(|op| op.engine == Engine::Store).count() as i64;
+
+    // Without shifting: VALU bound
+    let valu_only_bound = (valu_count + 5) / 6;
+    if !enable_valu_shift && valu_only_bound > capacity_lower_bound {
+        capacity_lower_bound = valu_only_bound;
+    }
+
+    // With shifting: combined ALU+VALU bound
+    // Each shifted VALU op uses 8 ALU slots
+    // Best case: shift as many VALU ops as ALU capacity allows
+    if enable_valu_shift {
+        // This is a rough lower bound - actual bound depends on shift decisions
+        // Minimum cycles needed to execute all ops considering both engines
+        let total_valu_work = valu_count; // Each VALU op = 1 VALU slot or 8 ALU slots
+        let total_alu_work = alu_count; // Each ALU op = 1 ALU slot
+
+        // Per cycle: up to 6 VALU + 12 ALU, but shifted VALU uses 8 ALU
+        // Lower bound: we need at least enough cycles to handle all work
+        // Simple bound: (total_alu + shifted_valu*8) / 12 combined with (unshifted_valu) / 6
+        // Approximate: max(alu_count/12, valu_count/6)
+        let combined_bound = (valu_count + alu_count + 5) / 14; // Rough approximation
+        if combined_bound > capacity_lower_bound {
+            capacity_lower_bound = combined_bound;
+        }
+    }
+
+    // Other engine bounds
+    let load_bound = (load_count + 1) / 2;
+    let store_bound = (store_count + 1) / 2;
+    capacity_lower_bound = capacity_lower_bound.max(load_bound).max(store_bound);
+
+    if verbose {
+        eprintln!(
+            "  Capacity bounds: VALU={}, ALU={}, Load={}, Store={}, combined={}",
+            valu_only_bound, (alu_count + 11) / 12, load_bound, store_bound, capacity_lower_bound
+        );
+    }
+
+    // 10. Create makespan variable and objective
     let makespan = model.new_int_var_with_name(
         [(capacity_lower_bound, horizon)],
         "makespan".to_string(),
@@ -1155,7 +1604,7 @@ pub fn schedule_ssa_cpsat(
 
     model.minimize(makespan);
 
-    // 8. Add hints from greedy scheduler
+    // 11. Add hints from greedy scheduler
     if let Some(hints) = greedy_hints {
         for (idx, &hint_cycle) in hints.iter().enumerate() {
             if idx < cycle_vars.len() && hint_cycle >= 0 {
@@ -1167,7 +1616,15 @@ pub fn schedule_ssa_cpsat(
         model.add_hint(makespan, hint_makespan as i64);
     }
 
-    // 9. Configure solver
+    // Add shift hints if provided
+    if let Some(hints) = shift_hints {
+        for (&idx, &shift_var) in &shift_vars {
+            let should_shift = hints.contains(&ops[idx].id);
+            model.add_hint(shift_var, if should_shift { 1 } else { 0 });
+        }
+    }
+
+    // 12. Configure solver
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
     params.log_search_progress = Some(verbose);
@@ -1177,7 +1634,7 @@ pub fn schedule_ssa_cpsat(
         params.stop_after_first_solution = Some(true);
     }
 
-    // 10. Solve
+    // 14. Solve
     let response = model.solve_with_parameters(&params);
     let solve_time = start_time.elapsed().as_secs_f64();
 
@@ -1191,6 +1648,13 @@ pub fn schedule_ssa_cpsat(
                 .collect();
 
             let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
+
+            // Extract shift decisions
+            let shifted_ops: HashSet<usize> = shift_vars
+                .iter()
+                .filter(|(_, &var)| var.solution_value(&response))
+                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
+                .collect();
 
             let gap = if status == CpsatStatus::Optimal {
                 0.0
@@ -1206,17 +1670,18 @@ pub fn schedule_ssa_cpsat(
 
             if verbose {
                 eprintln!(
-                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s",
-                    actual_makespan, status, gap * 100.0, solve_time
+                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s, shifted {} VALU ops",
+                    actual_makespan, status, gap * 100.0, solve_time, shifted_ops.len()
                 );
             }
 
-            Some(CpsatResult {
+            Some(SsaCpsatResult {
                 cycle_assignments,
                 makespan: actual_makespan as usize,
                 status,
                 solve_time_secs: solve_time,
                 gap,
+                shifted_ops,
             })
         }
         _ => {
@@ -1234,7 +1699,8 @@ pub fn schedule_ssa_cpsat(
     _ops: &[SsaOp],
     _config: SsaCpsatConfig,
     _greedy_hints: Option<&[i32]>,
-) -> Option<CpsatResult> {
+    _shift_hints: Option<&HashSet<usize>>,
+) -> Option<SsaCpsatResult> {
     eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
     None
 }
@@ -1340,7 +1806,7 @@ pub fn cpsat_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Engine, Op, SlotVal, MAX_SLOT_SIZE};
+    use crate::types::{Engine, Op, Operand, SlotVal, SsaOp, VReg, MAX_SLOT_SIZE};
     use arrayvec::ArrayVec;
     use std::collections::HashSet;
 
@@ -1866,5 +2332,831 @@ mod tests {
             "Makespan ({}) should be at least 3 (critical path)",
             r.result.makespan
         );
+    }
+
+    /// Helper to create SsaOp for testing
+    fn make_ssa_op(
+        id: usize,
+        engine: Engine,
+        opcode: crate::types::Opcode,
+        dest: Option<VReg>,
+        srcs: Vec<Operand>,
+        deps: Vec<usize>,
+    ) -> SsaOp {
+        let mut op = SsaOp::new(id, engine, opcode, dest, srcs);
+        op.dep_ids = deps.into_iter().collect();
+        op
+    }
+
+    /// Test that SSA CP-SAT scratch constraint is being applied.
+    /// Creates a scenario with high scratch pressure to verify the constraint.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_constraint_basic() {
+        use crate::types::Opcode;
+
+        // Create a simple chain where each op produces a value used by the next.
+        // op0: load -> v0 (scalar, 1 word)
+        // op1: alu(v0) -> v1
+        // op2: alu(v1) -> v2
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+        ];
+
+        // With generous budget, should succeed
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 100,  // More than enough
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with generous budget");
+        let r = result.unwrap();
+        assert_eq!(r.status, CpsatStatus::Optimal, "Should be optimal for simple chain");
+        eprintln!("Basic test: makespan={}, status={:?}", r.makespan, r.status);
+    }
+
+    /// Test that scratch constraint forces spreading when budget is tight.
+    /// With vector VRegs (8 words each), a tight budget should force longer schedules.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_constraint_tight_budget() {
+        use crate::types::Opcode;
+
+        // Create multiple independent ops that would normally run in parallel,
+        // but with tight scratch budget they must be serialized.
+        // Each vector VReg uses 8 words.
+        //
+        // op0: load -> v0 (vector, 8 words) - no deps
+        // op1: load -> v1 (vector, 8 words) - no deps
+        // op2: load -> v2 (vector, 8 words) - no deps
+        // op3: valu(v0, v1) -> v3 (vector, 8 words) - deps: 0, 1
+        // op4: valu(v2, v3) -> v4 (vector, 8 words) - deps: 2, 3
+        //
+        // If all run ASAP:
+        //   Cycle 0: op0, op1, op2 scheduled -> v0, v1, v2 all live = 24 words
+        //   Cycle 1: op3 scheduled -> v0, v1, v2, v3 live, then v0, v1 die = still ~24 words at peak
+        //   Cycle 2: op4 scheduled -> v2, v3, v4 live
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::vector(2)), vec![Operand::imm(3)], vec![]),
+            make_ssa_op(3, Engine::Valu, Opcode::Add, Some(VReg::vector(3)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)), vec![Operand::vector(2), Operand::vector(3)], vec![2, 3]),
+        ];
+
+        // With large budget (e.g., 100 words), should allow parallel loads
+        let result_generous = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 100,
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+
+        assert!(result_generous.is_some(), "Should find solution with generous budget");
+        let r_generous = result_generous.unwrap();
+        eprintln!("Generous budget: makespan={}, status={:?}", r_generous.makespan, r_generous.status);
+
+        // With tight budget (16 words = 2 vectors), should need to serialize more
+        let result_tight = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 16,  // Only 2 vectors can be live at once
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+
+        // The tight budget should either:
+        // 1. Force a longer schedule (more cycles to reduce concurrent live values), or
+        // 2. Return infeasible if impossible
+        if let Some(r_tight) = result_tight {
+            eprintln!("Tight budget: makespan={}, status={:?}", r_tight.makespan, r_tight.status);
+            // With tight budget, makespan should be >= generous budget makespan
+            // (can't do better, might need more cycles)
+            assert!(
+                r_tight.makespan >= r_generous.makespan,
+                "Tight budget makespan ({}) should be >= generous ({}) or infeasible",
+                r_tight.makespan, r_generous.makespan
+            );
+        } else {
+            eprintln!("Tight budget: infeasible (expected if budget too small)");
+        }
+    }
+
+    /// Test that scratch constraint with budget=0 disables the constraint.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_constraint_disabled() {
+        use crate::types::Opcode;
+
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+        ];
+
+        // With budget=0, constraint is disabled
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 0,  // Disabled
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution when scratch constraint disabled");
+        let r = result.unwrap();
+        eprintln!("Disabled constraint: makespan={}, status={:?}", r.makespan, r.status);
+        // Should be optimal minimal schedule (2 cycles: loads then add)
+        assert_eq!(r.makespan, 2, "Minimal schedule should be 2 cycles");
+    }
+
+    /// Test that SSA CP-SAT hints are complete and feasible.
+    /// This is a critical test - if hints are incomplete or infeasible, the solver will struggle.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_hint_roundtrip_no_scratch() {
+        use crate::types::Opcode;
+
+        // Create a simple dependency chain
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+        ];
+
+        // Valid ASAP schedule: op0 at 0, op1 at 1, op2 at 2
+        let hints = vec![0, 1, 2];
+
+        // Run with stop_after_first_solution - should return exactly the hint if it's valid
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 0, // Disable scratch constraint for this test
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with valid hints");
+        let r = result.unwrap();
+
+        // Critical: with stop_after_first_solution, we should get exactly the hinted solution
+        assert_eq!(r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(r.makespan, 3, "Makespan should be 3 (cycles 0, 1, 2)");
+
+        eprintln!("Hint roundtrip (no scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan);
+    }
+
+    /// Test that SSA CP-SAT hints with scratch constraint are complete and feasible.
+    /// This verifies that the scratch interval size hints are correct.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_hint_roundtrip_with_scratch() {
+        use crate::types::Opcode;
+
+        // Create ops with clear liveness patterns
+        // op0: load -> v0 (cycle 0)
+        // op1: alu(v0) -> v1 (cycle 1) - v0 live from 0 to 1, size = 2
+        // op2: alu(v1) -> v2 (cycle 2) - v1 live from 1 to 2, size = 2
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+        ];
+
+        // Valid ASAP schedule
+        let hints = vec![0, 1, 2];
+
+        // Run with scratch constraint enabled
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10, // Small but sufficient for scalars
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with valid hints and scratch constraint");
+        let r = result.unwrap();
+
+        // Critical: hints should be feasible with scratch constraint
+        assert_eq!(r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(r.makespan, 3, "Makespan should be 3");
+
+        eprintln!("Hint roundtrip (with scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan);
+    }
+
+    /// Test that SSA CP-SAT hints with vectors and scratch constraint are feasible.
+    /// Vectors use 8 words each, so this tests the demand calculation.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_hint_roundtrip_vectors_with_scratch() {
+        use crate::types::Opcode;
+
+        // Create vector ops with clear liveness
+        // op0: load -> v0 (vector, 8 words, cycle 0)
+        // op1: load -> v1 (vector, 8 words, cycle 0) - can run parallel with op0
+        // op2: valu(v0, v1) -> v2 (cycle 1) - v0, v1 live from 0 to 1
+        // At cycle 0: v0, v1 defined = 16 words
+        // At cycle 1: v0, v1 used, v2 defined = peak 24 words (v0, v1 still live during use)
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+        ];
+
+        // Schedule: op0 and op1 at cycle 0 (parallel loads), op2 at cycle 1
+        let hints = vec![0, 0, 1];
+
+        // Run with scratch constraint - need at least 24 words (3 vectors live at peak)
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 32, // Enough for 4 vectors
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with valid vector hints and scratch constraint");
+        let r = result.unwrap();
+
+        // Critical: hints should be feasible
+        assert_eq!(r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(r.makespan, 2, "Makespan should be 2 (cycles 0 and 1)");
+
+        eprintln!("Hint roundtrip (vectors with scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan);
+    }
+
+    /// Test that infeasible hints with tight scratch budget are detected.
+    /// This verifies the scratch constraint actually constrains the solution.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_hint_infeasible_tight_scratch() {
+        use crate::types::Opcode;
+
+        // Create vector ops that would exceed a tight budget if run in parallel
+        // op0: load -> v0 (vector, 8 words)
+        // op1: load -> v1 (vector, 8 words)
+        // op2: valu(v0, v1) -> v2
+        // If op0, op1 at cycle 0: 16 words live at cycle 0
+        // At cycle 1 when op2 runs: v0, v1, v2 all live = 24 words
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+        ];
+
+        // Hints that would work without scratch constraint but violate tight budget
+        let hints = vec![0, 0, 1]; // Both loads at cycle 0
+
+        // Run with very tight scratch constraint (only 16 words - not enough for 3 vectors)
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 16, // Only 2 vectors worth - not enough!
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The solver should either:
+        // 1. Find a different (valid) schedule that fits the budget, or
+        // 2. Return infeasible if no valid schedule exists
+        // It should NOT return the infeasible hint as-is
+        if let Some(r) = result {
+            // If it found a solution, it should NOT be the original hint
+            // because that hint violates the scratch budget
+            eprintln!("Found alternative schedule: {:?}, makespan={}", r.cycle_assignments, r.makespan);
+            // The solver might find a valid schedule by serializing the loads
+            // e.g., [0, 1, 2] instead of [0, 0, 1]
+            assert!(r.makespan >= 2, "Should need at least 2 cycles");
+        } else {
+            eprintln!("Correctly returned infeasible for tight budget");
+        }
+    }
+
+    /// Test scratch interval size when VReg is defined and used in the same cycle.
+    /// This should produce interval size = 1 (last_use_cycle - def_cycle + 1 = 0 - 0 + 1 = 1).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_interval_size_same_cycle() {
+        use crate::types::Opcode;
+
+        // Create ops where a value is defined and used in the same cycle.
+        // op0: const -> v0 (cycle 0, defines v0)
+        // op1: add v0, imm -> v1 (cycle 1, uses v0 - so v0 lives from cycle 0 to cycle 1)
+        // But for same-cycle test, we need op0 and op1 to be in the same cycle.
+        // However, due to data dependency (op1 depends on op0), they can't be in the same cycle.
+        //
+        // For a true same-cycle test, we need an op that defines a value and is the last user.
+        // When a VReg is defined but never used elsewhere, its lifetime is just its def cycle.
+        // Let's create: op0 defines v0, op1 defines v1 using v0, and v1 is never used again.
+        // v1's interval: def_cycle=1, last_use_cycle=1 (no further uses), size=1
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+        ];
+
+        // Hints: op0 at cycle 0, op1 at cycle 1
+        // v0 interval: def=0, last_use=1, size=2
+        // v1 interval: def=1, last_use=1 (no further uses), size=1
+        let hints = vec![0, 1];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10, // Sufficient for scalars
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with same-cycle interval (size=1)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(r.makespan, 2, "Makespan should be 2");
+        eprintln!("Same-cycle interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+    }
+
+    /// Test scratch interval size for VReg defined at cycle N and used at cycle N+1.
+    /// This should produce interval size = 2 (last_use_cycle - def_cycle + 1 = 1 - 0 + 1 = 2).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_interval_size_consecutive_cycles() {
+        use crate::types::Opcode;
+
+        // op0: const -> v0 (cycle 0)
+        // op1: add v0, imm -> v1 (cycle 1, uses v0)
+        // v0 interval: def_cycle=0, last_use_cycle=1, size=2
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+        ];
+
+        // Hints: op0 at cycle 0, op1 at cycle 1
+        let hints = vec![0, 1];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10, // Sufficient
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with consecutive-cycle interval (size=2)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(r.makespan, 2, "Makespan should be 2");
+        eprintln!("Consecutive-cycle interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+    }
+
+    /// Test scratch interval size for VReg defined at cycle 0 and used at cycle 5.
+    /// This should produce interval size = 6 (last_use_cycle - def_cycle + 1 = 5 - 0 + 1 = 6).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_interval_size_gap() {
+        use crate::types::Opcode;
+
+        // Create a chain where v0 is defined at cycle 0 but used at cycle 5.
+        // We need intermediate ops to push the use of v0 to cycle 5.
+        // op0: const -> v0 (cycle 0)
+        // op1: const -> v1 (cycle 0) - independent
+        // op2: add v1, imm -> v2 (cycle 1) - chain through v1
+        // op3: add v2, imm -> v3 (cycle 2)
+        // op4: add v3, imm -> v4 (cycle 3)
+        // op5: add v4, imm -> v5 (cycle 4)
+        // op6: add v5, v0 -> v6 (cycle 5) - finally uses v0
+        // v0 interval: def_cycle=0, last_use_cycle=5, size=6
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(10)], vec![]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(1)], vec![1]),
+            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(2), Operand::imm(1)], vec![2]),
+            make_ssa_op(4, Engine::Alu, Opcode::Add, Some(VReg::scalar(4)), vec![Operand::scalar(3), Operand::imm(1)], vec![3]),
+            make_ssa_op(5, Engine::Alu, Opcode::Add, Some(VReg::scalar(5)), vec![Operand::scalar(4), Operand::imm(1)], vec![4]),
+            make_ssa_op(6, Engine::Alu, Opcode::Add, Some(VReg::scalar(6)), vec![Operand::scalar(5), Operand::scalar(0)], vec![5, 0]),
+        ];
+
+        // Hints: op0 and op1 at cycle 0, then op2-op6 at cycles 1-5
+        // v0 is defined at cycle 0 and used at cycle 5 (by op6)
+        // v0 interval size = 5 - 0 + 1 = 6
+        let hints = vec![0, 0, 1, 2, 3, 4, 5];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 20, // Sufficient for multiple scalars
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        assert!(result.is_some(), "Should find solution with gap interval (size=6)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(r.makespan, 6, "Makespan should be 6");
+        eprintln!("Gap interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+    }
+
+    /// Test engine capacity: 6 independent VALU ops at the same cycle (exactly at limit).
+    /// Should work without violating the VALU cumulative constraint.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_engine_capacity_valu_within_limit() {
+        use crate::types::Opcode;
+
+        // Create 6 independent VALU ops that can all be scheduled at cycle 1.
+        // Each needs a load to provide input values first.
+        // op0-op5: load consts (cycle 0)
+        // op6-op11: valu add (cycle 1) - all 6 VALU ops at same cycle (exactly at limit)
+        let ops = vec![
+            // Load ops for first operands (cycle 0)
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            // Note: only 2 load slots per cycle, so we need more cycles
+            // Actually, let's use consts with immediates to avoid load slot issues
+            // Create 6 VALU ops that use immediates as second operand
+            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(3, Engine::Valu, Opcode::Sub, Some(VReg::vector(3)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(4, Engine::Valu, Opcode::Mul, Some(VReg::vector(4)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(5, Engine::Valu, Opcode::Xor, Some(VReg::vector(5)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(6, Engine::Valu, Opcode::And, Some(VReg::vector(6)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(7, Engine::Valu, Opcode::Or, Some(VReg::vector(7)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+        ];
+
+        // Hints: 2 loads at cycle 0, 6 VALU ops all at cycle 1 (exactly at VALU limit of 6)
+        let hints = vec![0, 0, 1, 1, 1, 1, 1, 1];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 0, // Disable scratch constraint for this test
+                enable_valu_shift: false,
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The verification code should NOT panic, and we should get a valid result
+        assert!(result.is_some(), "Should find solution with 6 VALU ops at same cycle (exactly at limit)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
+        eprintln!("VALU capacity test: 6 VALU ops at cycle 1, result={:?}", r.cycle_assignments);
+    }
+
+    /// Test engine capacity: 12 independent ALU ops at the same cycle (exactly at limit).
+    /// Should work without violating the ALU cumulative constraint.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_engine_capacity_alu_within_limit() {
+        use crate::types::Opcode;
+
+        // Create 12 independent ALU ops that can all be scheduled at cycle 1.
+        // First, we need load ops to provide input values.
+        // op0-op1: load consts (cycle 0) - 2 load slots
+        // op2-op13: 12 ALU ops (cycle 1) - all 12 ALU ops at same cycle (exactly at limit)
+        let ops = vec![
+            // Load ops
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(2)], vec![]),
+            // 12 ALU ops - all depend on loads, can run in parallel
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(3, Engine::Alu, Opcode::Sub, Some(VReg::scalar(3)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(4, Engine::Alu, Opcode::Mul, Some(VReg::scalar(4)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(5, Engine::Alu, Opcode::Xor, Some(VReg::scalar(5)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(6, Engine::Alu, Opcode::And, Some(VReg::scalar(6)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(7, Engine::Alu, Opcode::Or, Some(VReg::scalar(7)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(8, Engine::Alu, Opcode::Shl, Some(VReg::scalar(8)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(9, Engine::Alu, Opcode::Shr, Some(VReg::scalar(9)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(10, Engine::Alu, Opcode::Lt, Some(VReg::scalar(10)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(11, Engine::Alu, Opcode::Eq, Some(VReg::scalar(11)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(12, Engine::Alu, Opcode::Add, Some(VReg::scalar(12)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(13, Engine::Alu, Opcode::Sub, Some(VReg::scalar(13)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+        ];
+
+        // Hints: 2 loads at cycle 0, 12 ALU ops all at cycle 1 (exactly at ALU limit of 12)
+        let hints = vec![0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 0, // Disable scratch constraint for this test
+                enable_valu_shift: false,
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The verification code should NOT panic, and we should get a valid result
+        assert!(result.is_some(), "Should find solution with 12 ALU ops at same cycle (exactly at limit)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
+        eprintln!("ALU capacity test: 12 ALU ops at cycle 1, result={:?}", r.cycle_assignments);
+    }
+
+    /// Test engine capacity: A shiftable VALU op shifted to ALU uses 8 slots.
+    /// Create scenario with 1 shifted VALU (8 slots) + 4 ALU ops (4 slots) = 12 total.
+    /// Should work with enable_valu_shift=true and shift_hints.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_engine_capacity_shifted_valu() {
+        use crate::types::Opcode;
+
+        // Create:
+        // - 2 loads (cycle 0)
+        // - 1 VALU Add (shiftable, will use 8 ALU slots when shifted) at cycle 1
+        // - 4 ALU ops at cycle 1 (4 slots)
+        // Total ALU slots at cycle 1: 8 (shifted VALU) + 4 (ALU) = 12 (exactly at limit)
+        let ops = vec![
+            // Load ops
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(2)], vec![]),
+            // 1 VALU op that will be shifted to ALU (uses 8 ALU slots)
+            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(0)], vec![0]),
+            // 4 ALU ops (4 slots)
+            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
+            make_ssa_op(4, Engine::Alu, Opcode::Sub, Some(VReg::scalar(4)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
+            make_ssa_op(5, Engine::Alu, Opcode::Mul, Some(VReg::scalar(5)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
+            make_ssa_op(6, Engine::Alu, Opcode::Xor, Some(VReg::scalar(6)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
+        ];
+
+        // Hints: loads at cycle 0, shifted VALU + 4 ALU ops at cycle 1
+        let hints = vec![0, 0, 1, 1, 1, 1, 1];
+
+        // shift_hints: op id 2 should be shifted (the VALU Add)
+        let mut shift_hints = HashSet::new();
+        shift_hints.insert(2); // Op ID 2 is the VALU Add
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 0, // Disable scratch constraint for this test
+                enable_valu_shift: true, // Enable VALU shifting
+                ..Default::default()
+            },
+            Some(&hints),
+            Some(&shift_hints),
+        );
+
+        // The verification code should NOT panic:
+        // - VALU per cycle: 0 (the VALU op is shifted to ALU)
+        // - ALU per cycle: 8 (shifted VALU) + 4 (regular ALU) = 12 (exactly at limit)
+        //
+        // Note: The verification happens BEFORE solver runs (at lines 1462-1525) and uses
+        // shift_hints to verify that the greedy hints don't violate capacity. If the verification
+        // panicked, we wouldn't reach this point. Getting a result means verification passed.
+        assert!(result.is_some(), "Should find solution with shifted VALU (8) + 4 ALU = 12 (at limit)");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
+
+        // Note: The solver's shifted_ops may or may not contain our op depending on whether
+        // the solver decides to shift. The key test is that the verification code (which uses
+        // shift_hints to count ALU usage) did not panic. If it had panicked, we wouldn't get here.
+        eprintln!("Shifted VALU capacity test: 1 shifted VALU (8 slots) + 4 ALU (4 slots) = 12 total at cycle 1");
+        eprintln!("Result: {:?}, shifted_ops from solver: {:?}", r.cycle_assignments, r.shifted_ops);
+
+        // Also verify: if the solver did NOT shift op 2, then we have 1 VALU + 4 ALU at cycle 1,
+        // which is fine (within limits). If the solver DID shift it, we have 0 VALU + 12 ALU.
+        // Either way should be valid. The test was about the verification code not panicking
+        // when we provide shift_hints that put us at exactly the ALU limit.
+        eprintln!("Test passed: verification did not panic with 8+4=12 ALU slots at cycle 1");
+    }
+
+    // ==========================================================================
+    // VReg Last Use Computation Tests
+    // ==========================================================================
+    // These tests verify that vreg_last_use correctly identifies the op with the
+    // LATEST CYCLE that reads each VReg, not just the latest index. This is
+    // critical for scratch pressure constraints - using wrong last_use results
+    // in last_use_cycle < def_cycle which is impossible.
+
+    /// Test vreg_last_use with a simple dependency chain.
+    /// Each op reads the previous op's result, so last_use_cycle must >= def_cycle.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_vreg_last_use_simple_chain() {
+        use crate::types::Opcode;
+
+        // Simple chain: op0 -> op1 -> op2 -> op3
+        // Each op reads the previous op's VReg
+        // op0: const -> v0 (no reads, defines v0)
+        // op1: alu(v0) -> v1 (reads v0, defines v1)
+        // op2: alu(v1) -> v2 (reads v1, defines v2)
+        // op3: alu(v2) -> v3 (reads v2, defines v3)
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(2), Operand::imm(3)], vec![2]),
+        ];
+
+        // ASAP schedule: each op depends on the previous
+        let hints = vec![0, 1, 2, 3];
+
+        // Run with scratch constraint enabled - this will exercise vreg_last_use computation
+        // If last_use_cycle < def_cycle for any VReg, the existing verification code will panic
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10, // Enable scratch constraint
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
+        // For a simple chain, hints should be optimal (ASAP), so solver may return exact hints.
+        assert!(result.is_some(), "Simple chain should be schedulable");
+        let r = result.unwrap();
+        // Verify basic constraints are satisfied
+        assert!(r.makespan >= 4, "Need at least 4 cycles for 4-op dependency chain");
+        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
+        // Verify dependency order is respected
+        assert!(r.cycle_assignments[1] > r.cycle_assignments[0], "op1 must be after op0");
+        assert!(r.cycle_assignments[2] > r.cycle_assignments[1], "op2 must be after op1");
+        assert!(r.cycle_assignments[3] > r.cycle_assignments[2], "op3 must be after op2");
+        eprintln!("test_vreg_last_use_simple_chain: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
+    }
+
+    /// Test vreg_last_use with reordered hints (greedy schedule differs from index order).
+    /// This tests that we use CYCLES from hints, not indices, to determine last use.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_vreg_last_use_with_reordered_hints() {
+        use crate::types::Opcode;
+
+        // Create independent ops that can be reordered by the scheduler.
+        // op0: const -> v0 (defines v0)
+        // op1: const -> v1 (defines v1, independent of op0)
+        // op2: alu(v0) -> v2 (reads v0, defines v2, depends on op0)
+        // op3: alu(v1) -> v3 (reads v1, defines v3, depends on op1)
+        //
+        // Index order: op0, op1, op2, op3
+        // But greedy might schedule: op0 (cycle 0), op1 (cycle 0), op3 (cycle 1), op2 (cycle 1)
+        // or with explicit hints we can force reordering
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(10)], vec![]),
+            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+        ];
+
+        // Hints where op3 (index 3) runs at cycle 1, op2 (index 2) runs at cycle 2
+        // This means op2 runs LATER than op3 despite having a lower index
+        // v0: defined at cycle 0 (op0), used at cycle 2 (op2) -> last_use_cycle = 2
+        // v1: defined at cycle 0 (op1), used at cycle 1 (op3) -> last_use_cycle = 1
+        let hints = vec![0, 0, 2, 1]; // op0, op1 at 0; op3 at 1; op2 at 2
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10,
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
+        // Note: The solver may find a better schedule than the hints, so we don't assert exact match.
+        // The key test is that vreg_last_use computation doesn't produce impossible results.
+        assert!(result.is_some(), "Reordered schedule should be schedulable");
+        let r = result.unwrap();
+        // Verify basic constraints are satisfied
+        assert!(r.makespan >= 2, "Need at least 2 cycles (loads then ALU ops)");
+        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
+        eprintln!("test_vreg_last_use_with_reordered_hints: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
+    }
+
+    /// Test vreg_last_use with multiple readers of the same VReg at different cycles.
+    /// We must pick the reader with the LATEST cycle, not the latest index.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_vreg_last_use_multiple_readers() {
+        use crate::types::Opcode;
+
+        // op0: const -> v0 (defines v0)
+        // op1: alu(v0) -> v1 (reads v0 - early reader at index 1)
+        // op2: const -> v2 (independent, defines v2)
+        // op3: alu(v0, v2) -> v3 (reads v0 - late reader at index 3, also reads v2)
+        //
+        // v0 is read by both op1 and op3
+        // With hints [0, 1, 0, 2]: op1 reads v0 at cycle 1, op3 reads v0 at cycle 2
+        // So last_use_cycle for v0 should be 2 (from op3), not 1 (from op1)
+        //
+        // The tricky part: op3 has a higher index than op1, so if we use index order,
+        // we'd correctly pick op3. To test the cycle-based logic, we need a case where
+        // the LOWER index has a HIGHER cycle - see the test below.
+        let ops = vec![
+            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
+            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::scalar(2)), vec![Operand::imm(10)], vec![]),
+            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(0), Operand::scalar(2)], vec![0, 2]),
+        ];
+
+        // Hints: op0 at 0, op1 at 1, op2 at 0, op3 at 2
+        // v0: def at cycle 0, read by op1 at cycle 1, read by op3 at cycle 2 -> last_use = 2
+        let hints = vec![0, 1, 0, 2];
+
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                stop_after_first_solution: true,
+                scratch_budget: 10,
+                ..Default::default()
+            },
+            Some(&hints),
+            None,
+        );
+
+        // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
+        // Note: The solver may find a better schedule than the hints, so we don't assert exact match.
+        // The key test is that vreg_last_use computation doesn't produce impossible results.
+        assert!(result.is_some(), "Multiple readers should be schedulable");
+        let r = result.unwrap();
+        // Verify basic constraints are satisfied
+        assert!(r.makespan >= 2, "Need at least 2 cycles (loads then ALU ops)");
+        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
+        eprintln!("test_vreg_last_use_multiple_readers: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
     }
 }

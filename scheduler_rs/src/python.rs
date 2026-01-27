@@ -2186,7 +2186,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     }
 
     let result = if use_cpsat {
-        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose).map_err(|e| {
+        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
         })?
     } else {
