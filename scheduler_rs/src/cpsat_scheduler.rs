@@ -1287,13 +1287,22 @@ pub fn schedule_ssa_cpsat(
         // IMPORTANT: We need the op with the LATEST CYCLE that reads this VReg, not just the latest index.
         // If we have greedy hints, use them to determine the actual last use by cycle.
         // Otherwise, fall back to index order (which may be incorrect but is a reasonable heuristic).
-        // ALSO: Skip dead stores (ops with hints[idx] < 0), as they were filtered out by greedy.
+        //
+        // Dead Store Handling:
+        // The greedy scheduler (ssa_greedy.rs) identifies dead stores during scheduling
+        // and pre-marks them as "scheduled" without assigning a valid cycle. Their cycle
+        // field remains at -1 (the initial unscheduled value). CP-SAT honors this by:
+        // 1. Skipping ops with negative cycle hints when building vreg_last_use
+        // 2. This correctly excludes dead stores from liveness analysis
+        // The warnings printed by greedy are informational, not errors.
         let mut vreg_last_use: HashMap<VReg, usize> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
-            // Skip dead stores - they have negative cycle hints because greedy filtered them out
+            // Skip dead stores identified by greedy scheduler.
+            // Dead stores have negative cycle hints (-1) because greedy pre-marks them
+            // as "scheduled" without actually scheduling them to a real cycle.
             if let Some(hints) = greedy_hints {
                 if hints.get(idx).copied().unwrap_or(0) < 0 {
-                    continue; // Dead store, skip
+                    continue; // Dead store, skip - it will not be scheduled by CP-SAT either
                 }
             }
             for vreg in op.reads() {
