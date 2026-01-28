@@ -8,6 +8,24 @@
 //! - Same-cycle reuse model for accurate liveness tracking
 //! - Emergency force-scheduling to break deadlocks
 //! - VALU→ALU shifting when VALU slots are saturated
+//! - Dead store elimination (see below)
+//!
+//! # Dead Store Detection & Elimination
+//!
+//! Dead stores are operations that define a VReg with zero consumers.
+//! These can arise from:
+//! - Kernel builder generating unused intermediate values
+//! - CSE eliminating consumers but not producers
+//! - Conditional code paths where some outputs are unused
+//!
+//! **Strategy**: Detect dead stores before scheduling, pre-mark them as
+//! "already scheduled" so they never enter the ready queue. This:
+//! - Avoids wasting cycles on useless work
+//! - Doesn't count them toward scratch budget (liveness tracking skips them)
+//! - Logs warnings for debugging (these are informational, not errors)
+//!
+//! The CP-SAT scheduler (`cpsat_scheduler.rs`) also honors dead stores by
+//! checking for negative cycle hints (-1) from the greedy scheduler.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -159,8 +177,14 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
-        // Detect and filter dead stores - ops with destinations that have no users
-        // Dead stores are skipped from scheduling entirely (warning only)
+        // =========================================================================
+        // Dead Store Detection
+        //
+        // Identify ops with destinations that have zero consumers. These are
+        // "dead stores" - they compute values that no one reads. We detect
+        // them here and will pre-mark them as scheduled (see below) so they
+        // never enter the ready queue. The warnings are informational only.
+        // =========================================================================
         let mut dead_store_indices: HashSet<usize> = HashSet::new();
         for (idx, op) in ops.iter().enumerate() {
             if let Some(dest) = op.dest {
@@ -210,7 +234,14 @@ impl SsaTickTockKernelBuilder {
             .collect();
 
         // Track scheduling state
-        // Pre-mark dead stores as scheduled (they will be skipped)
+        // =========================================================================
+        // Dead Store Elimination
+        //
+        // Pre-mark dead stores as "already scheduled" - this is how we eliminate
+        // them. They won't enter the ready heap and won't be counted in
+        // ops_to_schedule. Their cycle field remains at -1 (unscheduled), which
+        // signals to CP-SAT that these ops should be skipped entirely.
+        // =========================================================================
         let mut scheduled: HashSet<usize> = dead_store_indices.clone();
         let ops_to_schedule = ops.len() - dead_store_indices.len();
 

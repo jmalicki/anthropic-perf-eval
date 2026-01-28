@@ -1664,8 +1664,10 @@ impl SsaLivenessTracker {
         if let Some(dest) = op.dest {
             if let Some((ref mut def_cycle, size, remaining)) = self.vreg_info.get_mut(&dest) {
                 *def_cycle = cycle;
-                // Only add to live words if someone will consume it
-                // (dead definitions don't consume scratch)
+                // Only add to live words if this VReg has consumers.
+                // Dead stores (remaining == 0) are filtered out by ssa_greedy before
+                // scheduling, but even if they weren't, they shouldn't consume scratch
+                // budget since no one reads them. This check provides defense-in-depth.
                 if *remaining > 0 {
                     self.live_words += *size;
                 }
