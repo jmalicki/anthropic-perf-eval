@@ -727,11 +727,8 @@ mod tests {
 
     /// Test that VReg liveness intervals are computed correctly.
     ///
-    /// The liveness interval for a VReg should extend from its definition
-    /// to its last use.
-    ///
-    /// KNOWN BUG: The linear scan allocator may be computing intervals
-    /// incorrectly, causing VRegs to be freed too early.
+    /// See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+    /// The liveness interval for a VReg uses CLOSED convention [start, end].
     #[test]
     fn test_vreg_liveness_intervals() {
         use crate::address_assign::compute_live_intervals;
@@ -754,20 +751,23 @@ mod tests {
 
         let intervals = compute_live_intervals(&ops);
 
-        // s0 should be live from cycle 0 to cycle 10
+        // CLOSED intervals: [start, end] where end = last_read_cycle
+        //
+        // s0: defined at 0, last read at 10 → [0, 10]
         let s0_interval = intervals.get(&VReg::scalar(0)).expect("s0 should have interval");
         assert_eq!(s0_interval.start, 0, "s0 should start at cycle 0");
-        assert_eq!(s0_interval.end, 10, "s0 should end at cycle 10 (last use)");
+        assert_eq!(s0_interval.end, 10, "s0 closed end = last_read = 10");
 
-        // s1 should be live from cycle 1 to cycle 10
+        // s1: defined at 1, last read at 10 → [1, 10]
         let s1_interval = intervals.get(&VReg::scalar(1)).expect("s1 should have interval");
         assert_eq!(s1_interval.start, 1, "s1 should start at cycle 1");
-        assert_eq!(s1_interval.end, 10, "s1 should end at cycle 10 (last use)");
+        assert_eq!(s1_interval.end, 10, "s1 closed end = last_read = 10");
 
-        // s2 should be live from cycle 10 to cycle 10 (no uses)
+        // s2: defined at 10, never read (dead) → [10, 11] (+1 extension)
+        // Dead VRegs get interval [D, D+1] with closed convention.
         let s2_interval = intervals.get(&VReg::scalar(2)).expect("s2 should have interval");
         assert_eq!(s2_interval.start, 10, "s2 should start at cycle 10");
-        assert_eq!(s2_interval.end, 10, "s2 should end at cycle 10 (no uses)");
+        assert_eq!(s2_interval.end, 11, "s2 (dead) has closed interval [10, 11] (+1 extension)");
     }
 
     /// Test that overlapping VRegs get different addresses.
@@ -806,28 +806,31 @@ mod tests {
 
     /// Test that non-overlapping VRegs can share addresses.
     ///
-    /// Two VRegs where one dies before the other is born can share the
-    /// same physical address.
+    /// See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+    /// Two VRegs where one's interval ends before the other's begins
+    /// can share the same physical address.
     #[test]
     fn test_non_overlapping_vregs_can_share_addresses() {
         use crate::address_assign::{assign_addresses, AddressAssignConfig};
 
-        // Create ops where VRegs have non-overlapping lifetimes:
+        // Create ops where VRegs have truly non-overlapping lifetimes:
         // op0: const -> s0 (def cycle 0)
         // op1: alu(s0, s0) -> s1 (cycle 1, s0 last used)
-        // op2: const -> s2 (def cycle 5)
-        // op3: alu(s1, s2) -> s3 (cycle 6, s1 and s2 last used)
+        // op2: const -> s2 (def cycle 5, AFTER s0's interval ends)
+        // op3: alu(s1, s2) -> s3 (cycle 6)
         //
-        // Intervals:
-        // - s0: [0, 1] - dies when s1 is born
-        // - s1: [1, 6] - lives through to op3
-        // - s2: [5, 6] - overlaps with s1 at cycles 5-6
-        // - s3: [6, 6] - can reuse after s1 and s2 die
+        // CLOSED intervals:
+        // - s0: [0, 1] — defined at 0, last read at 1
+        // - s1: [1, 6] — defined at 1, last read at 6
+        // - s2: [5, 6] — defined at 5, last read at 6
+        // - s3: [6, 7] — defined at 6, never read (dead, +1 extension)
         //
-        // With same-cycle reuse (< comparison for overlaps):
-        // - s0 and s1 do NOT overlap (0 < 6 && 1 < 1 is false) -> s1 CAN reuse s0
-        // - s1 and s2 overlap (1 < 6 && 5 < 6 is true) -> different addresses
-        // - s1/s2 and s3 do NOT overlap -> s3 CAN reuse s1 or s2
+        // Overlap analysis (strict inequality: start < other.end AND other.start < end):
+        // - s0 [0,1] and s1 [1,6]: 0 < 6 AND 1 < 1? NO, no overlap (same-cycle reuse)
+        // - s0 [0,1] and s2 [5,6]: 0 < 6 AND 5 < 1? NO, no overlap → s2 can reuse s0
+        // - s1 [1,6] and s2 [5,6]: 1 < 6 AND 5 < 6? YES, overlap
+        // - s1 [1,6] and s3 [6,7]: 1 < 7 AND 6 < 6? NO, no overlap (same-cycle reuse)
+        // - s2 [5,6] and s3 [6,7]: 5 < 7 AND 6 < 6? NO, no overlap (same-cycle reuse)
         let mut ops = vec![
             make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
             make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
@@ -838,8 +841,8 @@ mod tests {
         ];
 
         ops[0].cycle = 0;
-        ops[1].cycle = 1;  // s0 last used here
-        ops[2].cycle = 5;  // s2 defined here
+        ops[1].cycle = 1;  // s0 last used here → s0 [0, 1]
+        ops[2].cycle = 5;  // s2 defined here → s2 [5, 6]
         ops[3].cycle = 6;
 
         let config = AddressAssignConfig::default();
@@ -852,18 +855,25 @@ mod tests {
 
         println!("Addresses: s0={}, s1={}, s2={}, s3={}", addr_s0, addr_s1, addr_s2, addr_s3);
 
-        // With same-cycle reuse, s0 and s1 can share (s1 reuses s0's address when s0 dies)
-        // s2 needs its own address (overlaps with s1)
-        // s3 can reuse after s1 and s2 die
+        // With CLOSED intervals and linear scan allocation:
+        // 1. s0 [0,1] gets address 1
+        // 2. s1 [1,6] - s0 expires (1 <= 1) → s1 reuses address 1
+        // 3. s2 [5,6] - s1 still active (6 > 5) → s2 gets address 2
+        // 4. s3 [6,7] - s1 expires (6 <= 6), s2 expires (6 <= 6) → s3 reuses address 1
+        //
+        // So: s0=1, s1=1, s2=2, s3=1
+        // s2 CANNOT reuse s0's address because s1 took it and s1 overlaps with s2.
         assert_eq!(addr_s0, addr_s1,
-            "s0 and s1 should share address (s1 born when s0 dies via same-cycle reuse)");
+            "s0 [0,1] and s1 [1,6] allow same-cycle reuse, should share addresses");
         assert_ne!(addr_s1, addr_s2,
-            "s1 and s2 should have different addresses (they overlap at cycles 5-6)");
+            "s1 [1,6] and s2 [5,6] overlap, must have different addresses");
+        assert_eq!(addr_s0, addr_s3,
+            "s0=s1 expires before s3 [6,7], s3 can reuse address 1");
 
-        // Verify efficient reuse: max_addr should be 2 (addresses 1 and 2 used)
-        // 4 VRegs, 2 unique addresses = good reuse
+        // Verify efficient reuse: max_addr should be 2 (addresses 1, 2)
+        // - s0 gets addr 1, s1 reuses addr 1, s2 gets addr 2, s3 reuses addr 1
         assert!(result.max_addr <= 2,
-            "Should use at most 2 addresses for 4 non-simultaneous-live scalars, got max_addr={}",
+            "Should use at most 2 addresses with closed intervals and same-cycle reuse, got max_addr={}",
             result.max_addr);
     }
 

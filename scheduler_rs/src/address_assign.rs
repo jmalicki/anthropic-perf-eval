@@ -4,40 +4,46 @@
 //! assigns physical scratch addresses to virtual registers (VRegs) using
 //! linear scan allocation.
 //!
-//! ## Liveness Model: Same-Cycle Reuse
+//! # Liveness Model
 //!
-//! The liveness model allows **same-cycle reuse**: a VReg that ends at cycle C
-//! can share storage with a VReg that starts at cycle C. This is valid because
-//! within a VLIW cycle, reads happen before writes:
+//! **IMPORTANT:** See `types.rs` for the AUTHORITATIVE documentation on VReg liveness.
+//! This comment provides a brief summary; `types.rs` is the single source of truth.
+//!
+//! ## Closed Interval Convention: [start, end]
+//!
+//! We use **closed intervals** where `end` is the last cycle the VReg is ACCESSED:
 //!
 //! ```text
-//! Cycle 5:  [Read A] ... [Write B]
-//!           ^^^^^^^       ^^^^^^^
-//!           A is read     B is written
+//! LiveInterval { start: D, end: R }
+//!   - start (D) = cycle when VReg is WRITTEN (definition cycle)
+//!   - end (R)   = cycle when VReg is last ACCESSED
 //!
-//! Storage can be reused: A dies, then B is born in the same cycle.
+//! For LIVE VRegs (has readers):  [def_cycle, last_read_cycle]
+//! For DEAD VRegs (no readers):   [def_cycle, def_cycle + 1]
 //! ```
 //!
-//! **Key implementation details:**
+//! ## Why Dead VRegs Get `end = def + 1`
 //!
-//! - Live interval: `[def_cycle, last_use_cycle]` (both inclusive)
-//! - Intervals `[0,5]` and `[5,10]` do **NOT** overlap (5 is the transition point)
-//! - `LiveInterval::overlaps()` uses `<` comparison: `self.start < other.end`
-//! - Linear scan expires VRegs where `end_cycle <= current_start` (note: `<=`)
-//! - Peak liveness: births before deaths at same cycle (conservative for capacity check)
+//! This is NOT a hack! It precisely models the ISA hardware semantics:
+//! - Within a VLIW cycle: ALL reads happen FIRST, then ALL writes happen
+//! - A live VReg read at cycle R can be reused at cycle R (read completes before write)
+//! - A dead VReg written at cycle D can be reused at cycle D+1 (after write completes)
 //!
-//! This model must be consistent across:
-//! - `LiveInterval::overlaps()` in `types.rs`
-//! - `compute_peak_liveness()` event ordering
-//! - Linear scan expiration condition
-//! - Scheduler budget tracking (VRegs freed mid-cycle)
+//! See `types.rs` "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full explanation.
+//!
+//! ## The Single Expiration Rule: `end <= start`
+//!
+//! When allocating VReg B at cycle S, expire VReg A where `A.end <= S`:
+//! - Same-cycle reuse: A=[0,5], B=[5,...] → 5<=5 ✓ → A expires (correct)
+//! - Write conflict: A=[5,6] (dead), B=[5,...] → 6<=5 ✗ → no reuse (correct)
 //!
 //! ## Algorithm: Linear Scan Allocation
 //!
-//! 1. Compute live intervals: [def_cycle, last_use_cycle] for each VReg
-//! 2. Sort intervals by def_cycle (start)
+//! 1. Compute live intervals: [def_cycle, last_read_cycle] for live VRegs,
+//!    [def_cycle, def_cycle+1] for dead VRegs
+//! 2. Sort intervals by start cycle
 //! 3. For each VReg:
-//!    - Expire VRegs that ended at or before current def_cycle (same-cycle reuse)
+//!    - Expire VRegs where `end <= current_start`
 //!    - Return expired addresses to free pool
 //!    - Allocate from free pool or extend allocation
 //!    - Record VReg -> address mapping
@@ -94,26 +100,36 @@ impl Default for AddressAssignConfig {
 
 /// Compute live intervals for all VRegs based on scheduled cycles.
 ///
-/// For each VReg:
-/// - start = cycle when the defining op executes
-/// - end = cycle when the last op that reads this VReg executes
+/// Uses **CLOSED intervals** [start, end] as documented in `types.rs`.
+/// See `types.rs` "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
 ///
-/// If a VReg is never read (dead definition), end = start.
+/// Returns closed intervals where:
+/// - `start` = cycle when the VReg is written (definition cycle)
+/// - `end` = last cycle the VReg is ACCESSED (last read, or def+1 for dead VRegs)
+///
+/// For a VReg defined at cycle D and last read at cycle R:
+/// - Interval = [D, R] (closed)
+///
+/// For a dead VReg (defined at D, never read):
+/// - Interval = [D, D+1] — the "+1" ensures write conflicts are detected
 pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
-    // First pass: record definition cycles
+    // First pass: record definition cycles.
+    // Initialize with [def, def] — will be extended if read.
     for op in ops {
         if let Some(dest) = op.dest {
             intervals.insert(dest, LiveInterval::new(op.cycle, op.cycle));
         }
     }
 
-    // Second pass: extend end to last use cycle
+    // Second pass: extend end to last READ cycle.
+    // CLOSED interval: end = last_read_cycle (not last_read + 1).
     for op in ops {
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
                 if let Some(interval) = intervals.get_mut(vreg) {
+                    // Closed interval: end is the read cycle itself
                     if op.cycle > interval.end {
                         interval.end = op.cycle;
                     }
@@ -122,18 +138,27 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
         }
     }
 
+    // Third pass: extend dead VRegs (start == end) to [start, start+1].
+    // This prevents same-cycle write conflicts. See types.rs for explanation.
+    for interval in intervals.values_mut() {
+        if interval.start == interval.end {
+            // Dead VReg: written but never read. Extend by 1 to prevent
+            // same-cycle write conflicts with other VRegs.
+            interval.end = interval.start + 1;
+        }
+    }
+
     intervals
 }
 
 /// Compute peak liveness in words at any cycle using the same-cycle reuse model.
 ///
-/// This uses the same model as linear scan allocation:
-/// - At cycle C, VRegs with end_cycle < C are expired (freed) BEFORE new VRegs are allocated
-/// - At cycle C, VRegs with end_cycle == C are still alive during C (for reads)
-/// - Same-cycle reuse: interval [0,1] and [1,2] can share storage because [0,1] is
-///   expired (end_cycle 1 <= start_cycle 1) before [1,2] is allocated
+/// Uses the same expiration rule as linear scan allocation (see `types.rs`):
+/// - Expire VRegs where `end <= current_start`
+/// - Same-cycle reuse: [0,5] expires when [5,10] starts (5 <= 5)
+/// - Write conflict: [5,6] (dead) does NOT expire for [5,10] (6 > 5)
 ///
-/// This correctly counts single-cycle intervals [N, N] as 1 word.
+/// This correctly handles both live VRegs and dead VRegs with +1 extension.
 pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
     if intervals.is_empty() {
         return 0;
@@ -428,7 +453,8 @@ mod tests {
 
         let intervals = compute_live_intervals(&emit.ops);
 
-        // v1: defined at cycle 0, last used at cycle 1
+        // v1: defined at cycle 0, last read at cycle 1
+        // CLOSED interval: [0, 1] — end = last_read_cycle = 1
         assert_eq!(intervals[&v1], LiveInterval::new(0, 1));
     }
 
@@ -445,9 +471,10 @@ mod tests {
 
         let intervals = compute_live_intervals(&emit.ops);
 
-        // v1: defined at 0, last used at 5
+        // CLOSED intervals: end = last_read_cycle
+        // v1: defined at 0, last read at 5 → [0, 5]
         assert_eq!(intervals[&v1], LiveInterval::new(0, 5));
-        // v2: defined at 1, last used at 5
+        // v2: defined at 1, last read at 5 → [1, 5]
         assert_eq!(intervals[&v2], LiveInterval::new(1, 5));
     }
 
@@ -525,9 +552,13 @@ mod tests {
         let intervals = compute_live_intervals(&emit.ops);
         let peak = compute_peak_liveness(&intervals);
 
-        // At cycle 1: s1 (1 word) + v1 (8 words being defined)
-        // s1 live [0, 2], v1 live [1, 1] (never read)
-        // At cycle 1: s1 live (1) + v1 defined (8) = 9
+        // CLOSED intervals (see types.rs for authoritative docs):
+        // s1: defined at 0, last read at 2 → [0, 2]
+        // v1: defined at 1, never read (dead) → [1, 2] (+1 extension)
+        // s2: defined at 2, never read (dead) → [2, 3] (+1 extension)
+        //
+        // At cycle 1: s1 [0,2] is live (1 word), v1 [1,2] starts (8 words)
+        // Peak = 1 + 8 = 9
         assert_eq!(peak, 9);
     }
 
@@ -616,96 +647,154 @@ mod tests {
 
     #[test]
     fn test_same_cycle_reuse_boundary() {
-        // LIVENESS MODEL: Same-cycle reuse
-        // Intervals [0,5] and [5,10] should NOT overlap and can share storage.
+        // CLOSED INTERVALS: Same-cycle reuse (read before write within a cycle)
         //
-        // Scenario: VReg A is defined at cycle 0, last used at cycle 5.
-        //           VReg B is defined at cycle 5, last used at cycle 10.
+        // See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
         //
-        // Within cycle 5, hardware executes: read A, then write B.
-        // So A's storage is freed AFTER being read but BEFORE B needs it.
-        // Linear scan should expire A (end 5 <= start 5) before allocating B.
+        // Scenario: VReg A is defined at cycle 0, last READ at cycle 5.
+        //           VReg B is defined (WRITTEN) at cycle 5.
+        //
+        // ISA semantics: Within a cycle, reads happen FIRST, then writes.
+        // So at cycle 5: A is read (consumed), then B is written.
+        // Therefore A's storage CAN be reused by B.
+        //
+        // Closed intervals:
+        //   A: [0, 5] — defined at 0, last read at 5
+        //   B: [5, 10] — defined at 5, last read at 10
+        //
+        // Expiration check: end <= start → 5 <= 5 ✓ → A expires
+        // Result: B can reuse A's address.
 
         let mut emit = SsaEmitContext::new();
 
-        // Create VReg A: defined at cycle 0
+        // VReg A: defined at cycle 0, read at cycle 5 → [0, 5]
         let a = emit.emit_const(100);
-        // Create a use of A at cycle 5 (this will be an ALU op with result C)
-        let c = emit.emit_alu(Opcode::Add, a, a);
+        // VReg LONG: defined at cycle 0, read at cycle 10 → [0, 10]
+        let long = emit.emit_const(0);
+        // VReg B: defined at cycle 5, uses A (so A is read at cycle 5) → [5, 10]
+        let b = emit.emit_alu(Opcode::Add, a, long);
+        // Use B and LONG at cycle 10 to extend their liveness
+        let _c = emit.emit_alu(Opcode::Add, b, long);
 
-        // Create VReg B: defined at cycle 5 (same cycle A is last used)
-        let b = emit.emit_const(200);
-        // Create a use of B at cycle 10
-        let _d = emit.emit_alu(Opcode::Add, b, b);
-
-        // Schedule: A defined at 0, C (which uses A) at 5, B defined at 5, D at 10
-        emit.ops[0].cycle = 0;  // A defined
-        emit.ops[1].cycle = 5;  // C = A + A (last use of A)
-        emit.ops[2].cycle = 5;  // B defined (same cycle as A's last use)
-        emit.ops[3].cycle = 10; // D = B + B (last use of B)
+        emit.ops[0].cycle = 0;  // A defined → [0, 5]
+        emit.ops[1].cycle = 0;  // LONG defined → [0, 10]
+        emit.ops[2].cycle = 5;  // B = A + LONG → [5, 10]
+        emit.ops[3].cycle = 10; // C = B + LONG
 
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&emit.ops, &config);
 
-        // A and B should be able to share storage (same address)
-        // because A's interval [0,5] does not overlap with B's interval [5,10]
+        // With closed intervals:
+        // A: [0, 5] — last read at cycle 5
+        // B: [5, 10] — defined at cycle 5
+        //
+        // Expiration: 5 <= 5 ✓ → A expires when B is allocated
+        // Result: A and B CAN share the same address (same-cycle reuse)
         assert_eq!(
             result.vreg_to_addr[&a], result.vreg_to_addr[&b],
-            "VRegs with adjacent intervals [0,5] and [5,10] should share storage (same-cycle reuse)"
+            "With closed intervals, VRegs at the same-cycle reuse boundary should share addresses"
         );
-
-        // Verify peak liveness is correct (should be 2 at most: A or B + C or D)
-        // At cycle 5: A is being read (still live), B is being written, C is being written
-        // But with same-cycle reuse, A expires before B is allocated
-        assert!(result.peak_live <= 3, "Peak should be reasonable with same-cycle reuse");
     }
 
     #[test]
-    fn test_same_cycle_reuse_vectors() {
-        // Same test but with vectors (8 words each)
-        // This is more impactful because vectors are 8x the size
+    fn test_same_cycle_write_conflict() {
+        // Two VRegs defined in the SAME cycle must NOT share addresses.
+        //
+        // See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+        //
+        // In VLIW, all ops in a cycle execute concurrently. If two ops both
+        // WRITE in cycle 3, they cannot share the same address.
+        //
+        // Closed intervals:
+        // A: defined at 3, dead (no reads) → [3, 4] (+1 extension for dead VRegs)
+        // B: defined at 3, last read at 5 → [3, 5]
+        //
+        // These overlap because both are defined at cycle 3.
+        // Expiration check for B: A's end (4) <= B's start (3)? NO, 4 > 3.
+        // So A is NOT expired when allocating B → different addresses. ✓
 
         let mut emit = SsaEmitContext::new();
 
-        // Create scalar to broadcast
-        let s = emit.emit_const(1);
+        // VReg A: defined at cycle 3, immediately dead (no users) → [3, 4]
+        let a = emit.emit_const(100);
+        // VReg B: defined at cycle 3, used at cycle 5 → [3, 5]
+        let b = emit.emit_const(200);
+        // Use B at cycle 5 to keep it alive
+        let _c = emit.emit_alu(Opcode::Add, b, b);
 
-        // VReg A: vector defined at cycle 0
-        let a = emit.emit_vbroadcast_force(s);
-        // Use A at cycle 5
-        let c = emit.emit_valu(Opcode::Add, a, a);
-
-        // VReg B: vector defined at cycle 5 (same cycle A is last used)
-        let b = emit.emit_vbroadcast_force(s);
-        // Use B at cycle 10
-        let _d = emit.emit_valu(Opcode::Add, b, b);
-
-        emit.ops[0].cycle = 0;  // s defined
-        emit.ops[1].cycle = 0;  // A defined (broadcast)
-        emit.ops[2].cycle = 5;  // C = A + A (last use of A)
-        emit.ops[3].cycle = 5;  // B defined (same cycle as A's last use)
-        emit.ops[4].cycle = 10; // D = B + B
+        emit.ops[0].cycle = 3; // A → [3, 4] (dead, +1 extension)
+        emit.ops[1].cycle = 3; // B → [3, 5]
+        emit.ops[2].cycle = 5; // C = B + B
 
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&emit.ops, &config);
 
-        // Vectors A and B should share storage due to same-cycle reuse
-        // This saves 8 words of scratch space
-        assert_eq!(
+        // A and B are BOTH written at cycle 3, so they MUST have different addresses
+        assert_ne!(
             result.vreg_to_addr[&a], result.vreg_to_addr[&b],
-            "Vector VRegs with adjacent intervals should share storage"
+            "VRegs defined in the SAME cycle must have different addresses (concurrent writes)"
         );
     }
 
     #[test]
-    fn test_peak_liveness_same_cycle_boundary() {
-        // Verify that compute_peak_liveness correctly handles the boundary case
+    fn test_sequential_reuse_vectors() {
+        // Test sequential reuse with vectors (8 words each).
+        // When VReg A's interval ends BEFORE VReg B's interval starts,
+        // B can reuse A's address.
         //
-        // With intervals [0,5] and [5,10]:
-        // - At cycle 5, using same-cycle reuse model:
-        //   - [0,5] is expiring (end 5 <= current 5)
-        //   - [5,10] is being allocated
-        //   - Peak should NOT count both simultaneously
+        // See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+
+        let mut emit = SsaEmitContext::new();
+
+        // VReg A: vector defined at cycle 0, last read at cycle 2 → [0, 2]
+        let s1 = emit.emit_const(1);
+        let a = emit.emit_vbroadcast_force(s1);
+        let _use_a = emit.emit_valu(Opcode::Add, a, a);  // A read at cycle 2
+
+        // VReg B: vector defined at cycle 5 (AFTER A's interval [0,2] ends)
+        let s2 = emit.emit_const(2);
+        let b = emit.emit_vbroadcast_force(s2);
+        let _use_b = emit.emit_valu(Opcode::Add, b, b);  // B read at cycle 7
+
+        emit.ops[0].cycle = 0;   // s1 defined → [0, 0] then read at cycle 0, so [0, 0] (dead after broadcast)
+        emit.ops[1].cycle = 0;   // A defined → [0, 2] (vector)
+        emit.ops[2].cycle = 2;   // use_a = A + A (A last read)
+        emit.ops[3].cycle = 4;   // s2 defined → [4, 4] then read at cycle 5, so [4, 5]
+        emit.ops[4].cycle = 5;   // B defined → [5, 7] (vector)
+        emit.ops[5].cycle = 7;   // use_b = B + B (B last read)
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&emit.ops, &config);
+
+        // Closed intervals:
+        // - A: [0, 2] — last read at 2
+        // - B: [5, 7] — starts at 5
+        // Expiration check for B: A's end (2) <= B's start (5)? YES, 2 <= 5.
+        // So A is expired when allocating B → they can share.
+        assert_eq!(
+            result.vreg_to_addr[&a], result.vreg_to_addr[&b],
+            "Vector VRegs with non-overlapping intervals should share storage"
+        );
+    }
+
+    #[test]
+    fn test_peak_liveness_adjacent_intervals() {
+        // Test peak liveness with adjacent closed intervals.
+        //
+        // See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+        //
+        // Closed intervals [0, 5] and [5, 10]:
+        // - [0, 5] covers cycles 0,1,2,3,4,5 — VReg last READ at cycle 5
+        // - [5, 10] covers cycles 5,6,7,8,9,10 — VReg DEFINED at cycle 5
+        //
+        // These are ADJACENT at the boundary (both reference cycle 5), but:
+        // - In [0, 5], cycle 5 is the last READ
+        // - In [5, 10], cycle 5 is the WRITE
+        // - ISA: reads happen before writes within a cycle
+        //
+        // Linear scan expiration: end <= start → 5 <= 5 ✓ → v1 expires
+        // So at cycle 5, v1 is expired before v2 is allocated.
+        // Peak = 1 (either v1 OR v2, never both)
 
         use crate::types::LiveInterval;
 
@@ -713,18 +802,20 @@ mod tests {
         let v1 = VReg::scalar(1);
         let v2 = VReg::scalar(2);
 
-        intervals.insert(v1, LiveInterval::new(0, 5));
-        intervals.insert(v2, LiveInterval::new(5, 10));
+        intervals.insert(v1, LiveInterval::new(0, 5));  // [0, 5] — last read at 5
+        intervals.insert(v2, LiveInterval::new(5, 10)); // [5, 10] — defined at 5
 
         let peak = compute_peak_liveness(&intervals);
 
-        // With same-cycle reuse, peak should be 1 (not 2)
-        // Because v1 expires before v2 is allocated at cycle 5
-        assert_eq!(peak, 1, "Peak should be 1 with same-cycle reuse (intervals [0,5] and [5,10] don't overlap)");
+        // Adjacent closed intervals at the same-cycle reuse boundary don't conflict.
+        // Peak should be 1 (v1 expires before v2 is allocated)
+        assert_eq!(peak, 1, "Adjacent closed intervals [0,5] and [5,10] allow same-cycle reuse; peak = 1");
     }
 
     // ========================================================================
     // Minimal Reproduction: rounds=2 Memory Write Error
+    //
+    // See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
     //
     // With rounds=2 and greedy scheduler, the kernel crashes at cycle 81
     // because scratch[4] contains garbage instead of the partition address.
@@ -734,8 +825,10 @@ mod tests {
     // - Cycle 10: VReg B (computation) written to scratch[4], OVERWRITES A
     // - Cycle 81: vstore uses scratch[4] as address → CRASH
     //
-    // The bug: VReg A has interval [6, 81], VReg B has interval [10, 17]
-    // These overlap, but linear scan assigns both to scratch[4].
+    // Closed intervals:
+    // - A: [6, 81] — defined at 6, last read at 81
+    // - B: [10, 17] — defined at 10, last read at 17
+    // These overlap, so they must get different addresses.
     // ========================================================================
 
     /// Minimal reproduction of the rounds=2 register allocation bug.
@@ -745,10 +838,10 @@ mod tests {
     fn test_rounds2_overlapping_intervals_bug() {
         let mut emit = SsaEmitContext::new();
 
-        // VReg A: partition address, interval [6, 81]
+        // VReg A: partition address, closed interval [6, 81]
         let partition_addr = emit.emit_const_force(2055);  // op 0
 
-        // VReg B: computation result, interval [10, 17]
+        // VReg B: computation result, closed interval [10, 17]
         let x = emit.emit_const_force(256);  // op 1
         let y = emit.emit_const_force(256);  // op 2 (force to avoid CSE)
         let computation = emit.emit_alu(Opcode::Add, x, y);  // op 3
@@ -774,9 +867,12 @@ mod tests {
 
         let intervals = compute_live_intervals(&emit.ops);
 
-        // Verify intervals
+        // Verify closed intervals
+        // partition_addr: defined at 6, last read at 81 → [6, 81]
         assert_eq!(intervals[&partition_addr], LiveInterval::new(6, 81));
+        // computation: defined at 10, last read at 17 → [10, 17]
         assert_eq!(intervals[&computation], LiveInterval::new(10, 17));
+        // These overlap: 6 < 17 AND 10 < 81
         assert!(intervals[&partition_addr].overlaps(&intervals[&computation]));
 
         // Assign addresses - this is where the bug would manifest

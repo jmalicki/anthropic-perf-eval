@@ -2237,13 +2237,18 @@ mod ssa_tests {
     ///   v0 = const(5)        -- scalar, 1 word, born cycle 0
     ///   v1 = add(v0, v0)     -- scalar, 1 word, born cycle 1, v0 dies here
     ///   store(0, v1)         -- v1 dies here (cycle 2)
+    /// Test same-cycle reuse with a minimal chain: const -> alu -> store.
     ///
-    /// With same-cycle reuse:
-    ///   - v0 lives [0, 1], v1 lives [1, 2]
-    ///   - At cycle 1: v0 read (last use), then v1 written. v0's address is freed.
-    ///   - v1 can reuse v0's address. Peak = 1 word.
+    /// See types.rs "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
+    ///
+    /// With CLOSED intervals and same-cycle reuse:
+    ///   - v0: [0, 1] — defined at 0, last read at 1
+    ///   - v1: [1, 2] — defined at 1, last read at 2 (by store)
+    ///   - Overlap check: 0 < 2 AND 1 < 1? → 1 < 1 is FALSE → NO overlap!
+    ///   - Same-cycle reuse: v0 read at cycle 1, v1 written at cycle 1
+    ///   - They can share the same address (only 1 address needed).
     #[test]
-    fn test_ssa_greedy_minimal_budget_1_word() {
+    fn test_ssa_greedy_minimal_budget_2_words() {
         use crate::address_assign::{assign_addresses, AddressAssignConfig};
 
         let mut emit = SsaEmitContext::new();
@@ -2251,14 +2256,15 @@ mod ssa_tests {
         let v1 = emit.emit_alu(Opcode::Add, v0, v0);
         emit.emit_store_imm(0, v1);  // Store to address 0, consumes v1
 
-        // Schedule with budget of 1
+        // Schedule with budget of 1 (sufficient with same-cycle reuse)
         let result = schedule_ssa_greedy_with_budget(&mut emit.ops, 1);
 
-        // Greedy scheduler should report peak_live = 1
-        // (same-cycle reuse: v0 dies, v1 born in same cycle)
+        // With closed intervals and same-cycle reuse:
+        // v0 [0,1] and v1 [1,2] do NOT overlap (1 < 1 is FALSE).
+        // Peak = 1 word (never more than 1 live at a time due to reuse).
         assert!(
             result.peak_live <= 1,
-            "With same-cycle reuse, peak should be 1, got {}",
+            "Peak should be at most 1 with same-cycle reuse, got {}",
             result.peak_live
         );
 
@@ -2267,7 +2273,7 @@ mod ssa_tests {
             assert!(op.cycle >= 0, "Op {} should be scheduled", op.id);
         }
 
-        // Address assignment should fit in budget of 1
+        // Address assignment needs budget of 1 with same-cycle reuse
         let config = AddressAssignConfig {
             budget: 1,
             start_addr: 1,  // Reserve 0 for ZERO_REG
@@ -2275,23 +2281,23 @@ mod ssa_tests {
         };
         let assign_result = assign_addresses(&emit.ops, &config);
 
-        // max_addr should be 1 (only one address used)
+        // max_addr should be 1 (one address used: 1)
+        // v0 gets addr 1, v1 reuses addr 1 (same-cycle reuse at cycle 1)
         assert_eq!(
             assign_result.max_addr, 1,
-            "With same-cycle reuse, only 1 address should be needed, got max_addr={}",
+            "With closed intervals and same-cycle reuse, only 1 address needed, got max_addr={}",
             assign_result.max_addr
         );
 
-        // peak_live should be 1 with same-cycle reuse:
-        // v0 is consumed at cycle 1 (dies), v1 is produced at cycle 1 (born)
-        // Since reads happen before writes within a cycle, v0's space is freed before v1 needs it.
+        // peak_live should be 1 with closed intervals and same-cycle reuse:
+        // v0 [0,1] expires before v1 [1,2] is allocated (1 <= 1).
         assert_eq!(
             assign_result.peak_live, 1,
-            "With same-cycle reuse, peak_live should be 1, got {}",
+            "With closed intervals, peak_live should be 1, got {}",
             assign_result.peak_live
         );
 
-        // Should not exceed budget
+        // Should not exceed budget of 1
         assert!(
             !assign_result.budget_exceeded,
             "Should fit in budget of 1: peak_live={}, budget={}",

@@ -726,29 +726,49 @@ pub fn compute_ssa_dependencies_with_barriers(ops: &mut [SsaOp], vreg_def: &Hash
 
 /// Compute live intervals for all VRegs based on scheduled cycles.
 ///
-/// For each VReg:
-/// - start = cycle when the defining op executes
-/// - end = cycle when the last op that reads this VReg executes
+/// Uses **CLOSED intervals** [start, end] as documented in `types.rs`.
+/// See `types.rs` "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full details.
 ///
-/// If a VReg is never read, end = start (dies immediately after def).
+/// Returns closed intervals where:
+/// - `start` = cycle when the VReg is written (definition cycle)
+/// - `end` = last cycle the VReg is ACCESSED (last read, or def+1 for dead VRegs)
+///
+/// For a VReg defined at cycle D and last read at cycle R:
+/// - Interval = [D, R] (closed)
+///
+/// For a dead VReg (defined at D, never read):
+/// - Interval = [D, D+1] — the "+1" ensures write conflicts are detected
 pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
-    // First pass: record definition cycles
+    // First pass: record definition cycles.
+    // Initialize with [def, def] — will be extended if read.
     for op in ops {
         if let Some(dest) = op.dest {
             intervals.insert(dest, LiveInterval::new(op.cycle, op.cycle));
         }
     }
 
-    // Second pass: extend end to last use cycle
+    // Second pass: extend end to last READ cycle.
+    // CLOSED interval: end = last_read_cycle (not last_read + 1).
     for op in ops {
         for vreg in op.reads() {
             if let Some(interval) = intervals.get_mut(&vreg) {
+                // Closed interval: end is the read cycle itself
                 if op.cycle > interval.end {
                     interval.end = op.cycle;
                 }
             }
+        }
+    }
+
+    // Third pass: extend dead VRegs (start == end) to [start, start+1].
+    // This prevents same-cycle write conflicts. See types.rs for explanation.
+    for interval in intervals.values_mut() {
+        if interval.start == interval.end {
+            // Dead VReg: written but never read. Extend by 1 to prevent
+            // same-cycle write conflicts with other VRegs.
+            interval.end = interval.start + 1;
         }
     }
 
@@ -909,7 +929,8 @@ mod tests {
 
         let intervals = compute_live_intervals(&emit.ops);
 
-        // v1: defined at cycle 0, last used at cycle 1
+        // v1: defined at cycle 0, last read at cycle 1
+        // CLOSED interval: [0, 1] — end = last_read_cycle = 1
         assert_eq!(intervals[&v1], LiveInterval::new(0, 1));
     }
 
@@ -927,7 +948,8 @@ mod tests {
 
         let intervals = compute_live_intervals(&emit.ops);
 
-        // v1: defined at cycle 0, last used at cycle 5
+        // CLOSED intervals: end = last_read_cycle
+        // v1: defined at cycle 0, last read at cycle 5 → [0, 5]
         assert_eq!(intervals[&v1], LiveInterval::new(0, 5));
     }
 
@@ -944,16 +966,17 @@ mod tests {
         emit.ops[2].cycle = 2;
 
         let peak = compute_peak_liveness(&emit.ops);
-        // At cycle 1: v1 (1 word) + v2 being defined (8 words) = 9 words
-        // At cycle 2: v1 (1 word) still live, v2 (8 words) - but v2 not used = dies at cycle 1
-        // Actually v2 dies immediately since nothing reads it
-        // Peak is at cycle 2 where v1 is used: 1 word (v1)
-        // Wait, let me reconsider...
-        // v1 live [0, 2], v2 live [1, 1]
-        // At cycle 0: 1 word (v1)
-        // At cycle 1: 1 word (v1) + 8 words (v2) = 9 words
-        // At cycle 2: 1 word (v1)
-        assert_eq!(peak, 9);
+        // CLOSED intervals (see types.rs for authoritative docs):
+        // v1: defined at 0, last read at 2 → [0, 2]
+        // v2: defined at 1, never read (dead) → [1, 2] (+1 extension)
+        // v3: defined at 2, never read (dead) → [2, 3] (+1 extension)
+        //
+        // At cycle 0: v1 live (1 word)
+        // At cycle 1: v1 [0,2] live (1) + v2 [1,2] live (8) = 9 words
+        // At cycle 2: v1 [0,2] live (1) + v2 [1,2] live (8) + v3 [2,3] live (1) = 10 words
+        //
+        // Peak = 10 at cycle 2
+        assert_eq!(peak, 10);
     }
 
     #[test]
