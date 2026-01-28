@@ -10,6 +10,12 @@
 //!
 //! - **Cycle variable per op**: `cycle[i]` ∈ [ASAP[i], ALAP[i]] is the cycle when op i executes
 //! - **Makespan**: `makespan` = max(cycle[i]) + 1 is the total number of cycles
+//! - **Shift variables** (optional): For each shiftable VALU op, `shift[i]` ∈ {0, 1} where
+//!   `shift[i] = 1` means shift to ALU (uses 8 ALU slots), `shift[i] = 0` means keep on VALU (uses 1 VALU slot).
+//!   Both alternatives use the same `cycle[i]`, so switching doesn't require cycle changes.
+//! - **ConstChoice variables** (optional): For each ConstChoice op, `const_choice[i]` ∈ {0, 1} where
+//!   `const_choice[i] = 1` means use AddImm (Flow slot), `const_choice[i] = 0` means use Load (Load slot).
+//!   Both alternatives use the same `cycle[i]`, so switching doesn't require cycle changes.
 //!
 //! ## Constraints
 //!
@@ -25,6 +31,12 @@
 //!
 //!    We model this with cumulative constraints: the sum of ops executing in any cycle
 //!    must not exceed the engine's capacity.
+//!
+//!    **Optional intervals**: For ops with alternatives (Shift, ConstChoice), we use optional
+//!    intervals that are conditionally present based on the decision variable. Both alternatives
+//!    reference the same `cycle[i]`, ensuring that switching between alternatives (e.g., Load ↔ AddImm,
+//!    VALU ↔ ALU) only changes the boolean decision variable, not the cycle assignment. This avoids
+//!    cascading variable changes and makes optimization more efficient.
 //!
 //! 3. **Optional scratch memory constraint**: At most `scratch_budget` addresses can be live
 //!    simultaneously (live = written but not yet consumed).

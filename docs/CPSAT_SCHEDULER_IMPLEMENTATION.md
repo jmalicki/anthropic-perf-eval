@@ -5,9 +5,16 @@ This document provides a concrete implementation plan for adding an optional CP-
 ## Overview
 
 The CP-SAT scheduler models instruction scheduling as a constraint satisfaction problem:
-- **Decision variables**: Cycle assignment for each operation
+- **Decision variables**: Cycle assignment for each operation, plus optional Shift and ConstChoice decisions
 - **Constraints**: Dependencies (precedence), slot limits (cumulative), optionally scratch budget
 - **Objective**: Minimize makespan (total cycles)
+
+### Decision Variables
+
+1. **Cycle variables**: `cycle[i]` ∈ [ASAP[i], ALAP[i]] - when operation i executes
+2. **Shift variables** (optional): `shift[i]` ∈ {0, 1} - for shiftable VALU ops, whether to shift to ALU
+3. **ConstChoice variables** (optional): `const_choice[i]` ∈ {0, 1} - for ConstChoice ops, whether to use AddImm vs Load
+4. **Makespan**: `makespan` = max(cycle[i]) + 1 - total number of cycles
 
 ## Why CP-SAT is Necessary
 
@@ -244,6 +251,8 @@ pub fn schedule_cpsat(
     }
 
     // 5. Create interval variables for slot limits
+    // For ops with alternatives (Shift, ConstChoice), use optional intervals
+    // Both alternatives reference the same cycle[i], avoiding cascades when switching
     let intervals: Vec<IntervalVar> = cycle_vars.iter()
         .map(|&cv| model.new_fixed_size_interval_var(cv, 1))
         .collect();
@@ -573,6 +582,82 @@ With these bounds:
 - Small kernels (<1000 ops): Optimal in <10s
 - Medium kernels (1000-5000 ops): Optimal or near-optimal in <60s
 - Full kernel (~13000 ops): May need 5-10 minutes for optimal, but greedy hint should provide good feasible solution quickly
+
+## Variable Encoding Details
+
+### Optional Intervals Pattern
+
+For operations with alternative implementations (Shift, ConstChoice), we use **optional intervals** to model the choice without creating cascading variable changes.
+
+**Key Design Principle**: Both alternatives use the **same** `cycle[i]` variable. This ensures that switching between alternatives (e.g., Load ↔ AddImm, VALU ↔ ALU) only changes the boolean decision variable, not the cycle assignment.
+
+#### ConstChoice Encoding
+
+For each ConstChoice operation (can use either Load or AddImm to materialize a constant):
+
+```rust
+// Decision variable: true = use AddImm (Flow), false = use Load
+let choice_var = model.new_bool_var("const_choice_{}", idx);
+
+// Load variant: present when choice_var = false
+let load_interval = model.new_optional_fixed_size_interval_var(
+    cycle_vars[idx],  // Same cycle variable
+    1,
+    choice_var.not(),
+);
+
+// AddImm variant: present when choice_var = true
+let add_imm_interval = model.new_optional_fixed_size_interval_var(
+    cycle_vars[idx],  // Same cycle variable
+    1,
+    choice_var,
+);
+```
+
+**Benefits:**
+- Switching Load ↔ AddImm only changes `choice_var` (boolean flip)
+- `cycle_vars[idx]` remains unchanged
+- No cascade to other variables
+- CP-SAT can explore both options efficiently
+
+#### Shift Encoding
+
+For each shiftable VALU operation (can execute on VALU or ALU):
+
+```rust
+// Decision variable: true = shift to ALU, false = keep on VALU
+let shift_var = model.new_bool_var("shift_{}", idx);
+
+// VALU variant: present when shift_var = false
+let valu_interval = model.new_optional_fixed_size_interval_var(
+    cycle_vars[idx],  // Same cycle variable
+    1,
+    shift_var.not(),
+);
+
+// ALU variant: present when shift_var = true (demand = 8 slots)
+let alu_interval = model.new_optional_fixed_size_interval_var(
+    cycle_vars[idx],  // Same cycle variable
+    1,
+    shift_var,
+);
+```
+
+**Benefits:**
+- Switching VALU ↔ ALU only changes `shift_var` (boolean flip)
+- `cycle_vars[idx]` remains unchanged
+- No cascade to other variables
+- CP-SAT can explore shifting opportunities efficiently
+
+### Why This Matters
+
+Without this design, switching alternatives would require:
+1. Changing `cycle[i]` for the op
+2. Potentially changing cycles for dependent ops (precedence cascade)
+3. Potentially changing cycles for ops competing for resources (cumulative cascade)
+4. Potentially changing scratch live intervals (scratch cascade)
+
+By using the same `cycle[i]` for both alternatives, we avoid all these cascades, making optimization much more efficient.
 
 ## Future Extensions
 
