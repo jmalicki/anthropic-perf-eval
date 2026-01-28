@@ -722,4 +722,72 @@ mod tests {
         // Because v1 expires before v2 is allocated at cycle 5
         assert_eq!(peak, 1, "Peak should be 1 with same-cycle reuse (intervals [0,5] and [5,10] don't overlap)");
     }
+
+    // ========================================================================
+    // Minimal Reproduction: rounds=2 Memory Write Error
+    //
+    // With rounds=2 and greedy scheduler, the kernel crashes at cycle 81
+    // because scratch[4] contains garbage instead of the partition address.
+    //
+    // Timeline:
+    // - Cycle 6: VReg A (partition addr) written to scratch[4]
+    // - Cycle 10: VReg B (computation) written to scratch[4], OVERWRITES A
+    // - Cycle 81: vstore uses scratch[4] as address → CRASH
+    //
+    // The bug: VReg A has interval [6, 81], VReg B has interval [10, 17]
+    // These overlap, but linear scan assigns both to scratch[4].
+    // ========================================================================
+
+    /// Minimal reproduction of the rounds=2 register allocation bug.
+    ///
+    /// Two VRegs with overlapping intervals must get different addresses.
+    #[test]
+    fn test_rounds2_overlapping_intervals_bug() {
+        let mut emit = SsaEmitContext::new();
+
+        // VReg A: partition address, interval [6, 81]
+        let partition_addr = emit.emit_const_force(2055);  // op 0
+
+        // VReg B: computation result, interval [10, 17]
+        let x = emit.emit_const_force(256);  // op 1
+        let y = emit.emit_const_force(256);  // op 2 (force to avoid CSE)
+        let computation = emit.emit_alu(Opcode::Add, x, y);  // op 3
+
+        // VReg B used at cycle 17
+        let _use_b = emit.emit_alu(Opcode::Add, computation, y);  // op 4
+
+        // VReg A used by vstore at cycle 81
+        let data = emit.emit_vbroadcast_force(x);  // op 5 (force to avoid CSE)
+        emit.emit_vstore(partition_addr, data);  // op 6
+
+        // Schedule all ops
+        let n_ops = emit.ops.len();
+        assert_eq!(n_ops, 7, "Expected 7 ops");
+
+        emit.ops[0].cycle = 6;   // partition_addr
+        emit.ops[1].cycle = 8;   // x
+        emit.ops[2].cycle = 8;   // y
+        emit.ops[3].cycle = 10;  // computation
+        emit.ops[4].cycle = 17;  // use of computation
+        emit.ops[5].cycle = 80;  // data
+        emit.ops[6].cycle = 81;  // vstore
+
+        let intervals = compute_live_intervals(&emit.ops);
+
+        // Verify intervals
+        assert_eq!(intervals[&partition_addr], LiveInterval::new(6, 81));
+        assert_eq!(intervals[&computation], LiveInterval::new(10, 17));
+        assert!(intervals[&partition_addr].overlaps(&intervals[&computation]));
+
+        // Assign addresses - this is where the bug would manifest
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&emit.ops, &config);
+
+        // These MUST have different addresses (the bug is if they're the same)
+        assert_ne!(
+            result.vreg_to_addr[&partition_addr],
+            result.vreg_to_addr[&computation],
+            "BUG: Overlapping VRegs got the same address"
+        );
+    }
 }
