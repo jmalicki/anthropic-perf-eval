@@ -1776,12 +1776,13 @@ pub fn schedule_ssa_cpsat(
         model.add_hint(makespan, hint_makespan as i64);
     }
 
-    // Add shift hints if provided
-    if let Some(hints) = shift_hints {
-        for (&idx, &shift_var) in &shift_vars {
-            let should_shift = hints.contains(&ops[idx].id);
-            model.add_hint(shift_var, if should_shift { 1 } else { 0 });
-        }
+    // Add shift hints - always hint shift variables to avoid "unhinted variables" warnings
+    // If hints provided, use them; otherwise default to no shift (greedy's default)
+    for (&idx, &shift_var) in &shift_vars {
+        let should_shift = shift_hints
+            .map(|hints| hints.contains(&ops[idx].id))
+            .unwrap_or(false); // Default: no shift
+        model.add_hint(shift_var, if should_shift { 1 } else { 0 });
     }
 
     // 12. Configure solver
