@@ -87,14 +87,28 @@ generate_precomputed_kernel(
 )
 ```
 
-### CP-SAT Solver Settings (in `cp_scheduler.py`)
+### CP-SAT Solver Settings
 
+**Python (`solver/cp_scheduler.py`):**
 ```python
 solver.parameters.num_search_workers = os.cpu_count()  # Use all cores
 solver.parameters.interleave_search = True             # Multiple strategies
 solver.parameters.linearization_level = 2              # Stronger LP relaxations
 solver.parameters.cp_model_probing_level = 2           # Aggressive probing
+solver.parameters.cp_model_presolve = True             # Enable presolve
+solver.parameters.randomize_search = True              # Help escape local optima
 ```
+
+**Rust (`scheduler_rs/src/cpsat_scheduler.rs`):**
+```rust
+params.num_workers = Some(8);
+params.linearization_level = Some(2);              // Stronger LP relaxations
+params.cp_model_probing_level = Some(2);           // Aggressive probing
+params.cp_model_presolve = Some(true);             // Enable presolve
+params.randomize_search = Some(true);              // Help escape local optima
+```
+
+Both implementations now use the same LP optimization settings for consistent performance.
 
 ## Output Files
 
