@@ -63,7 +63,7 @@ def schedule_cp(ops: list[Op], op_by_id: dict[int, Op], time_limit: float = 60.0
                        dep_ids={d for d in op.dep_ids if d in local_ids},  # Filter external deps
                        reads=op.reads.copy(), writes=op.writes.copy()) for op in ops]
         temp_by_id = {op.id: op for op in temp_ops}
-        horizon = quick_greedy(temp_ops, temp_by_id)
+        horizon, _ = quick_greedy(temp_ops, temp_by_id)
         greedy_hint = {op.id: op.cycle for op in temp_ops}
 
     # Create interval variables for each operation

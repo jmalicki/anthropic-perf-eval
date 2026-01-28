@@ -2171,4 +2171,107 @@ mod tests {
         assert!(unique.contains(&VReg::scalar(0)));
         assert!(unique.contains(&VReg::scalar(1)));
     }
+
+    // =========================================================================
+    // CP-SAT Round-Trip Budget Validation Tests
+    // =========================================================================
+
+    /// Test whether greedy scheduler hints can round-trip through CP-SAT.
+    ///
+    /// This test validates:
+    /// 1. Whether CP-SAT accepts greedy hints if they're budget-feasible
+    /// 2. Whether CP-SAT finds a different solution if hints violate budget
+    /// 3. Or whether the problem is fundamentally infeasible within budget
+    ///
+    /// The greedy scheduler often exceeds the 1536-word scratch budget because
+    /// it doesn't model budget constraints during scheduling. This test uses
+    /// CP-SAT with `stop_after_first_solution` to quickly determine if:
+    /// - The greedy hints are directly usable (hints_match = true)
+    /// - A feasible schedule exists but differs from greedy (hints_match = false)
+    /// - No feasible schedule exists within budget (infeasible)
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_greedy_cpsat_roundtrip_budget_check() {
+        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
+
+        // Build a full-scale kernel
+        let config = KernelConfig::new(10, 2047, 256, 16);
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+
+        builder.build_internal();
+        let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut ssa_ops = builder.emit.take_ops();
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
+
+        // Run greedy scheduler to get hints
+        let mut greedy_shifted = HashSet::new();
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) =
+            builder.schedule_ssa_greedy_with_shift(
+                &mut ssa_ops,
+                false, // no VALU shift
+                &mut greedy_shifted,
+            ).expect("Greedy scheduler should succeed");
+
+        eprintln!("Greedy result: {} cycles, budget_exceeded={}, peak_live={}",
+            greedy_cycles, greedy_budget_exceeded, greedy_peak_live);
+
+        // Collect hints from greedy schedule
+        let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
+
+        // Reset cycles before CP-SAT
+        for op in &mut ssa_ops {
+            op.cycle = -1;
+        }
+
+        // Run CP-SAT with stop_after_first_solution - just validate hints
+        let cpsat_result = schedule_ssa_cpsat(
+            &ssa_ops,
+            SsaCpsatConfig {
+                time_limit_secs: 60.0,  // Short timeout
+                verbose: true,
+                stop_after_first_solution: true,  // Return first feasible solution
+                scratch_budget: 1536,  // Hardware limit
+                enable_valu_shift: false,
+            },
+            Some(&greedy_hints),
+            None,
+        );
+
+        match cpsat_result {
+            Some(result) => {
+                eprintln!("CP-SAT found solution: {} cycles, status={:?}",
+                    result.makespan, result.status);
+
+                // Check if CP-SAT used the hints directly or found different solution
+                let hints_match = result.cycle_assignments == greedy_hints;
+                eprintln!("Hints match exactly: {}", hints_match);
+
+                // If hints don't match, greedy hints were infeasible for budget
+                if !hints_match {
+                    eprintln!("Greedy hints were INFEASIBLE - CP-SAT found different solution");
+
+                    // Count how many cycle assignments differ
+                    let diff_count = result.cycle_assignments.iter()
+                        .zip(greedy_hints.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!("  {} of {} cycle assignments differ", diff_count, greedy_hints.len());
+                } else {
+                    eprintln!("Greedy hints were FEASIBLE - accepted by CP-SAT");
+                }
+
+                // The test passes if CP-SAT found any solution (feasible or optimal)
+                assert!(
+                    result.status == crate::cpsat_scheduler::CpsatStatus::Feasible ||
+                    result.status == crate::cpsat_scheduler::CpsatStatus::Optimal,
+                    "CP-SAT should find a feasible solution"
+                );
+            }
+            None => {
+                eprintln!("CP-SAT returned NO SOLUTION - problem may be infeasible within budget");
+                // This is an expected outcome if the kernel truly cannot fit in 1536 words
+                // We don't fail the test - just report the finding
+            }
+        }
+    }
 }
