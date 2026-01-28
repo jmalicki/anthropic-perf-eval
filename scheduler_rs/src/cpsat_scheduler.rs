@@ -1776,13 +1776,26 @@ pub fn schedule_ssa_cpsat(
         model.add_hint(makespan, hint_makespan as i64);
     }
 
-    // Add shift hints - always hint shift variables to avoid "unhinted variables" warnings
+    // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings
+    // We create one shift variable per shiftable VALU op, so we should hint all of them
     // If hints provided, use them; otherwise default to no shift (greedy's default)
-    for (&idx, &shift_var) in &shift_vars {
+    if !shift_vars.is_empty() && verbose {
+        let hinted_shift_count = shift_hints.map(|h| shiftable_valu.iter().filter(|&&idx| h.contains(&ops[idx].id)).count()).unwrap_or(0);
+        eprintln!("  Hinting {} shift variables ({} with shift=true, {} with shift=false)", 
+                  shift_vars.len(),
+                  hinted_shift_count,
+                  shift_vars.len() - hinted_shift_count);
+        // Verify we're hinting all shift variables
+        assert_eq!(shift_vars.len(), shiftable_valu.len(), 
+                   "shift_vars should contain one entry per shiftable VALU op");
+    }
+    // Hint all shift variables - this ensures CP-SAT has complete hints for all decision variables
+    for &idx in &shiftable_valu {
+        let shift_var = shift_vars.get(&idx).expect("shift_var should exist for all shiftable ops");
         let should_shift = shift_hints
             .map(|hints| hints.contains(&ops[idx].id))
             .unwrap_or(false); // Default: no shift
-        model.add_hint(shift_var, if should_shift { 1 } else { 0 });
+        model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
     }
 
     // 12. Configure solver
