@@ -28,6 +28,7 @@ pub enum Engine {
     // Scheduling-internal states (not real hardware engines)
     EliminatedBroadcast = 6,
     ShiftedValu = 7,
+    Barrier = 8, // Scheduling-only barrier (not real hardware)
 }
 
 impl Engine {
@@ -42,6 +43,7 @@ impl Engine {
             "debug" => Some(Engine::Debug),
             "eliminated_broadcast" => Some(Engine::EliminatedBroadcast),
             "shifted_valu" => Some(Engine::ShiftedValu),
+            "barrier" => Some(Engine::Barrier),
             _ => None,
         }
     }
@@ -57,6 +59,7 @@ impl Engine {
             Engine::Debug => "debug",
             Engine::EliminatedBroadcast => "eliminated_broadcast",
             Engine::ShiftedValu => "shifted_valu",
+            Engine::Barrier => "barrier",
         }
     }
 
@@ -72,12 +75,16 @@ impl Engine {
             // Internal states have no slots in bundles
             Engine::EliminatedBroadcast => 0,
             Engine::ShiftedValu => 0,
+            Engine::Barrier => 0, // Takes no slots
         }
     }
 
     /// Check if this is a real hardware engine (vs scheduling-internal)
     pub fn is_hardware(&self) -> bool {
-        !matches!(self, Engine::EliminatedBroadcast | Engine::ShiftedValu)
+        !matches!(
+            self,
+            Engine::EliminatedBroadcast | Engine::ShiftedValu | Engine::Barrier
+        )
     }
 }
 
@@ -138,6 +145,9 @@ pub enum Opcode {
 
     // Immediate operations (flow engine)
     AddImm = 31,
+
+    // Scheduling-only pseudo-ops (elided from output)
+    Barrier = 32, // Round boundary barrier
 }
 
 impl Opcode {
@@ -176,6 +186,7 @@ impl Opcode {
             "halt" => Some(Opcode::Halt),
             "debug_print" => Some(Opcode::DebugPrint),
             "add_imm" => Some(Opcode::AddImm),
+            "barrier" => Some(Opcode::Barrier),
             _ => None,
         }
     }
@@ -215,6 +226,7 @@ impl Opcode {
             Opcode::Halt => "halt",
             Opcode::DebugPrint => "debug_print",
             Opcode::AddImm => "add_imm",
+            Opcode::Barrier => "barrier",
         }
     }
 

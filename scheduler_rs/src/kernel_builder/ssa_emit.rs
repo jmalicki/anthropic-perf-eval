@@ -35,6 +35,12 @@ impl SsaTickTockKernelBuilder {
             self.emit.set_round_context(rnd, tree_depth);
             self.emit_round(rnd, tree_depth, n_groups, n_iters, is_last_round);
 
+            // Emit barrier between rounds for greedy scheduler
+            // (barriers are elided before CP-SAT and final output)
+            if !is_last_round {
+                self.emit.emit_barrier();
+            }
+
             // Update tree depth with wrap
             tree_depth += 1;
             if tree_depth >= tree_height {

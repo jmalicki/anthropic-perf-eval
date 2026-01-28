@@ -610,6 +610,32 @@ impl SsaEmitContext {
         self.emit(op);
         dest
     }
+
+    // ========================================================================
+    // Barrier Operations (Scheduling-only)
+    // ========================================================================
+
+    /// Emit a barrier pseudo-op for round boundaries.
+    ///
+    /// The barrier:
+    /// - Uses Engine::Barrier (slot_limit=0, is_hardware=false)
+    /// - Gets assigned a cycle during scheduling
+    /// - Forces all prior ops to complete before any subsequent ops start
+    /// - Is elided from final output (not a real instruction)
+    ///
+    /// Use `compute_ssa_dependencies_with_barriers` after emission to add
+    /// barrier dependency constraints.
+    #[track_caller]
+    pub fn emit_barrier(&mut self) {
+        let op = SsaOp::new(
+            0, // set by emit()
+            Engine::Barrier,
+            Opcode::Barrier,
+            None,   // no destination
+            vec![], // no operands
+        );
+        self.emit(op);
+    }
 }
 
 /// Compute SSA dependencies: only RAW (read-after-write) dependencies.
@@ -628,6 +654,73 @@ pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usiz
                 }
             }
         }
+    }
+}
+
+/// Compute dependencies with barrier constraints for greedy scheduling.
+///
+/// Barriers create hard scheduling boundaries between rounds:
+/// - Each barrier depends on all ops in its preceding section (since last barrier)
+/// - Each barrier also depends on the previous barrier (to chain them)
+/// - All ops after a barrier depend on that barrier
+///
+/// This is more efficient than making each barrier depend on ALL prior ops,
+/// which would create O(n²) dependencies. Instead, this creates a chain of
+/// barriers where each barrier gates its section.
+///
+/// The effect is the same: all ops before barrier N must complete before any
+/// ops after barrier N can start. But the dependency graph is O(n) instead of O(n²).
+pub fn compute_ssa_dependencies_with_barriers(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usize>) {
+    // First compute normal RAW deps
+    compute_ssa_dependencies(ops, vreg_def);
+
+    // Find barrier ops
+    let barrier_indices: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::Barrier)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if barrier_indices.is_empty() {
+        return;
+    }
+
+    // Process barriers in order
+    let mut prev_barrier_idx: Option<usize> = None;
+
+    for &barrier_idx in &barrier_indices {
+        let barrier_op_id = ops[barrier_idx].id;
+
+        // Find start of this section (after previous barrier, or start of ops)
+        let section_start = prev_barrier_idx.map_or(0, |idx| idx + 1);
+
+        // Barrier depends on all non-barrier ops in its section
+        for idx in section_start..barrier_idx {
+            if ops[idx].opcode != Opcode::Barrier {
+                ops[barrier_idx].dep_ids.insert(ops[idx].id);
+            }
+        }
+
+        // Barrier also depends on previous barrier (to chain them)
+        if let Some(prev_idx) = prev_barrier_idx {
+            ops[barrier_idx].dep_ids.insert(ops[prev_idx].id);
+        }
+
+        // All ops after this barrier (until next barrier or end) depend on it
+        let next_barrier_idx = barrier_indices
+            .iter()
+            .find(|&&i| i > barrier_idx)
+            .copied()
+            .unwrap_or(ops.len());
+
+        for idx in (barrier_idx + 1)..next_barrier_idx {
+            if ops[idx].opcode != Opcode::Barrier {
+                ops[idx].dep_ids.insert(barrier_op_id);
+            }
+        }
+
+        prev_barrier_idx = Some(barrier_idx);
     }
 }
 
@@ -918,5 +1011,85 @@ mod tests {
         let store_op = emit.ops.last().unwrap();
         assert!(store_op.dest.is_none());
         assert!(store_op.writes().is_none());
+    }
+
+    #[test]
+    fn test_emit_barrier() {
+        let mut emit = SsaEmitContext::new();
+        emit.emit_barrier();
+
+        let barrier_op = emit.ops.last().unwrap();
+        assert_eq!(barrier_op.engine, Engine::Barrier);
+        assert_eq!(barrier_op.opcode, Opcode::Barrier);
+        assert!(barrier_op.dest.is_none());
+        assert!(barrier_op.srcs.is_empty());
+    }
+
+    #[test]
+    fn test_barrier_dependencies() {
+        // Test that barrier creates proper dependencies:
+        // - Barrier depends on all prior non-barrier ops
+        // - All ops after barrier depend on it
+        let mut emit = SsaEmitContext::new();
+
+        // "Round 1"
+        let v1 = emit.emit_const(5);  // op 0
+        let v2 = emit.emit_const(6);  // op 1
+        let _v3 = emit.emit_alu(Opcode::Add, v1, v2);  // op 2
+
+        // Barrier
+        emit.emit_barrier();  // op 3
+
+        // "Round 2"
+        let v4 = emit.emit_const(7);  // op 4
+        let _v5 = emit.emit_alu(Opcode::Mul, v4, v1);  // op 5 (uses v1 from round 1)
+
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+
+        // Barrier (op 3) should depend on ops 0, 1, 2
+        assert!(emit.ops[3].dep_ids.contains(&0), "Barrier should depend on op 0");
+        assert!(emit.ops[3].dep_ids.contains(&1), "Barrier should depend on op 1");
+        assert!(emit.ops[3].dep_ids.contains(&2), "Barrier should depend on op 2");
+
+        // Ops after barrier should depend on it
+        assert!(emit.ops[4].dep_ids.contains(&3), "Op 4 should depend on barrier");
+        assert!(emit.ops[5].dep_ids.contains(&3), "Op 5 should depend on barrier");
+
+        // Op 5 should also have RAW dep on op 0 (v1) and op 4 (v4)
+        assert!(emit.ops[5].dep_ids.contains(&0), "Op 5 should have RAW dep on op 0 (v1)");
+        assert!(emit.ops[5].dep_ids.contains(&4), "Op 5 should have RAW dep on op 4 (v4)");
+    }
+
+    #[test]
+    fn test_multiple_barriers() {
+        // Test multiple barriers in sequence with chained dependencies
+        let mut emit = SsaEmitContext::new();
+
+        let v1 = emit.emit_const(1);  // op 0
+        emit.emit_barrier();  // op 1
+        let v2 = emit.emit_const(2);  // op 2
+        emit.emit_barrier();  // op 3
+        let _v3 = emit.emit_alu(Opcode::Add, v1, v2);  // op 4
+
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+
+        // First barrier depends on op 0 (its section)
+        assert!(emit.ops[1].dep_ids.contains(&0), "First barrier should depend on op 0");
+
+        // Op 2 depends on first barrier
+        assert!(emit.ops[2].dep_ids.contains(&1), "Op 2 should depend on first barrier");
+
+        // Second barrier depends on:
+        // - op 2 (its section - ops between barrier 1 and barrier 3)
+        // - barrier 1 (previous barrier - chaining)
+        assert!(emit.ops[3].dep_ids.contains(&2), "Second barrier should depend on op 2");
+        assert!(emit.ops[3].dep_ids.contains(&1), "Second barrier should depend on first barrier (chain)");
+        // Second barrier does NOT directly depend on op 0 (that's handled by the chain)
+        assert!(!emit.ops[3].dep_ids.contains(&0), "Second barrier should NOT directly depend on op 0 (chained via barrier 1)");
+
+        // Op 4 depends on second barrier (and has RAW deps on v1, v2)
+        assert!(emit.ops[4].dep_ids.contains(&3), "Op 4 should depend on second barrier");
+        assert!(emit.ops[4].dep_ids.contains(&0), "Op 4 should have RAW dep on v1");
+        assert!(emit.ops[4].dep_ids.contains(&2), "Op 4 should have RAW dep on v2");
     }
 }

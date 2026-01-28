@@ -5,6 +5,7 @@
 //!
 //! ## Module Organization
 //!
+//! - `barrier_elision` - Remove barrier pseudo-ops before CP-SAT/output
 //! - `config` - Kernel configuration (forest height, batch size, etc.)
 //! - `context` - Scratch memory allocation context
 //! - `context_ssa` - SSA scratch context with VRegs (no pre-allocated addresses)
@@ -14,6 +15,7 @@
 //! - `tick_tock` - TickTock kernel builder (main implementation)
 //! - `tick_tock_ssa` - SSA-based kernel builder (eliminates false dependencies)
 
+pub mod barrier_elision;
 pub mod config;
 pub mod context;
 pub mod context_ssa;
