@@ -410,7 +410,7 @@ pub fn schedule_cycles(
 
 /// Run multiple scheduling passes with different priority modes and return the best
 #[pyfunction]
-#[pyo3(signature = (instrs, enable_valu_shift, verbose=false))]
+#[pyo3(signature = (instrs, enable_valu_shift, verbose=true))]
 pub fn schedule_multipass<'py>(
     py: Python<'py>,
     instrs: &Bound<'py, PyList>,
@@ -488,7 +488,7 @@ pub fn count_cycles(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<usi
 
 /// Get cycle count from multipass (for testing)
 #[pyfunction]
-#[pyo3(signature = (instrs, enable_valu_shift, verbose=false))]
+#[pyo3(signature = (instrs, enable_valu_shift, verbose=true))]
 pub fn schedule_multipass_cycles(
     py: Python<'_>,
     instrs: &Bound<'_, PyList>,
@@ -542,7 +542,7 @@ pub fn schedule_multipass_cycles(
 
 /// Run multipass scheduling with diagnostics collection, returns JSON report
 #[pyfunction]
-#[pyo3(signature = (instrs, enable_valu_shift, verbose=false))]
+#[pyo3(signature = (instrs, enable_valu_shift, verbose=true))]
 pub fn run_diagnostics(
     py: Python<'_>,
     instrs: &Bound<'_, PyList>,
@@ -1131,7 +1131,7 @@ pub fn analyze_constants(
 /// Apply constant derivation optimization and return optimized ops
 /// If skip_scheduling is true, returns unscheduled ops (for use with schedule_multipass)
 #[pyfunction]
-#[pyo3(signature = (instrs, enable_valu_shift, hot_threshold=3, verbose=false, skip_scheduling=false))]
+#[pyo3(signature = (instrs, enable_valu_shift, hot_threshold=3, verbose=true, skip_scheduling=false))]
 pub fn optimize_constants<'py>(
     py: Python<'py>,
     instrs: &Bound<'py, PyList>,
@@ -1576,7 +1576,7 @@ fn apply_register_allocation(
 /// - Compacts scratch usage by reusing addresses when live ranges don't overlap
 /// - Uses linear scan algorithm for efficient allocation
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false, enable_tree_reduce_depth3=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false, enable_tree_reduce_depth3=false))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1849,7 +1849,7 @@ pub fn build_tick_tock_kernel<'py>(
 /// - Post-scheduling optimization that rewrites addresses based on liveness
 /// - Compacts scratch usage by reusing addresses when live ranges don't overlap
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false))]
 pub fn build_tick_tock_kernel_ops(
     _py: Python<'_>,
     forest_height: usize,
@@ -2043,7 +2043,7 @@ pub fn build_tick_tock_kernel_ops(
 ///   Compile with `--features cpsat` and set environment:
 ///   ORTOOLS_PREFIX=$(brew --prefix or-tools) RUSTFLAGS='-Clink-arg=-lprotobuf'
 #[pyfunction]
-#[pyo3(signature = (instrs, scratch_budget=0, time_limit_secs=60.0, use_greedy_hint=true, verbose=false))]
+#[pyo3(signature = (instrs, scratch_budget=0, time_limit_secs=60.0, use_greedy_hint=true, verbose=true))]
 pub fn schedule_cpsat<'py>(
     py: Python<'py>,
     instrs: &Bound<'py, PyList>,
@@ -2184,7 +2184,7 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=false, use_cpsat=false, cpsat_time_limit=600.0, output_json=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,

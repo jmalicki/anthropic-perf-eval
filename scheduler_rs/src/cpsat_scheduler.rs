@@ -357,7 +357,7 @@ impl<'a> Default for CpsatConfig<'a> {
             greedy_hints: None,
             shift_hints: None,
             enable_valu_shift: false,
-            verbose: false,
+            verbose: true, // Default: show optimizer output
             stop_after_first_solution: false,
         }
     }
@@ -838,10 +838,6 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
 
     let status = CpsatStatus::from(response.status());
 
-    if verbose {
-        eprintln!("CP-SAT: status={:?}, time={:.2}s", status, solve_time);
-    }
-
     // 12. Extract solution
     match status {
         CpsatStatus::Optimal | CpsatStatus::Feasible => {
@@ -852,17 +848,25 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
 
             let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
 
-            let gap = if status == CpsatStatus::Optimal {
-                0.0
+            let (best_bound, gap) = if status == CpsatStatus::Optimal {
+                (actual_makespan as f64, 0.0)
             } else {
                 let best = response.objective_value;
                 let bound = response.best_objective_bound;
-                if best > 0.0 {
+                let gap_val = if best > 0.0 {
                     (best - bound).abs() / best
                 } else {
                     0.0
-                }
+                };
+                (bound, gap_val)
             };
+
+            if verbose {
+                eprintln!(
+                    "CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
+                    actual_makespan, best_bound, status, gap * 100.0, solve_time
+                );
+            }
 
             // TODO: When enable_valu_shift is true, extract shift decisions from solver
             // For now, return empty valu_shifted (no shifting in CP-SAT)
@@ -913,7 +917,7 @@ impl Default for SsaCpsatConfig {
     fn default() -> Self {
         Self {
             time_limit_secs: 60.0,
-            verbose: false,
+            verbose: true, // Default: show optimizer output
             stop_after_first_solution: false,
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
@@ -1858,22 +1862,27 @@ pub fn schedule_ssa_cpsat(
                 .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
                 .collect();
 
-            let gap = if status == CpsatStatus::Optimal {
-                0.0
+            let (best_bound, gap) = if status == CpsatStatus::Optimal {
+                (actual_makespan as f64, 0.0)
             } else {
                 let best = response.objective_value;
                 let bound = response.best_objective_bound;
-                if best > 0.0 {
+                let gap_val = if best > 0.0 {
                     (best - bound).abs() / best
                 } else {
                     0.0
-                }
+                };
+                (bound, gap_val)
             };
 
             if verbose {
                 eprintln!(
-                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s, shifted {} VALU ops, {} ConstChoice AddImm",
-                    actual_makespan, status, gap * 100.0, solve_time, shifted_ops.len(), const_add_imm_ops.len()
+                    "SSA CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
+                    actual_makespan, best_bound, status, gap * 100.0, solve_time
+                );
+                eprintln!(
+                    "  Shifted {} VALU ops, {} ConstChoice AddImm ops",
+                    shifted_ops.len(), const_add_imm_ops.len()
                 );
             }
 
