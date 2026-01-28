@@ -1,0 +1,178 @@
+Building SSA kernel with CP-SAT (600s)...
+  forest_height=10, n_nodes=2047
+  batch_size=256, rounds=16
+  enable_valu_shift=True
+
+Building SSA kernel (CP-SAT)...
+Warning: Dead store detected (will skip): op[6896] id=6896 defines VReg { id: 6599, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6899] id=6899 defines VReg { id: 6602, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6902] id=6902 defines VReg { id: 6605, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6905] id=6905 defines VReg { id: 6608, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6908] id=6908 defines VReg { id: 6611, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6911] id=6911 defines VReg { id: 6614, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6914] id=6914 defines VReg { id: 6617, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6917] id=6917 defines VReg { id: 6620, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6920] id=6920 defines VReg { id: 6623, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6923] id=6923 defines VReg { id: 6626, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6926] id=6926 defines VReg { id: 6629, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6929] id=6929 defines VReg { id: 6632, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6932] id=6932 defines VReg { id: 6635, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6935] id=6935 defines VReg { id: 6638, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6938] id=6938 defines VReg { id: 6641, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: Dead store detected (will skip): op[6941] id=6941 defines VReg { id: 6644, width: Vector } with 0 users.
+Source: Some(Location { file: "src/kernel_builder/ssa_emit.rs", line: 724, column: 58 })
+Engine: Valu, Opcode: MultiplyAdd
+Warning: 16 dead stores detected and will be skipped
+SSA Greedy hint: 1494 cycles (15 barriers) (1344 VALU shifted)
+SSA CP-SAT: 11349 ops, critical path 223, horizon 11349, shiftable VALU ops: 6944, scratch_budget=1536
+DEBUG: scratch_budget = 1536, verbose = true
+  Scratch debug: 11349 ops total, 10805 with dest, 11299 with reads, 10805 VReg defs, 10757 VReg uses
+  Hint verification: peak_live=1079 <= budget=1536 OK
+  Scratch constraint: 10757 live VRegs, budget=1536
+  Engine capacity verification: OK (VALU<=6, ALU<=12 at all cycles)
+  Capacity bounds: VALU=1631, ALU=54, Load=193, Store=272, combined=744
+
+Starting CP-SAT solver v9.15.9999
+Parameters: max_time_in_seconds: 600 log_search_progress: true num_workers: 8
+
+Initial optimization model '': (model_fingerprint: 0x363f44a8479af255)
+#Variables: 29'051 (#ints: 1 in objective) (13'888 primary variables)
+  - 6'944 Booleans in [0,1]
+  - 696 different domains in [0,11350] with a largest complexity of 1.
+#kCumulative: 5 (#intervals: 29'050, #optional: 13'888, #variable_sizes: 10'757)
+#kInterval: 33'455 (#enforced: 13'888)
+#kLinear2: 58'876 (#enforced: 13'888)
+#kLinear3: 21'514
+
+Starting presolve at 0.06s
+The solution hint is incomplete: 29035 out of 29051 non fixed variables hinted.
+  6.68e-03s  0.00e+00d  [DetectDominanceRelations] 
+  3.17e-01s  2.16e-04d  [PresolveToFixPoint] #num_loops=2 #num_dual_strengthening=1 
+  6.94e-04s  0.00e+00d  [ExtractEncodingFromLinear] 
+  2.33e-03s  0.00e+00d  [DetectDuplicateColumns] 
+  1.23e-02s  0.00e+00d  [DetectDuplicateConstraints] #duplicates=21'514 
+[Symmetry] Graph for symmetry has 173'854 nodes and 266'942 arcs.
+[Symmetry] Symmetry computation done. time: 0.024481 dtime: 0.0670345
+[Symmetry] #generators: 2, average support size: 8
+[Symmetry] 8 orbits on 16 variables with sizes: 2,2,2,2,2,2,2,2
+[Symmetry] Found orbitope of size 4 x 2
+  1.10e-02s  0.00e+00d  [DetectDuplicateConstraintsWithDifferentEnforcements] #without_enforcements=6'944 
+  3.70e+00s  2.43e-03d  [Probe] #probed=13'888 
+  7.91e-04s  0.00e+00d  [MaxClique] 
+  4.32e-03s  0.00e+00d  [DetectDominanceRelations] 
+  1.88e-01s  1.30e-04d  [PresolveToFixPoint] #num_loops=1 #num_dual_strengthening=1 
+  6.86e-03s  0.00e+00d  [ProcessAtMostOneAndLinear] 
+  8.16e-03s  0.00e+00d  [DetectDuplicateConstraints] 
+  1.19e-02s  0.00e+00d  [DetectDuplicateConstraintsWithDifferentEnforcements] #without_enforcements=6'944 
+  1.34e-02s  5.96e-04d  [DetectDominatedLinearConstraints] #relevant_constraints=46'935 #num_inclusions=10'757 #num_redundant=10'757 
+  1.42e-01s  0.00e+00d  [DetectDifferentVariables] #different=25'421 #cliques=4'258 #size=12'920 
+  2.13e-03s  0.00e+00d  [ProcessSetPPC] 
+  1.94e-03s  0.00e+00d  [TransformClausesToExactlyOne] 
+  8.41e-04s  0.00e+00d  [DetectEncodedComplexDomains] 
+  2.60e-03s  3.15e-05d  [FindAlmostIdenticalLinearConstraints] #num_tested_pairs=2'098 
+  4.70e-05s  0.00e+00d  [FindBigAtMostOneAndLinearOverlap] 
+  6.96e-03s  2.02e-03d  [FindBigVerticalLinearOverlap] 
+  5.87e-04s  0.00e+00d  [FindBigHorizontalLinearOverlap] 
+  5.10e-04s  0.00e+00d  [MergeClauses] 
+  5.15e-03s  0.00e+00d  [DetectDominanceRelations] 
+  1.85e-01s  1.30e-04d  [PresolveToFixPoint] #num_loops=2 #num_dual_strengthening=1 
+  4.19e-03s  0.00e+00d  [DetectDominanceRelations] 
+  1.69e-01s  1.30e-04d  [PresolveToFixPoint] #num_loops=1 #num_dual_strengthening=1 
+  1.34e-03s  0.00e+00d  [DetectDuplicateColumns] 
+  8.45e-03s  0.00e+00d  [DetectDuplicateConstraints] 
+[Symmetry] Graph for symmetry has 171'847 nodes and 262'840 arcs.
+[Symmetry] Symmetry computation done. time: 0.022406 dtime: 0.0663935
+  2.25e-02s  0.00e+00d  [DetectDuplicateConstraintsWithDifferentEnforcements] #without_enforcements=6'944 
+  3.61e+00s  2.45e-03d  [Probe] #probed=13'888 
+  6.61e-04s  0.00e+00d  [MaxClique] 
+  4.47e-03s  0.00e+00d  [DetectDominanceRelations] 
+  1.87e-01s  1.30e-04d  [PresolveToFixPoint] #num_loops=1 #num_dual_strengthening=1 
+  5.62e-03s  0.00e+00d  [ProcessAtMostOneAndLinear] 
+  8.91e-03s  0.00e+00d  [DetectDuplicateConstraints] 
+  1.18e-02s  0.00e+00d  [DetectDuplicateConstraintsWithDifferentEnforcements] #without_enforcements=6'944 
+  4.44e-03s  3.66e-04d  [DetectDominatedLinearConstraints] #relevant_constraints=36'178 
+  3.91e-03s  0.00e+00d  [DetectDifferentVariables] 
+  1.99e-03s  0.00e+00d  [ProcessSetPPC] 
+  1.96e-03s  0.00e+00d  [TransformClausesToExactlyOne] 
+  9.18e-04s  0.00e+00d  [DetectEncodedComplexDomains] 
+  1.99e-03s  3.19e-05d  [FindAlmostIdenticalLinearConstraints] #num_tested_pairs=2'124 
+  4.90e-05s  0.00e+00d  [FindBigAtMostOneAndLinearOverlap] 
+  6.62e-03s  2.02e-03d  [FindBigVerticalLinearOverlap] 
+  6.39e-04s  0.00e+00d  [FindBigHorizontalLinearOverlap] 
+  5.22e-04s  0.00e+00d  [MergeClauses] 
+  4.50e-03s  0.00e+00d  [DetectDominanceRelations] 
+  1.80e-01s  1.30e-04d  [PresolveToFixPoint] #num_loops=1 #num_dual_strengthening=1 
+  6.36e-04s  0.00e+00d  [MergeNoOverlap] 
+  4.53e-04s  0.00e+00d  [MergeNoOverlap2D] 
+  3.44e-03s  0.00e+00d  [ExpandObjective] #entries=56'382 #tight_variables=28'191 #tight_constraints=10'757 
+
+Presolve summary:
+  - 0 affine relations were detected.
+  - rule 'TODO dual: only one unspecified blocking constraint?' was applied 2 times.
+  - rule 'TODO interval: same interval with different enforcement?' was applied 27'776 times.
+  - rule 'TODO no_overlap: with task always last' was applied 4'258 times.
+  - rule 'all_diff: inferred from x != y constraints' was applied 4'258 times.
+  - rule 'duplicate: removed constraint' was applied 21'514 times.
+  - rule 'intervals: removed unused interval' was applied 4'405 times.
+  - rule 'linear inclusion: subset + singleton is equality' was applied 10'757 times.
+  - rule 'linear: fixed or dup variables' was applied 22'698 times.
+  - rule 'linear: reduced variable domains in derived constraint' was applied 10'757 times.
+  - rule 'linear: trivial 0=0' was applied 22'698 times.
+  - rule 'presolve: 0 unused variables removed.' was applied 1 time.
+  - rule 'presolve: iteration' was applied 2 times.
+  - rule 'propagators: changed bounds' was applied 10'757 times.
+
+Presolved optimization model '': (model_fingerprint: 0xb94555486c6236f3)
+#Variables: 29'051 (#ints: 1 in objective) (18'294 primary variables)
+  - 6'944 Booleans in [0,1]
+  - 756 different domains in [0,11349] with a largest complexity of 1.
+#kAllDiff: 4'258
+#kCumulative: 5 (#intervals: 29'050, #optional: 13'888, #variable_sizes: 10'757)
+#kInterval: 29'050 (#enforced: 13'888)
+#kLinear2: 25'421
+#kLinear3: 10'757
+[Symmetry] Graph for symmetry has 171'847 nodes and 262'840 arcs.
+[Symmetry] Symmetry computation done. time: 0.025041 dtime: 0.0663935
+
+Preloading model.
+#Bound   9.16s best:inf   next:[744,11349] initial_domain
+The solution hint is incomplete: 29035 out of 29051 non fixed variables hinted.
+#Model   9.18s var:29051/29051 constraints:69491/69491
+
+Starting search at 9.18s with 8 workers.
+6 full problem subsolvers: [default_lp, fixed, max_lp, no_lp, quick_restart, reduced_costs]
+2 first solution subsolvers: [fj, fs_random_no_lp]
+13 interleaved subsolvers: [feasibility_pump, graph_arc_lns, graph_cst_lns, graph_dec_lns, graph_var_lns, ls, rins/rens, rnd_cst_lns, rnd_var_lns, scheduling_intervals_lns, scheduling_precedences_lns, scheduling_resource_windows_lns, scheduling_time_window_lns]
+3 helper subsolvers: [neighborhood_helper, synchronization_agent, update_gap_integral]
+
+#Bound  20.60s best:inf   next:[1317,11349] max_lp
