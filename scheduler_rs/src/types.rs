@@ -147,7 +147,8 @@ pub enum Opcode {
     AddImm = 31,
 
     // Scheduling-only pseudo-ops (elided from output)
-    Barrier = 32, // Round boundary barrier
+    Barrier = 32,     // Round boundary barrier
+    ConstChoice = 33, // Constant with encoding choice (Load vs AddImm)
 }
 
 impl Opcode {
@@ -187,6 +188,7 @@ impl Opcode {
             "debug_print" => Some(Opcode::DebugPrint),
             "add_imm" => Some(Opcode::AddImm),
             "barrier" => Some(Opcode::Barrier),
+            "const_choice" => Some(Opcode::ConstChoice),
             _ => None,
         }
     }
@@ -227,6 +229,7 @@ impl Opcode {
             Opcode::DebugPrint => "debug_print",
             Opcode::AddImm => "add_imm",
             Opcode::Barrier => "barrier",
+            Opcode::ConstChoice => "const_choice",
         }
     }
 
@@ -290,7 +293,7 @@ pub const VALU_TO_ALU_OPS: &[&str] = &[
 // ============================================================================
 
 /// Slot value - can be opcode or int
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotVal {
     Str(String),  // Legacy: will be replaced with Op(Opcode)
     Int(i64),
@@ -335,8 +338,11 @@ pub enum ConstEncoding {
     /// Cost: 1 load slot, no dependencies
     Load,
 
-    /// Flow add_imm: `add_imm dest s0 value`
-    /// Cost: 1 flow slot, needs ZERO_REG available
+    /// Flow add_imm: `add_imm dest scratch[0] value`
+    /// Cost: 1 flow slot
+    /// IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
+    /// is guaranteed by hardware initialization. AddImm can reference address 0 directly
+    /// without any dependency on a zero-loading op.
     AddImm { value: i64 },
 
     /// ALU addition: `add dest srcA srcB`
@@ -370,7 +376,7 @@ impl ConstEncoding {
     pub fn dependencies(&self) -> Vec<i64> {
         match self {
             ConstEncoding::Load => vec![],
-            ConstEncoding::AddImm { .. } => vec![0], // Depends on ZERO_REG
+            ConstEncoding::AddImm { .. } => vec![], // No scheduling dependencies - address 0 always contains 0 (hardware initialization)
             ConstEncoding::Add { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Sub { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Mul { a_value, b_value } => vec![*a_value, *b_value],
@@ -385,7 +391,7 @@ impl ConstEncoding {
     pub fn is_ready(&self, available_values: &HashSet<i64>) -> bool {
         match self {
             ConstEncoding::Load => true, // No dependencies
-            ConstEncoding::AddImm { .. } => available_values.contains(&0), // ZERO_REG must be available
+            ConstEncoding::AddImm { .. } => true, // No dependencies - address 0 always contains 0 (hardware initialization)
             ConstEncoding::Add { a_value, b_value }
             | ConstEncoding::Sub { a_value, b_value }
             | ConstEncoding::Mul { a_value, b_value } => {
@@ -647,7 +653,8 @@ pub fn compute_const_encodings_with_flags(value: i64, flags: ConstEncodingFlags)
 
     // AddImm via flow slot (second priority - flow slots are rarely used)
     // Works for any value since add_imm has immediate operand
-    // Requires ZERO_REG (value 0) to be available
+    // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
+    // is guaranteed by hardware initialization. AddImm can reference address 0 directly.
     if flags.enable_add_imm {
         encodings.push(ConstEncoding::AddImm { value });
     }
@@ -811,19 +818,20 @@ pub fn resolve_pseudo_const(
             (Engine::Load, slot, HashSet::new())
         }
 
-        ConstEncoding::AddImm { value } => {
-            // add_imm dest, ZERO_REG, value
-            let zero_reg = *value_to_register.get(&0)
-                .expect("ZERO_REG must be available for AddImm");
+            ConstEncoding::AddImm { value } => {
+            // add_imm dest, scratch[0], value
+            // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
+            // is guaranteed by hardware initialization. add_imm reads from address 0, but we don't
+            // need a precedence constraint because address 0 is always initialized to 0.
             let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
                 SlotVal::Str("add_imm".to_string()),
                 SlotVal::Int(dest),
-                SlotVal::Int(zero_reg),
+                SlotVal::Int(0), // Address 0 always contains 0 (hardware initialization)
                 SlotVal::Int(*value),
             ]
             .into_iter()
             .collect();
-            let reads: HashSet<i64> = [zero_reg].into_iter().collect();
+            let reads: HashSet<i64> = [0].into_iter().collect(); // Reads from address 0 (but no precedence constraint needed)
             (Engine::Flow, slot, reads)
         }
 
@@ -1195,6 +1203,10 @@ pub struct SsaOp {
 
     /// Source information: which round/phase/iteration generated this op
     pub source_info: Option<VarSource>,
+
+    /// For ConstChoice ops: alternative encodings the scheduler can choose from.
+    /// The greedy scheduler uses Load (default), while CP-SAT models the choice.
+    pub const_alternatives: Option<Vec<ConstEncoding>>,
 }
 
 impl SsaOp {
@@ -1212,6 +1224,7 @@ impl SsaOp {
             source: None,
             var_type: None,
             source_info: None,
+            const_alternatives: None,
         }
     }
 
@@ -1651,7 +1664,7 @@ mod tests {
         assert!(load.dependencies().is_empty());
 
         let add_imm = ConstEncoding::AddImm { value: 42 };
-        assert_eq!(add_imm.dependencies(), vec![0]); // Depends on ZERO_REG
+        assert_eq!(add_imm.dependencies(), Vec::<i64>::new()); // No dependencies - address 0 always contains 0
 
         let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
         assert_eq!(add.dependencies(), vec![10, 20]);
@@ -1668,10 +1681,7 @@ mod tests {
         assert!(load.is_ready(&available)); // Load always ready
 
         let add_imm = ConstEncoding::AddImm { value: 42 };
-        assert!(!add_imm.is_ready(&available)); // Needs ZERO_REG
-
-        available.insert(0); // ZERO_REG available
-        assert!(add_imm.is_ready(&available));
+        assert!(add_imm.is_ready(&available)); // Always ready - address 0 always contains 0
 
         let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
         assert!(!add.is_ready(&available));
@@ -1688,12 +1698,8 @@ mod tests {
         let pc = PseudoConst::new(0, 240, Some(100));
         let mut available: HashSet<i64> = HashSet::new();
 
-        // Initially only Load is available (ALU needs deps, AddImm needs ZERO_REG)
-        let best = pc.best_available_encoding(&available);
-        assert_eq!(best, Some(&ConstEncoding::Load));
-
-        // Add ZERO_REG - now AddImm is preferred over Load
-        available.insert(0);
+        // Initially Load and AddImm are both available (AddImm can use address 0 directly)
+        // AddImm is preferred over Load (flow slot vs load slot)
         let best = pc.best_available_encoding(&available);
         assert_eq!(best, Some(&ConstEncoding::AddImm { value: 240 }));
 
@@ -1747,8 +1753,8 @@ mod tests {
     #[test]
     fn test_resolve_pseudo_const_add_imm() {
         let pc = PseudoConst::new(0, 42, Some(100));
-        let mut value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        value_to_reg.insert(0, 0);  // ZERO_REG (value 0 is in register 0)
+        let value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        // Note: value_to_reg can be empty - AddImm uses address 0 directly (always contains 0)
 
         let encoding = ConstEncoding::AddImm { value: 42 };
         let op = resolve_pseudo_const(&pc, &encoding, &value_to_reg, 1000);
@@ -1756,7 +1762,7 @@ mod tests {
 
         let op = op.unwrap();
         assert_eq!(op.engine, Engine::Flow);
-        assert!(op.reads.contains(&0));  // Reads from ZERO_REG
+        assert!(op.reads.contains(&0));  // Reads from address 0 (but no precedence constraint needed - always initialized)
         assert!(op.writes.contains(&100));
         assert_eq!(op.produces_constant, Some(42));
     }

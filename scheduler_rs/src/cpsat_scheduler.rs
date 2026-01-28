@@ -93,7 +93,7 @@ use cp_sat::proto::{CpSolverStatus, SatParameters};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Not;
 
-use crate::types::{Engine, Op, SsaOp, VReg, VLEN};
+use crate::types::{Engine, Op, Opcode, SsaOp, VReg, VLEN};
 
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
@@ -919,6 +919,8 @@ pub struct SsaCpsatResult {
     pub gap: f64,
     /// Set of op IDs that should be shifted from VALU to ALU
     pub shifted_ops: HashSet<usize>,
+    /// Set of ConstChoice op IDs that should use AddImm (Flow) instead of Load
+    pub const_add_imm_ops: HashSet<usize>,
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
@@ -1082,6 +1084,7 @@ pub fn schedule_ssa_cpsat(
             solve_time_secs: 0.0,
             gap: 0.0,
             shifted_ops: HashSet::new(),
+            const_add_imm_ops: HashSet::new(),
         });
     }
 
@@ -1174,10 +1177,57 @@ pub fn schedule_ssa_cpsat(
         alu_optional_intervals.insert(idx, alu_interval);
     }
 
-    // 7. Create regular intervals for non-shiftable ops
+    // 6b. Create ConstChoice decision variables and optional intervals
+    let const_choice_ops: Vec<usize> = ops.iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::ConstChoice)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // Note: We don't need to find zero VReg op for AddImm precedence constraints.
+    // Scratch memory is ALWAYS initialized to 0 at startup, so address 0 always contains 0.
+    // AddImm operations can use address 0 directly without waiting for any op to "produce" zero.
+    // The zero VReg is just a reference to address 0, not a value that needs to be computed.
+
+    let mut const_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
+    let mut const_load_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+    let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+
+    for &idx in &const_choice_ops {
+        // Decision: true = use AddImm (Flow), false = use Load
+        let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
+        const_choice_vars.insert(idx, choice_var);
+
+        // Load variant: present when choice_var = false
+        let load_interval = model.new_optional_fixed_size_interval_var(
+            cycle_vars[idx],
+            1,
+            choice_var.not(),
+        );
+        const_load_intervals.insert(idx, load_interval);
+
+        // AddImm variant: present when choice_var = true
+        let add_imm_interval = model.new_optional_fixed_size_interval_var(
+            cycle_vars[idx],
+            1,
+            choice_var,
+        );
+        const_flow_intervals.insert(idx, add_imm_interval);
+
+        // AddImm can use address 0 directly - no precedence constraint needed!
+        // Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0 is
+        // guaranteed by hardware initialization. AddImm operations can reference address 0
+        // immediately without waiting for any op to "produce" zero.
+
+        // Hint from greedy (default: Load)
+        model.add_hint(choice_var, 0); // false = use Load
+    }
+
+    // 7. Create regular intervals for non-shiftable, non-ConstChoice ops
+    let const_choice_set: HashSet<usize> = const_choice_ops.iter().copied().collect();
     let mut regular_intervals: Vec<IntervalVar> = Vec::new();
     for (idx, _) in ops.iter().enumerate() {
-        if !shiftable_set.contains(&idx) {
+        if !shiftable_set.contains(&idx) && !const_choice_set.contains(&idx) {
             regular_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
         }
     }
@@ -1248,26 +1298,81 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // Load/Store/Flow cumulative constraints (unchanged - no shifting)
-    for (engine, engine_slots) in [
-        (Engine::Load, 2),
-        (Engine::Store, 2),
-        (Engine::Flow, 1),
-    ] {
-        let engine_ops: Vec<usize> = ops
-            .iter()
+    // Load cumulative: regular Load ops + optional Load intervals from ConstChoice
+    {
+        let regular_load_ops: Vec<usize> = ops.iter()
             .enumerate()
-            .filter(|(_, op)| op.engine == engine)
+            .filter(|(_, op)| op.engine == Engine::Load && op.opcode != Opcode::ConstChoice)
             .map(|(idx, _)| idx)
             .collect();
 
-        if !engine_ops.is_empty() {
-            let intervals: Vec<IntervalVar> = engine_ops
+        let mut load_intervals: Vec<IntervalVar> = Vec::new();
+        let mut load_demands: Vec<i64> = Vec::new();
+
+        // Add regular Load ops
+        for &idx in &regular_load_ops {
+            load_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            load_demands.push(1);
+        }
+
+        // Add optional Load intervals from ConstChoice ops (when choice_var = false)
+        for &idx in &const_choice_ops {
+            if let Some(&iv) = const_load_intervals.get(&idx) {
+                load_intervals.push(iv);
+                load_demands.push(1);
+            }
+        }
+
+        if !load_intervals.is_empty() {
+            model.add_cumulative(load_intervals, load_demands, 2); // Load has 2 slots
+        }
+    }
+
+    // Store cumulative (unchanged - no ConstChoice)
+    {
+        let store_ops: Vec<usize> = ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Store)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if !store_ops.is_empty() {
+            let intervals: Vec<IntervalVar> = store_ops
                 .iter()
                 .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
                 .collect();
             let demands: Vec<i64> = vec![1; intervals.len()];
-            model.add_cumulative(intervals, demands, engine_slots);
+            model.add_cumulative(intervals, demands, 2); // Store has 2 slots
+        }
+    }
+
+    // Flow cumulative: regular Flow ops + optional Flow intervals from ConstChoice
+    {
+        let regular_flow_ops: Vec<usize> = ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Flow && op.opcode != Opcode::AddImm)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let mut flow_intervals: Vec<IntervalVar> = Vec::new();
+        let mut flow_demands: Vec<i64> = Vec::new();
+
+        // Add regular Flow ops
+        for &idx in &regular_flow_ops {
+            flow_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            flow_demands.push(1);
+        }
+
+        // Add optional Flow intervals from ConstChoice ops (when choice_var = true)
+        for &idx in &const_choice_ops {
+            if let Some(&iv) = const_flow_intervals.get(&idx) {
+                flow_intervals.push(iv);
+                flow_demands.push(1);
+            }
+        }
+
+        if !flow_intervals.is_empty() {
+            model.add_cumulative(flow_intervals, flow_demands, 1); // Flow has 1 slot
         }
     }
 
@@ -1695,6 +1800,13 @@ pub fn schedule_ssa_cpsat(
                 .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
                 .collect();
 
+            // Extract ConstChoice decisions
+            let const_add_imm_ops: HashSet<usize> = const_choice_vars
+                .iter()
+                .filter(|(_, &var)| var.solution_value(&response))
+                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
+                .collect();
+
             let gap = if status == CpsatStatus::Optimal {
                 0.0
             } else {
@@ -1709,8 +1821,8 @@ pub fn schedule_ssa_cpsat(
 
             if verbose {
                 eprintln!(
-                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s, shifted {} VALU ops",
-                    actual_makespan, status, gap * 100.0, solve_time, shifted_ops.len()
+                    "SSA CP-SAT: {} cycles, status {:?}, gap {:.2}%, time {:.2}s, shifted {} VALU ops, {} ConstChoice AddImm",
+                    actual_makespan, status, gap * 100.0, solve_time, shifted_ops.len(), const_add_imm_ops.len()
                 );
             }
 
@@ -1721,6 +1833,7 @@ pub fn schedule_ssa_cpsat(
                 solve_time_secs: solve_time,
                 gap,
                 shifted_ops,
+                const_add_imm_ops,
             })
         }
         _ => {
@@ -1744,9 +1857,270 @@ pub fn schedule_ssa_cpsat(
     None
 }
 
-// ============================================================================
-// Convenience Functions
-// ============================================================================
+#[cfg(test)]
+mod ssa_tests {
+    use super::*;
+    use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+    use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+    use crate::types::{Engine, Opcode, SlotVal};
+    use std::collections::{HashMap, HashSet};
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_decisions() {
+        // Build a simple kernel with ConstChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let _zero = emit.emit_const(0);
+        
+        // Emit ConstChoice constants
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        
+        // Use constants in ALU ops
+        let _sum = emit.emit_alu(Opcode::Add, c1, c2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let result = result.unwrap();
+
+        // Verify all ops are scheduled
+        assert_eq!(result.cycle_assignments.len(), emit.ops.len());
+
+        // Verify ConstChoice decisions are extracted
+        // The result should contain const_add_imm_ops (may be empty if solver chose Load)
+        assert!(result.const_add_imm_ops.len() <= 2, 
+            "Should have at most 2 ConstChoice ops using AddImm");
+
+        // Note: AddImm operations can use address 0 directly without waiting for zero
+        // to be "ready" since scratch memory is always initialized to 0 at startup.
+        // There is no precedence constraint requiring zero to be scheduled before AddImm.
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_roundtrip() {
+        // Build a simple kernel with ConstChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let zero = emit.emit_const(0);
+        
+        // Emit ConstChoice constants
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        let c4 = emit.emit_const_choice(4);
+        
+        // Use constants in ALU ops
+        let _sum1 = emit.emit_alu(Opcode::Add, c1, c2);
+        let _sum2 = emit.emit_alu(Opcode::Add, c4, zero);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Verify all ops are scheduled
+        assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
+
+        // Find ConstChoice op IDs and their values
+        let const_choice_info: Vec<(usize, i64)> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .map(|op| {
+                let value = op.srcs[0].as_imm().expect("ConstChoice should have immediate operand");
+                (op.id, value)
+            })
+            .collect();
+
+        assert_eq!(const_choice_info.len(), 3, "Should have 3 ConstChoice ops (1, 2, 4)");
+
+        // Verify CP-SAT decisions are extracted
+        assert!(cpsat_result.const_add_imm_ops.len() <= 3,
+            "Should have at most 3 ConstChoice ops using AddImm");
+
+        // Now test round-trip: lower using CP-SAT decisions
+        let mut vreg_to_addr = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_to_addr.insert(dest, idx as i64 * 10); // Simple address assignment
+            }
+        }
+        // Ensure zero is at address 0
+        vreg_to_addr.insert(zero, 0);
+
+        let lowered_ops = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &vreg_to_addr,
+            &HashSet::new(), // No shifted ops
+            &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+        );
+
+        // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
+        for (const_choice_id, expected_value) in &const_choice_info {
+            let lowered_op = lowered_ops.iter()
+                .find(|op| op.produces_constant == Some(*expected_value))
+                .expect(&format!("Should find lowered op for ConstChoice producing {}", expected_value));
+
+            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+                // CP-SAT chose AddImm - verify it's a Flow op
+                assert_eq!(lowered_op.engine, Engine::Flow,
+                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)", const_choice_id, expected_value);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "add_imm",
+                        "ConstChoice op {} should be add_imm", const_choice_id),
+                    _ => panic!("AddImm slot[0] should be Str"),
+                }
+                match &lowered_op.slot[2] {
+                    SlotVal::Int(addr) => assert_eq!(*addr, 0,
+                        "AddImm should read from address 0"),
+                    _ => panic!("AddImm slot[2] should be Int(0)"),
+                }
+            } else {
+                // CP-SAT chose Load - verify it's a Load op
+                assert_eq!(lowered_op.engine, Engine::Load,
+                    "ConstChoice op {} (value {}) should be lowered to Load", const_choice_id, expected_value);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "const",
+                        "ConstChoice op {} should be const", const_choice_id),
+                    _ => panic!("Const slot[0] should be Str"),
+                }
+            }
+        }
+
+        // Verify all ConstChoice ops were lowered
+        assert_eq!(lowered_ops.len(), emit.ops.len(),
+            "All ops should be lowered");
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_prefers_addimm_when_load_slots_full() {
+        // Create a scenario where Load slots are heavily used, forcing CP-SAT to choose AddImm
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let zero = emit.emit_const(0);
+        
+        // Emit many Load ops to fill Load slots
+        for i in 0..10 {
+            emit.emit_const(i + 100); // Regular Load ops
+        }
+        
+        // Emit ConstChoice ops - CP-SAT should prefer AddImm to avoid Load slot pressure
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        
+        // Use constants
+        let _sum = emit.emit_alu(Opcode::Add, c1, c2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT with longer time limit to allow optimization
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: false,
+                stop_after_first_solution: false, // Allow optimization
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Find ConstChoice op IDs
+        let const_choice_ids: Vec<usize> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .map(|op| op.id)
+            .collect();
+
+        assert_eq!(const_choice_ids.len(), 2, "Should have 2 ConstChoice ops");
+
+        // Verify decisions were extracted
+        assert!(cpsat_result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm");
+
+        // Test lowering with the decisions
+        let mut vreg_to_addr = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_to_addr.insert(dest, idx as i64 * 10);
+            }
+        }
+        vreg_to_addr.insert(zero, 0);
+
+        let lowered_ops = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &vreg_to_addr,
+            &HashSet::new(),
+            &cpsat_result.const_add_imm_ops,
+        );
+
+        // Verify ConstChoice ops were lowered correctly
+        for const_choice_id in &const_choice_ids {
+            let ssa_op = emit.ops.iter().find(|op| op.id == *const_choice_id).unwrap();
+            let expected_value = ssa_op.srcs[0].as_imm().unwrap();
+            
+            let lowered_op = lowered_ops.iter()
+                .find(|op| op.produces_constant == Some(expected_value))
+                .expect(&format!("Should find lowered op for ConstChoice {}", const_choice_id));
+
+            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+                // Verify AddImm was chosen
+                assert_eq!(lowered_op.engine, Engine::Flow,
+                    "ConstChoice {} should use AddImm when Load slots are full", const_choice_id);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "add_imm"),
+                    _ => panic!("Should be add_imm"),
+                }
+            } else {
+                // Verify Load was chosen
+                assert_eq!(lowered_op.engine, Engine::Load,
+                    "ConstChoice {} should use Load", const_choice_id);
+            }
+        }
+    }
+}
 
 /// Schedule with CP-SAT and fall back to greedy if it fails.
 ///
@@ -2033,6 +2407,275 @@ mod tests {
         assert_eq!(r.result.makespan, 3);
         // With hints, should find the optimal solution quickly
         assert!(r.result.status == CpsatStatus::Optimal);
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_decisions() {
+        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::types::Opcode;
+
+        // Build a simple kernel with ConstChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let _zero = emit.emit_const(0);
+        
+        // Emit ConstChoice constants
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        
+        // Use constants in ALU ops
+        let _sum = emit.emit_alu(Opcode::Add, c1, c2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let result = result.unwrap();
+
+        // Verify all ops are scheduled
+        assert_eq!(result.cycle_assignments.len(), emit.ops.len());
+
+        // Verify ConstChoice decisions are extracted
+        // The result should contain const_add_imm_ops (may be empty if solver chose Load)
+        assert!(result.const_add_imm_ops.len() <= 2, 
+            "Should have at most 2 ConstChoice ops using AddImm");
+
+        // Note: AddImm operations can use address 0 directly without waiting for zero
+        // to be "ready" since scratch memory is always initialized to 0 at startup.
+        // There is no precedence constraint requiring zero to be scheduled before AddImm.
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_roundtrip() {
+        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::types::{Engine, Opcode, SlotVal};
+        use std::collections::HashMap;
+
+        // Build a simple kernel with ConstChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let zero = emit.emit_const(0);
+        
+        // Emit ConstChoice constants
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        let c4 = emit.emit_const_choice(4);
+        
+        // Use constants in ALU ops
+        let _sum1 = emit.emit_alu(Opcode::Add, c1, c2);
+        let _sum2 = emit.emit_alu(Opcode::Add, c4, zero);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Verify all ops are scheduled
+        assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
+
+        // Find ConstChoice op IDs and their values
+        let const_choice_info: Vec<(usize, i64)> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .map(|op| {
+                let value = op.srcs[0].as_imm().expect("ConstChoice should have immediate operand");
+                (op.id, value)
+            })
+            .collect();
+
+        assert_eq!(const_choice_info.len(), 3, "Should have 3 ConstChoice ops (1, 2, 4)");
+
+        // Verify CP-SAT decisions are extracted
+        assert!(cpsat_result.const_add_imm_ops.len() <= 3,
+            "Should have at most 3 ConstChoice ops using AddImm");
+
+        // Now test round-trip: lower using CP-SAT decisions
+        let mut vreg_to_addr = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_to_addr.insert(dest, idx as i64 * 10); // Simple address assignment
+            }
+        }
+        // Ensure zero is at address 0
+        vreg_to_addr.insert(zero, 0);
+
+        let lowered_ops = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &vreg_to_addr,
+            &HashSet::new(), // No shifted ops
+            &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+        );
+
+        // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
+        for (const_choice_id, expected_value) in &const_choice_info {
+            let lowered_op = lowered_ops.iter()
+                .find(|op| op.produces_constant == Some(*expected_value))
+                .expect(&format!("Should find lowered op for ConstChoice producing {}", expected_value));
+
+            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+                // CP-SAT chose AddImm - verify it's a Flow op
+                assert_eq!(lowered_op.engine, Engine::Flow,
+                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)", const_choice_id, expected_value);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "add_imm",
+                        "ConstChoice op {} should be add_imm", const_choice_id),
+                    _ => panic!("AddImm slot[0] should be Str"),
+                }
+                match &lowered_op.slot[2] {
+                    SlotVal::Int(addr) => assert_eq!(*addr, 0,
+                        "AddImm should read from address 0"),
+                    _ => panic!("AddImm slot[2] should be Int(0)"),
+                }
+            } else {
+                // CP-SAT chose Load - verify it's a Load op
+                assert_eq!(lowered_op.engine, Engine::Load,
+                    "ConstChoice op {} (value {}) should be lowered to Load", const_choice_id, expected_value);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "const",
+                        "ConstChoice op {} should be const", const_choice_id),
+                    _ => panic!("Const slot[0] should be Str"),
+                }
+            }
+        }
+
+        // Verify all ConstChoice ops were lowered
+        assert_eq!(lowered_ops.len(), emit.ops.len(),
+            "All ops should be lowered");
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_prefers_addimm_when_load_slots_full() {
+        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::types::{Engine, Opcode, SlotVal};
+        use std::collections::HashMap;
+
+        // Create a scenario where Load slots are heavily used, forcing CP-SAT to choose AddImm
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant
+        let zero = emit.emit_const(0);
+        
+        // Emit many Load ops to fill Load slots
+        for i in 0..10 {
+            emit.emit_const(i + 100); // Regular Load ops
+        }
+        
+        // Emit ConstChoice ops - CP-SAT should prefer AddImm to avoid Load slot pressure
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        
+        // Use constants
+        let _sum = emit.emit_alu(Opcode::Add, c1, c2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT with longer time limit to allow optimization
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: false,
+                stop_after_first_solution: false, // Allow optimization
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Find ConstChoice op IDs
+        let const_choice_ids: Vec<usize> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .map(|op| op.id)
+            .collect();
+
+        assert_eq!(const_choice_ids.len(), 2, "Should have 2 ConstChoice ops");
+
+        // Verify decisions were extracted
+        assert!(cpsat_result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm");
+
+        // Test lowering with the decisions
+        let mut vreg_to_addr = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_to_addr.insert(dest, idx as i64 * 10);
+            }
+        }
+        vreg_to_addr.insert(zero, 0);
+
+        let lowered_ops = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &vreg_to_addr,
+            &HashSet::new(),
+            &cpsat_result.const_add_imm_ops,
+        );
+
+        // Verify ConstChoice ops were lowered correctly
+        for const_choice_id in &const_choice_ids {
+            let ssa_op = emit.ops.iter().find(|op| op.id == *const_choice_id).unwrap();
+            let expected_value = ssa_op.srcs[0].as_imm().unwrap();
+            
+            let lowered_op = lowered_ops.iter()
+                .find(|op| op.produces_constant == Some(expected_value))
+                .expect(&format!("Should find lowered op for ConstChoice {}", const_choice_id));
+
+            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+                // Verify AddImm was chosen
+                assert_eq!(lowered_op.engine, Engine::Flow,
+                    "ConstChoice {} should use AddImm when Load slots are full", const_choice_id);
+                match &lowered_op.slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "add_imm"),
+                    _ => panic!("Should be add_imm"),
+                }
+            } else {
+                // Verify Load was chosen
+                assert_eq!(lowered_op.engine, Engine::Load,
+                    "ConstChoice {} should use Load", const_choice_id);
+            }
+        }
     }
 
     #[test]

@@ -92,7 +92,7 @@ impl Default for AddressAssignConfig {
     fn default() -> Self {
         Self {
             budget: 1536,
-            start_addr: 1, // Reserve address 0 for ZERO_REG
+            start_addr: 1, // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
             fixed_vregs: HashMap::new(),
         }
     }

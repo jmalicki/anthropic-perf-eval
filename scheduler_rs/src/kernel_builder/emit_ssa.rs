@@ -8,7 +8,34 @@
 
 use std::collections::HashMap;
 
-use crate::types::{EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, VarSource, VarType, VReg};
+use crate::types::{ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, VarSource, VarType, VReg};
+
+/// Tracks alternative implementations for a constant.
+///
+/// The CP-SAT scheduler can choose between:
+/// - **Load** (`Opcode::Const`): Uses 1 Load slot (2 slots/cycle available)
+/// - **AddImm** (`Opcode::AddImm` to s0): Uses 1 Flow slot (1 slot/cycle available)
+///
+/// Both alternatives produce the same constant value in the same destination VReg.
+/// The greedy scheduler defaults to Load, while CP-SAT can explore both options.
+///
+/// Note: The zero constant (value=0) can use either Load or AddImm. AddImm reads
+/// from address 0 (s0), which is always initialized to 0 at startup, so no precedence
+/// constraint is needed. We typically use Load for zero to ensure it's assigned to address 0.
+///
+/// Future work: ALU derivation (computing constants via Add/Mul/Shift from other
+/// constants) is more complex due to dependency chains and will be added later.
+#[derive(Clone, Debug)]
+pub struct ConstAlternative {
+    /// The constant value being materialized
+    pub value: i64,
+    /// Index in ops vec for the Load (Opcode::Const) variant
+    pub load_op_idx: usize,
+    /// Index in ops vec for the AddImm variant (Engine::Flow)
+    pub add_imm_op_idx: usize,
+    /// Destination VReg (shared by both alternatives)
+    pub dest: VReg,
+}
 
 /// SSA Emission context - tracks VReg IDs and collects emitted ops.
 ///
@@ -46,6 +73,16 @@ pub struct SsaEmitContext {
     pub current_phase: EmissionPhase,
     /// VarType to use for the next emitted op (if set)
     pub next_var_type: Option<VarType>,
+
+    // =========================================================================
+    // Constant Alternative Tracking (for CP-SAT optimization)
+    // =========================================================================
+    /// Tracks paired Load/AddImm alternatives for each constant.
+    /// CP-SAT can choose between these encodings to balance Load vs Flow slot usage.
+    pub const_alternatives: Vec<ConstAlternative>,
+    /// VReg for constant 0 - required for AddImm encoding of other constants.
+    /// Set by the kernel builder after emitting const(0).
+    pub zero_vreg: Option<VReg>,
 }
 
 impl Default for SsaEmitContext {
@@ -71,6 +108,9 @@ impl SsaEmitContext {
             current_group: None,
             current_phase: EmissionPhase::Init,
             next_var_type: None,
+            // Constant alternative tracking
+            const_alternatives: Vec::new(),
+            zero_vreg: None,
         }
     }
 
@@ -118,7 +158,15 @@ impl SsaEmitContext {
         self.current_group = None;
         self.current_phase = EmissionPhase::Init;
         self.next_var_type = None;
+        // Reset const alternative tracking
+        self.const_alternatives.clear();
+        self.zero_vreg = None;
         std::mem::take(&mut self.ops)
+    }
+
+    /// Take const alternatives (for passing to scheduler)
+    pub fn take_const_alternatives(&mut self) -> Vec<ConstAlternative> {
+        std::mem::take(&mut self.const_alternatives)
     }
 
     // =========================================================================
@@ -379,6 +427,12 @@ impl SsaEmitContext {
     ///
     /// Uses CSE deduplication - if the same constant value was already emitted,
     /// returns the existing VReg.
+    ///
+    /// For non-zero constants, emits BOTH a Load alternative and an AddImm alternative.
+    /// The CP-SAT scheduler can choose between them to balance Load vs Flow slot usage.
+    /// The greedy scheduler uses the Load alternative by default.
+    ///
+    /// For zero (value=0), emits Load-only since AddImm requires a pre-existing zero register.
     #[track_caller]
     pub fn emit_const(&mut self, value: i64) -> VReg {
         // CSE: check if already emitted
@@ -387,15 +441,45 @@ impl SsaEmitContext {
         }
 
         let dest = self.fresh_scalar();
-        let mut op = SsaOp::new(
+
+        // Alternative 1: Load (Opcode::Const) - always emitted
+        let mut load_op = SsaOp::new(
             0,
             Engine::Load,
             Opcode::Const,
             Some(dest),
             vec![Operand::Imm(value)],
         );
-        op.produces_constant = Some(value);
-        self.emit(op);
+        load_op.produces_constant = Some(value);
+        let load_op_idx = self.ops.len();
+        self.emit(load_op);
+
+        // Alternative 2: AddImm (Engine::Flow) - only for non-zero constants
+        // Zero is special: we can't use AddImm because it requires zero_vreg to exist first
+        if value != 0 {
+            if let Some(zero) = self.zero_vreg {
+                let mut add_imm_op = SsaOp::new(
+                    0,
+                    Engine::Flow,
+                    Opcode::AddImm,
+                    Some(dest), // Same dest as Load alternative
+                    vec![Operand::VReg(zero), Operand::Imm(value)],
+                );
+                add_imm_op.produces_constant = Some(value);
+                let add_imm_op_idx = self.ops.len();
+                self.emit(add_imm_op);
+
+                // Track the pair for CP-SAT optimization
+                self.const_alternatives.push(ConstAlternative {
+                    value,
+                    load_op_idx,
+                    add_imm_op_idx,
+                    dest,
+                });
+            }
+            // If zero_vreg is not set yet, we only emit the Load alternative
+            // This happens for constants emitted before const(0) is set up
+        }
 
         // Track that this VReg holds a constant
         self.vreg_constants.insert(dest, value);
@@ -421,6 +505,64 @@ impl SsaEmitContext {
 
         // Track that this VReg holds a constant
         self.vreg_constants.insert(dest, value);
+
+        dest
+    }
+
+    /// Emit a constant with scheduling choice between Load and AddImm encodings.
+    ///
+    /// This creates a single `ConstChoice` pseudo-op that the scheduler can resolve:
+    /// - **Greedy scheduler**: Treats as Engine::Load (default encoding)
+    /// - **CP-SAT scheduler**: Models as decision variable, choosing based on slot availability
+    ///
+    /// The alternatives are stored in `SsaOp.const_alternatives` for the scheduler to access.
+    ///
+    /// # Arguments
+    /// * `value` - The constant value to materialize
+    ///
+    /// # Returns
+    /// The destination scalar VReg holding the constant.
+    ///
+    /// # Note
+    /// Uses CSE deduplication - if the same constant was already emitted via `emit_const`
+    /// or `emit_const_choice`, returns the existing VReg.
+    ///
+    /// # Zero Constant Special Case
+    /// For `value == 0`: AddImm can use address 0 directly since scratch memory is **always
+    /// initialized to 0** at startup. Address 0 contains 0 by default and never needs to be loaded.
+    /// However, we typically use `emit_const(0)` for zero to ensure it's assigned to address 0
+    /// (via fixed_vregs), but `emit_const_choice(0)` would also work.
+    #[track_caller]
+    pub fn emit_const_choice(&mut self, value: i64) -> VReg {
+
+        // CSE: check if already emitted
+        if let Some(&existing) = self.const_cache.get(&value) {
+            return existing;
+        }
+
+        let dest = self.fresh_scalar();
+
+        // Build alternatives for the scheduler
+        let alternatives = vec![
+            ConstEncoding::Load,
+            ConstEncoding::AddImm { value },
+        ];
+
+        let mut op = SsaOp::new(
+            0,
+            Engine::Load, // Default engine for greedy scheduler
+            Opcode::ConstChoice,
+            Some(dest),
+            vec![Operand::Imm(value)],
+        );
+        op.produces_constant = Some(value);
+        op.const_alternatives = Some(alternatives);
+
+        self.emit(op);
+
+        // Track that this VReg holds a constant
+        self.vreg_constants.insert(dest, value);
+        self.const_cache.insert(value, dest);
 
         dest
     }
@@ -1114,5 +1256,50 @@ mod tests {
         assert!(emit.ops[4].dep_ids.contains(&3), "Op 4 should depend on second barrier");
         assert!(emit.ops[4].dep_ids.contains(&0), "Op 4 should have RAW dep on v1");
         assert!(emit.ops[4].dep_ids.contains(&2), "Op 4 should have RAW dep on v2");
+    }
+
+    #[test]
+    fn test_emit_const_choice() {
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit a ConstChoice constant
+        let v1 = emit.emit_const_choice(42);
+        
+        assert_eq!(emit.ops.len(), 1);
+        let op = &emit.ops[0];
+        assert_eq!(op.opcode, Opcode::ConstChoice);
+        assert_eq!(op.engine, Engine::Load); // Default engine
+        assert_eq!(op.dest, Some(v1));
+        assert_eq!(op.produces_constant, Some(42));
+        assert!(op.const_alternatives.is_some());
+        
+        let alternatives = op.const_alternatives.as_ref().unwrap();
+        assert_eq!(alternatives.len(), 2);
+        assert!(matches!(alternatives[0], ConstEncoding::Load));
+        assert!(matches!(alternatives[1], ConstEncoding::AddImm { value: 42 }));
+    }
+
+    #[test]
+    fn test_emit_const_choice_zero_allowed() {
+        // Zero can use ConstChoice - AddImm can reference address 0 directly
+        // since scratch memory is always initialized to 0 at startup
+        let mut emit = SsaEmitContext::new();
+        let zero = emit.emit_const_choice(0);
+        assert_eq!(emit.ops.len(), 1);
+        assert_eq!(emit.ops[0].opcode, Opcode::ConstChoice);
+        assert_eq!(emit.ops[0].produces_constant, Some(0));
+        assert_eq!(emit.ops[0].srcs[0], Operand::Imm(0));
+    }
+
+    #[test]
+    fn test_emit_const_choice_cse() {
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit same constant twice - should reuse VReg
+        let v1 = emit.emit_const_choice(100);
+        let v2 = emit.emit_const_choice(100);
+        
+        assert_eq!(v1, v2, "CSE should return same VReg");
+        assert_eq!(emit.ops.len(), 1, "Should only emit one op");
     }
 }

@@ -31,6 +31,14 @@ Each cycle, you can execute up to these many operations per engine:
 - **Scratch Space**: 1536 words, serves as registers/cache
 - **All addresses in instructions refer to scratch space** (except load/store which use scratch to hold memory addresses)
 
+### Special Address: s0 (Address 0)
+
+**Address 0 is special**: Scratch memory is **always initialized to 0** at program startup. This means:
+- `scratch[0] == 0` is guaranteed by hardware initialization
+- Address 0 never needs to be loaded with zero - it's already zero
+- The `add_imm` instruction reads from address 0 (s0) to compute `dest = scratch[0] + immediate`
+- No precedence constraints are needed for operations that use address 0, since it's always available
+
 ## Instruction Timing
 
 **All operations complete in 1 cycle.** There is no latency or pipeline stalls. However:
@@ -97,7 +105,7 @@ Process VLEN=8 elements in parallel. All take 1 cycle.
 |-----------|--------|-------------|
 | `select` | `("select", dest, cond, a, b)` | dest = a if cond else b |
 | `vselect` | `("vselect", dest, cond, a, b)` | Per-element select on vectors |
-| `add_imm` | `("add_imm", dest, a, imm)` | dest = a + immediate |
+| `add_imm` | `("add_imm", dest, a, imm)` | dest = scratch[a] + immediate<br/>**Note**: Typically used with `a=0` (s0) since scratch[0] is always 0. This allows materializing small constants without using a Load slot. |
 | `jump` | `("jump", addr)` | PC = addr (absolute) |
 | `cond_jump` | `("cond_jump", cond, addr)` | if cond: PC = addr |
 | `cond_jump_rel` | `("cond_jump_rel", cond, offset)` | if cond: PC += offset |

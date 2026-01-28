@@ -128,10 +128,19 @@ impl SsaTickTockKernelBuilder {
         self.build_internal();
 
         // Get ops and dependency info
-        // IMPORTANT: Take vreg_def BEFORE take_ops() since take_ops() clears it
+        // IMPORTANT: Take vreg_def and const_alternatives BEFORE take_ops() since take_ops() clears them
         let vreg_def = std::mem::take(&mut self.emit.vreg_def);
+        let const_alternatives = self.emit.take_const_alternatives();
         let vreg_count = self.emit.next_vreg_id;
         let mut ssa_ops = self.emit.take_ops();
+
+        // Build set of AddImm alternative op indices for the greedy scheduler to skip
+        // The greedy scheduler always uses the Load alternative; AddImm alternatives
+        // are only considered by CP-SAT. Mark them as dead so they're not scheduled.
+        let const_add_imm_indices: std::collections::HashSet<usize> = const_alternatives
+            .iter()
+            .map(|alt| alt.add_imm_op_idx)
+            .collect();
 
         // Use barrier-aware dependencies for greedy scheduler
         // Barriers create hard scheduling boundaries between rounds,
@@ -165,7 +174,7 @@ impl SsaTickTockKernelBuilder {
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();
 
-        // Reserve address 0 for ZERO constant
+        // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
         if let Some(zero) = self.zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
         }
@@ -188,10 +197,12 @@ impl SsaTickTockKernelBuilder {
         usage_accounting.set_peak_live(address_result.peak_live);
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
+        // Greedy scheduler always uses Load for ConstChoice (no AddImm decisions)
         let ops = lower_ssa_ops_with_shift(
             &ssa_ops,
             &address_result.vreg_to_addr,
             &shifted_ops,
+            &HashSet::new(), // Greedy always uses Load
         );
 
         let valu_shifted = shifted_ops.len();
@@ -343,7 +354,7 @@ impl SsaTickTockKernelBuilder {
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();
 
-        // Reserve address 0 for ZERO constant
+        // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
         if let Some(zero) = self.zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
         }
@@ -365,7 +376,12 @@ impl SsaTickTockKernelBuilder {
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         let valu_shifted = shifted_ops.len();
-        let ops = lower_ssa_ops_with_shift(&ssa_ops, &address_result.vreg_to_addr, &shifted_ops);
+        let ops = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &address_result.vreg_to_addr,
+            &shifted_ops,
+            &cpsat_result.const_add_imm_ops, // CP-SAT decisions for ConstChoice
+        );
 
         Ok(SsaScheduleResult {
             ops,

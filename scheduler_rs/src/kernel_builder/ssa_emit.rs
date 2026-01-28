@@ -67,20 +67,27 @@ impl SsaTickTockKernelBuilder {
     // =========================================================================
 
     pub(super) fn emit_common_init(&mut self) {
-        // Emit constant 0 - this VReg will be fixed at address 0
-        // (scratch memory is initialized to 0)
+        // Emit constant 0 - this VReg will be fixed at address 0.
+        // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so address 0
+        // already contains 0 and never needs to be loaded. We emit a zero constant op
+        // primarily to ensure the zero VReg is assigned to address 0 (via fixed_vregs),
+        // and to track it for AddImm operations that reference address 0.
+        // AddImm operations can use address 0 directly without waiting for zero to be "ready"
+        // since scratch[0] == 0 is guaranteed by hardware initialization.
         self.emit.set_next_var_type(VarType::Constant);
         let zero = self.emit.emit_const(0);
         self.zero_vreg = Some(zero);
+        // Track zero_vreg for AddImm operations (they reference address 0, which always contains 0)
+        self.emit.zero_vreg = Some(zero);
         self.ctx.c[0] = Some(zero);
 
-        // Bootstrap constants 1, 2, 4
+        // Bootstrap constants 1, 2, 4 (use ConstChoice for CP-SAT optimization)
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.c[1] = Some(self.emit.emit_const(1));
+        self.ctx.c[1] = Some(self.emit.emit_const_choice(1));
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.c[2] = Some(self.emit.emit_const(2));
+        self.ctx.c[2] = Some(self.emit.emit_const_choice(2));
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.c[4] = Some(self.emit.emit_const(4));
+        self.ctx.c[4] = Some(self.emit.emit_const_choice(4));
 
         // Derive remaining constants via ALU
         let c1 = self.ctx.c[1].unwrap();
@@ -124,7 +131,7 @@ impl SsaTickTockKernelBuilder {
         // Partition buffer offsets
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.partition_val_offset = Some(self.emit.emit_const(256));
+        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(256));
 
         // Load hash constants and create broadcasts.
         // Only emit constants/broadcasts that are actually used:

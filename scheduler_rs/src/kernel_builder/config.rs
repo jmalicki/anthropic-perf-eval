@@ -57,6 +57,7 @@ pub struct KernelConfig {
 
     // === Pseudo-const encoding flags ===
     /// Enable AddImm encoding via flow slot (add_imm dest, s0, value)
+    /// Note: s0 (address 0) is always initialized to 0 at startup, so no precedence constraint needed
     pub enable_add_imm: bool,
     /// Enable Load encoding via load slot (const dest, value)
     pub enable_const_load: bool,

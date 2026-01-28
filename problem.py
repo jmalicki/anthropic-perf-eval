@@ -104,6 +104,9 @@ class Machine:
         trace: bool = False,
         value_trace: dict[Any, int] = {},
     ):
+        # IMPORTANT: Scratch memory is always initialized to 0 at startup.
+        # This means scratch[0] == 0 is guaranteed, and address 0 (s0) can be used
+        # directly by operations like add_imm without needing to load zero first.
         self.cores = [
             Core(id=i, scratch=[0] * scratch_size, trace_buf=[]) for i in range(n_cores)
         ]

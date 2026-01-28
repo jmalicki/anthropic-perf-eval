@@ -19,8 +19,6 @@ pub mod barrier_elision;
 pub mod config;
 pub mod context;
 pub mod context_ssa;
-#[cfg(test)]
-mod debug_fma_users;
 pub mod emit;
 pub mod emit_ssa;
 pub mod partition;
@@ -37,3 +35,6 @@ pub use emit_ssa::SsaEmitContext;
 pub use partition::{PartitionBuffer, PartitionHelper};
 pub use tick_tock::TickTockKernelBuilder;
 pub use tick_tock_ssa::{SsaScheduleResult, SsaTickTockKernelBuilder};
+
+// #[cfg(test)]
+// mod debug_fma_users; // TODO: Re-enable when file is created

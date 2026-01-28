@@ -30,7 +30,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{Engine, Operand, SsaOp, VReg, VLEN};
+use crate::types::{Engine, Opcode, Operand, SsaOp, VReg, VLEN};
 
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 use super::tick_tock_ssa::SsaTickTockKernelBuilder;
@@ -162,14 +162,51 @@ impl SsaTickTockKernelBuilder {
             .map(|(idx, op)| (op.id, idx))
             .collect();
 
+        // =========================================================================
+        // Constant Alternative Detection
+        //
+        // Identify AddImm ops that are alternatives to Const (Load) ops for the
+        // same constant value. Pattern: Const op followed by AddImm op with
+        // same destination VReg. The greedy scheduler uses Load; AddImm
+        // alternatives are only considered by CP-SAT.
+        //
+        // We mark AddImm alternatives as dead so they're not scheduled by greedy.
+        // =========================================================================
+        let mut const_add_imm_alternatives: HashSet<usize> = HashSet::new();
+        for (idx, op) in ops.iter().enumerate() {
+            // Check if this is an AddImm op (Engine::Flow, Opcode::AddImm)
+            if op.engine == Engine::Flow && op.opcode == Opcode::AddImm {
+                if let Some(dest) = op.dest {
+                    // Check if there's an earlier Const op with the same dest
+                    // Look backwards to find the Load alternative
+                    for prev_idx in (0..idx).rev() {
+                        let prev_op = &ops[prev_idx];
+                        if prev_op.dest == Some(dest) {
+                            if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                // Found the Load alternative - this AddImm is an alternative
+                                const_add_imm_alternatives.insert(idx);
+                            }
+                            // Stop searching after finding the first op with same dest
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Pre-compute VReg information for scratch tracking
+        // Skip AddImm alternatives when building vreg_def (use Load's definition)
         let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
 
         for (idx, op) in ops.iter().enumerate() {
             if let Some(dest) = op.dest {
-                vreg_def.insert(dest, idx);
+                // Don't overwrite Load's entry with AddImm alternative
+                if !const_add_imm_alternatives.contains(&idx) {
+                    vreg_def.insert(dest, idx);
+                }
             }
+            // Still track users from AddImm alternatives (they read zero_vreg)
             for src in &op.srcs {
                 if let Operand::VReg(vreg) = src {
                     vreg_users.entry(*vreg).or_default().insert(idx);
@@ -187,6 +224,10 @@ impl SsaTickTockKernelBuilder {
         // =========================================================================
         let mut dead_store_indices: HashSet<usize> = HashSet::new();
         for (idx, op) in ops.iter().enumerate() {
+            // Skip AddImm alternatives - they're handled separately below
+            if const_add_imm_alternatives.contains(&idx) {
+                continue;
+            }
             if let Some(dest) = op.dest {
                 let user_count = vreg_users.get(&dest).map_or(0, |s| s.len());
                 if user_count == 0 {
@@ -200,11 +241,26 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         }
+
+        // Add AddImm constant alternatives to dead stores - greedy always uses Load
+        // (Note: These are not truly "dead", they're just unused by greedy.
+        //  CP-SAT may choose to use them instead of the Load alternative.)
+        dead_store_indices.extend(&const_add_imm_alternatives);
+
         if !dead_store_indices.is_empty() {
-            eprintln!(
-                "Warning: {} dead stores detected and will be skipped",
-                dead_store_indices.len()
-            );
+            let true_dead_stores = dead_store_indices.len() - const_add_imm_alternatives.len();
+            if true_dead_stores > 0 {
+                eprintln!(
+                    "Warning: {} dead stores detected and will be skipped",
+                    true_dead_stores
+                );
+            }
+            if !const_add_imm_alternatives.is_empty() {
+                eprintln!(
+                    "Info: {} constant AddImm alternatives skipped (greedy uses Load)",
+                    const_add_imm_alternatives.len()
+                );
+            }
         }
 
         // Build reverse dependency map: op_idx -> list of consumer indices
@@ -385,7 +441,12 @@ impl SsaTickTockKernelBuilder {
                         continue;
                     }
 
-                    let engine = ops[idx].engine;
+                    // Map ConstChoice to Load for greedy scheduler (default encoding)
+                    let engine = if ops[idx].opcode == Opcode::ConstChoice {
+                        Engine::Load
+                    } else {
+                        ops[idx].engine
+                    };
                     let dest = ops[idx].dest;
                     let op_id = ops[idx].id;
                     let srcs: Vec<Operand> = ops[idx].srcs.clone();
@@ -1691,5 +1752,64 @@ mod tests {
         assert!(emit.ops[2].cycle >= 0,
             "v1 (add) should be scheduled (used by vstore), but has cycle={}",
             emit.ops[2].cycle);
+    }
+
+    #[test]
+    fn test_greedy_constchoice_treated_as_load() {
+        use super::super::emit_ssa::SsaEmitContext;
+        use crate::types::Opcode;
+
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit zero constant (required for AddImm)
+        let zero = emit.emit_const(0);
+        
+        // Emit ConstChoice constant
+        let c1 = emit.emit_const_choice(42);
+        
+        // Use the constant in an ALU op
+        let _result = emit.emit_alu(Opcode::Add, c1, zero);
+
+        let mut builder = SsaTickTockKernelBuilder::new(
+            super::super::config::KernelConfig::new(10, 2047, 256, 16)
+        );
+        builder.zero_vreg = Some(zero);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+
+        // Find the ConstChoice op
+        let const_choice_op = emit.ops.iter().find(|op| op.opcode == Opcode::ConstChoice);
+        assert!(const_choice_op.is_some(), "Should have ConstChoice op");
+        let const_choice_op = const_choice_op.unwrap();
+        
+        // ConstChoice should be scheduled (greedy treats it as Load)
+        assert!(const_choice_op.cycle >= 0, 
+            "ConstChoice op should be scheduled, but has cycle={}", 
+            const_choice_op.cycle);
+        
+        // Should be scheduled early (before ops that use it)
+        let use_op = emit.ops.iter().find(|op| {
+            op.cycle >= 0 && // Only check scheduled ops (skip dead stores)
+            op.srcs.iter().any(|src| {
+                if let Operand::VReg(vreg) = src {
+                    *vreg == c1
+                } else {
+                    false
+                }
+            })
+        });
+        if let Some(use_op) = use_op {
+            assert!(const_choice_op.cycle < use_op.cycle,
+                "ConstChoice should be scheduled before ops that use it: const_choice={}, use_op={}",
+                const_choice_op.cycle, use_op.cycle);
+        }
     }
 }

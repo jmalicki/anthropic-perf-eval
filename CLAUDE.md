@@ -187,6 +187,7 @@ See **[docs/ISA_REFERENCE.md](docs/ISA_REFERENCE.md)** for complete instruction 
 - **SIMD**: Vector operations process VLEN=8 elements simultaneously
 - **Timing**: All operations complete in 1 cycle; results visible next cycle
 - **Memory**: 32-bit words; 1536-word scratch space (registers/cache)
+- **Special Address s0**: Address 0 is always initialized to 0 at startup. `add_imm` reads from s0 to materialize constants without using Load slots. No precedence constraints needed for s0 usage.
 
 ### Slot Limits (per cycle)
 | Engine | Slots | Operations |
@@ -195,7 +196,7 @@ See **[docs/ISA_REFERENCE.md](docs/ISA_REFERENCE.md)** for complete instruction 
 | VALU   | 6     | Same as ALU on 8 elements + `vbroadcast`, `multiply_add` |
 | Load   | 2     | `load`, `vload`, `const`, `load_offset` |
 | Store  | 2     | `store`, `vstore` |
-| Flow   | 1     | `select`, `vselect`, `jump`, `cond_jump`, `halt` |
+| Flow   | 1     | `select`, `vselect`, `add_imm`, `jump`, `cond_jump`, `halt` |
 
 ### Instruction Bundle Format
 Each cycle executes one bundle (dict of engine → list of operations):

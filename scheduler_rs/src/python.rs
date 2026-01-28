@@ -1618,7 +1618,7 @@ pub fn build_tick_tock_kernel<'py>(
     let mut builder = TickTockKernelBuilder::new(config.clone());
 
     // Get ops and optionally pseudo-consts
-    let (mut ops, pseudo_consts) = if enable_pseudo_consts {
+    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) = if enable_pseudo_consts {
         builder.build_with_pseudo_consts()
     } else {
         (builder.build(), Vec::new())
@@ -1667,7 +1667,7 @@ pub fn build_tick_tock_kernel<'py>(
         .collect();
 
     // Fixed addresses that should not be remapped during register allocation
-    let fixed_addrs: HashSet<i64> = [0i64].into_iter().collect(); // ZERO_REG
+    let fixed_addrs: HashSet<i64> = [0i64].into_iter().collect(); // Address 0 always contains 0 (hardware initialization)
 
     // Run all priority modes in parallel using Rayon
     let results: Vec<ScheduleAttempt> = if enable_slot_filling {
@@ -1889,7 +1889,7 @@ pub fn build_tick_tock_kernel_ops(
     let mut builder = TickTockKernelBuilder::new(config.clone());
 
     // Get ops and optionally pseudo-consts
-    let (mut ops, pseudo_consts) = if enable_pseudo_consts {
+    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) = if enable_pseudo_consts {
         builder.build_with_pseudo_consts()
     } else {
         (builder.build(), Vec::new())
