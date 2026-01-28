@@ -19,6 +19,8 @@ pub mod barrier_elision;
 pub mod config;
 pub mod context;
 pub mod context_ssa;
+#[cfg(test)]
+mod debug_fma_users;
 pub mod emit;
 pub mod emit_ssa;
 pub mod partition;

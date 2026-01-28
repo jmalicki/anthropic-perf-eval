@@ -35,7 +35,11 @@ Each cycle, you can execute up to these many operations per engine:
 
 **All operations complete in 1 cycle.** There is no latency or pipeline stalls. However:
 - Results written in cycle N are readable in cycle N+1
-- Within the same cycle, all reads happen before all writes
+- **Concurrent execution**: All slots in a bundle execute concurrently
+- **Read-before-write semantics**: Within the same cycle, all reads happen before all writes (in time, not slot order). This means:
+  - If op A writes to address X and op B reads from address X in the same cycle, op B reads the OLD value
+  - Slot order within a bundle does not affect execution semantics
+  - This enables safe "swap" patterns: `("+", 1, 2, 0), ("+", 2, 1, 0)` swaps values at addresses 1 and 2
 
 ## ALU Operations (`alu` engine)
 

@@ -156,8 +156,26 @@ def validate_kernel(instrs, forest_height, batch_size, rounds, seed):
     )
     machine.enable_pause = False
     machine.enable_debug = False
+    machine.prints = False  # Enable to debug
 
-    machine.run()
+    try:
+        machine.run()
+    except Exception as e:
+        # Print last few cycles for debug
+        print(f"\nCrash at cycle {machine.cycle}, core 0 pc={machine.cores[0].pc}")
+        print(f"Last instruction: {instrs[machine.cores[0].pc - 1] if machine.cores[0].pc > 0 else 'N/A'}")
+        raise
+    except IndexError as e:
+        print(f"\nIndexError details: {e}")
+        print(f"  mem_write entries: {len(machine.mem_write) if hasattr(machine, 'mem_write') else 'N/A'}")
+        print(f"  mem length: {len(machine.mem)}")
+        if hasattr(machine, 'mem_write'):
+            for addr, val in machine.mem_write.items():
+                if addr >= len(machine.mem):
+                    print(f"  OUT OF RANGE: addr={addr}, val={val}")
+                else:
+                    print(f"  addr={addr}, val={val}")
+        raise
 
     # Verify against reference
     ref_mem = list(reference_kernel2(mem))[-1]
