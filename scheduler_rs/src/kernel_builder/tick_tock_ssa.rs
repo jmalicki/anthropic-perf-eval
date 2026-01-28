@@ -16,9 +16,10 @@ use std::collections::HashSet;
 use crate::address_assign::{assign_addresses, AddressAssignConfig, AddressAssignmentResult};
 use crate::types::{Op, SsaOp, UsageAccounting, VReg};
 
+use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
 use super::context_ssa::SsaScratchContext;
-use super::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+use super::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, SsaEmitContext};
 use super::ssa_lower::lower_ssa_ops_with_shift;
 
 /// Unroll factor - process 8 groups per iteration
@@ -132,8 +133,10 @@ impl SsaTickTockKernelBuilder {
         let vreg_count = self.emit.next_vreg_id;
         let mut ssa_ops = self.emit.take_ops();
 
-        // Compute dependencies (RAW only - no false WAW/WAR)
-        compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
+        // Use barrier-aware dependencies for greedy scheduler
+        // Barriers create hard scheduling boundaries between rounds,
+        // constraining cross-round interleaving and reducing peak liveness
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
 
         // Schedule using greedy scheduler with VALU→ALU shifting
         let mut shifted_ops: HashSet<usize> = HashSet::new();
@@ -142,6 +145,22 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift,
             &mut shifted_ops,
         )?;
+
+        // Elide barriers before address assignment and lowering
+        // (barriers are scheduling-only, not real hardware instructions)
+        let ssa_ops = elide_barriers(ssa_ops);
+
+        // Filter out dead stores (ops with cycle=-1) before address assignment.
+        // Dead stores are ops whose dest VReg has no users - they were detected
+        // and marked by the greedy scheduler but remain in the ops list with
+        // cycle=-1. Including them in address assignment would corrupt live
+        // interval computation (their [-1,-1] intervals get processed first
+        // and their addresses freed immediately, potentially allowing live
+        // VRegs to incorrectly share addresses with them).
+        let ssa_ops: Vec<SsaOp> = ssa_ops
+            .into_iter()
+            .filter(|op| op.cycle >= 0)
+            .collect();
 
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();
@@ -191,12 +210,13 @@ impl SsaTickTockKernelBuilder {
     /// Build and schedule using CP-SAT on SSA ops (before register allocation).
     ///
     /// This performs:
-    /// 1. SSA op emission
-    /// 2. SSA dependency computation (RAW only)
-    /// 3. Optionally: Greedy scheduling to get hints
-    /// 4. CP-SAT scheduling on SsaOps (with optional VALU→ALU shift modeling)
-    /// 5. Address assignment via linear scan
-    /// 6. Lowering to concrete ops (expanding shifted VALU ops)
+    /// 1. SSA op emission (including barrier pseudo-ops)
+    /// 2. SSA dependency computation with barriers (for greedy hints)
+    /// 3. Greedy scheduling to get hints (with barrier constraints)
+    /// 4. Elide barriers before CP-SAT (CP-SAT has proper liveness constraints)
+    /// 5. CP-SAT scheduling on SsaOps (with optional VALU→ALU shift modeling)
+    /// 6. Address assignment via linear scan
+    /// 7. Lowering to concrete ops (expanding shifted VALU ops)
     ///
     /// When `enable_valu_shift` is true, the CP-SAT solver models VALU→ALU shifting
     /// as decision variables, allowing it to find globally optimal shift decisions.
@@ -207,8 +227,9 @@ impl SsaTickTockKernelBuilder {
         enable_valu_shift: bool,
     ) -> Result<SsaScheduleResult, String> {
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
+        use super::barrier_elision::count_barriers;
 
-        // Build SSA ops
+        // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
 
         // Get ops and dependency info
@@ -217,8 +238,11 @@ impl SsaTickTockKernelBuilder {
         let vreg_count = self.emit.next_vreg_id;
         let mut ssa_ops = self.emit.take_ops();
 
-        // Compute dependencies (RAW only)
-        compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
+        let barrier_count = count_barriers(&ssa_ops);
+
+        // Use barrier-aware dependencies for greedy hints
+        // This constrains cross-round interleaving and provides better hints
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
 
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
@@ -228,12 +252,12 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift, // Match CP-SAT shift setting for hints
             &mut greedy_shifted,
         )?;
-        let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
 
         if verbose {
             eprintln!(
-                "SSA Greedy hint: {} cycles{}{}",
+                "SSA Greedy hint: {} cycles ({} barriers){}{}",
                 greedy_cycles,
+                barrier_count,
                 if enable_valu_shift {
                     format!(" ({} VALU shifted)", greedy_shifted.len())
                 } else {
@@ -246,6 +270,15 @@ impl SsaTickTockKernelBuilder {
                 }
             );
         }
+
+        // Elide barriers before CP-SAT
+        // CP-SAT has proper liveness constraints via ILP, so barriers are unnecessary
+        // and would interfere with its optimization
+        let mut ssa_ops = elide_barriers(ssa_ops);
+
+        // Collect greedy hints after barrier elision (need to match ops)
+        // Since barriers are elided, hints need to be for non-barrier ops only
+        let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
 
         // Reset cycles before CP-SAT
         for op in &mut ssa_ops {
@@ -296,6 +329,16 @@ impl SsaTickTockKernelBuilder {
                 cycles, greedy_cycles, shifted_ops.len()
             );
         }
+
+        // Filter out dead stores (ops with cycle=-1) before address assignment.
+        // Dead stores are ops whose dest VReg has no users - they were detected
+        // during greedy hints generation but CP-SAT may also leave some ops
+        // unscheduled. Including them in address assignment would corrupt live
+        // interval computation.
+        let ssa_ops: Vec<SsaOp> = ssa_ops
+            .into_iter()
+            .filter(|op| op.cycle >= 0)
+            .collect();
 
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();

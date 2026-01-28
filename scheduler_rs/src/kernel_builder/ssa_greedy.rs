@@ -1194,4 +1194,502 @@ mod tests {
         assert!(emit.ops[1].cycle >= 0, "op1 should be scheduled (has reader op2)");
         assert_eq!(emit.ops[2].cycle, -1, "op2 should not be scheduled (dead store)");
     }
+
+    // =========================================================================
+    // Store Source VReg Liveness Tests
+    //
+    // These tests verify that store operations correctly count their source
+    // VRegs as users, preventing those VRegs from being marked as dead stores.
+    //
+    // THE BUG: If store operations don't count as users of their source VRegs,
+    // ops that compute values for stores could be marked as dead and skipped,
+    // leaving garbage values in scratch that cause runtime crashes.
+    // =========================================================================
+
+    /// Test that store source VRegs are NOT marked as dead stores.
+    ///
+    /// This is the core test for the validation bug: a vstore's data source
+    /// must be counted as a user, otherwise the FMA that produces it could
+    /// be marked as dead and skipped.
+    #[test]
+    fn test_store_source_vregs_not_dead() {
+        // Scenario (simplified version of the bug):
+        // op0: v0 = const 2 (multiplier for FMA)
+        // op1: v1 = const 100 (offset for FMA)
+        // op2: v2 = vbroadcast(v0) (FMA multiplier vector)
+        // op3: v3 = vbroadcast(v1) (FMA offset vector)
+        // op4: v4 = const 0 (base index)
+        // op5: v5 = vbroadcast(v4) (index vector)
+        // op6: v6 = FMA(v5, v2, v3) -> computes idx = idx * 2 + 100
+        // op7: addr = const 200 (store address)
+        // op8: vstore(addr, v6) -> store the FMA result
+        //
+        // v6 (FMA result) is ONLY used by vstore (op8).
+        // If vstore doesn't count as a user, v6 would be dead and op6 would be skipped.
+        // This would leave garbage at the scratch address for v6, causing crashes.
+
+        let mut emit = SsaEmitContext::new();
+        let mult_scalar = emit.emit_const(2);           // op 0
+        let offset_scalar = emit.emit_const(100);       // op 1
+        let mult_vec = emit.emit_vbroadcast(mult_scalar);   // op 2
+        let offset_vec = emit.emit_vbroadcast(offset_scalar); // op 3
+        let base_scalar = emit.emit_const(0);           // op 4
+        let base_vec = emit.emit_vbroadcast(base_scalar);    // op 5
+        let fma_result = emit.emit_fma(base_vec, mult_vec, offset_vec); // op 6
+        let addr = emit.emit_const(200);                // op 7
+        emit.emit_vstore(addr, fma_result);             // op 8
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Verify: vstore (op8) reads fma_result (v6)
+        // Build vreg_users map as the scheduler does
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // fma_result (v6) should have at least 1 user (the vstore)
+        let fma_result_users = vreg_users.get(&fma_result).map_or(0, |s| s.len());
+        assert!(fma_result_users >= 1,
+            "FMA result should have at least 1 user (vstore), but has {} users",
+            fma_result_users);
+
+        // Schedule and verify FMA is NOT a dead store
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+
+        // The FMA (op6) should be scheduled (NOT a dead store)
+        assert!(emit.ops[6].cycle >= 0,
+            "FMA op should be scheduled (used by vstore), but has cycle={}",
+            emit.ops[6].cycle);
+
+        // The vstore (op8) should be scheduled
+        assert!(emit.ops[8].cycle >= 0,
+            "vstore op should be scheduled, but has cycle={}",
+            emit.ops[8].cycle);
+
+        // vstore should happen AFTER FMA (dependency order)
+        assert!(emit.ops[8].cycle > emit.ops[6].cycle,
+            "vstore (cycle={}) should be after FMA (cycle={})",
+            emit.ops[8].cycle, emit.ops[6].cycle);
+    }
+
+    /// Test that store address VRegs are also counted as users.
+    ///
+    /// Both the address and data operands of a store should be counted as users.
+    #[test]
+    fn test_store_address_vreg_liveness() {
+        // Scenario:
+        // op0: base = const 100
+        // op1: offset = const 8
+        // op2: addr = add(base, offset) -> computed address
+        // op3: data = const 42
+        // op4: store(addr, data)
+        //
+        // Both addr (v2) and data (v3) are used by the store.
+        // Neither should be marked as dead.
+
+        let mut emit = SsaEmitContext::new();
+        let base = emit.emit_const(100);           // op 0
+        let offset = emit.emit_const(8);           // op 1
+        let addr = emit.emit_alu(Opcode::Add, base, offset);  // op 2
+        let data = emit.emit_const(42);            // op 3
+        emit.emit_store(addr, data);               // op 4
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Build vreg_users map
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // addr should have the store as a user
+        assert!(vreg_users.get(&addr).map_or(false, |users| users.contains(&4)),
+            "addr VReg should have store (op4) as user");
+
+        // data should have the store as a user
+        assert!(vreg_users.get(&data).map_or(false, |users| users.contains(&4)),
+            "data VReg should have store (op4) as user");
+
+        // Schedule
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+
+        // addr computation (op2) should be scheduled
+        assert!(emit.ops[2].cycle >= 0,
+            "addr computation should be scheduled (used by store)");
+
+        // data (op3) should be scheduled
+        assert!(emit.ops[3].cycle >= 0,
+            "data const should be scheduled (used by store)");
+    }
+
+    // =========================================================================
+    // DCE Invariant Tests: Cannot Eliminate Ops With Users
+    //
+    // These tests verify the fundamental invariant: DCE should NEVER mark an
+    // op as dead if its dest VReg has any users. This is a structural property
+    // of the vreg_users map construction.
+    // =========================================================================
+
+    /// Test that DCE cannot eliminate an op that has a user.
+    ///
+    /// This is the core invariant test: if op A defines v1, and op B uses v1,
+    /// then op A should NOT be marked as dead, regardless of whether op B
+    /// itself is dead or alive.
+    #[test]
+    fn test_dce_cannot_eliminate_op_with_user() {
+        // Scenario:
+        // op0: v1 = const 5
+        // op1: v2 = add(v1, v1)  <- uses v1
+        // op2: vstore(addr, v2)  <- uses v2
+        //
+        // v1 has user (op1), v2 has user (op2)
+        // Neither op0 nor op1 should be marked as dead
+
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);           // op 0 - has user (op1)
+        let v1_vec = emit.emit_vbroadcast(v1); // op 1 - has user (op2)
+        let v2 = emit.emit_valu(Opcode::Add, v1_vec, v1_vec); // op 2 - has user (op3)
+        let addr = emit.emit_const(100);       // op 3 - has user (op4)
+        emit.emit_vstore(addr, v2);            // op 4 - sink (no dest)
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Build vreg_users map as the scheduler does
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // Verify the invariant: each VReg with users should NOT be dead
+        // v1 (scalar) should have user (op1 - vbroadcast)
+        assert!(vreg_users.get(&v1).map_or(false, |users| !users.is_empty()),
+            "v1 should have at least 1 user");
+
+        // v1_vec (vector) should have user (op2 - add)
+        assert!(vreg_users.get(&v1_vec).map_or(false, |users| !users.is_empty()),
+            "v1_vec should have at least 1 user");
+
+        // v2 (vector) should have user (op4 - vstore)
+        assert!(vreg_users.get(&v2).map_or(false, |users| !users.is_empty()),
+            "v2 should have at least 1 user");
+
+        // addr should have user (op4 - vstore)
+        assert!(vreg_users.get(&addr).map_or(false, |users| !users.is_empty()),
+            "addr should have at least 1 user");
+
+        // Now schedule and verify none of these are marked as dead
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+
+        // All ops except the store should be scheduled (store has no dest, not tracked)
+        // ops 0-3 have dests and should all be scheduled
+        assert!(emit.ops[0].cycle >= 0, "op0 (const) should be scheduled");
+        assert!(emit.ops[1].cycle >= 0, "op1 (vbroadcast) should be scheduled");
+        assert!(emit.ops[2].cycle >= 0, "op2 (add) should be scheduled");
+        assert!(emit.ops[3].cycle >= 0, "op3 (addr) should be scheduled");
+        assert!(emit.ops[4].cycle >= 0, "op4 (vstore) should be scheduled");
+    }
+
+    /// Test that transitive users prevent elimination.
+    ///
+    /// A chain of ops where each depends on the previous should all be
+    /// scheduled, not eliminated by DCE.
+    #[test]
+    fn test_transitive_users_prevent_elimination() {
+        // Scenario:
+        // op0: v1 = const 5
+        // op1: v2 = add(v1, v1)  <- v1 has user
+        // op2: v3 = mul(v2, v2)  <- v2 has user
+        // op3: vstore(addr, v3)  <- v3 has user
+        //
+        // All of v1, v2, v3 have users - none should be dead
+
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);           // op 0
+        let v1_vec = emit.emit_vbroadcast(v1); // op 1
+        let v2 = emit.emit_valu(Opcode::Add, v1_vec, v1_vec); // op 2
+        let v3 = emit.emit_valu(Opcode::Mul, v2, v2);         // op 3
+        let addr = emit.emit_const(100);       // op 4
+        emit.emit_vstore(addr, v3);            // op 5
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Build vreg_users map
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // Verify the transitive chain: each VReg should have a user
+        assert!(vreg_users.get(&v1).map_or(0, |s| s.len()) >= 1, "v1 should have user");
+        assert!(vreg_users.get(&v1_vec).map_or(0, |s| s.len()) >= 1, "v1_vec should have user");
+        assert!(vreg_users.get(&v2).map_or(0, |s| s.len()) >= 1, "v2 should have user");
+        assert!(vreg_users.get(&v3).map_or(0, |s| s.len()) >= 1, "v3 should have user");
+
+        // Schedule
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule transitive chain: {:?}", result.err());
+
+        // All ops in the chain should be scheduled
+        for (i, op) in emit.ops.iter().enumerate() {
+            assert!(op.cycle >= 0, "op{} should be scheduled, got cycle={}", i, op.cycle);
+        }
+    }
+
+    /// Test that store sources are counted as users.
+    ///
+    /// This is the key invariant for the vstore bug: the data source of a
+    /// store operation must be counted as a user to prevent DCE from
+    /// eliminating the op that produces it.
+    #[test]
+    fn test_store_sources_count_as_users() {
+        // Scenario:
+        // op0: v1 = FMA(...)
+        // op1: vstore(addr, v1)  <- v1 is used by store
+        //
+        // v1 has a user (the vstore), so op0 should NOT be dead
+
+        let mut emit = SsaEmitContext::new();
+        // Create FMA inputs
+        let a_scalar = emit.emit_const(1);
+        let b_scalar = emit.emit_const(2);
+        let c_scalar = emit.emit_const(3);
+        let a = emit.emit_vbroadcast(a_scalar);
+        let b = emit.emit_vbroadcast(b_scalar);
+        let c = emit.emit_vbroadcast(c_scalar);
+
+        // FMA result - ONLY used by vstore
+        let fma_result = emit.emit_fma(a, b, c);  // op 6
+        let addr = emit.emit_const(100);         // op 7
+        emit.emit_vstore(addr, fma_result);      // op 8
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Build vreg_users map
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // The FMA result should have the vstore as its user
+        let fma_users = vreg_users.get(&fma_result).map_or(0, |s| s.len());
+        assert!(fma_users >= 1,
+            "FMA result should have at least 1 user (vstore), but has {} users",
+            fma_users);
+
+        // Schedule
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule FMA with store user: {:?}", result.err());
+
+        // The FMA (op 6) should be scheduled, NOT marked as dead
+        assert!(emit.ops[6].cycle >= 0,
+            "FMA op should be scheduled (used by vstore), but has cycle={}",
+            emit.ops[6].cycle);
+    }
+
+    // =========================================================================
+    // Minimal Reproduction of Invalid Memory Write Bug
+    //
+    // The invalid memory write error is NOT a DCE bug. It's a register
+    // allocation bug where a VReg's live interval is computed incorrectly,
+    // causing another VReg to overwrite it before its last use.
+    //
+    // Root cause: Linear scan allocation in address_assign.rs
+    // Symptom: vstore uses garbage address from scratch[4]
+    //
+    // Reproduction (run with rounds=2):
+    //   Cycle 10: scratch[4] = scratch[29] + scratch[1]  (overwrites partition addr)
+    //   Cycle 81: vstore scratch[4], scratch[126]        (uses garbage address)
+    //
+    // The partition store address VReg should have a live interval that
+    // extends to cycle 81, but it's being ended too early.
+    // =========================================================================
+
+    /// Test DCE correctly handles unused VRegs (simulates scattered_access bug).
+    ///
+    /// This test simulates the bug where `let _ = idx;` in Rust doesn't create
+    /// an SSA op, so the VReg has no users and is incorrectly marked as dead.
+    ///
+    /// The DCE invariant is: if a VReg has NO users across ALL ops, it's dead.
+    /// This test verifies that DCE correctly identifies dead stores when a
+    /// VReg is genuinely unused.
+    #[test]
+    fn test_dce_detects_genuinely_dead_store() {
+        // Scenario:
+        // op0: v1 = const 5         (used by op1)
+        // op1: v2 = add(v1, v1)     (DEAD - never used, simulates emit_fma result)
+        // op2: v3 = const 10        (used by store)
+        // op3: addr = const 100
+        // op4: store(addr, v3)
+        //
+        // v2 is genuinely dead - no op reads it. DCE should mark op1 as dead.
+
+        let mut emit = SsaEmitContext::new();
+        let v1 = emit.emit_const(5);           // op 0
+        let _v2 = emit.emit_alu(Opcode::Add, v1, v1); // op 1 - DEAD (result never used)
+        let v3 = emit.emit_const(10);          // op 2
+        let addr = emit.emit_const(100);       // op 3
+        emit.emit_store(addr, v3);             // op 4
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Schedule
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule: {:?}", result.err());
+
+        // op1 (v2) should be marked as dead (cycle = -1)
+        assert_eq!(emit.ops[1].cycle, -1, "Dead store op1 should not be scheduled");
+
+        // Other ops should be scheduled
+        assert!(emit.ops[0].cycle >= 0, "op0 should be scheduled");
+        assert!(emit.ops[2].cycle >= 0, "op2 should be scheduled");
+        assert!(emit.ops[3].cycle >= 0, "op3 should be scheduled");
+        assert!(emit.ops[4].cycle >= 0, "op4 should be scheduled");
+    }
+
+    /// Test that dead store detection correctly counts store users.
+    ///
+    /// Verifies the vreg_users map is built correctly when stores are present.
+    #[test]
+    fn test_dead_store_detection_counts_store_users() {
+        // Scenario:
+        // op0: v0 = const 5
+        // op1: v1 = add(v0, v0)  <- used by op2 vstore
+        // op2: addr = const 100
+        // op3: vstore(addr, v1)  <- sink operation
+        //
+        // v1 is ONLY used by the vstore.
+        // The vreg_users map should include op3 as a user of v1.
+
+        let mut emit = SsaEmitContext::new();
+        let v0_scalar = emit.emit_const(5);           // op 0
+        let v0 = emit.emit_vbroadcast(v0_scalar);     // op 1
+        let v1 = emit.emit_valu(Opcode::Add, v0, v0); // op 2 - ONLY used by vstore
+        let addr = emit.emit_const(100);              // op 3
+        emit.emit_vstore(addr, v1);                   // op 4 - uses v1
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        // Build vreg_users map as the scheduler does
+        let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            for src in &op.srcs {
+                if let Operand::VReg(vreg) = src {
+                    vreg_users.entry(*vreg).or_default().insert(idx);
+                }
+            }
+        }
+
+        // v1 should have vstore (op4) as its user
+        let v1_users = vreg_users.get(&v1);
+        assert!(v1_users.is_some(), "v1 should have users");
+        assert!(v1_users.unwrap().contains(&4),
+            "v1's users should include vstore (op4), but users are: {:?}", v1_users);
+
+        // v1 should NOT be considered a dead store (it has the vstore as user)
+        let v1_is_dead = vreg_users.get(&v1).map_or(true, |s| s.is_empty());
+        assert!(!v1_is_dead, "v1 should NOT be a dead store (used by vstore)");
+
+        // Schedule and verify v1 is scheduled
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+
+        let mut shifted_ops = HashSet::new();
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+
+        // v1 (op2) should be scheduled
+        assert!(emit.ops[2].cycle >= 0,
+            "v1 (add) should be scheduled (used by vstore), but has cycle={}",
+            emit.ops[2].cycle);
+    }
 }
