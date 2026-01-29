@@ -257,8 +257,8 @@ impl SsaTickTockKernelBuilder {
                         eprintln!(
                             "Warning: Dead store detected (will skip): op[{}] id={} defines {:?} with 0 users.\n\
                              Source: {:?}\n\
-                             Engine: {:?}, Opcode: {:?}",
-                            idx, op.id, dest, op.source, op.engine, op.opcode
+                             Engine: {:?}, Opcode: {:?}, srcs={:?}",
+                            idx, op.id, dest, op.source, op.engine, op.opcode, op.srcs
                         );
                     }
                 }
@@ -299,15 +299,22 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Track remaining unscheduled dependencies per op
-        // Only count deps that exist in id_to_idx AND are not dead stores
-        // (external/missing deps and dead stores are treated as satisfied)
+        // Only count deps that are not dead stores (dead stores are pre-satisfied)
+        // Panic if any dep_id doesn't exist - that's a bug in dependency computation
         let mut remaining_deps: Vec<usize> = ops
             .iter()
-            .map(|op| {
+            .enumerate()
+            .map(|(op_idx, op)| {
                 op.dep_ids
                     .iter()
                     .filter(|dep_id| {
-                        id_to_idx.get(dep_id).map_or(false, |&idx| !dead_store_indices.contains(&idx))
+                        let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
+                            panic!(
+                                "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list",
+                                op_idx, op.id, dep_id
+                            )
+                        });
+                        !dead_store_indices.contains(&dep_idx)
                     })
                     .count()
             })
@@ -393,10 +400,15 @@ impl SsaTickTockKernelBuilder {
                 // Check if deps are truly satisfied (scheduled in previous cycle)
                 // Dead stores are treated as already satisfied (they're skipped entirely)
                 let deps_ready = ops[idx].dep_ids.iter().all(|dep_id| {
-                    id_to_idx.get(dep_id).map_or(true, |&dep_idx| {
-                        dead_store_indices.contains(&dep_idx) ||
-                        (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
-                    })
+                    let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
+                        panic!(
+                            "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list. \
+                             This indicates a bug in dependency computation or op filtering.",
+                            idx, ops[idx].id, dep_id
+                        )
+                    });
+                    dead_store_indices.contains(&dep_idx) ||
+                    (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
                 });
 
                 if deps_ready {
@@ -864,12 +876,14 @@ impl SsaTickTockKernelBuilder {
                     !scheduled.contains(idx)
                         // All dependencies scheduled in earlier cycles
                         && op.dep_ids.iter().all(|dep_id| {
-                            if let Some(&dep_idx) = id_to_idx.get(dep_id) {
-                                let dep_cycle = ops[dep_idx].cycle;
-                                dep_cycle >= 0 && dep_cycle < cycle as i32
-                            } else {
-                                true // Unknown dep, assume ready
-                            }
+                            let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
+                                panic!(
+                                    "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list",
+                                    idx, op.id, dep_id
+                                )
+                            });
+                            let dep_cycle = ops[dep_idx].cycle;
+                            dep_cycle >= 0 && dep_cycle < cycle as i32
                         })
                 })
                 .map(|(idx, _)| idx)

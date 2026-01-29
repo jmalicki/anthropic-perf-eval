@@ -13,8 +13,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::address_assign::{assign_addresses, AddressAssignConfig, AddressAssignmentResult};
-use crate::types::{Op, SsaOp, UsageAccounting, VReg};
+use crate::address_assign::{assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult};
+use crate::types::{Op, SsaOp, UsageAccounting, VarType, VReg};
+use std::collections::HashMap;
 
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
@@ -48,6 +49,8 @@ pub struct SsaScheduleResult {
     pub budget_exceeded: bool,
     /// Usage accounting: breakdown by round and var_type
     pub usage_accounting: UsageAccounting,
+    /// VReg metadata for liveness debugging: (var_type, phase, round)
+    pub vreg_metadata: HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -124,6 +127,8 @@ impl SsaTickTockKernelBuilder {
         &mut self,
         enable_valu_shift: bool,
     ) -> Result<SsaScheduleResult, String> {
+        println!("[DEBUG] build_and_schedule_with_options ENTRY");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
         // Build SSA ops
         self.build_internal();
 
@@ -186,7 +191,16 @@ impl SsaTickTockKernelBuilder {
             assign_config.fixed_vregs.insert(zero, 0);
         }
 
+        eprintln!("[TRACE build_and_schedule] About to call assign_addresses with {} ops", ssa_ops.len());
+
         let address_result = assign_addresses(&ssa_ops, &assign_config);
+
+        eprintln!("[TRACE build_and_schedule] assign_addresses returned, peak_live={}", address_result.peak_live);
+
+        // Debug: verify all source VRegs have addresses assigned
+        if std::env::var("SCHEDULER_DEBUG").is_ok() {
+            verify_vreg_address_consistency(&ssa_ops, &address_result.vreg_to_addr);
+        }
 
         // Track if budget was exceeded (either in scheduling or address assignment)
         let budget_exceeded = sched_budget_exceeded || address_result.budget_exceeded;
@@ -202,6 +216,9 @@ impl SsaTickTockKernelBuilder {
         // Compute usage accounting from SSA ops (before lowering loses metadata)
         let mut usage_accounting = UsageAccounting::from_ssa_ops(&ssa_ops);
         usage_accounting.set_peak_live(address_result.peak_live);
+
+        // Build VReg metadata for liveness debugging (before lowering loses SSA info)
+        let vreg_metadata = build_vreg_metadata(&ssa_ops);
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         // Greedy scheduler always uses Load for ConstChoice (no AddImm decisions)
@@ -224,6 +241,7 @@ impl SsaTickTockKernelBuilder {
             valu_shifted,
             budget_exceeded,
             usage_accounting,
+            vreg_metadata,
         })
     }
 
@@ -419,6 +437,9 @@ impl SsaTickTockKernelBuilder {
         let mut usage_accounting = UsageAccounting::from_ssa_ops(&ssa_ops);
         usage_accounting.set_peak_live(address_result.peak_live);
 
+        // Build VReg metadata for liveness debugging (before lowering loses SSA info)
+        let vreg_metadata = build_vreg_metadata(&ssa_ops);
+
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         let valu_shifted = shifted_ops.len();
         let ops = lower_ssa_ops_with_shift(
@@ -437,11 +458,78 @@ impl SsaTickTockKernelBuilder {
             valu_shifted,
             budget_exceeded, // CP-SAT should not exceed budget
             usage_accounting,
+            vreg_metadata,
         })
     }
 
     // Note: Greedy scheduling methods are implemented in ssa_greedy.rs
     // Note: Emission methods are implemented in ssa_emit.rs
+}
+
+// ============================================================================
+// Debug Helpers
+// ============================================================================
+
+/// Verify that all source VRegs in ops have addresses assigned.
+/// This helps diagnose bugs where VRegs are read but not defined.
+fn verify_vreg_address_consistency(
+    ops: &[SsaOp],
+    vreg_to_addr: &std::collections::HashMap<VReg, i64>,
+) {
+    use crate::types::Operand;
+
+    eprintln!("[DEBUG verify_vreg_address_consistency] Called with {} ops", ops.len());
+
+    let mut missing_vregs = Vec::new();
+
+    for op in ops {
+        for src in &op.srcs {
+            if let Operand::VReg(vreg) = src {
+                if !vreg_to_addr.contains_key(vreg) {
+                    missing_vregs.push((op.id, op.cycle, op.opcode, *vreg));
+                }
+            }
+        }
+    }
+
+    if !missing_vregs.is_empty() {
+        eprintln!("[DEBUG verify_vreg_address_consistency] ERRORS FOUND:");
+        for (op_id, cycle, opcode, vreg) in &missing_vregs {
+            eprintln!(
+                "  Op id={} cycle={} opcode={:?} reads {:?} but no address assigned!",
+                op_id, cycle, opcode, vreg
+            );
+        }
+    } else {
+        eprintln!("[DEBUG verify_vreg_address_consistency] All source VRegs have addresses.");
+    }
+
+    // Also check for vstores specifically
+    let vstore_ops: Vec<_> = ops
+        .iter()
+        .filter(|op| op.opcode == crate::types::Opcode::Vstore)
+        .collect();
+
+    if !vstore_ops.is_empty() {
+        eprintln!("[DEBUG] {} vstore ops found. Checking sources:", vstore_ops.len());
+        for op in vstore_ops {
+            eprintln!("  vstore id={} cycle={}", op.id, op.cycle);
+            for (i, src) in op.srcs.iter().enumerate() {
+                match src {
+                    Operand::VReg(vreg) => {
+                        let addr = vreg_to_addr.get(vreg);
+                        eprintln!(
+                            "    src[{}]: {:?} -> addr {:?}",
+                            i, vreg, addr
+                        );
+                    }
+                    Operand::Imm(val) => {
+                        eprintln!("    src[{}]: Imm({})", i, val);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================

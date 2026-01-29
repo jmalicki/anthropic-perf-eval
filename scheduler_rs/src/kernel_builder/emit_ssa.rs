@@ -220,8 +220,21 @@ impl SsaEmitContext {
         }
     }
 
-    /// Record that a VReg is defined by a specific op
+    /// Record that a VReg is defined by a specific op.
+    ///
+    /// Panics if the VReg is already defined - this indicates an SSA violation.
+    /// Note: emit() skips calling this for alternative encodings that share a dest,
+    /// so this panic should never trigger for valid code.
+    #[track_caller]
     fn record_def(&mut self, vreg: VReg, op_id: usize) {
+        if let Some(&old_id) = self.vreg_def.get(&vreg) {
+            panic!(
+                "SSA VIOLATION: VReg {:?} already defined by op id={}, \
+                 now being redefined by op id={} at {:?}. \
+                 This should not happen - emit() should skip already-defined VRegs.",
+                vreg, old_id, op_id, std::panic::Location::caller()
+            );
+        }
         self.vreg_def.insert(vreg, op_id);
     }
 
@@ -250,9 +263,13 @@ impl SsaEmitContext {
 
         self.next_op_id += 1;
 
-        // Record VReg definition
+        // Record VReg definition (skip if already defined - handles alternative encodings)
+        // Alternative encodings (e.g., Load vs AddImm for ConstChoice) share the same
+        // dest VReg. Only the first definition should be recorded for dependency tracking.
         if let Some(dest) = op.dest {
-            self.record_def(dest, op_id);
+            if !self.vreg_def.contains_key(&dest) {
+                self.record_def(dest, op_id);
+            }
         }
 
         self.ops.push(op);
@@ -586,18 +603,15 @@ impl SsaEmitContext {
     }
 
     /// Emit scalar load from immediate address: result = mem[addr]
+    ///
+    /// The ISA's load instruction uses indirect addressing: mem[scratch[addr_reg]].
+    /// So we first emit a const to materialize the address, then load through it.
     #[track_caller]
     pub fn emit_load_imm(&mut self, addr: i64) -> VReg {
-        let dest = self.fresh_scalar();
-        let op = SsaOp::new(
-            0,
-            Engine::Load,
-            Opcode::Load,
-            Some(dest),
-            vec![Operand::Imm(addr)],
-        );
-        self.emit(op);
-        dest
+        // First emit a const to put the address value in a VReg
+        let addr_vreg = self.emit_const(addr);
+        // Then load through that VReg (indirect addressing)
+        self.emit_load(addr_vreg)
     }
 
     /// Emit vector load (contiguous): result[0..8] = mem[addr..addr+8]
@@ -619,18 +633,15 @@ impl SsaEmitContext {
     }
 
     /// Emit vector load from immediate address: result[0..8] = mem[addr..addr+8]
+    ///
+    /// The ISA's vload instruction uses indirect addressing: mem[scratch[addr_reg]..].
+    /// So we first emit a const to materialize the address, then vload through it.
     #[track_caller]
     pub fn emit_vload_imm(&mut self, addr: i64) -> VReg {
-        let dest = self.fresh_vector();
-        let op = SsaOp::new(
-            0,
-            Engine::Load,
-            Opcode::Vload,
-            Some(dest),
-            vec![Operand::Imm(addr)],
-        );
-        self.emit(op);
-        dest
+        // First emit a const to put the address value in a VReg
+        let addr_vreg = self.emit_const(addr);
+        // Then vload through that VReg (indirect addressing)
+        self.emit_vload(addr_vreg)
     }
 
     // ========================================================================
@@ -864,9 +875,14 @@ pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usiz
         // RAW: depend on producers of values we read
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
-                if let Some(&def_id) = vreg_def.get(vreg) {
-                    op.dep_ids.insert(def_id);
-                }
+                let def_id = *vreg_def.get(vreg).unwrap_or_else(|| {
+                    panic!(
+                        "BUG: op id={} reads {:?} but no definition found in vreg_def. \
+                         Source: {:?}",
+                        op.id, vreg, op.source
+                    )
+                });
+                op.dep_ids.insert(def_id);
             }
         }
     }

@@ -21,6 +21,10 @@ use crate::scheduler::{
 use arrayvec::ArrayVec;
 
 use crate::types::{Engine, Op, SlotVal, UsageAccounting, MAX_SLOT_SIZE, VLEN};
+use crate::address_assign::{
+    build_vreg_debug_info, compute_liveness_curve, compute_liveness_summary,
+    CycleLiveness, LivenessSummary, VRegDebugInfo,
+};
 
 // =============================================================================
 // Parsing: Python -> Rust
@@ -1482,10 +1486,143 @@ struct SsaScheduleOutput {
     budget_exceeded: bool,
     valu_shifted: usize,
     usage_accounting: crate::types::UsageAccounting,
+    /// Detailed per-op information including dependencies
+    ops: Vec<OpDebugInfo>,
+    /// VReg -> Address mapping (for debugging)
+    vreg_to_addr: std::collections::HashMap<String, i64>,
+    /// Liveness summary statistics (always included)
+    liveness_summary: LivenessSummary,
+    /// Per-VReg debug info with live intervals (full detail only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vregs: Option<Vec<VRegDebugInfo>>,
+    /// Per-cycle liveness curve (full detail only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness_curve: Option<Vec<CycleLiveness>>,
+}
+
+/// Debug info for a single op
+#[derive(Serialize)]
+struct OpDebugInfo {
+    id: usize,
+    cycle: i32,
+    engine: String,
+    opcode: String,
+    /// Slot values (opcode, dest, src1, src2, ...)
+    slot: Vec<String>,
+    /// Op IDs this op depends on (RAW dependencies)
+    dep_ids: Vec<usize>,
+    /// Scratch addresses read by this op
+    reads: Vec<i64>,
+    /// Scratch addresses written by this op
+    writes: Vec<i64>,
+}
+
+/// Liveness detail level for JSON output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LivenessDetail {
+    /// No liveness data (backward compatibility)
+    None,
+    /// Summary only: peak stats, breakdown by VarType
+    Summary,
+    /// Full: all VReg intervals + per-cycle curve
+    Full,
+}
+
+impl LivenessDetail {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "none" => LivenessDetail::None,
+            "summary" => LivenessDetail::Summary,
+            "full" => LivenessDetail::Full,
+            _ => LivenessDetail::Full, // Default to full
+        }
+    }
 }
 
 /// Write SSA schedule output with usage accounting to JSON file.
-fn write_ssa_schedule_json(result: &SsaScheduleResult, output_path: &str) -> Result<(), String> {
+///
+/// The `liveness_detail` parameter controls how much liveness data is included:
+/// - `None`: No liveness data (backward compatible output)
+/// - `Summary`: Just liveness_summary with peak stats and VarType breakdown
+/// - `Full`: All VReg intervals, per-cycle curve, and summary
+fn write_ssa_schedule_json(
+    result: &SsaScheduleResult,
+    output_path: &str,
+    liveness_detail: LivenessDetail,
+) -> Result<(), String> {
+    use crate::types::SlotVal;
+
+    // Convert ops to debug info
+    let ops_debug: Vec<OpDebugInfo> = result.ops.iter().map(|op| {
+        // Convert slot values to strings
+        let slot: Vec<String> = op.slot.iter().map(|sv| match sv {
+            SlotVal::Str(s) => s.clone(),
+            SlotVal::Int(i) => i.to_string(),
+        }).collect();
+
+        OpDebugInfo {
+            id: op.id,
+            cycle: op.cycle,
+            engine: op.engine.as_str().to_string(),
+            opcode: slot.first().cloned().unwrap_or_default(),
+            slot,
+            dep_ids: op.dep_ids.iter().copied().collect(),
+            reads: op.reads.iter().copied().collect(),
+            writes: op.writes.iter().copied().collect(),
+        }
+    }).collect();
+
+    // Convert vreg_to_addr to string keys for JSON serialization
+    let vreg_to_addr: std::collections::HashMap<String, i64> = result.address_result.vreg_to_addr
+        .iter()
+        .map(|(vreg, addr)| (format!("{:?}", vreg), *addr))
+        .collect();
+
+    // Compute liveness data based on detail level
+    let (liveness_summary, vregs, liveness_curve) = if liveness_detail == LivenessDetail::None {
+        // No liveness data - use empty/default summary
+        (
+            LivenessSummary {
+                peak_live_words: result.address_result.peak_live,
+                peak_cycle: 0,
+                peak_by_var_type: HashMap::new(),
+                total_vregs: result.vreg_count as usize,
+                dead_vregs: 0,
+                avg_interval_length: 0.0,
+                max_interval_length: 0,
+            },
+            None,
+            None,
+        )
+    } else {
+        // Compute full liveness summary
+        let summary = compute_liveness_summary(
+            &result.address_result.live_intervals,
+            &result.vreg_metadata,
+        );
+
+        if liveness_detail == LivenessDetail::Full {
+            // Build VReg debug info
+            let vreg_infos = build_vreg_debug_info(
+                &result.address_result.live_intervals,
+                &result.address_result.vreg_to_addr,
+                &result.vreg_metadata,
+            );
+
+            // Compute per-cycle liveness curve
+            let max_cycle = result.cycles as i32;
+            let curve = compute_liveness_curve(
+                &result.address_result.live_intervals,
+                max_cycle,
+                &result.vreg_metadata,
+            );
+
+            (summary, Some(vreg_infos), Some(curve))
+        } else {
+            (summary, None, None)
+        }
+    };
+
     let output = SsaScheduleOutput {
         total_cycles: result.cycles,
         total_ops: result.ops.len(),
@@ -1495,6 +1632,11 @@ fn write_ssa_schedule_json(result: &SsaScheduleResult, output_path: &str) -> Res
         budget_exceeded: result.budget_exceeded,
         valu_shifted: result.valu_shifted,
         usage_accounting: result.usage_accounting.clone(),
+        ops: ops_debug,
+        vreg_to_addr,
+        liveness_summary,
+        vregs,
+        liveness_curve,
     };
 
     let json = serde_json::to_string_pretty(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
@@ -1606,6 +1748,7 @@ pub fn build_tick_tock_kernel<'py>(
         enable_debug: false,
         enable_lazy_partition,
         partition_frequency,
+        enable_partition_stores: false,
         enable_pseudo_consts,
         enable_add_imm,
         enable_const_load,
@@ -1877,6 +2020,7 @@ pub fn build_tick_tock_kernel_ops(
         enable_debug: false,
         enable_lazy_partition,
         partition_frequency,
+        enable_partition_stores: false,
         enable_pseudo_consts,
         enable_add_imm,
         enable_const_load,
@@ -2183,8 +2327,9 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// If use_cpsat is true, uses CP-SAT scheduler instead of greedy (operates on SSA before register allocation).
 /// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
+/// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None, liveness_detail=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2196,6 +2341,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     use_cpsat: bool,
     cpsat_time_limit: f64,
     output_json: Option<String>,
+    liveness_detail: Option<String>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
         forest_height,
@@ -2206,6 +2352,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         enable_debug: false,
         enable_lazy_partition: false,
         partition_frequency: 3,
+        enable_partition_stores: false,
         enable_pseudo_consts: false,
         enable_add_imm: true,
         enable_const_load: true,
@@ -2281,11 +2428,17 @@ pub fn build_tick_tock_kernel_ssa<'py>(
 
     // Write output JSON if requested
     if let Some(output_path) = output_json {
-        write_ssa_schedule_json(&result, &output_path).map_err(|e| {
+        // Default to "full" liveness detail when output is requested
+        let detail = liveness_detail
+            .as_ref()
+            .map(|s| LivenessDetail::from_str(s))
+            .unwrap_or(LivenessDetail::Full);
+
+        write_ssa_schedule_json(&result, &output_path, detail).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to write output JSON: {}", e))
         })?;
         if verbose {
-            println!("Wrote schedule output with usage accounting to {}", output_path);
+            println!("Wrote schedule output with usage accounting to {} (liveness: {:?})", output_path, detail);
         }
     }
 

@@ -131,7 +131,7 @@ impl SsaTickTockKernelBuilder {
         // Partition buffer offsets
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(256));
+        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(self.config.batch_size as i64));
 
         // Load hash constants and create broadcasts.
         // Only emit constants/broadcasts that are actually used:
@@ -705,22 +705,12 @@ impl SsaTickTockKernelBuilder {
         let v_2 = self.ctx.v_2.unwrap();
         let zero = self.zero_vreg.unwrap();
 
-        // Determine which groups need idx updates on the last round.
-        // On non-last rounds, all groups need updates for the next round.
-        // On the last round, only groups being stored need updates.
-        let (idx_update_start, idx_update_end) = if is_last_round {
-            if TICK_STORE_DEPTHS.contains(&tree_depth) {
-                (0, n_groups / 2)
-            } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
-                (n_groups / 2, n_groups)
-            } else {
-                // No partition stores on last round - no idx updates needed
-                (0, 0)
-            }
-        } else {
-            // Not last round - all groups need updates
-            (0, n_groups)
-        };
+        // Determine which groups need idx updates.
+        // On the last round, ALL groups need updates because emit_store_data
+        // stores all groups to the output. The partition store pattern (TICK/TOCK)
+        // only affects which groups get stored to the partition buffer mid-computation,
+        // but all groups must have their final values computed for the final store.
+        let (idx_update_start, idx_update_end) = (0, n_groups);
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
@@ -742,20 +732,41 @@ impl SsaTickTockKernelBuilder {
                     // Normal branching: idx = idx * 2 + (2 - (val & 1))
                     let bit = self.emit.emit_valu(Opcode::And, val, v_1);
                     let offset = self.emit.emit_valu(Opcode::Sub, v_2, bit);
-                    self.ctx.all_idx[g] = Some(self.emit.emit_fma(idx, v_2, offset));
+                    let fma_result = self.emit.emit_fma(idx, v_2, offset);
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        if is_last_round {
+                            eprintln!("[DEBUG emit_branch] Last round g={} tree_depth={}: FMA result {:?}, old all_idx[g]={:?}",
+                                g, tree_depth, fma_result, self.ctx.all_idx[g]);
+                        }
+                        // Also log FMAs in range 6590-6650 to find the dead stores
+                        if fma_result.id >= 6590 && fma_result.id <= 6650 {
+                            eprintln!("[DEBUG emit_branch] DEAD STORE CANDIDATE? g={} tree_depth={} is_last_round={}: FMA result {:?}",
+                                g, tree_depth, is_last_round, fma_result);
+                        }
+                    }
+                    self.ctx.all_idx[g] = Some(fma_result);
                 }
             }
         }
 
-        // Partition stores (tick-tock)
-        if TICK_STORE_DEPTHS.contains(&tree_depth) {
-            self.emit_partition_stores(0, n_groups / 2);
-        } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
-            self.emit_partition_stores(n_groups / 2, n_groups);
+        // Partition stores (tick-tock) - only if enabled
+        if self.config.enable_partition_stores {
+            if TICK_STORE_DEPTHS.contains(&tree_depth) {
+                if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
+                    eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);
+                    for g in 0..n_groups/2 {
+                        eprintln!("  all_idx[{}] = {:?}", g, self.ctx.all_idx[g]);
+                    }
+                }
+                self.emit_partition_stores(0, n_groups / 2);
+            } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
+                self.emit_partition_stores(n_groups / 2, n_groups);
+            }
         }
     }
 
     pub(super) fn emit_partition_stores(&mut self, start_g: usize, end_g: usize) {
+        let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
         let extra_room_p = self.ctx.extra_room_p.unwrap();
         let partition_val_offset = self.ctx.partition_val_offset.unwrap();
 
@@ -767,10 +778,16 @@ impl SsaTickTockKernelBuilder {
 
         // Store all groups
         for g in start_g..end_g {
+            let idx_vreg = self.ctx.all_idx[g].unwrap();
+            let val_vreg = self.ctx.all_val[g].unwrap();
+            if debug {
+                eprintln!("[DEBUG emit_partition_stores] g={}: vstore(idx_addr={:?}, idx={:?}), vstore(val_addr={:?}, val={:?})",
+                    g, idx_addr, idx_vreg, val_addr, val_vreg);
+            }
             self.emit
-                .emit_vstore(idx_addr, self.ctx.all_idx[g].unwrap());
+                .emit_vstore(idx_addr, idx_vreg);
             self.emit
-                .emit_vstore(val_addr, self.ctx.all_val[g].unwrap());
+                .emit_vstore(val_addr, val_vreg);
 
             // Increment addresses for next group
             if g < end_g - 1 {
