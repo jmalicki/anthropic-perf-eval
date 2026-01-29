@@ -131,7 +131,7 @@ impl SsaTickTockKernelBuilder {
         // Partition buffer offsets
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(256));
+        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(self.config.batch_size as i64));
 
         // Load hash constants and create broadcasts.
         // Only emit constants/broadcasts that are actually used:

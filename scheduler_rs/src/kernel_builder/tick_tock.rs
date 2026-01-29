@@ -434,7 +434,7 @@ impl TickTockKernelBuilder {
 
         // Compute partition buffer offsets
         self.emit.emit_const(self.ctx.partition_idx_offset, 0);
-        self.emit.emit_const(self.ctx.partition_val_offset, 256);
+        self.emit.emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
 
         // Load hash constants
         for i in 0..6 {
@@ -551,7 +551,7 @@ impl TickTockKernelBuilder {
 
         // Compute partition buffer offsets (constant values, not addresses)
         self.emit.emit_const(self.ctx.partition_idx_offset, 0);
-        self.emit.emit_const(self.ctx.partition_val_offset, 256);
+        self.emit.emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
 
         // === HASH CONSTANTS ===
         // These are large values that must be loaded directly.
