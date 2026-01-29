@@ -252,12 +252,15 @@ impl SsaTickTockKernelBuilder {
                 let user_count = vreg_users.get(&dest).map_or(0, |s| s.len());
                 if user_count == 0 {
                     dead_store_indices.insert(idx);
-                    eprintln!(
-                        "Warning: Dead store detected (will skip): op[{}] id={} defines {:?} with 0 users.\n\
-                         Source: {:?}\n\
-                         Engine: {:?}, Opcode: {:?}",
-                        idx, op.id, dest, op.source, op.engine, op.opcode
-                    );
+                    // Dead store warnings disabled by default - enable with SCHEDULER_DEBUG=1
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        eprintln!(
+                            "Warning: Dead store detected (will skip): op[{}] id={} defines {:?} with 0 users.\n\
+                             Source: {:?}\n\
+                             Engine: {:?}, Opcode: {:?}",
+                            idx, op.id, dest, op.source, op.engine, op.opcode
+                        );
+                    }
                 }
             }
         }
@@ -267,6 +270,7 @@ impl SsaTickTockKernelBuilder {
         //  CP-SAT may choose to use them instead of the Load alternative.)
         dead_store_indices.extend(&const_add_imm_alternatives);
 
+<<<<<<< HEAD
         // SelectChoice ops are NOT expanded here - they remain as SelectChoice ops
         // and will be lowered based on CP-SAT decisions (or default to Flow/vselect for greedy)
         
@@ -278,6 +282,10 @@ impl SsaTickTockKernelBuilder {
             .collect();
 
         if !dead_store_indices.is_empty() {
+=======
+        // Summary warnings disabled by default - enable with SCHEDULER_DEBUG=1
+        if std::env::var("SCHEDULER_DEBUG").is_ok() && !dead_store_indices.is_empty() {
+>>>>>>> investigate/ssa-validation-issue
             let true_dead_stores = dead_store_indices.len() - const_add_imm_alternatives.len();
             if true_dead_stores > 0 {
                 eprintln!(
