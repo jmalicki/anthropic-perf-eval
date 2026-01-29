@@ -50,4 +50,6 @@ htmlcov/
 
 # Scheduler output
 schedule_output.json
+schedule_*.json
+debug_*.json
 *_diagnostics.json
