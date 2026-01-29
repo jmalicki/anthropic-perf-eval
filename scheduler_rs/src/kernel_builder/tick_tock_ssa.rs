@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::{assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult};
 use crate::types::{Op, SsaOp, UsageAccounting, VarType, VReg};
-use std::collections::HashMap;
 
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
