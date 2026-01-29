@@ -954,6 +954,8 @@ pub struct SsaCpsatResult {
     pub shifted_ops: HashSet<usize>,
     /// Set of ConstChoice op IDs that should use AddImm (Flow) instead of Load
     pub const_add_imm_ops: HashSet<usize>,
+    /// Set of SelectChoice op IDs that should use FMA path (VALU) instead of vselect (Flow)
+    pub select_fma_ops: HashSet<usize>,
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
@@ -1096,6 +1098,7 @@ pub fn schedule_ssa_cpsat(
     config: SsaCpsatConfig,
     greedy_hints: Option<&[i32]>,
     shift_hints: Option<&HashSet<usize>>,
+    select_choice_hints: Option<&HashSet<usize>>,
 ) -> Option<SsaCpsatResult> {
     use cp_sat::builder::BoolVar;
 
@@ -1118,6 +1121,7 @@ pub fn schedule_ssa_cpsat(
             gap: 0.0,
             shifted_ops: HashSet::new(),
             const_add_imm_ops: HashSet::new(),
+            select_fma_ops: HashSet::new(),
         });
     }
 
@@ -1256,22 +1260,98 @@ pub fn schedule_ssa_cpsat(
         model.add_hint(choice_var, 0); // false = use Load
     }
 
-    // 7. Create regular intervals for non-shiftable, non-ConstChoice ops
+    // 6c. Create SelectChoice decision variables and optional intervals
+    let select_choice_ops: Vec<usize> = ops.iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let mut select_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
+    let mut select_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+    let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
+
+    for &idx in &select_choice_ops {
+        // Decision: true = use FMA (VALU), false = use vselect (Flow)
+        let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
+        select_choice_vars.insert(idx, choice_var);
+
+        // Hint from greedy (default: vselect to match greedy behavior)
+        if let Some(hints) = select_choice_hints {
+            if hints.contains(&ops[idx].id) {
+                model.add_hint(choice_var, 1); // true = use FMA
+            } else {
+                model.add_hint(choice_var, 0); // false = use vselect
+            }
+        } else {
+            model.add_hint(choice_var, 0); // Default: vselect
+        }
+
+        // Flow interval (vselect): present when choice_var = false
+        let flow_interval = model.new_optional_fixed_size_interval_var(
+            cycle_vars[idx],
+            1,
+            choice_var.not(),
+        );
+        select_flow_intervals.insert(idx, flow_interval);
+
+        // VALU intervals (FMA): present when choice_var = true
+        let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
+            // Case A: delta_vreg is set - 1 VALU op (FMA directly)
+            vec![model.new_optional_fixed_size_interval_var(
+                cycle_vars[idx],
+                1,
+                choice_var,
+            )]
+        } else {
+            // Case B: delta_vreg is not set - 2 sequential VALU ops (sub + fma)
+            // Sub op at cycle c, FMA op at cycle c+1
+            let sub_interval = model.new_optional_fixed_size_interval_var(
+                cycle_vars[idx],
+                1,
+                choice_var,
+            );
+            
+            // For FMA, we need cycle_vars[idx] + 1. Since cycle_vars[idx] has domain [asap, alap],
+            // we create a new int var for fma_cycle with domain [asap+1, alap+1] and constraint
+            // fma_cycle = cycle_vars[idx] + 1
+            let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+            let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+            let fma_cycle_var = model.new_int_var_with_name(
+                [(fma_asap as i64, fma_alap as i64)],
+                format!("fma_cycle_{}", idx),
+            );
+            // Constraint: fma_cycle = cycle_vars[idx] + 1 (only enforced when choice_var = true)
+            model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1)
+                .only_enforce_if(choice_var);
+            
+            let fma_interval = model.new_optional_fixed_size_interval_var(
+                fma_cycle_var,
+                1,
+                choice_var,
+            );
+            vec![sub_interval, fma_interval]
+        };
+        select_valu_intervals.insert(idx, valu_intervals);
+    }
+
+    // 7. Create regular intervals for non-shiftable, non-ConstChoice, non-SelectChoice ops
     let const_choice_set: HashSet<usize> = const_choice_ops.iter().copied().collect();
+    let select_choice_set: HashSet<usize> = select_choice_ops.iter().copied().collect();
     let mut regular_intervals: Vec<IntervalVar> = Vec::new();
     for (idx, _) in ops.iter().enumerate() {
-        if !shiftable_set.contains(&idx) && !const_choice_set.contains(&idx) {
+        if !shiftable_set.contains(&idx) && !const_choice_set.contains(&idx) && !select_choice_set.contains(&idx) {
             regular_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
         }
     }
 
     // 8. Build cumulative constraints with optional intervals
 
-    // Collect non-shiftable VALU ops
+    // Collect non-shiftable VALU ops (exclude SelectChoice ops - they use optional intervals)
     let non_shiftable_valu: Vec<usize> = ops
         .iter()
         .enumerate()
-        .filter(|(idx, op)| op.engine == Engine::Valu && !shiftable_set.contains(idx))
+        .filter(|(idx, op)| op.engine == Engine::Valu && !shiftable_set.contains(idx) && op.opcode != Opcode::SelectChoice)
         .map(|(idx, _)| idx)
         .collect();
 
@@ -1299,6 +1379,16 @@ pub fn schedule_ssa_cpsat(
             if let Some(&iv) = valu_optional_intervals.get(&idx) {
                 valu_intervals.push(iv);
                 valu_demands.push(1);
+            }
+        }
+
+        // Add optional VALU intervals from SelectChoice ops (when choice_var = true, i.e., FMA path)
+        for &idx in &select_choice_ops {
+            if let Some(intervals) = select_valu_intervals.get(&idx) {
+                for &iv in intervals {
+                    valu_intervals.push(iv);
+                    valu_demands.push(1); // Each VALU op (sub or fma) uses 1 slot
+                }
             }
         }
 
@@ -1379,11 +1469,15 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // Flow cumulative: regular Flow ops + optional Flow intervals from ConstChoice
+    // Flow cumulative: regular Flow ops + optional Flow intervals from ConstChoice + optional Flow intervals from SelectChoice
     {
         let regular_flow_ops: Vec<usize> = ops.iter()
             .enumerate()
-            .filter(|(_, op)| op.engine == Engine::Flow && op.opcode != Opcode::AddImm)
+            .filter(|(idx, op)| {
+                op.engine == Engine::Flow 
+                    && op.opcode != Opcode::AddImm 
+                    && op.opcode != Opcode::SelectChoice
+            })
             .map(|(idx, _)| idx)
             .collect();
 
@@ -1399,6 +1493,14 @@ pub fn schedule_ssa_cpsat(
         // Add optional Flow intervals from ConstChoice ops (when choice_var = true)
         for &idx in &const_choice_ops {
             if let Some(&iv) = const_flow_intervals.get(&idx) {
+                flow_intervals.push(iv);
+                flow_demands.push(1);
+            }
+        }
+
+        // Add optional Flow intervals from SelectChoice ops (when choice_var = false, i.e., vselect path)
+        for &idx in &select_choice_ops {
+            if let Some(&iv) = select_flow_intervals.get(&idx) {
                 flow_intervals.push(iv);
                 flow_demands.push(1);
             }
@@ -1874,6 +1976,13 @@ pub fn schedule_ssa_cpsat(
                 .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
                 .collect();
 
+            // Extract SelectChoice decisions
+            let select_fma_ops: HashSet<usize> = select_choice_vars
+                .iter()
+                .filter(|(_, &var)| var.solution_value(&response))
+                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
+                .collect();
+
             let (best_bound, gap) = if status == CpsatStatus::Optimal {
                 (actual_makespan as f64, 0.0)
             } else {
@@ -1893,8 +2002,8 @@ pub fn schedule_ssa_cpsat(
                     actual_makespan, best_bound, status, gap * 100.0, solve_time
                 );
                 eprintln!(
-                    "  Shifted {} VALU ops, {} ConstChoice AddImm ops",
-                    shifted_ops.len(), const_add_imm_ops.len()
+                    "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} SelectChoice FMA ops",
+                    shifted_ops.len(), const_add_imm_ops.len(), select_fma_ops.len()
                 );
             }
 
@@ -1906,6 +2015,7 @@ pub fn schedule_ssa_cpsat(
                 gap,
                 shifted_ops,
                 const_add_imm_ops,
+                select_fma_ops,
             })
         }
         _ => {
@@ -1924,6 +2034,7 @@ pub fn schedule_ssa_cpsat(
     _config: SsaCpsatConfig,
     _greedy_hints: Option<&[i32]>,
     _shift_hints: Option<&HashSet<usize>>,
+    _select_choice_hints: Option<&HashSet<usize>>,
 ) -> Option<SsaCpsatResult> {
     eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
     None
@@ -1969,6 +2080,7 @@ mod ssa_tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2021,6 +2133,7 @@ mod ssa_tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2135,6 +2248,7 @@ mod ssa_tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2223,7 +2337,6 @@ mod ssa_tests {
                 verbose: false,
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
-                enable_select_choice: true, // Enable SelectChoice
                 scratch_budget: 1536,
             },
             None,
@@ -2231,6 +2344,7 @@ mod ssa_tests {
             None,
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2283,6 +2397,7 @@ mod ssa_tests {
             None,
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2674,6 +2789,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2731,6 +2847,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2850,6 +2967,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -3288,6 +3406,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "Should find solution with generous budget");
@@ -3336,6 +3455,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result_generous.is_some(), "Should find solution with generous budget");
@@ -3353,6 +3473,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         // The tight budget should either:
@@ -3395,6 +3516,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         assert!(result.is_some(), "Should find solution when scratch constraint disabled");
@@ -4112,6 +4234,7 @@ mod tests {
             },
             None,
             None,
+            None, // select_choice_hints
         );
 
         // CP-SAT should find a solution with budget=2
