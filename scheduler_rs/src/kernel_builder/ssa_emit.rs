@@ -735,17 +735,19 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
-        // Partition stores (tick-tock)
-        if TICK_STORE_DEPTHS.contains(&tree_depth) {
-            if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
-                eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);
-                for g in 0..n_groups/2 {
-                    eprintln!("  all_idx[{}] = {:?}", g, self.ctx.all_idx[g]);
+        // Partition stores (tick-tock) - only if enabled
+        if self.config.enable_partition_stores {
+            if TICK_STORE_DEPTHS.contains(&tree_depth) {
+                if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
+                    eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);
+                    for g in 0..n_groups/2 {
+                        eprintln!("  all_idx[{}] = {:?}", g, self.ctx.all_idx[g]);
+                    }
                 }
+                self.emit_partition_stores(0, n_groups / 2);
+            } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
+                self.emit_partition_stores(n_groups / 2, n_groups);
             }
-            self.emit_partition_stores(0, n_groups / 2);
-        } else if TOCK_STORE_DEPTHS.contains(&tree_depth) {
-            self.emit_partition_stores(n_groups / 2, n_groups);
         }
     }
 

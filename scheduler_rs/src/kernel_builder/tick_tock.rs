@@ -1172,7 +1172,7 @@ impl TickTockKernelBuilder {
                 config: &self.config,
             };
             helper.emit_partition_stores(write_buffer, n_groups);
-        } else {
+        } else if self.config.enable_partition_stores {
             // Use original tick-tock stores for load balancing
             if TICK_STORE_DEPTHS.contains(&tree_depth) {
                 // Store first half: groups 0-15
