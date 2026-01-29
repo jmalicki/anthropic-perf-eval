@@ -1397,7 +1397,7 @@ impl SsaOp {
 ///   → A=[5,6], B=[5,...], check 6<=5 ✗, no reuse (CORRECT)
 ///
 /// See the module-level documentation above for full details.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveInterval {
     /// Cycle when the VReg is defined (written).
     pub start: i32,

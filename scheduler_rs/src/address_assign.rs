@@ -56,7 +56,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{LiveInterval, Operand, SsaOp, VReg, VLEN};
+use crate::types::{LiveInterval, Opcode, Operand, SsaOp, VarType, VReg, VLEN};
 
 /// Result of address assignment.
 #[derive(Debug, Default)]
@@ -75,6 +75,8 @@ pub struct AddressAssignmentResult {
     pub budget_exceeded: bool,
     /// The scratch budget that was used
     pub budget: usize,
+    /// Live intervals for all VRegs (for debugging liveness)
+    pub live_intervals: HashMap<VReg, LiveInterval>,
 }
 
 /// Configuration for address assignment.
@@ -113,6 +115,9 @@ impl Default for AddressAssignConfig {
 /// For a dead VReg (defined at D, never read):
 /// - Interval = [D, D+1] — the "+1" ensures write conflicts are detected
 pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
+    let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
+    // Always print to verify this code is reached
+    eprintln!("[TRACE compute_live_intervals] Called with {} ops, debug={}", ops.len(), debug);
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
     // First pass: record definition cycles.
@@ -126,13 +131,35 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
     // Second pass: extend end to last READ cycle.
     // CLOSED interval: end = last_read_cycle (not last_read + 1).
     for op in ops {
+        // Debug: log vstore reads
+        if debug && op.opcode == Opcode::Vstore {
+            eprintln!(
+                "[DEBUG compute_live_intervals] vstore op id={} cycle={} srcs={:?}",
+                op.id, op.cycle, op.srcs
+            );
+        }
+
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
                 if let Some(interval) = intervals.get_mut(vreg) {
+                    let old_end = interval.end;
                     // Closed interval: end is the read cycle itself
                     if op.cycle > interval.end {
                         interval.end = op.cycle;
                     }
+                    // Debug: log interval extension for vstore sources
+                    if debug && op.opcode == Opcode::Vstore && interval.end > old_end {
+                        eprintln!(
+                            "  Extended {:?} interval from [{}, {}] to [{}, {}] (read by vstore)",
+                            vreg, interval.start, old_end, interval.start, interval.end
+                        );
+                    }
+                } else if debug && op.opcode == Opcode::Vstore {
+                    // VReg not in intervals - this is a bug!
+                    eprintln!(
+                        "  WARNING: VReg {:?} read by vstore but not in intervals!",
+                        vreg
+                    );
                 }
             }
         }
@@ -145,6 +172,24 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
             // Dead VReg: written but never read. Extend by 1 to prevent
             // same-cycle write conflicts with other VRegs.
             interval.end = interval.start + 1;
+        }
+    }
+
+    // Debug: print all intervals for VRegs used by vstores
+    if debug {
+        let vstore_vregs: HashSet<VReg> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Vstore)
+            .flat_map(|op| op.srcs.iter().filter_map(|s| s.as_vreg()))
+            .collect();
+
+        eprintln!("[DEBUG compute_live_intervals] Final intervals for vstore sources:");
+        for vreg in &vstore_vregs {
+            if let Some(interval) = intervals.get(vreg) {
+                eprintln!("  {:?}: [{}, {}]", vreg, interval.start, interval.end);
+            } else {
+                eprintln!("  {:?}: NOT FOUND IN INTERVALS!", vreg);
+            }
         }
     }
 
@@ -208,18 +253,37 @@ pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
 /// # Returns
 /// Assignment result with VReg -> address mapping and statistics.
 pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressAssignmentResult {
+    let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
+    println!("[TRACE assign_addresses] Called with {} ops, debug={}", ops.len(), debug);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
     // Compute live intervals
     let intervals = compute_live_intervals(ops);
+
+    // Debug: Collect vstore source VRegs for tracking
+    let vstore_vregs: HashSet<VReg> = if debug {
+        ops.iter()
+            .filter(|op| op.opcode == Opcode::Vstore)
+            .flat_map(|op| op.srcs.iter().filter_map(|s| s.as_vreg()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     // Calculate peak liveness
     let peak_live = compute_peak_liveness(&intervals);
     let budget_exceeded = peak_live > config.budget;
+
+    // Clone intervals for storage in result
+    let live_intervals = intervals.clone();
 
     if intervals.is_empty() {
         return AddressAssignmentResult {
             budget: config.budget,
             peak_live,
             budget_exceeded,
+            live_intervals,
             ..Default::default()
         };
     }
@@ -266,7 +330,10 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
 
         let size = vreg.size();
 
-        // Expire intervals that ended at or before this one starts (allowing same-cycle reuse)
+        // Expire intervals that ended at or before this one starts (allowing same-cycle reuse).
+        // VLIW semantics: reads happen before writes within a cycle.
+        // So if A ends at cycle 11 (last read at 11) and B starts at cycle 11 (written at 11),
+        // A is read first, then B is written - they can safely share the same address.
         while let Some(&Reverse((end_cycle, freed_addr, freed_size))) = active.peek() {
             if end_cycle <= interval.start {
                 active.pop();
@@ -311,6 +378,14 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
 
         vreg_to_addr.insert(*vreg, new_addr);
         active.push(Reverse((interval.end, new_addr, size)));
+
+        // Debug: log assignment for vstore-related VRegs
+        if debug && vstore_vregs.contains(vreg) {
+            eprintln!(
+                "[DEBUG assign_addresses] Assigned {:?} -> addr {} (interval [{}, {}])",
+                vreg, new_addr, interval.start, interval.end
+            );
+        }
     }
 
     // Calculate statistics
@@ -331,6 +406,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         total_words,
         budget_exceeded,
         budget: config.budget,
+        live_intervals,
     }
 }
 
@@ -356,6 +432,30 @@ use arrayvec::ArrayVec;
 
 /// Lower an SsaOp to a concrete Op using the VReg -> address mapping.
 pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
+    let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
+
+    // Debug logging for vstore operations
+    if debug && ssa_op.opcode == Opcode::Vstore {
+        eprintln!(
+            "[DEBUG lower_ssa_op] vstore op id={} cycle={}",
+            ssa_op.id, ssa_op.cycle
+        );
+        for (i, src) in ssa_op.srcs.iter().enumerate() {
+            match src {
+                Operand::VReg(vreg) => {
+                    let addr = vreg_to_addr.get(vreg);
+                    eprintln!(
+                        "  src[{}]: VReg {:?} -> addr {:?}",
+                        i, vreg, addr
+                    );
+                }
+                Operand::Imm(val) => {
+                    eprintln!("  src[{}]: Imm({})", i, val);
+                }
+            }
+        }
+    }
+
     // Build the slot array based on opcode
     let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
     slot.push(SlotVal::Str(ssa_op.opcode.as_str().to_string()));
@@ -373,7 +473,8 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         match src {
             Operand::VReg(vreg) => {
                 let addr = vreg_to_addr.get(vreg).copied().unwrap_or_else(|| {
-                    panic!("VReg {:?} not found in address mapping", vreg);
+                    panic!("VReg {:?} not found in address mapping (op id={}, cycle={})",
+                           vreg, ssa_op.id, ssa_op.cycle);
                 });
                 slot.push(SlotVal::Int(addr));
             }
@@ -381,6 +482,15 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
                 slot.push(SlotVal::Int(*value));
             }
         }
+    }
+
+    // Debug: print resulting slot for vstore
+    if debug && ssa_op.opcode == Opcode::Vstore {
+        let slot_vals: Vec<String> = slot.iter().map(|s| match s {
+            SlotVal::Str(s) => s.clone(),
+            SlotVal::Int(i) => i.to_string(),
+        }).collect();
+        eprintln!("  -> lowered slot: [{}]", slot_vals.join(", "));
     }
 
     // Build reads set
@@ -429,6 +539,273 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
 /// Lower all SsaOps to concrete Ops.
 pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
     ssa_ops.iter().map(|op| lower_ssa_op(op, vreg_to_addr)).collect()
+}
+
+// ============================================================================
+// Liveness Debugging Helpers
+// ============================================================================
+
+use serde::Serialize;
+
+/// Liveness information for a single cycle.
+#[derive(Debug, Clone, Serialize)]
+pub struct CycleLiveness {
+    /// The cycle number
+    pub cycle: i32,
+    /// Total live words at this cycle
+    pub total_live_words: usize,
+    /// Breakdown by VarType
+    pub by_var_type: HashMap<String, usize>,
+    /// VReg IDs becoming live at this cycle (defined here)
+    pub becoming_live: Vec<u32>,
+    /// VReg IDs dying at this cycle (last use here)
+    pub dying: Vec<u32>,
+}
+
+/// Summary statistics for liveness analysis.
+#[derive(Debug, Clone, Serialize)]
+pub struct LivenessSummary {
+    /// Peak live words across all cycles
+    pub peak_live_words: usize,
+    /// Cycle at which peak occurs
+    pub peak_cycle: i32,
+    /// Peak breakdown by VarType (words at peak cycle)
+    pub peak_by_var_type: HashMap<String, usize>,
+    /// Total number of VRegs
+    pub total_vregs: usize,
+    /// Number of dead VRegs (never read)
+    pub dead_vregs: usize,
+    /// Average interval length (in cycles)
+    pub avg_interval_length: f64,
+    /// Maximum interval length
+    pub max_interval_length: i32,
+}
+
+/// Debug information for a single VReg.
+#[derive(Debug, Clone, Serialize)]
+pub struct VRegDebugInfo {
+    /// VReg ID (low 31 bits)
+    pub id: u32,
+    /// Width: "scalar" or "vector"
+    pub width: String,
+    /// Size in words (1 for scalar, 8 for vector)
+    pub size_words: usize,
+    /// Interval start (definition cycle)
+    pub interval_start: i32,
+    /// Interval end (last use cycle, or def+1 for dead)
+    pub interval_end: i32,
+    /// Allocated address
+    pub address: i64,
+    /// VarType category (if known)
+    pub var_type: Option<String>,
+    /// Emission phase (if known)
+    pub phase: Option<String>,
+    /// Source round (if known)
+    pub round: Option<i32>,
+    /// True if VReg is never read (dead)
+    pub is_dead: bool,
+}
+
+/// Build VReg metadata from SSA ops.
+///
+/// Returns a map from VReg to (VarType, phase, round).
+pub fn build_vreg_metadata(
+    ops: &[SsaOp],
+) -> HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)> {
+    let mut metadata = HashMap::new();
+    for op in ops {
+        if let Some(dest) = op.dest {
+            let phase = op.source_info.as_ref().map(|s| s.phase.as_str().to_string());
+            let round = op.source_info.as_ref().and_then(|s| s.round);
+            metadata.insert(dest, (op.var_type, phase, round));
+        }
+    }
+    metadata
+}
+
+/// Build VRegDebugInfo for all VRegs.
+pub fn build_vreg_debug_info(
+    intervals: &HashMap<VReg, LiveInterval>,
+    vreg_to_addr: &HashMap<VReg, i64>,
+    vreg_metadata: &HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)>,
+) -> Vec<VRegDebugInfo> {
+    let mut infos: Vec<VRegDebugInfo> = intervals
+        .iter()
+        .map(|(vreg, interval)| {
+            let id = vreg.id;
+            let is_vector = vreg.is_vector();
+            let size_words = vreg.size();
+            let address = *vreg_to_addr.get(vreg).unwrap_or(&-1);
+
+            // Dead check: interval was extended by +1 (start == end - 1 for never-read VRegs)
+            // Actually, dead VRegs have interval [def, def+1] so interval length is 1
+            // But live VRegs can also have length 1 if read same cycle. Check if start+1 == end and start == end-1
+            // A dead VReg has no reads, so start == interval.end - 1 (because we add +1 for dead)
+            // Actually the simplest check: a dead VReg was defined and never read, meaning
+            // no op reads it. We set end = start + 1 for dead VRegs.
+            // We can check if interval length is exactly 1 AND the VReg appears in no sources.
+            // For now, approximate: if end == start + 1, it might be dead.
+            let is_dead = interval.end == interval.start + 1;
+
+            let (var_type, phase, round) = vreg_metadata
+                .get(vreg)
+                .cloned()
+                .unwrap_or((None, None, None));
+
+            VRegDebugInfo {
+                id,
+                width: if is_vector { "vector".to_string() } else { "scalar".to_string() },
+                size_words,
+                interval_start: interval.start,
+                interval_end: interval.end,
+                address,
+                var_type: var_type.map(|vt| format!("{:?}", vt)),
+                phase,
+                round: round.map(|r| r as i32),
+                is_dead,
+            }
+        })
+        .collect();
+
+    // Sort by ID for stable output
+    infos.sort_by_key(|info| info.id);
+    infos
+}
+
+/// Compute per-cycle liveness curve.
+///
+/// Returns a vector of CycleLiveness entries, one per cycle from 0 to max_cycle.
+pub fn compute_liveness_curve(
+    intervals: &HashMap<VReg, LiveInterval>,
+    max_cycle: i32,
+    vreg_metadata: &HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)>,
+) -> Vec<CycleLiveness> {
+    if intervals.is_empty() || max_cycle < 0 {
+        return vec![];
+    }
+
+    // For each cycle, track live VRegs
+    let mut curve: Vec<CycleLiveness> = Vec::with_capacity((max_cycle + 1) as usize);
+
+    // Build events: (cycle, vreg, is_start)
+    let mut events: Vec<(i32, VReg, bool)> = Vec::new();
+    for (&vreg, interval) in intervals {
+        events.push((interval.start, vreg, true));  // becoming live
+        events.push((interval.end, vreg, false));   // dying (at end cycle)
+    }
+    events.sort_by_key(|(cycle, _, is_start)| (*cycle, !*is_start)); // ends before starts at same cycle
+
+    // Track currently live VRegs
+    let mut live_set: HashSet<VReg> = HashSet::new();
+    let mut event_idx = 0;
+
+    for cycle in 0..=max_cycle {
+        let mut becoming_live: Vec<u32> = Vec::new();
+        let mut dying: Vec<u32> = Vec::new();
+
+        // Process events for this cycle
+        while event_idx < events.len() && events[event_idx].0 == cycle {
+            let (_, vreg, is_start) = events[event_idx];
+            if is_start {
+                live_set.insert(vreg);
+                becoming_live.push(vreg.id);
+            } else {
+                live_set.remove(&vreg);
+                dying.push(vreg.id);
+            }
+            event_idx += 1;
+        }
+
+        // Compute totals for this cycle
+        let mut total_live_words = 0usize;
+        let mut by_var_type: HashMap<String, usize> = HashMap::new();
+
+        for vreg in &live_set {
+            let size = vreg.size();
+            total_live_words += size;
+
+            if let Some((var_type, _, _)) = vreg_metadata.get(vreg) {
+                let key = var_type.map(|vt| format!("{:?}", vt)).unwrap_or_else(|| "Unknown".to_string());
+                *by_var_type.entry(key).or_insert(0) += size;
+            } else {
+                *by_var_type.entry("Unknown".to_string()).or_insert(0) += size;
+            }
+        }
+
+        curve.push(CycleLiveness {
+            cycle,
+            total_live_words,
+            by_var_type,
+            becoming_live,
+            dying,
+        });
+    }
+
+    curve
+}
+
+/// Compute liveness summary statistics.
+pub fn compute_liveness_summary(
+    intervals: &HashMap<VReg, LiveInterval>,
+    vreg_metadata: &HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)>,
+) -> LivenessSummary {
+    if intervals.is_empty() {
+        return LivenessSummary {
+            peak_live_words: 0,
+            peak_cycle: 0,
+            peak_by_var_type: HashMap::new(),
+            total_vregs: 0,
+            dead_vregs: 0,
+            avg_interval_length: 0.0,
+            max_interval_length: 0,
+        };
+    }
+
+    // Find max cycle for curve computation
+    let max_cycle = intervals.values().map(|i| i.end).max().unwrap_or(0);
+
+    // Compute curve to find peak
+    let curve = compute_liveness_curve(intervals, max_cycle, vreg_metadata);
+
+    // Find peak
+    let (peak_cycle, peak_live_words) = curve
+        .iter()
+        .map(|c| (c.cycle, c.total_live_words))
+        .max_by_key(|(_, words)| *words)
+        .unwrap_or((0, 0));
+
+    // Get breakdown at peak
+    let peak_by_var_type = curve
+        .iter()
+        .find(|c| c.cycle == peak_cycle)
+        .map(|c| c.by_var_type.clone())
+        .unwrap_or_default();
+
+    // Count dead VRegs
+    let dead_vregs = intervals
+        .values()
+        .filter(|i| i.end == i.start + 1)
+        .count();
+
+    // Interval statistics
+    let total_vregs = intervals.len();
+    let interval_lengths: Vec<i32> = intervals
+        .values()
+        .map(|i| i.end - i.start)
+        .collect();
+    let sum_lengths: i64 = interval_lengths.iter().map(|&x| x as i64).sum();
+    let avg_interval_length = sum_lengths as f64 / total_vregs as f64;
+    let max_interval_length = *interval_lengths.iter().max().unwrap_or(&0);
+
+    LivenessSummary {
+        peak_live_words,
+        peak_cycle,
+        peak_by_var_type,
+        total_vregs,
+        dead_vregs,
+        avg_interval_length,
+        max_interval_length,
+    }
 }
 
 // ============================================================================

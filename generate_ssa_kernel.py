@@ -59,6 +59,9 @@ def main():
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
                         help="Output schedule JSON for analysis")
+    parser.add_argument("--liveness-detail", type=str, default=None,
+                        choices=["none", "summary", "full"],
+                        help="Liveness detail level in JSON: none, summary, or full (default: full)")
     parser.add_argument("--validate", action="store_true",
                         help="Validate against reference kernel")
     parser.add_argument("--seed", type=int, default=123,
@@ -90,6 +93,7 @@ def main():
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time_limit,
         output_json=args.output_json,
+        liveness_detail=args.liveness_detail,
     )
     build_time = time.time() - start_time
 
