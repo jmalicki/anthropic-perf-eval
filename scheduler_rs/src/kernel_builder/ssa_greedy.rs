@@ -267,80 +267,8 @@ impl SsaTickTockKernelBuilder {
         //  CP-SAT may choose to use them instead of the Load alternative.)
         dead_store_indices.extend(&const_add_imm_alternatives);
 
-        // =========================================================================
-        // SelectChoice Expansion
-        //
-        // Expand SelectChoice ops into sub+fma ops when greedy chooses FMA path.
-        // The sub and fma ops self-track their relationship via select_choice_parent
-        // and methods (is_select_choice_sub(), is_select_choice_fma(), etc.).
-        // This allows greedy to schedule sub and fma non-adjacently if beneficial.
-        // =========================================================================
-        let mut ops_to_add: Vec<SsaOp> = Vec::new();
-
-        for (idx, op) in ops.iter().enumerate() {
-            if op.opcode == Opcode::SelectChoice && !dead_store_indices.contains(&idx) {
-                // Decide FMA vs vselect based on resource availability heuristics
-                // Simple heuristic: prefer FMA when VALU slots are available (preserves Flow slots)
-                // TODO: Make this decision based on actual resource pressure during scheduling
-                let use_fma = true; // For now, always expand to FMA to allow non-adjacent scheduling
-                
-                if use_fma {
-                    // Extract operands
-                    if op.srcs.len() < 3 {
-                        continue;
-                    }
-                    use crate::types::Operand;
-                    let cond_vreg = op.srcs[0].as_vreg()?;
-                    let true_val_vreg = op.srcs[1].as_vreg()?;
-                    let false_val_vreg = op.srcs[2].as_vreg()?;
-                    let dest = op.dest?;
-                    
-                    // Create sub op: sub_temp = true_val - false_val
-                    // The op knows it belongs to SelectChoice via select_choice_parent
-                    let sub_id = op.id + 1000000; // Unique ID for sub
-                    let mut sub_op = SsaOp::new(
-                        sub_id,
-                        Engine::Valu,
-                        Opcode::Sub,
-                        Some(dest), // Temporary VReg (will be handled in lowering)
-                        vec![Operand::VReg(true_val_vreg), Operand::VReg(false_val_vreg)],
-                    );
-                    sub_op.dep_ids = op.dep_ids.clone();
-                    sub_op.select_choice_parent = Some(op.id); // Self-tracking: op knows its parent
-                    sub_op.var_type = op.var_type.clone();
-                    sub_op.source_info = op.source_info.clone();
-                    
-                    // Create fma op: dest = cond * sub_temp + false_val
-                    // The op knows it belongs to SelectChoice via select_choice_parent
-                    let fma_id = op.id + 2000000; // Unique ID for fma
-                    let mut fma_op = SsaOp::new(
-                        fma_id,
-                        Engine::Valu,
-                        Opcode::MultiplyAdd,
-                        Some(dest),
-                        vec![
-                            Operand::VReg(cond_vreg),
-                            Operand::VReg(dest), // sub_temp (will be fixed in lowering)
-                            Operand::VReg(false_val_vreg),
-                        ],
-                    );
-                    fma_op.dep_ids.insert(sub_id); // fma depends on sub
-                    fma_op.dep_ids.extend(&op.dep_ids); // fma also depends on SelectChoice's deps
-                    fma_op.select_choice_parent = Some(op.id); // Self-tracking: op knows its parent
-                    fma_op.var_type = op.var_type.clone();
-                    fma_op.source_info = op.source_info.clone();
-                    
-                    ops_to_add.push(sub_op);
-                    ops_to_add.push(fma_op);
-                    
-                    // Mark SelectChoice op as dead (replaced by sub+fma)
-                    dead_store_indices.insert(idx);
-                }
-            }
-        }
-
-        // Add expanded ops to the ops list
-        ops.extend(ops_to_add);
+        // SelectChoice ops are NOT expanded here - they remain as SelectChoice ops
+        // and will be lowered based on CP-SAT decisions (or default to Flow/vselect for greedy)
         
         // Rebuild id_to_idx mapping after adding new ops
         let id_to_idx: HashMap<usize, usize> = ops
@@ -350,7 +278,7 @@ impl SsaTickTockKernelBuilder {
             .collect();
 
         if !dead_store_indices.is_empty() {
-            let true_dead_stores = dead_store_indices.len() - const_add_imm_alternatives.len() - select_choice_expansions.len();
+            let true_dead_stores = dead_store_indices.len() - const_add_imm_alternatives.len();
             if true_dead_stores > 0 {
                 eprintln!(
                     "Warning: {} dead stores detected and will be skipped",
@@ -361,12 +289,6 @@ impl SsaTickTockKernelBuilder {
                 eprintln!(
                     "Info: {} constant AddImm alternatives skipped (greedy uses Load)",
                     const_add_imm_alternatives.len()
-                );
-            }
-            if !select_choice_expansions.is_empty() {
-                eprintln!(
-                    "Info: {} SelectChoice ops expanded to FMA path (sub+fma)",
-                    select_choice_expansions.len()
                 );
             }
         }
@@ -838,13 +760,15 @@ impl SsaTickTockKernelBuilder {
         let _ = vreg_def;
 
         // =========================================================================
-        // Collect SelectChoice tracking information (self-tracked via methods)
+        // Collect SelectChoice tracking information
         //
-        // The ops know how to report their SelectChoice relationship through methods.
-        // This elegant self-tracking approach avoids hardcoding tracking logic.
+        // Note: Since SelectChoice ops are no longer expanded in greedy scheduler,
+        // these collections will be empty. The tracking code remains for compatibility
+        // but will not find any expanded SelectChoice ops.
         // =========================================================================
-        if let Some(ref mut fma_ops) = select_choice_fma_ops {
+        if let Some(fma_ops) = select_choice_fma_ops {
             // Find all SelectChoice ops that were expanded (have sub/fma children)
+            // Since we no longer expand SelectChoice ops, this will be empty
             let mut selectchoice_to_fma: HashSet<usize> = HashSet::new();
             for op in ops.iter() {
                 if let Some(parent_id) = op.select_choice_parent_id() {
@@ -856,8 +780,9 @@ impl SsaTickTockKernelBuilder {
             fma_ops.extend(selectchoice_to_fma);
         }
         
-        if let Some(ref mut sub_cycles) = select_sub_cycles {
-            // Collect cycles for sub ops (self-tracked via methods)
+        if let Some(sub_cycles) = select_sub_cycles {
+            // Collect cycles for sub ops
+            // Since we no longer expand SelectChoice ops, this will be empty
             for op in ops.iter() {
                 if op.is_select_choice_sub() && op.cycle >= 0 {
                     if let Some(parent_id) = op.select_choice_parent_id() {
@@ -867,8 +792,9 @@ impl SsaTickTockKernelBuilder {
             }
         }
         
-        if let Some(ref mut fma_cycles) = select_fma_cycles {
-            // Collect cycles for fma ops (self-tracked via methods)
+        if let Some(fma_cycles) = select_fma_cycles {
+            // Collect cycles for fma ops
+            // Since we no longer expand SelectChoice ops, this will be empty
             for op in ops.iter() {
                 if op.is_select_choice_fma() && op.cycle >= 0 {
                     if let Some(parent_id) = op.select_choice_parent_id() {

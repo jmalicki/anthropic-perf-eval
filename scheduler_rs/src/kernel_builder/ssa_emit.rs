@@ -204,18 +204,12 @@ impl SsaTickTockKernelBuilder {
         self.ctx.v_tc2 = Some(self.emit.emit_vbroadcast(tc2));
         self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_1 = Some(self.emit.emit_vbroadcast(self.ctx.td_1.unwrap()));
-        // Compute v_tc1 = v_tc2 + v_td_1 for SelectChoice (true_val)
-        self.emit.set_next_var_type(VarType::TreeCache);
-        let v_tc1 = self.emit.emit_valu(Opcode::Add, self.ctx.v_tc2.unwrap(), self.ctx.v_td_1.unwrap());
-        self.ctx.v_tc1 = Some(v_tc1);
+        // v_tc1 is no longer computed upfront - SelectChoice will compute it when needed
         self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_tc3 = Some(self.emit.emit_vbroadcast(tc3));
         self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_4 = Some(self.emit.emit_vbroadcast(self.ctx.td_4.unwrap()));
-        // Compute v_tc4 = v_tc3 + v_td_4 for SelectChoice (true_val)
-        self.emit.set_next_var_type(VarType::TreeCache);
-        let v_tc4 = self.emit.emit_valu(Opcode::Add, self.ctx.v_tc3.unwrap(), self.ctx.v_td_4.unwrap());
-        self.ctx.v_tc4 = Some(v_tc4);
+        // v_tc4 is no longer computed upfront - SelectChoice will compute it when needed
         self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_5 = Some(self.emit.emit_vbroadcast(self.ctx.td_5.unwrap()));
         // Compute v_tc5 = v_tc3 + v_td_5 for SelectChoice (true_val)
@@ -452,9 +446,8 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_next_var_type(VarType::Condition);
                 let cond = self.emit.emit_valu(Opcode::Eq, idx, v_1);
                 self.emit.set_next_var_type(VarType::Temporary);
-                // Use SelectChoice: cond ? v_tc1 : v_tc2
-                let v_tc1 = self.ctx.v_tc1.unwrap();
-                let v_nv = self.emit.emit_select_choice(cond, v_tc1, v_tc2);
+                // Use SelectChoice with precomputed delta: cond ? (v_tc2 + v_td_1) : v_tc2
+                let v_nv = self.emit.emit_select_choice_with_delta(cond, self.ctx.v_td_1.unwrap(), self.ctx.v_tc2.unwrap());
                 self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
@@ -483,8 +476,8 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_next_var_type(VarType::Condition);
                 let cond4 = self.emit.emit_valu(Opcode::Eq, idx, v_const_4);
                 self.emit.set_next_var_type(VarType::Temporary);
-                let v_tc4 = self.ctx.v_tc4.unwrap();
-                let mut v_nv = self.emit.emit_select_choice(cond4, v_tc4, v_tc3);
+                // Use SelectChoice with precomputed delta: cond4 ? (v_tc3 + v_td_4) : v_tc3
+                let mut v_nv = self.emit.emit_select_choice_with_delta(cond4, self.ctx.v_td_4.unwrap(), self.ctx.v_tc3.unwrap());
 
                 // Select tc[5] if idx == 5
                 self.emit.set_next_var_type(VarType::Condition);

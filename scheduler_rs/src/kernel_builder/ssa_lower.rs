@@ -137,73 +137,109 @@ pub fn lower_ssa_ops_with_shift(
             let false_val_addr = *vreg_to_addr.get(&false_val_vreg).expect("false_val VReg not in mapping");
 
             if select_fma_ops.contains(&ssa_op.id) {
-                // FMA path: emit sub + fma ops (both VALU, sequential)
-                // sub = true_val - false_val
-                // fma = cond * sub + false_val
-                
-                // Create temporary address for sub result (use a unique address)
-                // Use a large offset based on op ID to ensure uniqueness
-                let sub_temp_addr = 10000 + ssa_op.id as i64;
-                
-                // Sub op: sub_temp = true_val - false_val
-                let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
-                sub_slot.push(SlotVal::Str("-".to_string()));
-                sub_slot.push(SlotVal::Int(sub_temp_addr));
-                sub_slot.push(SlotVal::Int(true_val_addr));
-                sub_slot.push(SlotVal::Int(false_val_addr));
-                
-                let mut sub_reads = HashSet::new();
-                sub_reads.insert(true_val_addr);
-                sub_reads.insert(false_val_addr);
-                
-                let mut sub_writes = HashSet::new();
-                sub_writes.insert(sub_temp_addr);
-                
-                result.push(Op {
-                    id: ssa_op.id, // Use same ID for sub (will be different for fma)
-                    engine: crate::types::Engine::Valu,
-                    slot: sub_slot,
-                    cycle: ssa_op.cycle, // Sub is at the same cycle as SelectChoice
-                    dep_ids: ssa_op.dep_ids.clone(),
-                    reads: sub_reads,
-                    writes: sub_writes,
-                    last_use_reads: HashSet::new(),
-                    produces_constant: None,
-                });
-                
-                // FMA op: dest = cond * sub_temp + false_val
-                let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
-                fma_slot.push(SlotVal::Str("multiply_add".to_string()));
-                fma_slot.push(SlotVal::Int(dest_addr));
-                fma_slot.push(SlotVal::Int(cond_addr));
-                fma_slot.push(SlotVal::Int(sub_temp_addr));
-                fma_slot.push(SlotVal::Int(false_val_addr));
-                
-                let mut fma_reads = HashSet::new();
-                fma_reads.insert(cond_addr);
-                fma_reads.insert(sub_temp_addr);
-                fma_reads.insert(false_val_addr);
-                
-                let mut fma_writes = HashSet::new();
-                fma_writes.insert(dest_addr);
-                
-                result.push(Op {
-                    id: ssa_op.id + 1000000, // Different ID for fma op
-                    engine: crate::types::Engine::Valu,
-                    slot: fma_slot,
-                    cycle: ssa_op.cycle + 1, // FMA is at cycle + 1 (adjacent to sub)
-                    dep_ids: {
-                        let mut deps = ssa_op.dep_ids.clone();
-                        deps.insert(ssa_op.id); // FMA depends on sub
-                        deps
-                    },
-                    reads: fma_reads,
-                    writes: fma_writes,
-                    last_use_reads: HashSet::new(),
-                    produces_constant: None,
-                });
+                // FMA path: check if we have a precomputed delta
+                if let Some(delta_vreg) = ssa_op.delta_vreg {
+                    // Precomputed delta available: emit single FMA op
+                    // fma = cond * delta + base (where base = false_val)
+                    let delta_addr = *vreg_to_addr.get(&delta_vreg).expect("delta VReg not in mapping");
+                    
+                    let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                    fma_slot.push(SlotVal::Str("multiply_add".to_string()));
+                    fma_slot.push(SlotVal::Int(dest_addr));
+                    fma_slot.push(SlotVal::Int(cond_addr));
+                    fma_slot.push(SlotVal::Int(delta_addr));
+                    fma_slot.push(SlotVal::Int(false_val_addr));
+                    
+                    let mut fma_reads = HashSet::new();
+                    fma_reads.insert(cond_addr);
+                    fma_reads.insert(delta_addr);
+                    fma_reads.insert(false_val_addr);
+                    
+                    let mut fma_writes = HashSet::new();
+                    fma_writes.insert(dest_addr);
+                    
+                    result.push(Op {
+                        id: ssa_op.id,
+                        engine: crate::types::Engine::Valu,
+                        slot: fma_slot,
+                        cycle: ssa_op.cycle,
+                        dep_ids: ssa_op.dep_ids.clone(),
+                        reads: fma_reads,
+                        writes: fma_writes,
+                        last_use_reads: HashSet::new(),
+                        produces_constant: None,
+                    });
+                } else {
+                    // No precomputed delta: emit sub + fma ops (both VALU, sequential)
+                    // sub = true_val - false_val
+                    // fma = cond * sub + false_val
+                    
+                    // Create temporary address for sub result (use a unique address)
+                    // Use a large offset based on op ID to ensure uniqueness
+                    let sub_temp_addr = 10000 + ssa_op.id as i64;
+                    
+                    // Sub op: sub_temp = true_val - false_val
+                    let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                    sub_slot.push(SlotVal::Str("-".to_string()));
+                    sub_slot.push(SlotVal::Int(sub_temp_addr));
+                    sub_slot.push(SlotVal::Int(true_val_addr));
+                    sub_slot.push(SlotVal::Int(false_val_addr));
+                    
+                    let mut sub_reads = HashSet::new();
+                    sub_reads.insert(true_val_addr);
+                    sub_reads.insert(false_val_addr);
+                    
+                    let mut sub_writes = HashSet::new();
+                    sub_writes.insert(sub_temp_addr);
+                    
+                    result.push(Op {
+                        id: ssa_op.id, // Use same ID for sub (will be different for fma)
+                        engine: crate::types::Engine::Valu,
+                        slot: sub_slot,
+                        cycle: ssa_op.cycle, // Sub is at the same cycle as SelectChoice
+                        dep_ids: ssa_op.dep_ids.clone(),
+                        reads: sub_reads,
+                        writes: sub_writes,
+                        last_use_reads: HashSet::new(),
+                        produces_constant: None,
+                    });
+                    
+                    // FMA op: dest = cond * sub_temp + false_val
+                    let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                    fma_slot.push(SlotVal::Str("multiply_add".to_string()));
+                    fma_slot.push(SlotVal::Int(dest_addr));
+                    fma_slot.push(SlotVal::Int(cond_addr));
+                    fma_slot.push(SlotVal::Int(sub_temp_addr));
+                    fma_slot.push(SlotVal::Int(false_val_addr));
+                    
+                    let mut fma_reads = HashSet::new();
+                    fma_reads.insert(cond_addr);
+                    fma_reads.insert(sub_temp_addr);
+                    fma_reads.insert(false_val_addr);
+                    
+                    let mut fma_writes = HashSet::new();
+                    fma_writes.insert(dest_addr);
+                    
+                    result.push(Op {
+                        id: ssa_op.id + 1000000, // Different ID for fma op
+                        engine: crate::types::Engine::Valu,
+                        slot: fma_slot,
+                        cycle: ssa_op.cycle + 1, // FMA is at cycle + 1 (adjacent to sub)
+                        dep_ids: {
+                            let mut deps = ssa_op.dep_ids.clone();
+                            deps.insert(ssa_op.id); // FMA depends on sub
+                            deps
+                        },
+                        reads: fma_reads,
+                        writes: fma_writes,
+                        last_use_reads: HashSet::new(),
+                        produces_constant: None,
+                    });
+                }
             } else {
                 // vselect path: emit vselect op (Flow)
+                // If delta_vreg is set, true_val was already computed during emission
+                // (via emit_select_choice_with_delta), so we can use it directly
                 let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                 slot.push(SlotVal::Str("vselect".to_string()));
                 slot.push(SlotVal::Int(dest_addr));

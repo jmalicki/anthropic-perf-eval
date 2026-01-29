@@ -320,7 +320,6 @@ impl SsaTickTockKernelBuilder {
             verbose,
             stop_after_first_solution: false,
             enable_valu_shift,
-            enable_select_choice: true, // Enable SelectChoice optimization
             scratch_budget: 1536, // Hardware limit
         };
 
@@ -340,59 +339,13 @@ impl SsaTickTockKernelBuilder {
         }
         let greedy_hints_opt = Some(&greedy_hints);
 
-        // Pass SelectChoice hints from greedy scheduler
-        // Note: SelectChoice decisions are keyed by op ID, which remains constant after barrier elision
-        // We just need to verify the SelectChoice ops still exist after elision
-        let mut select_choice_hints_set = HashSet::new();
-        let mut select_sub_cycles_map = HashMap::new();
-        let mut select_fma_cycles_map = HashMap::new();
-        
-        // Build set of op IDs that exist after barrier elision
-        let op_ids_after_elision: HashSet<usize> = ssa_ops.iter().map(|op| op.id).collect();
-        
-        // Filter greedy SelectChoice decisions to only include ops that still exist after elision
-        for &select_choice_id in &greedy_select_fma_ops {
-            if op_ids_after_elision.contains(&select_choice_id) {
-                select_choice_hints_set.insert(select_choice_id);
-            }
-        }
-        
-        for (select_choice_id, &cycle) in &greedy_select_sub_cycles {
-            if op_ids_after_elision.contains(select_choice_id) {
-                select_sub_cycles_map.insert(*select_choice_id, cycle);
-            }
-        }
-        
-        for (select_choice_id, &cycle) in &greedy_select_fma_cycles {
-            if op_ids_after_elision.contains(select_choice_id) {
-                select_fma_cycles_map.insert(*select_choice_id, cycle);
-            }
-        }
-        
-        let select_choice_hints = if select_choice_hints_set.is_empty() {
-            None
-        } else {
-            Some(&select_choice_hints_set)
-        };
-        let select_sub_cycles = if select_sub_cycles_map.is_empty() {
-            None
-        } else {
-            Some(&select_sub_cycles_map)
-        };
-        let select_fma_cycles = if select_fma_cycles_map.is_empty() {
-            None
-        } else {
-            Some(&select_fma_cycles_map)
-        };
-        
+        // Note: SelectChoice hints are not currently passed to CP-SAT
+        // CP-SAT will handle SelectChoice ops based on its own optimization decisions
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
             cpsat_config,
             greedy_hints_opt.map(|v| v.as_slice()),
             shift_hints,
-            select_choice_hints,
-            select_sub_cycles,
-            select_fma_cycles,
         )
         .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
@@ -453,7 +406,7 @@ impl SsaTickTockKernelBuilder {
             &address_result.vreg_to_addr,
             &shifted_ops,
             &cpsat_result.const_add_imm_ops, // CP-SAT decisions for ConstChoice
-            &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
+            &HashSet::new(), // CP-SAT doesn't support SelectChoice yet - default to vselect
         );
 
         Ok(SsaScheduleResult {

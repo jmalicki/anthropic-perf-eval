@@ -780,6 +780,47 @@ impl SsaEmitContext {
             ],
         );
         op.needs_subtraction = needs_subtraction;
+        op.delta_vreg = None; // No precomputed delta
+        
+        self.emit(op);
+        dest
+    }
+
+    /// Emit SelectChoice with precomputed delta: result = cond ? (base + delta) : base
+    /// Allows CP-SAT to choose between vselect and FMA path.
+    /// When FMA path is chosen, uses delta directly: `cond * delta + base` (1 VALU op).
+    /// When vselect path is chosen, computes `true_val = base + delta` first, then vselect.
+    ///
+    /// This is more efficient than `emit_select_choice` when delta is precomputed,
+    /// as it avoids computing `sub = true_val - false_val` on-the-fly in FMA path.
+    #[track_caller]
+    pub fn emit_select_choice_with_delta(&mut self, cond: VReg, delta: VReg, base: VReg) -> VReg {
+        assert!(cond.is_vector(), "SelectChoice cond must be vector");
+        assert!(delta.is_vector(), "SelectChoice delta must be vector");
+        assert!(base.is_vector(), "SelectChoice base must be vector");
+
+        // Compute true_val = base + delta for operands (needed for dependency tracking and vselect path)
+        // This is computed once per SelectChoice, not globally upfront
+        let true_val = self.emit_valu(Opcode::Add, base, delta);
+        
+        let dest = self.fresh_vector();
+        
+        // Detect zero case: if base is constant 0, subtraction is not needed
+        let needs_subtraction = self.vreg_constants.get(&base) != Some(&0);
+        
+        let mut op = SsaOp::new(
+            0,
+            Engine::Flow, // Default engine (will be overridden by scheduler choice)
+            Opcode::SelectChoice,
+            Some(dest),
+            vec![
+                Operand::VReg(cond),
+                Operand::VReg(true_val),
+                Operand::VReg(base),
+            ],
+        );
+        op.needs_subtraction = needs_subtraction;
+        op.delta_vreg = Some(delta); // Store precomputed delta for lowering
         
         self.emit(op);
         dest

@@ -1215,6 +1215,13 @@ pub struct SsaOp {
     /// If `false_val = 0`, subtraction is not needed (FMA simplifies to multiply only).
     pub needs_subtraction: bool,
 
+    /// For SelectChoice ops: optional precomputed delta VReg.
+    /// When set, indicates that `true_val = false_val + delta_vreg`, allowing FMA path
+    /// to use `cond * delta_vreg + false_val` directly (1 VALU op) instead of computing
+    /// `sub = true_val - false_val` on-the-fly (2 VALU ops).
+    /// None when delta is not precomputed (e.g., cascaded SelectChoice where base is result of previous SelectChoice).
+    pub delta_vreg: Option<VReg>,
+
     /// For ops that are part of a SelectChoice expansion (sub or fma):
     /// Points to the original SelectChoice op's ID.
     /// None for regular ops or the SelectChoice op itself.
@@ -1238,6 +1245,7 @@ impl SsaOp {
             source_info: None,
             const_alternatives: None,
             needs_subtraction: true, // Default: subtraction needed (false_val != 0)
+            delta_vreg: None, // Default: no precomputed delta
             select_choice_parent: None, // Default: not part of SelectChoice expansion
         }
     }
