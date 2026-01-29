@@ -40,38 +40,40 @@ maturin build --release  # Build optimized release
 
 ### Running Tests
 ```bash
-# Run all tests
-pytest
+# Run all tests (use uv run for correct Python environment)
+uv run pytest
 
 # Run solver tests
-pytest solver/
+uv run pytest solver/
 
 # Run submission tests
-python tests/submission_tests.py
+uv run tests/submission_tests.py
 
 # Test the optimized kernel
-python test_optimized.py
+uv run test_optimized.py
 ```
 
 ### Generating Kernels
+
+**Important: Always use `uv run` to execute Python scripts** to ensure the correct Python environment and dependencies.
 
 **Recommended: SSA builder with CP-SAT** (best quality):
 ```bash
 # Default: 10 min CP-SAT, VALU shift disabled
 # Shows full optimization progress (solver stats, cycle improvements)
-python generate_ssa_kernel.py
+uv run generate_ssa_kernel.py
 
 # With validation against reference kernel
-python generate_ssa_kernel.py --validate
+uv run generate_ssa_kernel.py --validate
 
 # Quick iteration with greedy scheduler (~2 seconds, may exceed budget)
-python generate_ssa_kernel.py --use-greedy
+uv run generate_ssa_kernel.py --use-greedy
 
 # Longer optimization (diminishing returns after 10 min)
-python generate_ssa_kernel.py --cpsat-time-limit 3600
+uv run generate_ssa_kernel.py --cpsat-time-limit 3600
 
 # Output schedule JSON for analysis
-python generate_ssa_kernel.py --output-json schedule.json
+uv run generate_ssa_kernel.py --output-json schedule.json
 ```
 
 **CP-SAT solver output:** The script shows full CP-SAT progress by default, including:
@@ -99,8 +101,8 @@ python generate_ssa_kernel.py --output-json schedule.json
 
 **Legacy: Python builder** (deprecated):
 ```bash
-python generate_precomputed_kernel.py --use-greedy
-python generate_precomputed_kernel.py --full-solve-time 600
+uv run generate_precomputed_kernel.py --use-greedy
+uv run generate_precomputed_kernel.py --full-solve-time 600
 ```
 
 **Scheduler Selection Guide:**
@@ -110,8 +112,8 @@ python generate_precomputed_kernel.py --full-solve-time 600
 
 ### Running Experiments
 ```bash
-python run_experiment.py           # With W&B logging
-python run_experiment.py --offline # Without W&B
+uv run run_experiment.py           # With W&B logging
+uv run run_experiment.py --offline # Without W&B
 ```
 
 ## Architecture Overview
@@ -242,8 +244,8 @@ All kernels are validated against `reference_kernel2()` in `problem.py`. The ker
 
 ```bash
 # Validate with Rust builder (fastest, ~2 seconds)
-python test_optimized.py --rust-builder
+uv run test_optimized.py --rust-builder
 
 # Validate with Python builder (slower, ~80 seconds)
-python test_optimized.py --tick-tock
+uv run test_optimized.py --tick-tock
 ```
