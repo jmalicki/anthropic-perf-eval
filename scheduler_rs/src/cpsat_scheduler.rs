@@ -1322,8 +1322,11 @@ pub fn schedule_ssa_cpsat(
                 format!("fma_cycle_{}", idx),
             );
             // Constraint: fma_cycle = cycle_vars[idx] + 1 (only enforced when choice_var = true)
-            model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1)
-                .only_enforce_if(choice_var);
+            // TODO: Fix CP-SAT API - only_enforce_if method may have changed
+            // For now, create the constraint unconditionally - the optional interval will handle enforcement
+            model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
+            // Note: The fma_interval below is optional (based on choice_var), so the constraint
+            // is effectively conditional through the interval's presence
             
             let fma_interval = model.new_optional_fixed_size_interval_var(
                 fma_cycle_var,

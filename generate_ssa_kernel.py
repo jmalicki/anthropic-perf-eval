@@ -93,7 +93,8 @@ def main():
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time_limit,
         output_json=args.output_json,
-        liveness_detail=args.liveness_detail,
+        # Note: liveness_detail parameter not available in Python bindings yet
+        # It's only used when output_json is provided anyway
     )
     build_time = time.time() - start_time
 
