@@ -1,0 +1,643 @@
+{
+  "total_cycles": 1480,
+  "total_ops": 20757,
+  "vreg_count": 10805,
+  "peak_live_words": 1063,
+  "max_addr": 1101,
+  "budget_exceeded": false,
+  "valu_shifted": 1344,
+  "usage_accounting": {
+    "total_vregs": 10805,
+    "total_words": 81519,
+    "peak_live_words": 1063,
+    "by_round": [
+      {
+        "round": -1,
+        "stats": {
+          "vreg_count": 374,
+          "total_words": 1431,
+          "scalar_count": 223,
+          "vector_count": 151,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 0,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 1,
+        "stats": {
+          "vreg_count": 608,
+          "total_words": 4640,
+          "scalar_count": 32,
+          "vector_count": 576,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 2,
+        "stats": {
+          "vreg_count": 736,
+          "total_words": 5664,
+          "scalar_count": 32,
+          "vector_count": 704,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 3,
+        "stats": {
+          "vreg_count": 1071,
+          "total_words": 8344,
+          "scalar_count": 32,
+          "vector_count": 1039,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 4,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 5,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 6,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 7,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 8,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 9,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 10,
+        "stats": {
+          "vreg_count": 480,
+          "total_words": 3840,
+          "scalar_count": 0,
+          "vector_count": 480,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 11,
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 12,
+        "stats": {
+          "vreg_count": 608,
+          "total_words": 4640,
+          "scalar_count": 32,
+          "vector_count": 576,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 13,
+        "stats": {
+          "vreg_count": 736,
+          "total_words": 5664,
+          "scalar_count": 32,
+          "vector_count": 704,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 14,
+        "stats": {
+          "vreg_count": 1056,
+          "total_words": 8224,
+          "scalar_count": 32,
+          "vector_count": 1024,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 15,
+        "stats": {
+          "vreg_count": 528,
+          "total_words": 4000,
+          "scalar_count": 32,
+          "vector_count": 496,
+          "peak_words": 0
+        }
+      }
+    ],
+    "by_var_type": [
+      {
+        "var_type": "address",
+        "stats": {
+          "vreg_count": 135,
+          "total_words": 135,
+          "scalar_count": 135,
+          "vector_count": 0,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "batch_data",
+        "stats": {
+          "vreg_count": 128,
+          "total_words": 1024,
+          "scalar_count": 0,
+          "vector_count": 128,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "condition",
+        "stats": {
+          "vreg_count": 256,
+          "total_words": 2048,
+          "scalar_count": 0,
+          "vector_count": 256,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "constant",
+        "stats": {
+          "vreg_count": 41,
+          "total_words": 83,
+          "scalar_count": 35,
+          "vector_count": 6,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "hash_state",
+        "stats": {
+          "vreg_count": 23,
+          "total_words": 100,
+          "scalar_count": 12,
+          "vector_count": 11,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "pointer",
+        "stats": {
+          "vreg_count": 4,
+          "total_words": 4,
+          "scalar_count": 4,
+          "vector_count": 0,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 192,
+          "total_words": 1536,
+          "scalar_count": 0,
+          "vector_count": 192,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 10009,
+          "total_words": 76530,
+          "scalar_count": 506,
+          "vector_count": 9503,
+          "peak_words": 0
+        }
+      },
+      {
+        "var_type": "tree_cache",
+        "stats": {
+          "vreg_count": 17,
+          "total_words": 59,
+          "scalar_count": 11,
+          "vector_count": 6,
+          "peak_words": 0
+        }
+      }
+    ],
+    "bivariate": [
+      {
+        "round": -1,
+        "var_type": "address",
+        "stats": {
+          "vreg_count": 135,
+          "total_words": 135,
+          "scalar_count": 135,
+          "vector_count": 0,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "batch_data",
+        "stats": {
+          "vreg_count": 128,
+          "total_words": 1024,
+          "scalar_count": 0,
+          "vector_count": 128,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "constant",
+        "stats": {
+          "vreg_count": 41,
+          "total_words": 83,
+          "scalar_count": 35,
+          "vector_count": 6,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "hash_state",
+        "stats": {
+          "vreg_count": 23,
+          "total_words": 100,
+          "scalar_count": 12,
+          "vector_count": 11,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "pointer",
+        "stats": {
+          "vreg_count": 4,
+          "total_words": 4,
+          "scalar_count": 4,
+          "vector_count": 0,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 26,
+          "total_words": 26,
+          "scalar_count": 26,
+          "vector_count": 0,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": -1,
+        "var_type": "tree_cache",
+        "stats": {
+          "vreg_count": 17,
+          "total_words": 59,
+          "scalar_count": 11,
+          "vector_count": 6,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 0,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 0,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 544,
+          "total_words": 4128,
+          "scalar_count": 32,
+          "vector_count": 512,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 1,
+        "var_type": "condition",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 1,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 1,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 544,
+          "total_words": 4128,
+          "scalar_count": 32,
+          "vector_count": 512,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 2,
+        "var_type": "condition",
+        "stats": {
+          "vreg_count": 96,
+          "total_words": 768,
+          "scalar_count": 0,
+          "vector_count": 96,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 2,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 2,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 608,
+          "total_words": 4640,
+          "scalar_count": 32,
+          "vector_count": 576,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 3,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 1071,
+          "total_words": 8344,
+          "scalar_count": 32,
+          "vector_count": 1039,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 4,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 5,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 6,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 7,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 8,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 9,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 576,
+          "total_words": 4384,
+          "scalar_count": 32,
+          "vector_count": 544,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 10,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 480,
+          "total_words": 3840,
+          "scalar_count": 0,
+          "vector_count": 480,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 11,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 11,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 544,
+          "total_words": 4128,
+          "scalar_count": 32,
+          "vector_count": 512,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 12,
+        "var_type": "condition",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 12,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 12,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 544,
+          "total_words": 4128,
+          "scalar_count": 32,
+          "vector_count": 512,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 13,
+        "var_type": "condition",
+        "stats": {
+          "vreg_count": 96,
+          "total_words": 768,
+          "scalar_count": 0,
+          "vector_count": 96,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 13,
+        "var_type": "round_state",
+        "stats": {
+          "vreg_count": 32,
+          "total_words": 256,
+          "scalar_count": 0,
+          "vector_count": 32,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 13,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 608,
+          "total_words": 4640,
+          "scalar_count": 32,
+          "vector_count": 576,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 14,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 1056,
+          "total_words": 8224,
+          "scalar_count": 32,
+          "vector_count": 1024,
+          "peak_words": 0
+        }
+      },
+      {
+        "round": 15,
+        "var_type": "temporary",
+        "stats": {
+          "vreg_count": 528,
+          "total_words": 4000,
+          "scalar_count": 32,
+          "vector_count": 496,
+          "peak_words": 0
+        }
+      }
+    ]
+  }
+}

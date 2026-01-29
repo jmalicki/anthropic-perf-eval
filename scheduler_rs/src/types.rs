@@ -149,6 +149,7 @@ pub enum Opcode {
     // Scheduling-only pseudo-ops (elided from output)
     Barrier = 32,     // Round boundary barrier
     ConstChoice = 33, // Constant with encoding choice (Load vs AddImm)
+    SelectChoice = 34, // Selection with encoding choice (vselect vs FMA: sub + fma)
 }
 
 impl Opcode {
@@ -189,6 +190,7 @@ impl Opcode {
             "add_imm" => Some(Opcode::AddImm),
             "barrier" => Some(Opcode::Barrier),
             "const_choice" => Some(Opcode::ConstChoice),
+            "select_choice" => Some(Opcode::SelectChoice),
             _ => None,
         }
     }
@@ -230,6 +232,7 @@ impl Opcode {
             Opcode::AddImm => "add_imm",
             Opcode::Barrier => "barrier",
             Opcode::ConstChoice => "const_choice",
+            Opcode::SelectChoice => "select_choice",
         }
     }
 
@@ -1207,6 +1210,15 @@ pub struct SsaOp {
     /// For ConstChoice ops: alternative encodings the scheduler can choose from.
     /// The greedy scheduler uses Load (default), while CP-SAT models the choice.
     pub const_alternatives: Option<Vec<ConstEncoding>>,
+
+    /// For SelectChoice ops: whether subtraction is needed in FMA path.
+    /// If `false_val = 0`, subtraction is not needed (FMA simplifies to multiply only).
+    pub needs_subtraction: bool,
+
+    /// For ops that are part of a SelectChoice expansion (sub or fma):
+    /// Points to the original SelectChoice op's ID.
+    /// None for regular ops or the SelectChoice op itself.
+    pub select_choice_parent: Option<usize>,
 }
 
 impl SsaOp {
@@ -1225,6 +1237,8 @@ impl SsaOp {
             var_type: None,
             source_info: None,
             const_alternatives: None,
+            needs_subtraction: true, // Default: subtraction needed (false_val != 0)
+            select_choice_parent: None, // Default: not part of SelectChoice expansion
         }
     }
 
@@ -1236,6 +1250,26 @@ impl SsaOp {
     /// Get the destination VReg if any
     pub fn writes(&self) -> Option<VReg> {
         self.dest
+    }
+
+    /// Check if this op is part of a SelectChoice expansion (sub or fma)
+    pub fn is_select_choice_expansion(&self) -> bool {
+        self.select_choice_parent.is_some()
+    }
+
+    /// Get the parent SelectChoice op ID if this is part of an expansion
+    pub fn select_choice_parent_id(&self) -> Option<usize> {
+        self.select_choice_parent
+    }
+
+    /// Check if this is a sub op from SelectChoice expansion
+    pub fn is_select_choice_sub(&self) -> bool {
+        self.select_choice_parent.is_some() && self.opcode == Opcode::Sub
+    }
+
+    /// Check if this is an fma op from SelectChoice expansion
+    pub fn is_select_choice_fma(&self) -> bool {
+        self.select_choice_parent.is_some() && self.opcode == Opcode::MultiplyAdd
     }
 
     /// Check if this op is scheduled

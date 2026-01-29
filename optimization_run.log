@@ -176,3 +176,219 @@ Starting search at 9.18s with 8 workers.
 3 helper subsolvers: [neighborhood_helper, synchronization_agent, update_gap_integral]
 
 #Bound  20.60s best:inf   next:[1317,11349] max_lp
+#1      50.37s best:1494  next:[1317,1493] fs_random_no_lp [hint]
+#2     111.48s best:1492  next:[1317,1491] scheduling_time_window_lns (d=5.00e-01 s=218 t=0.10 p=0.00 stall=0 h=base)
+#3     123.53s best:1491  next:[1317,1490] scheduling_resource_windows_lns (d=5.00e-01 s=219 t=0.10 p=0.00 stall=0 h=base)
+#4     192.38s best:1490  next:[1317,1489] graph_cst_lns (d=5.00e-01 s=226 t=0.10 p=0.00 stall=0 h=base)
+#5     463.30s best:1488  next:[1317,1487] scheduling_resource_windows_lns (d=2.93e-01 s=360 t=0.10 p=0.00 stall=0 h=base)
+#6     558.31s best:1485  next:[1317,1484] scheduling_time_window_lns (d=2.93e-01 s=516 t=0.10 p=0.00 stall=0 h=base)
+#7     586.31s best:1480  next:[1317,1479] scheduling_resource_windows_lns (d=1.86e-01 s=638 t=0.10 p=0.00 stall=0 h=base)
+
+Task timing                                  n [     min,      max]      avg      dev     time         n [     min,      max]      avg      dev    dtime
+                       'default_lp':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [   7.65s,   25.68s]   16.67s    9.02s   33.33s
+                 'feasibility_pump':       294 [325.00us,    4.53s]  21.61ms 263.42ms    6.35s       127 [  4.16ms,  35.40ms]   6.30ms   7.01ms 800.66ms
+                            'fixed':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [  11.20s,   42.28s]   26.74s   15.54s   53.48s
+                               'fj':        41 [  4.42ms,    3.01s] 312.11ms 774.88ms   12.80s        41 [100.84ms,    3.18m]   22.50s   56.26s   15.37m
+                  'fs_random_no_lp':         1 [  41.22s,   41.22s]   41.22s   0.00ns   41.22s         1 [227.10ms, 227.10ms] 227.10ms   0.00ns 227.10ms
+                    'graph_arc_lns':         1 [   1.60m,    1.60m]    1.60m   0.00ns    1.60m         1 [ 57.24ms,  57.24ms]  57.24ms   0.00ns  57.24ms
+                    'graph_cst_lns':         3 [ 13.38ms,   35.63s]   11.89s   16.79s   35.67s         1 [100.00ms, 100.00ms] 100.00ms   0.00ns 100.00ms
+                    'graph_dec_lns':         4 [ 73.90ms,    3.95m]    1.63m    1.70m    6.52m         4 [ 14.00us, 100.00ms]  50.02ms  49.98ms 200.07ms
+                    'graph_var_lns':        46 [  5.89ms,    9.45s] 655.10ms    1.51s   30.13s        23 [ 88.21us, 109.81ms]  53.08ms  50.66ms    1.22s
+                               'ls':       294 [ 12.79ms,    1.94s]  57.58ms 202.06ms   16.93s       294 [100.17ms,    2.29m]    2.16s   14.79s   10.59m
+                           'max_lp':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [  17.01s,   59.73s]   38.37s   21.36s    1.28m
+                            'no_lp':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [227.10ms,    3.53s]    1.88s    1.65s    3.76s
+                    'quick_restart':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [  11.65s,   54.62s]   33.13s   21.48s    1.10m
+                    'reduced_costs':         1 [   9.85m,    9.85m]    9.85m   0.00ns    9.85m         2 [   6.24s,   18.12s]   12.18s    5.94s   24.35s
+                        'rins/rens':        37 [ 27.16ms,    9.82s] 984.37ms    2.33s   36.42s        28 [190.00ns, 100.17ms]  14.22ms  34.71ms 398.23ms
+                      'rnd_cst_lns':         2 [ 76.48ms,   59.00s]   29.54s   29.46s   59.07s         2 [ 12.73us, 100.00ms]  50.01ms  49.99ms 100.02ms
+                      'rnd_var_lns':         4 [ 92.35ms,    2.89m]    1.31m    1.29m    5.24m         4 [ 12.16us, 100.00ms]  38.87ms  41.35ms 155.49ms
+         'scheduling_intervals_lns':         1 [  37.52s,   37.52s]   37.52s   0.00ns   37.52s         1 [100.13ms, 100.13ms] 100.13ms   0.00ns 100.13ms
+       'scheduling_precedences_lns':         1 [  32.98s,   32.98s]   32.98s   0.00ns   32.98s         1 [101.32ms, 101.32ms] 101.32ms   0.00ns 101.32ms
+  'scheduling_resource_windows_lns':         3 [  11.21s,   12.59s]   11.94s 562.90ms   35.82s         3 [100.07ms, 101.05ms] 100.49ms 411.17us 301.48ms
+       'scheduling_time_window_lns':         2 [  16.33s,   18.98s]   17.65s    1.32s   35.30s         2 [102.09ms, 102.69ms] 102.39ms 301.84us 204.79ms
+
+Search stats           Bools  Conflicts  Branches  Restarts  BacktrackToRoot  Backtrack  BoolPropag  IntegerPropag
+       'default_lp':  23'559      2'003   237'787         7           94'379    151'381     693'535     70'110'848
+            'fixed':  24'409      9'822   159'750         0           13'889     23'711   6'933'587     67'163'022
+  'fs_random_no_lp':  22'807          0    35'296         0           13'889     13'889       1'400      1'704'917
+           'max_lp':  24'658      1'436   226'559         5           83'073    123'926   1'330'905     60'736'598
+            'no_lp':  22'888      2'093   268'848         5           34'119     38'431     222'640     26'604'975
+    'quick_restart':  25'256         88   306'241         8          140'792    199'690     162'358     62'598'518
+    'reduced_costs':  23'216        241    90'765         3           50'209     62'683     691'965     31'797'260
+
+SAT formula           Fixed  Equiv   Total  VarLeft  BinaryClauses  PermanentClauses  TemporaryClauses
+       'default_lp':     41      0  23'559   23'518         53'890                34             1'056
+            'fixed':      5      0  24'409   24'404         14'552                 0             6'896
+  'fs_random_no_lp':      1      0  22'807   22'806          9'026                 0                 0
+           'max_lp':     36      0  24'658   24'622         51'144                74             1'049
+            'no_lp':     29      0  22'888   22'859         13'410                 4               591
+    'quick_restart':     37      0  25'256   25'219         26'854                 2                58
+    'reduced_costs':     21      0  23'216   23'195         43'078               156                32
+
+SAT stats             ClassicMinim  LitRemoved  LitRemovedBinary  LitLearned  LitForgotten  Subsumed
+       'default_lp':         1'845      18'843             3'149      82'392             0       827
+            'fixed':         8'742      57'704                31     209'285             0     2'926
+  'fs_random_no_lp':             0           0                 0           0             0         0
+           'max_lp':         1'159       2'835             1'427      25'987             0       301
+            'no_lp':         1'956     102'092             1'308     254'681             0     1'490
+    'quick_restart':            64         644               562      17'111             0        18
+    'reduced_costs':            45          45               261       1'014             0         0
+
+Vivification          Clauses  Decisions  LitTrue  Subsumed  LitRemoved  DecisionReused  Conflicts
+       'default_lp':      277        171        0        40         152             552          0
+            'fixed':        0          0        0         0           0               0          0
+  'fs_random_no_lp':        0          0        0         0           0               0          0
+           'max_lp':      346        288        0         8          41             762          0
+            'no_lp':        0          0        0         0           0               0          0
+    'quick_restart':       24         27        0         1           4              33          0
+    'reduced_costs':      512        283        0        24          94             884          0
+
+Clause deletion       at_true  l_and_not(l)  to_binary  sub_conflict  sub_extra  sub_decisions  sub_eager  sub_vivify  sub_probing  sub_inpro  blocked  eliminated  forgotten  promoted  conflicts
+       'default_lp':        3             0          3           789          0              0         38          40            0          1        0           0          0     2'890      2'003
+            'fixed':        0             0          0         2'731          0              0        195           0            0          0        0           0          0    13'609      9'822
+  'fs_random_no_lp':        0             0          0             0          0              0          0           0            0          0        0           0          0         0          0
+           'max_lp':        3             0          0           277          0              0         24           8            0          1        0           0          0     1'834      1'436
+            'no_lp':        0             0          0         1'487          3              0          3           0            0          0        0           0          0     4'059      2'093
+    'quick_restart':        2             0          0            13          0              0          5           1            0          0        0           0          0       139         88
+    'reduced_costs':        0             0          8             0          0              0          0          24            0          0        0           0          0        32        241
+
+Lp stats            Component  Iterations  AddedCuts  OPTIMAL  DUAL_F.  DUAL_U.
+     'default_lp':          1      27'832          0   35'555        0        0
+          'fixed':          1      45'983          0   53'256        0        0
+         'max_lp':          4      86'519        184   28'692    5'794        0
+  'quick_restart':          1      84'386          0   37'925        9        0
+  'reduced_costs':          4      48'763         83    9'332    3'755        0
+
+Lp dimension              Final dimension of first component
+     'default_lp':  10240 rows, 22107 columns, 30262 entries
+          'fixed':  10276 rows, 29051 columns, 37172 entries
+         'max_lp':  13125 rows, 29051 columns, 58819 entries
+  'quick_restart':  12988 rows, 22107 columns, 36731 entries
+  'reduced_costs':  11353 rows, 29051 columns, 50655 entries
+
+Lp debug            CutPropag  CutEqPropag  Adjust  Overflow     Bad  BadScaling
+     'default_lp':          0            0       0         0       0           0
+          'fixed':          0            0       0         0       0           0
+         'max_lp':          1            0       0         0  23'301           0
+  'quick_restart':          0            0       0         0       0           0
+  'reduced_costs':          0            0       0         0  25'806           0
+
+Lp pool             Constraints  Updates  Simplif  Merged  Shortened  Split  Strengthened  Cuts/Call
+     'default_lp':       36'179        0    5'844       0          0      0             0        0/0
+          'fixed':       36'181        0    1'883       0          0      0             0        0/0
+         'max_lp':       36'348        0   11'918      17          0      0           208    184/192
+  'quick_restart':       36'179        0    9'944       0          0      0             0        0/0
+  'reduced_costs':       36'264        0    4'028       0          0      0             0      83/86
+
+Lp Cut                                          max_lp  reduced_costs
+                                         CG_R:      11              -
+  CumulativeCompletionTimeExhaustive_weighted:      23              6
+             CumulativeCompletionTimeQueyrane:     143             76
+      CumulativeCompletionTimeQueyrane_lifted:       4              1
+            CumulativeEnergyM_lifted_makespan:       2              -
+                                  ZERO_HALF_R:       1              -
+
+LNS stats                             Improv/Calls  Closed  Difficulty  TimeLimit
+                    'graph_arc_lns':           1/1    100%    7.07e-01       0.10
+                    'graph_cst_lns':           1/1      0%    2.93e-01       0.10
+                    'graph_dec_lns':           3/4     50%    5.97e-01       0.10
+                    'graph_var_lns':         17/23     48%    3.41e-01       0.10
+                        'rins/rens':         37/37     89%    1.00e+00       0.10
+                      'rnd_cst_lns':           2/2     50%    5.38e-01       0.10
+                      'rnd_var_lns':           2/4     50%    5.97e-01       0.10
+         'scheduling_intervals_lns':           1/1      0%    2.93e-01       0.10
+       'scheduling_precedences_lns':           0/1      0%    2.93e-01       0.10
+  'scheduling_resource_windows_lns':           3/3      0%    1.24e-01       0.10
+       'scheduling_time_window_lns':           2/2      0%    1.86e-01       0.10
+
+LS stats                                    Batches  Restarts/Perturbs  LinMoves  GenMoves  CompoundMoves  Bactracks  WeightUpdates  ScoreComputed
+                             'fj_restart':        2                  2       438         0              0          0              1        407'104
+                    'fj_restart_compound':        2                  1         0         6              6          0              0            710
+                'fj_restart_compound_obj':        4                  3         0        13             12          0              0         20'396
+            'fj_restart_compound_perturb':        2                  1         0         4              0          0              0          1'045
+        'fj_restart_compound_perturb_obj':        4                  3         0        12             11          0              0          1'621
+          'fj_restart_decay_compound_obj':        6                  4         0        17             13          0              0         54'965
+      'fj_restart_decay_compound_perturb':        4                  2         0        10             10          0              0         15'741
+  'fj_restart_decay_compound_perturb_obj':        3                  2         0         6              5          0              0         32'473
+                   'fj_restart_decay_obj':        6                  3       866         3              0          0              1        621'347
+               'fj_restart_decay_perturb':        1                  1       360         0              0          0              0          8'425
+           'fj_restart_decay_perturb_obj':        1                  1        16         0              0          0              1        396'795
+                         'fj_restart_obj':        1                  1       422         0              0          0              0         10'105
+                 'fj_restart_perturb_obj':        5                  2     1'461         0              0          0              1        430'891
+                             'ls_restart':       49                 31       214        11              0          0            175      1'555'650
+                    'ls_restart_compound':       30                 15         0       138             31         34              9      1'305'656
+            'ls_restart_compound_perturb':       44                 26         0       186             58         44              8        663'180
+                       'ls_restart_decay':       25                 18       105        11              0          0             65        773'913
+              'ls_restart_decay_compound':       31                 19         0       141             41         33              9        655'379
+      'ls_restart_decay_compound_perturb':       28                 22         0       128             51         21              7        407'420
+               'ls_restart_decay_perturb':       33                 15        95        15              0          0             73      1'022'143
+                     'ls_restart_perturb':       54                 34       208         6              0          0            172      1'730'480
+
+Solutions (7)                         Num   Rank
+                  'fs_random_no_lp':    2  [0,1]
+                    'graph_cst_lns':    2  [3,4]
+  'scheduling_resource_windows_lns':    6  [2,7]
+       'scheduling_time_window_lns':    4  [1,6]
+
+Objective bounds     Num
+  'initial_domain':    1
+          'max_lp':    1
+
+Solution repositories    Added  Queried  Synchro
+    'alternative_path':      1        0        1
+      'best_solutions':     19      251       19
+   'fj solution hints':     18        0       18
+        'lp solutions':  1'320       11    1'241
+                'pump':    282       26
+
+Improving bounds shared       Num  Sym
+            'default_lp':  22'107    0
+                 'fixed':       1    0
+                'max_lp':  44'215    0
+                 'no_lp':  22'107    0
+         'quick_restart':  22'107    0
+         'reduced_costs':  22'107    0
+
+Clauses shared        #Exported  #Imported  #BinaryRead  #BinaryTotal
+       'default_lp':          0          0            0             0
+            'fixed':          0          0            0             0
+  'fs_random_no_lp':          0          0            0             0
+           'max_lp':          0          0            0             0
+            'no_lp':          0          0            0             0
+    'quick_restart':          0          0            0             0
+    'reduced_costs':          0          0            0             0
+
+LRAT_status: NA
+CpSolverResponse summary:
+status: FEASIBLE
+objective: 1480
+best_bound: 1317
+integers: 22107
+booleans: 22807
+conflicts: 0
+branches: 35296
+propagations: 1400
+integer_propagations: 1704917
+restarts: 0
+lp_iterations: 0
+walltime: 600.489
+usertime: 600.489
+deterministic_time: 1819.57
+gap_integral: 13126.5
+solution_fingerprint: 0xf1539eac5653377d
+
+SSA CP-SAT: 1480 cycles, status Feasible, gap 11.01%, time 600.59s, shifted 1344 VALU ops
+SSA CP-SAT result: 1480 cycles (greedy was 1494), 1344 VALU ops shifted
+SSA kernel: 1480 cycles, 20757 ops, 10805 VRegs, peak_live=1063, max_addr=1101, valu_shifted=1344
+Wrote schedule output with usage accounting to optimized_with_lp_params.json
+
+Results:
+  Build time: 600.7s
+  Cycles: 1480
+  Speedup: 99.8x over baseline (147734)
+  Instructions: 1477
+  VRegs: 10805
+  Peak live: 1063 words
+  Budget exceeded: False
+
+  Schedule JSON written to: optimized_with_lp_params.json

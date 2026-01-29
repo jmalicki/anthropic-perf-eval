@@ -11,7 +11,7 @@
 //! 4. `assign_addresses()` - Linear scan allocation based on live ranges
 //! 5. `lower_ssa_ops()` - Convert to concrete Ops (expanding shifted VALU ops)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::{assign_addresses, AddressAssignConfig, AddressAssignmentResult};
 use crate::types::{Op, SsaOp, UsageAccounting, VReg};
@@ -148,12 +148,19 @@ impl SsaTickTockKernelBuilder {
         compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
 
         // Schedule using greedy scheduler with VALU→ALU shifting
+        // Collect SelectChoice decisions from greedy scheduler
         let mut shifted_ops: HashSet<usize> = HashSet::new();
-        let (cycles, sched_budget_exceeded, _sched_peak_live) = self.schedule_ssa_greedy_with_shift(
-            &mut ssa_ops,
-            enable_valu_shift,
-            &mut shifted_ops,
-        )?;
+        let mut greedy_select_fma_ops = HashSet::new();
+        let (cycles, sched_budget_exceeded, _sched_peak_live) = 
+            self.schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+                &mut ssa_ops,
+                enable_valu_shift,
+                &mut shifted_ops,
+                1536, // Scratch budget
+                Some(&mut greedy_select_fma_ops),
+                None, // Don't need cycle hints for greedy path
+                None,
+            )?;
 
         // Elide barriers before address assignment and lowering
         // (barriers are scheduling-only, not real hardware instructions)
@@ -198,11 +205,13 @@ impl SsaTickTockKernelBuilder {
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         // Greedy scheduler always uses Load for ConstChoice (no AddImm decisions)
+        // Greedy scheduler chooses SelectChoice path based on resource availability
         let ops = lower_ssa_ops_with_shift(
             &ssa_ops,
             &address_result.vreg_to_addr,
             &shifted_ops,
-            &HashSet::new(), // Greedy always uses Load
+            &HashSet::new(), // Greedy always uses Load for ConstChoice
+            &greedy_select_fma_ops, // Pass greedy's SelectChoice decisions
         );
 
         let valu_shifted = shifted_ops.len();
@@ -257,12 +266,21 @@ impl SsaTickTockKernelBuilder {
 
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
+        // Collect SelectChoice decisions from greedy scheduler
         let mut greedy_shifted = HashSet::new();
-        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = self.schedule_ssa_greedy_with_shift(
-            &mut ssa_ops,
-            enable_valu_shift, // Match CP-SAT shift setting for hints
-            &mut greedy_shifted,
-        )?;
+        let mut greedy_select_fma_ops = HashSet::new();
+        let mut greedy_select_sub_cycles = HashMap::new();
+        let mut greedy_select_fma_cycles = HashMap::new();
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = 
+            self.schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+                &mut ssa_ops,
+                enable_valu_shift, // Match CP-SAT shift setting for hints
+                &mut greedy_shifted,
+                1536, // Scratch budget
+                Some(&mut greedy_select_fma_ops),
+                Some(&mut greedy_select_sub_cycles),
+                Some(&mut greedy_select_fma_cycles),
+            )?;
 
         if verbose {
             eprintln!(
@@ -302,6 +320,7 @@ impl SsaTickTockKernelBuilder {
             verbose,
             stop_after_first_solution: false,
             enable_valu_shift,
+            enable_select_choice: true, // Enable SelectChoice optimization
             scratch_budget: 1536, // Hardware limit
         };
 
@@ -321,8 +340,61 @@ impl SsaTickTockKernelBuilder {
         }
         let greedy_hints_opt = Some(&greedy_hints);
 
-        let cpsat_result = schedule_ssa_cpsat(&ssa_ops, cpsat_config, greedy_hints_opt.map(|v| v.as_slice()), shift_hints)
-            .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
+        // Pass SelectChoice hints from greedy scheduler
+        // Note: SelectChoice decisions are keyed by op ID, which remains constant after barrier elision
+        // We just need to verify the SelectChoice ops still exist after elision
+        let mut select_choice_hints_set = HashSet::new();
+        let mut select_sub_cycles_map = HashMap::new();
+        let mut select_fma_cycles_map = HashMap::new();
+        
+        // Build set of op IDs that exist after barrier elision
+        let op_ids_after_elision: HashSet<usize> = ssa_ops.iter().map(|op| op.id).collect();
+        
+        // Filter greedy SelectChoice decisions to only include ops that still exist after elision
+        for &select_choice_id in &greedy_select_fma_ops {
+            if op_ids_after_elision.contains(&select_choice_id) {
+                select_choice_hints_set.insert(select_choice_id);
+            }
+        }
+        
+        for (select_choice_id, &cycle) in &greedy_select_sub_cycles {
+            if op_ids_after_elision.contains(select_choice_id) {
+                select_sub_cycles_map.insert(*select_choice_id, cycle);
+            }
+        }
+        
+        for (select_choice_id, &cycle) in &greedy_select_fma_cycles {
+            if op_ids_after_elision.contains(select_choice_id) {
+                select_fma_cycles_map.insert(*select_choice_id, cycle);
+            }
+        }
+        
+        let select_choice_hints = if select_choice_hints_set.is_empty() {
+            None
+        } else {
+            Some(&select_choice_hints_set)
+        };
+        let select_sub_cycles = if select_sub_cycles_map.is_empty() {
+            None
+        } else {
+            Some(&select_sub_cycles_map)
+        };
+        let select_fma_cycles = if select_fma_cycles_map.is_empty() {
+            None
+        } else {
+            Some(&select_fma_cycles_map)
+        };
+        
+        let cpsat_result = schedule_ssa_cpsat(
+            &ssa_ops,
+            cpsat_config,
+            greedy_hints_opt.map(|v| v.as_slice()),
+            shift_hints,
+            select_choice_hints,
+            select_sub_cycles,
+            select_fma_cycles,
+        )
+        .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
         // Apply cycle assignments
         for (idx, op) in ssa_ops.iter_mut().enumerate() {
@@ -381,6 +453,7 @@ impl SsaTickTockKernelBuilder {
             &address_result.vreg_to_addr,
             &shifted_ops,
             &cpsat_result.const_add_imm_ops, // CP-SAT decisions for ConstChoice
+            &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
         );
 
         Ok(SsaScheduleResult {

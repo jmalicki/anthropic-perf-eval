@@ -753,6 +753,38 @@ impl SsaEmitContext {
         dest
     }
 
+    /// Emit SelectChoice: result = cond ? true_val : false_val
+    /// Allows CP-SAT to choose between vselect (1 Flow op) and FMA path (2 VALU ops: sub + fma).
+    ///
+    /// If `false_val = 0`, subtraction is not needed (FMA simplifies to multiply only).
+    #[track_caller]
+    pub fn emit_select_choice(&mut self, cond: VReg, true_val: VReg, false_val: VReg) -> VReg {
+        assert!(cond.is_vector(), "SelectChoice cond must be vector");
+        assert!(true_val.is_vector(), "SelectChoice true_val must be vector");
+        assert!(false_val.is_vector(), "SelectChoice false_val must be vector");
+
+        let dest = self.fresh_vector();
+        
+        // Detect zero case: if false_val is constant 0, subtraction is not needed
+        let needs_subtraction = self.vreg_constants.get(&false_val) != Some(&0);
+        
+        let mut op = SsaOp::new(
+            0,
+            Engine::Flow, // Default engine (will be overridden by scheduler choice)
+            Opcode::SelectChoice,
+            Some(dest),
+            vec![
+                Operand::VReg(cond),
+                Operand::VReg(true_val),
+                Operand::VReg(false_val),
+            ],
+        );
+        op.needs_subtraction = needs_subtraction;
+        
+        self.emit(op);
+        dest
+    }
+
     // ========================================================================
     // Barrier Operations (Scheduling-only)
     // ========================================================================

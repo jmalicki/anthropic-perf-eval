@@ -2192,6 +2192,164 @@ mod ssa_tests {
             }
         }
     }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_decisions() {
+        // Build a simple kernel with SelectChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit vector condition and values
+        let cond = emit.emit_valu(Opcode::Eq, emit.emit_const(0), emit.emit_const(1));
+        let true_val = emit.emit_vbroadcast(emit.emit_const(10));
+        let false_val = emit.emit_vbroadcast(emit.emit_const(20));
+        
+        // Emit SelectChoice ops
+        let sel1 = emit.emit_select_choice(cond, true_val, false_val);
+        let sel2 = emit.emit_select_choice(cond, true_val, false_val);
+        
+        // Use results
+        let _sum = emit.emit_valu(Opcode::Add, sel1, sel2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                enable_select_choice: true, // Enable SelectChoice
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let result = result.unwrap();
+
+        // Verify all ops are scheduled
+        assert_eq!(result.cycle_assignments.len(), emit.ops.len());
+
+        // Verify SelectChoice decisions are extracted
+        // The result should contain select_fma_ops (may be empty if solver chose vselect)
+        assert!(result.select_fma_ops.len() <= 2, 
+            "Should have at most 2 SelectChoice ops using FMA path");
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_roundtrip() {
+        // Build a simple kernel with SelectChoice ops
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit vector condition and values
+        let cond = emit.emit_valu(Opcode::Eq, emit.emit_const(0), emit.emit_const(1));
+        let true_val = emit.emit_vbroadcast(emit.emit_const(10));
+        let false_val = emit.emit_vbroadcast(emit.emit_const(20));
+        
+        // Emit SelectChoice ops
+        let sel1 = emit.emit_select_choice(cond, true_val, false_val);
+        let sel2 = emit.emit_select_choice(cond, true_val, false_val);
+        
+        // Use results
+        let _sum = emit.emit_valu(Opcode::Add, sel1, sel2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                enable_select_choice: true,
+                scratch_budget: 1536,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Find SelectChoice op IDs
+        let select_choice_ids: Vec<usize> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::SelectChoice)
+            .map(|op| op.id)
+            .collect();
+
+        assert_eq!(select_choice_ids.len(), 2, "Should have 2 SelectChoice ops");
+
+        // Verify decisions were extracted
+        assert!(cpsat_result.select_fma_ops.len() <= 2,
+            "Should have at most 2 SelectChoice ops using FMA path");
+
+        // Now test round-trip: lower using CP-SAT decisions
+        let mut vreg_to_addr = HashMap::new();
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if let Some(dest) = op.dest {
+                vreg_to_addr.insert(dest, idx as i64 * 10); // Simple address assignment
+            }
+        }
+
+        let lowered_ops = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &vreg_to_addr,
+            &HashSet::new(), // No shifted ops
+            &HashSet::new(), // No ConstChoice AddImm ops
+            &cpsat_result.select_fma_ops, // Use CP-SAT decisions
+        );
+
+        // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
+        for select_choice_id in &select_choice_ids {
+            if cpsat_result.select_fma_ops.contains(select_choice_id) {
+                // CP-SAT chose FMA path - verify sub and fma ops exist
+                let sub_op = lowered_ops.iter()
+                    .find(|op| op.id == *select_choice_id && op.engine == Engine::Valu);
+                assert!(sub_op.is_some(), 
+                    "SelectChoice op {} should be lowered to sub op (VALU)", select_choice_id);
+                
+                let fma_op = lowered_ops.iter()
+                    .find(|op| op.id == *select_choice_id + 1000000 && op.engine == Engine::Valu);
+                assert!(fma_op.is_some(), 
+                    "SelectChoice op {} should be lowered to fma op (VALU)", select_choice_id);
+                
+                // Verify fma is scheduled after sub
+                let sub_cycle = sub_op.unwrap().cycle;
+                let fma_cycle = fma_op.unwrap().cycle;
+                assert!(fma_cycle >= sub_cycle + 1,
+                    "FMA should be scheduled after sub: sub={}, fma={}", sub_cycle, fma_cycle);
+            } else {
+                // CP-SAT chose vselect path - verify vselect op exists
+                let vselect_op = lowered_ops.iter()
+                    .find(|op| op.id == *select_choice_id && op.engine == Engine::Flow);
+                assert!(vselect_op.is_some(), 
+                    "SelectChoice op {} should be lowered to vselect op (Flow)", select_choice_id);
+                
+                match &vselect_op.unwrap().slot[0] {
+                    SlotVal::Str(s) => assert_eq!(s, "vselect",
+                        "SelectChoice op {} should be vselect", select_choice_id),
+                    _ => panic!("vselect slot[0] should be Str"),
+                }
+            }
+        }
+    }
 }
 
 /// Schedule with CP-SAT and fall back to greedy if it fails.

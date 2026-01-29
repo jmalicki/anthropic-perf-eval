@@ -88,8 +88,12 @@ pub struct SsaScratchContext {
     pub v_td_4: Option<VReg>,        // Vector td_4
     pub v_td_5: Option<VReg>,        // Vector td_5
     pub v_td_6: Option<VReg>,        // Vector td_6
+    pub v_tc1: Option<VReg>,         // Vector tc[1] (computed as v_tc2 + v_td_1)
     pub v_tc2: Option<VReg>,         // Vector tc[2]
     pub v_tc3: Option<VReg>,         // Vector tc[3]
+    pub v_tc4: Option<VReg>,         // Vector tc[4] (computed as v_tc3 + v_td_4)
+    pub v_tc5: Option<VReg>,         // Vector tc[5] (computed as v_tc3 + v_td_5)
+    pub v_tc6: Option<VReg>,         // Vector tc[6] (computed as v_tc3 + v_td_6)
 
     // =========================================================================
     // Depth 3 Vectors
