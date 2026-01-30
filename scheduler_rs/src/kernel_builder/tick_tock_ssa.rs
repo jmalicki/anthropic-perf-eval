@@ -332,28 +332,35 @@ impl SsaTickTockKernelBuilder {
         let budget_result = sections_exceeding_budget(&ssa_ops, 1536);
         let n_exceeding: usize = budget_result.section_exceeds_budget.iter().filter(|&&b| b).count();
         if verbose {
-            eprintln!("Phase 1: per-section scratch budget check (budget=1536):");
+            eprintln!();
+            eprintln!("================================================================================");
+            eprintln!("  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = 1536 words)");
+            eprintln!("  Sections that exceed budget will get a per-section CP-SAT run (feasibility).");
+            eprintln!("================================================================================");
+            eprintln!();
             for (k, &peak) in budget_result.section_peaks.iter().enumerate() {
                 if budget_result.section_exceeds_budget[k] {
                     eprintln!(
-                        "  Section {}: peak {} words > 1536 -> running per-section CP-SAT feasibility",
+                        "  Section {:2}:  peak {} words  > 1536  -->  RUN PER-SECTION CP-SAT (feasibility)",
                         k, peak
                     );
                 } else {
                     eprintln!(
-                        "  Section {}: peak {} words <= 1536 -> skip per-section CP-SAT",
+                        "  Section {:2}:  peak {} words  <= 1536  -->  SKIP (within budget)",
                         k, peak
                     );
                 }
             }
+            eprintln!();
             if n_exceeding > 0 {
                 eprintln!(
-                    "Phase 1: {} section(s) exceed budget, running per-section CP-SAT for those",
+                    "  SUMMARY: {} section(s) exceed budget; running per-section CP-SAT for those.",
                     n_exceeding
                 );
             } else {
-                eprintln!("Phase 1: all sections within budget, skipping per-section CP-SAT");
+                eprintln!("  SUMMARY: All sections within budget; no per-section CP-SAT.");
             }
+            eprintln!();
         }
         let vreg_def_sec = vreg_def_section(&ssa_ops, &boundaries);
         let mut section_offset: i32 = 0;
@@ -367,6 +374,13 @@ impl SsaTickTockKernelBuilder {
                 if global_indices.is_empty() {
                     section_offset += 0;
                     continue;
+                }
+                if verbose {
+                    eprintln!("--------------------------------------------------------------------------------");
+                    eprintln!("  PER-SECTION CP-SAT:  SECTION {}  (feasibility — find any valid schedule)", k);
+                    eprintln!("  {} ops in this section. Goal: stay within scratch budget.", global_indices.len());
+                    eprintln!("--------------------------------------------------------------------------------");
+                    eprintln!();
                 }
                 let segment_op_ids: HashSet<usize> =
                     global_indices.iter().map(|&i| ssa_ops[i].id).collect();
@@ -397,6 +411,7 @@ impl SsaTickTockKernelBuilder {
                     stop_after_first_solution: true,
                     enable_valu_shift,
                     scratch_budget: 1536,
+                    model_name: Some(format!("section_{}_feasibility", k)),
                 };
                 let seg_shift = if enable_valu_shift {
                     Some(&greedy_shifted)
@@ -428,10 +443,12 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 if verbose {
+                    eprintln!();
                     eprintln!(
-                        "  Section {} feasibility: {} cycles (merged into global schedule)",
+                        "  --> Section {} done: {} cycles (merged into global schedule)",
                         k, seg_result.makespan
                     );
+                    eprintln!();
                 }
             }
             // Advance section_offset by this section's makespan
@@ -471,6 +488,7 @@ impl SsaTickTockKernelBuilder {
             stop_after_first_solution: false,
             enable_valu_shift,
             scratch_budget: 1536, // Hardware limit
+            model_name: Some("full_kernel_optimization".to_string()),
         };
 
         // Pass shift hints if VALU shift is enabled
@@ -482,11 +500,6 @@ impl SsaTickTockKernelBuilder {
             None
         };
 
-        // Always pass greedy hints - CP-SAT handles infeasible hints gracefully
-        // The cycle timings are still valuable even if budget was exceeded
-        if greedy_budget_exceeded && verbose {
-            eprintln!("  Passing greedy hints despite budget exceeded (CP-SAT handles infeasible hints)");
-        }
         let greedy_hints_opt = Some(&greedy_hints);
 
         // Pass SelectChoice hints from greedy scheduler
@@ -509,6 +522,18 @@ impl SsaTickTockKernelBuilder {
         } else {
             Some(&select_choice_hints_set)
         };
+
+        if verbose {
+            eprintln!();
+            eprintln!("================================================================================");
+            eprintln!("  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)");
+            eprintln!("  All rounds merged; solving for minimum cycles. Scratch budget = 1536.");
+            if greedy_budget_exceeded {
+                eprintln!("  (Greedy exceeded budget; hints may be infeasible — CP-SAT will search.)");
+            }
+            eprintln!("================================================================================");
+            eprintln!();
+        }
 
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
@@ -2590,6 +2615,7 @@ mod tests {
                 stop_after_first_solution: true,  // Return first feasible solution
                 scratch_budget: 1536,  // Hardware limit
                 enable_valu_shift: false,
+                model_name: None,
             },
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),

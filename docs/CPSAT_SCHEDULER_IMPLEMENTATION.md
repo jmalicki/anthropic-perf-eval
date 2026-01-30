@@ -45,6 +45,13 @@ default = []
 cpsat = ["cp_sat"]
 ```
 
+The `jmalicki/cp_sat` fork should include `set_model_name` on `CpModelBuilder` so that solver log output (e.g. "Presolved optimization model 'name'") shows a descriptive name (e.g. "section_5_feasibility", "full_kernel_optimization"). In `builder.rs` add:
+```rust
+pub fn set_model_name(&mut self, name: impl Into<String>) {
+    self.proto.name = name.into();
+}
+```
+
 ### Build Environment
 ```bash
 # OR-Tools must be installed via Homebrew

@@ -923,6 +923,8 @@ pub struct SsaCpsatConfig {
     pub enable_valu_shift: bool,
     /// Scratch memory budget (max simultaneous live words). 0 = no constraint.
     pub scratch_budget: usize,
+    /// Optional name for the model (appears in solver log, e.g. "Presolved optimization model 'name'").
+    pub model_name: Option<String>,
 }
 
 impl Default for SsaCpsatConfig {
@@ -933,6 +935,7 @@ impl Default for SsaCpsatConfig {
             stop_after_first_solution: false,
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
+            model_name: None,
         }
     }
 }
@@ -1120,6 +1123,7 @@ pub fn schedule_ssa_cpsat(
         stop_after_first_solution,
         enable_valu_shift,
         scratch_budget,
+        model_name,
     } = config;
     let greedy_hints = hints.greedy_hints;
     let shift_hints = hints.shift_hints;
@@ -1173,6 +1177,9 @@ pub fn schedule_ssa_cpsat(
 
     // 3. Build the CP model
     let mut model = CpModelBuilder::default();
+    if let Some(name) = &model_name {
+        model.set_model_name(name);
+    }
 
     // Build op_id to index mapping
     let op_id_to_idx: HashMap<usize, usize> = ops
@@ -2115,6 +2122,7 @@ mod ssa_tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2166,6 +2174,7 @@ mod ssa_tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2279,6 +2288,7 @@ mod ssa_tests {
                 stop_after_first_solution: false, // Allow optimization
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2370,6 +2380,7 @@ mod ssa_tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2417,6 +2428,7 @@ mod ssa_tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2807,6 +2819,7 @@ mod tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2863,6 +2876,7 @@ mod tests {
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
@@ -2981,6 +2995,7 @@ mod tests {
                 stop_after_first_solution: false, // Allow optimization
                 enable_valu_shift: false,
                 scratch_budget: 1536,
+                model_name: None,
             },
             SsaCpsatHints::default(),
         );
