@@ -118,13 +118,18 @@ impl SsaTickTockKernelBuilder {
     /// 4. Address assignment via linear scan
     /// 5. Lowering to concrete ops (expanding shifted VALU ops)
     pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, String> {
-        self.build_and_schedule_with_options(self.config.enable_valu_shift)
+        self.build_and_schedule_with_options(self.config.enable_valu_shift, None)
     }
 
     /// Build and schedule with explicit VALU shift option.
+    ///
+    /// `scratch_budget_override`: If `Some(b)`, use `b` as scratch budget for the greedy
+    /// scheduler (for tests that need to trigger force-schedule / budget_exceeded).
+    /// If `None`, use the hardware limit 1536.
     pub fn build_and_schedule_with_options(
         &mut self,
         enable_valu_shift: bool,
+        scratch_budget_override: Option<usize>,
     ) -> Result<SsaScheduleResult, String> {
         println!("[DEBUG] build_and_schedule_with_options ENTRY");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -151,6 +156,8 @@ impl SsaTickTockKernelBuilder {
         // constraining cross-round interleaving and reducing peak liveness
         compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
 
+        let scratch_budget = scratch_budget_override.unwrap_or(1536);
+
         // Schedule using greedy scheduler with VALU→ALU shifting
         // Collect SelectChoice decisions from greedy scheduler
         let mut shifted_ops: HashSet<usize> = HashSet::new();
@@ -160,7 +167,7 @@ impl SsaTickTockKernelBuilder {
                 &mut ssa_ops,
                 enable_valu_shift,
                 &mut shifted_ops,
-                1536, // Scratch budget
+                scratch_budget,
                 Some(&mut greedy_select_fma_ops),
                 None, // Don't need cycle hints for greedy path
                 None,
@@ -184,6 +191,7 @@ impl SsaTickTockKernelBuilder {
 
         // Assign addresses via linear scan
         let mut assign_config = AddressAssignConfig::default();
+        assign_config.budget = scratch_budget;
 
         // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
         if let Some(zero) = self.zero_vreg {
@@ -637,6 +645,26 @@ mod tests {
         );
         // Scheduler uses emergency force-scheduling when budget is tight, so it still succeeds
         assert!(result2.is_ok(), "Budget=8 should still succeed (emergency force-scheduling): {:?}", result2.err());
+        let (_cycles2, budget_exceeded, _peak2) = result2.unwrap();
+        assert!(budget_exceeded, "When force-schedule is used (budget=8), budget_exceeded must be true");
+    }
+
+    /// Test that budget_exceeded from the greedy scheduler is combined with address
+    /// assignment and reflected in the final SsaScheduleResult (CRITICAL_TESTS_PLAN 5.2).
+    #[test]
+    fn test_budget_exceeded_propagates() {
+        // Build and schedule with a tiny scratch budget so the greedy scheduler
+        // must force-schedule and set sched_budget_exceeded. The final result
+        // must have budget_exceeded = sched_budget_exceeded || address_result.budget_exceeded.
+        let config = KernelConfig::new(10, 2047, 256, 4);
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+        let result = builder.build_and_schedule_with_options(false, Some(8));
+        assert!(result.is_ok(), "Build+schedule with budget=8 should complete: {:?}", result.err());
+        let ssa_result = result.unwrap();
+        assert!(
+            ssa_result.budget_exceeded,
+            "budget_exceeded must propagate to final result when scheduler exceeds budget"
+        );
     }
 
     /// Test that greedy scheduler with generous budget allows parallel ops.

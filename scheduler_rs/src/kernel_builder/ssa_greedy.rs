@@ -594,9 +594,20 @@ impl SsaTickTockKernelBuilder {
                 }
             }
 
+            // ============================================================================
+            // EMERGENCY FALLBACK: FORCE-SCHEDULE MECHANISM
+            // ============================================================================
+            // IMPORTANT: DO NOT REMOVE THIS CODE DURING DEBUGGING UNLESS EXPLICITLY
+            // INSTRUCTED BY THE USER. This force-schedule mechanism is intentional and
+            // necessary to prevent deadlock when the greedy scheduler cannot make progress
+            // due to budget constraints. While it may exceed the scratch budget, it ensures
+            // the scheduler completes and produces a valid (though potentially suboptimal)
+            // schedule.
+            //
             // Emergency fallback: if we made no progress and have budget-deferred ops,
             // force-schedule the highest-LUC op to break the deadlock.
             // This temporarily exceeds the budget but allows progress.
+            // ============================================================================
             if !budget_deferred.is_empty() {
                 // Sort by LUC and pick the best one
                 budget_deferred.sort_by(|&a, &b| {
@@ -625,7 +636,11 @@ impl SsaTickTockKernelBuilder {
                 };
 
                 if fits_slots {
-                    // Force schedule, ignoring budget constraint - this exceeds budget!
+                    // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
+                    // This is intentional behavior - DO NOT REMOVE unless explicitly instructed.
+                    // The force-schedule allows progress when retry loops fail to free enough
+                    // VRegs. The budget_exceeded flag tracks this for reporting.
+                    //
                     // Dump usage breakdown once per cycle with budget violation
                     if last_budget_dump_cycle != Some(cycle) {
                         Self::dump_live_usage_breakdown(
@@ -976,6 +991,54 @@ mod tests {
     use super::*;
     use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, SsaEmitContext};
     use crate::types::Opcode;
+
+    // =========================================================================
+    // Force-Schedule and Budget-Exceeded Tests (CRITICAL_TESTS_PLAN)
+    //
+    // These tests verify that the emergency force-schedule path sets budget_exceeded
+    // and that the flag is not removed during debugging unless explicitly instructed.
+    // =========================================================================
+
+    /// Test that when the greedy scheduler force-schedules (budget too tight),
+    /// it sets budget_exceeded to true and returns Ok.
+    ///
+    /// Scenario: two vbroadcasts (8 words each) feed one VALU add. With budget 8,
+    /// after the first vbroadcast we have 8 words live; the second vbroadcast would
+    /// push to 16 > 8, so it is deferred. No other op is ready. The retry loop
+    /// makes no progress, so the emergency fallback force-schedules the second
+    /// vbroadcast and sets budget_exceeded.
+    #[test]
+    fn test_greedy_fallback_sets_budget_exceeded() {
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);                    // op 0
+        let s2 = emit.emit_const(2);                    // op 1
+        let v1 = emit.emit_vbroadcast(s1);              // op 2 - 8 words
+        let v2 = emit.emit_vbroadcast(s2);               // op 3 - 8 words
+        let v3 = emit.emit_valu(Opcode::Add, v1, v2);    // op 4 - needs v1, v2 live
+        let addr = emit.emit_const(100);                 // op 5
+        emit.emit_vstore(addr, v3);                      // op 6 - sink
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+        let mut shifted_ops = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            8, // Tight budget: 2 vectors (16 words) cannot fit in 8
+        );
+
+        assert!(result.is_ok(), "Scheduler should complete (force-schedule): {:?}", result.err());
+        let (_cycles, budget_exceeded, peak_live) = result.unwrap();
+        assert!(
+            budget_exceeded,
+            "Force-schedule path must set budget_exceeded=true when budget is exceeded; got budget_exceeded=false, peak_live={}",
+            peak_live
+        );
+    }
 
     // =========================================================================
     // Barrier + Dead Store Interaction Tests
