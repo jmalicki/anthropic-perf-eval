@@ -327,9 +327,34 @@ impl SsaTickTockKernelBuilder {
             );
         }
 
-        // Phase 1: Per-section feasibility (if any section exceeds scratch budget)
+        // Phase 1: Per-section feasibility (only when a section exceeds scratch budget)
         let boundaries = section_boundaries(&ssa_ops);
         let budget_result = sections_exceeding_budget(&ssa_ops, 1536);
+        let n_exceeding: usize = budget_result.section_exceeds_budget.iter().filter(|&&b| b).count();
+        if verbose {
+            eprintln!("Phase 1: per-section scratch budget check (budget=1536):");
+            for (k, &peak) in budget_result.section_peaks.iter().enumerate() {
+                if budget_result.section_exceeds_budget[k] {
+                    eprintln!(
+                        "  Section {}: peak {} words > 1536 -> running per-section CP-SAT feasibility",
+                        k, peak
+                    );
+                } else {
+                    eprintln!(
+                        "  Section {}: peak {} words <= 1536 -> skip per-section CP-SAT",
+                        k, peak
+                    );
+                }
+            }
+            if n_exceeding > 0 {
+                eprintln!(
+                    "Phase 1: {} section(s) exceed budget, running per-section CP-SAT for those",
+                    n_exceeding
+                );
+            } else {
+                eprintln!("Phase 1: all sections within budget, skipping per-section CP-SAT");
+            }
+        }
         let vreg_def_sec = vreg_def_section(&ssa_ops, &boundaries);
         let mut section_offset: i32 = 0;
 

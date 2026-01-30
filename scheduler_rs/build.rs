@@ -4,6 +4,27 @@
 //! and sets the necessary linker flags for the cpsat feature.
 
 fn main() {
+    // Require BUILD_FROM_PROJECT_ROOT=1 so we don't install into scheduler_rs/.venv by mistake.
+    // When you run maturin from project root, set it: BUILD_FROM_PROJECT_ROOT=1 uv run maturin develop --manifest-path scheduler_rs/Cargo.toml
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let manifest_path = std::path::Path::new(&manifest_dir);
+    let is_nested = manifest_path
+        .file_name()
+        .map_or(false, |n| n == "scheduler_rs")
+        && manifest_path
+            .parent()
+            .map_or(false, |p| p.join("pyproject.toml").exists());
+    if is_nested {
+        let ok = std::env::var("BUILD_FROM_PROJECT_ROOT")
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true") || v == "yes");
+        if !ok {
+            panic!(
+                "Do not run maturin/cargo from inside scheduler_rs/. \
+                 Run from the project root with:\n  BUILD_FROM_PROJECT_ROOT=1 uv run maturin develop --manifest-path scheduler_rs/Cargo.toml"
+            );
+        }
+    }
+
     // Only add protobuf linking when cpsat feature is enabled
     #[cfg(feature = "cpsat")]
     {

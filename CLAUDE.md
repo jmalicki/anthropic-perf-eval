@@ -31,11 +31,17 @@ uv pip install -e .
 uv pip install -e ".[dev]"
 ```
 
-### Rust Scheduler (in scheduler_rs/)
+### Rust Scheduler (scheduler_rs/)
+**Always build from the project root** so the extension installs into the project venv (used by `uv run`). Building from inside `scheduler_rs/` installs into `scheduler_rs/.venv` and will fail with an explicit error.
 ```bash
-cd scheduler_rs
-maturin develop          # Build and install for development
-maturin build --release  # Build optimized release
+# From project root (required)
+BUILD_FROM_PROJECT_ROOT=1 uv run maturin develop --manifest-path scheduler_rs/Cargo.toml
+
+# Or use the helper script (from project root)
+./scripts/build_scheduler_rs.sh
+
+# Release build
+BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path scheduler_rs/Cargo.toml
 ```
 
 ### Running Tests
