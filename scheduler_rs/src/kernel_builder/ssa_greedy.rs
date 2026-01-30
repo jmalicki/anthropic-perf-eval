@@ -30,7 +30,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{Engine, Opcode, Operand, SsaOp, VReg, VLEN};
+use crate::types::{EmissionPhase, Engine, Opcode, Operand, SsaOp, VReg, VLEN};
 
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 use super::tick_tock_ssa::SsaTickTockKernelBuilder;
@@ -60,7 +60,7 @@ impl SsaTickTockKernelBuilder {
         // Find the ops that define each live VReg
         let mut by_round: BTreeMap<i32, (usize, usize)> = BTreeMap::new(); // round -> (count, words)
         let mut by_type: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // type -> (count, words)
-        let mut by_phase: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // phase -> (count, words)
+        let mut by_phase: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // phase (branch includes round) -> (count, words)
 
         for op in ops {
             if let Some(dest) = op.dest {
@@ -84,13 +84,18 @@ impl SsaTickTockKernelBuilder {
                     entry.0 += 1;
                     entry.1 += words;
 
-                    // By phase
-                    let phase = op
-                        .source_info
-                        .as_ref()
-                        .map(|s| s.phase.as_str())
-                        .unwrap_or("unknown");
-                    let entry = by_phase.entry(phase).or_insert((0, 0));
+                    // By phase: for Branch, include round (e.g. branch_r3) so we see which round generated the allocation
+                    let phase_label = op.source_info.as_ref().map(|s| {
+                        if s.phase == EmissionPhase::Branch {
+                            match s.round {
+                                Some(r) => format!("branch_r{}", r),
+                                None => s.phase.as_str().to_string(),
+                            }
+                        } else {
+                            s.phase.as_str().to_string()
+                        }
+                    }).unwrap_or_else(|| "unknown".to_string());
+                    let entry = by_phase.entry(phase_label).or_insert((0, 0));
                     entry.0 += 1;
                     entry.1 += words;
                 }

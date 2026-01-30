@@ -56,7 +56,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{LiveInterval, Opcode, Operand, SsaOp, VarType, VReg, VLEN};
+use crate::types::{EmissionPhase, LiveInterval, Opcode, Operand, SsaOp, VarType, VReg, VLEN};
 
 /// Result of address assignment.
 #[derive(Debug, Default)]
@@ -615,7 +615,17 @@ pub fn build_vreg_metadata(
     let mut metadata = HashMap::new();
     for op in ops {
         if let Some(dest) = op.dest {
-            let phase = op.source_info.as_ref().map(|s| s.phase.as_str().to_string());
+            // For Branch phase, include round in the phase label (e.g. branch_r3)
+            let phase = op.source_info.as_ref().map(|s| {
+                if s.phase == EmissionPhase::Branch {
+                    match s.round {
+                        Some(r) => format!("branch_r{}", r),
+                        None => s.phase.as_str().to_string(),
+                    }
+                } else {
+                    s.phase.as_str().to_string()
+                }
+            });
             let round = op.source_info.as_ref().and_then(|s| s.round);
             metadata.insert(dest, (op.var_type, phase, round));
         }
