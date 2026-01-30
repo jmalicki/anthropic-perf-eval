@@ -937,6 +937,21 @@ impl Default for SsaCpsatConfig {
     }
 }
 
+/// Optional hints and segment input for SSA CP-SAT.
+/// Use struct literal syntax to pass only what you need; omit fields for `None`.
+/// Example: `SsaCpsatHints { greedy_hints: Some(&hints), ..Default::default() }`
+#[derive(Debug, Clone, Default)]
+pub struct SsaCpsatHints<'a> {
+    /// Cycle assignments from greedy scheduler (warm start).
+    pub greedy_hints: Option<&'a [i32]>,
+    /// Shift decisions from greedy (op ID -> should shift to ALU).
+    pub shift_hints: Option<&'a HashSet<usize>>,
+    /// SelectChoice decisions from greedy (op ID -> use FMA path).
+    pub select_choice_hints: Option<&'a HashSet<usize>>,
+    /// Segment mode: (VReg, op index of last use); adds fixed [0, end] intervals to scratch (per-section feasibility).
+    pub initial_live: Option<&'a [(VReg, usize)]>,
+}
+
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
 #[derive(Debug, Clone)]
 pub struct SsaCpsatResult {
@@ -1085,9 +1100,8 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
 ///
 /// # Arguments
 /// * `ops` - SSA operations to schedule (with dep_ids computed)
-/// * `config` - Configuration for the CP-SAT scheduler
-/// * `greedy_hints` - Optional cycle assignments from greedy scheduler
-/// * `shift_hints` - Optional shift decisions from greedy scheduler (op idx -> should shift)
+/// * `config` - Solver configuration (time limit, scratch budget, etc.)
+/// * `hints` - Optional warm-start and segment input; use `SsaCpsatHints::default()` for none
 ///
 /// # Returns
 /// * `Some(SsaCpsatResult)` if a solution was found (includes shift decisions)
@@ -1096,9 +1110,7 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
 pub fn schedule_ssa_cpsat(
     ops: &[SsaOp],
     config: SsaCpsatConfig,
-    greedy_hints: Option<&[i32]>,
-    shift_hints: Option<&HashSet<usize>>,
-    select_choice_hints: Option<&HashSet<usize>>,
+    hints: SsaCpsatHints<'_>,
 ) -> Option<SsaCpsatResult> {
     use cp_sat::builder::BoolVar;
 
@@ -1109,6 +1121,10 @@ pub fn schedule_ssa_cpsat(
         enable_valu_shift,
         scratch_budget,
     } = config;
+    let greedy_hints = hints.greedy_hints;
+    let shift_hints = hints.shift_hints;
+    let select_choice_hints = hints.select_choice_hints;
+    let initial_live = hints.initial_live;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -1516,7 +1532,6 @@ pub fn schedule_ssa_cpsat(
 
     // 8b. Add scratch pressure constraint (live VReg capacity)
     // Models: at any cycle, total size of live VRegs <= scratch_budget
-    eprintln!("DEBUG: scratch_budget = {}, verbose = {}", scratch_budget, verbose);
     if scratch_budget > 0 {
         // Build VReg -> defining op index mapping
         let mut vreg_def_op: HashMap<VReg, usize> = HashMap::new();
@@ -1661,6 +1676,28 @@ pub fn schedule_ssa_cpsat(
                 // Demand = size of VReg (1 for scalar, VLEN for vector)
                 let demand = vreg.size() as i64;
                 scratch_demands.push(demand);
+            }
+
+            // Segment mode: add fixed [0, last_use_cycle+1] intervals for live-in VRegs
+            if let Some(il) = initial_live {
+                let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
+                for (vreg, last_use_idx) in il {
+                    if *last_use_idx >= cycle_vars.len() {
+                        continue;
+                    }
+                    let end_expr = LinearExpr::from(cycle_vars[*last_use_idx]) + 1;
+                    let size = model.new_int_var_with_name(
+                        [(1, horizon + 1)],
+                        format!("init_live_size_{}", vreg.id),
+                    );
+                    model.add_eq(
+                        LinearExpr::from(zero_var) + LinearExpr::from(size),
+                        end_expr.clone(),
+                    );
+                    let interval = model.new_interval_var(zero_var, size, end_expr);
+                    scratch_intervals.push(interval);
+                    scratch_demands.push(vreg.size() as i64);
+                }
             }
 
             model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
@@ -2035,9 +2072,7 @@ pub fn schedule_ssa_cpsat(
 pub fn schedule_ssa_cpsat(
     _ops: &[SsaOp],
     _config: SsaCpsatConfig,
-    _greedy_hints: Option<&[i32]>,
-    _shift_hints: Option<&HashSet<usize>>,
-    _select_choice_hints: Option<&HashSet<usize>>,
+    _hints: SsaCpsatHints<'_>,
 ) -> Option<SsaCpsatResult> {
     eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
     None
@@ -2081,9 +2116,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2134,9 +2167,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2249,9 +2280,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2342,12 +2371,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2392,15 +2416,9 @@ mod ssa_tests {
                 verbose: false,
                 stop_after_first_solution: true,
                 enable_valu_shift: false,
-                enable_select_choice: true,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2790,9 +2808,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2848,9 +2864,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -2968,9 +2982,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -3407,9 +3419,7 @@ mod tests {
                 scratch_budget: 100,  // More than enough
                 ..Default::default()
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "Should find solution with generous budget");
@@ -3456,9 +3466,7 @@ mod tests {
                 scratch_budget: 100,
                 ..Default::default()
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result_generous.is_some(), "Should find solution with generous budget");
@@ -3474,9 +3482,7 @@ mod tests {
                 scratch_budget: 16,  // Only 2 vectors can be live at once
                 ..Default::default()
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         // The tight budget should either:
@@ -3517,9 +3523,7 @@ mod tests {
                 scratch_budget: 0,  // Disabled
                 ..Default::default()
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         assert!(result.is_some(), "Should find solution when scratch constraint disabled");
@@ -3556,8 +3560,10 @@ mod tests {
                 scratch_budget: 0, // Disable scratch constraint for this test
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with valid hints");
@@ -3602,8 +3608,10 @@ mod tests {
                 scratch_budget: 10, // Small but sufficient for scalars
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with valid hints and scratch constraint");
@@ -3650,8 +3658,10 @@ mod tests {
                 scratch_budget: 32, // Enough for 4 vectors
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with valid vector hints and scratch constraint");
@@ -3698,8 +3708,10 @@ mod tests {
                 scratch_budget: 16, // Only 2 vectors worth - not enough!
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The solver should either:
@@ -3754,8 +3766,10 @@ mod tests {
                 scratch_budget: 10, // Sufficient for scalars
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with same-cycle interval (size=1)");
@@ -3792,8 +3806,10 @@ mod tests {
                 scratch_budget: 10, // Sufficient
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with consecutive-cycle interval (size=2)");
@@ -3844,8 +3860,10 @@ mod tests {
                 scratch_budget: 20, // Sufficient for multiple scalars
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         assert!(result.is_some(), "Should find solution with gap interval (size=6)");
@@ -3894,8 +3912,10 @@ mod tests {
                 enable_valu_shift: false,
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The verification code should NOT panic, and we should get a valid result
@@ -3948,8 +3968,10 @@ mod tests {
                 enable_valu_shift: false,
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The verification code should NOT panic, and we should get a valid result
@@ -4002,8 +4024,11 @@ mod tests {
                 enable_valu_shift: true, // Enable VALU shifting
                 ..Default::default()
             },
-            Some(&hints),
-            Some(&shift_hints),
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                shift_hints: Some(&shift_hints),
+                ..Default::default()
+            },
         );
 
         // The verification code should NOT panic:
@@ -4072,8 +4097,10 @@ mod tests {
                 scratch_budget: 10, // Enable scratch constraint
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -4128,8 +4155,10 @@ mod tests {
                 scratch_budget: 10,
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -4182,8 +4211,10 @@ mod tests {
                 scratch_budget: 10,
                 ..Default::default()
             },
-            Some(&hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                ..Default::default()
+            },
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -4235,9 +4266,7 @@ mod tests {
                 scratch_budget: 2,  // CP-SAT needs 2 because no same-cycle reuse
                 ..Default::default()
             },
-            None,
-            None,
-            None, // select_choice_hints
+            SsaCpsatHints::default(),
         );
 
         // CP-SAT should find a solution with budget=2

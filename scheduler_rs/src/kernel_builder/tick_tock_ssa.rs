@@ -271,8 +271,10 @@ impl SsaTickTockKernelBuilder {
         verbose: bool,
         enable_valu_shift: bool,
     ) -> Result<SsaScheduleResult, String> {
-        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
-        use super::barrier_elision::count_barriers;
+        use crate::types::Opcode;
+        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+        use super::barrier_elision::{count_barriers, section_boundaries};
+        use super::round_budget::{sections_exceeding_budget, live_in_for_section, vreg_def_section};
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
@@ -323,6 +325,104 @@ impl SsaTickTockKernelBuilder {
                     String::new()
                 }
             );
+        }
+
+        // Phase 1: Per-section feasibility (if any section exceeds scratch budget)
+        let boundaries = section_boundaries(&ssa_ops);
+        let budget_result = sections_exceeding_budget(&ssa_ops, 1536);
+        let vreg_def_sec = vreg_def_section(&ssa_ops, &boundaries);
+        let mut section_offset: i32 = 0;
+
+        for k in 0..boundaries.len() {
+            if budget_result.section_exceeds_budget[k] {
+                let (start, end) = boundaries[k];
+                let global_indices: Vec<usize> = (start..end)
+                    .filter(|&i| ssa_ops[i].opcode != Opcode::Barrier)
+                    .collect();
+                if global_indices.is_empty() {
+                    section_offset += 0;
+                    continue;
+                }
+                let segment_op_ids: HashSet<usize> =
+                    global_indices.iter().map(|&i| ssa_ops[i].id).collect();
+                let segment_ops: Vec<SsaOp> = global_indices
+                    .iter()
+                    .map(|&i| {
+                        let mut op = ssa_ops[i].clone();
+                        op.dep_ids.retain(|id| segment_op_ids.contains(id));
+                        op
+                    })
+                    .collect();
+                let initial_live =
+                    live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let segment_hints: Vec<i32> = global_indices
+                    .iter()
+                    .map(|&i| {
+                        let c = ssa_ops[i].cycle;
+                        if c >= 0 {
+                            (c - section_offset).max(0)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                let config_feasibility = SsaCpsatConfig {
+                    time_limit_secs: (time_limit_secs * 0.25).min(300.0),
+                    verbose,
+                    stop_after_first_solution: true,
+                    enable_valu_shift,
+                    scratch_budget: 1536,
+                };
+                let seg_shift = if enable_valu_shift {
+                    Some(&greedy_shifted)
+                } else {
+                    None
+                };
+                let seg_select = if greedy_select_fma_ops.is_empty() {
+                    None
+                } else {
+                    Some(&greedy_select_fma_ops)
+                };
+                let seg_result = schedule_ssa_cpsat(
+                    &segment_ops,
+                    config_feasibility,
+                    SsaCpsatHints {
+                        greedy_hints: Some(&segment_hints),
+                        shift_hints: seg_shift,
+                        select_choice_hints: seg_select,
+                        initial_live: Some(&initial_live),
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| {
+                    format!("Per-section CP-SAT failed for section {}", k)
+                })?;
+                for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
+                    if seg_idx < global_indices.len() && cycle >= 0 {
+                        ssa_ops[global_indices[seg_idx]].cycle = section_offset + cycle;
+                    }
+                }
+                if verbose {
+                    eprintln!(
+                        "  Section {} feasibility: {} cycles (merged into global schedule)",
+                        k, seg_result.makespan
+                    );
+                }
+            }
+            // Advance section_offset by this section's makespan
+            let (start, end) = boundaries[k];
+            let mut min_c = i32::MAX;
+            let mut max_c = i32::MIN;
+            for idx in start..end {
+                let op = &ssa_ops[idx];
+                if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+                    min_c = min_c.min(op.cycle);
+                    max_c = max_c.max(op.cycle);
+                }
+            }
+            if min_c <= max_c {
+                section_offset += max_c - min_c + 1;
+            }
         }
 
         // Elide barriers before CP-SAT
@@ -388,9 +488,12 @@ impl SsaTickTockKernelBuilder {
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
             cpsat_config,
-            greedy_hints_opt.map(|v| v.as_slice()),
-            shift_hints,
-            select_choice_hints,
+            SsaCpsatHints {
+                greedy_hints: greedy_hints_opt.map(|v| v.as_slice()),
+                shift_hints,
+                select_choice_hints,
+                ..Default::default()
+            },
         )
         .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
@@ -2422,7 +2525,7 @@ mod tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_greedy_cpsat_roundtrip_budget_check() {
-        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig};
+        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
 
         // Build a full-scale kernel
         let config = KernelConfig::new(10, 2047, 256, 16);
@@ -2463,8 +2566,10 @@ mod tests {
                 scratch_budget: 1536,  // Hardware limit
                 enable_valu_shift: false,
             },
-            Some(&greedy_hints),
-            None,
+            SsaCpsatHints {
+                greedy_hints: Some(&greedy_hints),
+                ..Default::default()
+            },
         );
 
         match cpsat_result {

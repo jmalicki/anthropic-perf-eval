@@ -107,6 +107,71 @@ pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> Sectio
     }
 }
 
+/// VReg -> section index that defines it (from full ops and section boundaries).
+pub fn vreg_def_section(ops: &[SsaOp], boundaries: &[(usize, usize)]) -> HashMap<VReg, usize> {
+    let mut out = HashMap::new();
+    for (sec, &(start, end)) in boundaries.iter().enumerate() {
+        for idx in start..end {
+            let op = &ops[idx];
+            if op.opcode == Opcode::Barrier {
+                continue;
+            }
+            if let Some(dest) = op.dest {
+                out.insert(dest, sec);
+            }
+        }
+    }
+    out
+}
+
+/// Live-in VRegs for a section: defined in an earlier section, read in this section.
+/// Returns (VReg, segment_last_use_idx): segment index (0-based within non-barrier ops of this section)
+/// of the op that last uses this VReg (by greedy cycle).
+pub fn live_in_for_section(
+    ops: &[SsaOp],
+    boundaries: &[(usize, usize)],
+    section_k: usize,
+    vreg_def_section: &HashMap<VReg, usize>,
+) -> Vec<(VReg, usize)> {
+    let (start, end) = match boundaries.get(section_k) {
+        Some(&b) => b,
+        None => return vec![],
+    };
+
+    // Segment = non-barrier ops in this section; segment index = order in (start..end) skipping barriers
+    let global_to_segment: Vec<usize> = (start..end)
+        .filter(|&i| ops[i].opcode != Opcode::Barrier)
+        .collect();
+
+    // VReg -> (segment_idx, cycle) for last use in this section
+    let mut last_use: HashMap<VReg, (usize, i32)> = HashMap::new();
+    for (seg_idx, &global_idx) in global_to_segment.iter().enumerate() {
+        let op = &ops[global_idx];
+        let c = op.cycle;
+        if c < 0 {
+            continue;
+        }
+        for vreg in op.reads() {
+            let def_sec = match vreg_def_section.get(&vreg) {
+                Some(&s) => s,
+                None => continue,
+            };
+            if def_sec >= section_k {
+                continue; // defined in this or later section, not live-in
+            }
+            let entry = last_use.entry(vreg).or_insert((seg_idx, c));
+            if c > entry.1 {
+                *entry = (seg_idx, c);
+            }
+        }
+    }
+
+    last_use
+        .into_iter()
+        .map(|(vreg, (seg_idx, _))| (vreg, seg_idx))
+        .collect()
+}
+
 /// Build cycle hints for a single section in **local** cycle space (0-based).
 ///
 /// Per-round CP-SAT runs on segment ops only and uses cycles 0..makespan locally.
@@ -217,6 +282,47 @@ mod tests {
         assert_eq!(result.section_peaks.len(), 1);
         assert_eq!(result.section_peaks[0], 1);
         assert!(!result.section_exceeds_budget[0]);
+    }
+
+    #[test]
+    fn test_vreg_def_section_and_live_in() {
+        let v0 = VReg::scalar(0);
+        let v1 = VReg::scalar(1);
+        let v3 = VReg::scalar(3);
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Load, Opcode::Const, Some(v0), vec![], vec![], 0),
+            make_op_with_cycle(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v1),
+                vec![Operand::VReg(v0), Operand::VReg(v0)],
+                vec![0],
+                1,
+            ),
+            make_barrier_with_cycle(2, vec![0, 1], 2),
+            make_op_with_cycle(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v3),
+                vec![Operand::VReg(v0), Operand::VReg(v1)],
+                vec![0, 1, 2],
+                3,
+            ),
+        ];
+        let boundaries = section_boundaries(&ops);
+        let vds = vreg_def_section(&ops, &boundaries);
+        assert_eq!(vds.get(&v0), Some(&0), "v0 defined in section 0");
+        assert_eq!(vds.get(&v1), Some(&0), "v1 defined in section 0");
+        assert_eq!(vds.get(&v3), Some(&1), "v3 defined in section 1");
+
+        let live_in_1 = live_in_for_section(&ops, &boundaries, 1, &vds);
+        // Section 1 reads v0 and v1 (both defined in section 0) -> live-in (v0, seg_idx of last use), (v1, seg_idx of last use)
+        // Section 1 has one op (index 3) at segment index 0, and it reads both v0 and v1
+        assert_eq!(live_in_1.len(), 2, "v0 and v1 are live-in for section 1");
+        let seg_idxs: Vec<usize> = live_in_1.iter().map(|(_, i)| *i).collect();
+        assert!(seg_idxs.contains(&0), "last use is segment op 0");
     }
 
     #[test]
