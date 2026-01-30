@@ -16,7 +16,7 @@ rayon = "1.10"
 
 # CP-SAT solver bindings (fork with interval/cumulative support)
 # Build requires: ORTOOLS_PREFIX=$(brew --prefix or-tools) RUSTFLAGS='-Clink-arg=-lprotobuf'
-cp_sat = { git = "https://github.com/jmalicki/cp_sat.git", optional = true }
+cp_sat = { git = "https://github.com/jmalicki/cp_sat.git", branch = "main", optional = true }
 
 [features]
 default = []

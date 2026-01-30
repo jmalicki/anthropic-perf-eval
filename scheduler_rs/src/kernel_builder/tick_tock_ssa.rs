@@ -375,6 +375,18 @@ impl SsaTickTockKernelBuilder {
                     section_offset += 0;
                     continue;
                 }
+                // Greedy section makespan and peak (for delta reporting after feasibility)
+                let (greedy_min_c, greedy_max_c) = global_indices
+                    .iter()
+                    .filter_map(|&i| {
+                        let c = ssa_ops[i].cycle;
+                        if c >= 0 { Some(c) } else { None }
+                    })
+                    .fold((i32::MAX, i32::MIN), |(lo, hi), c| (lo.min(c), hi.max(c)));
+                let greedy_section_makespan =
+                    if greedy_min_c <= greedy_max_c { greedy_max_c - greedy_min_c + 1 } else { 0 };
+                let greedy_section_peak = budget_result.section_peaks[k];
+
                 if verbose {
                     eprintln!("--------------------------------------------------------------------------------");
                     eprintln!("  PER-SECTION CP-SAT:  SECTION {}  (feasibility — find any valid schedule)", k);
@@ -443,10 +455,23 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 if verbose {
+                    let after_budget = sections_exceeding_budget(&ssa_ops, 1536);
+                    let after_peak = after_budget.section_peaks[k];
+                    let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
+                    let delta_peak = after_peak as i32 - greedy_section_peak as i32;
                     eprintln!();
                     eprintln!(
                         "  --> Section {} done: {} cycles (merged into global schedule)",
                         k, seg_result.makespan
+                    );
+                    eprintln!(
+                        "      Greedy: {} cycles, peak {} words  →  After feasibility: {} cycles, peak {} words  (Δ cycles: {:+}, Δ peak: {:+})",
+                        greedy_section_makespan,
+                        greedy_section_peak,
+                        seg_result.makespan,
+                        after_peak,
+                        delta_cycles,
+                        delta_peak
                     );
                     eprintln!();
                 }
@@ -472,9 +497,15 @@ impl SsaTickTockKernelBuilder {
         // and would interfere with its optimization
         let mut ssa_ops = elide_barriers(ssa_ops);
 
-        // Collect greedy hints after barrier elision (need to match ops)
-        // Since barriers are elided, hints need to be for non-barrier ops only
+        // Collect hints for full-kernel CP-SAT: merged schedule (greedy for within-budget
+        // sections, per-section feasibility result for sections that exceeded budget).
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
+        let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
+        let hint_peak = sections_exceeding_budget(&ssa_ops, 1536)
+            .section_peaks
+            .first()
+            .copied()
+            .unwrap_or(0);
 
         // Reset cycles before CP-SAT
         for op in &mut ssa_ops {
@@ -528,6 +559,10 @@ impl SsaTickTockKernelBuilder {
             eprintln!("================================================================================");
             eprintln!("  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)");
             eprintln!("  All rounds merged; solving for minimum cycles. Scratch budget = 1536.");
+            eprintln!(
+                "  Before optimization: {} cycles, peak {} words (hint schedule).",
+                hint_makespan, hint_peak
+            );
             if greedy_budget_exceeded {
                 eprintln!("  (Greedy exceeded budget; hints may be infeasible — CP-SAT will search.)");
             }

@@ -1180,6 +1180,9 @@ pub fn schedule_ssa_cpsat(
     if let Some(name) = &model_name {
         model.set_model_name(name);
     }
+    if verbose && model_name.is_some() {
+        eprintln!("  Model name: {}", model_name.as_deref().unwrap_or(""));
+    }
 
     // Build op_id to index mapping
     let op_id_to_idx: HashMap<usize, usize> = ops
