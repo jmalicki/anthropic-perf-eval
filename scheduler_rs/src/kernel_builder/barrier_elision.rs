@@ -54,6 +54,39 @@ pub fn count_barriers(ops: &[SsaOp]) -> usize {
     ops.iter().filter(|op| op.opcode == Opcode::Barrier).count()
 }
 
+/// Return section boundaries for ops that contain barriers.
+///
+/// Sections are the ranges of ops between consecutive barriers (same logic as
+/// `compute_ssa_dependencies_with_barriers`). Section k = `ops[start..end]` with
+/// `(start, end)` from the k-th element of the returned vec; end is exclusive.
+/// - Section 0: from start of ops to (but not including) first barrier index.
+/// - Section k for k > 0: from the op after barrier k-1 to (but not including) barrier k.
+/// - Last section: from the op after the last barrier to end of ops.
+///
+/// If there are no barriers, returns a single section `[(0, ops.len())]`.
+pub fn section_boundaries(ops: &[SsaOp]) -> Vec<(usize, usize)> {
+    let barrier_indices: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::Barrier)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if barrier_indices.is_empty() {
+        return vec![(0, ops.len())];
+    }
+
+    let mut boundaries = Vec::with_capacity(barrier_indices.len() + 1);
+    let mut prev = 0usize;
+    for &bi in &barrier_indices {
+        // Section from prev (inclusive) to barrier (exclusive) = ops in this section before the barrier
+        boundaries.push((prev, bi));
+        prev = bi + 1;
+    }
+    boundaries.push((prev, ops.len()));
+    boundaries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +182,34 @@ mod tests {
         ];
 
         assert_eq!(count_barriers(&ops), 2);
+    }
+
+    #[test]
+    fn test_section_boundaries() {
+        // ops: [op0, op1, barrier2, op3, barrier4, op5]
+        let ops = vec![
+            make_op(0, Engine::Load, Opcode::Const, vec![]),
+            make_op(1, Engine::Load, Opcode::Const, vec![]),
+            make_barrier(2, vec![0, 1]),
+            make_op(3, Engine::Alu, Opcode::Add, vec![0, 1, 2]),
+            make_barrier(4, vec![3]),
+            make_op(5, Engine::Alu, Opcode::Add, vec![3, 4]),
+        ];
+        let boundaries = section_boundaries(&ops);
+        assert_eq!(boundaries.len(), 3);
+        assert_eq!(boundaries[0], (0, 2)); // section 0: indices 0, 1 (before first barrier)
+        assert_eq!(boundaries[1], (3, 4)); // section 1: index 3 (between barrier 2 and 4)
+        assert_eq!(boundaries[2], (5, 6)); // section 2: index 5 (after last barrier)
+    }
+
+    #[test]
+    fn test_section_boundaries_no_barriers() {
+        let ops = vec![
+            make_op(0, Engine::Load, Opcode::Const, vec![]),
+            make_op(1, Engine::Alu, Opcode::Add, vec![0]),
+        ];
+        let boundaries = section_boundaries(&ops);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0], (0, 2));
     }
 }

@@ -17,6 +17,7 @@
 
 pub mod barrier_elision;
 pub mod config;
+pub mod round_budget;
 pub mod context;
 pub mod context_ssa;
 pub mod emit;
