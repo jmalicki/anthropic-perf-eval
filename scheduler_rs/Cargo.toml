@@ -8,11 +8,11 @@ name = "scheduler_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.27", features = ["extension-module"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 arrayvec = { version = "0.7", features = ["serde"] }
-rayon = "1.10"
+rayon = "1.11"
 
 # CP-SAT solver bindings (fork with interval/cumulative support)
 # Build requires: ORTOOLS_PREFIX=$(brew --prefix or-tools) RUSTFLAGS='-Clink-arg=-lprotobuf'
