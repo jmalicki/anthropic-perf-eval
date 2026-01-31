@@ -2905,6 +2905,311 @@ mod ssa_tests {
         eprintln!("test_ssa_cpsat_selectchoice_flow_slot_limit PASSED");
     }
 
+    // =========================================================================
+    // Tests for AddImm ops from emit_const() in Flow constraint
+    // These tests verify the fix for the Flow slot violation bug where AddImm
+    // ops were not included in the Flow cumulative constraint.
+    // =========================================================================
+
+    /// Test that AddImm ops from emit_const() are counted in the Flow constraint.
+    /// This was the root cause of the Flow slot violation bug.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_addimm_ops_counted_in_flow_constraint() {
+        let mut emit = SsaEmitContext::new();
+        
+        // Set up zero_vreg so emit_const creates AddImm alternatives
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        // Emit 5 non-zero constants - each creates Load + AddImm ops
+        let c1 = emit.emit_const(1);
+        let c2 = emit.emit_const(2);
+        let c3 = emit.emit_const(3);
+        let c4 = emit.emit_const(4);
+        let c5 = emit.emit_const(5);
+        
+        // Use the constants to create dependencies
+        let sum1 = emit.emit_alu(Opcode::Add, c1, c2);
+        let sum2 = emit.emit_alu(Opcode::Add, c3, c4);
+        let _sum3 = emit.emit_alu(Opcode::Add, sum1, sum2);
+        let _use_c5 = emit.emit_alu(Opcode::Add, c5, c1);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Count AddImm ops
+        let addimm_count = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::AddImm)
+            .count();
+        assert_eq!(addimm_count, 5, "Should have 5 AddImm ops from emit_const");
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: true,
+                stop_after_first_solution: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+            },
+            SsaCpsatHints::default(),
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Collect all Flow-engine ops and their cycles
+        let flow_ops: Vec<(usize, i32)> = emit.ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Flow)
+            .map(|(idx, _)| (idx, cpsat_result.cycle_assignments[idx]))
+            .collect();
+
+        eprintln!("Flow ops (idx, cycle): {:?}", flow_ops);
+
+        // Verify no two Flow ops are in the same cycle
+        let mut cycle_counts: HashMap<i32, usize> = HashMap::new();
+        for (_, cy) in &flow_ops {
+            *cycle_counts.entry(*cy).or_default() += 1;
+        }
+
+        for (cy, count) in &cycle_counts {
+            assert!(*count <= 1, 
+                "Flow slot limit violated: {} Flow ops in cycle {} (limit is 1). \
+                This would indicate AddImm ops are not properly constrained.", 
+                count, cy);
+        }
+
+        eprintln!("test_ssa_cpsat_addimm_ops_counted_in_flow_constraint PASSED: {} AddImm ops properly scheduled in different cycles", addimm_count);
+    }
+
+    /// Test that the validation function correctly detects Flow slot violations.
+    /// This ensures our validation logic matches what we expect.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_validate_ssa_slot_limits_detects_flow_violation() {
+        // Create minimal ops that would violate Flow limit if scheduled in same cycle
+        let mut op0 = SsaOp::new(0, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(0)), vec![]);
+        op0.produces_constant = Some(1);
+        
+        let mut op1 = SsaOp::new(1, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(1)), vec![]);
+        op1.produces_constant = Some(2);
+        
+        let ops = vec![op0, op1];
+
+        // Schedule both in cycle 0 - this should violate Flow limit
+        let cycle_assignments = vec![0, 0];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let select_fma_ops = HashSet::new();
+
+        // This should panic because we have 2 Flow ops in cycle 0
+        let result = std::panic::catch_unwind(|| {
+            validate_ssa_slot_limits(
+                &ops,
+                &cycle_assignments,
+                &shifted_ops,
+                &const_add_imm_ops,
+                &select_fma_ops,
+            );
+        });
+
+        assert!(result.is_err(), 
+            "validate_ssa_slot_limits should panic when 2 Flow ops are in same cycle");
+        
+        eprintln!("test_validate_ssa_slot_limits_detects_flow_violation PASSED");
+    }
+
+    /// Test that validation passes when Flow ops are in different cycles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_validate_ssa_slot_limits_passes_valid_schedule() {
+        let mut op0 = SsaOp::new(0, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(0)), vec![]);
+        op0.produces_constant = Some(1);
+        
+        let mut op1 = SsaOp::new(1, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(1)), vec![]);
+        op1.produces_constant = Some(2);
+        
+        let ops = vec![op0, op1];
+
+        // Schedule in different cycles - this should be valid
+        let cycle_assignments = vec![0, 1];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let select_fma_ops = HashSet::new();
+
+        // This should NOT panic
+        validate_ssa_slot_limits(
+            &ops,
+            &cycle_assignments,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &select_fma_ops,
+        );
+        
+        eprintln!("test_validate_ssa_slot_limits_passes_valid_schedule PASSED");
+    }
+
+    /// Test that ConstChoice ops are correctly handled when they choose AddImm path.
+    /// ConstChoice is different from emit_const() - it's a single op with a choice.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_addimm_uses_flow_slot() {
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit several ConstChoice constants
+        let c1 = emit.emit_const_choice(10);
+        let c2 = emit.emit_const_choice(20);
+        let c3 = emit.emit_const_choice(30);
+        
+        // Use them
+        let sum = emit.emit_alu(Opcode::Add, c1, c2);
+        let _sum2 = emit.emit_alu(Opcode::Add, sum, c3);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Verify we have ConstChoice ops
+        let constchoice_count = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .count();
+        assert_eq!(constchoice_count, 3, "Should have 3 ConstChoice ops");
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: true,
+                stop_after_first_solution: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+            },
+            SsaCpsatHints::default(),
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // If any ConstChoice ops chose AddImm path, they should be in different cycles
+        if !cpsat_result.const_add_imm_ops.is_empty() {
+            let addimm_cycles: Vec<i32> = emit.ops.iter()
+                .enumerate()
+                .filter(|(_, op)| op.opcode == Opcode::ConstChoice 
+                    && cpsat_result.const_add_imm_ops.contains(&op.id))
+                .map(|(idx, _)| cpsat_result.cycle_assignments[idx])
+                .collect();
+
+            eprintln!("ConstChoice ops using AddImm path, cycles: {:?}", addimm_cycles);
+
+            // Check no duplicates
+            let mut cycle_counts: HashMap<i32, usize> = HashMap::new();
+            for cy in &addimm_cycles {
+                *cycle_counts.entry(*cy).or_default() += 1;
+            }
+            for (cy, count) in &cycle_counts {
+                assert!(*count <= 1, 
+                    "Flow slot limit violated: {} ConstChoice AddImm ops in cycle {}", 
+                    count, cy);
+            }
+        }
+        
+        eprintln!("test_ssa_cpsat_constchoice_addimm_uses_flow_slot PASSED");
+    }
+
+    /// Test that mixed AddImm (from emit_const) and ConstChoice AddImm paths
+    /// are all constrained to 1 per cycle.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_mixed_addimm_and_constchoice_flow_constraint() {
+        let mut emit = SsaEmitContext::new();
+        
+        // Set up zero_vreg for emit_const AddImm ops
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        // Mix of emit_const (creates Load+AddImm) and emit_const_choice (creates ConstChoice)
+        let c1 = emit.emit_const(10);      // Creates Load + AddImm
+        let c2 = emit.emit_const_choice(20); // Creates ConstChoice
+        let c3 = emit.emit_const(30);      // Creates Load + AddImm
+        let c4 = emit.emit_const_choice(40); // Creates ConstChoice
+        
+        // Use them
+        let sum1 = emit.emit_alu(Opcode::Add, c1, c2);
+        let sum2 = emit.emit_alu(Opcode::Add, c3, c4);
+        let _final = emit.emit_alu(Opcode::Add, sum1, sum2);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Count ops
+        let addimm_count = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::AddImm)
+            .count();
+        let constchoice_count = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::ConstChoice)
+            .count();
+        
+        eprintln!("AddImm ops: {}, ConstChoice ops: {}", addimm_count, constchoice_count);
+        assert_eq!(addimm_count, 2, "Should have 2 AddImm ops from emit_const");
+        assert_eq!(constchoice_count, 2, "Should have 2 ConstChoice ops");
+
+        // Schedule with CP-SAT
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: true,
+                stop_after_first_solution: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+            },
+            SsaCpsatHints::default(),
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Collect all ops that use Flow slot:
+        // 1. AddImm ops (from emit_const)
+        // 2. ConstChoice ops that chose AddImm path
+        let mut flow_users: Vec<(usize, i32, &str)> = Vec::new();
+        
+        for (idx, op) in emit.ops.iter().enumerate() {
+            let cycle = cpsat_result.cycle_assignments[idx];
+            if op.opcode == Opcode::AddImm {
+                flow_users.push((idx, cycle, "AddImm"));
+            } else if op.opcode == Opcode::ConstChoice 
+                && cpsat_result.const_add_imm_ops.contains(&op.id) {
+                flow_users.push((idx, cycle, "ConstChoice→AddImm"));
+            }
+        }
+
+        eprintln!("All Flow-using ops: {:?}", flow_users);
+
+        // Verify no two in same cycle
+        let mut cycle_counts: HashMap<i32, Vec<&str>> = HashMap::new();
+        for (_, cy, kind) in &flow_users {
+            cycle_counts.entry(*cy).or_default().push(kind);
+        }
+        
+        for (cy, kinds) in &cycle_counts {
+            assert!(kinds.len() <= 1, 
+                "Flow slot limit violated: {} ops in cycle {}: {:?}", 
+                kinds.len(), cy, kinds);
+        }
+        
+        eprintln!("test_ssa_cpsat_mixed_addimm_and_constchoice_flow_constraint PASSED");
+    }
+
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_selectchoice_roundtrip() {

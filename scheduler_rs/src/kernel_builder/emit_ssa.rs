@@ -1391,4 +1391,179 @@ mod tests {
         assert_eq!(v1, v2, "CSE should return same VReg");
         assert_eq!(emit.ops.len(), 1, "Should only emit one op");
     }
+
+    // =========================================================================
+    // Tests for emit_const() dual-emission behavior (Load + AddImm)
+    // =========================================================================
+
+    #[test]
+    fn test_emit_const_creates_load_only_without_zero_vreg() {
+        // Without zero_vreg set, emit_const should only create Load op (no AddImm alternative)
+        let mut emit = SsaEmitContext::new();
+        
+        let v1 = emit.emit_const(42);
+        
+        // Should only have 1 op (Load), no AddImm alternative
+        assert_eq!(emit.ops.len(), 1, "Without zero_vreg, should only emit Load op");
+        assert_eq!(emit.ops[0].opcode, Opcode::Const);
+        assert_eq!(emit.ops[0].engine, Engine::Load);
+        assert_eq!(emit.ops[0].dest, Some(v1));
+        assert_eq!(emit.ops[0].produces_constant, Some(42));
+        
+        // No const_alternatives should be tracked
+        assert!(emit.const_alternatives.is_empty(), 
+            "No alternatives without zero_vreg");
+    }
+
+    #[test]
+    fn test_emit_const_creates_load_and_addimm_with_zero_vreg() {
+        // With zero_vreg set, emit_const should create BOTH Load and AddImm ops
+        let mut emit = SsaEmitContext::new();
+        
+        // First emit zero constant to set up zero_vreg
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        // Now emit non-zero constant
+        let v1 = emit.emit_const(42);
+        
+        // Should have 3 ops: const(0), const(42), add_imm(42)
+        assert_eq!(emit.ops.len(), 3, "Should emit Load(0), Load(42), AddImm(42)");
+        
+        // Op 0: const(0)
+        assert_eq!(emit.ops[0].opcode, Opcode::Const);
+        assert_eq!(emit.ops[0].engine, Engine::Load);
+        assert_eq!(emit.ops[0].produces_constant, Some(0));
+        
+        // Op 1: const(42) - Load alternative
+        assert_eq!(emit.ops[1].opcode, Opcode::Const);
+        assert_eq!(emit.ops[1].engine, Engine::Load);
+        assert_eq!(emit.ops[1].dest, Some(v1));
+        assert_eq!(emit.ops[1].produces_constant, Some(42));
+        
+        // Op 2: add_imm(42) - AddImm alternative (same dest VReg!)
+        assert_eq!(emit.ops[2].opcode, Opcode::AddImm);
+        assert_eq!(emit.ops[2].engine, Engine::Flow);
+        assert_eq!(emit.ops[2].dest, Some(v1), "AddImm should have same dest as Load");
+        assert_eq!(emit.ops[2].produces_constant, Some(42));
+        
+        // const_alternatives should track the pair
+        assert_eq!(emit.const_alternatives.len(), 1, "Should have 1 alternative pair");
+        assert_eq!(emit.const_alternatives[0].value, 42);
+        assert_eq!(emit.const_alternatives[0].load_op_idx, 1);
+        assert_eq!(emit.const_alternatives[0].add_imm_op_idx, 2);
+        assert_eq!(emit.const_alternatives[0].dest, v1);
+    }
+
+    #[test]
+    fn test_emit_const_zero_does_not_create_addimm() {
+        // emit_const(0) should NOT create AddImm alternative (even with zero_vreg set)
+        // because AddImm(0) would be circular (reads zero to produce zero)
+        let mut emit = SsaEmitContext::new();
+        
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        // Emit zero again (should just use CSE)
+        let zero2 = emit.emit_const(0);
+        
+        assert_eq!(zero, zero2, "CSE should return same VReg");
+        assert_eq!(emit.ops.len(), 1, "Should only have one op for const(0)");
+        assert_eq!(emit.ops[0].opcode, Opcode::Const);
+        assert!(emit.const_alternatives.is_empty(), 
+            "Zero constant should not have AddImm alternative");
+    }
+
+    #[test]
+    fn test_emit_const_multiple_creates_multiple_addimm_ops() {
+        // Each non-zero constant gets its own AddImm op
+        let mut emit = SsaEmitContext::new();
+        
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        let v1 = emit.emit_const(10);
+        let v2 = emit.emit_const(20);
+        let v3 = emit.emit_const(30);
+        
+        // Should have 7 ops: const(0), const(10), add_imm(10), const(20), add_imm(20), const(30), add_imm(30)
+        assert_eq!(emit.ops.len(), 7, "Each non-zero const gets Load + AddImm");
+        
+        // Verify all AddImm ops have Engine::Flow
+        let addimm_ops: Vec<_> = emit.ops.iter()
+            .filter(|op| op.opcode == Opcode::AddImm)
+            .collect();
+        assert_eq!(addimm_ops.len(), 3, "Should have 3 AddImm ops");
+        for op in &addimm_ops {
+            assert_eq!(op.engine, Engine::Flow, "AddImm ops must have Engine::Flow");
+        }
+        
+        // Verify const_alternatives tracking
+        assert_eq!(emit.const_alternatives.len(), 3);
+        let values: Vec<i64> = emit.const_alternatives.iter().map(|a| a.value).collect();
+        assert!(values.contains(&10));
+        assert!(values.contains(&20));
+        assert!(values.contains(&30));
+    }
+
+    #[test]
+    fn test_emit_const_addimm_depends_on_zero() {
+        // AddImm ops should have dependency on zero VReg
+        let mut emit = SsaEmitContext::new();
+        
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        let _v1 = emit.emit_const(42);
+        
+        // The AddImm op (index 2) should read from zero VReg
+        let addimm_op = &emit.ops[2];
+        assert_eq!(addimm_op.opcode, Opcode::AddImm);
+        
+        // Check the source operand is the zero VReg
+        assert_eq!(addimm_op.srcs.len(), 2);
+        match &addimm_op.srcs[0] {
+            Operand::VReg(vreg) => assert_eq!(*vreg, zero, "AddImm src should be zero VReg"),
+            _ => panic!("AddImm src[0] should be VReg"),
+        }
+        match &addimm_op.srcs[1] {
+            Operand::Imm(val) => assert_eq!(*val, 42, "AddImm src[1] should be immediate value"),
+            _ => panic!("AddImm src[1] should be Imm"),
+        }
+    }
+
+    #[test]
+    fn test_emit_const_vs_emit_const_choice_difference() {
+        // emit_const creates 2 separate ops (Load + AddImm)
+        // emit_const_choice creates 1 op with alternatives field
+        let mut emit = SsaEmitContext::new();
+        
+        let zero = emit.emit_const(0);
+        emit.zero_vreg = Some(zero);
+        
+        // emit_const: creates 2 ops
+        let v1 = emit.emit_const(100);
+        let ops_after_emit_const = emit.ops.len();
+        
+        // emit_const_choice: creates 1 op
+        let v2 = emit.emit_const_choice(200);
+        let ops_after_choice = emit.ops.len();
+        
+        // emit_const added 2 ops (Load + AddImm)
+        assert_eq!(ops_after_emit_const - 1, 2, "emit_const should add 2 ops");
+        
+        // emit_const_choice added 1 op
+        assert_eq!(ops_after_choice - ops_after_emit_const, 1, "emit_const_choice should add 1 op");
+        
+        // The ConstChoice op has alternatives in its field, not separate ops
+        let choice_op = &emit.ops[ops_after_emit_const];
+        assert_eq!(choice_op.opcode, Opcode::ConstChoice);
+        assert!(choice_op.const_alternatives.is_some());
+        assert_eq!(choice_op.const_alternatives.as_ref().unwrap().len(), 2);
+        
+        // emit_const tracks pairs in emit.const_alternatives
+        // emit_const_choice stores alternatives in the op itself
+        assert_eq!(emit.const_alternatives.len(), 1, "Only emit_const tracks in const_alternatives");
+        assert_eq!(emit.const_alternatives[0].dest, v1);
+    }
 }
