@@ -2329,7 +2329,7 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None, *, liveness_detail=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None, enable_tree_reduce_depth3=false, *, liveness_detail=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2341,6 +2341,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     use_cpsat: bool,
     cpsat_time_limit: f64,
     output_json: Option<String>,
+    enable_tree_reduce_depth3: bool,
     liveness_detail: Option<String>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
@@ -2358,7 +2359,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         enable_const_load: true,
         enable_const_alu: true,
         max_alu_depth: None,
-        enable_tree_reduce_depth3: false,
+        enable_tree_reduce_depth3,
     };
 
     let mut builder = SsaTickTockKernelBuilder::new(config);

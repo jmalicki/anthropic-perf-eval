@@ -55,6 +55,8 @@ def main():
                         help="Use greedy scheduler instead of CP-SAT (fast, ~2s)")
     parser.add_argument("--enable-valu-shift", action="store_true",
                         help="Enable VALU->ALU shifting (disabled by default to avoid budget issues)")
+    parser.add_argument("--enable-tree-reduce-depth3", action="store_true",
+                        help="Enable tree-reduce for depth-3 (8-way) selection (uses more scratch)")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -79,6 +81,7 @@ def main():
     print(f"  forest_height={args.forest_height}, n_nodes={args.n_nodes}")
     print(f"  batch_size={args.batch_size}, rounds={args.rounds}")
     print(f"  enable_valu_shift={args.enable_valu_shift}")
+    print(f"  enable_tree_reduce_depth3={args.enable_tree_reduce_depth3}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -93,6 +96,7 @@ def main():
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time_limit,
         output_json=args.output_json,
+        enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
         # Note: liveness_detail parameter not available in Python bindings yet
         # It's only used when output_json is provided anyway
     )
