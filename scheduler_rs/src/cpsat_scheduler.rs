@@ -276,6 +276,98 @@ pub fn compute_alap(ops: &[Op], horizon: i32) -> HashMap<usize, i32> {
     alap
 }
 
+/// Validate that a CP-SAT solution respects engine slot limits per cycle.
+/// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
+#[cfg(feature = "cpsat")]
+fn validate_ssa_slot_limits(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    const_add_imm_ops: &HashSet<usize>,
+    select_fma_ops: &HashSet<usize>,
+) {
+    let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
+    if makespan <= 0 {
+        return;
+    }
+    let mut alu_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut valu_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut load_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut store_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut flow_per_cycle: Vec<i32> = vec![0; makespan as usize];
+
+    for (idx, op) in ops.iter().enumerate() {
+        let cycle = cycle_assignments.get(idx).copied().unwrap_or(0) as usize;
+        if cycle >= alu_per_cycle.len() {
+            continue;
+        }
+
+        if op.opcode == Opcode::ConstChoice {
+            if const_add_imm_ops.contains(&op.id) {
+                flow_per_cycle[cycle] += 1;
+            } else {
+                load_per_cycle[cycle] += 1;
+            }
+            continue;
+        }
+        if op.opcode == Opcode::SelectChoice {
+            if select_fma_ops.contains(&op.id) {
+                valu_per_cycle[cycle] += 1;
+                if op.delta_vreg.is_none() {
+                    let cycle2 = cycle + 1;
+                    if cycle2 < valu_per_cycle.len() {
+                        valu_per_cycle[cycle2] += 1;
+                    }
+                }
+            } else {
+                flow_per_cycle[cycle] += 1;
+            }
+            continue;
+        }
+
+        match op.engine {
+            Engine::Alu => alu_per_cycle[cycle] += 1,
+            Engine::Valu => {
+                if shifted_ops.contains(&op.id) {
+                    alu_per_cycle[cycle] += VLEN as i32;
+                } else {
+                    valu_per_cycle[cycle] += 1;
+                }
+            }
+            Engine::Load => load_per_cycle[cycle] += 1,
+            Engine::Store => store_per_cycle[cycle] += 1,
+            Engine::Flow => flow_per_cycle[cycle] += 1,
+            _ => {}
+        }
+    }
+
+    let limits: [(usize, &str); 5] = [
+        (Engine::Alu.slot_limit(), "ALU"),
+        (Engine::Valu.slot_limit(), "VALU"),
+        (Engine::Load.slot_limit(), "Load"),
+        (Engine::Store.slot_limit(), "Store"),
+        (Engine::Flow.slot_limit(), "Flow"),
+    ];
+    let counts = [
+        &alu_per_cycle,
+        &valu_per_cycle,
+        &load_per_cycle,
+        &store_per_cycle,
+        &flow_per_cycle,
+    ];
+    for (cycle, _) in alu_per_cycle.iter().enumerate() {
+        for (limit_idx, (limit, name)) in limits.iter().enumerate() {
+            let count = counts[limit_idx][cycle];
+            if count > *limit as i32 {
+                panic!(
+                    "BUG: CP-SAT solution violates {} slot limit at cycle {}: {} > {} (model constraint error)",
+                    name, cycle, count, limit
+                );
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Live Interval Computation (for scratch memory tracking)
 // ============================================================================
@@ -1542,7 +1634,11 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !flow_intervals.is_empty() {
-            model.add_cumulative(flow_intervals, flow_demands, 1); // Flow has 1 slot
+            model.add_cumulative(flow_intervals.clone(), flow_demands, 1); // Flow has 1 slot
+            // Flow has exactly 1 slot: enforce no two intervals overlap (mandatory + optional).
+            // This is redundant with cumulative(..., 1) but ensures OR-Tools respects the limit
+            // even if optional-interval handling in cumulative were buggy.
+            model.add_no_overlap(flow_intervals);
         }
     }
 
@@ -2122,6 +2218,15 @@ pub fn schedule_ssa_cpsat(
                 };
                 (bound, gap_val)
             };
+
+            // Post-solution validation: slot limits must never be violated (model bug if they are)
+            validate_ssa_slot_limits(
+                ops,
+                &cycle_assignments,
+                &shifted_ops,
+                &const_add_imm_ops,
+                &select_fma_ops,
+            );
 
             if verbose {
                 eprintln!(

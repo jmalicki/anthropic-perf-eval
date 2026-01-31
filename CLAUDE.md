@@ -127,6 +127,10 @@ uv run generate_precomputed_kernel.py --full-solve-time 600
 - **SSA + CP-SAT 10 min** (default): Production runs, benchmarking (recommended, correct output)
 - **SSA + CP-SAT 1 hour** (`--cpsat-time-limit 3600`): Final optimization (diminishing returns)
 
+**4-round and full-kernel validation:**
+- All full 4-round tests (and 16-round when applicable) **must pass with ALL OPTIONS** including **CP-SAT** and **--enable-valu-shift** when recording results or benchmarking. Do not use `--use-greedy` for recorded results.
+- CP-SAT is required to find a **valid feasible schedule** that respects engine slot limits (ALU 12, VALU 6, Load 2, Store 2, **Flow 1**). The model enforces Flow capacity 1 via cumulative + NoOverlap; after solve we validate per-cycle slot counts. **If slot limits are ever violated in a CP-SAT solution, that indicates a serious bug in the constraints** and must be fixed.
+
 ### Running Experiments
 ```bash
 uv run run_experiment.py           # With W&B logging
