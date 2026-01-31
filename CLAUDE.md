@@ -45,17 +45,21 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 ```
 
 ### Running Tests
+
+**Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel`, `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). Solver tests in `solver/` and `tests/submission_tests.py` exercise the **Python** kernel builders and pipeline.
+
 ```bash
-# Run all tests (use uv run for correct Python environment)
-uv run pytest
+# Rust: full scheduler_rs test suite (from project root)
+BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat
 
-# Run solver tests
+# Python: interface test only (scheduler_rs build → Machine → reference)
+uv run pytest tests/test_scheduler_rs_interface.py -v
+
+# Python: solver / submission tests (Python pipeline, not Rust)
 uv run pytest solver/
-
-# Run submission tests
 uv run tests/submission_tests.py
 
-# Test the optimized kernel
+# Manual / CI: optimized kernel with optional --rust-builder
 uv run test_optimized.py
 ```
 

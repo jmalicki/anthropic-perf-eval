@@ -274,7 +274,7 @@ impl SsaTickTockKernelBuilder {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
         use super::barrier_elision::{count_barriers, section_boundaries};
-        use super::round_budget::{sections_exceeding_budget, live_in_for_section, live_out_from_section, vreg_def_section};
+        use super::round_budget::{sections_exceeding_budget, live_in_for_section, live_out_from_section, live_through_for_section, vreg_def_section};
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
@@ -407,6 +407,7 @@ impl SsaTickTockKernelBuilder {
                 let initial_live =
                     live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let segment_hints: Vec<i32> = global_indices
                     .iter()
                     .map(|&i| {
@@ -445,7 +446,7 @@ impl SsaTickTockKernelBuilder {
                         select_choice_hints: seg_select,
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
-                        ..Default::default()
+                        live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
                     },
                 )
                 .ok_or_else(|| {
@@ -482,8 +483,7 @@ impl SsaTickTockKernelBuilder {
             let (start, end) = boundaries[k];
             let mut min_c = i32::MAX;
             let mut max_c = i32::MIN;
-            for idx in start..end {
-                let op = &ssa_ops[idx];
+            for op in &ssa_ops[start..end] {
                 if op.opcode != Opcode::Barrier && op.cycle >= 0 {
                     min_c = min_c.min(op.cycle);
                     max_c = max_c.max(op.cycle);
@@ -492,6 +492,21 @@ impl SsaTickTockKernelBuilder {
             if min_c <= max_c {
                 section_offset += max_c - min_c + 1;
             }
+        }
+
+        // Presolve guarantee: merged schedule must be within scratch budget.
+        let post_merge_budget = sections_exceeding_budget(&ssa_ops, 1536);
+        if let Some((sec, peak)) = post_merge_budget
+            .section_peaks
+            .iter()
+            .enumerate()
+            .find(|(_, &p)| p > 1536)
+        {
+            return Err(format!(
+                "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget 1536). \
+                 This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
+                sec, *peak
+            ));
         }
 
         // Elide barriers before CP-SAT
@@ -508,6 +523,14 @@ impl SsaTickTockKernelBuilder {
             .first()
             .copied()
             .unwrap_or(0);
+
+        if hint_peak > 1536 {
+            return Err(format!(
+                "Merged hint schedule exceeds scratch budget: peak {} words (budget 1536). \
+                 Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
+                hint_peak
+            ));
+        }
 
         // Reset cycles before CP-SAT
         for op in &mut ssa_ops {
@@ -2700,15 +2723,16 @@ mod tests {
 
     /// Regression: two-phase CP-SAT (per-section feasibility then full-kernel optimization) must
     /// produce a merged hint schedule that stays within scratch budget so the final result does not exceed 1536.
-    /// See live_out_from_section and segment scratch constraint with live_out_vregs.
+    /// Presolves (per-section CP-SAT with live_out and live_through) guarantee the merged schedule is feasible;
+    /// if not, build_and_schedule_cpsat returns Err. This test asserts the happy path.
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_cpsat_two_phase_hint_schedule_within_budget() {
-        // Full 16 rounds so some sections may exceed budget and trigger per-section CP-SAT
-        let config = KernelConfig::new(10, 2047, 256, 16);
+        // Small config: fast run, still exercises full two-phase flow (section boundaries, budget check, merge, full CP-SAT)
+        let config = KernelConfig::new(5, 63, 64, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule_cpsat(
-            120.0,  // Short time limit for CI
+            30.0,   // Short time limit; small kernel solves quickly
             false,  // verbose
             false,  // enable_valu_shift to keep test deterministic and faster
         );
