@@ -187,6 +187,44 @@ def compute_dependencies(ops: list[Op]) -> dict[int, Op]:
     return op_by_id
 
 
+def compute_first_writers(ops: list[Op]) -> dict[int, int]:
+    """For each scratch address, the op id of the first op that writes to it."""
+    result: dict[int, int] = {}
+    for op in ops:
+        for addr in op.writes:
+            if addr not in result:
+                result[addr] = op.id
+    return result
+
+
+def compute_last_readers(ops: list[Op]) -> dict[int, int]:
+    """For each scratch address, the op id of the last op that reads it."""
+    result: dict[int, int] = {}
+    for op in ops:
+        for addr in op.reads:
+            result[addr] = op.id
+    return result
+
+
+def compute_last_users(ops: list[Op]) -> dict[int, int]:
+    """For each scratch address, the op id of the last op that uses it (reads it)."""
+    return compute_last_readers(ops)
+
+
+def compute_memory_accesses(ops: list[Op]) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Return (loads, stores): loads[op_id] = memory addrs read, stores[op_id] = memory addrs written.
+    Only load/vload and store/vstore are tracked; const is not."""
+    loads: dict[int, list[int]] = {}
+    stores: dict[int, list[int]] = {}
+    for op in ops:
+        if op.engine == "load" and op.slot[0] in ("load", "vload"):
+            loads[op.id] = list(op.reads)
+        elif op.engine == "store" and op.slot[0] in ("store", "vstore"):
+            # Store destination (scratch addr written to by the store) from slot[1]
+            stores[op.id] = [op.slot[1]]
+    return loads, stores
+
+
 # VALU ops that can be converted to scalar ALU ops (binary operations)
 # NOTE: 'multiply_add' is intentionally EXCLUDED because:
 # - VALU multiply_add is 1 fused op
@@ -773,6 +811,62 @@ def emit_scheduled(ops: list[Op], max_cycle: int) -> list[dict]:
                 if op.engine not in instr:
                     instr[op.engine] = []
                 instr[op.engine].append(op.slot)
+        if instr:
+            instrs.append(instr)
+
+    return instrs
+
+
+def emit_scheduled_with_debug(
+    ops: list[Op],
+    max_cycle: int,
+    op_by_id: dict[int, Op],
+    scratch_debug: Optional[dict[int, tuple[str, int]]] = None,
+) -> list[dict]:
+    """Emit instructions with debug slots (scratch_alloc, scratch_retire, mem_load, mem_store)."""
+    first_writers = compute_first_writers(ops)
+    last_users = compute_last_users(ops)
+    loads, stores = compute_memory_accesses(ops)
+    instrs = []
+
+    for cycle in range(max_cycle):
+        instr = {}
+        debug_slots = []
+
+        for op in ops:
+            if op.cycle != cycle:
+                continue
+            if op.engine not in instr:
+                instr[op.engine] = []
+            instr[op.engine].append(op.slot)
+
+            # scratch_alloc for first write to each address
+            allocated_bases: set[int] = set()
+            for addr in op.writes:
+                if first_writers.get(addr) != op.id:
+                    continue
+                if scratch_debug:
+                    for base, (_, length) in scratch_debug.items():
+                        if base <= addr < base + length and base not in allocated_bases:
+                            allocated_bases.add(base)
+                            debug_slots.append(("scratch_alloc", base, length))
+                            break
+                else:
+                    debug_slots.append(("scratch_alloc", addr, 1))
+
+            # scratch_retire for last read of each address
+            for addr in op.reads:
+                if last_users.get(addr) == op.id:
+                    debug_slots.append(("scratch_retire", addr))
+
+            # mem_load / mem_store
+            for addr in loads.get(op.id, []):
+                debug_slots.append(("mem_load", addr))
+            for addr in stores.get(op.id, []):
+                debug_slots.append(("mem_store", addr))
+
+        if debug_slots:
+            instr["debug"] = debug_slots
         if instr:
             instrs.append(instr)
 
