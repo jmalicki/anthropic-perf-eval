@@ -955,6 +955,8 @@ pub struct SsaCpsatHints<'a> {
     pub initial_live: Option<&'a [(VReg, usize)]>,
     /// Segment mode: VRegs defined in this segment but last-used in a later section. Their scratch interval must extend to segment end (max cycle).
     pub live_out_vregs: Option<&'a HashSet<VReg>>,
+    /// Segment mode: VRegs defined in the previous section but last-used in a later section (live for the whole of this segment). Their scratch interval is [0, segment_end].
+    pub live_through_vregs: Option<&'a HashSet<VReg>>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
@@ -1132,6 +1134,7 @@ pub fn schedule_ssa_cpsat(
     let select_choice_hints = hints.select_choice_hints;
     let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
+    let live_through_vregs = hints.live_through_vregs;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -1619,10 +1622,13 @@ pub fn schedule_ssa_cpsat(
             .copied()
             .collect();
 
-        // Segment mode with live-out: VRegs defined in this segment but last-used in a later section
-        // must be modeled as live until segment end (max cycle) so scratch matches full-kernel view.
+        // Segment mode with live-out or live-through: need segment_end so we can model
+        // VRegs live until end of segment (live-out = defined here, used later; live-through = defined in prev section, used later).
         let segment_end_var: Option<IntVar> =
-            if initial_live.is_some() && live_out_vregs.is_some_and(|s| !s.is_empty()) {
+            if initial_live.is_some()
+                && (live_out_vregs.is_some_and(|s| !s.is_empty())
+                    || live_through_vregs.is_some_and(|s| !s.is_empty()))
+            {
                 let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
                 for cv in &cycle_vars {
                     model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
@@ -1724,6 +1730,25 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
+            // Segment mode: add [0, segment_end+1] intervals for live-through VRegs (defined in prev section, used in later section)
+            if let (Some(lt), Some(seg_end)) = (live_through_vregs, segment_end_var) {
+                let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
+                for vreg in lt {
+                    let end_expr = LinearExpr::from(seg_end) + 1;
+                    let size = model.new_int_var_with_name(
+                        [(1, horizon + 1)],
+                        format!("live_through_size_{}", vreg.id),
+                    );
+                    model.add_eq(
+                        LinearExpr::from(zero_var) + LinearExpr::from(size),
+                        end_expr.clone(),
+                    );
+                    let interval = model.new_interval_var(zero_var, size, end_expr);
+                    scratch_intervals.push(interval);
+                    scratch_demands.push(vreg.size() as i64);
+                }
+            }
+
             model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
 
             // Add hints for size variables if we have greedy hints
@@ -1803,6 +1828,13 @@ pub fn schedule_ssa_cpsat(
                             events.push((0, size));
                             events.push((hints[*last_use_idx] + 1, -size));
                         }
+                    }
+                }
+                if let Some(lt) = live_through_vregs {
+                    for vreg in lt {
+                        let size = vreg.size() as i64;
+                        events.push((0, size));
+                        events.push((max_hint + 1, -size));
                     }
                 }
                 for vreg in &live_vregs {
