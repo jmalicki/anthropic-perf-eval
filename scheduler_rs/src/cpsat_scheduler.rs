@@ -953,6 +953,8 @@ pub struct SsaCpsatHints<'a> {
     pub select_choice_hints: Option<&'a HashSet<usize>>,
     /// Segment mode: (VReg, op index of last use); adds fixed [0, end] intervals to scratch (per-section feasibility).
     pub initial_live: Option<&'a [(VReg, usize)]>,
+    /// Segment mode: VRegs defined in this segment but last-used in a later section. Their scratch interval must extend to segment end (max cycle).
+    pub live_out_vregs: Option<&'a HashSet<VReg>>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
@@ -1129,6 +1131,7 @@ pub fn schedule_ssa_cpsat(
     let shift_hints = hints.shift_hints;
     let select_choice_hints = hints.select_choice_hints;
     let initial_live = hints.initial_live;
+    let live_out_vregs = hints.live_out_vregs;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -1502,7 +1505,7 @@ pub fn schedule_ssa_cpsat(
     {
         let regular_flow_ops: Vec<usize> = ops.iter()
             .enumerate()
-            .filter(|(idx, op)| {
+            .filter(|(_idx, op)| {
                 op.engine == Engine::Flow 
                     && op.opcode != Opcode::AddImm 
                     && op.opcode != Opcode::SelectChoice
@@ -1586,9 +1589,7 @@ pub fn schedule_ssa_cpsat(
                     true
                 };
 
-                if should_update {
-                    vreg_last_use.insert(vreg, idx);
-                } else if !vreg_last_use.contains_key(&vreg) {
+                if should_update || !vreg_last_use.contains_key(&vreg) {
                     vreg_last_use.insert(vreg, idx);
                 }
             }
@@ -1617,6 +1618,19 @@ pub fn schedule_ssa_cpsat(
             .filter(|v| vreg_last_use.contains_key(v))
             .copied()
             .collect();
+
+        // Segment mode with live-out: VRegs defined in this segment but last-used in a later section
+        // must be modeled as live until segment end (max cycle) so scratch matches full-kernel view.
+        let segment_end_var: Option<IntVar> =
+            if initial_live.is_some() && live_out_vregs.is_some_and(|s| !s.is_empty()) {
+                let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
+                for cv in &cycle_vars {
+                    model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
+                }
+                Some(m)
+            } else {
+                None
+            };
 
         if !live_vregs.is_empty() {
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
@@ -1649,37 +1663,37 @@ pub fn schedule_ssa_cpsat(
             for vreg in &live_vregs {
                 let def_idx = vreg_def_op[vreg];
                 let last_use_idx = vreg_last_use[vreg];
+                let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
 
-                // The VReg is live from when it's defined until its last use.
-                // Create a variable-length interval: [def_cycle, last_use_cycle]
-                // The "size" of this interval is (last_use_cycle - def_cycle + 1)
-                //
-                // For cumulative, we need: start, size (or end)
-                // start = cycle_vars[def_idx]
-                // end = cycle_vars[last_use_idx] + 1 (VReg is live through the last use cycle)
-                //
-                // Use new_interval_var(start, size, end) where end = start + size
-                // We want: live from def_cycle to last_use_cycle (inclusive)
-                // So: end = last_use_cycle + 1, size = end - start = last_use_cycle + 1 - def_cycle
+                // Live-out VRegs (defined here, last-used in a later section) must extend to segment end
+                // so the scratch constraint matches the full-kernel peak.
+                let (end_expr, end_for_interval) = if is_live_out {
+                    let seg_end = segment_end_var.expect("segment_end when live_out");
+                    let e = LinearExpr::from(seg_end) + 1;
+                    (e.clone(), e)
+                } else {
+                    let e = LinearExpr::from(cycle_vars[last_use_idx]) + 1;
+                    (e.clone(), e)
+                };
 
+                // The VReg is live from when it's defined until its last use (or segment end if live-out).
+                // size = end - start
                 let start = cycle_vars[def_idx];
-                let end_expr = LinearExpr::from(cycle_vars[last_use_idx]) + 1;
 
-                // Create a size variable: size = end - start = cycle[last_use] + 1 - cycle[def]
+                // Create a size variable: size = end - start
                 // Size must be >= 1 (def and last_use could be same cycle)
                 let size = model.new_int_var_with_name(
                     [(1, horizon + 1)],
                     format!("live_size_{}", vreg.id),
                 );
 
-                // Constraint: size = cycle[last_use] + 1 - cycle[def]
-                // Rewrite: cycle[def] + size = cycle[last_use] + 1
+                // Constraint: cycle[def] + size = end
                 model.add_eq(
                     LinearExpr::from(start) + LinearExpr::from(size),
                     end_expr,
                 );
 
-                let interval = model.new_interval_var(start, size, LinearExpr::from(cycle_vars[last_use_idx]) + 1);
+                let interval = model.new_interval_var(start, size, end_for_interval);
                 scratch_intervals.push(interval);
                 size_vars.push((size, def_idx, last_use_idx));
 
@@ -1714,8 +1728,16 @@ pub fn schedule_ssa_cpsat(
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
+                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                if let Some(seg_end) = segment_end_var {
+                    model.add_hint(seg_end, max_hint as i64);
+                }
                 let mut bad_size_count = 0;
                 for vreg in &live_vregs {
+                    let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
+                    if is_live_out {
+                        continue; // live-out uses segment end, not last_use_idx
+                    }
                     let def_idx = vreg_def_op[vreg];
                     let last_use_idx = vreg_last_use[vreg];
                     if def_idx < hints.len() && last_use_idx < hints.len() {
@@ -1741,14 +1763,23 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
 
-                // Now add size hints
-                for (size_var, def_idx, last_use_idx) in &size_vars {
-                    if *def_idx < hints.len() && *last_use_idx < hints.len() {
-                        let def_cycle = hints[*def_idx];
-                        let last_use_cycle = hints[*last_use_idx];
-                        let expected_size = (last_use_cycle - def_cycle + 1).max(1);
-                        model.add_hint(*size_var, expected_size as i64);
+                // Now add size hints (live-out VRegs: use segment end = max_hint)
+                for (i, (size_var, def_idx, last_use_idx)) in size_vars.iter().enumerate() {
+                    let vreg = &live_vregs[i];
+                    let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
+                    if *def_idx >= hints.len() {
+                        continue;
                     }
+                    let def_cycle = hints[*def_idx];
+                    let expected_size = if is_live_out {
+                        (max_hint - def_cycle + 1).max(1)
+                    } else {
+                        if *last_use_idx >= hints.len() {
+                            continue;
+                        }
+                        (hints[*last_use_idx] - def_cycle + 1).max(1)
+                    };
+                    model.add_hint(*size_var, expected_size as i64);
                 }
 
                 if bad_size_count > 0 {
@@ -1762,13 +1793,27 @@ pub fn schedule_ssa_cpsat(
             // CRITICAL: Verify hints are feasible before solving
             // If hints are infeasible, there's a bug in our model - fail immediately
             if let Some(hints) = greedy_hints {
-                // Compute peak liveness from hints
+                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                // Compute peak liveness from hints (live-out VRegs extend to segment end = max_hint)
                 let mut events: Vec<(i32, i64)> = Vec::new();
+                if let Some(il) = initial_live {
+                    for (vreg, last_use_idx) in il.iter() {
+                        if *last_use_idx < hints.len() {
+                            let size = vreg.size() as i64;
+                            events.push((0, size));
+                            events.push((hints[*last_use_idx] + 1, -size));
+                        }
+                    }
+                }
                 for vreg in &live_vregs {
                     let def_idx = vreg_def_op[vreg];
                     let last_use_idx = vreg_last_use[vreg];
                     let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
-                    let last_use_cycle = hints.get(last_use_idx).copied().unwrap_or(def_cycle);
+                    let last_use_cycle = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
+                        max_hint
+                    } else {
+                        hints.get(last_use_idx).copied().unwrap_or(def_cycle)
+                    };
                     let size = vreg.size() as i64;
                     events.push((def_cycle, size));           // VReg becomes live
                     events.push((last_use_cycle + 1, -size)); // VReg dies after last use
@@ -1894,8 +1939,8 @@ pub fn schedule_ssa_cpsat(
     if enable_valu_shift {
         // This is a rough lower bound - actual bound depends on shift decisions
         // Minimum cycles needed to execute all ops considering both engines
-        let total_valu_work = valu_count; // Each VALU op = 1 VALU slot or 8 ALU slots
-        let total_alu_work = alu_count; // Each ALU op = 1 ALU slot
+        let _total_valu_work = valu_count; // Each VALU op = 1 VALU slot or 8 ALU slots
+        let _total_alu_work = alu_count; // Each ALU op = 1 ALU slot
 
         // Per cycle: up to 6 VALU + 12 ALU, but shifted VALU uses 8 ALU
         // Lower bound: we need at least enough cycles to handle all work
@@ -2218,6 +2263,7 @@ mod ssa_tests {
             &vreg_to_addr,
             &HashSet::new(), // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            &cpsat_result.select_fma_ops,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -2325,6 +2371,7 @@ mod ssa_tests {
             &vreg_to_addr,
             &HashSet::new(),
             &cpsat_result.const_add_imm_ops,
+            &cpsat_result.select_fma_ops,
         );
 
         // Verify ConstChoice ops were lowered correctly
@@ -2358,10 +2405,14 @@ mod ssa_tests {
         // Build a simple kernel with SelectChoice ops
         let mut emit = SsaEmitContext::new();
         
-        // Emit vector condition and values
-        let cond = emit.emit_valu(Opcode::Eq, emit.emit_const(0), emit.emit_const(1));
-        let true_val = emit.emit_vbroadcast(emit.emit_const(10));
-        let false_val = emit.emit_vbroadcast(emit.emit_const(20));
+        // Emit vector condition and values (use locals to avoid double mutable borrow)
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let cond = emit.emit_valu(Opcode::Eq, c0, c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
         
         // Emit SelectChoice ops
         let sel1 = emit.emit_select_choice(cond, true_val, false_val);
@@ -2406,10 +2457,14 @@ mod ssa_tests {
         // Build a simple kernel with SelectChoice ops
         let mut emit = SsaEmitContext::new();
         
-        // Emit vector condition and values
-        let cond = emit.emit_valu(Opcode::Eq, emit.emit_const(0), emit.emit_const(1));
-        let true_val = emit.emit_vbroadcast(emit.emit_const(10));
-        let false_val = emit.emit_vbroadcast(emit.emit_const(20));
+        // Emit vector condition and values (use locals to avoid double mutable borrow)
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let cond = emit.emit_valu(Opcode::Eq, c0, c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
         
         // Emit SelectChoice ops
         let sel1 = emit.emit_select_choice(cond, true_val, false_val);
@@ -2484,7 +2539,7 @@ mod ssa_tests {
                 // Verify fma is scheduled after sub
                 let sub_cycle = sub_op.unwrap().cycle;
                 let fma_cycle = fma_op.unwrap().cycle;
-                assert!(fma_cycle >= sub_cycle + 1,
+                assert!(fma_cycle > sub_cycle,
                     "FMA should be scheduled after sub: sub={}, fma={}", sub_cycle, fma_cycle);
             } else {
                 // CP-SAT chose vselect path - verify vselect op exists
@@ -2920,6 +2975,7 @@ mod tests {
             &vreg_to_addr,
             &HashSet::new(), // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            &cpsat_result.select_fma_ops,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -3032,6 +3088,7 @@ mod tests {
             &vreg_to_addr,
             &HashSet::new(),
             &cpsat_result.const_add_imm_ops,
+            &cpsat_result.select_fma_ops,
         );
 
         // Verify ConstChoice ops were lowered correctly

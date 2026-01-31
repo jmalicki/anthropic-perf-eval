@@ -10,7 +10,7 @@
 //! for each op in the segment, hint = greedy_cycle[global_idx] - section_offset.
 //! Use `segment_hints_for_section` for this.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{Opcode, SsaOp, VReg};
 
@@ -39,7 +39,7 @@ pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> Sectio
 
     // VReg -> defining op index (for cycle); only ops with cycle >= 0
     let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
-    for (idx, op) in ops.iter().enumerate() {
+    for op in ops.iter() {
         if op.cycle >= 0 {
             if let Some(dest) = op.dest {
                 vreg_def_cycle.insert(dest, op.cycle);
@@ -69,8 +69,7 @@ pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> Sectio
         // Cycle range for this section: min and max cycle among non-barrier ops with cycle >= 0
         let mut min_c = i32::MAX;
         let mut max_c = i32::MIN;
-        for idx in start..end {
-            let op = &ops[idx];
+        for op in &ops[start..end] {
             if op.opcode == Opcode::Barrier {
                 continue;
             }
@@ -111,8 +110,7 @@ pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> Sectio
 pub fn vreg_def_section(ops: &[SsaOp], boundaries: &[(usize, usize)]) -> HashMap<VReg, usize> {
     let mut out = HashMap::new();
     for (sec, &(start, end)) in boundaries.iter().enumerate() {
-        for idx in start..end {
-            let op = &ops[idx];
+        for op in &ops[start..end] {
             if op.opcode == Opcode::Barrier {
                 continue;
             }
@@ -170,6 +168,62 @@ pub fn live_in_for_section(
         .into_iter()
         .map(|(vreg, (seg_idx, _))| (vreg, seg_idx))
         .collect()
+}
+
+/// VRegs defined in section `section_k` whose last use (by global cycle) is in a later section.
+/// For per-section CP-SAT we must treat these as live until the end of the segment so the
+/// scratch constraint matches the full-kernel view.
+pub fn live_out_from_section(
+    ops: &[SsaOp],
+    boundaries: &[(usize, usize)],
+    section_k: usize,
+    vreg_def_section: &HashMap<VReg, usize>,
+) -> HashSet<VReg> {
+    let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
+    for op in ops.iter() {
+        if op.cycle < 0 {
+            continue;
+        }
+        let c = op.cycle;
+        for vreg in op.reads() {
+            vreg_last_use_cycle
+                .entry(vreg)
+                .and_modify(|m| *m = (*m).max(c))
+                .or_insert(c);
+        }
+    }
+    let mut section_cycle_ranges: Vec<(i32, i32)> = Vec::with_capacity(boundaries.len());
+    for &(start, end) in boundaries {
+        let mut min_c = i32::MAX;
+        let mut max_c = i32::MIN;
+        for op in &ops[start..end] {
+            if op.opcode == Opcode::Barrier || op.cycle < 0 {
+                continue;
+            }
+            let c = op.cycle;
+            min_c = min_c.min(c);
+            max_c = max_c.max(c);
+        }
+        section_cycle_ranges.push(if min_c <= max_c { (min_c, max_c) } else { (i32::MAX, i32::MIN) });
+    }
+    let mut out = HashSet::new();
+    for (vreg, &def_sec) in vreg_def_section {
+        if def_sec != section_k {
+            continue;
+        }
+        let last_c = match vreg_last_use_cycle.get(vreg) {
+            Some(&c) => c,
+            None => continue,
+        };
+        let last_use_section = section_cycle_ranges
+            .iter()
+            .position(|&(lo, hi)| lo <= last_c && last_c <= hi)
+            .unwrap_or(section_k);
+        if last_use_section > section_k {
+            out.insert(*vreg);
+        }
+    }
+    out
 }
 
 /// Build cycle hints for a single section in **local** cycle space (0-based).
@@ -359,5 +413,50 @@ mod tests {
         // Section 1: op 3 (cycle 20). Offset 13 (e.g. section 0 makespan 3) -> hint 20 - 13 = 7
         let h1 = segment_hints_for_section(&ops, &boundaries, 1, 13);
         assert_eq!(h1, vec![7]);
+    }
+
+    /// Regression: live_out_from_section identifies VRegs defined in section k but last-used in a later section.
+    /// Per-section CP-SAT must extend their scratch interval to segment end so the merged schedule stays within budget.
+    #[test]
+    fn test_live_out_from_section() {
+        let v0 = VReg::scalar(0);
+        let v1 = VReg::scalar(1);
+        let v3 = VReg::scalar(3);
+        // Section 0: op0 def v0 (cycle 0), op1 def v1 (cycle 1), both read in section 1
+        // Section 1: op3 reads v0, v1 and def v3 (cycle 3)
+        // v0 and v1 are defined in section 0 but last used in section 1 -> live-out from section 0
+        // v3 is defined in section 1 and last used in section 1 -> not live-out from section 1
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Load, Opcode::Const, Some(v0), vec![], vec![], 0),
+            make_op_with_cycle(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v1),
+                vec![Operand::VReg(v0), Operand::VReg(v0)],
+                vec![0],
+                1,
+            ),
+            make_barrier_with_cycle(2, vec![0, 1], 2),
+            make_op_with_cycle(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v3),
+                vec![Operand::VReg(v0), Operand::VReg(v1)],
+                vec![0, 1, 2],
+                3,
+            ),
+        ];
+        let boundaries = section_boundaries(&ops);
+        let vds = vreg_def_section(&ops, &boundaries);
+        // Section 0 live-out: v0 and v1 are defined in 0, last use in section 1
+        let live_out_0 = live_out_from_section(&ops, &boundaries, 0, &vds);
+        assert!(live_out_0.contains(&v0), "v0 defined in section 0, last use in section 1");
+        assert!(live_out_0.contains(&v1), "v1 defined in section 0, last use in section 1");
+        assert_eq!(live_out_0.len(), 2);
+        // Section 1 live-out: v3 is defined in 1 and last use in 1 -> empty
+        let live_out_1 = live_out_from_section(&ops, &boundaries, 1, &vds);
+        assert!(live_out_1.is_empty(), "v3 last use in section 1, no live-out");
     }
 }

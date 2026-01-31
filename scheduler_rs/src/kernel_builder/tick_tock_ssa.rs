@@ -274,7 +274,7 @@ impl SsaTickTockKernelBuilder {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
         use super::barrier_elision::{count_barriers, section_boundaries};
-        use super::round_budget::{sections_exceeding_budget, live_in_for_section, vreg_def_section};
+        use super::round_budget::{sections_exceeding_budget, live_in_for_section, live_out_from_section, vreg_def_section};
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
@@ -406,6 +406,7 @@ impl SsaTickTockKernelBuilder {
                     .collect();
                 let initial_live =
                     live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let segment_hints: Vec<i32> = global_indices
                     .iter()
                     .map(|&i| {
@@ -443,6 +444,7 @@ impl SsaTickTockKernelBuilder {
                         shift_hints: seg_shift,
                         select_choice_hints: seg_select,
                         initial_live: Some(&initial_live),
+                        live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
                         ..Default::default()
                     },
                 )
@@ -2694,5 +2696,33 @@ mod tests {
                 // We don't fail the test - just report the finding
             }
         }
+    }
+
+    /// Regression: two-phase CP-SAT (per-section feasibility then full-kernel optimization) must
+    /// produce a merged hint schedule that stays within scratch budget so the final result does not exceed 1536.
+    /// See live_out_from_section and segment scratch constraint with live_out_vregs.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_cpsat_two_phase_hint_schedule_within_budget() {
+        // Full 16 rounds so some sections may exceed budget and trigger per-section CP-SAT
+        let config = KernelConfig::new(10, 2047, 256, 16);
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+        let result = builder.build_and_schedule_cpsat(
+            120.0,  // Short time limit for CI
+            false,  // verbose
+            false,  // enable_valu_shift to keep test deterministic and faster
+        );
+        assert!(result.is_ok(), "build_and_schedule_cpsat should succeed: {:?}", result.err());
+        let result = result.unwrap();
+        assert!(
+            !result.address_result.budget_exceeded,
+            "Two-phase CP-SAT must produce a schedule within scratch budget; peak_live={} > 1536",
+            result.address_result.peak_live
+        );
+        assert!(
+            result.address_result.peak_live <= 1536,
+            "Peak live words must not exceed scratch budget: {} > 1536",
+            result.address_result.peak_live
+        );
     }
 }

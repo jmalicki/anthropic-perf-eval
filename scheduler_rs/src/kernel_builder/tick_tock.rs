@@ -10,7 +10,7 @@ use super::config::{
 };
 use super::context::{ScratchAllocator, ScratchContext, ZERO_REG};
 use super::emit::EmitContext;
-use super::partition::{get_read_buffer, should_partition, PartitionHelper};
+use super::partition::{get_read_buffer, PartitionHelper};
 
 /// Unroll factor - process 8 groups per iteration
 const UNROLL: usize = 8;
@@ -1159,9 +1159,8 @@ impl TickTockKernelBuilder {
         //   1. Actually interleave TIK stores with TOK hash (and vice versa)
         //   2. Use cheaper partition algorithm (parallel prefix-sum)
         //   3. Skip partition, use wider selection window (16-way select)
-        if false && self.config.enable_lazy_partition
-            && should_partition(rnd, self.config.rounds, self.config.partition_frequency)
-        {
+        // Dead code: lazy partition path (disabled); kept for reference.
+        if false {
             // Emit partition stores to the write buffer (currently disabled)
             let read_buffer = get_read_buffer(rnd, self.config.partition_frequency);
             let write_buffer = read_buffer.write_target();
