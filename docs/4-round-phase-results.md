@@ -16,8 +16,8 @@ Record after each phase: git SHA, exact uv command, liveness peak, cycles, and c
 
 ## Before/after tree-reduce depth3 (treeselect)
 
-Comparison with **all bells and whistles**: 4 rounds, `--enable-valu-shift`, greedy scheduler (CP-SAT + valu_shift for 4 rounds currently fails merged scratch budget check, so greedy was used to get returned cycles and peak liveness).
-
+- **Git SHA:** 68b1602
+- Comparison with **all bells and whistles**: 4 rounds, `--enable-valu-shift`, greedy scheduler (CP-SAT + valu_shift for 4 rounds currently fails merged scratch budget check, so greedy was used to get returned cycles and peak liveness).
 - **Exact command:** `uv run python scripts/run_before_after_treeselect.py --use-greedy -q`
 - **Options:** rounds=4, enable_valu_shift=True, scheduler=greedy
 
