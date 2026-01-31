@@ -411,6 +411,155 @@ impl SsaTickTockKernelBuilder {
     }
 
     // =========================================================================
+    // Selection Primitives (2-way, 4-way, 8-way)
+    // =========================================================================
+    //
+    // These build tree selection from SelectChoice pseudo-ops (vselect or FMA per op).
+    // 2-way: one select. 4-way: linear chain of 3 selects or bit-tree (2 parallel + 1).
+    // 8-way: bit-tree of 7 selects (4 + 2 + 1 levels).
+
+    /// 2-way selection: cond ? true_val : false_val (one SelectChoice).
+    fn select_2way(&mut self, cond: crate::types::VReg, true_val: crate::types::VReg, false_val: crate::types::VReg) -> crate::types::VReg {
+        self.emit.emit_select_choice(cond, true_val, false_val)
+    }
+
+    /// 2-way selection with precomputed delta: cond ? (base + delta) : base (one SelectChoice).
+    fn select_2way_with_delta(&mut self, cond: crate::types::VReg, delta: crate::types::VReg, base: crate::types::VReg) -> crate::types::VReg {
+        self.emit.emit_select_choice_with_delta(cond, delta, base)
+    }
+
+    /// 4-way selection via linear chain: start with v0, then select v1 if idx==base_idx+1, v2 if base_idx+2, v3 if base_idx+3.
+    fn select_4way_linear(
+        &mut self,
+        idx: crate::types::VReg,
+        base_idx: usize,
+        v0: crate::types::VReg,
+        v1: crate::types::VReg,
+        v2: crate::types::VReg,
+        v3: crate::types::VReg,
+    ) -> crate::types::VReg {
+        let c1 = base_idx + 1;
+        let c2 = base_idx + 2;
+        let c3 = base_idx + 3;
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond1 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        let mut result = self.select_2way(cond1, v1, v0);
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond2 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        result = self.select_2way(cond2, v2, result);
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond3 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        result = self.select_2way(cond3, v3, result);
+        result
+    }
+
+    /// 4-way selection via linear chain with first pair as (base, delta) to avoid materializing base+delta.
+    fn select_4way_linear_first_delta(
+        &mut self,
+        idx: crate::types::VReg,
+        base_idx: usize,
+        base: crate::types::VReg,
+        delta: crate::types::VReg,
+        v2: crate::types::VReg,
+        v3: crate::types::VReg,
+    ) -> crate::types::VReg {
+        let c1 = base_idx + 1;
+        let c2 = base_idx + 2;
+        let c3 = base_idx + 3;
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond1 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        let mut result = self.select_2way_with_delta(cond1, delta, base);
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond2 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        result = self.select_2way(cond2, v2, result);
+        self.emit.set_next_var_type(VarType::Condition);
+        let cond3 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
+        self.emit.set_next_var_type(VarType::Temporary);
+        result = self.select_2way(cond3, v3, result);
+        result
+    }
+
+    /// 4-way selection via bit-tree: idx_adj = idx - base_idx (0..4), bit0 = low bit, bit1 = high bit.
+    /// Level 0: two parallel 2-way (v0,v1) by bit0 and (v2,v3) by bit0. Level 1: one 2-way by bit1.
+    /// Requires v_const[base_idx] for idx_adj.
+    fn select_4way_bit_tree(
+        &mut self,
+        idx: crate::types::VReg,
+        base_idx: usize,
+        v0: crate::types::VReg,
+        v1: crate::types::VReg,
+        v2: crate::types::VReg,
+        v3: crate::types::VReg,
+    ) -> crate::types::VReg {
+        let v_const_base = self.ctx.v_const[base_idx].unwrap();
+        let v_1 = self.ctx.v_1.unwrap();
+        self.emit.set_next_var_type(VarType::Temporary);
+        let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_const_base);
+        let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
+        let idx_adj_shr = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
+        let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
+        self.emit.set_next_var_type(VarType::Temporary);
+        let p01 = self.select_2way(bit0, v1, v0);
+        let p23 = self.select_2way(bit0, v3, v2);
+        self.select_2way(bit1, p23, p01)
+    }
+
+    /// 4-way bit-tree with first pair as (base, delta) to avoid materializing v1.
+    fn select_4way_bit_tree_first_delta(
+        &mut self,
+        idx: crate::types::VReg,
+        base_idx: usize,
+        base01: crate::types::VReg,
+        delta1: crate::types::VReg,
+        v2: crate::types::VReg,
+        v3: crate::types::VReg,
+    ) -> crate::types::VReg {
+        let v_const_base = self.ctx.v_const[base_idx].unwrap();
+        let v_1 = self.ctx.v_1.unwrap();
+        self.emit.set_next_var_type(VarType::Temporary);
+        let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_const_base);
+        let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
+        let idx_adj_shr = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
+        let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
+        self.emit.set_next_var_type(VarType::Temporary);
+        let p01 = self.select_2way_with_delta(bit0, delta1, base01);
+        let p23 = self.select_2way(bit0, v3, v2);
+        self.select_2way(bit1, p23, p01)
+    }
+
+    /// 8-way selection via bit-tree: idx_adj = idx - base_idx (0..8), bit0/bit1/bit2.
+    /// Level 0: four parallel 2-way by bit0. Level 1: two 2-way by bit1. Level 2: one 2-way by bit2.
+    /// Uses SelectChoice only (no direct FMA). Requires v_const[base_idx] and v_1.
+    fn select_8way_bit_tree(
+        &mut self,
+        idx: crate::types::VReg,
+        base_idx: usize,
+        values: &[crate::types::VReg; 8],
+    ) -> crate::types::VReg {
+        let v_const_base = self.ctx.v_const[base_idx].unwrap();
+        let v_1 = self.ctx.v_1.unwrap();
+        self.emit.set_next_var_type(VarType::Temporary);
+        let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_const_base);
+        let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
+        let idx_adj_shr1 = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
+        let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr1, v_1);
+        let bit2 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr1, v_1);
+        self.emit.set_next_var_type(VarType::Temporary);
+        let p01 = self.select_2way(bit0, values[1], values[0]);
+        let p23 = self.select_2way(bit0, values[3], values[2]);
+        let p45 = self.select_2way(bit0, values[5], values[4]);
+        let p67 = self.select_2way(bit0, values[7], values[6]);
+        let q03 = self.select_2way(bit1, p23, p01);
+        let q47 = self.select_2way(bit1, p67, p45);
+        self.select_2way(bit2, q47, q03)
+    }
+
+    // =========================================================================
     // Tree Access by Depth
     // =========================================================================
 
@@ -432,7 +581,7 @@ impl SsaTickTockKernelBuilder {
     }
 
     pub(super) fn emit_depth1_access(&mut self, n_iters: usize) {
-        // Depth 1: Delta selection for 2 values
+        // Depth 1: 2-way selection (indices 1, 2) via select_2way_with_delta.
         let v_1 = self.ctx.v_1.unwrap();
         let v_td_1 = self.ctx.v_td_1.unwrap();
         let v_tc2 = self.ctx.v_tc2.unwrap();
@@ -446,8 +595,7 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_next_var_type(VarType::Condition);
                 let cond = self.emit.emit_valu(Opcode::Eq, idx, v_1);
                 self.emit.set_next_var_type(VarType::Temporary);
-                // Use SelectChoice with precomputed delta: cond ? (v_tc2 + v_td_1) : v_tc2
-                let v_nv = self.emit.emit_select_choice_with_delta(cond, self.ctx.v_td_1.unwrap(), self.ctx.v_tc2.unwrap());
+                let v_nv = self.select_2way_with_delta(cond, v_td_1, v_tc2);
                 self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
@@ -456,43 +604,21 @@ impl SsaTickTockKernelBuilder {
     }
 
     pub(super) fn emit_depth2_access(&mut self, n_iters: usize) {
-        // Depth 2: Delta selection for 4 values
-        let v_const_4 = self.ctx.v_const[4].unwrap();
-        let v_const_5 = self.ctx.v_const[5].unwrap();
-        let v_const_6 = self.ctx.v_const[6].unwrap();
-        let v_td_4 = self.ctx.v_td_4.unwrap();
-        let v_td_5 = self.ctx.v_td_5.unwrap();
-        let v_td_6 = self.ctx.v_td_6.unwrap();
+        // Depth 2: 4-way selection (indices 3,4,5,6). First pair (tc3,tc4) as (base, delta); rest as full values.
         let v_tc3 = self.ctx.v_tc3.unwrap();
+        let v_td_4 = self.ctx.v_td_4.unwrap();
+        let v_tc5 = self.ctx.v_tc5.unwrap();
+        let v_tc6 = self.ctx.v_tc6.unwrap();
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
+        const BASE_IDX: usize = 3;
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
-
-                // Start with tc[3], select tc[4] if idx == 4
-                self.emit.set_next_var_type(VarType::Condition);
-                let cond4 = self.emit.emit_valu(Opcode::Eq, idx, v_const_4);
                 self.emit.set_next_var_type(VarType::Temporary);
-                // Use SelectChoice with precomputed delta: cond4 ? (v_tc3 + v_td_4) : v_tc3
-                let mut v_nv = self.emit.emit_select_choice_with_delta(cond4, self.ctx.v_td_4.unwrap(), self.ctx.v_tc3.unwrap());
-
-                // Select tc[5] if idx == 5
-                self.emit.set_next_var_type(VarType::Condition);
-                let cond5 = self.emit.emit_valu(Opcode::Eq, idx, v_const_5);
-                self.emit.set_next_var_type(VarType::Temporary);
-                let v_tc5 = self.ctx.v_tc5.unwrap();
-                v_nv = self.emit.emit_select_choice(cond5, v_tc5, v_nv);
-
-                // Select tc[6] if idx == 6
-                self.emit.set_next_var_type(VarType::Condition);
-                let cond6 = self.emit.emit_valu(Opcode::Eq, idx, v_const_6);
-                self.emit.set_next_var_type(VarType::Temporary);
-                let v_tc6 = self.ctx.v_tc6.unwrap();
-                v_nv = self.emit.emit_select_choice(cond6, v_tc6, v_nv);
-
+                let v_nv = self.select_4way_linear_first_delta(idx, BASE_IDX, v_tc3, v_td_4, v_tc5, v_tc6);
                 self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
@@ -507,7 +633,8 @@ impl SsaTickTockKernelBuilder {
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
         if self.config.enable_tree_reduce_depth3 {
-            // Tree-reduce approach (15 VALU ops instead of 16)
+            // Tree-reduce: 3 levels of 2-way by bits (same shape as select_8way_bit_tree), but using direct FMA for lower op count.
+            // For a SelectChoice-based 8-way use select_8way_bit_tree(idx, 7, &[v_tc_r3[0], ..., v_tc_r3[7]]).
             let v_const_7 = self.ctx.v_const[7].unwrap();
             let v_1 = self.ctx.v_1.unwrap();
             let v_td_r3_01 = self.ctx.v_td_r3_01.unwrap();

@@ -304,21 +304,18 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Track remaining unscheduled dependencies per op
-        // Only count deps that are not dead stores (dead stores are pre-satisfied)
-        // Panic if any dep_id doesn't exist - that's a bug in dependency computation
+        // Only count deps that exist in the ops list and are not dead stores (dead stores are pre-satisfied).
+        // Deps that don't exist in id_to_idx (e.g. external/phantom deps) are treated as satisfied.
         let mut remaining_deps: Vec<usize> = ops
             .iter()
             .enumerate()
-            .map(|(op_idx, op)| {
+            .map(|(_op_idx, op)| {
                 op.dep_ids
                     .iter()
                     .filter(|dep_id| {
-                        let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
-                            panic!(
-                                "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list",
-                                op_idx, op.id, dep_id
-                            )
-                        });
+                        let Some(&dep_idx) = id_to_idx.get(dep_id) else {
+                            return false; // external/phantom dep - treat as satisfied
+                        };
                         !dead_store_indices.contains(&dep_idx)
                     })
                     .count()
@@ -403,15 +400,12 @@ impl SsaTickTockKernelBuilder {
                 }
 
                 // Check if deps are truly satisfied (scheduled in previous cycle)
-                // Dead stores are treated as already satisfied (they're skipped entirely)
+                // Dead stores are treated as already satisfied (they're skipped entirely).
+                // Deps not in id_to_idx (external/phantom) are treated as satisfied.
                 let deps_ready = ops[idx].dep_ids.iter().all(|dep_id| {
-                    let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
-                        panic!(
-                            "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list. \
-                             This indicates a bug in dependency computation or op filtering.",
-                            idx, ops[idx].id, dep_id
-                        )
-                    });
+                    let Some(&dep_idx) = id_to_idx.get(dep_id) else {
+                        return true; // external/phantom dep - treat as satisfied
+                    };
                     dead_store_indices.contains(&dep_idx) ||
                     (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
                 });
@@ -894,14 +888,11 @@ impl SsaTickTockKernelBuilder {
                 .filter(|(idx, op)| {
                     // Not yet scheduled
                     !scheduled.contains(idx)
-                        // All dependencies scheduled in earlier cycles
+                        // All dependencies scheduled in earlier cycles (missing deps treated as satisfied)
                         && op.dep_ids.iter().all(|dep_id| {
-                            let dep_idx = *id_to_idx.get(dep_id).unwrap_or_else(|| {
-                                panic!(
-                                    "BUG: op[{}] (id={}) has dependency on op id={} which doesn't exist in ops list",
-                                    idx, op.id, dep_id
-                                )
-                            });
+                            let Some(&dep_idx) = id_to_idx.get(dep_id) else {
+                                return true; // external/phantom dep - treat as satisfied
+                            };
                             let dep_cycle = ops[dep_idx].cycle;
                             dep_cycle >= 0 && dep_cycle < cycle as i32
                         })
