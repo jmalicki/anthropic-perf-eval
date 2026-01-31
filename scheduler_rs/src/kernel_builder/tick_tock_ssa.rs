@@ -806,6 +806,22 @@ mod tests {
         assert!(!result.address_result.budget_exceeded, "Should not exceed budget");
     }
 
+    /// 4-round optimization effort: production-sized 4-round kernel must complete and stay within scratch budget.
+    #[test]
+    fn test_4_round_kernel_generation_within_budget() {
+        let config = KernelConfig::new(10, 2047, 256, 4);
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+        let result = builder.build_and_schedule();
+        assert!(result.is_ok(), "4-round kernel generation should succeed: {:?}", result.err());
+        let result = result.unwrap();
+        assert!(
+            result.address_result.peak_live <= 1536,
+            "4-round kernel must stay within scratch budget: peak_live={} > 1536",
+            result.address_result.peak_live
+        );
+        assert!(!result.address_result.budget_exceeded, "4-round kernel must not report budget_exceeded");
+    }
+
     // =========================================================================
     // Greedy Scheduler Scratch Budget Tests
     // =========================================================================

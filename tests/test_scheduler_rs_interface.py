@@ -88,3 +88,34 @@ def test_build_tick_tock_kernel_ssa_greedy():
         use_cpsat=False,
     )
     _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+
+
+# Production-sized 4-round config: same as submission (forest_height=10, batch=256) but rounds=4.
+# Used for 4-round optimization effort submission-style correctness.
+FOUR_ROUND_FOREST_HEIGHT = 10
+FOUR_ROUND_N_NODES = 2047
+FOUR_ROUND_BATCH_SIZE = 256
+FOUR_ROUNDS = 4
+
+
+def test_4_round_submission_correctness():
+    """4-round kernel (Rust-generated, production-sized) must match reference_kernel2.
+
+    Submission-style correctness: forest_height=10, n_nodes=2047, batch_size=256, rounds=4.
+    Build via scheduler_rs, run on Machine, assert output == reference_kernel2.
+    """
+    import scheduler_rs
+
+    forest = Tree.generate(FOUR_ROUND_FOREST_HEIGHT)
+    inp = Input.generate(forest, FOUR_ROUND_BATCH_SIZE, FOUR_ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOUR_ROUND_FOREST_HEIGHT,
+        FOUR_ROUND_N_NODES,
+        FOUR_ROUND_BATCH_SIZE,
+        FOUR_ROUNDS,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+    )
+    _run_kernel_and_assert_matches_reference(instrs, mem, FOUR_ROUND_BATCH_SIZE)
