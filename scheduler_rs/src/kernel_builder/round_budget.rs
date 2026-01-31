@@ -170,55 +170,43 @@ pub fn live_in_for_section(
         .collect()
 }
 
-/// VRegs defined in section `section_k` whose last use (by global cycle) is in a later section.
+/// VRegs defined in section `section_k` whose last use is in a later section.
 /// For per-section CP-SAT we must treat these as live until the end of the segment so the
 /// scratch constraint matches the full-kernel view.
+///
+/// Uses OP INDEX to determine section membership (not cycle), since ops can be interleaved
+/// across sections. An op at index i belongs to section s if boundaries[s].0 <= i < boundaries[s].1.
 pub fn live_out_from_section(
     ops: &[SsaOp],
     boundaries: &[(usize, usize)],
     section_k: usize,
     vreg_def_section: &HashMap<VReg, usize>,
 ) -> HashSet<VReg> {
-    let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
-    for op in ops.iter() {
-        if op.cycle < 0 {
-            continue;
-        }
-        let c = op.cycle;
-        for vreg in op.reads() {
-            vreg_last_use_cycle
-                .entry(vreg)
-                .and_modify(|m| *m = (*m).max(c))
-                .or_insert(c);
-        }
-    }
-    let mut section_cycle_ranges: Vec<(i32, i32)> = Vec::with_capacity(boundaries.len());
-    for &(start, end) in boundaries {
-        let mut min_c = i32::MAX;
-        let mut max_c = i32::MIN;
+    // Build a map from vreg -> section of last use (by op index, not cycle)
+    let mut vreg_last_use_section: HashMap<VReg, usize> = HashMap::new();
+    for (sec_idx, &(start, end)) in boundaries.iter().enumerate() {
         for op in &ops[start..end] {
-            if op.opcode == Opcode::Barrier || op.cycle < 0 {
+            if op.opcode == Opcode::Barrier {
                 continue;
             }
-            let c = op.cycle;
-            min_c = min_c.min(c);
-            max_c = max_c.max(c);
+            for vreg in op.reads() {
+                vreg_last_use_section
+                    .entry(vreg)
+                    .and_modify(|s| *s = (*s).max(sec_idx))
+                    .or_insert(sec_idx);
+            }
         }
-        section_cycle_ranges.push(if min_c <= max_c { (min_c, max_c) } else { (i32::MAX, i32::MIN) });
     }
+
     let mut out = HashSet::new();
     for (vreg, &def_sec) in vreg_def_section {
         if def_sec != section_k {
             continue;
         }
-        let last_c = match vreg_last_use_cycle.get(vreg) {
-            Some(&c) => c,
+        let last_use_section = match vreg_last_use_section.get(vreg) {
+            Some(&s) => s,
             None => continue,
         };
-        let last_use_section = section_cycle_ranges
-            .iter()
-            .position(|&(lo, hi)| lo <= last_c && last_c <= hi)
-            .unwrap_or(section_k);
         if last_use_section > section_k {
             out.insert(*vreg);
         }
@@ -226,9 +214,13 @@ pub fn live_out_from_section(
     out
 }
 
-/// VRegs defined in section `section_k - 1` whose last use is in a section > `section_k`.
+/// VRegs defined in ANY section before `section_k` (sections 0..section_k-1) whose last use
+/// is in a section AFTER `section_k` (sections section_k+1..N).
 /// They are live for the entire segment k (carry-through). Per-section CP-SAT for section k
 /// must add [0, segment_end] intervals so scratch matches the full-kernel view.
+///
+/// Uses OP INDEX to determine section membership (not cycle), since ops can be interleaved
+/// across sections. An op at index i belongs to section s if boundaries[s].0 <= i < boundaries[s].1.
 pub fn live_through_for_section(
     ops: &[SsaOp],
     boundaries: &[(usize, usize)],
@@ -238,47 +230,36 @@ pub fn live_through_for_section(
     if section_k == 0 {
         return HashSet::new();
     }
-    let prev_sec = section_k - 1;
-    let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
-    for op in ops.iter() {
-        if op.cycle < 0 {
-            continue;
-        }
-        let c = op.cycle;
-        for vreg in op.reads() {
-            vreg_last_use_cycle
-                .entry(vreg)
-                .and_modify(|m| *m = (*m).max(c))
-                .or_insert(c);
-        }
-    }
-    let mut section_cycle_ranges: Vec<(i32, i32)> = Vec::with_capacity(boundaries.len());
-    for &(start, end) in boundaries {
-        let mut min_c = i32::MAX;
-        let mut max_c = i32::MIN;
+
+    // Build a map from vreg -> section of last use (by op index, not cycle)
+    // This correctly handles interleaved ops where cycles don't correspond to sections
+    let mut vreg_last_use_section: HashMap<VReg, usize> = HashMap::new();
+    for (sec_idx, &(start, end)) in boundaries.iter().enumerate() {
         for op in &ops[start..end] {
-            if op.opcode == Opcode::Barrier || op.cycle < 0 {
+            if op.opcode == Opcode::Barrier {
                 continue;
             }
-            let c = op.cycle;
-            min_c = min_c.min(c);
-            max_c = max_c.max(c);
+            for vreg in op.reads() {
+                // Update last use section to the max section index where vreg is used
+                vreg_last_use_section
+                    .entry(vreg)
+                    .and_modify(|s| *s = (*s).max(sec_idx))
+                    .or_insert(sec_idx);
+            }
         }
-        section_cycle_ranges.push(if min_c <= max_c { (min_c, max_c) } else { (i32::MAX, i32::MIN) });
     }
+
     let mut out = HashSet::new();
     for (vreg, &def_sec) in vreg_def_section {
-        if def_sec != prev_sec {
+        // VReg must be defined BEFORE section_k (in any earlier section)
+        if def_sec >= section_k {
             continue;
         }
-        let last_c = match vreg_last_use_cycle.get(vreg) {
-            Some(&c) => c,
+        let last_use_section = match vreg_last_use_section.get(vreg) {
+            Some(&s) => s,
             None => continue,
         };
-        let last_use_section = section_cycle_ranges
-            .iter()
-            .position(|&(lo, hi)| lo <= last_c && last_c <= hi)
-            .unwrap_or(prev_sec);
+        // VReg is live-through if its last use is in a section AFTER section_k
         if last_use_section > section_k {
             out.insert(*vreg);
         }
@@ -575,5 +556,79 @@ mod tests {
         assert_eq!(live_through_1.len(), 1);
         let live_through_2 = live_through_for_section(&ops, &boundaries, 2, &vds);
         assert!(live_through_2.is_empty(), "v2 last use in section 2, so 2 > 2 is false");
+    }
+
+    /// Test that live_through_for_section correctly handles VRegs from early sections
+    /// that are live-through multiple later sections (the bug fix: def_sec < section_k, not def_sec == prev_sec).
+    #[test]
+    fn test_live_through_for_section_multi_section_span() {
+        let v0 = VReg::scalar(0);
+        let v1 = VReg::scalar(1);
+        let v2 = VReg::scalar(2);
+        let v3 = VReg::scalar(3);
+        let v4 = VReg::scalar(4);
+        // Section 0: def v0, v1
+        // Section 1: def v2 (uses v0)
+        // Section 2: def v3 (uses v2)
+        // Section 3: def v4 (uses v0, v1) - v0 and v1 are live-through sections 1 AND 2
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Load, Opcode::Const, Some(v0), vec![], vec![], 0),
+            make_op_with_cycle(1, Engine::Load, Opcode::Const, Some(v1), vec![], vec![], 1),
+            make_barrier_with_cycle(2, vec![0, 1], 2),
+            // Section 1
+            make_op_with_cycle(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v2),
+                vec![Operand::VReg(v0), Operand::VReg(v0)],
+                vec![0, 2],
+                3,
+            ),
+            make_barrier_with_cycle(4, vec![0, 1, 2, 3], 4),
+            // Section 2
+            make_op_with_cycle(
+                5,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v3),
+                vec![Operand::VReg(v2), Operand::VReg(v2)],
+                vec![3, 4],
+                5,
+            ),
+            make_barrier_with_cycle(6, vec![0, 1, 3, 4, 5], 6),
+            // Section 3: uses v0, v1 from section 0
+            make_op_with_cycle(
+                7,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v4),
+                vec![Operand::VReg(v0), Operand::VReg(v1)],
+                vec![0, 1, 5, 6],
+                7,
+            ),
+        ];
+        let boundaries = section_boundaries(&ops);
+        assert_eq!(boundaries.len(), 4, "Should have 4 sections");
+        let vds = vreg_def_section(&ops, &boundaries);
+
+        // Section 1 live-through: v0 and v1 are both defined in section 0, last use in section 3 (> 1)
+        // v0 is ALSO used in section 1, but its LAST use is in section 3, so it's still live-through
+        let live_through_1 = live_through_for_section(&ops, &boundaries, 1, &vds);
+        assert!(live_through_1.contains(&v1), "v1: def=0, last_use=3 > 1, live-through section 1");
+        assert!(live_through_1.contains(&v0), "v0: def=0, last_use=3 > 1 (also used in 1, but LAST use is 3)");
+        assert_eq!(live_through_1.len(), 2);
+
+        // Section 2 live-through: v0 and v1 are both defined in section 0 (< 2), last use in section 3 (> 2)
+        // This is the key test case for the bug fix - v0 and v1 should be live-through section 2
+        // even though they were defined in section 0 (not section 1 = prev_sec)
+        let live_through_2 = live_through_for_section(&ops, &boundaries, 2, &vds);
+        assert!(live_through_2.contains(&v0), "v0: def=0 < 2, last_use=3 > 2, live-through section 2");
+        assert!(live_through_2.contains(&v1), "v1: def=0 < 2, last_use=3 > 2, live-through section 2");
+        assert_eq!(live_through_2.len(), 2);
+
+        // Section 3 live-through: nothing, v0 and v1 are last-used in section 3 (not > 3)
+        let live_through_3 = live_through_for_section(&ops, &boundaries, 3, &vds);
+        assert!(live_through_3.is_empty(), "Section 3 has no live-through (all last uses in section 3)");
     }
 }
