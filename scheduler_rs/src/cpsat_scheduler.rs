@@ -276,6 +276,132 @@ pub fn compute_alap(ops: &[Op], horizon: i32) -> HashMap<usize, i32> {
     alap
 }
 
+/// One row of the Flow audit: an op that contributes to the Flow engine at a given cycle.
+#[cfg(feature = "cpsat")]
+#[derive(Debug, Clone)]
+struct FlowAuditRow {
+    idx: usize,
+    op_id: usize,
+    opcode: Opcode,
+    cycle: usize,
+    reason: String,
+}
+
+/// Build full Flow audit: every op that contributes to Flow, with idx, op.id, opcode, cycle, reason.
+/// Used for rigorous breadcrumb logging and panic messages.
+#[cfg(feature = "cpsat")]
+fn build_flow_audit(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    const_add_imm_ops: &HashSet<usize>,
+    select_fma_ops: &HashSet<usize>,
+) -> (Vec<FlowAuditRow>, Vec<i32>, Vec<Vec<(usize, String)>>) {
+    let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
+    let makespan_usize = makespan.max(0) as usize;
+    let mut flow_per_cycle: Vec<i32> = vec![0; makespan_usize];
+    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> = vec![Vec::new(); makespan_usize];
+    let mut all_flow_rows: Vec<FlowAuditRow> = Vec::new();
+
+    for (idx, op) in ops.iter().enumerate() {
+        let cycle = cycle_assignments.get(idx).copied().unwrap_or(0) as usize;
+        if cycle >= flow_per_cycle.len() {
+            continue;
+        }
+
+        if op.opcode == Opcode::ConstChoice {
+            if const_add_imm_ops.contains(&op.id) {
+                let reason = format!("ConstChoice→AddImm (op.id={})", op.id);
+                flow_per_cycle[cycle] += 1;
+                if cycle < flow_contributors_per_cycle.len() {
+                    flow_contributors_per_cycle[cycle].push((idx, reason.clone()));
+                }
+                all_flow_rows.push(FlowAuditRow {
+                    idx,
+                    op_id: op.id,
+                    opcode: op.opcode,
+                    cycle,
+                    reason,
+                });
+            }
+            continue;
+        }
+        if op.opcode == Opcode::SelectChoice {
+            if !select_fma_ops.contains(&op.id) {
+                let reason = format!("SelectChoice→vselect (op.id={})", op.id);
+                flow_per_cycle[cycle] += 1;
+                if cycle < flow_contributors_per_cycle.len() {
+                    flow_contributors_per_cycle[cycle].push((idx, reason.clone()));
+                }
+                all_flow_rows.push(FlowAuditRow {
+                    idx,
+                    op_id: op.id,
+                    opcode: op.opcode,
+                    cycle,
+                    reason,
+                });
+            }
+            continue;
+        }
+
+        if op.engine == Engine::Flow {
+            let reason = format!("Flow({:?}) op.id={}", op.opcode, op.id);
+            flow_per_cycle[cycle] += 1;
+            if cycle < flow_contributors_per_cycle.len() {
+                flow_contributors_per_cycle[cycle].push((idx, reason.clone()));
+            }
+            all_flow_rows.push(FlowAuditRow {
+                idx,
+                op_id: op.id,
+                opcode: op.opcode,
+                cycle,
+                reason,
+            });
+        }
+    }
+
+    (all_flow_rows, flow_per_cycle, flow_contributors_per_cycle)
+}
+
+/// Format a detailed Flow violation message for debugging (breadcrumbs).
+#[cfg(feature = "cpsat")]
+fn format_flow_violation_breadcrumbs(
+    violating_cycle: usize,
+    count: i32,
+    limit: usize,
+    flow_rows: &[FlowAuditRow],
+    flow_contributors_per_cycle: &[Vec<(usize, String)>],
+    const_add_imm_ops: &HashSet<usize>,
+    select_fma_ops: &HashSet<usize>,
+    cycle_assignments: &[i32],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "\n\n=== Flow slot violation at cycle {}: {} > {} ===\n",
+        violating_cycle, count, limit
+    ));
+    s.push_str("Contributors at this cycle (from flow_contributors_per_cycle):\n");
+    if violating_cycle < flow_contributors_per_cycle.len() {
+        for (idx, desc) in &flow_contributors_per_cycle[violating_cycle] {
+            let cy = cycle_assignments.get(*idx).copied().unwrap_or(-1);
+            s.push_str(&format!("  idx={} cycle_assignment={} {}\n", idx, cy, desc));
+        }
+    }
+    s.push_str("All Flow-contributing ops in schedule (full audit):\n");
+    for r in flow_rows {
+        s.push_str(&format!(
+            "  idx={} op.id={} opcode={:?} cycle={} reason={}\n",
+            r.idx, r.op_id, r.opcode, r.cycle, r.reason
+        ));
+    }
+    s.push_str("Solution decision sets (op.id):\n");
+    s.push_str(&format!("  const_add_imm_ops = {:?}\n", const_add_imm_ops));
+    s.push_str(&format!("  select_fma_ops   = {:?}\n", select_fma_ops));
+    s.push_str("Interpretation: ConstChoice with op.id in const_add_imm_ops -> AddImm (Flow); ");
+    s.push_str("SelectChoice with op.id NOT in select_fma_ops -> vselect (Flow).\n");
+    s.push_str("=== end Flow violation breadcrumbs ===\n");
+    s
+}
+
 /// Validate that a CP-SAT solution respects engine slot limits per cycle.
 /// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
 #[cfg(feature = "cpsat")]
@@ -295,6 +421,8 @@ fn validate_ssa_slot_limits(
     let mut load_per_cycle: Vec<i32> = vec![0; makespan as usize];
     let mut store_per_cycle: Vec<i32> = vec![0; makespan as usize];
     let mut flow_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    // For Flow violations: which ops contribute Flow at each cycle (for diagnostics).
+    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> = vec![Vec::new(); makespan as usize];
 
     for (idx, op) in ops.iter().enumerate() {
         let cycle = cycle_assignments.get(idx).copied().unwrap_or(0) as usize;
@@ -305,6 +433,9 @@ fn validate_ssa_slot_limits(
         if op.opcode == Opcode::ConstChoice {
             if const_add_imm_ops.contains(&op.id) {
                 flow_per_cycle[cycle] += 1;
+                if cycle < flow_contributors_per_cycle.len() {
+                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} ConstChoice→AddImm", op.id)));
+                }
             } else {
                 load_per_cycle[cycle] += 1;
             }
@@ -321,6 +452,9 @@ fn validate_ssa_slot_limits(
                 }
             } else {
                 flow_per_cycle[cycle] += 1;
+                if cycle < flow_contributors_per_cycle.len() {
+                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} SelectChoice→vselect", op.id)));
+                }
             }
             continue;
         }
@@ -336,7 +470,12 @@ fn validate_ssa_slot_limits(
             }
             Engine::Load => load_per_cycle[cycle] += 1,
             Engine::Store => store_per_cycle[cycle] += 1,
-            Engine::Flow => flow_per_cycle[cycle] += 1,
+            Engine::Flow => {
+                flow_per_cycle[cycle] += 1;
+                if cycle < flow_contributors_per_cycle.len() {
+                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} Flow({:?})", op.id, op.opcode)));
+                }
+            }
             _ => {}
         }
     }
@@ -359,9 +498,36 @@ fn validate_ssa_slot_limits(
         for (limit_idx, (limit, name)) in limits.iter().enumerate() {
             let count = counts[limit_idx][cycle];
             if count > *limit as i32 {
+                let detail = if *name == "Flow" && cycle < flow_contributors_per_cycle.len() {
+                    let contribs: Vec<String> = flow_contributors_per_cycle[cycle]
+                        .iter()
+                        .map(|(i, desc)| format!("idx={} {}", i, desc))
+                        .collect();
+                    let breadcrumbs = {
+                        let (flow_rows, _, _) = build_flow_audit(
+                            ops,
+                            cycle_assignments,
+                            const_add_imm_ops,
+                            select_fma_ops,
+                        );
+                        format_flow_violation_breadcrumbs(
+                            cycle,
+                            count,
+                            *limit,
+                            &flow_rows,
+                            &flow_contributors_per_cycle,
+                            const_add_imm_ops,
+                            select_fma_ops,
+                            cycle_assignments,
+                        )
+                    };
+                    format!(" contributors at cycle {}: {:?}.{}", cycle, contribs, breadcrumbs)
+                } else {
+                    String::new()
+                };
                 panic!(
-                    "BUG: CP-SAT solution violates {} slot limit at cycle {}: {} > {} (model constraint error)",
-                    name, cycle, count, limit
+                    "BUG: CP-SAT solution violates {} slot limit at cycle {}: {} > {} (model constraint error).{}",
+                    name, cycle, count, limit, detail
                 );
             }
         }
@@ -1597,12 +1763,23 @@ pub fn schedule_ssa_cpsat(
     }
 
     // Flow cumulative: regular Flow ops + optional Flow intervals from ConstChoice + optional Flow intervals from SelectChoice
+    //
+    // NOTE: Opcode::AddImm ops are included as regular Flow ops. These are created by
+    // emit_const() as an alternative to Load ops. Both the Load op AND the AddImm op
+    // are emitted, but only one should be scheduled. The greedy scheduler marks AddImm
+    // ops as dead (cycle=-1). For CP-SAT, we include them in the Flow constraint so if
+    // the solver does schedule them, they consume a Flow slot.
+    //
+    // ConstChoice ops are different - they're a single op with alternatives modeled
+    // via choice variables. SelectChoice ops are similar (vselect vs FMA path).
     {
         let regular_flow_ops: Vec<usize> = ops.iter()
             .enumerate()
             .filter(|(_idx, op)| {
+                // Include all Flow ops EXCEPT:
+                // - SelectChoice (has optional intervals via choice var)
+                // - Note: Opcode::AddImm IS included (from emit_const() pairs)
                 op.engine == Engine::Flow 
-                    && op.opcode != Opcode::AddImm 
                     && op.opcode != Opcode::SelectChoice
             })
             .map(|(idx, _)| idx)
@@ -1633,11 +1810,34 @@ pub fn schedule_ssa_cpsat(
             }
         }
 
+        if verbose {
+            eprintln!(
+                "[Flow model breadcrumbs] regular_flow_ops={} (indices {:?}, op.ids {:?})",
+                regular_flow_ops.len(),
+                regular_flow_ops,
+                regular_flow_ops.iter().map(|&i| ops[i].id).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[Flow model breadcrumbs] const_choice_ops={} (optional Flow when choice=true; indices {:?}, op.ids {:?})",
+                const_choice_ops.len(),
+                const_choice_ops,
+                const_choice_ops.iter().map(|&i| ops[i].id).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[Flow model breadcrumbs] select_choice_ops={} (optional Flow when choice=false; indices {:?}, op.ids {:?})",
+                select_choice_ops.len(),
+                select_choice_ops,
+                select_choice_ops.iter().map(|&i| ops[i].id).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[Flow model breadcrumbs] Flow cumulative: total intervals={}, capacity=1",
+                flow_intervals.len()
+            );
+        }
+
         if !flow_intervals.is_empty() {
             model.add_cumulative(flow_intervals.clone(), flow_demands, 1); // Flow has 1 slot
-            // Flow has exactly 1 slot: enforce no two intervals overlap (mandatory + optional).
-            // This is redundant with cumulative(..., 1) but ensures OR-Tools respects the limit
-            // even if optional-interval handling in cumulative were buggy.
+            // Redundant with cumulative(1): no two Flow intervals overlap when present.
             model.add_no_overlap(flow_intervals);
         }
     }
@@ -2206,6 +2406,34 @@ pub fn schedule_ssa_cpsat(
                 .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
                 .collect();
 
+            // Solution breadcrumbs: log Flow audit when verbose (before validation)
+            if verbose {
+                let (flow_rows, flow_per_cycle, _) = build_flow_audit(
+                    ops,
+                    &cycle_assignments,
+                    &const_add_imm_ops,
+                    &select_fma_ops,
+                );
+                eprintln!("[Flow solution breadcrumbs] Total Flow-contributing ops: {}", flow_rows.len());
+                eprintln!("[Flow solution breadcrumbs] const_add_imm_ops (op.id) = {:?}", const_add_imm_ops);
+                eprintln!("[Flow solution breadcrumbs] select_fma_ops (op.id)   = {:?}", select_fma_ops);
+                for r in &flow_rows {
+                    eprintln!(
+                        "  idx={} op.id={} opcode={:?} cycle={} {}",
+                        r.idx, r.op_id, r.opcode, r.cycle, r.reason
+                    );
+                }
+                let overloaded: Vec<(usize, i32)> = flow_per_cycle
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &count)| count > 1)
+                    .map(|(cycle_idx, &count)| (cycle_idx, count))
+                    .collect();
+                if !overloaded.is_empty() {
+                    eprintln!("[Flow solution breadcrumbs] WARNING: cycles with Flow count > 1: {:?}", overloaded);
+                }
+            }
+
             let (best_bound, gap) = if status == CpsatStatus::Optimal {
                 (actual_makespan as f64, 0.0)
             } else {
@@ -2586,6 +2814,95 @@ mod ssa_tests {
         // The result should contain select_fma_ops (may be empty if solver chose vselect)
         assert!(result.select_fma_ops.len() <= 2, 
             "Should have at most 2 SelectChoice ops using FMA path");
+    }
+
+    /// Test that multiple SelectChoice ops in vselect mode cannot be in the same cycle.
+    /// This tests the Flow cumulative constraint with optional intervals.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_flow_slot_limit() {
+        // Build a kernel with 3 independent SelectChoice ops that all use the same inputs.
+        // They have no data dependency on each other, so without Flow constraint they could
+        // all be scheduled in the same cycle. The Flow slot limit (1) should force them
+        // into different cycles when they choose vselect path.
+        let mut emit = SsaEmitContext::new();
+        
+        // Emit vector condition and values
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+        
+        // Emit 3 SelectChoice ops - they are independent so could run in parallel if allowed
+        let sel1 = emit.emit_select_choice(cond, true_val, false_val);
+        let sel2 = emit.emit_select_choice(cond, true_val, false_val);
+        let sel3 = emit.emit_select_choice(cond, true_val, false_val);
+        
+        // Use results
+        let sum12 = emit.emit_valu(Opcode::Add, sel1, sel2);
+        let _sum123 = emit.emit_valu(Opcode::Add, sum12, sel3);
+
+        // Compute dependencies
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+
+        // Schedule with CP-SAT - use verbose to see breadcrumbs
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: true, // Show Flow breadcrumbs
+                stop_after_first_solution: false, // Let it optimize
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+            },
+            SsaCpsatHints::default(),
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        // Find SelectChoice op indices and their cycles
+        let select_choice_info: Vec<(usize, usize, i32)> = emit.ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
+            .map(|(idx, op)| (idx, op.id, cpsat_result.cycle_assignments[idx]))
+            .collect();
+
+        assert_eq!(select_choice_info.len(), 3, "Should have 3 SelectChoice ops");
+        eprintln!("SelectChoice ops: {:?}", select_choice_info);
+        eprintln!("select_fma_ops: {:?}", cpsat_result.select_fma_ops);
+
+        // Count how many SelectChoice ops chose vselect path (not in select_fma_ops)
+        let vselect_ops: Vec<_> = select_choice_info.iter()
+            .filter(|(_, op_id, _)| !cpsat_result.select_fma_ops.contains(op_id))
+            .collect();
+        
+        if vselect_ops.len() > 1 {
+            // If multiple vselect ops, verify they're in different cycles
+            let vselect_cycles: Vec<i32> = vselect_ops.iter().map(|(_, _, cy)| *cy).collect();
+            eprintln!("vselect ops cycles: {:?}", vselect_cycles);
+            
+            // Check no duplicates (each cycle should appear at most once)
+            let mut cycle_counts: HashMap<i32, usize> = HashMap::new();
+            for cy in &vselect_cycles {
+                *cycle_counts.entry(*cy).or_default() += 1;
+            }
+            
+            for (cy, count) in &cycle_counts {
+                assert!(*count <= 1, 
+                    "Flow slot limit violated: {} vselect ops in cycle {} (limit is 1)", 
+                    count, cy);
+            }
+        }
+        
+        eprintln!("test_ssa_cpsat_selectchoice_flow_slot_limit PASSED");
     }
 
     #[cfg(feature = "cpsat")]
