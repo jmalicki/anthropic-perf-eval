@@ -33,6 +33,8 @@ uv pip install -e ".[dev]"
 
 ### Rust Scheduler (scheduler_rs/)
 **Always build from the project root** so the extension installs into the project venv (used by `uv run`). Building from inside `scheduler_rs/` installs into `scheduler_rs/.venv` and will fail with an explicit error.
+
+**Why uv doesn't manage scheduler_rs:** uv and maturin integrate (PEP 517): uv uses maturin to build when installing a maturin package. Here we use a separate script because (1) scheduler_rs is not a dependency of the root project—the root `pyproject.toml` does not list it—so `uv sync` / `uv run` never install or rebuild it; (2) scheduler_rs's `build.rs` requires `BUILD_FROM_PROJECT_ROOT=1` and running from the project root (so the wheel installs into the project venv). When uv builds a path dependency it typically runs the build from the package directory, which would hit that check. So scheduler_rs is installed manually via the script below (or `./scripts/run_generate_ssa_kernel.sh` to auto-rebuild when Rust changes, then run the generator).
 ```bash
 # From project root (required)
 BUILD_FROM_PROJECT_ROOT=1 uv run maturin develop --manifest-path scheduler_rs/Cargo.toml
@@ -67,6 +69,8 @@ uv run test_optimized.py
 
 **Important: Always use `uv run` to execute Python scripts** to ensure the correct Python environment and dependencies.
 
+**Rebuilding scheduler_rs:** `uv run generate_ssa_kernel.py` does **not** rebuild the Rust extension. After changing Rust code, run `./scripts/build_scheduler_rs.sh` first, or use `./scripts/run_generate_ssa_kernel.sh` which rebuilds scheduler_rs when Rust sources are newer than the installed extension, then runs the generator.
+
 **Recommended: SSA builder with CP-SAT** (best quality):
 ```bash
 # Default: 10 min CP-SAT, VALU shift disabled
@@ -75,6 +79,9 @@ uv run generate_ssa_kernel.py
 
 # With validation against reference kernel
 uv run generate_ssa_kernel.py --validate
+
+# Auto-rebuild scheduler_rs if Rust changed, then run (e.g. long CP-SAT + validate)
+./scripts/run_generate_ssa_kernel.sh --enable-valu-shift --cpsat-time-limit 7200 --validate --rounds 5
 
 # Quick iteration with greedy scheduler (~2 seconds, may exceed budget)
 uv run generate_ssa_kernel.py --use-greedy
