@@ -2531,7 +2531,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -2583,7 +2583,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -2698,7 +2698,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT with longer time limit to allow optimization
         let result = schedule_ssa_cpsat(
@@ -2795,7 +2795,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -2856,7 +2856,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT - use verbose to see breadcrumbs
         let result = schedule_ssa_cpsat(
@@ -2944,7 +2944,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Count AddImm ops
         let addimm_count = emit.ops.iter()
@@ -3079,7 +3079,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Verify we have ConstChoice ops
         let constchoice_count = emit.ops.iter()
@@ -3154,7 +3154,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Count ops
         let addimm_count = emit.ops.iter()
@@ -3241,7 +3241,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -3632,7 +3632,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -3689,7 +3689,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -3809,7 +3809,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Schedule with CP-SAT with longer time limit to allow optimization
         let result = schedule_ssa_cpsat(

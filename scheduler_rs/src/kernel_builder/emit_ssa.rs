@@ -80,8 +80,9 @@ pub struct SsaEmitContext {
     /// Tracks paired Load/AddImm alternatives for each constant.
     /// CP-SAT can choose between these encodings to balance Load vs Flow slot usage.
     pub const_alternatives: Vec<ConstAlternative>,
-    /// VReg for constant 0 - required for AddImm encoding of other constants.
-    /// Set by the kernel builder after emitting const(0).
+    /// Reserved VReg for constant 0 at address 0.
+    /// This VReg has no associated SSA op - scratch[0] is always 0 by hardware initialization.
+    /// Used by AddImm encoding of other constants.
     pub zero_vreg: Option<VReg>,
 }
 
@@ -125,6 +126,35 @@ impl SsaEmitContext {
     pub fn fresh_vector(&mut self) -> VReg {
         let vreg = VReg::vector(self.next_vreg_id);
         self.next_vreg_id += 1;
+        vreg
+    }
+
+    /// Reserve the zero VReg (address 0, always contains 0 by hardware initialization).
+    ///
+    /// This allocates a VReg but does NOT emit any SSA op - scratch[0] is guaranteed
+    /// to contain 0 at startup and is never overwritten. The returned VReg should be
+    /// passed to address assignment with `fixed_vregs.insert(zero_vreg, 0)`.
+    ///
+    /// Call this once at the start of kernel building, before emitting any constants.
+    /// The zero_vreg is used by AddImm encoding of non-zero constants.
+    ///
+    /// **Important**: This VReg is NOT added to `vreg_def` because there's no operation
+    /// that defines it - the value exists from program start. The dependency computation
+    /// must skip reads from zero_vreg (they have no RAW dependency).
+    ///
+    /// Returns the reserved VReg and also stores it in `self.zero_vreg`.
+    pub fn reserve_zero_vreg(&mut self) -> VReg {
+        if let Some(existing) = self.zero_vreg {
+            return existing;
+        }
+        let vreg = self.fresh_scalar();
+        self.zero_vreg = Some(vreg);
+        // Track that this VReg holds constant 0
+        self.vreg_constants.insert(vreg, 0);
+        // Add to const cache so emit_const(0) returns this VReg
+        self.const_cache.insert(0, vreg);
+        // NOTE: We do NOT add to vreg_def - there's no defining op.
+        // Dependency computation must handle this specially.
         vreg
     }
 
@@ -445,12 +475,25 @@ impl SsaEmitContext {
     /// Uses CSE deduplication - if the same constant value was already emitted,
     /// returns the existing VReg.
     ///
-    /// For non-zero constants, emits BOTH a Load alternative and an AddImm alternative.
-    /// The CP-SAT scheduler can choose between them to balance Load vs Flow slot usage.
-    /// The greedy scheduler uses the Load alternative by default.
+    /// Emit a constant value, creating BOTH Load and AddImm alternatives for non-zero values.
     ///
-    /// For zero (value=0), emits Load-only since AddImm requires a pre-existing zero register.
+    /// **DEPRECATED for CP-SAT path**: Use [`emit_const_choice`] instead, which creates a single
+    /// `ConstChoice` pseudo-op that CP-SAT can properly model with decision variables.
+    /// This function creates two separate SSA ops that violate SSA form (same dest VReg),
+    /// requiring post-hoc filtering before CP-SAT.
+    ///
+    /// **Still valid for**:
+    /// - Non-SSA paths (greedy-only): The greedy scheduler handles the dual-op pattern
+    /// - Tests: Simpler API for unit tests that don't need CP-SAT choice modeling
+    ///
+    /// For zero (value=0): If `reserve_zero_vreg()` was called first, returns the reserved
+    /// VReg without emitting any op (scratch[0] is always 0 by hardware). Otherwise emits
+    /// a Load op.
     #[track_caller]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use emit_const_choice() for CP-SAT path; emit_const() creates SSA violations"
+    )]
     pub fn emit_const(&mut self, value: i64) -> VReg {
         // CSE: check if already emitted
         if let Some(&existing) = self.const_cache.get(&value) {
@@ -545,10 +588,10 @@ impl SsaEmitContext {
     /// or `emit_const_choice`, returns the existing VReg.
     ///
     /// # Zero Constant Special Case
-    /// For `value == 0`: AddImm can use address 0 directly since scratch memory is **always
-    /// initialized to 0** at startup. Address 0 contains 0 by default and never needs to be loaded.
-    /// However, we typically use `emit_const(0)` for zero to ensure it's assigned to address 0
-    /// (via fixed_vregs), but `emit_const_choice(0)` would also work.
+    /// For `value == 0`: If `reserve_zero_vreg()` was called first, returns the reserved VReg
+    /// without emitting any op (scratch[0] is always 0 by hardware initialization). This is
+    /// the preferred approach - call `reserve_zero_vreg()` at kernel start, then all uses of
+    /// constant 0 will automatically use the reserved VReg.
     #[track_caller]
     pub fn emit_const_choice(&mut self, value: i64) -> VReg {
 
@@ -607,6 +650,7 @@ impl SsaEmitContext {
     /// The ISA's load instruction uses indirect addressing: mem[scratch[addr_reg]].
     /// So we first emit a const to materialize the address, then load through it.
     #[track_caller]
+    #[allow(deprecated)] // emit_const is fine here - this is a low-level helper
     pub fn emit_load_imm(&mut self, addr: i64) -> VReg {
         // First emit a const to put the address value in a VReg
         let addr_vreg = self.emit_const(addr);
@@ -637,6 +681,7 @@ impl SsaEmitContext {
     /// The ISA's vload instruction uses indirect addressing: mem[scratch[addr_reg]..].
     /// So we first emit a const to materialize the address, then vload through it.
     #[track_caller]
+    #[allow(deprecated)] // emit_const is fine here - this is a low-level helper
     pub fn emit_vload_imm(&mut self, addr: i64) -> VReg {
         // First emit a const to put the address value in a VReg
         let addr_vreg = self.emit_const(addr);
@@ -868,13 +913,24 @@ impl SsaEmitContext {
 ///
 /// For each op that reads a VReg, add a dependency on the op that defined that VReg.
 /// No WAW or WAR dependencies - those don't exist in SSA form.
-pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usize>) {
+///
+/// `zero_vreg`: Optional reserved zero VReg. Reads from this VReg have no dependency
+/// because scratch[0] is always 0 by hardware initialization (no defining op).
+pub fn compute_ssa_dependencies(
+    ops: &mut [SsaOp],
+    vreg_def: &HashMap<VReg, usize>,
+    zero_vreg: Option<VReg>,
+) {
     for op in ops.iter_mut() {
         op.dep_ids.clear();
 
         // RAW: depend on producers of values we read
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
+                // Skip zero_vreg - it has no defining op (hardware-initialized)
+                if Some(*vreg) == zero_vreg {
+                    continue;
+                }
                 let def_id = *vreg_def.get(vreg).unwrap_or_else(|| {
                     panic!(
                         "BUG: op id={} reads {:?} but no definition found in vreg_def. \
@@ -901,9 +957,15 @@ pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usiz
 ///
 /// The effect is the same: all ops before barrier N must complete before any
 /// ops after barrier N can start. But the dependency graph is O(n) instead of O(n²).
-pub fn compute_ssa_dependencies_with_barriers(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usize>) {
+///
+/// `zero_vreg`: Optional reserved zero VReg. Reads from this VReg have no dependency.
+pub fn compute_ssa_dependencies_with_barriers(
+    ops: &mut [SsaOp],
+    vreg_def: &HashMap<VReg, usize>,
+    zero_vreg: Option<VReg>,
+) {
     // First compute normal RAW deps
-    compute_ssa_dependencies(ops, vreg_def);
+    compute_ssa_dependencies(ops, vreg_def, zero_vreg);
 
     // Find barrier ops
     let barrier_indices: Vec<usize> = ops
@@ -1112,7 +1174,7 @@ mod tests {
         let v1 = emit.emit_const(5);
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // op1 (v2 = v1 + v1) depends on op0 (v1 = const 5)
         assert!(emit.ops[1].dep_ids.contains(&0));
@@ -1126,7 +1188,7 @@ mod tests {
         let _v1 = emit.emit_const(5);
         let _v2 = emit.emit_const(6);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // op1 should have no dependencies
         assert!(emit.ops[1].dep_ids.is_empty());
@@ -1142,7 +1204,7 @@ mod tests {
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1);
         let _v3 = emit.emit_const(7);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // op2 (v3) should have no dependencies
         assert!(emit.ops[2].dep_ids.is_empty());
@@ -1298,7 +1360,7 @@ mod tests {
         let v4 = emit.emit_const(7);  // op 4
         let _v5 = emit.emit_alu(Opcode::Mul, v4, v1);  // op 5 (uses v1 from round 1)
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Barrier (op 3) should depend on ops 0, 1, 2
         assert!(emit.ops[3].dep_ids.contains(&0), "Barrier should depend on op 0");
@@ -1325,7 +1387,7 @@ mod tests {
         emit.emit_barrier();  // op 3
         let _v3 = emit.emit_alu(Opcode::Add, v1, v2);  // op 4
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // First barrier depends on op 0 (its section)
         assert!(emit.ops[1].dep_ids.contains(&0), "First barrier should depend on op 0");

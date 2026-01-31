@@ -3,12 +3,18 @@
 //! This module contains all the emit_* methods that generate SSA ops
 //! for different kernel phases: initialization, data load/store, tree access,
 //! XOR, hash, and branch.
+//!
+//! NOTE: This module uses `emit_const()` instead of `emit_const_choice()` because
+//! the per-section scratch budget model doesn't correctly account for ConstChoice
+//! decisions yet. The CP-SAT path uses a filtering workaround to remove the AddImm
+//! alternatives before scheduling. See tick_tock_ssa.rs for details.
 
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{HASH_STAGES, STAGE5_XOR_CONST};
 use super::tick_tock_ssa::{SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL};
 
+#[allow(deprecated)] // emit_const used with filtering workaround - see module docs
 impl SsaTickTockKernelBuilder {
     /// Internal build logic.
     pub(super) fn build_internal(&mut self) {
@@ -70,15 +76,10 @@ impl SsaTickTockKernelBuilder {
         // Emit constant 0 - this VReg will be fixed at address 0.
         // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so address 0
         // already contains 0 and never needs to be loaded. We emit a zero constant op
-        // primarily to ensure the zero VReg is assigned to address 0 (via fixed_vregs),
-        // and to track it for AddImm operations that reference address 0.
-        // AddImm operations can use address 0 directly without waiting for zero to be "ready"
-        // since scratch[0] == 0 is guaranteed by hardware initialization.
-        self.emit.set_next_var_type(VarType::Constant);
-        let zero = self.emit.emit_const(0);
+        // Reserve address 0 for zero - scratch[0] is always 0 by hardware initialization.
+        // No op is emitted - we just reserve the VReg and assign it to address 0.
+        let zero = self.emit.reserve_zero_vreg();
         self.zero_vreg = Some(zero);
-        // Track zero_vreg for AddImm operations (they reference address 0, which always contains 0)
-        self.emit.zero_vreg = Some(zero);
         self.ctx.c[0] = Some(zero);
 
         // Bootstrap constants 1, 2, 4 (use ConstChoice for CP-SAT optimization)

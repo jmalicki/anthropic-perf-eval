@@ -1014,7 +1014,7 @@ mod tests {
         let addr = emit.emit_const(100);                 // op 5
         emit.emit_vstore(addr, v3);                      // op 6 - sink
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
         let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
@@ -1090,7 +1090,7 @@ mod tests {
         let addr = emit.emit_const(100);   // op 5
         emit.emit_store(addr, v4);         // op 6 - makes v4 live
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify barrier depends on the dead store
         assert!(
@@ -1149,7 +1149,7 @@ mod tests {
         let addr = emit.emit_const(100);   // op 6
         emit.emit_store(addr, v5);         // op 7
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify barrier depends on all dead stores
         assert!(emit.ops[4].dep_ids.contains(&0), "Barrier should depend on dead store op0");
@@ -1213,7 +1213,7 @@ mod tests {
         let addr = emit.emit_const(100);   // op 7
         emit.emit_store(addr, v5);         // op 8
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify barrier1 depends on dead store op1
         assert!(emit.ops[2].dep_ids.contains(&1), "Barrier1 should depend on dead store op1");
@@ -1273,7 +1273,7 @@ mod tests {
         let addr = emit.emit_const(100); // op 4
         emit.emit_store(addr, v4);     // op 5 - makes v4 live
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
         let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
@@ -1322,7 +1322,7 @@ mod tests {
         let addr = emit.emit_const(100);   // op 4
         emit.emit_store(addr, v4);         // op 5
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
         let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
@@ -1370,7 +1370,7 @@ mod tests {
         let v2 = emit.emit_const_force(6);  // op 1 - has reader (op2), not dead
         let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 2 - DEAD (no readers)
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify all 3 ops were created
         assert_eq!(emit.ops.len(), 3, "Should have 3 ops");
@@ -1442,7 +1442,7 @@ mod tests {
         let addr = emit.emit_const(200);                // op 7
         emit.emit_vstore(addr, fma_result);             // op 8
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify: vstore (op8) reads fma_result (v6)
         // Build vreg_users map as the scheduler does
@@ -1513,7 +1513,7 @@ mod tests {
         let data = emit.emit_const(42);            // op 3
         emit.emit_store(addr, data);               // op 4
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Build vreg_users map
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1586,7 +1586,7 @@ mod tests {
         let addr = emit.emit_const(100);       // op 3 - has user (op4)
         emit.emit_vstore(addr, v2);            // op 4 - sink (no dest)
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Build vreg_users map as the scheduler does
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1660,7 +1660,7 @@ mod tests {
         let addr = emit.emit_const(100);       // op 4
         emit.emit_vstore(addr, v3);            // op 5
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Build vreg_users map
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1725,7 +1725,7 @@ mod tests {
         let addr = emit.emit_const(100);         // op 7
         emit.emit_vstore(addr, fma_result);      // op 8
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Build vreg_users map
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1807,7 +1807,7 @@ mod tests {
         let addr = emit.emit_const(100);       // op 3
         emit.emit_store(addr, v3);             // op 4
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1854,7 +1854,7 @@ mod tests {
         let addr = emit.emit_const(100);              // op 3
         emit.emit_vstore(addr, v1);                   // op 4 - uses v1
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Build vreg_users map as the scheduler does
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -2017,7 +2017,7 @@ mod tests {
         emit.emit_vstore(addr, idx_new);               // op 8
 
         // Use barrier-aware dependencies to match real kernel behavior
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify: vstore (op8) reads idx_new (the FMA result)
         // Build vreg_users map as the scheduler does
@@ -2122,7 +2122,7 @@ mod tests {
         emit.emit_vstore(addr, idx_new);              // op 9
 
         // Use barrier-aware dependencies to match real kernel behavior
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify: vstore (op9) reads idx_new (the FMA result)
         // Build vreg_users map as the scheduler does
@@ -2236,7 +2236,7 @@ mod tests {
         emit.emit_vstore(addr, idx_round2_use);         // op 10
 
         // Use barrier-aware dependencies to match real kernel behavior
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify: idx_round2_use (op8) reads idx_round1 (the FMA result from round 1)
         // Build vreg_users map as the scheduler does
@@ -2312,7 +2312,7 @@ mod tests {
         let addr = emit.emit_const(200);               // op 3
         emit.emit_vstore(addr, use_idx);               // op 4
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -2375,7 +2375,7 @@ mod tests {
         let addr = emit.emit_const(200);
         emit.emit_vstore(addr, idx_round3_use); // op 12
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify dependency chain: Round 1 FMA -> Round 2 use -> Round 3 use -> Store
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -2449,7 +2449,7 @@ mod tests {
         let addr = emit.emit_const(200);
         emit.emit_vstore(addr, new_idx_vec); // op 8
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify: vstore uses new_idx_vec, which depends on MultiplyAdd
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -2538,7 +2538,7 @@ mod tests {
         let addr = emit.emit_const(200);
         emit.emit_vstore(addr, result_vec); // op 13
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify dependency chain
         let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();

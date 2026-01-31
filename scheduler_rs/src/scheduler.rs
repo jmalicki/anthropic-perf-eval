@@ -1543,13 +1543,24 @@ pub struct SsaScheduleResult {
 /// Unlike `compute_dependencies` which tracks WAW and WAR dependencies based on
 /// concrete addresses, SSA ops only have true data dependencies (RAW) since each
 /// VReg is defined exactly once.
-pub fn compute_ssa_dependencies(ops: &mut [SsaOp], vreg_def: &HashMap<VReg, usize>) {
+///
+/// `zero_vreg`: Optional reserved zero VReg. Reads from this VReg have no dependency
+/// because scratch[0] is always 0 by hardware initialization (no defining op).
+pub fn compute_ssa_dependencies(
+    ops: &mut [SsaOp],
+    vreg_def: &HashMap<VReg, usize>,
+    zero_vreg: Option<VReg>,
+) {
     for op in ops.iter_mut() {
         op.dep_ids.clear();
 
         // RAW: depend on producers of values we read
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
+                // Skip zero_vreg - it has no defining op (hardware-initialized)
+                if Some(*vreg) == zero_vreg {
+                    continue;
+                }
                 if let Some(&def_id) = vreg_def.get(vreg) {
                     op.dep_ids.insert(def_id);
                 }
@@ -1711,7 +1722,9 @@ pub fn schedule_ssa_greedy_with_budget(ops: &mut [SsaOp], budget: usize) -> SsaS
     }
 
     // Compute dependencies
-    compute_ssa_dependencies(ops, &vreg_def);
+    // Note: zero_vreg is None here - this standalone scheduler doesn't track it.
+    // The `if let Some` in compute_ssa_dependencies handles missing vreg_def entries gracefully.
+    compute_ssa_dependencies(ops, &vreg_def, None);
 
     // Initialize liveness tracker
     let mut liveness = SsaLivenessTracker::new(budget);

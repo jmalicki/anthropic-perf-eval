@@ -154,7 +154,7 @@ impl SsaTickTockKernelBuilder {
         // Use barrier-aware dependencies for greedy scheduler
         // Barriers create hard scheduling boundaries between rounds,
         // constraining cross-round interleaving and reducing peak liveness
-        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
 
         let scratch_budget = scratch_budget_override.unwrap_or(1536);
 
@@ -289,7 +289,7 @@ impl SsaTickTockKernelBuilder {
 
         // Use barrier-aware dependencies for greedy hints
         // This constrains cross-round interleaving and provides better hints
-        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def);
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
 
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
@@ -1802,7 +1802,7 @@ mod tests {
         let mut ops = builder.emit.take_ops();
 
         // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
 
         println!("Generated {} ops", ops.len());
 
@@ -1856,7 +1856,7 @@ mod tests {
         let mut ops = builder.emit.take_ops();
 
         // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
 
         println!("Generated {} ops", ops.len());
 
@@ -1893,7 +1893,7 @@ mod tests {
         let mut ops = builder.emit.take_ops();
 
         // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
 
         println!("Generated {} ops for full-scale kernel", ops.len());
 
@@ -2729,7 +2729,7 @@ mod tests {
         builder.build_internal();
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ssa_ops = builder.emit.take_ops();
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def, None);
 
         // Run greedy scheduler to get hints
         let mut greedy_shifted = HashSet::new();
