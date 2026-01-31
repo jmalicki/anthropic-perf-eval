@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::{assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult};
-use crate::types::{Op, SsaOp, UsageAccounting, VarType, VReg};
+use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VarType, VReg};
 
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
@@ -396,7 +396,7 @@ impl SsaTickTockKernelBuilder {
                 }
                 let segment_op_ids: HashSet<usize> =
                     global_indices.iter().map(|&i| ssa_ops[i].id).collect();
-                let segment_ops: Vec<SsaOp> = global_indices
+                let segment_ops_raw: Vec<SsaOp> = global_indices
                     .iter()
                     .map(|&i| {
                         let mut op = ssa_ops[i].clone();
@@ -404,21 +404,45 @@ impl SsaTickTockKernelBuilder {
                         op
                     })
                     .collect();
-                let initial_live =
-                    live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
-                let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
-                let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
-                let segment_hints: Vec<i32> = global_indices
-                    .iter()
-                    .map(|&i| {
+                
+                // Filter out AddImm alternatives from segment_ops (same logic as full-kernel CP-SAT)
+                let mut seg_addimm_alternatives: HashSet<usize> = HashSet::new();
+                for (idx, op) in segment_ops_raw.iter().enumerate() {
+                    if op.engine == Engine::Flow && op.opcode == Opcode::AddImm {
+                        if let Some(dest) = op.dest {
+                            for prev_idx in (0..idx).rev() {
+                                let prev_op = &segment_ops_raw[prev_idx];
+                                if prev_op.dest == Some(dest) {
+                                    if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                        seg_addimm_alternatives.insert(idx);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Filter segment_ops and corresponding hints together
+                let filtered_segment: Vec<(SsaOp, i32)> = segment_ops_raw
+                    .into_iter()
+                    .zip(global_indices.iter().map(|&i| {
                         let c = ssa_ops[i].cycle;
                         if c >= 0 {
                             (c - section_offset).max(0)
                         } else {
                             c
                         }
-                    })
+                    }))
+                    .enumerate()
+                    .filter(|(idx, _)| !seg_addimm_alternatives.contains(idx))
+                    .map(|(_, pair)| pair)
                     .collect();
+                let (segment_ops, segment_hints): (Vec<SsaOp>, Vec<i32>) = filtered_segment.into_iter().unzip();
+                
+                let initial_live =
+                    live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let config_feasibility = SsaCpsatConfig {
                     time_limit_secs: (time_limit_secs * 0.25).min(300.0),
                     verbose,
@@ -513,6 +537,57 @@ impl SsaTickTockKernelBuilder {
         // CP-SAT has proper liveness constraints via ILP, so barriers are unnecessary
         // and would interfere with its optimization
         let mut ssa_ops = elide_barriers(ssa_ops);
+
+        // =========================================================================
+        // Filter out AddImm alternatives from emit_const()
+        //
+        // When emit_const() is called with zero_vreg set, it creates BOTH a Load op
+        // (Opcode::Const) AND an AddImm op (Opcode::AddImm) with the SAME dest VReg.
+        // The greedy scheduler detects these and marks the AddImm ops as dead stores.
+        //
+        // CP-SAT must also skip these ops because:
+        // 1. They violate SSA form (two ops writing to the same VReg)
+        // 2. Including both would cause address assignment conflicts
+        // 3. The Load alternative is always valid; AddImm is just an optimization hint
+        //
+        // Detection: An AddImm op is an alternative if there's a preceding Const op
+        // with the same dest VReg.
+        // =========================================================================
+        let mut const_add_imm_alternatives: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (idx, op) in ssa_ops.iter().enumerate() {
+            if op.engine == Engine::Flow && op.opcode == Opcode::AddImm {
+                if let Some(dest) = op.dest {
+                    // Look backwards to find the Load alternative
+                    for prev_idx in (0..idx).rev() {
+                        let prev_op = &ssa_ops[prev_idx];
+                        if prev_op.dest == Some(dest) {
+                            if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                // Found the Load alternative - this AddImm is an alternative
+                                const_add_imm_alternatives.insert(idx);
+                            }
+                            // Stop searching after finding the first op with same dest
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter out the AddImm alternatives
+        let ssa_ops_filtered: Vec<SsaOp> = ssa_ops
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| !const_add_imm_alternatives.contains(idx))
+            .map(|(_, op)| op)
+            .collect();
+        let mut ssa_ops = ssa_ops_filtered;
+
+        if verbose && !const_add_imm_alternatives.is_empty() {
+            eprintln!(
+                "  Filtered {} AddImm alternatives from emit_const() before CP-SAT",
+                const_add_imm_alternatives.len()
+            );
+        }
 
         // Collect hints for full-kernel CP-SAT: merged schedule (greedy for within-budget
         // sections, per-section feasibility result for sections that exceeded budget).
