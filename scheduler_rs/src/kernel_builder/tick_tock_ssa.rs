@@ -329,7 +329,7 @@ impl SsaTickTockKernelBuilder {
 
         // Phase 1: Per-section feasibility (only when a section exceeds scratch budget)
         let boundaries = section_boundaries(&ssa_ops);
-        let budget_result = sections_exceeding_budget(&ssa_ops, 1536);
+        let budget_result = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
         let n_exceeding: usize = budget_result.section_exceeds_budget.iter().filter(|&&b| b).count();
         if verbose {
             eprintln!();
@@ -482,7 +482,7 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 if verbose {
-                    let after_budget = sections_exceeding_budget(&ssa_ops, 1536);
+                    let after_budget = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
                     let delta_peak = after_peak as i32 - greedy_section_peak as i32;
@@ -519,7 +519,7 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget.
-        let post_merge_budget = sections_exceeding_budget(&ssa_ops, 1536);
+        let post_merge_budget = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks
             .iter()
@@ -593,7 +593,7 @@ impl SsaTickTockKernelBuilder {
         // sections, per-section feasibility result for sections that exceeded budget).
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
-        let hint_peak = sections_exceeding_budget(&ssa_ops, 1536)
+        let hint_peak = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops))
             .section_peaks
             .first()
             .copied()

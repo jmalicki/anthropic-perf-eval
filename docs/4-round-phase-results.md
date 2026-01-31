@@ -31,10 +31,10 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 
 ---
 
-## Current Status (ff9895a)
+## Current Status (ae4a158)
 
-- **Git SHA:** ff9895a
-- **Changes:** Reserved zero VReg without emitting op, deprecated `emit_const()`, added filtering for AddImm alternatives
+- **Git SHA:** ae4a158
+- **Changes:** Fixed SelectChoice lowering bug (allocate real VReg for sub temp), reserved zero VReg
 
 ### Greedy scheduler (no valu-shift)
 
@@ -45,13 +45,92 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 
 ### Known Issues
 
-1. **SelectChoice lowering bug**: When CP-SAT (or greedy with valu-shift) chooses the FMA path for SelectChoice ops without a precomputed delta, the lowering creates invalid temporary addresses (`10000 + op_id`) that don't exist in scratch memory. This causes validation failures.
+1. **~~SelectChoice lowering bug~~** (FIXED in ae4a158): Now allocates real sub_temp_vreg during emission.
 
-2. **CP-SAT non-determinism**: Per-section CP-SAT sometimes fails to find feasible solutions within scratch budget, and full-kernel CP-SAT often times out (10 min) without finding a solution.
+2. **VALU-shift scratch pressure**: When `--enable-valu-shift` is used, peak_live reaches exactly 1536 words, causing address assignment to exceed budget (addresses 1536, 1537, 1538 are invalid).
+
+3. **CP-SAT per-section liveness model**: Per-section CP-SAT sometimes produces schedules that exceed scratch budget due to incorrect live-through/live-out calculations. See [CP-SAT per-section liveness](#cp-sat-per-section-liveness) below.
 
 | Config | Status | Cycles | Peak | Notes |
 |--------|--------|--------|------|-------|
 | Greedy (no valu-shift) | PASS | 513 | 1488 | Baseline working |
-| Greedy (valu-shift) | FAIL | - | - | SelectChoice lowering bug |
-| CP-SAT (no valu-shift) | FAIL | 491* | 1458* | *Found but fails validation |
+| Greedy (valu-shift) | FAIL | - | 1536 | Exceeds budget by 3 words |
+| CP-SAT (no valu-shift) | FAIL | - | - | Per-section liveness bug |
 | CP-SAT (valu-shift) | FAIL | - | - | Times out (10 min) |
+
+---
+
+## CP-SAT per-section liveness
+
+When CP-SAT is used, the flow is:
+
+1. **Greedy with barriers** – Schedule the full kernel with barriers between rounds. Compute peak scratch per *section* (ops between barriers).
+2. **Per-section CP-SAT (feasibility)** – For any section whose greedy peak exceeds 1536, run CP-SAT on that section only to find a feasible schedule that fits in the budget.
+3. **Merge** – Write per-section cycle assignments back into the full `ssa_ops` (local cycle + `section_offset`).
+4. **Check** – Re-run `sections_exceeding_budget(&ssa_ops, 1536)`. If any section peak > 1536, we return the error you see.
+
+So the bug: **per-section CP-SAT says “feasible” for a section, but after merge the full-kernel peak for that section is > 1536** (e.g. section 2 peak 1544).
+
+### How per-section scratch is modeled
+
+For a segment (one section’s ops), CP-SAT gets:
+
+- **Segment ops** – Only ops in that section (by *op index* in the full list; section = `boundaries[k]`).
+- **initial_live** – VRegs live at segment start: defined in an earlier section, last use in *this* section. From `live_in_for_section`; each entry is `(VReg, segment_last_use_idx)`.
+- **live_out** – VRegs defined in *this* section, last use in a *later* section. Must stay live until segment end.
+- **live_through** – VRegs defined in an *earlier* section, last use in a *later* section. Live for the whole segment `[0, segment_end]`.
+
+Section membership is by **op index** (which ops fall in `boundaries[k]`), not by cycle. Liveness uses **cycles** (def_cycle, last_use_cycle). So we mix “section by index” with “live range by cycle”.
+
+The segment model:
+
+- Puts each segment op’s result on `[cycle, cycle+size]` (or for live-out, `[cycle, segment_end]`).
+- Puts live_through on `[0, segment_end+1]`.
+- Adds a cumulative constraint: total scratch demand ≤ 1536 at every time in the segment.
+
+So in theory the segment scratch model should match “this section’s cycles in global time” once we merge with `section_offset`.
+
+### Likely causes of the bug (detailed)
+
+---
+
+#### 1. Segment end vs. actual makespan
+
+**What "segment end" is.** In the per-section CP-SAT model, the segment runs in *local* cycle space: cycles 0, 1, 2, … up to some maximum. That maximum is `segment_end`: the makespan of the segment (the latest cycle at which any segment op runs). Live_through and live_out VRegs are modeled as occupying scratch for the *entire* segment: from cycle 0 to `segment_end` (or `segment_end + 1` depending on convention). So the cumulative constraint "total scratch ≤ 1536" is enforced over the range `[0, segment_end]`.
+
+**How segment_end is chosen.** The model has a variable (or derived value) that represents the segment's makespan. Hints from the greedy schedule give a *suggested* segment_end (e.g. max of greedy cycle hints for that section). CP-SAT is free to pick a *different* makespan: it can lengthen the segment (schedule some ops later) or shorten it (schedule earlier). So after solving, the *actual* segment_end is whatever the solver chose (max of the cycle variables for segment ops).
+
+**Why a longer makespan can break the merged peak.** When we *merge* back into the full kernel, we set `ssa_ops[global_idx].cycle = section_offset + local_cycle`. So the section's *global* cycle range is `[section_offset, section_offset + actual_segment_end]`. The next section then starts at `section_offset + actual_segment_end + 1`. If CP-SAT *lengthened* the segment (actual_segment_end > greedy_segment_end), then live_through and live_out are still "live for the whole segment" in the segment model — but we're now counting over more cycles. Two ways the full-kernel peak can exceed 1536 even though the segment model was satisfied: (a) **Overlap shape changes** — with more cycles, the *pattern* of which VRegs overlap at which cycle can change; the segment model's intervals might not perfectly match what we compute in `sections_exceeding_budget` at each instant. (b) **segment_end used for hints vs. solution** — if the model fixes or biases segment_end to the *hint* (greedy makespan) but the solution actually uses a *larger* makespan, then live_through/live_out might be modeled only until the hint makespan, while the merged schedule extends further; we'd under-count their lifetime in the segment and the full-kernel check would see more overlap.
+
+---
+
+#### 2. Live sets by index, not by cycle
+
+**How "last use" is defined today.** `live_out_from_section(ops, boundaries, section_k, vreg_def_section)` answers: "Which VRegs are defined in section_k and have their *last use* in a *later* section?" It decides "last use" by **section index**, not by cycle: for each VReg we find the *highest section index* that contains an op that *reads* that VReg (by op index: op in `boundaries[s]`). That section index is "last use section." So "last use" = "last section that contains a reader," not "cycle at which the last read happens." Similarly, `live_through_for_section` uses "defined in a section before k" and "last use section > k," again with "last use" = "max section index of a reader."
+
+**Why this is a problem after CP-SAT reorders.** Section membership is fixed by **op index**: op at index `i` belongs to section `s` iff `boundaries[s].0 <= i < boundaries[s].1`. So "which section contains the op that last uses VReg v?" is fixed by the *ordering of ops in the list*, not by when those ops are *scheduled*. After CP-SAT runs, it only moves *cycles*; op indices don't change. So the *section index* of "last use" for every VReg is unchanged. But the *cycle* at which that last use happens can change. Example: **Greedy** — Section 2 has ops A, B, C at cycles 10, 11, 12; section 3 has op D at cycle 13. So VReg v (defined in section 2) is "last used" in section 3 (by D). So v is in live_out for section 2: "live until end of segment 2." **CP-SAT** — It might schedule D *earlier*, e.g. cycle 9 (still in section 3 by index). So in *global time*, v's last use is now at cycle 9. But we still treat v as "live until end of segment 2." If segment 2's cycles are now 8..15, we're still counting v as live for 8..15, even though the true last use is at 9 — we *over*-count v's lifetime in the segment. **Opposite case** — CP-SAT moves a *reader* from section 3 into *later* cycles (e.g. cycle 20). So v's true last-use cycle is 20, but we only model segment 2 as 8..15. In the segment we treat v as live until 15, but in the full-kernel check v is live until 20. So we *under*-count v's lifetime in the segment; at cycle 20 we might have v plus other VRegs that we didn't account for in the segment, and the full-kernel peak can exceed 1536. So **"live sets by index, not cycle"** means: we commit to "last use section" at hint time (by op index). After CP-SAT, the *actual* last-use *cycle* can move. If it moves so that a VReg is live *longer* than we modeled in the segment, the full-kernel peak can exceed what the segment model allowed.
+
+---
+
+#### 3. sub_temp_vreg not in round_budget
+
+**What sub_temp_vreg is.** For a SelectChoice op that uses the FMA path *without* a precomputed delta, we emit two conceptual steps: (1) `sub_temp = true_val - false_val`, (2) `dest = cond * sub_temp + false_val`. The temporary `sub_temp` is a real VReg (`sub_temp_vreg`) allocated during SSA emission. It gets a real scratch address from address assignment and is live for one cycle (e.g. defined at cycle c, read at c+1). So it *does* consume scratch.
+
+**What sections_exceeding_budget counts.** `sections_exceeding_budget(ops, 1536)` builds: `vreg_def_cycle` (for each op with `cycle >= 0` and `op.dest = Some(v)`, map `v -> op.cycle`) and `vreg_last_use_cycle` (for each op with `cycle >= 0`, for each `v` in `op.reads()`, update "last use" of `v` to at least `op.cycle`). So only VRegs that appear as some op's `dest` or in some op's `reads()` are counted. No other field (e.g. `sub_temp_vreg`) is used.
+
+**Why sub_temp_vreg is missing.** SelectChoice's `dest` is the *result* of the vselect/FMA (the chosen value). The sub_temp is an *intermediate*; it is not the op's `dest`. The only "consumer" of sub_temp is the *lowered* FMA op (sub_temp as operand). That FMA op does not exist in the SSA op list; it's created during lowering. So no SSA op has sub_temp in `reads()`. So `sub_temp_vreg` never appears in `vreg_def_cycle` or `vreg_last_use_cycle`. Therefore **every section's peak in `sections_exceeding_budget` under-counts scratch by the amount of sub_temp VRegs live in that section** (e.g. 8 words per vector sub_temp, for each SelectChoice FMA-without-delta in that section at that cycle).
+
+**Consequences.** The *greedy* section peaks (used to decide "run per-section CP-SAT for this section") can be *below* 1536 even when the true peak (including sub_temps) is *above* 1536 — so we might skip per-section CP-SAT for a section that's actually over budget. When we *do* run per-section CP-SAT, the segment model also doesn't know about sub_temp (the segment only sees the SelectChoice op's dest and normal reads), so the segment scratch model under-counts as well. After merge, `sections_exceeding_budget` still doesn't count sub_temp, so the *reported* peak (e.g. 1544) is still *without* sub_temp. The *true* peak could be even higher (1544 + 8*k for k vector sub_temps at the same cycle). So **sub_temp_vreg not in round_budget** doesn't by itself explain "1544" — it explains why we might be *closer* to the limit than we think, and why fixing the segment model might still not be enough until we also count sub_temp in both the segment model and in `sections_exceeding_budget`.
+
+---
+
+#### 4. Filtering and indices
+
+Before per-section CP-SAT we filter out AddImm alternatives from the *segment* ops (same logic as full-kernel CP-SAT: remove the AddImm op when a Const op with the same dest exists). Segment hints are then aligned to the *filtered* segment (one hint per filtered op, in order). If any indexing or hint mapping is off — e.g. `segment_last_use_idx` in `initial_live` refers to segment op indices, and the segment is filtered — then the scratch model's notion of "which op last uses this VReg" or "which cycle range an initial_live VReg occupies" could be wrong. That could make the segment model optimistic (under-count overlap) or pessimistic; if optimistic, the merged schedule can exceed 1536. The exact failure mode depends on how `live_in_for_section` and the CP-SAT segment code map segment indices to ops and cycles; any mismatch between filtered segment order and the full-kernel op list can cause inconsistency.
+
+
+### Where to look in code
+
+- **Section boundaries and peak:** `scheduler_rs/src/kernel_builder/round_budget.rs`: `sections_exceeding_budget`, `live_in_for_section`, `live_out_from_section`, `live_through_for_section`.
+- **Segment CP-SAT scratch model:** `scheduler_rs/src/cpsat_scheduler.rs`: segment mode with `initial_live`, `live_through_vregs`, `live_out_vregs`, `segment_end_var`, and cumulative constraint.
+- **Merge and check:** `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`: after the per-section loop, `section_offset` update and `sections_exceeding_budget(&ssa_ops, 1536)` that triggers “section N has peak P words (budget 1536).”

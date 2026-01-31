@@ -34,7 +34,15 @@ pub struct SectionBudgetResult {
 ///
 /// * `ops`: Full SSA op list with barriers; each op must have `cycle` set (from greedy).
 /// * `scratch_budget`: Max allowed simultaneous live words.
-pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> SectionBudgetResult {
+/// * `select_fma_op_ids`: When provided (e.g. greedy or CP-SAT SelectChoice decisions), any
+///   SelectChoice op whose id is in this set and that has `sub_temp_vreg` is treated as using
+///   the FMA path; the sub_temp VReg is then counted in peak (def at op.cycle, last use at
+///   op.cycle+1). Pass `None` when no provisional selection is available.
+pub fn sections_exceeding_budget(
+    ops: &[SsaOp],
+    scratch_budget: usize,
+    select_fma_op_ids: Option<&HashSet<usize>>,
+) -> SectionBudgetResult {
     let boundaries = section_boundaries(ops);
 
     // VReg -> defining op index (for cycle); only ops with cycle >= 0
@@ -59,6 +67,19 @@ pub fn sections_exceeding_budget(ops: &[SsaOp], scratch_budget: usize) -> Sectio
                 .entry(vreg)
                 .and_modify(|m| *m = (*m).max(c))
                 .or_insert(c);
+        }
+    }
+
+    // When FMA path is provisionally selected for a SelectChoice, count its sub_temp_vreg
+    // (def at op.cycle, read by lowered FMA at op.cycle+1).
+    if let Some(fma_ids) = select_fma_op_ids {
+        for op in ops.iter() {
+            if op.cycle >= 0 && fma_ids.contains(&op.id) {
+                if let Some(sub_temp) = op.sub_temp_vreg {
+                    vreg_def_cycle.insert(sub_temp, op.cycle);
+                    vreg_last_use_cycle.insert(sub_temp, op.cycle + 1);
+                }
+            }
         }
     }
 
@@ -353,7 +374,7 @@ mod tests {
                 3,
             ),
         ];
-        let result = sections_exceeding_budget(&ops, 2);
+        let result = sections_exceeding_budget(&ops, 2, None);
         assert_eq!(result.section_peaks.len(), 2);
         assert_eq!(result.section_peaks[0], 2, "Section 0: at cycle 1 both v0 and v1 live");
         assert_eq!(result.section_peaks[1], 3, "Section 1: v0, v1, v3 live at cycle 3");
@@ -373,10 +394,61 @@ mod tests {
             vec![],
             0,
         )];
-        let result = sections_exceeding_budget(&ops, 1536);
+        let result = sections_exceeding_budget(&ops, 1536, None);
         assert_eq!(result.section_peaks.len(), 1);
         assert_eq!(result.section_peaks[0], 1);
         assert!(!result.section_exceeds_budget[0]);
+    }
+
+    /// SelectChoice with FMA path chosen must count sub_temp_vreg in section peak.
+    /// The subtraction temporary is live for one cycle (def at op.cycle, read at op.cycle+1 by the lowered FMA).
+    #[test]
+    fn test_sections_exceeding_budget_selectchoice_fma_counts_sub_temp() {
+        use std::collections::HashSet;
+
+        // One section: one SelectChoice op (id=1) at cycle 10, FMA path chosen.
+        // dest = vector (8 words), sub_temp_vreg = vector (8 words), live [10, 11].
+        let cond = VReg::vector(0);
+        let true_val = VReg::vector(1);
+        let false_val = VReg::vector(2);
+        let dest = VReg::vector(3);
+        let sub_temp = VReg::vector(4);
+
+        let mut op = SsaOp::new(
+            1,
+            Engine::Flow,
+            Opcode::SelectChoice,
+            Some(dest),
+            vec![
+                Operand::VReg(cond),
+                Operand::VReg(true_val),
+                Operand::VReg(false_val),
+            ],
+        );
+        op.cycle = 10;
+        op.sub_temp_vreg = Some(sub_temp); // FMA path without delta: sub_temp is used
+
+        let ops = vec![op];
+
+        // Without passing select_fma_op_ids, sub_temp is not counted -> peak = 8 (dest only).
+        let result_no_fma = sections_exceeding_budget(&ops, 1536, None);
+        assert_eq!(result_no_fma.section_peaks.len(), 1);
+        assert_eq!(
+            result_no_fma.section_peaks[0], 8,
+            "Without FMA selection, only dest (8 words) is counted; sub_temp is ignored"
+        );
+
+        // With FMA path chosen for op 1, sub_temp must be counted: live at 10 and 11 (8 words each).
+        // At cycle 10: dest defined (8), sub_temp defined (8) -> 16 words.
+        let mut select_fma = HashSet::new();
+        select_fma.insert(1);
+
+        let result_with_fma = sections_exceeding_budget(&ops, 1536, Some(&select_fma));
+        assert_eq!(result_with_fma.section_peaks.len(), 1);
+        assert_eq!(
+            result_with_fma.section_peaks[0], 16,
+            "With FMA chosen, dest (8) + sub_temp_vreg (8) must be counted in peak"
+        );
     }
 
     #[test]
