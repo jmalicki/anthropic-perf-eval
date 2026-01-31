@@ -1226,6 +1226,14 @@ pub struct SsaOp {
     /// Points to the original SelectChoice op's ID.
     /// None for regular ops or the SelectChoice op itself.
     pub select_choice_parent: Option<usize>,
+
+    /// For SelectChoice ops WITHOUT delta: VReg to hold the sub temp result.
+    /// When FMA path is chosen without a precomputed delta, we emit:
+    ///   sub_temp = true_val - false_val
+    ///   dest = cond * sub_temp + false_val
+    /// This VReg is allocated during emission and assigned an address during address assignment.
+    /// None when delta_vreg is set (no sub needed) or for non-SelectChoice ops.
+    pub sub_temp_vreg: Option<VReg>,
 }
 
 impl SsaOp {
@@ -1247,6 +1255,7 @@ impl SsaOp {
             needs_subtraction: true, // Default: subtraction needed (false_val != 0)
             delta_vreg: None, // Default: no precomputed delta
             select_choice_parent: None, // Default: not part of SelectChoice expansion
+            sub_temp_vreg: None, // Default: no sub temp needed (set for SelectChoice without delta)
         }
     }
 

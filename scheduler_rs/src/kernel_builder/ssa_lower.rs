@@ -174,9 +174,13 @@ pub fn lower_ssa_ops_with_shift(
                     // sub = true_val - false_val
                     // fma = cond * sub + false_val
                     
-                    // Create temporary address for sub result (use a unique address)
-                    // Use a large offset based on op ID to ensure uniqueness
-                    let sub_temp_addr = 10000 + ssa_op.id as i64;
+                    // Get the sub_temp VReg that was allocated during emission
+                    let sub_temp_vreg = ssa_op.sub_temp_vreg.expect(
+                        "SelectChoice without delta must have sub_temp_vreg allocated during emission"
+                    );
+                    let sub_temp_addr = *vreg_to_addr.get(&sub_temp_vreg).expect(
+                        "sub_temp_vreg not in address mapping - was it included in address assignment?"
+                    );
                     
                     // Sub op: sub_temp = true_val - false_val
                     let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
@@ -433,5 +437,202 @@ mod tests {
         // Second op: Load
         assert_eq!(result[1].engine, Engine::Load);
         assert_eq!(result[1].slot[0], SlotVal::Str("const".to_string()));
+    }
+
+    // =========================================================================
+    // SelectChoice lowering tests
+    // =========================================================================
+
+    fn make_select_choice_op(id: usize, cond: VReg, true_val: VReg, false_val: VReg, delta: Option<VReg>, cycle: i32) -> SsaOp {
+        let mut op = SsaOp::new(
+            id,
+            Engine::Flow, // Default engine
+            Opcode::SelectChoice,
+            Some(VReg::vector(100 + id as u32)), // dest
+            vec![
+                Operand::VReg(cond),
+                Operand::VReg(true_val),
+                Operand::VReg(false_val),
+            ],
+        );
+        op.delta_vreg = delta;
+        op.cycle = cycle;
+        op
+    }
+
+    /// Test that SelectChoice vselect path creates valid addresses
+    #[test]
+    fn test_lower_selectchoice_vselect_path() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest = VReg::vector(100);
+        
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest, 400);
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op.dest = Some(dest);
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let select_fma_ops = HashSet::new(); // vselect path
+
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+
+        assert_eq!(result.len(), 1, "vselect should produce 1 op");
+        let op = &result[0];
+        assert_eq!(op.slot[0], SlotVal::Str("vselect".to_string()));
+        
+        // Verify all addresses are valid (< scratch budget)
+        for addr in &op.reads {
+            assert!(*addr < 1536, "Read address {} exceeds scratch budget", addr);
+        }
+        for addr in &op.writes {
+            assert!(*addr < 1536, "Write address {} exceeds scratch budget", addr);
+        }
+    }
+
+    /// Test that SelectChoice FMA path WITH delta creates valid addresses
+    #[test]
+    fn test_lower_selectchoice_fma_with_delta() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let delta = VReg::vector(4);
+        let dest = VReg::vector(100);
+        
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(delta, 500);
+        vreg_to_addr.insert(dest, 400);
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, Some(delta), 10);
+        op.dest = Some(dest);
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42); // FMA path
+
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+
+        assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
+        let op = &result[0];
+        assert_eq!(op.slot[0], SlotVal::Str("multiply_add".to_string()));
+        
+        // Verify all addresses are valid (< scratch budget)
+        for addr in &op.reads {
+            assert!(*addr < 1536, "Read address {} exceeds scratch budget", addr);
+        }
+        for addr in &op.writes {
+            assert!(*addr < 1536, "Write address {} exceeds scratch budget", addr);
+        }
+    }
+
+    /// Test that SelectChoice FMA path WITHOUT delta creates valid addresses
+    /// Previously: Created addresses like 10000 + op_id which are invalid!
+    /// Now: Uses sub_temp_vreg allocated during emission
+    #[test]
+    fn test_lower_selectchoice_fma_without_delta_addresses_valid() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest = VReg::vector(100);
+        let sub_temp = VReg::vector(101); // Allocated for sub temp
+        
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest, 400);
+        vreg_to_addr.insert(sub_temp, 500); // Valid address for sub temp
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op.dest = Some(dest);
+        op.sub_temp_vreg = Some(sub_temp); // Set the sub_temp_vreg
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42); // FMA path WITHOUT delta
+
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+
+        // FMA without delta should produce 2 ops: sub + fma
+        assert_eq!(result.len(), 2, "FMA without delta should produce 2 ops (sub + fma)");
+        
+        let sub_op = &result[0];
+        let fma_op = &result[1];
+        
+        assert_eq!(sub_op.slot[0], SlotVal::Str("-".to_string()));
+        assert_eq!(fma_op.slot[0], SlotVal::Str("multiply_add".to_string()));
+        
+        // CRITICAL: Verify all addresses are valid (< scratch budget)
+        // This test should FAIL currently because sub_temp_addr = 10000 + 42 = 10042
+        for addr in &sub_op.reads {
+            assert!(*addr < 1536, "Sub read address {} exceeds scratch budget", addr);
+        }
+        for addr in &sub_op.writes {
+            assert!(*addr < 1536, "Sub write address {} exceeds scratch budget (BUG: using 10000 + op_id)", addr);
+        }
+        for addr in &fma_op.reads {
+            assert!(*addr < 1536, "FMA read address {} exceeds scratch budget (BUG: reading from sub temp)", addr);
+        }
+        for addr in &fma_op.writes {
+            assert!(*addr < 1536, "FMA write address {} exceeds scratch budget", addr);
+        }
+    }
+
+    /// Test addresses in slot values are also valid
+    #[test]
+    fn test_lower_selectchoice_fma_without_delta_slot_addresses_valid() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest = VReg::vector(100);
+        let sub_temp = VReg::vector(101);
+        
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest, 400);
+        vreg_to_addr.insert(sub_temp, 500);
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op.dest = Some(dest);
+        op.sub_temp_vreg = Some(sub_temp);
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42); // FMA path WITHOUT delta
+
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+
+        // Check slot values for invalid addresses
+        for op in &result {
+            for slot_val in op.slot.iter() {
+                if let SlotVal::Int(addr) = slot_val {
+                    assert!(
+                        *addr < 1536,
+                        "Slot contains invalid address {}: {} (op: {:?})",
+                        addr,
+                        if *addr >= 10000 { "BUG: using fake temp address 10000 + op_id" } else { "" },
+                        op.slot[0]
+                    );
+                }
+            }
+        }
     }
 }

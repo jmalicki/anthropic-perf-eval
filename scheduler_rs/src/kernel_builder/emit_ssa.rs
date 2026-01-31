@@ -824,6 +824,16 @@ impl SsaEmitContext {
         // Detect zero case: if false_val is constant 0, subtraction is not needed
         let needs_subtraction = self.vreg_constants.get(&false_val) != Some(&0);
         
+        // Allocate sub_temp_vreg for FMA path without delta
+        // This holds the result of (true_val - false_val) if FMA path is chosen
+        // The VReg is allocated regardless of scheduler choice - if vselect is chosen,
+        // address assignment will see it has no consumers and can reclaim the space.
+        let sub_temp_vreg = if needs_subtraction {
+            Some(self.fresh_vector())
+        } else {
+            None
+        };
+        
         let mut op = SsaOp::new(
             0,
             Engine::Flow, // Default engine (will be overridden by scheduler choice)
@@ -837,6 +847,7 @@ impl SsaEmitContext {
         );
         op.needs_subtraction = needs_subtraction;
         op.delta_vreg = None; // No precomputed delta
+        op.sub_temp_vreg = sub_temp_vreg;
         
         self.emit(op);
         dest

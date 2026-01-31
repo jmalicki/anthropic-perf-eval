@@ -28,3 +28,30 @@ Record after each phase: git SHA, exact uv command, liveness peak, cycles, and c
 | **Delta**                                    | **-5** | **-7** |
 
 Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness for this configuration. The `--enable-tree-reduce-depth3` flag is exposed in `generate_ssa_kernel.py` and in the SSA Python binding (`enable_tree_reduce_depth3`).
+
+---
+
+## Current Status (ff9895a)
+
+- **Git SHA:** ff9895a
+- **Changes:** Reserved zero VReg without emitting op, deprecated `emit_const()`, added filtering for AddImm alternatives
+
+### Greedy scheduler (no valu-shift)
+
+- **Command:** `uv run python generate_ssa_kernel.py --rounds 4 --use-greedy --validate -q`
+- **Cycles:** 513
+- **Peak live:** 1488 words
+- **Verification:** PASSED
+
+### Known Issues
+
+1. **SelectChoice lowering bug**: When CP-SAT (or greedy with valu-shift) chooses the FMA path for SelectChoice ops without a precomputed delta, the lowering creates invalid temporary addresses (`10000 + op_id`) that don't exist in scratch memory. This causes validation failures.
+
+2. **CP-SAT non-determinism**: Per-section CP-SAT sometimes fails to find feasible solutions within scratch budget, and full-kernel CP-SAT often times out (10 min) without finding a solution.
+
+| Config | Status | Cycles | Peak | Notes |
+|--------|--------|--------|------|-------|
+| Greedy (no valu-shift) | PASS | 513 | 1488 | Baseline working |
+| Greedy (valu-shift) | FAIL | - | - | SelectChoice lowering bug |
+| CP-SAT (no valu-shift) | FAIL | 491* | 1458* | *Found but fails validation |
+| CP-SAT (valu-shift) | FAIL | - | - | Times out (10 min) |

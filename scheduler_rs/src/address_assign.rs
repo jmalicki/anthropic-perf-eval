@@ -126,6 +126,13 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
         if let Some(dest) = op.dest {
             intervals.insert(dest, LiveInterval::new(op.cycle, op.cycle));
         }
+        
+        // Handle sub_temp_vreg for SelectChoice ops without delta
+        // The sub_temp is defined at the SelectChoice's cycle and read at cycle + 1 (by FMA)
+        if let Some(sub_temp) = op.sub_temp_vreg {
+            // Interval: [cycle, cycle+1] - defined at cycle, read at cycle+1
+            intervals.insert(sub_temp, LiveInterval::new(op.cycle, op.cycle + 1));
+        }
     }
 
     // Second pass: extend end to last READ cycle.
