@@ -756,12 +756,12 @@ for (o1, o2) in symmetric_pairs {
 
 **Caution:** CP-SAT has built-in symmetry detection. Adding manual symmetry breaking may conflict with or duplicate the solver's efforts. Test empirically.
 
-**For our problem:** Limited symmetry breaking is safe:
-- Groups are NOT symmetric (they operate on different data)
-- Ops within a cycle are symmetric only if they have identical structure
-- We don't use address variables, so no register symmetry
+**Our implementation (`SymmetryHint`):** We use emission hints so the optimizer sees only generic ordering groups and lexicographic streams—no interpretation of rounds, batches, etc. Emission encodes structure (e.g. tree levels, batch items) into opaque keys:
 
-**Recommendation:** Add symmetry breaking only if profiling shows the solver exploring symmetric branches. Start without it.
+- **Ordering groups**: Ops with the same `ordering_group` key get `cycle[i] <= cycle[j]` by emission order (e.g. leaves before level 1 before level 2 in a tree-select).
+- **Lexicographic streams**: `(stream_key, item_key)` enforces first_op[item_i] <= first_op[item_{i+1}] (e.g. batch item 0 before batch item 1).
+
+**Why we want this:** CP-SAT reports many orbits (e.g. 276); without breaking symmetry, the solver explores equivalent branches. Our hints reduce redundant search while keeping emission and optimization cleanly separated. See `scheduler_rs/src/types.rs` (`SymmetryHint`) and `docs/CPSAT_SLOW_PROGRESS_ANALYSIS.md`.
 
 ### 5.6 Solver Parameters and Diagnostics
 

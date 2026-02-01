@@ -487,7 +487,7 @@ impl SsaTickTockKernelBuilder {
 
     /// 4-way selection via bit-tree: idx_adj = idx - base_idx (0..4), bit0 = low bit, bit1 = high bit.
     /// Level 0: two parallel 2-way (v0,v1) by bit0 and (v2,v3) by bit0. Level 1: one 2-way by bit1.
-    /// Requires v_const[base_idx] for idx_adj.
+    /// Requires v_const[base_idx] for idx_adj. Tree levels set for symmetry breaking.
     fn select_4way_bit_tree(
         &mut self,
         idx: crate::types::VReg,
@@ -505,9 +505,13 @@ impl SsaTickTockKernelBuilder {
         let idx_adj_shr = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
         let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
         self.emit.set_next_var_type(VarType::Temporary);
+        self.emit.set_symmetry_hint(0);
         let p01 = self.select_2way(bit0, v1, v0);
         let p23 = self.select_2way(bit0, v3, v2);
-        self.select_2way(bit1, p23, p01)
+        self.emit.set_symmetry_hint(1);
+        let result = self.select_2way(bit1, p23, p01);
+        self.emit.clear_symmetry_hint();
+        result
     }
 
     /// 4-way bit-tree with first pair as (base, delta) to avoid materializing v1.
@@ -536,6 +540,7 @@ impl SsaTickTockKernelBuilder {
     /// 8-way selection via bit-tree: idx_adj = idx - base_idx (0..8), bit0/bit1/bit2.
     /// Level 0: four parallel 2-way by bit0. Level 1: two 2-way by bit1. Level 2: one 2-way by bit2.
     /// Uses SelectChoice only (no direct FMA). Requires v_const[base_idx] and v_1.
+    /// Tree levels are set for symmetry breaking in CP-SAT (leaves in order, then level 1, then level 2).
     fn select_8way_bit_tree(
         &mut self,
         idx: crate::types::VReg,
@@ -551,13 +556,18 @@ impl SsaTickTockKernelBuilder {
         let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr1, v_1);
         let bit2 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr1, v_1);
         self.emit.set_next_var_type(VarType::Temporary);
+        self.emit.set_symmetry_hint(0);
         let p01 = self.select_2way(bit0, values[1], values[0]);
         let p23 = self.select_2way(bit0, values[3], values[2]);
         let p45 = self.select_2way(bit0, values[5], values[4]);
         let p67 = self.select_2way(bit0, values[7], values[6]);
+        self.emit.set_symmetry_hint(1);
         let q03 = self.select_2way(bit1, p23, p01);
         let q47 = self.select_2way(bit1, p67, p45);
-        self.select_2way(bit2, q47, q03)
+        self.emit.set_symmetry_hint(2);
+        let result = self.select_2way(bit2, q47, q03);
+        self.emit.clear_symmetry_hint();
+        result
     }
 
     // =========================================================================
@@ -659,21 +669,25 @@ impl SsaTickTockKernelBuilder {
                     let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
                     let bit2 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr, v_1);
 
-                    // Level 0: 4 FMAs
+                    // Level 0: 4 FMAs (symmetry hint: leaves in order)
+                    self.emit.set_symmetry_hint(0);
                     let p01 = self.emit.emit_fma(bit0, v_td_r3_01, v_tc_r3_0);
                     let p23 = self.emit.emit_fma(bit0, v_td_r3_23, v_tc_r3_2);
                     let p45 = self.emit.emit_fma(bit0, v_td_r3_45, v_tc_r3_4);
                     let p67 = self.emit.emit_fma(bit0, v_td_r3_67, v_tc_r3_6);
 
                     // Level 1: Combine pairs
+                    self.emit.set_symmetry_hint(1);
                     let dp03 = self.emit.emit_valu(Opcode::Sub, p23, p01);
                     let q03 = self.emit.emit_fma(bit1, dp03, p01);
                     let dp47 = self.emit.emit_valu(Opcode::Sub, p67, p45);
                     let q47 = self.emit.emit_fma(bit1, dp47, p45);
 
                     // Level 2: Final result
+                    self.emit.set_symmetry_hint(2);
                     let d_final = self.emit.emit_valu(Opcode::Sub, q47, q03);
                     let result = self.emit.emit_fma(bit2, d_final, q03);
+                    self.emit.clear_symmetry_hint();
 
                     self.ctx.v_nv[it][i] =
                         Some(self.emit.emit_valu(Opcode::Xor, result, v_stage5_xor));

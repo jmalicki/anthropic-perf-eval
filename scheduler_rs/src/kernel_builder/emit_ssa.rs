@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, VarSource, VarType, VReg};
+use crate::types::{ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, SymmetryHint, VarSource, VarType, VReg};
 
 /// Tracks alternative implementations for a constant.
 ///
@@ -71,6 +71,8 @@ pub struct SsaEmitContext {
     pub current_group: Option<usize>,
     /// Current emission phase
     pub current_phase: EmissionPhase,
+    /// Symmetry hint for next emitted ops (optimization uses this; emission only sets it).
+    pub current_symmetry_hint: Option<SymmetryHint>,
     /// VarType to use for the next emitted op (if set)
     pub next_var_type: Option<VarType>,
 
@@ -108,6 +110,7 @@ impl SsaEmitContext {
             current_iter: None,
             current_group: None,
             current_phase: EmissionPhase::Init,
+            current_symmetry_hint: None,
             next_var_type: None,
             // Constant alternative tracking
             const_alternatives: Vec::new(),
@@ -250,6 +253,22 @@ impl SsaEmitContext {
         }
     }
 
+    /// Set symmetry hint for next emitted ops. Emission encodes (round, iter, level, group) into
+    /// generic ordering_group and lexicographic_stream keys; optimizer does not interpret them.
+    pub fn set_symmetry_hint(&mut self, level: u8) {
+        let r = self.current_round.map(|x| x as i64).unwrap_or(-1);
+        let i = self.current_iter.map(|x| x as i64).unwrap_or(-1);
+        self.current_symmetry_hint = Some(SymmetryHint {
+            ordering_group: vec![r, i, level as i64],
+            lexicographic_stream: self.current_group.map(|g| (vec![r, i], g as i64)),
+        });
+    }
+
+    /// Clear symmetry hint (e.g. after emitting a selection tree).
+    pub fn clear_symmetry_hint(&mut self) {
+        self.current_symmetry_hint = None;
+    }
+
     /// Record that a VReg is defined by a specific op.
     ///
     /// Panics if the VReg is already defined - this indicates an SSA violation.
@@ -287,6 +306,7 @@ impl SsaEmitContext {
 
         // Capture current context for usage accounting
         op.source_info = Some(self.current_var_source());
+        op.symmetry_hint = self.current_symmetry_hint.clone();
         if let Some(var_type) = self.next_var_type.take() {
             op.var_type = Some(var_type);
         }

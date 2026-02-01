@@ -136,4 +136,6 @@ If the goal is a **good schedule** rather than **proven optimal**:
 | Who finds solutions? | Mostly LNS (scheduling_*, graph_*, rnd_*); core MIP improves the bound. |
 | Time between improvements grows | Proving “no solution with makespan ≤ M” gets harder as M decreases. |
 
-So nothing is “wrong” with the formulation in the sense of incorrectness; the slowness comes from the **difficulty of the problem** (many ops, many cumulatives, integer makespan) and the **weak LP for cumulatives**. We have implemented **redundant linear capacity constraints** to strengthen the LP. Remaining levers: **symmetry breaking** if we can identify equivalent ops, and **stopping earlier** (gap or time) when a good-enough solution is enough.
+So nothing is “wrong” with the formulation in the sense of incorrectness; the slowness comes from the **difficulty of the problem** (many ops, many cumulatives, integer makespan) and the **weak LP for cumulatives**. We have implemented **redundant linear capacity constraints** to strengthen the LP. **Symmetry breaking (implemented):** We use `SymmetryHint` on `SsaOp`: emission attaches `ordering_group` and `lexicographic_stream` keys; the optimizer adds ordering constraints (cycle[i] <= cycle[j] within groups, first_op ordering across stream items). This prunes redundant search when CP-SAT reports many orbits (e.g. 276). See `scheduler_rs/src/types.rs` (`SymmetryHint`) and `docs/INTEGRATED_SCHEDULING_ALLOCATION.md` §5.5.
+
+Remaining levers: **stopping earlier** (gap or time) when a good-enough solution is enough.

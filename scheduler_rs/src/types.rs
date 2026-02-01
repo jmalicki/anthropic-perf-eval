@@ -1114,6 +1114,33 @@ impl EmissionPhase {
     }
 }
 
+/// Hint from emission for symmetry breaking during optimization.
+///
+/// **Why we want this**: The scheduler explores many equivalent solutions (CP-SAT reports
+/// hundreds of orbits). Symmetry hints let emission mark structurally symmetric ops so the
+/// optimizer can add ordering constraints and prune redundant search without losing the
+/// optimal schedule.
+///
+/// **Generic structure**: Optimizer only sees ordering groups and lexicographic streams.
+/// Emission encodes problem-specific structure (batch, round, etc.) into opaque keys.
+///
+/// - **Ordering group**: ops with the same `ordering_group` key form a chain; optimizer adds
+///   cycle[i] <= cycle[j] for consecutive ops in emission order.
+/// - **Lexicographic stream**: when set, (stream_key, item_key) identifies an item in a stream.
+///   Optimizer groups by stream_key, orders by item_key, and enforces first_op[item_i] <=
+///   first_op[item_{i+1}] for consecutive items.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SymmetryHint {
+    /// Key for ordering group. Ops with same key get cycle[i] <= cycle[j] by emission order.
+    /// Empty = no ordering hint for this op.
+    pub ordering_group: Vec<i64>,
+
+    /// Optional (stream_key, item_key) for lexicographic ordering across items in a stream.
+    /// Optimizer groups by stream_key, sorts by item_key, adds first_op[i] <= first_op[i+1].
+    /// None = no lexicographic hint for this op.
+    pub lexicographic_stream: Option<(Vec<i64>, i64)>,
+}
+
 /// Source information for a variable - tracks where/when it was created.
 ///
 /// This metadata enables usage accounting by round and category.
@@ -1207,6 +1234,12 @@ pub struct SsaOp {
     /// Source information: which round/phase/iteration generated this op
     pub source_info: Option<VarSource>,
 
+    /// Optional symmetry hint from emission. Optimizer uses `ordering_group` and
+    /// `lexicographic_stream` to add ordering constraints that prune redundant search.
+    /// Emission sets this; optimization consumes it. See `SymmetryHint` and
+    /// `docs/CPSAT_SLOW_PROGRESS_ANALYSIS.md`.
+    pub symmetry_hint: Option<SymmetryHint>,
+
     /// For ConstChoice ops: alternative encodings the scheduler can choose from.
     /// The greedy scheduler uses Load (default), while CP-SAT models the choice.
     pub const_alternatives: Option<Vec<ConstEncoding>>,
@@ -1251,6 +1284,7 @@ impl SsaOp {
             source: None,
             var_type: None,
             source_info: None,
+            symmetry_hint: None,
             const_alternatives: None,
             needs_subtraction: true, // Default: subtraction needed (false_val != 0)
             delta_vreg: None, // Default: no precomputed delta

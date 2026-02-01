@@ -87,6 +87,25 @@
 //! The greedy schedule is feasible, so CP-SAT can start from a known good point and
 //! focus on proving optimality or finding improvements.
 //!
+//! ## Symmetry Breaking (from Emission Hints)
+//!
+//! Ops may carry a `symmetry_hint` (see `SymmetryHint` in `types`). The optimizer uses these
+//! to add ordering constraints that reduce redundant search:
+//!
+//! - **Ordering groups**: Ops with the same `ordering_group` key get `cycle[i] <= cycle[j]`
+//!   for consecutive ops in emission order. This prunes equivalent schedules where symmetric
+//!   ops (e.g. same tree level) are reordered.
+//!
+//! - **Lexicographic streams**: When `lexicographic_stream` is set, we enforce
+//!   `first_op[item_i] <= first_op[item_{i+1}]` for consecutive items in each stream. This
+//!   prunes schedules where symmetric "items" (e.g. batch elements) are reordered.
+//!
+//! **Why we want this**: CP-SAT reports many orbits (e.g. 276); without breaking symmetry,
+//! the solver explores equivalent branches. Emission encodes problem structure (e.g. tree
+//! levels, batch items) into opaque keys; the optimizer only groups and orders—no
+//! interpretation of rounds, batches, etc. See `docs/CPSAT_SLOW_PROGRESS_ANALYSIS.md` and
+//! `docs/INTEGRATED_SCHEDULING_ALLOCATION.md` §5.5.
+//!
 //! # Build Requirements
 //!
 //! This module requires the `cpsat` feature and OR-Tools to be installed:
@@ -1487,6 +1506,61 @@ pub fn schedule_ssa_cpsat(
                 // cycle[idx] >= cycle[dep_idx] + 1
                 model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
             }
+        }
+    }
+
+    // 5b. Symmetry breaking (ordering groups): ops with same ordering_group key get cycle[i] <= cycle[j]
+    // for consecutive ops in emission order. Optimizer only groups by key; emission encodes structure.
+    {
+        use std::collections::HashMap;
+        let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(ref hint) = op.symmetry_hint else { continue };
+            if hint.ordering_group.is_empty() {
+                continue;
+            }
+            groups.entry(hint.ordering_group.clone()).or_default().push(idx);
+        }
+        for (_key, indices) in groups.iter() {
+            for w in indices.windows(2) {
+                let (i, j) = (w[0], w[1]);
+                model.add_le(cycle_vars[i], cycle_vars[j]);
+            }
+        }
+        if verbose && !groups.is_empty() {
+            let total_constraints: usize = groups.values().map(|v| v.len().saturating_sub(1)).sum();
+            eprintln!("  Symmetry breaking (ordering): {} groups, {} constraints", groups.len(), total_constraints);
+        }
+    }
+
+    // 5c. Symmetry breaking (lexicographic streams): for each stream_key, items ordered by item_key
+    // get first_op[item_i] <= first_op[item_{i+1}]. Optimizer only groups and orders; emission encodes structure.
+    {
+        use std::collections::{BTreeMap, HashMap};
+        let mut streams: HashMap<Vec<i64>, BTreeMap<i64, Vec<usize>>> = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(ref hint) = op.symmetry_hint else { continue };
+            let Some((ref stream_key, item_key)) = hint.lexicographic_stream else { continue };
+            streams
+                .entry(stream_key.clone())
+                .or_default()
+                .entry(item_key)
+                .or_default()
+                .push(idx);
+        }
+        let n_streams = streams.len();
+        let mut lex_constraints = 0usize;
+        for (_stream_key, by_item) in streams {
+            let ordered: Vec<Vec<usize>> = by_item.into_values().collect();
+            for w in ordered.windows(2) {
+                let first_op_cur = w[0][0];
+                let first_op_next = w[1][0];
+                model.add_le(cycle_vars[first_op_cur], cycle_vars[first_op_next]);
+                lex_constraints += 1;
+            }
+        }
+        if verbose && lex_constraints > 0 {
+            eprintln!("  Symmetry breaking (lex streams): {} streams, {} constraints", n_streams, lex_constraints);
         }
     }
 
