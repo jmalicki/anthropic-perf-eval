@@ -103,7 +103,9 @@ uv run generate_ssa_kernel.py --output-json schedule.json
 - `--cpsat-time-limit SECONDS` - CP-SAT time limit (default: 600 = 10 min)
 - `--enable-valu-shift` - Enable VALU→ALU shifting (disabled by default)
 - `--output-json PATH` - Write schedule JSON for analysis
-- `--validate` - Validate against reference kernel
+- `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
+- `--validate-only PATH` - Load kernel from JSON and run validation only (no build). Use after a run with `--validate` to re-check: `uv run generate_ssa_kernel.py --validate-only kernel_to_validate.json`.
+- `--save-kernel PATH` - Save kernel to this path (default when `--validate`: `kernel_to_validate.json`).
 - `-q, --quiet` - Suppress verbose Rust scheduler output
 
 **Why SSA builder?**

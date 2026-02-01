@@ -19,8 +19,10 @@ Example usage:
     # Longer optimization
     python generate_ssa_kernel.py --cpsat-time-limit 3600
 
-    # With validation
+    # With validation (kernel is always saved before validation for debugging)
     python generate_ssa_kernel.py --validate
+    # Kernel written to kernel_to_validate.json; re-validate without rebuilding:
+    python generate_ssa_kernel.py --validate-only kernel_to_validate.json
 """
 
 import argparse
@@ -68,11 +70,11 @@ def main():
                         choices=["none", "summary", "full"],
                         help="Liveness detail level in JSON: none, summary, or full (default: full)")
     parser.add_argument("--validate", action="store_true",
-                        help="Validate against reference kernel")
+                        help="Validate against reference kernel (kernel is always saved before validation for debugging)")
     parser.add_argument("--validate-only", type=str, metavar="PATH", default=None,
                         help="Load kernel from JSON and run validation only (no build). Use same forest_height, batch_size, rounds, seed.")
     parser.add_argument("--save-kernel", type=str, metavar="PATH", default=None,
-                        help="After building, save instruction list to JSON so you can rerun validation with --validate-only PATH")
+                        help="Save instruction list to JSON (default when --validate: kernel_to_validate.json). Rerun with --validate-only PATH.")
     parser.add_argument("--seed", type=int, default=123,
                         help="Random seed for validation (default: 123)")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -147,16 +149,20 @@ def main():
     if args.output_json:
         print(f"\n  Schedule JSON written to: {args.output_json}")
 
-    if args.save_kernel:
+    # Always save kernel before validating so failures can be analyzed without re-running.
+    kernel_path = args.save_kernel
+    if args.validate and kernel_path is None:
+        kernel_path = "kernel_to_validate.json"
+    if kernel_path:
         save_kernel_to_json(
             instrs,
-            args.save_kernel,
+            kernel_path,
             args.forest_height,
             args.batch_size,
             args.rounds,
             args.seed,
         )
-        print(f"\n  Kernel saved to {args.save_kernel} (rerun with --validate-only {args.save_kernel})")
+        print(f"\n  Kernel saved to {kernel_path} (rerun with --validate-only {kernel_path})")
 
     if args.validate:
         if budget_exceeded:

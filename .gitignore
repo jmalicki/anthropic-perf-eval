@@ -53,3 +53,4 @@ schedule_output.json
 schedule_*.json
 debug_*.json
 *_diagnostics.json
+kernel_to_validate.json
