@@ -37,9 +37,16 @@ pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Ve
 /// Shifted VALU ops are expanded to 8 scalar ALU ops, one per lane.
 /// Each ALU op reads from src[i] and writes to dest[i].
 ///
-/// ConstChoice ops are lowered based on the scheduler's decision:
+/// ConstChoice ops (single op from emit_const_choice) are lowered based on the scheduler's decision:
 /// - If in `const_add_imm_ops`: emit AddImm op (Flow engine)
 /// - Otherwise: emit Const op (Load engine)
+///
+/// **emit_const() dual-op path**: When emit_const() is used (Load + AddImm with same dest),
+/// the AddImm ops are filtered out *before* CP-SAT (tick_tock_ssa.rs), so we never choose
+/// at lowering for those constants—we always emit the Load encoding. To choose at lowering
+/// for all constants, either (1) use emit_const_choice() everywhere and fix the per-section
+/// scratch budget model, or (2) keep both ops through CP-SAT (model pairs like ConstChoice),
+/// output which encoding was chosen per pair, and at lowering emit only the chosen op.
 ///
 /// SelectChoice ops are lowered based on the scheduler's decision:
 /// - If in `select_fma_ops`: emit sub + fma ops (both VALU, sequential)

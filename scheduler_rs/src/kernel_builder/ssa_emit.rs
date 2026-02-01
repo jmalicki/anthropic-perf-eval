@@ -6,8 +6,11 @@
 //!
 //! NOTE: This module uses `emit_const()` instead of `emit_const_choice()` because
 //! the per-section scratch budget model doesn't correctly account for ConstChoice
-//! decisions yet. The CP-SAT path uses a filtering workaround to remove the AddImm
-//! alternatives before scheduling. See tick_tock_ssa.rs for details.
+//! decisions yet. The CP-SAT path filters out AddImm alternatives before scheduling,
+//! so we never choose Load vs AddImm at lowering time for those constants—we always
+//! emit Load. ConstChoice (emit_const_choice) does choose at lowering. To unify:
+//! use emit_const_choice() everywhere and fix the per-section model, or model
+//! emit_const() pairs in CP-SAT and emit only the chosen encoding at lowering.
 
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 

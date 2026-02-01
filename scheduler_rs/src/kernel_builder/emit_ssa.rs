@@ -1084,27 +1084,56 @@ pub fn eliminate_ssa_dead_code(
         }
     }
 
+    // ConstChoice atomicity: emit_const() creates Load + AddImm with same dest (one logical constant).
+    // Map each encoding's index to its partner so we keep/remove both as a unit.
+    let const_choice_partner: HashMap<usize, usize> = const_alternatives
+        .iter()
+        .flat_map(|alt| {
+            [
+                (alt.load_op_idx, alt.add_imm_op_idx),
+                (alt.add_imm_op_idx, alt.load_op_idx),
+            ]
+        })
+        .collect();
+
     let mut live: HashSet<usize> = HashSet::new();
     let mut worklist: Vec<usize> = Vec::new();
+
+    /// Mark an op index live; if it's one encoding of a ConstChoice pair, mark the other encoding live too.
+    fn mark_live_atomic(
+        idx: usize,
+        live: &mut HashSet<usize>,
+        worklist: &mut Vec<usize>,
+        const_choice_partner: &HashMap<usize, usize>,
+    ) {
+        if live.insert(idx) {
+            worklist.push(idx);
+            if let Some(&partner) = const_choice_partner.get(&idx) {
+                if live.insert(partner) {
+                    worklist.push(partner);
+                }
+            }
+        }
+    }
 
     // Roots: control flow, barriers, and all stores (side effects; harness reads memory later)
     for (idx, op) in ops.iter().enumerate() {
         match op.opcode {
             Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier => {
-                live.insert(idx);
-                worklist.push(idx);
+                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
             }
             Opcode::Store | Opcode::Vstore => {
                 // Always keep stores: they have side effects (memory). The harness reads
                 // output memory; that use is not visible in SSA, so treat all stores as roots.
-                live.insert(idx);
-                worklist.push(idx);
+                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
             }
             _ => {}
         }
     }
 
-    // Propagate: definers of operands of live ops are live
+    // Propagate: definers of operands of live ops are live.
+    // ConstChoice and SelectChoice are atomic: we keep/remove encodings as a unit (ConstChoice pair
+    // via const_choice_partner; SelectChoice is a single op so no extra handling).
     while let Some(idx) = worklist.pop() {
         for vreg in ops[idx].reads() {
             if Some(vreg) == zero_vreg {
@@ -1118,9 +1147,7 @@ pub fn eliminate_ssa_dead_code(
                 Some(&i) => i,
                 None => continue,
             };
-            if live.insert(def_idx) {
-                worklist.push(def_idx);
-            }
+            mark_live_atomic(def_idx, &mut live, &mut worklist, &const_choice_partner);
         }
     }
 
