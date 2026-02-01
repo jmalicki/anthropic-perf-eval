@@ -2045,6 +2045,31 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
+            // Segment mode: add scratch for SelectChoice FMA sub_temp_vreg (def at op.cycle, last use at op.cycle+1)
+            if let Some(fma_ids) = select_choice_hints {
+                for (op_idx, op) in ops.iter().enumerate() {
+                    if op.opcode == Opcode::SelectChoice
+                        && fma_ids.contains(&op.id)
+                        && op.sub_temp_vreg.is_some()
+                    {
+                        if op_idx >= cycle_vars.len() {
+                            continue;
+                        }
+                        let start = cycle_vars[op_idx];
+                        let end_expr = LinearExpr::from(start) + 2; // [c, c+2) = cycles c and c+1
+                        let size_two =
+                            model.new_int_var_with_name([(2, 2)], format!("sub_temp_size_op_{}", op.id));
+                        model.add_eq(
+                            LinearExpr::from(start) + LinearExpr::from(size_two),
+                            end_expr.clone(),
+                        );
+                        let interval = model.new_interval_var(start, size_two, end_expr);
+                        scratch_intervals.push(interval);
+                        scratch_demands.push(8); // vector = VLEN words
+                    }
+                }
+            }
+
             model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
 
             // Add hints for size variables if we have greedy hints
@@ -2147,6 +2172,20 @@ pub fn schedule_ssa_cpsat(
                     let size = vreg.size() as i64;
                     events.push((def_cycle, size));           // VReg becomes live
                     events.push((last_use_cycle + 1, -size)); // VReg dies after last use
+                }
+                // SelectChoice FMA sub_temp: live [c, c+2)
+                if let Some(fma_ids) = select_choice_hints {
+                    for (op_idx, op) in ops.iter().enumerate() {
+                        if op.opcode == Opcode::SelectChoice
+                            && fma_ids.contains(&op.id)
+                            && op.sub_temp_vreg.is_some()
+                            && op_idx < hints.len()
+                        {
+                            let c = hints[op_idx];
+                            events.push((c, 8));
+                            events.push((c + 2, -8));
+                        }
+                    }
                 }
                 events.sort_by_key(|(cycle, delta)| (*cycle, *delta));
 

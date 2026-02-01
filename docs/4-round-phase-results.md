@@ -43,19 +43,25 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 - **Peak live:** 1488 words
 - **Verification:** PASSED
 
+### Fixes applied (recent)
+
+- **Effective scratch budget when zero reserved**: Scheduler uses 1535 words when address 0 is reserved for zero; `peak_live` includes zero_vreg so total capacity stays 1536.
+- **sub_temp_vreg in segment scratch**: CP-SAT per-section scratch model now adds intervals for SelectChoice FMA `sub_temp_vreg` (def at op cycle, last use at cycle+1); hint verification includes them.
+- **Filtered segment indices**: `live_in_for_section_filtered` uses indices into the *filtered* segment (AddImm alternatives removed) so CP-SAT `cycle_vars` and initial_live last-use indices align.
+
 ### Known Issues
 
 1. **~~SelectChoice lowering bug~~** (FIXED in ae4a158): Now allocates real sub_temp_vreg during emission.
 
-2. **VALU-shift scratch pressure**: When `--enable-valu-shift` is used, peak_live reaches exactly 1536 words, causing address assignment to exceed budget (addresses 1536, 1537, 1538 are invalid).
+2. **VALU-shift scratch pressure**: With `--enable-valu-shift`, greedy may still force-schedule when at the limit, so peak_live can reach 1536 assignable + zero → 1537 and exceed budget. Effective budget 1535 is used; greedy does not yet count sub_temp in its budget check.
 
-3. **CP-SAT per-section liveness model**: Per-section CP-SAT sometimes produces schedules that exceed scratch budget due to incorrect live-through/live-out calculations. See [CP-SAT per-section liveness](#cp-sat-per-section-liveness) below.
+3. **CP-SAT per-section liveness model**: Per-section CP-SAT may still produce schedules that exceed scratch budget (e.g. segment end vs actual makespan, live sets by index not cycle). The sub_temp and filtered initial_live fixes reduce the gap.
 
 | Config | Status | Cycles | Peak | Notes |
 |--------|--------|--------|------|-------|
-| Greedy (no valu-shift) | PASS | 513 | 1488 | Baseline working |
-| Greedy (valu-shift) | FAIL | - | 1536 | Exceeds budget by 3 words |
-| CP-SAT (no valu-shift) | FAIL | - | - | Per-section liveness bug |
+| Greedy (no valu-shift) | PASS | 513 | 1489 | Baseline working |
+| Greedy (valu-shift) | FAIL | - | 1537 | May force-schedule; peak includes zero |
+| CP-SAT (no valu-shift) | FAIL | - | - | Per-section liveness bug (improved) |
 | CP-SAT (valu-shift) | FAIL | - | - | Times out (10 min) |
 
 ---
@@ -112,15 +118,11 @@ So in theory the segment scratch model should match “this section’s cycles i
 
 ---
 
-#### 3. sub_temp_vreg not in round_budget
+#### 3. ~~sub_temp_vreg not in round_budget~~ (FIXED)
 
-**What sub_temp_vreg is.** For a SelectChoice op that uses the FMA path *without* a precomputed delta, we emit two conceptual steps: (1) `sub_temp = true_val - false_val`, (2) `dest = cond * sub_temp + false_val`. The temporary `sub_temp` is a real VReg (`sub_temp_vreg`) allocated during SSA emission. It gets a real scratch address from address assignment and is live for one cycle (e.g. defined at cycle c, read at c+1). So it *does* consume scratch.
+**What sub_temp_vreg is.** For a SelectChoice op that uses the FMA path *without* a precomputed delta, we emit two conceptual steps: (1) `sub_temp = true_val - false_val`, (2) `dest = cond * sub_temp + false_val`. The temporary `sub_temp` is a real VReg (`sub_temp_vreg`) allocated during SSA emission.
 
-**What sections_exceeding_budget counts.** `sections_exceeding_budget(ops, 1536)` builds: `vreg_def_cycle` (for each op with `cycle >= 0` and `op.dest = Some(v)`, map `v -> op.cycle`) and `vreg_last_use_cycle` (for each op with `cycle >= 0`, for each `v` in `op.reads()`, update "last use" of `v` to at least `op.cycle`). So only VRegs that appear as some op's `dest` or in some op's `reads()` are counted. No other field (e.g. `sub_temp_vreg`) is used.
-
-**Why sub_temp_vreg is missing.** SelectChoice's `dest` is the *result* of the vselect/FMA (the chosen value). The sub_temp is an *intermediate*; it is not the op's `dest`. The only "consumer" of sub_temp is the *lowered* FMA op (sub_temp as operand). That FMA op does not exist in the SSA op list; it's created during lowering. So no SSA op has sub_temp in `reads()`. So `sub_temp_vreg` never appears in `vreg_def_cycle` or `vreg_last_use_cycle`. Therefore **every section's peak in `sections_exceeding_budget` under-counts scratch by the amount of sub_temp VRegs live in that section** (e.g. 8 words per vector sub_temp, for each SelectChoice FMA-without-delta in that section at that cycle).
-
-**Consequences.** The *greedy* section peaks (used to decide "run per-section CP-SAT for this section") can be *below* 1536 even when the true peak (including sub_temps) is *above* 1536 — so we might skip per-section CP-SAT for a section that's actually over budget. When we *do* run per-section CP-SAT, the segment model also doesn't know about sub_temp (the segment only sees the SelectChoice op's dest and normal reads), so the segment scratch model under-counts as well. After merge, `sections_exceeding_budget` still doesn't count sub_temp, so the *reported* peak (e.g. 1544) is still *without* sub_temp. The *true* peak could be even higher (1544 + 8*k for k vector sub_temps at the same cycle). So **sub_temp_vreg not in round_budget** doesn't by itself explain "1544" — it explains why we might be *closer* to the limit than we think, and why fixing the segment model might still not be enough until we also count sub_temp in both the segment model and in `sections_exceeding_budget`.
+**Fix.** `sections_exceeding_budget` now accepts optional `select_fma_op_ids`; when provided, for each SelectChoice op in that set with `sub_temp_vreg`, the sub_temp is counted (def at op.cycle, last use at op.cycle+1). The CP-SAT segment scratch model also adds intervals for these sub_temps when `select_choice_hints` is provided. So section peaks and segment feasibility now include sub_temp when the FMA path is chosen.
 
 ---
 

@@ -31,6 +31,20 @@ pub(crate) const TICK_STORE_DEPTHS: [usize; 6] = [0, 1, 2, 4, 5, 6];
 /// Depths where TOCK stores happen (second half of groups)
 pub(crate) const TOCK_STORE_DEPTHS: [usize; 4] = [3, 7, 8, 9];
 
+/// Hardware scratch size in words (addresses 0..SCRATCH_BUDGET_HW-1).
+pub(crate) const SCRATCH_BUDGET_HW: usize = 1536;
+
+/// When address 0 is reserved for zero, only 1535 words are assignable; use this as the scheduler
+/// scratch budget so we never schedule more than 1535 assignable words (peak_live then includes zero = 1536).
+pub(crate) fn effective_scratch_budget(zero_vreg_reserved: bool) -> usize {
+    if zero_vreg_reserved {
+        SCRATCH_BUDGET_HW - 1
+    } else {
+        SCRATCH_BUDGET_HW
+    }
+}
+
+
 /// Result of SSA scheduling and address assignment.
 #[derive(Debug)]
 pub struct SsaScheduleResult {
@@ -125,7 +139,7 @@ impl SsaTickTockKernelBuilder {
     ///
     /// `scratch_budget_override`: If `Some(b)`, use `b` as scratch budget for the greedy
     /// scheduler (for tests that need to trigger force-schedule / budget_exceeded).
-    /// If `None`, use the hardware limit 1536.
+    /// If `None`, use the hardware limit 1536 (peak_live includes zero_vreg when reserved).
     pub fn build_and_schedule_with_options(
         &mut self,
         enable_valu_shift: bool,
@@ -156,7 +170,7 @@ impl SsaTickTockKernelBuilder {
         // constraining cross-round interleaving and reducing peak liveness
         compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
 
-        let scratch_budget = scratch_budget_override.unwrap_or(1536);
+        let scratch_budget = scratch_budget_override.unwrap_or(SCRATCH_BUDGET_HW);
 
         // Schedule using greedy scheduler with VALU→ALU shifting
         // Collect SelectChoice decisions from greedy scheduler
@@ -189,13 +203,14 @@ impl SsaTickTockKernelBuilder {
             .filter(|op| op.cycle >= 0)
             .collect();
 
-        // Assign addresses via linear scan
+        // Assign addresses via linear scan (budget = hardware limit; zero_vreg included in peak so we stay within capacity)
         let mut assign_config = AddressAssignConfig::default();
-        assign_config.budget = scratch_budget;
+        assign_config.budget = SCRATCH_BUDGET_HW;
 
-        // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
+        // Reserve address 0 and include zero in peak_live so scheduler budget 1536 matches assignable+zero
         if let Some(zero) = self.zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
+            assign_config.zero_vreg = Some(zero);
         }
 
         eprintln!("[TRACE build_and_schedule] About to call assign_addresses with {} ops", ssa_ops.len());
@@ -274,7 +289,7 @@ impl SsaTickTockKernelBuilder {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
         use super::barrier_elision::{count_barriers, section_boundaries};
-        use super::round_budget::{sections_exceeding_budget, live_in_for_section, live_out_from_section, live_through_for_section, vreg_def_section};
+        use super::round_budget::{sections_exceeding_budget, live_in_for_section_filtered, live_out_from_section, live_through_for_section, vreg_def_section};
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
@@ -329,25 +344,26 @@ impl SsaTickTockKernelBuilder {
 
         // Phase 1: Per-section feasibility (only when a section exceeds scratch budget)
         let boundaries = section_boundaries(&ssa_ops);
-        let budget_result = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
+        let effective_budget = effective_scratch_budget(self.zero_vreg.is_some());
+        let budget_result = sections_exceeding_budget(&ssa_ops, effective_budget, Some(&greedy_select_fma_ops));
         let n_exceeding: usize = budget_result.section_exceeds_budget.iter().filter(|&&b| b).count();
         if verbose {
             eprintln!();
             eprintln!("================================================================================");
-            eprintln!("  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = 1536 words)");
+            eprintln!("  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)", SCRATCH_BUDGET_HW);
             eprintln!("  Sections that exceed budget will get a per-section CP-SAT run (feasibility).");
             eprintln!("================================================================================");
             eprintln!();
             for (k, &peak) in budget_result.section_peaks.iter().enumerate() {
                 if budget_result.section_exceeds_budget[k] {
                     eprintln!(
-                        "  Section {:2}:  peak {} words  > 1536  -->  RUN PER-SECTION CP-SAT (feasibility)",
-                        k, peak
+                        "  Section {:2}:  peak {} words  > {}  -->  RUN PER-SECTION CP-SAT (feasibility)",
+                        k, peak, effective_budget
                     );
                 } else {
                     eprintln!(
-                        "  Section {:2}:  peak {} words  <= 1536  -->  SKIP (within budget)",
-                        k, peak
+                        "  Section {:2}:  peak {} words  <= {}  -->  SKIP (within budget)",
+                        k, peak, effective_budget
                     );
                 }
             }
@@ -439,8 +455,9 @@ impl SsaTickTockKernelBuilder {
                     .collect();
                 let (segment_ops, segment_hints): (Vec<SsaOp>, Vec<i32>) = filtered_segment.into_iter().unzip();
                 
+                // Use filtered segment indices so CP-SAT cycle_vars align with segment_ops
                 let initial_live =
-                    live_in_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                    live_in_for_section_filtered(&ssa_ops, &boundaries, k, &vreg_def_sec, &global_indices);
                 let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let config_feasibility = SsaCpsatConfig {
@@ -448,7 +465,7 @@ impl SsaTickTockKernelBuilder {
                     verbose,
                     stop_after_first_solution: true,
                     enable_valu_shift,
-                    scratch_budget: 1536,
+                    scratch_budget: SCRATCH_BUDGET_HW,
                     model_name: Some(format!("section_{}_feasibility", k)),
                 };
                 let seg_shift = if enable_valu_shift {
@@ -482,7 +499,7 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 if verbose {
-                    let after_budget = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
+                    let after_budget = sections_exceeding_budget(&ssa_ops, effective_scratch_budget(self.zero_vreg.is_some()), Some(&greedy_select_fma_ops));
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
                     let delta_peak = after_peak as i32 - greedy_section_peak as i32;
@@ -519,17 +536,17 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget.
-        let post_merge_budget = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops));
+        let post_merge_budget = sections_exceeding_budget(&ssa_ops, SCRATCH_BUDGET_HW, Some(&greedy_select_fma_ops));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks
             .iter()
             .enumerate()
-            .find(|(_, &p)| p > 1536)
+            .find(|(_, &p)| p > SCRATCH_BUDGET_HW)
         {
             return Err(format!(
-                "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget 1536). \
+                "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget {}). \
                  This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
-                sec, *peak
+                sec, *peak, SCRATCH_BUDGET_HW
             ));
         }
 
@@ -593,17 +610,18 @@ impl SsaTickTockKernelBuilder {
         // sections, per-section feasibility result for sections that exceeded budget).
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
-        let hint_peak = sections_exceeding_budget(&ssa_ops, 1536, Some(&greedy_select_fma_ops))
+        let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
+        let hint_peak = sections_exceeding_budget(&ssa_ops, effective_budget_hint, Some(&greedy_select_fma_ops))
             .section_peaks
             .first()
             .copied()
             .unwrap_or(0);
 
-        if hint_peak > 1536 {
+        if hint_peak > SCRATCH_BUDGET_HW {
             return Err(format!(
-                "Merged hint schedule exceeds scratch budget: peak {} words (budget 1536). \
+                "Merged hint schedule exceeds scratch budget: peak {} words (budget {}). \
                  Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
-                hint_peak
+                hint_peak, SCRATCH_BUDGET_HW
             ));
         }
 
@@ -618,7 +636,7 @@ impl SsaTickTockKernelBuilder {
             verbose,
             stop_after_first_solution: false,
             enable_valu_shift,
-            scratch_budget: 1536, // Hardware limit
+            scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
         };
 
@@ -658,7 +676,7 @@ impl SsaTickTockKernelBuilder {
             eprintln!();
             eprintln!("================================================================================");
             eprintln!("  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)");
-            eprintln!("  All rounds merged; solving for minimum cycles. Scratch budget = 1536.");
+            eprintln!("  All rounds merged; solving for minimum cycles. Scratch budget = {}.", cpsat_config.scratch_budget);
             eprintln!(
                 "  Before optimization: {} cycles, peak {} words (hint schedule).",
                 hint_makespan, hint_peak
@@ -709,12 +727,13 @@ impl SsaTickTockKernelBuilder {
             .filter(|op| op.cycle >= 0)
             .collect();
 
-        // Assign addresses via linear scan
+        // Assign addresses via linear scan (zero_vreg included in peak so we stay within 1536)
         let mut assign_config = AddressAssignConfig::default();
+        assign_config.budget = SCRATCH_BUDGET_HW;
 
-        // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
         if let Some(zero) = self.zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
+            assign_config.zero_vreg = Some(zero);
         }
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
@@ -890,9 +909,10 @@ mod tests {
         assert!(result.is_ok(), "4-round kernel generation should succeed: {:?}", result.err());
         let result = result.unwrap();
         assert!(
-            result.address_result.peak_live <= 1536,
-            "4-round kernel must stay within scratch budget: peak_live={} > 1536",
-            result.address_result.peak_live
+            result.address_result.peak_live <= SCRATCH_BUDGET_HW,
+            "4-round kernel must stay within scratch budget: peak_live={} > {}",
+            result.address_result.peak_live,
+            SCRATCH_BUDGET_HW
         );
         assert!(!result.address_result.budget_exceeded, "4-round kernel must not report budget_exceeded");
     }
@@ -1230,7 +1250,7 @@ mod tests {
         ops[1].cycle = 1;
         ops[2].cycle = 10;
 
-        let intervals = compute_live_intervals(&ops);
+        let intervals = compute_live_intervals(&ops, None);
 
         // CLOSED intervals: [start, end] where end = last_read_cycle
         //
@@ -2825,13 +2845,15 @@ mod tests {
         let result = result.unwrap();
         assert!(
             !result.address_result.budget_exceeded,
-            "Two-phase CP-SAT must produce a schedule within scratch budget; peak_live={} > 1536",
-            result.address_result.peak_live
+            "Two-phase CP-SAT must produce a schedule within scratch budget; peak_live={} > {}",
+            result.address_result.peak_live,
+            SCRATCH_BUDGET_HW
         );
         assert!(
-            result.address_result.peak_live <= 1536,
-            "Peak live words must not exceed scratch budget: {} > 1536",
-            result.address_result.peak_live
+            result.address_result.peak_live <= SCRATCH_BUDGET_HW,
+            "Peak live words must not exceed scratch budget: {} > {}",
+            result.address_result.peak_live,
+            SCRATCH_BUDGET_HW
         );
     }
 }

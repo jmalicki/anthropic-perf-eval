@@ -88,6 +88,8 @@ pub struct AddressAssignConfig {
     pub start_addr: i64,
     /// Fixed VRegs that must use specific addresses
     pub fixed_vregs: HashMap<VReg, i64>,
+    /// When set, this VReg (address 0) is included in live intervals so peak_live counts it and stays within budget.
+    pub zero_vreg: Option<VReg>,
 }
 
 impl Default for AddressAssignConfig {
@@ -96,6 +98,7 @@ impl Default for AddressAssignConfig {
             budget: 1536,
             start_addr: 1, // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
             fixed_vregs: HashMap::new(),
+            zero_vreg: None,
         }
     }
 }
@@ -114,7 +117,10 @@ impl Default for AddressAssignConfig {
 ///
 /// For a dead VReg (defined at D, never read):
 /// - Interval = [D, D+1] — the "+1" ensures write conflicts are detected
-pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
+///
+/// When `zero_vreg` is Some, it is added with interval [0, max_cycle] so peak_live counts it
+/// (address 0 is reserved; total capacity is budget words including zero).
+pub fn compute_live_intervals(ops: &[SsaOp], zero_vreg: Option<VReg>) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     // Always print to verify this code is reached
     eprintln!("[TRACE compute_live_intervals] Called with {} ops, debug={}", ops.len(), debug);
@@ -180,6 +186,17 @@ pub fn compute_live_intervals(ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
             // same-cycle write conflicts with other VRegs.
             interval.end = interval.start + 1;
         }
+    }
+
+    // Include zero_vreg so peak_live counts the reserved slot (total capacity = budget including zero)
+    if let Some(zero) = zero_vreg {
+        let max_cycle = ops
+            .iter()
+            .filter(|op| op.cycle >= 0)
+            .map(|op| op.cycle)
+            .max()
+            .unwrap_or(0);
+        intervals.insert(zero, LiveInterval::new(0, max_cycle));
     }
 
     // Debug: print all intervals for VRegs used by vstores
@@ -265,8 +282,8 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // Compute live intervals
-    let intervals = compute_live_intervals(ops);
+    // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
+    let intervals = compute_live_intervals(ops, config.zero_vreg);
 
     // Debug: Collect vstore source VRegs for tracking
     let vstore_vregs: HashSet<VReg> = if debug {
@@ -863,7 +880,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 5;
 
-        let intervals = compute_live_intervals(&emit.ops);
+        let intervals = compute_live_intervals(&emit.ops, None);
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
@@ -1259,7 +1276,7 @@ mod tests {
         emit.ops[5].cycle = 80;  // data
         emit.ops[6].cycle = 81;  // vstore
 
-        let intervals = compute_live_intervals(&emit.ops);
+        let intervals = compute_live_intervals(&emit.ops, None);
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]

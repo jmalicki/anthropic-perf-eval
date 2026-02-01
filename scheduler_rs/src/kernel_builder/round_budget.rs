@@ -191,6 +191,56 @@ pub fn live_in_for_section(
         .collect()
 }
 
+/// Live-in VRegs for a section when the segment is filtered (e.g. AddImm alternatives removed).
+/// Returns (VReg, filtered_segment_last_use_idx): index in `filtered_global_indices` of the op
+/// that last uses this VReg (by greedy cycle). Use this so CP-SAT's cycle_vars indices match.
+pub fn live_in_for_section_filtered(
+    ops: &[SsaOp],
+    boundaries: &[(usize, usize)],
+    section_k: usize,
+    vreg_def_section: &HashMap<VReg, usize>,
+    filtered_global_indices: &[usize],
+) -> Vec<(VReg, usize)> {
+    let (_start, _end) = match boundaries.get(section_k) {
+        Some(&b) => b,
+        None => return vec![],
+    };
+
+    // VReg -> (filtered_seg_idx, cycle) for last use in this section (only among filtered ops)
+    let mut last_use: HashMap<VReg, (usize, i32)> = HashMap::new();
+    for (filtered_idx, &global_idx) in filtered_global_indices.iter().enumerate() {
+        if global_idx >= ops.len() {
+            continue;
+        }
+        let op = &ops[global_idx];
+        if op.opcode == Opcode::Barrier {
+            continue;
+        }
+        let c = op.cycle;
+        if c < 0 {
+            continue;
+        }
+        for vreg in op.reads() {
+            let def_sec = match vreg_def_section.get(&vreg) {
+                Some(&s) => s,
+                None => continue,
+            };
+            if def_sec >= section_k {
+                continue;
+            }
+            let entry = last_use.entry(vreg).or_insert((filtered_idx, c));
+            if c > entry.1 {
+                *entry = (filtered_idx, c);
+            }
+        }
+    }
+
+    last_use
+        .into_iter()
+        .map(|(vreg, (filtered_idx, _))| (vreg, filtered_idx))
+        .collect()
+}
+
 /// VRegs defined in section `section_k` whose last use is in a later section.
 /// For per-section CP-SAT we must treat these as live until the end of the segment so the
 /// scratch constraint matches the full-kernel view.
