@@ -4,8 +4,19 @@
 //! - Eliminate redundant operations (CSE)
 //! - Simplify algebraic patterns (x ^ x -> 0)
 //! - Optimize operations involving the zero register
+//! - Dead code elimination (DCE)
 //!
 //! These optimizations run BEFORE scheduling to reduce op count and dependencies.
+//!
+//! **Why peephole (including DCE) is not used on the SSA path:**
+//! - The SSA pipeline (`build_tick_tock_kernel_ssa`) does not call peephole at all; it works on
+//!   SSA ops and uses the greedy scheduler's dead-store detection (cycle=-1) instead.
+//! - Peephole operates on lowered `Op` (addresses, not VRegs); the SSA path lowers only after
+//!   scheduling and address assignment.
+//! - DCE is disabled by default (correctness: it doesn't track stores properly) and explicitly
+//!   skips Store ops, so it would not remove dead stores even if enabled. Dead-store removal
+//!   on the SSA path would need to happen in the SSA builder (filter ops before CP-SAT) or via
+//!   an SSA-level DCE that removes ops whose dest VReg has no users before scheduling.
 
 use std::collections::{HashMap, HashSet};
 

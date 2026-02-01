@@ -19,7 +19,7 @@ use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VarType, VReg};
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
 use super::context_ssa::SsaScratchContext;
-use super::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, SsaEmitContext};
+use super::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code, SsaEmitContext};
 use super::ssa_lower::lower_ssa_ops_with_shift;
 
 /// Unroll factor - process 8 groups per iteration
@@ -152,10 +152,27 @@ impl SsaTickTockKernelBuilder {
 
         // Get ops and dependency info
         // IMPORTANT: Take vreg_def and const_alternatives BEFORE take_ops() since take_ops() clears them
-        let vreg_def = std::mem::take(&mut self.emit.vreg_def);
-        let const_alternatives = self.emit.take_const_alternatives();
+        let mut vreg_def = std::mem::take(&mut self.emit.vreg_def);
+        let mut const_alternatives = self.emit.take_const_alternatives();
         let vreg_count = self.emit.next_vreg_id;
         let mut ssa_ops = self.emit.take_ops();
+
+        // Use barrier-aware dependencies for greedy scheduler
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+
+        // Optional SSA DCE: remove ops whose result has no users (saves cycles, optimizer time, scratch)
+        if self.config.enable_ssa_dce {
+            let (new_ops, new_vreg_def, new_const_alternatives) = eliminate_ssa_dead_code(
+                ssa_ops,
+                &mut vreg_def,
+                &mut const_alternatives,
+                self.zero_vreg,
+            );
+            ssa_ops = new_ops;
+            vreg_def = new_vreg_def;
+            const_alternatives = new_const_alternatives;
+            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+        }
 
         // Build set of AddImm alternative op indices for the greedy scheduler to skip
         // The greedy scheduler always uses the Load alternative; AddImm alternatives
@@ -164,11 +181,6 @@ impl SsaTickTockKernelBuilder {
             .iter()
             .map(|alt| alt.add_imm_op_idx)
             .collect();
-
-        // Use barrier-aware dependencies for greedy scheduler
-        // Barriers create hard scheduling boundaries between rounds,
-        // constraining cross-round interleaving and reducing peak liveness
-        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
 
         let scratch_budget = scratch_budget_override.unwrap_or(SCRATCH_BUDGET_HW);
 
@@ -301,16 +313,31 @@ impl SsaTickTockKernelBuilder {
         self.build_internal();
 
         // Get ops and dependency info
-        // IMPORTANT: Take vreg_def BEFORE take_ops() since take_ops() clears it
-        let vreg_def = std::mem::take(&mut self.emit.vreg_def);
+        // IMPORTANT: Take vreg_def and const_alternatives BEFORE take_ops() since take_ops() clears them
+        let mut vreg_def = std::mem::take(&mut self.emit.vreg_def);
+        let mut const_alternatives = self.emit.take_const_alternatives();
         let vreg_count = self.emit.next_vreg_id;
         let mut ssa_ops = self.emit.take_ops();
 
-        let barrier_count = count_barriers(&ssa_ops);
-
         // Use barrier-aware dependencies for greedy hints
-        // This constrains cross-round interleaving and provides better hints
         compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+
+        // Optional SSA DCE: remove ops whose result has no users (saves cycles, optimizer time, scratch)
+        if self.config.enable_ssa_dce {
+            let (new_ops, new_vreg_def, new_const_alternatives) = eliminate_ssa_dead_code(
+                ssa_ops,
+                &mut vreg_def,
+                &mut const_alternatives,
+                self.zero_vreg,
+            );
+            ssa_ops = new_ops;
+            vreg_def = new_vreg_def;
+            const_alternatives = new_const_alternatives;
+            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+        }
+        let _ = &const_alternatives; // used in greedy path; CP-SAT discovers alternatives from ops
+
+        let barrier_count = count_barriers(&ssa_ops);
 
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler

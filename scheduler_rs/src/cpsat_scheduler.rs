@@ -2468,11 +2468,23 @@ pub fn schedule_ssa_cpsat(
     model.minimize(makespan);
 
     // 11. Add hints from greedy scheduler
+    // We skip cycle hints for ops with hint_cycle < 0 (dead stores). Greedy marks those as -1
+    // and does not assign a real cycle, so CP-SAT must choose. That yields "solution hint is
+    // incomplete: N-1 out of N non fixed variables hinted" where the unhinted vars are dead-store cycles.
     if let Some(hints) = greedy_hints {
+        let mut skipped_cycle_hints = 0usize;
         for (idx, &hint_cycle) in hints.iter().enumerate() {
             if idx < cycle_vars.len() && hint_cycle >= 0 {
                 model.add_hint(cycle_vars[idx], hint_cycle as i64);
+            } else if idx < cycle_vars.len() && hint_cycle < 0 {
+                skipped_cycle_hints += 1;
             }
+        }
+        if verbose && skipped_cycle_hints > 0 {
+            eprintln!(
+                "  Hint: {} cycle vars unhinted (dead stores, cycle=-1); solver will assign cycles.",
+                skipped_cycle_hints
+            );
         }
         // Hint the makespan too
         let hint_makespan = hints.iter().max().copied().unwrap_or(0) + 1;

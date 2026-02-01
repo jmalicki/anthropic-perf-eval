@@ -6,7 +6,7 @@
 //!
 //! After scheduling, VRegs are mapped to physical addresses via linear scan allocation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, SymmetryHint, VarSource, VarType, VReg};
 
@@ -1048,6 +1048,119 @@ pub fn compute_ssa_dependencies_with_barriers(
     }
 }
 
+/// Eliminate SSA dead code: remove ops whose result has no users.
+///
+/// This reduces cycles, optimizer time, and scratch pressure. Roots (always live)
+/// are: Halt, Jump, CondJump, Barrier. Store/Vstore are live only if the value
+/// they store has more than one user (otherwise the store is dead). All other
+/// ops are live if some live op uses their result.
+///
+/// Returns `(new_ops, new_vreg_def, new_const_alternatives)` and updates
+/// `const_alternatives` in place by remapping indices and dropping alternatives
+/// whose ops were removed. Caller should replace ops/vreg_def/const_alternatives
+/// with the returned values.
+pub fn eliminate_ssa_dead_code(
+    ops: Vec<SsaOp>,
+    vreg_def: &mut HashMap<VReg, usize>,
+    const_alternatives: &mut Vec<ConstAlternative>,
+    zero_vreg: Option<VReg>,
+) -> (Vec<SsaOp>, HashMap<VReg, usize>, Vec<ConstAlternative>) {
+    if ops.is_empty() {
+        return (ops, std::mem::take(vreg_def), std::mem::take(const_alternatives));
+    }
+
+    let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
+
+    // vreg_users[v] = set of op indices that use v as an operand
+    let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        for src in &op.srcs {
+            if let Operand::VReg(vreg) = src {
+                if Some(*vreg) == zero_vreg {
+                    continue;
+                }
+                vreg_users.entry(*vreg).or_default().insert(idx);
+            }
+        }
+    }
+
+    let mut live: HashSet<usize> = HashSet::new();
+    let mut worklist: Vec<usize> = Vec::new();
+
+    // Roots: control flow, barriers, and all stores (side effects; harness reads memory later)
+    for (idx, op) in ops.iter().enumerate() {
+        match op.opcode {
+            Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier => {
+                live.insert(idx);
+                worklist.push(idx);
+            }
+            Opcode::Store | Opcode::Vstore => {
+                // Always keep stores: they have side effects (memory). The harness reads
+                // output memory; that use is not visible in SSA, so treat all stores as roots.
+                live.insert(idx);
+                worklist.push(idx);
+            }
+            _ => {}
+        }
+    }
+
+    // Propagate: definers of operands of live ops are live
+    while let Some(idx) = worklist.pop() {
+        for vreg in ops[idx].reads() {
+            if Some(vreg) == zero_vreg {
+                continue;
+            }
+            let def_id = match vreg_def.get(&vreg) {
+                Some(&id) => id,
+                None => continue,
+            };
+            let def_idx = match id_to_idx.get(&def_id) {
+                Some(&i) => i,
+                None => continue,
+            };
+            if live.insert(def_idx) {
+                worklist.push(def_idx);
+            }
+        }
+    }
+
+    // Build new ops and old_idx -> new_idx
+    let mut new_ops = Vec::with_capacity(live.len());
+    let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+    for (old_idx, op) in ops.into_iter().enumerate() {
+        if live.contains(&old_idx) {
+            let new_idx = new_ops.len();
+            old_to_new.insert(old_idx, new_idx);
+            new_ops.push(op);
+        }
+    }
+
+    // Rebuild vreg_def from remaining ops only (so ConstChoice's single remaining encoding is the definer)
+    let mut new_vreg_def: HashMap<VReg, usize> = HashMap::new();
+    for op in &new_ops {
+        if let Some(dest) = op.dest {
+            new_vreg_def.insert(dest, op.id);
+        }
+    }
+
+    // Remap const_alternatives and drop alternatives where an op was removed
+    let mut new_const_alternatives = Vec::new();
+    for alt in const_alternatives.drain(..) {
+        let new_load = old_to_new.get(&alt.load_op_idx).copied();
+        let new_add_imm = old_to_new.get(&alt.add_imm_op_idx).copied();
+        if let (Some(load_idx), Some(add_imm_idx)) = (new_load, new_add_imm) {
+            new_const_alternatives.push(ConstAlternative {
+                value: alt.value,
+                load_op_idx: load_idx,
+                add_imm_op_idx: add_imm_idx,
+                dest: alt.dest,
+            });
+        }
+    }
+
+    (new_ops, new_vreg_def, new_const_alternatives)
+}
+
 /// Compute live intervals for all VRegs based on scheduled cycles.
 ///
 /// Uses **CLOSED intervals** [start, end] as documented in `types.rs`.
@@ -1130,6 +1243,31 @@ pub fn compute_peak_liveness(ops: &[SsaOp]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Opcode;
+
+    #[test]
+    fn test_eliminate_ssa_dead_code_removes_unused_result() {
+        let mut emit = SsaEmitContext::new();
+        let a = emit.emit_const(1);
+        let b = emit.emit_const(2);
+        let sum = emit.emit_alu(Opcode::Add, a, b); // used by next op
+        let _dead = emit.emit_const(99); // never used -> removed by DCE
+        let d = emit.emit_const(3);
+        let _final_sum = emit.emit_alu(Opcode::Add, sum, d); // root chain
+        let mut vreg_def = std::mem::take(&mut emit.vreg_def);
+        let mut const_alternatives = emit.take_const_alternatives();
+        let ops = emit.take_ops();
+        let n_before = ops.len();
+        let (new_ops, _new_vreg_def, _new_alts) = eliminate_ssa_dead_code(
+            ops,
+            &mut vreg_def,
+            &mut const_alternatives,
+            emit.zero_vreg,
+        );
+        assert!(new_ops.len() < n_before, "DCE should remove at least the dead const(99) op");
+        let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
+        assert!(!has_dead_const, "const(99) should be removed by DCE");
+    }
 
     #[test]
     fn test_emit_const_cse() {

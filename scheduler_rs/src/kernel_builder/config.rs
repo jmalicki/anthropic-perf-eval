@@ -78,6 +78,11 @@ pub struct KernelConfig {
     /// DISABLED BY DEFAULT because it exceeds the 1536 word scratch budget.
     /// Enable only if other optimizations free up sufficient scratch space.
     pub enable_tree_reduce_depth3: bool,
+
+    /// Enable SSA dead code elimination before scheduling.
+    /// When enabled (default), ops whose result has no users are removed,
+    /// reducing cycles, optimizer time, and scratch pressure.
+    pub enable_ssa_dce: bool,
 }
 
 impl Default for KernelConfig {
@@ -100,6 +105,8 @@ impl Default for KernelConfig {
             max_alu_depth: None, // No limit by default
             // Tree-reduce disabled by default (exceeds scratch budget)
             enable_tree_reduce_depth3: false,
+            // SSA DCE on by default (removes dead code before scheduling)
+            enable_ssa_dce: true,
         }
     }
 }
