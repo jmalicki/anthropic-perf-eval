@@ -57,6 +57,23 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 
 3. **CP-SAT per-section liveness model**: Per-section CP-SAT may still produce schedules that exceed scratch budget (e.g. segment end vs actual makespan, live sets by index not cycle). The sub_temp and filtered initial_live fixes reduce the gap.
 
+### Why per-section CP-SAT might not find a feasible solution
+
+When we run per-section CP-SAT for a section that exceeds budget (e.g. greedy peak 1700 > 1536), we pass the **greedy** segment schedule as a hint. That hint is **infeasible** (peak &gt; budget), so the solver cannot “validate hint”; it must search for **any** feasible assignment. If the run fails, it’s for one of these reasons:
+
+1. **Timeout (status `Unknown`)**  
+   The solver hits the per-section time limit (e.g. 900s) without finding a feasible schedule. The search space is huge (many ops, many cycles, precedence + slot + scratch constraints). With an infeasible hint, CP-SAT may spend time in bad regions. **Check logs**: “SSA CP-SAT: no solution found, status Unknown” ⇒ need more time or better search heuristics.
+
+2. **Model infeasible (status `Infeasible`)**  
+   The CP-SAT model has **no** assignment that satisfies precedence, slot limits, and scratch ≤ 1536. That can mean:  
+   - **Segment is genuinely too dense**: Every valid schedule for this segment (under precedence and slots) needs more than 1536 words at some cycle. Then the only fix is to change the kernel (e.g. split the section, reduce liveness).  
+   - **Model bug**: Our segment scratch or liveness model over-constrains (e.g. wrong intervals, double-counting, or initial_live/live_through too large), so we rule out schedules that would actually fit. **Check logs**: “status Infeasible” ⇒ inspect segment scratch intervals and live sets; optionally run the segment with scratch constraint disabled to see if it’s feasible without scratch.
+
+3. **Budget mismatch**  
+   Per-section CP-SAT uses `scratch_budget: SCRATCH_BUDGET_HW` (1536). Post-merge we check against `effective_scratch_budget` (1535 when zero is reserved). So CP-SAT could in theory return a schedule with peak 1536 that then fails post-merge. That would show up as “found a solution but post_merge fails,” not “no solution.” Using `effective_scratch_budget` for per-section would align the two checks.
+
+**Next steps**: Inspect the actual solver status (Unknown vs Infeasible) in the failure log. If Unknown, try a longer per-section limit or different search settings. If Infeasible, verify whether the segment is feasible without the scratch constraint; if yes, the scratch/liveness model is likely wrong.
+
 | Config | Status | Cycles | Peak | Notes |
 |--------|--------|--------|------|-------|
 | Greedy (no valu-shift) | PASS | 513 | 1489 | Baseline working |

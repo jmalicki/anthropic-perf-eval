@@ -280,11 +280,17 @@ impl SsaTickTockKernelBuilder {
     ///
     /// When `enable_valu_shift` is true, the CP-SAT solver models VALU→ALU shifting
     /// as decision variables, allowing it to find globally optimal shift decisions.
+    ///
+    /// When `per_section_optimize_secs` is `Some(t)` with t > 0, each per-section CP-SAT
+    /// run uses that time limit and optimizes for cycles (stop_after_first_solution: false).
+    /// Per-section never uses VALU shift. When `None`, per-section runs in feasibility-only
+    /// mode (stop at first feasible solution) with the usual time cap.
     pub fn build_and_schedule_cpsat(
         &mut self,
         time_limit_secs: f64,
         verbose: bool,
         enable_valu_shift: bool,
+        per_section_optimize_secs: Option<f64>,
     ) -> Result<SsaScheduleResult, String> {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
@@ -403,9 +409,18 @@ impl SsaTickTockKernelBuilder {
                     if greedy_min_c <= greedy_max_c { greedy_max_c - greedy_min_c + 1 } else { 0 };
                 let greedy_section_peak = budget_result.section_peaks[k];
 
+                let section_optimize = per_section_optimize_secs.map_or(false, |t| t > 0.0);
                 if verbose {
                     eprintln!("--------------------------------------------------------------------------------");
-                    eprintln!("  PER-SECTION CP-SAT:  SECTION {}  (feasibility — find any valid schedule)", k);
+                    eprintln!(
+                        "  PER-SECTION CP-SAT:  SECTION {}  ({})",
+                        k,
+                        if section_optimize {
+                            format!("optimize up to {:.0}s, no VALU shift", per_section_optimize_secs.unwrap_or(0.0))
+                        } else {
+                            "feasibility — find any valid schedule, no VALU shift".to_string()
+                        }
+                    );
                     eprintln!("  {} ops in this section. Goal: stay within scratch budget.", global_indices.len());
                     eprintln!("--------------------------------------------------------------------------------");
                     eprintln!();
@@ -460,19 +475,20 @@ impl SsaTickTockKernelBuilder {
                     live_in_for_section_filtered(&ssa_ops, &boundaries, k, &vreg_def_sec, &global_indices);
                 let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                // Per-section never uses VALU shift (avoids extra scratch pressure in segment).
+                let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
+                    Some(t) if t > 0.0 => (t, false), // Short optimization run
+                    _ => ((time_limit_secs * 0.25).min(900.0), true), // Feasibility only
+                };
                 let config_feasibility = SsaCpsatConfig {
-                    time_limit_secs: (time_limit_secs * 0.25).min(300.0),
+                    time_limit_secs: section_time_limit,
                     verbose,
-                    stop_after_first_solution: true,
-                    enable_valu_shift,
-                    scratch_budget: SCRATCH_BUDGET_HW,
+                    stop_after_first_solution: section_stop_first,
+                    enable_valu_shift: false, // Per-section: no VALU shift
+                    scratch_budget: effective_budget,
                     model_name: Some(format!("section_{}_feasibility", k)),
                 };
-                let seg_shift = if enable_valu_shift {
-                    Some(&greedy_shifted)
-                } else {
-                    None
-                };
+                let seg_shift: Option<&HashSet<usize>> = None; // Per-section: no shift hints
                 let seg_select = if greedy_select_fma_ops.is_empty() {
                     None
                 } else {
@@ -613,8 +629,9 @@ impl SsaTickTockKernelBuilder {
         let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
         let hint_peak = sections_exceeding_budget(&ssa_ops, effective_budget_hint, Some(&greedy_select_fma_ops))
             .section_peaks
-            .first()
+            .iter()
             .copied()
+            .max()
             .unwrap_or(0);
 
         if hint_peak > SCRATCH_BUDGET_HW {
@@ -2840,6 +2857,7 @@ mod tests {
             30.0,   // Short time limit; small kernel solves quickly
             false,  // verbose
             false,  // enable_valu_shift to keep test deterministic and faster
+            None,   // per_section_optimize_secs: feasibility only
         );
         assert!(result.is_ok(), "build_and_schedule_cpsat should succeed: {:?}", result.err());
         let result = result.unwrap();

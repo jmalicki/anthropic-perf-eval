@@ -2326,10 +2326,12 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// If enable_valu_shift is true (default), VALU ops are shifted to ALU when VALU is saturated.
 /// If use_cpsat is true, uses CP-SAT scheduler instead of greedy (operates on SSA before register allocation).
 /// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
+/// per_section_optimize_secs: when use_cpsat is true and > 0, each per-section CP-SAT run uses this time limit
+/// and optimizes for cycles (no VALU shift in per-section). When 0 or None, per-section runs in feasibility-only mode.
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, output_json=None, enable_tree_reduce_depth3=false, *, liveness_detail=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, *, liveness_detail=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2340,6 +2342,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     verbose: bool,
     use_cpsat: bool,
     cpsat_time_limit: f64,
+    per_section_optimize_secs: Option<f64>,
     output_json: Option<String>,
     enable_tree_reduce_depth3: bool,
     liveness_detail: Option<String>,
@@ -2369,7 +2372,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     }
 
     let result = if use_cpsat {
-        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift).map_err(|e| {
+        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
         })?
     } else {

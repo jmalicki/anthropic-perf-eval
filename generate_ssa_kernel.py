@@ -49,8 +49,10 @@ def main():
                         help="Hash rounds per traversal (default: 16)")
 
     # Scheduler options
-    parser.add_argument("--cpsat-time-limit", type=float, default=600.0,
-                        help="CP-SAT time limit in seconds (default: 600 = 10 min)")
+    parser.add_argument("--cpsat-time-limit", type=float, default=3600.0,
+                        help="CP-SAT time limit in seconds (default: 3600 = 1 hour)")
+    parser.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
+                        help="If set, run each per-section CP-SAT for SECS seconds to optimize cycles (no VALU shift in per-section). 0 or omit = feasibility only.")
     parser.add_argument("--use-greedy", action="store_true",
                         help="Use greedy scheduler instead of CP-SAT (fast, ~2s)")
     parser.add_argument("--enable-valu-shift", action="store_true",
@@ -82,6 +84,8 @@ def main():
     print(f"  batch_size={args.batch_size}, rounds={args.rounds}")
     print(f"  enable_valu_shift={args.enable_valu_shift}")
     print(f"  enable_tree_reduce_depth3={args.enable_tree_reduce_depth3}")
+    if per_section_optimize is not None:
+        print(f"  per_section_optimize_secs={per_section_optimize}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -95,6 +99,7 @@ def main():
         verbose=verbose,
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time_limit,
+        per_section_optimize_secs=per_section_optimize,
         output_json=args.output_json,
         enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
         # Note: liveness_detail parameter not available in Python bindings yet
