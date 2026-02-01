@@ -24,6 +24,7 @@ Example usage:
 """
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -68,6 +69,10 @@ def main():
                         help="Liveness detail level in JSON: none, summary, or full (default: full)")
     parser.add_argument("--validate", action="store_true",
                         help="Validate against reference kernel")
+    parser.add_argument("--validate-only", type=str, metavar="PATH", default=None,
+                        help="Load kernel from JSON and run validation only (no build). Use same forest_height, batch_size, rounds, seed.")
+    parser.add_argument("--save-kernel", type=str, metavar="PATH", default=None,
+                        help="After building, save instruction list to JSON so you can rerun validation with --validate-only PATH")
     parser.add_argument("--seed", type=int, default=123,
                         help="Random seed for validation (default: 123)")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -75,8 +80,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate-only: load kernel and run validation, then exit
+    if args.validate_only:
+        return run_validate_only(
+            args.validate_only,
+            args.forest_height,
+            args.batch_size,
+            args.rounds,
+            args.seed,
+        )
+
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
+    per_section_optimize = (
+        None if args.per_section_optimize_secs is None or args.per_section_optimize_secs <= 0
+        else args.per_section_optimize_secs
+    )
 
     scheduler_name = "greedy" if args.use_greedy else f"CP-SAT ({args.cpsat_time_limit:.0f}s)"
     print(f"Building SSA kernel with {scheduler_name}...")
@@ -128,6 +147,17 @@ def main():
     if args.output_json:
         print(f"\n  Schedule JSON written to: {args.output_json}")
 
+    if args.save_kernel:
+        save_kernel_to_json(
+            instrs,
+            args.save_kernel,
+            args.forest_height,
+            args.batch_size,
+            args.rounds,
+            args.seed,
+        )
+        print(f"\n  Kernel saved to {args.save_kernel} (rerun with --validate-only {args.save_kernel})")
+
     if args.validate:
         if budget_exceeded:
             print("\nSkipping validation - budget exceeded (results known to be incorrect)")
@@ -147,6 +177,70 @@ def main():
             return 1
 
     return 0
+
+
+def load_kernel_from_json(path):
+    """Load instruction list from JSON. If file has 'instrs' key, use saved params; else treat as raw list."""
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "instrs" in data:
+        raw = data["instrs"]
+        params = {
+            "forest_height": data.get("forest_height"),
+            "batch_size": data.get("batch_size"),
+            "rounds": data.get("rounds"),
+            "seed": data.get("seed"),
+        }
+    else:
+        raw = data
+        params = None
+    instrs = []
+    for bundle in raw:
+        restored = {}
+        for engine, ops in bundle.items():
+            restored[engine] = [tuple(op) for op in ops]
+        instrs.append(restored)
+    return instrs, params
+
+
+def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed):
+    """Save instruction list and problem params to JSON so --validate-only uses same params."""
+    serializable = []
+    for bundle in instrs:
+        sb = {}
+        for k, v in bundle.items():
+            sb[k] = [list(op) for op in v]
+        serializable.append(sb)
+    payload = {
+        "forest_height": forest_height,
+        "batch_size": batch_size,
+        "rounds": rounds,
+        "seed": seed,
+        "instrs": serializable,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed):
+    """Load kernel from JSON and run validation only (no build). Uses params from file if saved."""
+    print(f"Loading kernel from {kernel_path}...")
+    instrs, saved_params = load_kernel_from_json(kernel_path)
+    if saved_params and all(saved_params.get(k) is not None for k in ("forest_height", "batch_size", "rounds", "seed")):
+        forest_height = saved_params["forest_height"]
+        batch_size = saved_params["batch_size"]
+        rounds = saved_params["rounds"]
+        seed = saved_params["seed"]
+        print(f"  Loaded {len(instrs)} instructions; params from file: forest_height={forest_height}, batch_size={batch_size}, rounds={rounds}, seed={seed}")
+    else:
+        print(f"  Loaded {len(instrs)} instructions; params from CLI: forest_height={forest_height}, batch_size={batch_size}, rounds={rounds}, seed={seed}")
+    print("\nValidating against reference kernel...")
+    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed)
+    if correct:
+        print("  PASSED - kernel produces correct output")
+        return 0
+    print("  FAILED - kernel produces incorrect output")
+    return 1
 
 
 def validate_kernel(instrs, forest_height, batch_size, rounds, seed):
@@ -197,24 +291,34 @@ def validate_kernel(instrs, forest_height, batch_size, rounds, seed):
     inp_values_p = ref_mem[6]
     inp_indices_p = ref_mem[5]
 
-    values_correct = (
-        machine.mem[inp_values_p : inp_values_p + batch_size]
-        == ref_mem[inp_values_p : inp_values_p + batch_size]
-    )
-    indices_correct = (
-        machine.mem[inp_indices_p : inp_indices_p + batch_size]
-        == ref_mem[inp_indices_p : inp_indices_p + batch_size]
-    )
+    got_values = machine.mem[inp_values_p : inp_values_p + batch_size]
+    ref_values = ref_mem[inp_values_p : inp_values_p + batch_size]
+    got_indices = machine.mem[inp_indices_p : inp_indices_p + batch_size]
+    ref_indices = ref_mem[inp_indices_p : inp_indices_p + batch_size]
+
+    values_correct = got_values == ref_values
+    indices_correct = got_indices == ref_indices
 
     if not values_correct:
-        print("\n  Value mismatch (first 8):")
-        print(f"    Got:      {machine.mem[inp_values_p : inp_values_p + 8]}")
-        print(f"    Expected: {ref_mem[inp_values_p : inp_values_p + 8]}")
+        first_bad = next(i for i in range(batch_size) if got_values[i] != ref_values[i])
+        print(f"\n  Value mismatch: first difference at batch index {first_bad} (of {batch_size})")
+        print(f"    Got:      {got_values[first_bad]!r}")
+        print(f"    Expected: {ref_values[first_bad]!r}")
+        # Show a window around the first mismatch
+        lo = max(0, first_bad - 2)
+        hi = min(batch_size, first_bad + 6)
+        print(f"    Window [{lo}:{hi}]: Got {got_values[lo:hi]}")
+        print(f"                 Expected {ref_values[lo:hi]}")
 
     if not indices_correct:
-        print("\n  Index mismatch (first 8):")
-        print(f"    Got:      {machine.mem[inp_indices_p : inp_indices_p + 8]}")
-        print(f"    Expected: {ref_mem[inp_indices_p : inp_indices_p + 8]}")
+        first_bad = next(i for i in range(batch_size) if got_indices[i] != ref_indices[i])
+        print(f"\n  Index mismatch: first difference at batch index {first_bad} (of {batch_size})")
+        print(f"    Got:      {got_indices[first_bad]!r}")
+        print(f"    Expected: {ref_indices[first_bad]!r}")
+        lo = max(0, first_bad - 2)
+        hi = min(batch_size, first_bad + 6)
+        print(f"    Window [{lo}:{hi}]: Got {got_indices[lo:hi]}")
+        print(f"                 Expected {ref_indices[lo:hi]}")
 
     return values_correct and indices_correct
 
