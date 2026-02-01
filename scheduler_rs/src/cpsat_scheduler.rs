@@ -1030,6 +1030,20 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         .map(|h| h.iter().max().copied().unwrap_or(0) as i64 + 1)
         .unwrap_or(horizon);
     let makespan = model.new_int_var([(computed_lower_bound, greedy_ub)]);
+
+    // Redundant linear capacity constraints: makespan >= ceil(num_ops / capacity) per engine.
+    // The cumulative constraint's LP relaxation is weak; adding these as explicit linear
+    // constraints helps the LP see the bound and can improve best_objective_bound.
+    for (engine, op_indices) in &ops_by_engine {
+        let capacity = engine.slot_limit() as i64;
+        if capacity > 0 && !op_indices.is_empty() {
+            let num_ops = op_indices.len() as i64;
+            let min_cycles = (num_ops + capacity - 1) / capacity;
+            let lb_var = model.new_int_var([(min_cycles, min_cycles)]);
+            model.add_ge(makespan, LinearExpr::from(lb_var));
+        }
+    }
+
     for &cv in &cycle_vars {
         model.add_le(cv, LinearExpr::from(makespan) - 1);
     }
@@ -2344,6 +2358,34 @@ pub fn schedule_ssa_cpsat(
         "makespan".to_string(),
     );
 
+    // Redundant linear capacity constraints: makespan >= ceil(num_ops / capacity) per engine.
+    // The cumulative constraint's LP relaxation is weak; adding these as explicit linear
+    // constraints helps the LP see the bound and can improve best_objective_bound.
+    let alu_bound = if alu_count > 0 {
+        (alu_count + 11) / 12
+    } else {
+        0
+    };
+    let valu_bound = (valu_count + 5) / 6;
+    if alu_bound > 0 {
+        let alu_lb = model.new_int_var([(alu_bound, alu_bound)]);
+        model.add_ge(makespan, LinearExpr::from(alu_lb));
+    }
+    if valu_bound > 0 {
+        let valu_lb = model.new_int_var([(valu_bound, valu_bound)]);
+        model.add_ge(makespan, LinearExpr::from(valu_lb));
+    }
+    if load_count > 0 {
+        let load_bound = (load_count + 1) / 2;
+        let load_lb = model.new_int_var([(load_bound, load_bound)]);
+        model.add_ge(makespan, LinearExpr::from(load_lb));
+    }
+    if store_count > 0 {
+        let store_bound = (store_count + 1) / 2;
+        let store_lb = model.new_int_var([(store_bound, store_bound)]);
+        model.add_ge(makespan, LinearExpr::from(store_lb));
+    }
+
     // makespan >= max(cycle[i]) + 1 for all ops
     for &cv in &cycle_vars {
         model.add_ge(makespan, LinearExpr::from(cv) + 1);
@@ -3624,6 +3666,31 @@ mod tests {
         let r = result.unwrap();
         // 15 ops with 12 ALU slots = at least 2 cycles
         assert!(r.result.makespan >= 2);
+    }
+
+    /// Verifies that makespan respects the capacity lower bound (ceil(num_ops / capacity))
+    /// enforced by our redundant linear constraints. 13 VALU ops with capacity 6 => ceil(13/6)=3.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_schedule_cpsat_makespan_respects_capacity_lower_bound() {
+        let ops: Vec<Op> = (0..13)
+            .map(|i| {
+                let mut op = make_op(i, Engine::Valu, vec![]);
+                op.writes = [(i * 10) as i64].into_iter().collect();
+                op
+            })
+            .collect();
+
+        let result = schedule_cpsat(&ops, CpsatConfig::new().with_time_limit(10.0));
+        assert!(result.is_some());
+
+        let r = result.unwrap();
+        // 13 VALU ops with 6 slots/cycle => ceil(13/6) = 3 minimum cycles (redundant linear constraint)
+        assert!(
+            r.result.makespan >= 3,
+            "makespan {} should be >= 3 (capacity lower bound for 13 VALU ops)",
+            r.result.makespan
+        );
     }
 
     #[cfg(feature = "cpsat")]

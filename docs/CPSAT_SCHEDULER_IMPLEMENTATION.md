@@ -562,6 +562,14 @@ makespan >= ceil(mandatory_count / capacity)
 
 This catches situations where ops are "bunched up" in tight ASAP/ALAP windows that the simple capacity bound misses.
 
+### Redundant Linear Capacity Constraints
+
+In addition to using capacity (and profile/suffix/sparse) bounds to set the **domain** of the makespan variable, we add **explicit linear constraints** so the LP relaxation can see them directly:
+
+- For each engine: **makespan ≥ ceil(num_ops_engine / capacity)**.
+
+These are redundant with the cumulative constraints and the makespan domain, but as linear inequalities they can be used more effectively in the LP relaxation and cut generation, improving `best_objective_bound` and convergence. Implemented in both `schedule_cpsat` (non-SSA) and `schedule_ssa_cpsat` (SSA) in `scheduler_rs/src/cpsat_scheduler.rs`.
+
 ### Impact
 
 With these bounds:

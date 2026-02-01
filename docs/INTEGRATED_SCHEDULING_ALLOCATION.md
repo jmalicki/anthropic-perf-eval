@@ -721,7 +721,7 @@ model.add_ge(makespan, min_cycles_valu);
 3. **Avoid O(n²) implied constraints** unless they catch frequent conflicts
 4. **Profile with and without** - implied constraints can hurt as much as help
 
-**For our problem:** The total-slots cumulative is cheap and useful. Write-conflict constraints (O(n²) pairs) are probably not worth it since we don't have address variables.
+**For our problem:** The total-slots cumulative is cheap and useful. We implement the capacity lower-bound redundant constraints (makespan ≥ ceil(num_ops_engine / capacity) per engine) in `scheduler_rs/src/cpsat_scheduler.rs` to strengthen the LP relaxation. Write-conflict constraints (O(n²) pairs) are probably not worth it since we don't have address variables.
 
 ### 5.5 Symmetry Breaking
 
