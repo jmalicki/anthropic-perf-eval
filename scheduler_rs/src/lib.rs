@@ -57,3 +57,15 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ssa, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Optional/slow tests run only when `ci-tests` feature is enabled.
+    /// Local (fast): `cargo test --features cpsat`
+    /// Full (CI): `cargo test --features "cpsat ci-tests"`
+    #[cfg(feature = "ci-tests")]
+    #[test]
+    fn test_ci_tests_feature_included() {
+        assert!(true);
+    }
+}

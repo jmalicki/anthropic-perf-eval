@@ -21,6 +21,8 @@ cp_sat = { git = "https://github.com/jmalicki/cp_sat.git", branch = "main", opti
 [features]
 default = []
 cpsat = ["cp_sat"]
+# Optional: slow/optional tests (proptest, minimal failing config, etc.). CI should use --features "cpsat ci-tests".
+ci-tests = []
 
 [profile.release]
 lto = true

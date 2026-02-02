@@ -18,6 +18,10 @@ dev = [
 [tool.pytest.ini_options]
 timeout = 120
 testpaths = [".", "solver", "tests"]
+# Optional/CI-only tests: mark with @pytest.mark.ci_only. Default run excludes them: pytest -m "not ci_only". CI runs full suite.
+markers = [
+    "ci_only: marks tests as optional/CI-only (excluded by default; use -m ci_only to run only these, or run without -m filter for full suite)",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["solver", "problem.py", "perf_takehome.py"]

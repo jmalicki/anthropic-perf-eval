@@ -54,6 +54,9 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 # Rust: full scheduler_rs test suite (from project root)
 BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat
 
+# Rust: include optional/CI-only tests (slow proptest, minimal failing config, etc.)
+BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features "cpsat ci-tests"
+
 # Python: interface test only (scheduler_rs build → Machine → reference)
 uv run pytest tests/test_scheduler_rs_interface.py -v
 
@@ -64,6 +67,8 @@ uv run tests/submission_tests.py
 # Manual / CI: optimized kernel with optional --rust-builder
 uv run test_optimized.py
 ```
+
+**Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, use a pytest marker (e.g. `@pytest.mark.ci_only`) and run default with `-m "not ci_only"`; document in `pyproject.toml`.
 
 ### Generating Kernels
 

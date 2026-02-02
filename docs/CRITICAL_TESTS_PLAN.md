@@ -280,6 +280,6 @@ Examples:
 
 After implementing tests:
 1. All new tests pass with current code (except tests that expose known bugs)
-2. Tests that expose bugs should be marked `#[ignore]` with comment explaining the bug
-3. When bug is fixed, remove `#[ignore]` and verify test passes
-4. Run full test suite: `cd scheduler_rs && cargo test`
+2. **Optional/CI-only tests:** Use a **Cargo feature** (`ci-tests`) so they run only when requested. Gate with `#[cfg(feature = "ci-tests")]`; run with `cargo test --features "cpsat ci-tests"`. CI should use this for full coverage. Do not use `#[ignore]` for optional tests.
+3. **Tests that expose known bugs:** Mark `#[ignore]` with a comment and issue reference; when the bug is fixed, remove `#[ignore]` and verify the test passes.
+4. Run full test suite: from project root, `BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`. For optional tests: `--features "cpsat ci-tests"`.
