@@ -2947,7 +2947,9 @@ mod ssa_tests {
         // Emit vector condition and values (use locals to avoid double mutable borrow)
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
-        let cond = emit.emit_valu(Opcode::Eq, c0, c1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
         let c10 = emit.emit_const(10);
         let true_val = emit.emit_vbroadcast(c10);
         let c20 = emit.emit_const(20);
@@ -3393,7 +3395,9 @@ mod ssa_tests {
         // Emit vector condition and values (use locals to avoid double mutable borrow)
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
-        let cond = emit.emit_valu(Opcode::Eq, c0, c1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
         let c10 = emit.emit_const(10);
         let true_val = emit.emit_vbroadcast(c10);
         let c20 = emit.emit_const(20);
