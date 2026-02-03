@@ -125,8 +125,87 @@ use cp_sat::proto::{CpSolverStatus, SatParameters};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Not;
+use std::str::FromStr;
 
 use crate::types::{Engine, MachineConfig, Op, Opcode, SsaOp, VReg, VLEN};
+
+/// ConstChoice encoding mode: let solver choose (Optimize), force AddImm (Flow), or force Load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstChoiceMode {
+    Optimize,
+    ForceAddImm,
+    ForceLoad,
+}
+
+impl Default for ConstChoiceMode {
+    fn default() -> Self {
+        Self::Optimize
+    }
+}
+
+impl FromStr for ConstChoiceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "optimize" => Ok(Self::Optimize),
+            "add_imm" => Ok(Self::ForceAddImm),
+            "load" => Ok(Self::ForceLoad),
+            _ => Err(format!("invalid const_choice '{}', expected optimize, add_imm, or load", s)),
+        }
+    }
+}
+
+/// SelectChoice encoding mode: let solver choose (Optimize), force FMA (VALU), or force vselect (Flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectChoiceMode {
+    Optimize,
+    ForceFma,
+    ForceVselect,
+}
+
+impl Default for SelectChoiceMode {
+    fn default() -> Self {
+        Self::Optimize
+    }
+}
+
+impl FromStr for SelectChoiceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "optimize" => Ok(Self::Optimize),
+            "fma" => Ok(Self::ForceFma),
+            "vselect" => Ok(Self::ForceVselect),
+            _ => Err(format!("invalid select_choice '{}', expected optimize, fma, or vselect", s)),
+        }
+    }
+}
+
+/// VALU shift mode: let solver choose (Optimize), force shift to ALU, or force stay on VALU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuShiftMode {
+    Optimize,
+    ForceAlu,
+    ForceValu,
+}
+
+impl Default for ValuShiftMode {
+    fn default() -> Self {
+        Self::Optimize
+    }
+}
+
+impl FromStr for ValuShiftMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "optimize" => Ok(Self::Optimize),
+            "alu" => Ok(Self::ForceAlu),
+            "valu" => Ok(Self::ForceValu),
+            _ => Err(format!("invalid valu_shift '{}', expected optimize, alu, or valu", s)),
+        }
+    }
+}
 
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
@@ -1330,12 +1409,12 @@ pub struct SsaCpsatConfig {
     pub model_name: Option<String>,
     /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
     pub machine: MachineConfig,
-    /// If true, fix ConstChoice to Load only (no AddImm); no choice variable.
-    pub disable_const_choice: bool,
-    /// If true, fix SelectChoice to vselect only (no FMA); no choice variable.
-    pub disable_select_choice: bool,
-    /// If true, disable VALU->ALU shift; no shift variables.
-    pub disable_shift: bool,
+    /// ConstChoice encoding: Optimize (solver chooses), ForceAddImm, or ForceLoad.
+    pub const_choice_mode: ConstChoiceMode,
+    /// SelectChoice encoding: Optimize (solver chooses), ForceFma, or ForceVselect.
+    pub select_choice_mode: SelectChoiceMode,
+    /// VALU shift: Optimize (solver chooses), ForceAlu, or ForceValu.
+    pub valu_shift_mode: ValuShiftMode,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1348,9 +1427,9 @@ impl Default for SsaCpsatConfig {
             scratch_budget: 1536, // Default hardware limit
             model_name: None,
             machine: MachineConfig::default(),
-            disable_const_choice: false,
-            disable_select_choice: false,
-            disable_shift: false,
+            const_choice_mode: ConstChoiceMode::default(),
+            select_choice_mode: SelectChoiceMode::default(),
+            valu_shift_mode: ValuShiftMode::default(),
         }
     }
 }
@@ -1550,9 +1629,9 @@ pub fn schedule_ssa_cpsat(
         scratch_budget,
         model_name,
         machine,
-        disable_const_choice,
-        disable_select_choice,
-        disable_shift,
+        const_choice_mode,
+        select_choice_mode,
+        valu_shift_mode,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -1725,114 +1804,114 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 6. Create shift decision variables and optional intervals for shiftable VALU ops
+    // 6. Create shift decision variables and optional/required intervals for shiftable VALU ops
     // Note: shiftable_set was already created above in section 2
     let mut shift_vars: HashMap<usize, BoolVar> = HashMap::new();
     let mut valu_optional_intervals: HashMap<usize, IntervalVar> = HashMap::new();
-    // Changed: Store 8 intervals per shifted VALU op (one per ALU op)
+    // Store 8 intervals per shifted VALU op (one per ALU op) - optional when Optimize, required when ForceAlu
     let mut alu_optional_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
-    // New: Store 8 cycle variables per shifted VALU op (one per ALU op)
+    let mut alu_required_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
+    // Store 8 cycle variables per shifted VALU op (one per ALU op)
     let mut alu_cycle_vars: HashMap<usize, Vec<IntVar>> = HashMap::new();
-    // New: Store completion cycle variable (max of 8 ALU cycles) per shifted VALU op
+    // Store completion cycle variable (max of 8 ALU cycles) per shifted VALU op
     let mut completion_cycle_vars: HashMap<usize, IntVar> = HashMap::new();
 
-    if !disable_shift {
-    for &idx in &shiftable_valu {
-        // shift[idx] = 1 means shift to ALU, 0 means keep on VALU
-        let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
-        shift_vars.insert(idx, shift_var);
-        
-        // If this op is in forced_shifts, enforce the shift decision
-        if let Some(forced) = forced_shifts {
-            let op_id = ops[idx].id;
-            if forced.contains(&op_id) {
-                // Force shift: shift_var = 1
-                model.add_eq(shift_var, 1);
-            }
+    match valu_shift_mode {
+        ValuShiftMode::ForceValu => {
+            // No shift vars, no ALU intervals. VALU cumulative will add required intervals for shiftable.
         }
+        ValuShiftMode::ForceAlu => {
+            for &idx in &shiftable_valu {
+                let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
 
-        // VALU variant: present when NOT shifted (shift_var = false)
-        let valu_interval = model.new_optional_fixed_size_interval_var(
-            cycle_vars[idx],
-            1,
-            shift_var.not(),
-        );
-        valu_optional_intervals.insert(idx, valu_interval);
+                let mut alu_cycles = Vec::with_capacity(VLEN);
+                let mut alu_intervals = Vec::with_capacity(VLEN);
 
-        // ALU variant: Create 8 separate cycle variables and intervals (one per ALU op)
-        // Each ALU op can be scheduled independently between ASAP and ALAP
-        let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-        let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
-        
-        let mut alu_cycles = Vec::with_capacity(VLEN);
-        let mut alu_intervals = Vec::with_capacity(VLEN);
-        
-        for i in 0..VLEN {
-            // Create cycle variable for ALU op i
-            let alu_cycle = model.new_int_var_with_name(
-                [(op_asap, op_alap)],
-                format!("alu_c{}_{}", idx, i),
-            );
-            alu_cycles.push(alu_cycle);
-            
-            // Create optional interval for ALU op i (present when shifted)
-            let alu_interval = model.new_optional_fixed_size_interval_var(
-                alu_cycle,
-                1,
-                shift_var,
-            );
-            alu_intervals.push(alu_interval);
-            
-            // Add precedence constraints: each ALU op depends on the original VALU op's dependencies
-            for &dep_id in &ops[idx].dep_ids {
-                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                    // alu_cycle[i] >= cycle[dep_idx] + 1
-                    model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                for i in 0..VLEN {
+                    let alu_cycle = model.new_int_var_with_name(
+                        [(op_asap, op_alap)],
+                        format!("alu_c{}_{}", idx, i),
+                    );
+                    alu_cycles.push(alu_cycle);
+                    for &dep_id in &ops[idx].dep_ids {
+                        if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                            model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                        }
+                    }
+                    let alu_interval = model.new_fixed_size_interval_var(alu_cycle, 1);
+                    alu_intervals.push(alu_interval);
+                }
+                alu_cycle_vars.insert(idx, alu_cycles.clone());
+                alu_required_intervals.insert(idx, alu_intervals);
+
+                let completion_cycle = model.new_int_var_with_name(
+                    [(op_asap, op_alap)],
+                    format!("completion_c{}", idx),
+                );
+                completion_cycle_vars.insert(idx, completion_cycle);
+                for &alu_cycle in &alu_cycles {
+                    model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
                 }
             }
         }
-        
-        alu_cycle_vars.insert(idx, alu_cycles.clone());
-        alu_optional_intervals.insert(idx, alu_intervals);
-        
-        // Create completion cycle variable: max of all 8 ALU cycles
-        // This represents when all 8 ALU ops have completed
-        let completion_cycle = model.new_int_var_with_name(
-            [(op_asap, op_alap)],
-            format!("completion_c{}", idx),
-        );
-        completion_cycle_vars.insert(idx, completion_cycle);
-        
-        // Model completion_cycle = max(alu_cycles[0..8])
-        // CP-SAT doesn't have direct max constraint, so we use inequalities:
-        // completion_cycle >= alu_cycles[i] for all i
-        // The solver will naturally minimize completion_cycle to be the max
-        for &alu_cycle in &alu_cycles {
-            model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+        ValuShiftMode::Optimize => {
+            for &idx in &shiftable_valu {
+                let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
+                shift_vars.insert(idx, shift_var);
+
+                if let Some(forced) = forced_shifts {
+                    let op_id = ops[idx].id;
+                    if forced.contains(&op_id) {
+                        model.add_eq(shift_var, 1);
+                    }
+                }
+
+                let valu_interval = model.new_optional_fixed_size_interval_var(
+                    cycle_vars[idx],
+                    1,
+                    shift_var.not(),
+                );
+                valu_optional_intervals.insert(idx, valu_interval);
+
+                let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+
+                let mut alu_cycles = Vec::with_capacity(VLEN);
+                let mut alu_intervals = Vec::with_capacity(VLEN);
+
+                for i in 0..VLEN {
+                    let alu_cycle = model.new_int_var_with_name(
+                        [(op_asap, op_alap)],
+                        format!("alu_c{}_{}", idx, i),
+                    );
+                    alu_cycles.push(alu_cycle);
+                    let alu_interval = model.new_optional_fixed_size_interval_var(
+                        alu_cycle,
+                        1,
+                        shift_var,
+                    );
+                    alu_intervals.push(alu_interval);
+                    for &dep_id in &ops[idx].dep_ids {
+                        if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                            model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                        }
+                    }
+                }
+                alu_cycle_vars.insert(idx, alu_cycles.clone());
+                alu_optional_intervals.insert(idx, alu_intervals);
+
+                let completion_cycle = model.new_int_var_with_name(
+                    [(op_asap, op_alap)],
+                    format!("completion_c{}", idx),
+                );
+                completion_cycle_vars.insert(idx, completion_cycle);
+                for &alu_cycle in &alu_cycles {
+                    model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+                }
+            }
         }
-        
-        // Note: We don't constrain completion_cycle <= cycle_vars[idx] because:
-        // 1. CP-SAT minimizes makespan, so it will naturally try to minimize completion_cycle
-        // 2. Allowing completion_cycle to be slightly later might enable better schedules
-        //    where the 8 ALU ops are spread across cycles to reduce overall makespan
-        // 3. If completion_cycle is later, it will increase makespan, so CP-SAT will avoid
-        //    shifts that hurt makespan anyway
-        //
-        // What prevents "cascading" (one shift → more shifts → everything shifting earlier)?
-        // - Nothing in the model forbids it: the 8 ALU ops can be spread across cycles (each has
-        //   its own alu_cycle var; completion_cycle = max of them; cumulative allows spread).
-        // - Two things still limit cascading in practice:
-        //   (1) Each op's ASAP: the 8 ALU ops cannot run before the op's dependencies allow,
-        //       so we can't "shift earlier" than ASAP. If ASAP is late (e.g. 28), we can't fill
-        //       early cycles with that op's ALU work.
-        //   (2) Single objective = makespan: when spreading doesn't change completion_cycle
-        //       (e.g. consumers already at 29+), all placements with the same completion_cycle
-        //       are equivalent. The solver has no incentive to "spread to free capacity" so that
-        //       more ops could shift; it may cluster at ALAP. We add a tie-breaker below:
-        //       minimize (scale * makespan + sum of completion_cycles) so that for equal
-        //       makespan we prefer earlier completion (more spread), freeing capacity.
     }
-    } // end if !disable_shift
 
     // 5c. Add precedence constraints for consumers of shifted VALU ops
     // Consumers must wait for completion_cycle (when all 8 ALU ops have completed)
@@ -1868,33 +1947,35 @@ pub fn schedule_ssa_cpsat(
     let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
 
     for &idx in &const_choice_ops {
-        if disable_const_choice {
-            // Fixed encoding: Load only (no choice variable)
-            let load_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
-            const_load_intervals.insert(idx, load_interval);
-        } else {
-            // Decision: true = use AddImm (Flow), false = use Load
-            let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
-            const_choice_vars.insert(idx, choice_var);
+        match const_choice_mode {
+            ConstChoiceMode::ForceLoad => {
+                let load_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                const_load_intervals.insert(idx, load_interval);
+            }
+            ConstChoiceMode::ForceAddImm => {
+                let add_imm_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                const_flow_intervals.insert(idx, add_imm_interval);
+            }
+            ConstChoiceMode::Optimize => {
+                let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
+                const_choice_vars.insert(idx, choice_var);
 
-            // Load variant: present when choice_var = false
-            let load_interval = model.new_optional_fixed_size_interval_var(
-                cycle_vars[idx],
-                1,
-                choice_var.not(),
-            );
-            const_load_intervals.insert(idx, load_interval);
+                let load_interval = model.new_optional_fixed_size_interval_var(
+                    cycle_vars[idx],
+                    1,
+                    choice_var.not(),
+                );
+                const_load_intervals.insert(idx, load_interval);
 
-            // AddImm variant: present when choice_var = true
-            let add_imm_interval = model.new_optional_fixed_size_interval_var(
-                cycle_vars[idx],
-                1,
-                choice_var,
-            );
-            const_flow_intervals.insert(idx, add_imm_interval);
+                let add_imm_interval = model.new_optional_fixed_size_interval_var(
+                    cycle_vars[idx],
+                    1,
+                    choice_var,
+                );
+                const_flow_intervals.insert(idx, add_imm_interval);
 
-            // Hint from greedy (default: Load)
-            model.add_hint(choice_var, 0); // false = use Load
+                model.add_hint(choice_var, 0); // false = use Load
+            }
         }
     }
 
@@ -1910,75 +1991,77 @@ pub fn schedule_ssa_cpsat(
     let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
 
     for &idx in &select_choice_ops {
-        if disable_select_choice {
-            // Fixed encoding: vselect (Flow) only (no choice variable)
-            let flow_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
-            select_flow_intervals.insert(idx, flow_interval);
-        } else {
-            // Decision: true = use FMA (VALU), false = use vselect (Flow)
-            let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
-            select_choice_vars.insert(idx, choice_var);
-
-            // Hint from greedy (default: vselect to match greedy behavior)
-            if let Some(hints) = select_choice_hints {
-                if hints.contains(&ops[idx].id) {
-                    model.add_hint(choice_var, 1); // true = use FMA
-                } else {
-                    model.add_hint(choice_var, 0); // false = use vselect
-                }
-            } else {
-                model.add_hint(choice_var, 0); // Default: vselect
+        match select_choice_mode {
+            SelectChoiceMode::ForceVselect => {
+                let flow_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                select_flow_intervals.insert(idx, flow_interval);
             }
+            SelectChoiceMode::ForceFma => {
+                let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
+                    vec![model.new_fixed_size_interval_var(cycle_vars[idx], 1)]
+                } else {
+                    let sub_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+                    let fma_cycle_var = model.new_int_var_with_name(
+                        [(fma_asap as i64, fma_alap as i64)],
+                        format!("fma_cycle_{}", idx),
+                    );
+                    model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
+                    let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
+                    vec![sub_interval, fma_interval]
+                };
+                select_valu_intervals.insert(idx, valu_intervals);
+            }
+            SelectChoiceMode::Optimize => {
+                let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
+                select_choice_vars.insert(idx, choice_var);
 
-            // Flow interval (vselect): present when choice_var = false
-            let flow_interval = model.new_optional_fixed_size_interval_var(
-                cycle_vars[idx],
-                1,
-                choice_var.not(),
-            );
-            select_flow_intervals.insert(idx, flow_interval);
+                if let Some(hints) = select_choice_hints {
+                    if hints.contains(&ops[idx].id) {
+                        model.add_hint(choice_var, 1);
+                    } else {
+                        model.add_hint(choice_var, 0);
+                    }
+                } else {
+                    model.add_hint(choice_var, 0);
+                }
 
-            // VALU intervals (FMA): present when choice_var = true
-            let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
-                // Case A: delta_vreg is set - 1 VALU op (FMA directly)
-                vec![model.new_optional_fixed_size_interval_var(
+                let flow_interval = model.new_optional_fixed_size_interval_var(
                     cycle_vars[idx],
                     1,
-                    choice_var,
-                )]
-            } else {
-                // Case B: delta_vreg is not set - 2 sequential VALU ops (sub + fma)
-                // Sub op at cycle c, FMA op at cycle c+1
-                let sub_interval = model.new_optional_fixed_size_interval_var(
-                    cycle_vars[idx],
-                    1,
-                    choice_var,
+                    choice_var.not(),
                 );
-                
-                // For FMA, we need cycle_vars[idx] + 1. Since cycle_vars[idx] has domain [asap, alap],
-                // we create a new int var for fma_cycle with domain [asap+1, alap+1] and constraint
-                // fma_cycle = cycle_vars[idx] + 1
-                let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-                let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-                let fma_cycle_var = model.new_int_var_with_name(
-                    [(fma_asap as i64, fma_alap as i64)],
-                    format!("fma_cycle_{}", idx),
-                );
-                // Constraint: fma_cycle = cycle_vars[idx] + 1 (only enforced when choice_var = true)
-                // TODO: Fix CP-SAT API - only_enforce_if method may have changed
-                // For now, create the constraint unconditionally - the optional interval will handle enforcement
-                model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
-                // Note: The fma_interval below is optional (based on choice_var), so the constraint
-                // is effectively conditional through the interval's presence
-                
-                let fma_interval = model.new_optional_fixed_size_interval_var(
-                    fma_cycle_var,
-                    1,
-                    choice_var,
-                );
-                vec![sub_interval, fma_interval]
-            };
-            select_valu_intervals.insert(idx, valu_intervals);
+                select_flow_intervals.insert(idx, flow_interval);
+
+                let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
+                    vec![model.new_optional_fixed_size_interval_var(
+                        cycle_vars[idx],
+                        1,
+                        choice_var,
+                    )]
+                } else {
+                    let sub_interval = model.new_optional_fixed_size_interval_var(
+                        cycle_vars[idx],
+                        1,
+                        choice_var,
+                    );
+                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+                    let fma_cycle_var = model.new_int_var_with_name(
+                        [(fma_asap as i64, fma_alap as i64)],
+                        format!("fma_cycle_{}", idx),
+                    );
+                    model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
+                    let fma_interval = model.new_optional_fixed_size_interval_var(
+                        fma_cycle_var,
+                        1,
+                        choice_var,
+                    );
+                    vec![sub_interval, fma_interval]
+                };
+                select_valu_intervals.insert(idx, valu_intervals);
+            }
         }
     }
 
@@ -2021,14 +2104,20 @@ pub fn schedule_ssa_cpsat(
             valu_demands.push(1);
         }
 
-        // Add VALU intervals for shiftable ops: when shift disabled use required interval; else optional (present when not shifted)
+        // Add VALU intervals for shiftable ops: ForceValu => required; ForceAlu => none; Optimize => optional
         for &idx in &shiftable_valu {
-            if disable_shift {
-                valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
-                valu_demands.push(1);
-            } else if let Some(&iv) = valu_optional_intervals.get(&idx) {
-                valu_intervals.push(iv);
-                valu_demands.push(1);
+            match valu_shift_mode {
+                ValuShiftMode::ForceValu => {
+                    valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+                    valu_demands.push(1);
+                }
+                ValuShiftMode::ForceAlu => {}
+                ValuShiftMode::Optimize => {
+                    if let Some(&iv) = valu_optional_intervals.get(&idx) {
+                        valu_intervals.push(iv);
+                        valu_demands.push(1);
+                    }
+                }
             }
         }
 
@@ -2058,14 +2147,18 @@ pub fn schedule_ssa_cpsat(
             alu_demands.push(1);
         }
 
-        // Add optional ALU intervals for shifted VALU ops (8 intervals, each with demand=1)
-        // Each of the 8 ALU ops can be scheduled independently
+        // Add ALU intervals for shifted VALU ops: ForceAlu => required intervals; Optimize => optional
         for &idx in &shiftable_valu {
-            if let Some(intervals) = alu_optional_intervals.get(&idx) {
-                // Add all 8 intervals (one per ALU op)
+            if let Some(intervals) = alu_required_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
-                    alu_demands.push(1); // Each ALU op uses 1 slot
+                    alu_demands.push(1);
+                }
+            }
+            if let Some(intervals) = alu_optional_intervals.get(&idx) {
+                for iv in intervals {
+                    alu_intervals.push(*iv);
+                    alu_demands.push(1);
                 }
             }
         }
@@ -2863,24 +2956,37 @@ pub fn schedule_ssa_cpsat(
     match status {
         CpsatStatus::Optimal | CpsatStatus::Feasible => {
             // Extract cycle assignments for all ops
-            // For shifted VALU ops, use completion_cycle (when all 8 ALU ops have completed)
+            // For shiftable VALU: ForceAlu => completion_cycle; ForceValu => cycle_vars[idx]; Optimize => shift_var ? completion_cycle : cycle_vars[idx]
             let mut cycle_assignments: Vec<i32> = Vec::with_capacity(ops.len());
             for (idx, _) in ops.iter().enumerate() {
                 if shiftable_set.contains(&idx) {
-                    if let Some(shift_var) = shift_vars.get(&idx) {
-                        let is_shifted = shift_var.solution_value(&response);
-                        if is_shifted {
+                    match valu_shift_mode {
+                        ValuShiftMode::ForceAlu => {
                             if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
                                 cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
                             } else {
                                 cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
                             }
-                        } else {
+                        }
+                        ValuShiftMode::ForceValu => {
                             cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
                         }
-                    } else {
-                        // Shift disabled: no shift var, use cycle_var
-                        cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                        ValuShiftMode::Optimize => {
+                            if let Some(shift_var) = shift_vars.get(&idx) {
+                                let is_shifted = shift_var.solution_value(&response);
+                                if is_shifted {
+                                    if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
+                                        cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
+                                    } else {
+                                        cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                    }
+                                } else {
+                                    cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                }
+                            } else {
+                                cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                            }
+                        }
                     }
                 } else {
                     cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
@@ -2889,15 +2995,21 @@ pub fn schedule_ssa_cpsat(
 
             let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
 
-            // Extract shift decisions (empty when shift disabled)
-            let shifted_ops: HashSet<usize> = if shift_vars.is_empty() {
-                HashSet::new()
-            } else {
-                shift_vars
-                    .iter()
-                    .filter(|(_, &var)| var.solution_value(&response))
-                    .map(|(&idx, _)| ops[idx].id)
-                    .collect()
+            // Extract shift decisions: ForceAlu => all shiftable; ForceValu => none; Optimize => from solver
+            let shifted_ops: HashSet<usize> = match valu_shift_mode {
+                ValuShiftMode::ForceAlu => shiftable_valu.iter().map(|&idx| ops[idx].id).collect(),
+                ValuShiftMode::ForceValu => HashSet::new(),
+                ValuShiftMode::Optimize => {
+                    if shift_vars.is_empty() {
+                        HashSet::new()
+                    } else {
+                        shift_vars
+                            .iter()
+                            .filter(|(_, &var)| var.solution_value(&response))
+                            .map(|(&idx, _)| ops[idx].id)
+                            .collect()
+                    }
+                }
             };
 
             // Debug: Extract shift decisions for high-impact ops
@@ -2935,12 +3047,12 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Extract individual ALU cycle assignments for shifted VALU ops
+            // Extract individual ALU cycle assignments for shifted VALU ops (ForceAlu => all; Optimize => from solver)
             let mut shifted_alu_cycles: HashMap<usize, Vec<i32>> = HashMap::new();
             for &idx in &shiftable_valu {
                 let op_id = ops[idx].id;
-                if shifted_ops.contains(&op_id) {
-                    // Extract cycles for all 8 ALU ops
+                let is_shifted = shifted_ops.contains(&op_id);
+                if is_shifted {
                     if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
                         let cycles: Vec<i32> = alu_cycles
                             .iter()
@@ -2951,26 +3063,38 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Extract ConstChoice decisions (empty when ConstChoice disabled)
-            let const_add_imm_ops: HashSet<usize> = if const_choice_vars.is_empty() {
-                HashSet::new()
-            } else {
-                const_choice_vars
-                    .iter()
-                    .filter(|(_, &var)| var.solution_value(&response))
-                    .map(|(&idx, _)| ops[idx].id)
-                    .collect()
+            // Extract ConstChoice: ForceAddImm => all; ForceLoad => none; Optimize => from solver
+            let const_add_imm_ops: HashSet<usize> = match const_choice_mode {
+                ConstChoiceMode::ForceAddImm => const_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
+                ConstChoiceMode::ForceLoad => HashSet::new(),
+                ConstChoiceMode::Optimize => {
+                    if const_choice_vars.is_empty() {
+                        HashSet::new()
+                    } else {
+                        const_choice_vars
+                            .iter()
+                            .filter(|(_, &var)| var.solution_value(&response))
+                            .map(|(&idx, _)| ops[idx].id)
+                            .collect()
+                    }
+                }
             };
 
-            // Extract SelectChoice decisions (empty when SelectChoice disabled)
-            let select_fma_ops: HashSet<usize> = if select_choice_vars.is_empty() {
-                HashSet::new()
-            } else {
-                select_choice_vars
-                    .iter()
-                    .filter(|(_, &var)| var.solution_value(&response))
-                    .map(|(&idx, _)| ops[idx].id)
-                    .collect()
+            // Extract SelectChoice: ForceFma => all; ForceVselect => none; Optimize => from solver
+            let select_fma_ops: HashSet<usize> = match select_choice_mode {
+                SelectChoiceMode::ForceFma => select_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
+                SelectChoiceMode::ForceVselect => HashSet::new(),
+                SelectChoiceMode::Optimize => {
+                    if select_choice_vars.is_empty() {
+                        HashSet::new()
+                    } else {
+                        select_choice_vars
+                            .iter()
+                            .filter(|(_, &var)| var.solution_value(&response))
+                            .map(|(&idx, _)| ops[idx].id)
+                            .collect()
+                    }
+                }
             };
 
             // Solution breadcrumbs: log Flow audit when verbose (before validation)

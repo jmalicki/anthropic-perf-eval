@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::str::FromStr;
 
 use crate::allocator::{allocate_registers, rewrite_addresses, AllocationResult};
 use crate::constants::{
@@ -2407,7 +2408,7 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, disable_const_choice=false, disable_select_choice=false, disable_shift=false, *, liveness_detail=None, forced_shifts=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2421,9 +2422,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     per_section_optimize_secs: Option<f64>,
     output_json: Option<String>,
     enable_tree_reduce_depth3: bool,
-    disable_const_choice: bool,
-    disable_select_choice: bool,
-    disable_shift: bool,
+    const_choice: &str,
+    select_choice: &str,
+    valu_shift: &str,
     liveness_detail: Option<String>,
     forced_shifts: Option<Vec<usize>>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
@@ -2458,9 +2459,16 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         println!("Building SSA kernel{}...", if use_cpsat { " (CP-SAT)" } else { "" });
     }
 
+    let const_choice_mode = crate::cpsat_scheduler::ConstChoiceMode::from_str(const_choice)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let select_choice_mode = crate::cpsat_scheduler::SelectChoiceMode::from_str(select_choice)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let valu_shift_mode = crate::cpsat_scheduler::ValuShiftMode::from_str(valu_shift)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
     let forced_shifts_set: Option<std::collections::HashSet<usize>> = forced_shifts.map(|v| v.into_iter().collect());
     let result = if use_cpsat {
-        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs, forced_shifts_set, disable_const_choice, disable_select_choice, disable_shift).map_err(|e| {
+        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs, forced_shifts_set, const_choice_mode, select_choice_mode, valu_shift_mode).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
         })?
     } else {

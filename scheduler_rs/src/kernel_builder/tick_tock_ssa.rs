@@ -331,9 +331,9 @@ impl SsaTickTockKernelBuilder {
         enable_valu_shift: bool,
         per_section_optimize_secs: Option<f64>,
         forced_shifts: Option<HashSet<usize>>,
-        disable_const_choice: bool,
-        disable_select_choice: bool,
-        disable_shift: bool,
+        const_choice_mode: crate::cpsat_scheduler::ConstChoiceMode,
+        select_choice_mode: crate::cpsat_scheduler::SelectChoiceMode,
+        valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
     ) -> Result<SsaScheduleResult, String> {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
@@ -678,9 +678,9 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift,
             scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
-            disable_const_choice,
-            disable_select_choice,
-            disable_shift,
+            const_choice_mode,
+            select_choice_mode,
+            valu_shift_mode,
             ..Default::default()
         };
 
@@ -2958,15 +2958,16 @@ mod tests {
         // Small config: fast run, still exercises full two-phase flow (section boundaries, budget check, merge, full CP-SAT)
         let config = KernelConfig::new(5, 63, 64, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
+        use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
         let result = builder.build_and_schedule_cpsat(
             30.0,   // Short time limit; small kernel solves quickly
             false,  // verbose
             true,   // enable_valu_shift
             None,   // per_section_optimize_secs
             None,   // forced_shifts
-            false,  // disable_const_choice
-            false,  // disable_select_choice
-            false,  // disable_shift
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
         );
         assert!(result.is_ok(), "build_and_schedule_cpsat should succeed: {:?}", result.err());
         let result = result.unwrap();
