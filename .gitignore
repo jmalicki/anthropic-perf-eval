@@ -48,9 +48,17 @@ htmlcov/
 # macOS
 .DS_Store
 
-# Scheduler output
+# Scheduler / script output (JSON)
 schedule_output.json
 schedule_*.json
+scheduler_output*.json
 debug_*.json
 *_diagnostics.json
 kernel_to_validate.json
+trace.json
+output.json
+*_slot_util.json
+current.json
+optimized_*.json
+*_schedule.json
+schedule_analysis.json

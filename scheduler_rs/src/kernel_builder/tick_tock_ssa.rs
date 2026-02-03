@@ -64,6 +64,9 @@ pub struct SsaScheduleResult {
     pub usage_accounting: UsageAccounting,
     /// VReg metadata for liveness debugging: (var_type, phase, round)
     pub vreg_metadata: HashMap<VReg, (Option<VarType>, Option<String>, Option<usize>)>,
+    /// Individual ALU cycle assignments for shifted VALU ops (from CP-SAT)
+    /// Maps op_id -> [cycle0, cycle1, ..., cycle7] (8 cycles, one per ALU op)
+    pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -271,11 +274,13 @@ impl SsaTickTockKernelBuilder {
             &shifted_ops,
             &HashSet::new(), // Greedy always uses Load for ConstChoice
             &greedy_select_fma_ops, // Pass greedy's SelectChoice decisions
+            &HashMap::new(), // Greedy doesn't provide individual ALU cycles
         );
 
         let valu_shifted = shifted_ops.len();
 
         Ok(SsaScheduleResult {
+            shifted_alu_cycles: HashMap::new(), // Greedy doesn't provide individual ALU cycles
             ops,
             cycles,
             address_result,
@@ -313,6 +318,7 @@ impl SsaTickTockKernelBuilder {
         verbose: bool,
         enable_valu_shift: bool,
         per_section_optimize_secs: Option<f64>,
+        forced_shifts: Option<HashSet<usize>>,
     ) -> Result<SsaScheduleResult, String> {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
@@ -552,6 +558,7 @@ impl SsaTickTockKernelBuilder {
                     SsaCpsatHints {
                         greedy_hints: Some(&segment_hints),
                         shift_hints: seg_shift,
+                        forced_shifts: None,
                         select_choice_hints: seg_select,
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
@@ -707,14 +714,18 @@ impl SsaTickTockKernelBuilder {
             eprintln!();
         }
 
+        let forced_shifts_ref = forced_shifts.as_ref();
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
             cpsat_config,
             SsaCpsatHints {
                 greedy_hints: greedy_hints_opt.map(|v| v.as_slice()),
                 shift_hints,
+                forced_shifts: forced_shifts_ref,
                 select_choice_hints,
-                ..Default::default()
+                initial_live: None,
+                live_out_vregs: None,
+                live_through_vregs: None,
             },
         )
         .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
@@ -795,6 +806,7 @@ impl SsaTickTockKernelBuilder {
             &shifted_ops,
             &cpsat_result.const_add_imm_ops, // CP-SAT decisions for ConstChoice
             &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
+            &cpsat_result.shifted_alu_cycles, // Individual ALU cycles from CP-SAT
         );
 
         Ok(SsaScheduleResult {
@@ -806,6 +818,7 @@ impl SsaTickTockKernelBuilder {
             budget_exceeded, // CP-SAT should not exceed budget
             usage_accounting,
             vreg_metadata,
+            shifted_alu_cycles: cpsat_result.shifted_alu_cycles.clone(),
         })
     }
 
@@ -2641,7 +2654,7 @@ mod tests {
         vreg_to_addr.insert(VReg::vector(2), 300);
 
         // Expand
-        let expanded = expand_ssa_valu_to_alu(&op, &vreg_to_addr);
+        let expanded = expand_ssa_valu_to_alu(&op, &vreg_to_addr, None); // Test doesn't have individual cycles
 
         // Should produce 8 ALU ops
         assert_eq!(expanded.len(), 8, "Should expand to 8 ALU ops");
@@ -2849,7 +2862,12 @@ mod tests {
             },
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),
-                ..Default::default()
+                shift_hints: None,
+                forced_shifts: None,
+                select_choice_hints: None,
+                initial_live: None,
+                live_out_vregs: None,
+                live_through_vregs: None,
             },
         );
 
@@ -2902,6 +2920,11 @@ mod tests {
         let config = KernelConfig::new(5, 63, 64, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule_cpsat(
+            30.0,   // Short time limit; small kernel solves quickly
+            false,  // verbose
+            true,   // enable_valu_shift
+            None,   // per_section_optimize_secs
+            None,   // forced_shifts
             30.0,   // Short time limit; small kernel solves quickly
             false,  // verbose
             false,  // enable_valu_shift to keep test deterministic and faster

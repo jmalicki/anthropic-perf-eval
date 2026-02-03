@@ -1498,6 +1498,32 @@ struct SsaScheduleOutput {
     /// Per-cycle liveness curve (full detail only)
     #[serde(skip_serializing_if = "Option::is_none")]
     liveness_curve: Option<Vec<CycleLiveness>>,
+    /// Debug info about shifted VALU ops and their ALU cycle assignments
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valu_shift_debug: Option<ValuShiftDebug>,
+}
+
+/// Debug info about shifted VALU ops
+#[derive(Serialize)]
+struct ValuShiftDebug {
+    /// Total number of shifted VALU ops
+    total_shifted: usize,
+    /// Number of shifted VALU ops with ALU ops spread across cycles
+    spread_count: usize,
+    /// Number of shifted VALU ops with all ALU ops at same cycle
+    clustered_count: usize,
+    /// Sample of shifted VALU ops with their ALU cycle assignments
+    /// Limited to first 10 examples of spread and clustered ops
+    samples: Vec<ShiftedValuSample>,
+}
+
+/// Sample of a shifted VALU op's ALU cycle assignments
+#[derive(Serialize)]
+struct ShiftedValuSample {
+    op_id: usize,
+    alu_cycles: Vec<i32>,
+    unique_cycles: usize,
+    spread: bool, // true if unique_cycles > 1
 }
 
 /// Debug info for a single op
@@ -1623,6 +1649,53 @@ fn write_ssa_schedule_json(
         }
     };
 
+    // Compute debug statistics for shifted VALU ops
+    let valu_shift_debug = if !result.shifted_alu_cycles.is_empty() {
+        let mut spread_count = 0;
+        let mut clustered_count = 0;
+        let mut spread_samples = Vec::new();
+        let mut clustered_samples = Vec::new();
+        
+        for (op_id, cycles) in &result.shifted_alu_cycles {
+            let unique: HashSet<i32> = cycles.iter().copied().collect();
+            let is_spread = unique.len() > 1;
+            
+            if is_spread {
+                spread_count += 1;
+                if spread_samples.len() < 10 {
+                    spread_samples.push(ShiftedValuSample {
+                        op_id: *op_id,
+                        alu_cycles: cycles.clone(),
+                        unique_cycles: unique.len(),
+                        spread: true,
+                    });
+                }
+            } else {
+                clustered_count += 1;
+                if clustered_samples.len() < 10 {
+                    clustered_samples.push(ShiftedValuSample {
+                        op_id: *op_id,
+                        alu_cycles: cycles.clone(),
+                        unique_cycles: 1,
+                        spread: false,
+                    });
+                }
+            }
+        }
+        
+        let mut samples = spread_samples;
+        samples.extend(clustered_samples);
+        
+        Some(ValuShiftDebug {
+            total_shifted: result.shifted_alu_cycles.len(),
+            spread_count,
+            clustered_count,
+            samples,
+        })
+    } else {
+        None
+    };
+
     let output = SsaScheduleOutput {
         total_cycles: result.cycles,
         total_ops: result.ops.len(),
@@ -1637,6 +1710,7 @@ fn write_ssa_schedule_json(
         liveness_summary,
         vregs,
         liveness_curve,
+        valu_shift_debug,
     };
 
     let json = serde_json::to_string_pretty(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
@@ -2333,7 +2407,7 @@ use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, *, liveness_detail=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, *, liveness_detail=None, forced_shifts=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2348,6 +2422,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     output_json: Option<String>,
     enable_tree_reduce_depth3: bool,
     liveness_detail: Option<String>,
+    forced_shifts: Option<Vec<usize>>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let config = KernelConfig {
         forest_height,
@@ -2380,8 +2455,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         println!("Building SSA kernel{}...", if use_cpsat { " (CP-SAT)" } else { "" });
     }
 
+    let forced_shifts_set: Option<std::collections::HashSet<usize>> = forced_shifts.map(|v| v.into_iter().collect());
     let result = if use_cpsat {
-        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs).map_err(|e| {
+        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs, forced_shifts_set).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
         })?
     } else {

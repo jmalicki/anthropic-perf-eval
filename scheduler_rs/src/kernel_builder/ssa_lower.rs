@@ -54,6 +54,7 @@ pub fn lower_ssa_ops_with_shift(
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
     select_fma_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>, // op_id -> [cycle0, ..., cycle7]
 ) -> Vec<Op> {
     use crate::types::{Opcode, SlotVal};
     use arrayvec::ArrayVec;
@@ -63,7 +64,9 @@ pub fn lower_ssa_ops_with_shift(
     for ssa_op in ssa_ops {
         if shifted_ops.contains(&ssa_op.id) {
             // Expand shifted VALU op to 8 ALU ops
-            let expanded = expand_ssa_valu_to_alu(ssa_op, vreg_to_addr);
+            // Use individual cycles if available (from CP-SAT), otherwise use completion_cycle
+            let alu_cycles = shifted_alu_cycles.get(&ssa_op.id);
+            let expanded = expand_ssa_valu_to_alu(ssa_op, vreg_to_addr, alu_cycles.map(|v| v.as_slice()));
             result.extend(expanded);
         } else if ssa_op.opcode == Opcode::ConstChoice {
             // Handle ConstChoice based on scheduler decision
@@ -285,7 +288,11 @@ pub fn lower_ssa_ops_with_shift(
 }
 
 /// Expand a shifted SSA VALU op into 8 scalar ALU ops.
-pub fn expand_ssa_valu_to_alu(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
+pub fn expand_ssa_valu_to_alu(
+    ssa_op: &SsaOp,
+    vreg_to_addr: &HashMap<VReg, i64>,
+    alu_cycles: Option<&[i32]>, // Individual cycles for 8 ALU ops (if available from CP-SAT)
+) -> Vec<Op> {
     use crate::types::Operand;
 
     let dest = ssa_op.dest.expect("VALU op must have dest");
@@ -300,6 +307,10 @@ pub fn expand_ssa_valu_to_alu(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>)
         }
         _ => return vec![], // Can't expand non-binary ops
     };
+
+    // Determine cycles for each ALU op
+    // If individual cycles are provided (from CP-SAT), use them; otherwise use ssa_op.cycle for all
+    let use_individual_cycles = alu_cycles.is_some() && alu_cycles.unwrap().len() == VLEN;
 
     // Create 8 ALU ops
     let mut ops = Vec::with_capacity(VLEN);
@@ -320,11 +331,18 @@ pub fn expand_ssa_valu_to_alu(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>)
         let mut writes = HashSet::new();
         writes.insert(dest_addr + i_offset);
 
+        // Use individual cycle if available, otherwise use ssa_op.cycle (completion_cycle)
+        let cycle = if use_individual_cycles {
+            alu_cycles.unwrap()[i]
+        } else {
+            ssa_op.cycle
+        };
+
         ops.push(Op {
             id: ssa_op.id * 1000 + i, // Unique ID for expanded op
             engine: Engine::Alu,
             slot,
-            cycle: ssa_op.cycle,
+            cycle,
             dep_ids: ssa_op.dep_ids.clone(),
             reads,
             writes,
@@ -370,7 +388,7 @@ mod tests {
         let shifted_ops = HashSet::new();
         let const_add_imm_ops = HashSet::new(); // Use Load
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new());
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -398,7 +416,7 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(99); // Use AddImm
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new());
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -430,7 +448,7 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(1); // op1 uses AddImm, op2 uses Load
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new());
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
 
         assert_eq!(result.len(), 2);
         
@@ -486,7 +504,7 @@ mod tests {
         let const_add_imm_ops = HashSet::new();
         let select_fma_ops = HashSet::new(); // vselect path
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
         let op = &result[0];
@@ -526,7 +544,7 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
 
         assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
         let op = &result[0];
@@ -569,7 +587,7 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
 
         // FMA without delta should produce 2 ops: sub + fma
         assert_eq!(result.len(), 2, "FMA without delta should produce 2 ops (sub + fma)");
@@ -622,7 +640,7 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops);
+        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
 
         // Check slot values for invalid addresses
         for op in &result {
