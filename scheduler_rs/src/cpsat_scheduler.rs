@@ -2744,9 +2744,19 @@ pub fn schedule_ssa_cpsat(
                     "SSA CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
                     actual_makespan, best_bound, status, gap * 100.0, solve_time
                 );
+                let makespan_usize = actual_makespan as usize;
+                let alu_capacity = machine.alu_slots as usize * makespan_usize;
+                let valu_capacity = machine.valu_slots as usize * makespan_usize;
+                let load_capacity = machine.load_slots as usize * makespan_usize;
+                let store_capacity = machine.store_slots as usize * makespan_usize;
+                let flow_capacity = machine.flow_slots as usize * makespan_usize;
                 eprintln!(
-                    "  Engine usage: ALU={} VALU={} Load={} Store={} Flow={}",
-                    summary.alu_total, summary.valu_total, summary.load_total, summary.store_total, summary.flow_total
+                    "  Engine usage: ALU={}/{} VALU={}/{} Load={}/{} Store={}/{} Flow={}/{}",
+                    summary.alu_total, alu_capacity,
+                    summary.valu_total, valu_capacity,
+                    summary.load_total, load_capacity,
+                    summary.store_total, store_capacity,
+                    summary.flow_total, flow_capacity
                 );
                 eprintln!(
                     "  ConstChoice: {} AddImm, {} Load",
