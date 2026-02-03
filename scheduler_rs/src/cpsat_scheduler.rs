@@ -1996,10 +1996,14 @@ pub fn schedule_ssa_cpsat(
             );
         }
 
-        // For VRegs that are defined but never read (dead code), they still occupy space
-        // until the end. For simplicity, we'll only model VRegs that have both def and use.
+        // We only model VRegs that have both a definition and at least one use.
+        // The caller (build_and_schedule_cpsat) runs SSA DCE before CP-SAT when
+        // enable_ssa_dce is true (default), so every defined VReg is expected to
+        // have at least one reader. If DCE is disabled, dead VRegs would be omitted
+        // from the scratch constraint and could cause undercounting; the caller
+        // asserts no dead VRegs when DCE is enabled.
 
-        // Collect VRegs that have both definition and use
+        // Collect VRegs that have both definition and use (all defined VRegs when DCE ran)
         let live_vregs: Vec<VReg> = vreg_def_op
             .keys()
             .filter(|v| vreg_last_use.contains_key(v))

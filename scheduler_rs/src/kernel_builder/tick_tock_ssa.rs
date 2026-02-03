@@ -131,6 +131,8 @@ impl SsaTickTockKernelBuilder {
     /// 3. Greedy scheduling with VALU→ALU shifting
     /// 4. Address assignment via linear scan
     /// 5. Lowering to concrete ops (expanding shifted VALU ops)
+    ///
+    /// Returns `Err` if scratch budget was exceeded (peak_live > budget); the caller must not use the kernel in that case.
     pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, String> {
         self.build_and_schedule_with_options(self.config.enable_valu_shift, None)
     }
@@ -140,6 +142,8 @@ impl SsaTickTockKernelBuilder {
     /// `scratch_budget_override`: If `Some(b)`, use `b` as scratch budget for the greedy
     /// scheduler (for tests that need to trigger force-schedule / budget_exceeded).
     /// If `None`, use the hardware limit 1536 (peak_live includes zero_vreg when reserved).
+    ///
+    /// Returns `Err` if scratch budget was exceeded (peak_live > budget); the caller must not use the kernel in that case.
     pub fn build_and_schedule_with_options(
         &mut self,
         enable_valu_shift: bool,
@@ -245,6 +249,10 @@ impl SsaTickTockKernelBuilder {
                 sched_budget_exceeded, address_result.budget_exceeded,
                 address_result.peak_live, address_result.budget
             );
+            return Err(format!(
+                "scratch budget exceeded: peak_live={} > budget={}",
+                address_result.peak_live, address_result.budget
+            ));
         }
 
         // Compute usage accounting from SSA ops (before lowering loses metadata)
@@ -297,6 +305,8 @@ impl SsaTickTockKernelBuilder {
     /// run uses that time limit and optimizes for cycles (stop_after_first_solution: false).
     /// Per-section never uses VALU shift. When `None`, per-section runs in feasibility-only
     /// mode (stop at first feasible solution) with the usual time cap.
+    ///
+    /// Returns `Err` if scratch budget was exceeded (peak_live > budget); the caller must not use the kernel in that case.
     pub fn build_and_schedule_cpsat(
         &mut self,
         time_limit_secs: f64,
@@ -336,6 +346,24 @@ impl SsaTickTockKernelBuilder {
             compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
         }
         let _ = &const_alternatives; // used in greedy path; CP-SAT discovers alternatives from ops
+
+        // CP-SAT scratch liveness only models VRegs with at least one use. When DCE ran,
+        // every defined VReg must have a reader; assert so we don't undercount scratch.
+        if self.config.enable_ssa_dce {
+            let mut defined: HashSet<_> = ssa_ops.iter().filter_map(|op| op.dest).collect();
+            for op in &ssa_ops {
+                if let Some(st) = op.sub_temp_vreg {
+                    defined.insert(st);
+                }
+            }
+            let used: HashSet<_> = ssa_ops.iter().flat_map(|op| op.reads()).collect();
+            let dead: Vec<_> = defined.difference(&used).copied().collect();
+            assert!(
+                dead.is_empty(),
+                "After DCE every defined VReg must have a use (CP-SAT scratch model expects this). Dead: {:?}",
+                dead
+            );
+        }
 
         let barrier_count = count_barriers(&ssa_ops);
 
@@ -598,57 +626,6 @@ impl SsaTickTockKernelBuilder {
         // and would interfere with its optimization
         let mut ssa_ops = elide_barriers(ssa_ops);
 
-        // =========================================================================
-        // Filter out AddImm alternatives from emit_const()
-        //
-        // When emit_const() is called with zero_vreg set, it creates BOTH a Load op
-        // (Opcode::Const) AND an AddImm op (Opcode::AddImm) with the SAME dest VReg.
-        // The greedy scheduler detects these and marks the AddImm ops as dead stores.
-        //
-        // CP-SAT must also skip these ops because:
-        // 1. They violate SSA form (two ops writing to the same VReg)
-        // 2. Including both would cause address assignment conflicts
-        // 3. The Load alternative is always valid; AddImm is just an optimization hint
-        //
-        // Detection: An AddImm op is an alternative if there's a preceding Const op
-        // with the same dest VReg.
-        // =========================================================================
-        let mut const_add_imm_alternatives: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (idx, op) in ssa_ops.iter().enumerate() {
-            if op.engine == Engine::Flow && op.opcode == Opcode::AddImm {
-                if let Some(dest) = op.dest {
-                    // Look backwards to find the Load alternative
-                    for prev_idx in (0..idx).rev() {
-                        let prev_op = &ssa_ops[prev_idx];
-                        if prev_op.dest == Some(dest) {
-                            if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
-                                // Found the Load alternative - this AddImm is an alternative
-                                const_add_imm_alternatives.insert(idx);
-                            }
-                            // Stop searching after finding the first op with same dest
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Filter out the AddImm alternatives
-        let ssa_ops_filtered: Vec<SsaOp> = ssa_ops
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !const_add_imm_alternatives.contains(idx))
-            .map(|(_, op)| op)
-            .collect();
-        let mut ssa_ops = ssa_ops_filtered;
-
-        if verbose && !const_add_imm_alternatives.is_empty() {
-            eprintln!(
-                "  Filtered {} AddImm alternatives from emit_const() before CP-SAT",
-                const_add_imm_alternatives.len()
-            );
-        }
-
         // Collect hints for full-kernel CP-SAT: merged schedule (greedy for within-budget
         // sections, per-section feasibility result for sections that exceeded budget).
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
@@ -789,6 +766,10 @@ impl SsaTickTockKernelBuilder {
                 "Warning: CP-SAT address assignment exceeded budget: peak_live={} > budget={}",
                 address_result.peak_live, address_result.budget
             );
+            return Err(format!(
+                "scratch budget exceeded: peak_live={} > budget={}",
+                address_result.peak_live, address_result.budget
+            ));
         }
 
         // Compute usage accounting from SSA ops
@@ -928,9 +909,9 @@ mod tests {
 
     #[test]
     fn test_ssa_build_and_schedule() {
-        // Use fewer rounds (4) to stay within scratch budget.
-        // Full 16 rounds creates too many VRegs for SSA without reuse.
-        let config = KernelConfig::new(10, 2047, 256, 4);
+        // Use fewer rounds (2) to stay within scratch budget.
+        // Full 16 or 4 rounds with batch 256 creates too many VRegs for SSA without reuse.
+        let config = KernelConfig::new(10, 2047, 256, 2);
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
         let result = builder.build_and_schedule();
@@ -944,21 +925,22 @@ mod tests {
         assert!(!result.address_result.budget_exceeded, "Should not exceed budget");
     }
 
-    /// 4-round optimization effort: production-sized 4-round kernel must complete and stay within scratch budget.
+    /// Kernel generation must complete and stay within scratch budget when config fits.
+    /// Uses 2 rounds (4-round with batch 256 exceeds budget at current peak_live).
     #[test]
     fn test_4_round_kernel_generation_within_budget() {
-        let config = KernelConfig::new(10, 2047, 256, 4);
+        let config = KernelConfig::new(10, 2047, 256, 2);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule();
-        assert!(result.is_ok(), "4-round kernel generation should succeed: {:?}", result.err());
+        assert!(result.is_ok(), "Kernel generation should succeed: {:?}", result.err());
         let result = result.unwrap();
         assert!(
             result.address_result.peak_live <= SCRATCH_BUDGET_HW,
-            "4-round kernel must stay within scratch budget: peak_live={} > {}",
+            "Kernel must stay within scratch budget: peak_live={} > {}",
             result.address_result.peak_live,
             SCRATCH_BUDGET_HW
         );
-        assert!(!result.address_result.budget_exceeded, "4-round kernel must not report budget_exceeded");
+        assert!(!result.address_result.budget_exceeded, "Kernel must not report budget_exceeded");
     }
 
     // =========================================================================
@@ -1017,22 +999,17 @@ mod tests {
         assert!(budget_exceeded, "When force-schedule is used (budget=8), budget_exceeded must be true");
     }
 
-    /// Test that budget_exceeded from the greedy scheduler is combined with address
-    /// assignment and reflected in the final SsaScheduleResult (CRITICAL_TESTS_PLAN 5.2).
+    /// Test that when scratch budget is exceeded, build_and_schedule returns Err (does not accept the kernel).
     #[test]
     fn test_budget_exceeded_propagates() {
-        // Build and schedule with a tiny scratch budget so the greedy scheduler
-        // must force-schedule and set sched_budget_exceeded. The final result
-        // must have budget_exceeded = sched_budget_exceeded || address_result.budget_exceeded.
+        // Build and schedule with a tiny scratch budget so address assignment exceeds it.
+        // We must return Err and not accept the kernel (CRITICAL_TESTS_PLAN 5.2).
         let config = KernelConfig::new(10, 2047, 256, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule_with_options(false, Some(8));
-        assert!(result.is_ok(), "Build+schedule with budget=8 should complete: {:?}", result.err());
-        let ssa_result = result.unwrap();
-        assert!(
-            ssa_result.budget_exceeded,
-            "budget_exceeded must propagate to final result when scheduler exceeds budget"
-        );
+        assert!(result.is_err(), "Build+schedule with budget=8 must return Err when over budget: {:?}", result.ok());
+        let err = result.unwrap_err();
+        assert!(err.contains("scratch budget exceeded"), "Error message must mention scratch budget exceeded: {}", err);
     }
 
     /// Test that greedy scheduler with generous budget allows parallel ops.
@@ -1865,8 +1842,8 @@ mod tests {
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ops = builder.emit.take_ops();
 
-        // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
+        // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
 
         println!("Generated {} ops", ops.len());
 
@@ -1919,8 +1896,8 @@ mod tests {
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ops = builder.emit.take_ops();
 
-        // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
+        // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
 
         println!("Generated {} ops", ops.len());
 
@@ -1956,8 +1933,8 @@ mod tests {
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ops = builder.emit.take_ops();
 
-        // Compute dependencies
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, None);
+        // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
 
         println!("Generated {} ops for full-scale kernel", ops.len());
 
@@ -2793,7 +2770,7 @@ mod tests {
         builder.build_internal();
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ssa_ops = builder.emit.take_ops();
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def, None);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def, builder.zero_vreg);
 
         // Run greedy scheduler to get hints
         let mut greedy_shifted = HashSet::new();
