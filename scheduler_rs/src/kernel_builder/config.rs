@@ -133,9 +133,14 @@ impl KernelConfig {
         self.batch_size / VLEN
     }
 
-    /// Number of iterations (n_groups / UNROLL)
+    /// Number of iterations (ceil(n_groups / 8) so that 1..7 groups still get one iter)
     pub fn n_iters(&self) -> usize {
-        self.n_groups() / 8  // UNROLL = 8
+        let n = self.n_groups();
+        if n == 0 {
+            0
+        } else {
+            (n + 7) / 8  // UNROLL = 8; ceiling division
+        }
     }
 
     /// Tree height (forest_height + 1)

@@ -1805,9 +1805,19 @@ pub fn schedule_ssa_cpsat(
         // 3. If completion_cycle is later, it will increase makespan, so CP-SAT will avoid
         //    shifts that hurt makespan anyway
         //
-        // However, this means CP-SAT might be conservative about shifting. If we want to
-        // encourage more shifting when there's spare capacity, we could add a soft constraint
-        // or secondary objective, but that's more complex.
+        // What prevents "cascading" (one shift → more shifts → everything shifting earlier)?
+        // - Nothing in the model forbids it: the 8 ALU ops can be spread across cycles (each has
+        //   its own alu_cycle var; completion_cycle = max of them; cumulative allows spread).
+        // - Two things still limit cascading in practice:
+        //   (1) Each op's ASAP: the 8 ALU ops cannot run before the op's dependencies allow,
+        //       so we can't "shift earlier" than ASAP. If ASAP is late (e.g. 28), we can't fill
+        //       early cycles with that op's ALU work.
+        //   (2) Single objective = makespan: when spreading doesn't change completion_cycle
+        //       (e.g. consumers already at 29+), all placements with the same completion_cycle
+        //       are equivalent. The solver has no incentive to "spread to free capacity" so that
+        //       more ops could shift; it may cluster at ALAP. We add a tie-breaker below:
+        //       minimize (scale * makespan + sum of completion_cycles) so that for equal
+        //       makespan we prefer earlier completion (more spread), freeing capacity.
     }
 
     // 5c. Add precedence constraints for consumers of shifted VALU ops
@@ -2699,12 +2709,27 @@ pub fn schedule_ssa_cpsat(
         model.add_ge(makespan, LinearExpr::from(cv) + 1);
     }
 
-    model.minimize(makespan);
+    // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops (tie-breaker).
+    // Objective: scale * makespan + sum(completion_cycle). Scale is chosen so it's a true tie-breaker:
+    // scale = (horizon+1)*(n+1) > n*horizon = max(sum(completion_cycle)), so one unit of makespan
+    // always dominates the entire sum — we never sacrifice makespan for earlier completion.
+    if let Some((&first_cc, rest)) = completion_cycle_vars.values().next().map(|v| (v, completion_cycle_vars.values().skip(1))) {
+        let scale = (horizon as i64 + 1) * (completion_cycle_vars.len() as i64 + 1);
+        let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| acc + LinearExpr::from(v));
+        let objective = LinearExpr::from(makespan) * scale + sum_completion;
+        model.minimize(objective);
+    } else {
+        model.minimize(makespan);
+    }
 
     // 11. Add hints from greedy scheduler
     // We skip cycle hints for ops with hint_cycle < 0 (dead stores). Greedy marks those as -1
-    // and does not assign a real cycle, so CP-SAT must choose. That yields "solution hint is
-    // incomplete: N-1 out of N non fixed variables hinted" where the unhinted vars are dead-store cycles.
+    // and does not assign a real cycle, so CP-SAT must choose.
+    //
+    // Why "solution hint is incomplete: K out of N non fixed variables hinted" with many unhinted?
+    // For each shiftable VALU op we have 8 alu_cycle vars + 1 completion_cycle var that are never
+    // hinted unless we do it here. So with ~1400 shiftable ops, ~12600 vars are unhinted, which
+    // dominates the total. We hint them from the greedy cycle below so the solver gets a full hint.
     if let Some(hints) = greedy_hints {
         let mut skipped_cycle_hints = 0usize;
         for (idx, &hint_cycle) in hints.iter().enumerate() {
@@ -2742,6 +2767,27 @@ pub fn schedule_ssa_cpsat(
             .map(|hints| hints.contains(&ops[idx].id))
             .unwrap_or(false);
         model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
+    }
+
+    // Hint completion_cycle and alu_cycle for shiftable ops so CP-SAT gets a full solution hint.
+    // Greedy gives one cycle per op; we use that for completion_cycle and all 8 alu_cycles
+    // (valid when shifted: all 8 ALU ops at same cycle -> completion_cycle = that cycle).
+    if let Some(hints) = greedy_hints {
+        for &idx in &shiftable_valu {
+            let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
+            if hint_cycle < 0 {
+                continue;
+            }
+            let c = hint_cycle as i64;
+            if let Some(completion_var) = completion_cycle_vars.get(&idx) {
+                model.add_hint(*completion_var, c);
+            }
+            if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
+                for &alu_var in alu_cycles {
+                    model.add_hint(alu_var, c);
+                }
+            }
+        }
     }
 
     // 12. Configure solver

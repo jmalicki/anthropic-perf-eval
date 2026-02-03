@@ -306,30 +306,30 @@ impl SsaTickTockKernelBuilder {
 
         for g in (0..n_groups).step_by(2) {
             let offset_a = (g * VLEN) as i64;
-            let offset_b = ((g + 1) * VLEN) as i64;
-
             self.emit.set_next_var_type(VarType::Constant);
             let off_a = self.emit.emit_const_choice(offset_a);
-            self.emit.set_next_var_type(VarType::Constant);
-            let off_b = self.emit.emit_const_choice(offset_b);
-
             self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
             self.emit.set_next_var_type(VarType::Address);
-            let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
-            self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit.set_next_var_type(VarType::Address);
-            let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
-
             self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr_a));
             self.emit.set_next_var_type(VarType::BatchData);
-            self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
-            self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr_a));
-            self.emit.set_next_var_type(VarType::BatchData);
-            self.ctx.all_val[g + 1] = Some(self.emit.emit_vload(val_addr_b));
+
+            if g + 1 < n_groups {
+                let offset_b = ((g + 1) * VLEN) as i64;
+                self.emit.set_next_var_type(VarType::Constant);
+                let off_b = self.emit.emit_const_choice(offset_b);
+                self.emit.set_next_var_type(VarType::Address);
+                let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+                self.emit.set_next_var_type(VarType::Address);
+                let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
+                self.emit.set_next_var_type(VarType::BatchData);
+                self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
+                self.emit.set_next_var_type(VarType::BatchData);
+                self.ctx.all_val[g + 1] = Some(self.emit.emit_vload(val_addr_b));
+            }
         }
 
         // Convert initial values to optimized form
@@ -347,30 +347,30 @@ impl SsaTickTockKernelBuilder {
 
         for g in (0..n_groups).step_by(2) {
             let offset_a = (g * VLEN) as i64;
-            let offset_b = ((g + 1) * VLEN) as i64;
-
             self.emit.set_next_var_type(VarType::Constant);
             let off_a = self.emit.emit_const_choice(offset_a);
-            self.emit.set_next_var_type(VarType::Constant);
-            let off_b = self.emit.emit_const_choice(offset_b);
-
             self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
             self.emit.set_next_var_type(VarType::Address);
-            let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
-            self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit.set_next_var_type(VarType::Address);
-            let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
-
             self.emit
                 .emit_vstore(idx_addr_a, self.ctx.all_idx[g].unwrap());
             self.emit
-                .emit_vstore(idx_addr_b, self.ctx.all_idx[g + 1].unwrap());
-            self.emit
                 .emit_vstore(val_addr_a, self.ctx.all_val[g].unwrap());
-            self.emit
-                .emit_vstore(val_addr_b, self.ctx.all_val[g + 1].unwrap());
+
+            if g + 1 < n_groups {
+                let offset_b = ((g + 1) * VLEN) as i64;
+                self.emit.set_next_var_type(VarType::Constant);
+                let off_b = self.emit.emit_const_choice(offset_b);
+                self.emit.set_next_var_type(VarType::Address);
+                let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+                self.emit.set_next_var_type(VarType::Address);
+                let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
+                self.emit
+                    .emit_vstore(idx_addr_b, self.ctx.all_idx[g + 1].unwrap());
+                self.emit
+                    .emit_vstore(val_addr_b, self.ctx.all_val[g + 1].unwrap());
+            }
         }
     }
 
@@ -389,11 +389,11 @@ impl SsaTickTockKernelBuilder {
         // Tree access based on depth
         self.emit.set_phase(EmissionPhase::TreeAccess);
         match tree_depth {
-            0 => self.emit_depth0_access(n_iters),
-            1 => self.emit_depth1_access(n_iters),
-            2 => self.emit_depth2_access(n_iters),
-            3 => self.emit_depth3_access(n_iters),
-            _ => self.emit_scattered_access(n_iters),
+            0 => self.emit_depth0_access(n_iters, n_groups),
+            1 => self.emit_depth1_access(n_iters, n_groups),
+            2 => self.emit_depth2_access(n_iters, n_groups),
+            3 => self.emit_depth3_access(n_iters, n_groups),
+            _ => self.emit_scattered_access(n_iters, n_groups),
         }
 
         // XOR
@@ -572,14 +572,18 @@ impl SsaTickTockKernelBuilder {
     // Tree Access by Depth
     // =========================================================================
 
-    pub(super) fn emit_depth0_access(&mut self, n_iters: usize) {
+    pub(super) fn emit_depth0_access(&mut self, n_iters: usize, n_groups: usize) {
         // Depth 0: All at root - broadcast tree[0]
         let tc0 = self.ctx.tc[0].unwrap();
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
         for it in 0..n_iters {
+            let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                self.emit.set_iter_group(it, i);
+                if base_g + i >= n_groups {
+                    continue;
+                }
+                self.emit.set_iter_group(it, base_g + i);
                 self.emit.set_next_var_type(VarType::Temporary);
                 let v_nv = self.emit.emit_vbroadcast_force(tc0);
                 self.emit.set_next_var_type(VarType::RoundState);
@@ -589,7 +593,7 @@ impl SsaTickTockKernelBuilder {
         self.emit.clear_iter_group();
     }
 
-    pub(super) fn emit_depth1_access(&mut self, n_iters: usize) {
+    pub(super) fn emit_depth1_access(&mut self, n_iters: usize, n_groups: usize) {
         // Depth 1: 2-way selection (indices 1, 2) via select_2way_with_delta.
         let v_1 = self.ctx.v_1.unwrap();
         let v_td_1 = self.ctx.v_td_1.unwrap();
@@ -599,6 +603,9 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
+                if base_g + i >= n_groups {
+                    continue;
+                }
                 self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
                 self.emit.set_next_var_type(VarType::Condition);
@@ -612,7 +619,7 @@ impl SsaTickTockKernelBuilder {
         self.emit.clear_iter_group();
     }
 
-    pub(super) fn emit_depth2_access(&mut self, n_iters: usize) {
+    pub(super) fn emit_depth2_access(&mut self, n_iters: usize, n_groups: usize) {
         // Depth 2: 4-way selection (indices 3,4,5,6). First pair (tc3,tc4) as (base, delta); rest as full values.
         let v_tc3 = self.ctx.v_tc3.unwrap();
         let v_td_4 = self.ctx.v_td_4.unwrap();
@@ -624,6 +631,9 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
+                if base_g + i >= n_groups {
+                    continue;
+                }
                 self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
                 self.emit.set_next_var_type(VarType::Temporary);
@@ -635,7 +645,7 @@ impl SsaTickTockKernelBuilder {
         self.emit.clear_iter_group();
     }
 
-    pub(super) fn emit_depth3_access(&mut self, n_iters: usize) {
+    pub(super) fn emit_depth3_access(&mut self, n_iters: usize, n_groups: usize) {
         // Ensure depth 3 broadcasts are initialized
         self.ensure_depth3_broadcasts();
 
@@ -658,6 +668,9 @@ impl SsaTickTockKernelBuilder {
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
+                    if base_g + i >= n_groups {
+                        continue;
+                    }
                     let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                     // Bit extraction
@@ -696,6 +709,9 @@ impl SsaTickTockKernelBuilder {
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
+                    if base_g + i >= n_groups {
+                        continue;
+                    }
                     let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                     // First iteration: Mul
@@ -721,7 +737,7 @@ impl SsaTickTockKernelBuilder {
         }
     }
 
-    pub(super) fn emit_scattered_access(&mut self, n_iters: usize) {
+    pub(super) fn emit_scattered_access(&mut self, n_iters: usize, n_groups: usize) {
         // Scattered/gathered loads for depths 4+
         //
         // The ISA doesn't support gathered vload, so we need to compute addresses
@@ -742,6 +758,9 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
+                if base_g + i >= n_groups {
+                    continue;
+                }
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                 // For gathered access, we need 8 separate loads (or load_offset).
@@ -762,12 +781,19 @@ impl SsaTickTockKernelBuilder {
     // =========================================================================
 
     pub(super) fn emit_xor(&mut self, n_groups: usize) {
-        let n_iters = n_groups / UNROLL;
+        let n_iters = if n_groups == 0 {
+            0
+        } else {
+            (n_groups + UNROLL - 1) / UNROLL
+        };
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let g = base_g + i;
+                if g >= n_groups {
+                    continue;
+                }
                 let val = self.ctx.all_val[g].unwrap();
                 let v_nv = self.ctx.v_nv[it][i].unwrap();
                 self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_nv));
@@ -779,7 +805,7 @@ impl SsaTickTockKernelBuilder {
     // Hash Phase
     // =========================================================================
 
-    pub(super) fn emit_hash(&mut self, _n_groups: usize, n_iters: usize) {
+    pub(super) fn emit_hash(&mut self, n_groups: usize, n_iters: usize) {
         for hi in 0..6 {
             let (op1, _, op2, op3, _) = HASH_STAGES[hi];
 
@@ -787,6 +813,9 @@ impl SsaTickTockKernelBuilder {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
                     let g = base_g + i;
+                    if g >= n_groups {
+                        continue;
+                    }
                     let val = self.ctx.all_val[g].unwrap();
 
                     if self.ctx.hash_fma_mult[hi].is_some() {
