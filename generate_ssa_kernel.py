@@ -64,6 +64,12 @@ def main():
                         help="Disable VALU->ALU shifting (e.g. if hitting scratch budget)")
     parser.add_argument("--enable-tree-reduce-depth3", action="store_true",
                         help="Enable tree-reduce for depth-3 (8-way) selection (uses more scratch)")
+    parser.add_argument("--disable-const-choice", action="store_true",
+                        help="CP-SAT: fix ConstChoice to Load only (no AddImm)")
+    parser.add_argument("--disable-select-choice", action="store_true",
+                        help="CP-SAT: fix SelectChoice to vselect only (no FMA)")
+    parser.add_argument("--disable-shift", action="store_true",
+                        help="CP-SAT: disable VALU->ALU shift (no shift variables)")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -109,6 +115,8 @@ def main():
     print(f"  enable_tree_reduce_depth3={args.enable_tree_reduce_depth3}")
     if per_section_optimize is not None:
         print(f"  per_section_optimize_secs={per_section_optimize}")
+    if args.disable_const_choice or args.disable_select_choice or args.disable_shift:
+        print(f"  disable_const_choice={args.disable_const_choice}, disable_select_choice={args.disable_select_choice}, disable_shift={args.disable_shift}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -125,6 +133,9 @@ def main():
         per_section_optimize_secs=per_section_optimize,
         output_json=args.output_json,
         enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
+        disable_const_choice=args.disable_const_choice,
+        disable_select_choice=args.disable_select_choice,
+        disable_shift=args.disable_shift,
         # Note: liveness_detail parameter not available in Python bindings yet
         # It's only used when output_json is provided anyway
     )

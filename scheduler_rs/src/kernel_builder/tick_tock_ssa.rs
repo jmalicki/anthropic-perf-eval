@@ -265,6 +265,18 @@ impl SsaTickTockKernelBuilder {
         // Build VReg metadata for liveness debugging (before lowering loses SSA info)
         let vreg_metadata = build_vreg_metadata(&ssa_ops);
 
+        // Debug: dump scheduler decisions for comparison (e.g. CP-SAT vs greedy)
+        if std::env::var("SCHEDULER_DEBUG_DECISIONS").is_ok() {
+            let mut s: Vec<_> = shifted_ops.iter().copied().collect();
+            s.sort_unstable();
+            let mut f: Vec<_> = greedy_select_fma_ops.iter().copied().collect();
+            f.sort_unstable();
+            eprintln!(
+                "[GREEDY_DECISIONS] shifted_ops={:?} const_add_imm_ops=[] select_fma_ops={:?}",
+                s, f
+            );
+        }
+
         // Lower to concrete ops, expanding shifted VALU ops to ALU
         // Greedy scheduler always uses Load for ConstChoice (no AddImm decisions)
         // Greedy scheduler chooses SelectChoice path based on resource availability
@@ -319,6 +331,9 @@ impl SsaTickTockKernelBuilder {
         enable_valu_shift: bool,
         per_section_optimize_secs: Option<f64>,
         forced_shifts: Option<HashSet<usize>>,
+        disable_const_choice: bool,
+        disable_select_choice: bool,
+        disable_shift: bool,
     ) -> Result<SsaScheduleResult, String> {
         use crate::types::Opcode;
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
@@ -663,6 +678,9 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift,
             scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
+            disable_const_choice,
+            disable_select_choice,
+            disable_shift,
             ..Default::default()
         };
 
@@ -738,6 +756,20 @@ impl SsaTickTockKernelBuilder {
         }
 
         let cycles = cpsat_result.makespan;
+
+        if std::env::var("SCHEDULER_DEBUG_DECISIONS").is_ok() {
+            let mut s: Vec<_> = cpsat_result.shifted_ops.iter().copied().collect();
+            s.sort_unstable();
+            let mut c: Vec<_> = cpsat_result.const_add_imm_ops.iter().copied().collect();
+            c.sort_unstable();
+            let mut f: Vec<_> = cpsat_result.select_fma_ops.iter().copied().collect();
+            f.sort_unstable();
+            eprintln!(
+                "[CPSAT_DECISIONS] shifted_ops={:?} const_add_imm_ops={:?} select_fma_ops={:?}",
+                s, c, f
+            );
+        }
+
         let shifted_ops = cpsat_result.shifted_ops;
 
         if verbose {
@@ -799,12 +831,19 @@ impl SsaTickTockKernelBuilder {
         let vreg_metadata = build_vreg_metadata(&ssa_ops);
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
+        // Optional: force all ConstChoice to Load (for debugging CP-SAT validation vs greedy)
+        let empty_const: HashSet<usize> = HashSet::new();
+        let const_add_imm_ops = if std::env::var("SCHEDULER_FORCE_CONST_LOAD").is_ok() {
+            &empty_const
+        } else {
+            &cpsat_result.const_add_imm_ops
+        };
         let valu_shifted = shifted_ops.len();
         let ops = lower_ssa_ops_with_shift(
             &ssa_ops,
             &address_result.vreg_to_addr,
             &shifted_ops,
-            &cpsat_result.const_add_imm_ops, // CP-SAT decisions for ConstChoice
+            const_add_imm_ops,
             &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
             &cpsat_result.shifted_alu_cycles, // Individual ALU cycles from CP-SAT
         );
@@ -2925,10 +2964,9 @@ mod tests {
             true,   // enable_valu_shift
             None,   // per_section_optimize_secs
             None,   // forced_shifts
-            30.0,   // Short time limit; small kernel solves quickly
-            false,  // verbose
-            false,  // enable_valu_shift to keep test deterministic and faster
-            None,   // per_section_optimize_secs: feasibility only
+            false,  // disable_const_choice
+            false,  // disable_select_choice
+            false,  // disable_shift
         );
         assert!(result.is_ok(), "build_and_schedule_cpsat should succeed: {:?}", result.err());
         let result = result.unwrap();

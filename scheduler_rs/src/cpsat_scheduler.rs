@@ -1330,6 +1330,12 @@ pub struct SsaCpsatConfig {
     pub model_name: Option<String>,
     /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
     pub machine: MachineConfig,
+    /// If true, fix ConstChoice to Load only (no AddImm); no choice variable.
+    pub disable_const_choice: bool,
+    /// If true, fix SelectChoice to vselect only (no FMA); no choice variable.
+    pub disable_select_choice: bool,
+    /// If true, disable VALU->ALU shift; no shift variables.
+    pub disable_shift: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1342,6 +1348,9 @@ impl Default for SsaCpsatConfig {
             scratch_budget: 1536, // Default hardware limit
             model_name: None,
             machine: MachineConfig::default(),
+            disable_const_choice: false,
+            disable_select_choice: false,
+            disable_shift: false,
         }
     }
 }
@@ -1541,6 +1550,9 @@ pub fn schedule_ssa_cpsat(
         scratch_budget,
         model_name,
         machine,
+        disable_const_choice,
+        disable_select_choice,
+        disable_shift,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -1724,6 +1736,7 @@ pub fn schedule_ssa_cpsat(
     // New: Store completion cycle variable (max of 8 ALU cycles) per shifted VALU op
     let mut completion_cycle_vars: HashMap<usize, IntVar> = HashMap::new();
 
+    if !disable_shift {
     for &idx in &shiftable_valu {
         // shift[idx] = 1 means shift to ALU, 0 means keep on VALU
         let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
@@ -1819,6 +1832,7 @@ pub fn schedule_ssa_cpsat(
         //       minimize (scale * makespan + sum of completion_cycles) so that for equal
         //       makespan we prefer earlier completion (more spread), freeing capacity.
     }
+    } // end if !disable_shift
 
     // 5c. Add precedence constraints for consumers of shifted VALU ops
     // Consumers must wait for completion_cycle (when all 8 ALU ops have completed)
@@ -1854,33 +1868,34 @@ pub fn schedule_ssa_cpsat(
     let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
 
     for &idx in &const_choice_ops {
-        // Decision: true = use AddImm (Flow), false = use Load
-        let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
-        const_choice_vars.insert(idx, choice_var);
+        if disable_const_choice {
+            // Fixed encoding: Load only (no choice variable)
+            let load_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+            const_load_intervals.insert(idx, load_interval);
+        } else {
+            // Decision: true = use AddImm (Flow), false = use Load
+            let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
+            const_choice_vars.insert(idx, choice_var);
 
-        // Load variant: present when choice_var = false
-        let load_interval = model.new_optional_fixed_size_interval_var(
-            cycle_vars[idx],
-            1,
-            choice_var.not(),
-        );
-        const_load_intervals.insert(idx, load_interval);
+            // Load variant: present when choice_var = false
+            let load_interval = model.new_optional_fixed_size_interval_var(
+                cycle_vars[idx],
+                1,
+                choice_var.not(),
+            );
+            const_load_intervals.insert(idx, load_interval);
 
-        // AddImm variant: present when choice_var = true
-        let add_imm_interval = model.new_optional_fixed_size_interval_var(
-            cycle_vars[idx],
-            1,
-            choice_var,
-        );
-        const_flow_intervals.insert(idx, add_imm_interval);
+            // AddImm variant: present when choice_var = true
+            let add_imm_interval = model.new_optional_fixed_size_interval_var(
+                cycle_vars[idx],
+                1,
+                choice_var,
+            );
+            const_flow_intervals.insert(idx, add_imm_interval);
 
-        // AddImm can use address 0 directly - no precedence constraint needed!
-        // Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0 is
-        // guaranteed by hardware initialization. AddImm operations can reference address 0
-        // immediately without waiting for any op to "produce" zero.
-
-        // Hint from greedy (default: Load)
-        model.add_hint(choice_var, 0); // false = use Load
+            // Hint from greedy (default: Load)
+            model.add_hint(choice_var, 0); // false = use Load
+        }
     }
 
     // 6c. Create SelectChoice decision variables and optional intervals
@@ -1895,70 +1910,76 @@ pub fn schedule_ssa_cpsat(
     let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
 
     for &idx in &select_choice_ops {
-        // Decision: true = use FMA (VALU), false = use vselect (Flow)
-        let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
-        select_choice_vars.insert(idx, choice_var);
+        if disable_select_choice {
+            // Fixed encoding: vselect (Flow) only (no choice variable)
+            let flow_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+            select_flow_intervals.insert(idx, flow_interval);
+        } else {
+            // Decision: true = use FMA (VALU), false = use vselect (Flow)
+            let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
+            select_choice_vars.insert(idx, choice_var);
 
-        // Hint from greedy (default: vselect to match greedy behavior)
-        if let Some(hints) = select_choice_hints {
-            if hints.contains(&ops[idx].id) {
-                model.add_hint(choice_var, 1); // true = use FMA
+            // Hint from greedy (default: vselect to match greedy behavior)
+            if let Some(hints) = select_choice_hints {
+                if hints.contains(&ops[idx].id) {
+                    model.add_hint(choice_var, 1); // true = use FMA
+                } else {
+                    model.add_hint(choice_var, 0); // false = use vselect
+                }
             } else {
-                model.add_hint(choice_var, 0); // false = use vselect
+                model.add_hint(choice_var, 0); // Default: vselect
             }
-        } else {
-            model.add_hint(choice_var, 0); // Default: vselect
+
+            // Flow interval (vselect): present when choice_var = false
+            let flow_interval = model.new_optional_fixed_size_interval_var(
+                cycle_vars[idx],
+                1,
+                choice_var.not(),
+            );
+            select_flow_intervals.insert(idx, flow_interval);
+
+            // VALU intervals (FMA): present when choice_var = true
+            let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
+                // Case A: delta_vreg is set - 1 VALU op (FMA directly)
+                vec![model.new_optional_fixed_size_interval_var(
+                    cycle_vars[idx],
+                    1,
+                    choice_var,
+                )]
+            } else {
+                // Case B: delta_vreg is not set - 2 sequential VALU ops (sub + fma)
+                // Sub op at cycle c, FMA op at cycle c+1
+                let sub_interval = model.new_optional_fixed_size_interval_var(
+                    cycle_vars[idx],
+                    1,
+                    choice_var,
+                );
+                
+                // For FMA, we need cycle_vars[idx] + 1. Since cycle_vars[idx] has domain [asap, alap],
+                // we create a new int var for fma_cycle with domain [asap+1, alap+1] and constraint
+                // fma_cycle = cycle_vars[idx] + 1
+                let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+                let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+                let fma_cycle_var = model.new_int_var_with_name(
+                    [(fma_asap as i64, fma_alap as i64)],
+                    format!("fma_cycle_{}", idx),
+                );
+                // Constraint: fma_cycle = cycle_vars[idx] + 1 (only enforced when choice_var = true)
+                // TODO: Fix CP-SAT API - only_enforce_if method may have changed
+                // For now, create the constraint unconditionally - the optional interval will handle enforcement
+                model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
+                // Note: The fma_interval below is optional (based on choice_var), so the constraint
+                // is effectively conditional through the interval's presence
+                
+                let fma_interval = model.new_optional_fixed_size_interval_var(
+                    fma_cycle_var,
+                    1,
+                    choice_var,
+                );
+                vec![sub_interval, fma_interval]
+            };
+            select_valu_intervals.insert(idx, valu_intervals);
         }
-
-        // Flow interval (vselect): present when choice_var = false
-        let flow_interval = model.new_optional_fixed_size_interval_var(
-            cycle_vars[idx],
-            1,
-            choice_var.not(),
-        );
-        select_flow_intervals.insert(idx, flow_interval);
-
-        // VALU intervals (FMA): present when choice_var = true
-        let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
-            // Case A: delta_vreg is set - 1 VALU op (FMA directly)
-            vec![model.new_optional_fixed_size_interval_var(
-                cycle_vars[idx],
-                1,
-                choice_var,
-            )]
-        } else {
-            // Case B: delta_vreg is not set - 2 sequential VALU ops (sub + fma)
-            // Sub op at cycle c, FMA op at cycle c+1
-            let sub_interval = model.new_optional_fixed_size_interval_var(
-                cycle_vars[idx],
-                1,
-                choice_var,
-            );
-            
-            // For FMA, we need cycle_vars[idx] + 1. Since cycle_vars[idx] has domain [asap, alap],
-            // we create a new int var for fma_cycle with domain [asap+1, alap+1] and constraint
-            // fma_cycle = cycle_vars[idx] + 1
-            let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-            let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-            let fma_cycle_var = model.new_int_var_with_name(
-                [(fma_asap as i64, fma_alap as i64)],
-                format!("fma_cycle_{}", idx),
-            );
-            // Constraint: fma_cycle = cycle_vars[idx] + 1 (only enforced when choice_var = true)
-            // TODO: Fix CP-SAT API - only_enforce_if method may have changed
-            // For now, create the constraint unconditionally - the optional interval will handle enforcement
-            model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
-            // Note: The fma_interval below is optional (based on choice_var), so the constraint
-            // is effectively conditional through the interval's presence
-            
-            let fma_interval = model.new_optional_fixed_size_interval_var(
-                fma_cycle_var,
-                1,
-                choice_var,
-            );
-            vec![sub_interval, fma_interval]
-        };
-        select_valu_intervals.insert(idx, valu_intervals);
     }
 
     // 7. Create regular intervals for non-shiftable, non-ConstChoice, non-SelectChoice ops
@@ -2000,9 +2021,12 @@ pub fn schedule_ssa_cpsat(
             valu_demands.push(1);
         }
 
-        // Add optional VALU intervals (present when not shifted)
+        // Add VALU intervals for shiftable ops: when shift disabled use required interval; else optional (present when not shifted)
         for &idx in &shiftable_valu {
-            if let Some(&iv) = valu_optional_intervals.get(&idx) {
+            if disable_shift {
+                valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+                valu_demands.push(1);
+            } else if let Some(&iv) = valu_optional_intervals.get(&idx) {
                 valu_intervals.push(iv);
                 valu_demands.push(1);
             }
@@ -2387,6 +2411,7 @@ pub fn schedule_ssa_cpsat(
             }
 
             // Segment mode: add scratch for SelectChoice FMA sub_temp_vreg (def at op.cycle, last use at op.cycle+1)
+            // Use fixed-size interval (size=2) — cheaper than variable-size; see CP-SAT Primer on interval types.
             if let Some(fma_ids) = select_choice_hints {
                 for (op_idx, op) in ops.iter().enumerate() {
                     if op.opcode == Opcode::SelectChoice
@@ -2397,14 +2422,7 @@ pub fn schedule_ssa_cpsat(
                             continue;
                         }
                         let start = cycle_vars[op_idx];
-                        let end_expr = LinearExpr::from(start) + 2; // [c, c+2) = cycles c and c+1
-                        let size_two =
-                            model.new_int_var_with_name([(2, 2)], format!("sub_temp_size_op_{}", op.id));
-                        model.add_eq(
-                            LinearExpr::from(start) + LinearExpr::from(size_two),
-                            end_expr.clone(),
-                        );
-                        let interval = model.new_interval_var(start, size_two, end_expr);
+                        let interval = model.new_fixed_size_interval_var(start, 2);
                         scratch_intervals.push(interval);
                         scratch_demands.push(8); // vector = VLEN words
                     }
@@ -2710,11 +2728,18 @@ pub fn schedule_ssa_cpsat(
     }
 
     // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops (tie-breaker).
-    // Objective: scale * makespan + sum(completion_cycle). Scale is chosen so it's a true tie-breaker:
-    // scale = (horizon+1)*(n+1) > n*horizon = max(sum(completion_cycle)), so one unit of makespan
-    // always dominates the entire sum — we never sacrifice makespan for earlier completion.
+    //
+    // Objective = scale * makespan + sum(completion_cycle).
+    // Scale is chosen as the next power of 10 above max(sum(completion_cycle)):
+    //   (1) True tie-breaker: scale > max_sum, so one extra cycle always dominates the sum.
+    //   (2) Leading digits of the objective value are the makespan (cycle count), e.g.
+    //       objective 104_042_000 => makespan 104, tie-breaker sum 42_000.
     if let Some((&first_cc, rest)) = completion_cycle_vars.values().next().map(|v| (v, completion_cycle_vars.values().skip(1))) {
-        let scale = (horizon as i64 + 1) * (completion_cycle_vars.len() as i64 + 1);
+        let max_sum = (completion_cycle_vars.len() as i64) * (horizon as i64);
+        let mut scale = 1i64;
+        while scale <= max_sum {
+            scale = scale.saturating_mul(10);
+        }
         let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| acc + LinearExpr::from(v));
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
@@ -2761,12 +2786,14 @@ pub fn schedule_ssa_cpsat(
             shift_vars.len() - hinted_shift_count
         );
     }
-    for &idx in &shiftable_valu {
-        let shift_var = shift_vars.get(&idx).expect("shift_var should exist for all shiftable ops");
-        let should_shift = shift_hints
-            .map(|hints| hints.contains(&ops[idx].id))
-            .unwrap_or(false);
-        model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
+    if !shift_vars.is_empty() {
+        for &idx in &shiftable_valu {
+            let shift_var = shift_vars.get(&idx).expect("shift_var should exist for all shiftable ops");
+            let should_shift = shift_hints
+                .map(|hints| hints.contains(&ops[idx].id))
+                .unwrap_or(false);
+            model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
+        }
     }
 
     // Hint completion_cycle and alu_cycle for shiftable ops so CP-SAT gets a full solution hint.
@@ -2796,6 +2823,12 @@ pub fn schedule_ssa_cpsat(
     // Always log search progress by default - user must go out of their way to suppress
     params.log_search_progress = Some(true);
     params.num_workers = Some(8);
+
+    // Ideal stop: once minimum cycles is proven (bound >= scale*M), i.e. when value - bound <= S
+    // (tie-breaker of current best). So the "right" gap would be S at runtime, not a fixed number.
+    // CP-SAT only accepts a fixed absolute_gap_limit at solve start, so we don't set it here:
+    // the solver runs until time limit or full optimality. If the crate gains solution callbacks,
+    // we could stop when best_bound >= scale * floor(best_objective_value / scale).
 
     // Optimize LP relaxation for tighter bounds and faster convergence
     // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
@@ -2834,40 +2867,42 @@ pub fn schedule_ssa_cpsat(
             let mut cycle_assignments: Vec<i32> = Vec::with_capacity(ops.len());
             for (idx, _) in ops.iter().enumerate() {
                 if shiftable_set.contains(&idx) {
-                    // Check if this VALU op was shifted
-                    let shift_var = shift_vars.get(&idx).expect("shift_var should exist");
-                    let is_shifted = shift_var.solution_value(&response);
-                    
-                    if is_shifted {
-                        // Use completion_cycle (max of all 8 ALU cycles)
-                        if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
-                            cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
+                    if let Some(shift_var) = shift_vars.get(&idx) {
+                        let is_shifted = shift_var.solution_value(&response);
+                        if is_shifted {
+                            if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
+                                cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
+                            } else {
+                                cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                            }
                         } else {
-                            // Fallback: use original cycle_var (shouldn't happen)
                             cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
                         }
                     } else {
-                        // Not shifted: use original cycle_var
+                        // Shift disabled: no shift var, use cycle_var
                         cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
                     }
                 } else {
-                    // Not a shiftable VALU op: use original cycle_var
                     cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
                 }
             }
 
             let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
 
-            // Extract shift decisions
-            let shifted_ops: HashSet<usize> = shift_vars
-                .iter()
-                .filter(|(_, &var)| var.solution_value(&response))
-                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
-                .collect();
+            // Extract shift decisions (empty when shift disabled)
+            let shifted_ops: HashSet<usize> = if shift_vars.is_empty() {
+                HashSet::new()
+            } else {
+                shift_vars
+                    .iter()
+                    .filter(|(_, &var)| var.solution_value(&response))
+                    .map(|(&idx, _)| ops[idx].id)
+                    .collect()
+            };
 
             // Debug: Extract shift decisions for high-impact ops
             let high_impact_op_ids: HashSet<usize> = [244, 287, 291, 285, 323, 289, 262].iter().copied().collect();
-            if verbose {
+            if verbose && !shift_vars.is_empty() {
                 for &idx in &shiftable_valu {
                     let op_id = ops[idx].id;
                     if high_impact_op_ids.contains(&op_id) {
@@ -2916,19 +2951,27 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Extract ConstChoice decisions
-            let const_add_imm_ops: HashSet<usize> = const_choice_vars
-                .iter()
-                .filter(|(_, &var)| var.solution_value(&response))
-                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
-                .collect();
+            // Extract ConstChoice decisions (empty when ConstChoice disabled)
+            let const_add_imm_ops: HashSet<usize> = if const_choice_vars.is_empty() {
+                HashSet::new()
+            } else {
+                const_choice_vars
+                    .iter()
+                    .filter(|(_, &var)| var.solution_value(&response))
+                    .map(|(&idx, _)| ops[idx].id)
+                    .collect()
+            };
 
-            // Extract SelectChoice decisions
-            let select_fma_ops: HashSet<usize> = select_choice_vars
-                .iter()
-                .filter(|(_, &var)| var.solution_value(&response))
-                .map(|(&idx, _)| ops[idx].id) // Return op IDs, not indices
-                .collect();
+            // Extract SelectChoice decisions (empty when SelectChoice disabled)
+            let select_fma_ops: HashSet<usize> = if select_choice_vars.is_empty() {
+                HashSet::new()
+            } else {
+                select_choice_vars
+                    .iter()
+                    .filter(|(_, &var)| var.solution_value(&response))
+                    .map(|(&idx, _)| ops[idx].id)
+                    .collect()
+            };
 
             // Solution breadcrumbs: log Flow audit when verbose (before validation)
             if verbose {
