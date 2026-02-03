@@ -1,4 +1,7 @@
 //! Core types and constants for the scheduler.
+//!
+//! [`MachineConfig`] defines slot capacities per engine (ALU, VALU, Load, Store, Flow)
+//! and is used by the CP-SAT scheduler; [`Engine::slot_limit()`] gives the default hardware limits.
 
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
@@ -85,6 +88,69 @@ impl Engine {
             self,
             Engine::EliminatedBroadcast | Engine::ShiftedValu | Engine::Barrier
         )
+    }
+
+    /// Slot limit for this engine from a machine config (for configurable machines).
+    /// Returns 0 for non-hardware / internal engines.
+    pub fn slot_limit_from(&self, machine: &MachineConfig) -> u32 {
+        match self {
+            Engine::Load => machine.load_slots,
+            Engine::Store => machine.store_slots,
+            Engine::Alu => machine.alu_slots,
+            Engine::Valu => machine.valu_slots,
+            Engine::Flow => machine.flow_slots,
+            Engine::Debug => 64,
+            Engine::EliminatedBroadcast | Engine::ShiftedValu | Engine::Barrier => 0,
+        }
+    }
+}
+
+// ============================================================================
+// MachineConfig
+// ============================================================================
+
+/// Machine configuration: slot capacities per engine per cycle.
+///
+/// Defines the target machine for scheduling. The scheduler uses these limits
+/// in cumulative constraints (no more than `N` ops of a given engine per cycle)
+/// and in capacity-based lower bounds on makespan.
+///
+/// **Default** ([`Default::default()`]): Matches the hardware spec (ALU 12, VALU 6,
+/// Load 2, Store 2, Flow 1). Override for tests or alternate machines (e.g.
+/// toy configs with 1 VALU / 8 ALU to exercise VALU→ALU shifting).
+///
+/// Used by [`crate::cpsat_scheduler::SsaCpsatConfig::machine`]; the greedy
+/// scheduler still uses [`Engine::slot_limit()`] (fixed hardware values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineConfig {
+    /// ALU slots per cycle (default 12).
+    pub alu_slots: u32,
+    /// VALU slots per cycle (default 6). A shifted VALU op uses 8 ALU slots instead.
+    pub valu_slots: u32,
+    /// Load slots per cycle (default 2).
+    pub load_slots: u32,
+    /// Store slots per cycle (default 2).
+    pub store_slots: u32,
+    /// Flow slots per cycle (default 1). vselect, AddImm, jump, etc.
+    pub flow_slots: u32,
+}
+
+impl Default for MachineConfig {
+    fn default() -> Self {
+        Self {
+            alu_slots: 12,
+            valu_slots: 6,
+            load_slots: 2,
+            store_slots: 2,
+            flow_slots: 1,
+        }
+    }
+}
+
+impl MachineConfig {
+    /// Slot limit for an engine (for use in cumulative constraints and validation).
+    pub fn slot_limit(&self, engine: Engine) -> u32 {
+        engine.slot_limit_from(self)
     }
 }
 

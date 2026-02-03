@@ -163,7 +163,12 @@ impl SsaTickTockKernelBuilder {
 
     /// Schedule SSA ops with SelectChoice expansion support.
     /// Returns (cycles, budget_exceeded, peak_live)
-    /// 
+    ///
+    /// **VALU→ALU shifting (design choice):** We do not prefer shifting in greedy. We only shift
+    /// when VALU slots are full (6/6); otherwise we keep the op on VALU. Shift decisions are left
+    /// to CP-SAT, which optimizes them globally. Greedy provides cycle hints; CP-SAT decides which
+    /// ops to shift.
+    ///
     /// SelectChoice tracking is self-contained: ops report their relationship via methods.
     /// The sub and fma ops know they belong to a SelectChoice op through `select_choice_parent`.
     pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
@@ -529,6 +534,11 @@ impl SsaTickTockKernelBuilder {
                     }
 
                     // Schedule the op
+                    //
+                    // Design choice: we do NOT prefer VALU→ALU shifting in greedy. We only shift when
+                    // VALU is full (valu_used >= 6). Shift decisions are left to CP-SAT, which can
+                    // optimize them globally; greedy just provides cycle hints and shifts only when
+                    // necessary to make progress.
                     match engine {
                         Engine::Load => load_used += 1,
                         Engine::Store => store_used += 1,
@@ -653,6 +663,7 @@ impl SsaTickTockKernelBuilder {
                     }
                     budget_exceeded = true;
                     #[allow(unused_assignments)]
+                    // Same design as normal path: shift only when VALU full, not by preference
                     match engine {
                         Engine::Load => load_used += 1,
                         Engine::Store => store_used += 1,
@@ -940,8 +951,7 @@ impl SsaTickTockKernelBuilder {
                             valu_used += 1;
                             true
                         } else if can_shift && alu_used + VLEN <= 12 {
-                            // VALU is full, but we can shift to ALU
-                            // Shifted VALU op uses 8 ALU slots
+                            // Design choice: shift only when VALU full; we do not prefer shifting in greedy (CP-SAT decides).
                             alu_used += VLEN;
                             shifted_ops.insert(op.id);
                             true

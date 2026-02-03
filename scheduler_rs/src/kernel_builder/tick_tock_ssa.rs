@@ -538,6 +538,7 @@ impl SsaTickTockKernelBuilder {
                     enable_valu_shift: false, // Per-section: no VALU shift
                     scratch_budget: effective_budget,
                     model_name: Some(format!("section_{}_feasibility", k)),
+                    ..Default::default()
                 };
                 let seg_shift: Option<&HashSet<usize>> = None; // Per-section: no shift hints
                 let seg_select = if greedy_select_fma_ops.is_empty() {
@@ -655,6 +656,7 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift,
             scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
+            ..Default::default()
         };
 
         // Pass shift hints if VALU shift is enabled
@@ -2833,6 +2835,7 @@ mod tests {
                 scratch_budget: 1536,  // Hardware limit
                 enable_valu_shift: false,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),

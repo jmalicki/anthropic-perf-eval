@@ -22,7 +22,8 @@
 //! 1. **Precedence constraints**: If op j depends on op i, then `cycle[j] >= cycle[i] + 1`
 //!    (results are available the cycle after execution)
 //!
-//! 2. **Resource constraints (cumulative)**: Each engine has a limited number of slots per cycle:
+//! 2. **Resource constraints (cumulative)**: Each engine has a limited number of slots per cycle,
+//!    defined by [`SsaCpsatConfig::machine`] ([`crate::types::MachineConfig`]). Default capacities:
 //!    - ALU: 12 slots/cycle
 //!    - VALU: 6 slots/cycle
 //!    - Load: 2 slots/cycle
@@ -30,7 +31,7 @@
 //!    - Flow: 1 slot/cycle
 //!
 //!    We model this with cumulative constraints: the sum of ops executing in any cycle
-//!    must not exceed the engine's capacity.
+//!    must not exceed the engine's capacity. Override `config.machine` for tests or alternate machines.
 //!
 //!    **Optional intervals**: For ops with alternatives (Shift, ConstChoice), we use optional
 //!    intervals that are conditionally present based on the decision variable. Both alternatives
@@ -48,9 +49,10 @@
 //!
 //! ### Capacity Bounds
 //!
-//! For each engine: `makespan >= ceil(num_ops / capacity)`
+//! For each engine: `makespan >= ceil(num_ops / capacity)` where capacity is from
+//! [`SsaCpsatConfig::machine`].
 //!
-//! Example: 9838 VALU ops with 6 slots/cycle requires at least ceil(9838/6) = 1640 cycles.
+//! Example: 9838 VALU ops with default VALU capacity 6 requires at least ceil(9838/6) = 1640 cycles.
 //! This is often tighter than the critical path bound.
 //!
 //! ### Profile Bounds (Energy-Based)
@@ -68,7 +70,7 @@
 //! These ops need `ceil(count / capacity)` cycles starting from t, so:
 //!   - `makespan >= t + ceil(count / capacity)`
 //!
-//! Example: If 9837 VALU ops have ASAP >= 1, they need ceil(9837/6) = 1640 cycles
+//! Example: If 9837 VALU ops have ASAP >= 1 and default VALU capacity 6, they need ceil(9837/6) = 1640 cycles
 //! starting from cycle 1, giving makespan >= 1641.
 //!
 //! ### Sparse Window Bounds
@@ -124,7 +126,7 @@ use cp_sat::proto::{CpSolverStatus, SatParameters};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Not;
 
-use crate::types::{Engine, Op, Opcode, SsaOp, VReg, VLEN};
+use crate::types::{Engine, MachineConfig, Op, Opcode, SsaOp, VReg, VLEN};
 
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
@@ -430,6 +432,7 @@ fn validate_ssa_slot_limits(
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
     select_fma_ops: &HashSet<usize>,
+    machine: &MachineConfig,
 ) {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
     if makespan <= 0 {
@@ -499,12 +502,12 @@ fn validate_ssa_slot_limits(
         }
     }
 
-    let limits: [(usize, &str); 5] = [
-        (Engine::Alu.slot_limit(), "ALU"),
-        (Engine::Valu.slot_limit(), "VALU"),
-        (Engine::Load.slot_limit(), "Load"),
-        (Engine::Store.slot_limit(), "Store"),
-        (Engine::Flow.slot_limit(), "Flow"),
+    let limits: [(u32, &str); 5] = [
+        (machine.slot_limit(Engine::Alu), "ALU"),
+        (machine.slot_limit(Engine::Valu), "VALU"),
+        (machine.slot_limit(Engine::Load), "Load"),
+        (machine.slot_limit(Engine::Store), "Store"),
+        (machine.slot_limit(Engine::Flow), "Flow"),
     ];
     let counts = [
         &alu_per_cycle,
@@ -532,7 +535,7 @@ fn validate_ssa_slot_limits(
                         format_flow_violation_breadcrumbs(
                             cycle,
                             count,
-                            *limit,
+                            *limit as usize,
                             &flow_rows,
                             &flow_contributors_per_cycle,
                             const_add_imm_ops,
@@ -1201,7 +1204,11 @@ pub fn schedule_cpsat(_ops: &[Op], _config: CpsatConfig<'_>) -> Option<CpsatResu
 // SSA CP-SAT Scheduling
 // ============================================================================
 
-/// Configuration for SSA CP-SAT scheduling
+/// Configuration for SSA CP-SAT scheduling.
+///
+/// Slot capacities come from [`machine`](SsaCpsatConfig::machine); use
+/// [`MachineConfig::default()`] for the hardware spec or override for tests (e.g.
+/// `MachineConfig { valu_slots: 1, alu_slots: 8, ..Default::default() }` to exercise shifting).
 #[derive(Debug, Clone)]
 pub struct SsaCpsatConfig {
     /// Maximum solving time in seconds (default: 60.0)
@@ -1216,6 +1223,8 @@ pub struct SsaCpsatConfig {
     pub scratch_budget: usize,
     /// Optional name for the model (appears in solver log, e.g. "Presolved optimization model 'name'").
     pub model_name: Option<String>,
+    /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
+    pub machine: MachineConfig,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1227,6 +1236,7 @@ impl Default for SsaCpsatConfig {
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
             model_name: None,
+            machine: MachineConfig::default(),
         }
     }
 }
@@ -1419,7 +1429,14 @@ pub fn schedule_ssa_cpsat(
         enable_valu_shift,
         scratch_budget,
         model_name,
+        machine,
     } = config;
+
+    let valu_cap: i64 = machine.valu_slots as i64;
+    let alu_cap: i64 = machine.alu_slots as i64;
+    let load_cap: i64 = machine.load_slots as i64;
+    let store_cap: i64 = machine.store_slots as i64;
+    let flow_cap: i64 = machine.flow_slots as i64;
     let greedy_hints = hints.greedy_hints;
     let shift_hints = hints.shift_hints;
     let select_choice_hints = hints.select_choice_hints;
@@ -1774,7 +1791,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !valu_intervals.is_empty() {
-            model.add_cumulative(valu_intervals, valu_demands, 6); // VALU has 6 slots
+            model.add_cumulative(valu_intervals, valu_demands, valu_cap);
         }
     }
 
@@ -1798,7 +1815,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !alu_intervals.is_empty() {
-            model.add_cumulative(alu_intervals, alu_demands, 12); // ALU has 12 slots
+            model.add_cumulative(alu_intervals, alu_demands, alu_cap);
         }
     }
 
@@ -1828,7 +1845,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !load_intervals.is_empty() {
-            model.add_cumulative(load_intervals, load_demands, 2); // Load has 2 slots
+            model.add_cumulative(load_intervals, load_demands, load_cap);
         }
     }
 
@@ -1846,7 +1863,7 @@ pub fn schedule_ssa_cpsat(
                 .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
                 .collect();
             let demands: Vec<i64> = vec![1; intervals.len()];
-            model.add_cumulative(intervals, demands, 2); // Store has 2 slots
+            model.add_cumulative(intervals, demands, store_cap);
         }
     }
 
@@ -1918,13 +1935,13 @@ pub fn schedule_ssa_cpsat(
                 select_choice_ops.iter().map(|&i| ops[i].id).collect::<Vec<_>>()
             );
             eprintln!(
-                "[Flow model breadcrumbs] Flow cumulative: total intervals={}, capacity=1",
-                flow_intervals.len()
+                "[Flow model breadcrumbs] Flow cumulative: total intervals={}, capacity={}",
+                flow_intervals.len(), flow_cap
             );
         }
 
         if !flow_intervals.is_empty() {
-            model.add_cumulative(flow_intervals.clone(), flow_demands, 1); // Flow has 1 slot
+            model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
             // Redundant with cumulative(1): no two Flow intervals overlap when present.
             model.add_no_overlap(flow_intervals);
         }
@@ -2352,15 +2369,15 @@ pub fn schedule_ssa_cpsat(
         let mut valu_violations = 0;
         let mut alu_violations = 0;
         for cycle in 0..max_cycle {
-            if valu_per_cycle[cycle] > 6 {
+            if (valu_per_cycle[cycle] as i64) > valu_cap {
                 if valu_violations < 3 && verbose {
-                    eprintln!("  WARNING: VALU overflow at cycle {}: {} > 6", cycle, valu_per_cycle[cycle]);
+                    eprintln!("  WARNING: VALU overflow at cycle {}: {} > {}", cycle, valu_per_cycle[cycle], valu_cap);
                 }
                 valu_violations += 1;
             }
-            if alu_per_cycle[cycle] > 12 {
+            if (alu_per_cycle[cycle] as i64) > alu_cap {
                 if alu_violations < 3 && verbose {
-                    eprintln!("  WARNING: ALU overflow at cycle {}: {} > 12", cycle, alu_per_cycle[cycle]);
+                    eprintln!("  WARNING: ALU overflow at cycle {}: {} > {}", cycle, alu_per_cycle[cycle], alu_cap);
                 }
                 alu_violations += 1;
             }
@@ -2379,7 +2396,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         if verbose {
-            eprintln!("  Engine capacity verification: OK (VALU<=6, ALU<=12 at all cycles)");
+            eprintln!("  Engine capacity verification: OK (VALU<={}, ALU<={} at all cycles)", valu_cap, alu_cap);
         }
     }
 
@@ -2394,39 +2411,30 @@ pub fn schedule_ssa_cpsat(
     let store_count = ops.iter().filter(|op| op.engine == Engine::Store).count() as i64;
 
     // Without shifting: VALU bound
-    let valu_only_bound = (valu_count + 5) / 6;
+    let valu_only_bound = (valu_count + valu_cap - 1) / valu_cap;
     if !enable_valu_shift && valu_only_bound > capacity_lower_bound {
         capacity_lower_bound = valu_only_bound;
     }
 
-    // With shifting: combined ALU+VALU bound
-    // Each shifted VALU op uses 8 ALU slots
-    // Best case: shift as many VALU ops as ALU capacity allows
+    // With shifting: at least need enough cycles for VALU and ALU (solver may shift to balance)
     if enable_valu_shift {
-        // This is a rough lower bound - actual bound depends on shift decisions
-        // Minimum cycles needed to execute all ops considering both engines
-        let _total_valu_work = valu_count; // Each VALU op = 1 VALU slot or 8 ALU slots
-        let _total_alu_work = alu_count; // Each ALU op = 1 ALU slot
-
-        // Per cycle: up to 6 VALU + 12 ALU, but shifted VALU uses 8 ALU
-        // Lower bound: we need at least enough cycles to handle all work
-        // Simple bound: (total_alu + shifted_valu*8) / 12 combined with (unshifted_valu) / 6
-        // Approximate: max(alu_count/12, valu_count/6)
-        let combined_bound = (valu_count + alu_count + 5) / 14; // Rough approximation
-        if combined_bound > capacity_lower_bound {
-            capacity_lower_bound = combined_bound;
+        let valu_bound_cap = (valu_count + valu_cap - 1) / valu_cap;
+        let alu_bound_cap = if alu_count > 0 { (alu_count + alu_cap - 1) / alu_cap } else { 0 };
+        let combined = valu_bound_cap.max(alu_bound_cap);
+        if combined > capacity_lower_bound {
+            capacity_lower_bound = combined;
         }
     }
 
     // Other engine bounds
-    let load_bound = (load_count + 1) / 2;
-    let store_bound = (store_count + 1) / 2;
+    let load_bound = if load_cap > 0 { (load_count + load_cap - 1) / load_cap } else { 0 };
+    let store_bound = if store_cap > 0 { (store_count + store_cap - 1) / store_cap } else { 0 };
     capacity_lower_bound = capacity_lower_bound.max(load_bound).max(store_bound);
 
     if verbose {
         eprintln!(
             "  Capacity bounds: VALU={}, ALU={}, Load={}, Store={}, combined={}",
-            valu_only_bound, (alu_count + 11) / 12, load_bound, store_bound, capacity_lower_bound
+            valu_only_bound, (alu_count + alu_cap - 1) / alu_cap, load_bound, store_bound, capacity_lower_bound
         );
     }
 
@@ -2440,11 +2448,11 @@ pub fn schedule_ssa_cpsat(
     // The cumulative constraint's LP relaxation is weak; adding these as explicit linear
     // constraints helps the LP see the bound and can improve best_objective_bound.
     let alu_bound = if alu_count > 0 {
-        (alu_count + 11) / 12
+        (alu_count + alu_cap - 1) / alu_cap
     } else {
         0
     };
-    let valu_bound = (valu_count + 5) / 6;
+    let valu_bound = (valu_count + valu_cap - 1) / valu_cap;
     if alu_bound > 0 {
         let alu_lb = model.new_int_var([(alu_bound, alu_bound)]);
         model.add_ge(makespan, LinearExpr::from(alu_lb));
@@ -2453,13 +2461,13 @@ pub fn schedule_ssa_cpsat(
         let valu_lb = model.new_int_var([(valu_bound, valu_bound)]);
         model.add_ge(makespan, LinearExpr::from(valu_lb));
     }
-    if load_count > 0 {
-        let load_bound = (load_count + 1) / 2;
+    if load_count > 0 && load_cap > 0 {
+        let load_bound = (load_count + load_cap - 1) / load_cap;
         let load_lb = model.new_int_var([(load_bound, load_bound)]);
         model.add_ge(makespan, LinearExpr::from(load_lb));
     }
-    if store_count > 0 {
-        let store_bound = (store_count + 1) / 2;
+    if store_count > 0 && store_cap > 0 {
+        let store_bound = (store_count + store_cap - 1) / store_cap;
         let store_lb = model.new_int_var([(store_bound, store_bound)]);
         model.add_ge(makespan, LinearExpr::from(store_lb));
     }
@@ -2495,25 +2503,22 @@ pub fn schedule_ssa_cpsat(
         model.add_hint(makespan, hint_makespan as i64);
     }
 
-    // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings
-    // We create one shift variable per shiftable VALU op, so we should hint all of them
-    // If hints provided, use them; otherwise default to no shift (greedy's default)
+    // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings.
+    // Use greedy's shift decisions when provided; otherwise default to no shift (0).
     if !shift_vars.is_empty() && verbose {
         let hinted_shift_count = shift_hints.map(|h| shiftable_valu.iter().filter(|&&idx| h.contains(&ops[idx].id)).count()).unwrap_or(0);
-        eprintln!("  Hinting {} shift variables ({} with shift=true, {} with shift=false)", 
-                  shift_vars.len(),
-                  hinted_shift_count,
-                  shift_vars.len() - hinted_shift_count);
-        // Verify we're hinting all shift variables
-        assert_eq!(shift_vars.len(), shiftable_valu.len(), 
-                   "shift_vars should contain one entry per shiftable VALU op");
+        eprintln!(
+            "  Hinting {} shift variables ({} with shift=true, {} with shift=false)",
+            shift_vars.len(),
+            hinted_shift_count,
+            shift_vars.len() - hinted_shift_count
+        );
     }
-    // Hint all shift variables - this ensures CP-SAT has complete hints for all decision variables
     for &idx in &shiftable_valu {
         let shift_var = shift_vars.get(&idx).expect("shift_var should exist for all shiftable ops");
         let should_shift = shift_hints
             .map(|hints| hints.contains(&ops[idx].id))
-            .unwrap_or(false); // Default: no shift
+            .unwrap_or(false);
         model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
     }
 
@@ -2632,6 +2637,7 @@ pub fn schedule_ssa_cpsat(
                 &shifted_ops,
                 &const_add_imm_ops,
                 &select_fma_ops,
+                &machine,
             );
 
             if verbose {
@@ -2714,6 +2720,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -2766,6 +2773,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -2881,6 +2889,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -2980,6 +2989,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -2994,6 +3004,68 @@ mod ssa_tests {
         // The result should contain select_fma_ops (may be empty if solver chose vselect)
         assert!(result.select_fma_ops.len() <= 2, 
             "Should have at most 2 SelectChoice ops using FMA path");
+    }
+
+    /// Toy test: 3 parallel chains SelectChoice -> valu1 (shiftable) -> valu2, with a toy
+    /// [`MachineConfig`] (1 VALU slot, 8 ALU slots per cycle). With only 1 VALU slot we need
+    /// at least one valu1 to shift to ALU (8 slots). Asserts CP-SAT shifts at least one.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_valu_shift_toy() {
+        let mut emit = SsaEmitContext::new();
+
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+
+        let mut valu1_op_ids = Vec::new();
+
+        // 3 parallel chains so we have 3 valu1 + 3 valu2 = 6 VALU ops; with 1 VALU slot we need 6+ cycles
+        // unless we shift (shifted valu1 uses 8 ALU, 0 VALU), giving the solver incentive to shift.
+        for _ in 0..3 {
+            let sel = emit.emit_select_choice(cond, true_val, false_val);
+            let valu1 = emit.emit_valu(Opcode::Add, sel, true_val);
+            valu1_op_ids.push(emit.ops.last().unwrap().id);
+            let _valu2 = emit.emit_valu(Opcode::Add, valu1, false_val);
+        }
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        // Toy machine: 1 VALU, 8 ALU so one shifted VALU fits in ALU.
+        let toy_machine = MachineConfig { valu_slots: 1, alu_slots: 8, ..Default::default() };
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: false,
+                enable_valu_shift: true,
+                scratch_budget: 1536,
+                model_name: Some("selectchoice_valu_shift_toy".to_string()),
+                machine: toy_machine,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution with 1 VALU / 8 ALU toy caps");
+        let r = result.unwrap();
+        assert_eq!(r.cycle_assignments.len(), emit.ops.len());
+
+        // With 1 VALU slot and 3 chains (6 VALU ops), shifting at least one valu1 to ALU should help.
+        let shifted_valu1 = valu1_op_ids.iter().filter(|&id| r.shifted_ops.contains(id)).count();
+        assert!(
+            shifted_valu1 >= 1,
+            "With 1 VALU and 8 ALU slots and 3 chains, at least one of the 3 shiftable valu1 ops should be shifted; got shifted_ops={:?}, valu1_op_ids={:?}",
+            r.shifted_ops, valu1_op_ids
+        );
     }
 
     /// Test that multiple SelectChoice ops in vselect mode cannot be in the same cycle.
@@ -3041,6 +3113,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3135,6 +3208,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3195,6 +3269,7 @@ mod ssa_tests {
                 &shifted_ops,
                 &const_add_imm_ops,
                 &select_fma_ops,
+                &MachineConfig::default(),
             );
         });
 
@@ -3229,6 +3304,7 @@ mod ssa_tests {
             &shifted_ops,
             &const_add_imm_ops,
             &select_fma_ops,
+            &MachineConfig::default(),
         );
         
         eprintln!("test_validate_ssa_slot_limits_passes_valid_schedule PASSED");
@@ -3270,6 +3346,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3351,6 +3428,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3428,6 +3506,7 @@ mod ssa_tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3844,6 +3923,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -3901,6 +3981,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
@@ -4021,6 +4102,7 @@ mod tests {
                 enable_valu_shift: false,
                 scratch_budget: 1536,
                 model_name: None,
+                ..Default::default()
             },
             SsaCpsatHints::default(),
         );
