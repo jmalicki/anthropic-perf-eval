@@ -38,6 +38,9 @@ pub struct SectionBudgetResult {
 ///   SelectChoice op whose id is in this set and that has `sub_temp_vreg` is treated as using
 ///   the FMA path; the sub_temp VReg is then counted in peak (def at op.cycle, last use at
 ///   op.cycle+1). Pass `None` when no provisional selection is available.
+/// * ConstChoice ops: each is a single op with one dest VReg. Scratch usage is one word
+///   regardless of whether we later lower to Load or AddImm, so no extra parameter or
+///   logic is needed (unlike SelectChoice's sub_temp_vreg when FMA is chosen).
 pub fn sections_exceeding_budget(
     ops: &[SsaOp],
     scratch_budget: usize,

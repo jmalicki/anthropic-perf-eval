@@ -670,10 +670,9 @@ impl SsaEmitContext {
     /// The ISA's load instruction uses indirect addressing: mem[scratch[addr_reg]].
     /// So we first emit a const to materialize the address, then load through it.
     #[track_caller]
-    #[allow(deprecated)] // emit_const is fine here - this is a low-level helper
     pub fn emit_load_imm(&mut self, addr: i64) -> VReg {
-        // First emit a const to put the address value in a VReg
-        let addr_vreg = self.emit_const(addr);
+        // First emit a const to put the address value in a VReg (SSA path uses ConstChoice)
+        let addr_vreg = self.emit_const_choice(addr);
         // Then load through that VReg (indirect addressing)
         self.emit_load(addr_vreg)
     }
@@ -701,10 +700,9 @@ impl SsaEmitContext {
     /// The ISA's vload instruction uses indirect addressing: mem[scratch[addr_reg]..].
     /// So we first emit a const to materialize the address, then vload through it.
     #[track_caller]
-    #[allow(deprecated)] // emit_const is fine here - this is a low-level helper
     pub fn emit_vload_imm(&mut self, addr: i64) -> VReg {
-        // First emit a const to put the address value in a VReg
-        let addr_vreg = self.emit_const(addr);
+        // First emit a const to put the address value in a VReg (SSA path uses ConstChoice)
+        let addr_vreg = self.emit_const_choice(addr);
         // Then vload through that VReg (indirect addressing)
         self.emit_vload(addr_vreg)
     }

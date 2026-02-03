@@ -2372,12 +2372,14 @@ mod pseudo_const_tests {
         let tracker = ConstValueTracker::new(1000);
         let slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
 
+        // With empty slot_usage and no deps, try_resolve tries encodings in order:
+        // ALU (need deps), then AddImm (no deps), then Load. So we get AddImm first.
         match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage, 1) {
             PseudoConstResolution::Resolved(op, encoding) => {
-                assert_eq!(encoding, ConstEncoding::Load);
-                assert_eq!(op.engine, Engine::Load);
+                assert_eq!(encoding, ConstEncoding::AddImm { value: 42 });
+                assert_eq!(op.engine, Engine::Flow);
             }
-            _ => panic!("Should resolve to Load"),
+            _ => panic!("Should resolve to AddImm or Load"),
         }
     }
 
@@ -2386,15 +2388,16 @@ mod pseudo_const_tests {
         // Create pseudo-const for 4 = 2 + 2
         let pc = PseudoConst::new(0, 4, Some(100));
 
-        // Initially, can only use Load (no deps available)
+        // Initially, AddImm and Load are both available (no deps needed). Encodings order
+        // tries AddImm before Load, so we get AddImm.
         let mut tracker = ConstValueTracker::new(1000);
         let slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
 
         match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage, 1) {
             PseudoConstResolution::Resolved(_, encoding) => {
-                assert_eq!(encoding, ConstEncoding::Load);
+                assert_eq!(encoding, ConstEncoding::AddImm { value: 4 });
             }
-            _ => panic!("Should resolve to Load"),
+            _ => panic!("Should resolve to AddImm or Load"),
         }
 
         // Now make value 2 available

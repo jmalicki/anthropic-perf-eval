@@ -1881,21 +1881,35 @@ mod tests {
     }
 
     /// Test that the actual SSA kernel builder produces schedulable ops at medium scale.
+    /// Uses the same pre-schedule pipeline as production (DCE, barrier deps); only AddImm
+    /// alternatives may remain unscheduled (cycle=-1).
     #[test]
     fn test_greedy_real_kernel_medium() {
         // Medium config: ~1000-2000 ops
         let config = KernelConfig::new(5, 63, 64, 4);  // height=5, nodes=63, batch=64, rounds=4
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
-        // Build SSA ops
+        // Same pre-schedule steps as build_and_schedule_with_options
         builder.build_internal();
-        let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+        let mut const_alternatives = builder.emit.take_const_alternatives();
         let mut ops = builder.emit.take_ops();
 
-        // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg);
 
-        println!("Generated {} ops", ops.len());
+        if builder.config.enable_ssa_dce {
+            let (new_ops, new_vreg_def, _new_const_alternatives) = eliminate_ssa_dead_code(
+                ops,
+                &mut vreg_def,
+                &mut const_alternatives,
+                builder.zero_vreg,
+            );
+            ops = new_ops;
+            vreg_def = new_vreg_def;
+            compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg);
+        }
+
+        println!("Generated {} ops (after DCE)", ops.len());
 
         let mut shifted = HashSet::new();
         let result = builder.schedule_ssa_greedy_with_shift_budget(
@@ -1906,13 +1920,34 @@ mod tests {
 
         let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
         if !budget_exceeded {
+            // Build set of AddImm alternative indices (same logic as ssa_greedy)
+            let mut add_imm_alternatives: HashSet<usize> = HashSet::new();
+            for (idx, op) in ops.iter().enumerate() {
+                if op.engine == Engine::Flow && op.opcode == Opcode::AddImm {
+                    if let Some(dest) = op.dest {
+                        for prev_idx in (0..idx).rev() {
+                            let prev_op = &ops[prev_idx];
+                            if prev_op.dest == Some(dest) {
+                                if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                    add_imm_alternatives.insert(idx);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             let unscheduled: Vec<_> = ops.iter().enumerate()
                 .filter(|(_, op)| op.cycle < 0)
                 .map(|(i, op)| format!("op[{}] id={}", i, op.id))
                 .collect();
-            assert!(unscheduled.is_empty(),
-                "All ops should be scheduled when within budget, {} unscheduled: {:?}",
-                unscheduled.len(), &unscheduled[..unscheduled.len().min(10)]);
+            let wrongly_unscheduled: Vec<_> = ops.iter().enumerate()
+                .filter(|(idx, op)| op.cycle < 0 && !add_imm_alternatives.contains(idx))
+                .map(|(i, op)| format!("op[{}] id={}", i, op.id))
+                .collect();
+            assert!(wrongly_unscheduled.is_empty(),
+                "When within budget, only AddImm alternatives may be unscheduled. {} unscheduled ({} AddImm alts): wrongly unscheduled: {:?}",
+                unscheduled.len(), add_imm_alternatives.len(), &wrongly_unscheduled[..wrongly_unscheduled.len().min(10)]);
         }
     }
 

@@ -5,12 +5,12 @@ This is the recommended approach for generating high-quality kernels.
 The SSA builder eliminates false dependencies, and CP-SAT finds optimal schedules.
 
 Default settings:
-- enable_valu_shift=False (avoids scratch budget issues)
+- enable_valu_shift=True (VALU→ALU shifting for better slot use)
 - use_cpsat=True (optimal scheduling)
 - cpsat_time_limit=600 (10 minutes - good default)
 
 Example usage:
-    # Default (10 min CP-SAT, no VALU shift)
+    # Default (CP-SAT with VALU shift)
     python generate_ssa_kernel.py
 
     # Quick iteration with greedy scheduler
@@ -58,8 +58,10 @@ def main():
                         help="If set, run each per-section CP-SAT for SECS seconds to optimize cycles (no VALU shift in per-section). 0 or omit = feasibility only.")
     parser.add_argument("--use-greedy", action="store_true",
                         help="Use greedy scheduler instead of CP-SAT (fast, ~2s)")
-    parser.add_argument("--enable-valu-shift", action="store_true",
-                        help="Enable VALU->ALU shifting (disabled by default to avoid budget issues)")
+    parser.add_argument("--enable-valu-shift", action="store_true", default=True,
+                        help="Enable VALU->ALU shifting (default: True)")
+    parser.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
+                        help="Disable VALU->ALU shifting (e.g. if hitting scratch budget)")
     parser.add_argument("--enable-tree-reduce-depth3", action="store_true",
                         help="Enable tree-reduce for depth-3 (8-way) selection (uses more scratch)")
 

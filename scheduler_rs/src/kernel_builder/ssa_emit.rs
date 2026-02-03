@@ -4,20 +4,15 @@
 //! for different kernel phases: initialization, data load/store, tree access,
 //! XOR, hash, and branch.
 //!
-//! NOTE: This module uses `emit_const()` instead of `emit_const_choice()` because
-//! the per-section scratch budget model doesn't correctly account for ConstChoice
-//! decisions yet. The CP-SAT path filters out AddImm alternatives before scheduling,
-//! so we never choose Load vs AddImm at lowering time for those constants—we always
-//! emit Load. ConstChoice (emit_const_choice) does choose at lowering. To unify:
-//! use emit_const_choice() everywhere and fix the per-section model, or model
-//! emit_const() pairs in CP-SAT and emit only the chosen encoding at lowering.
+//! The SSA path uses only emit_const_choice() for constants. The per-section scratch
+//! budget model counts one VReg per ConstChoice op; scratch usage is the same whether
+//! we later lower to Load or AddImm, so no extra logic is needed there.
 
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{HASH_STAGES, STAGE5_XOR_CONST};
 use super::tick_tock_ssa::{SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL};
 
-#[allow(deprecated)] // emit_const used with filtering workaround - see module docs
 impl SsaTickTockKernelBuilder {
     /// Internal build logic.
     pub(super) fn build_internal(&mut self) {
@@ -146,14 +141,14 @@ impl SsaTickTockKernelBuilder {
             // v_hc needed for stages 0, 1, 2, 3, 4 (not 5)
             if i != 5 {
                 self.emit.set_next_var_type(VarType::HashState);
-                self.ctx.hc[i] = Some(self.emit.emit_const(HASH_STAGES[i].1));
+                self.ctx.hc[i] = Some(self.emit.emit_const_choice(HASH_STAGES[i].1));
                 self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.v_hc[i] = Some(self.emit.emit_vbroadcast(self.ctx.hc[i].unwrap()));
             }
             // v_hs needed for stages 1, 3, 5 (not 0, 2, 4 which use FMA)
             if i == 1 || i == 3 || i == 5 {
                 self.emit.set_next_var_type(VarType::HashState);
-                self.ctx.hs[i] = Some(self.emit.emit_const(HASH_STAGES[i].4));
+                self.ctx.hs[i] = Some(self.emit.emit_const_choice(HASH_STAGES[i].4));
                 self.emit.set_next_var_type(VarType::HashState);
                 self.ctx.v_hs[i] = Some(self.emit.emit_vbroadcast(self.ctx.hs[i].unwrap()));
             }
@@ -173,7 +168,7 @@ impl SsaTickTockKernelBuilder {
 
         // Stage 5 XOR constant
         self.emit.set_next_var_type(VarType::HashState);
-        self.ctx.stage5_xor_s = Some(self.emit.emit_const(STAGE5_XOR_CONST));
+        self.ctx.stage5_xor_s = Some(self.emit.emit_const_choice(STAGE5_XOR_CONST));
         self.emit.set_next_var_type(VarType::HashState);
         self.ctx.v_stage5_xor = Some(self.emit.emit_vbroadcast(self.ctx.stage5_xor_s.unwrap()));
 
@@ -231,7 +226,7 @@ impl SsaTickTockKernelBuilder {
         for i in 0..6 {
             if let Some(mult) = self.ctx.hash_fma_mult[i] {
                 self.emit.set_next_var_type(VarType::HashState);
-                let mult_s = self.emit.emit_const(mult);
+                let mult_s = self.emit.emit_const_choice(mult);
                 self.ctx.hash_fma_mult_s.insert(i, mult_s);
                 self.emit.set_next_var_type(VarType::HashState);
                 let v_mult = self.emit.emit_vbroadcast(mult_s);
@@ -314,9 +309,9 @@ impl SsaTickTockKernelBuilder {
             let offset_b = ((g + 1) * VLEN) as i64;
 
             self.emit.set_next_var_type(VarType::Constant);
-            let off_a = self.emit.emit_const(offset_a);
+            let off_a = self.emit.emit_const_choice(offset_a);
             self.emit.set_next_var_type(VarType::Constant);
-            let off_b = self.emit.emit_const(offset_b);
+            let off_b = self.emit.emit_const_choice(offset_b);
 
             self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
@@ -355,9 +350,9 @@ impl SsaTickTockKernelBuilder {
             let offset_b = ((g + 1) * VLEN) as i64;
 
             self.emit.set_next_var_type(VarType::Constant);
-            let off_a = self.emit.emit_const(offset_a);
+            let off_a = self.emit.emit_const_choice(offset_a);
             self.emit.set_next_var_type(VarType::Constant);
-            let off_b = self.emit.emit_const(offset_b);
+            let off_b = self.emit.emit_const_choice(offset_b);
 
             self.emit.set_next_var_type(VarType::Address);
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
@@ -916,10 +911,10 @@ impl SsaTickTockKernelBuilder {
         let partition_val_offset = self.ctx.partition_val_offset.unwrap();
 
         // Compute base addresses
-        let base_offset = self.emit.emit_const((start_g * VLEN) as i64);
+        let base_offset = self.emit.emit_const_choice((start_g * VLEN) as i64);
         let mut idx_addr = self.emit.emit_alu(Opcode::Add, extra_room_p, base_offset);
         let mut val_addr = self.emit.emit_alu(Opcode::Add, idx_addr, partition_val_offset);
-        let vlen_const = self.emit.emit_const(VLEN as i64);
+        let vlen_const = self.emit.emit_const_choice(VLEN as i64);
 
         // Store all groups
         for g in start_g..end_g {

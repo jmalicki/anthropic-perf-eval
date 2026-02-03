@@ -862,7 +862,7 @@ mod tests {
         emit.ops[0].cycle = 0;
         emit.ops[1].cycle = 1;
 
-        let intervals = compute_live_intervals(&emit.ops);
+        let intervals = compute_live_intervals(&emit.ops, None);
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -960,7 +960,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 2;
 
-        let intervals = compute_live_intervals(&emit.ops);
+        let intervals = compute_live_intervals(&emit.ops, None);
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -996,6 +996,7 @@ mod tests {
             budget: 20, // Small budget
             start_addr: 1,
             fixed_vregs: HashMap::new(),
+            zero_vreg: None,
         };
         let result = assign_addresses(&emit.ops, &config);
 

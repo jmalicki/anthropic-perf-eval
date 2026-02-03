@@ -2370,6 +2370,12 @@ pub fn build_tick_tock_kernel_ssa<'py>(
 
     let mut builder = SsaTickTockKernelBuilder::new(config);
 
+    if use_cpsat && !builder.config.enable_ssa_dce {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "CP-SAT requires DCE; enable_ssa_dce must be true when use_cpsat is true.",
+        ));
+    }
+
     if verbose {
         println!("Building SSA kernel{}...", if use_cpsat { " (CP-SAT)" } else { "" });
     }

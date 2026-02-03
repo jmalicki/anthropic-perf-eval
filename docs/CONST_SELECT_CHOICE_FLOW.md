@@ -43,15 +43,15 @@ emit_select_choice  as unit)        vars)               select_fma_ops
 
 1. **emit_const_choice()** (single op)
    - Emits one SSA op with `Opcode::ConstChoice`, `dest`, `produces_constant`, and `const_alternatives: Some([Load, AddImm { value }])`.
-   - Used in SSA kernel for bootstrap constants (e.g. c[1], c[2], c[4], partition_val_offset).
+   - Used in the SSA kernel for bootstrap and partition constants (c[1], c[2], c[4], partition_val_offset). Hash stages, offsets, FMA multipliers, stage5 XOR, partition base/vlen still use emit_const() (dual op) and are filtered before CP-SAT.
    - **Scheduling**: CP-SAT gets one op per constant and a boolean `const_choice[idx]` (true = AddImm, false = Load). Same `cycle[idx]` for both encodings; optional Load and Flow intervals.
    - **Lowering**: `lower_ssa_ops_with_shift` sees `Opcode::ConstChoice`. If `ssa_op.id ∈ const_add_imm_ops` → emit AddImm; else → emit Const. **Choice is made at lowering time.**
 
-2. **emit_const()** (dual op — legacy)
+2. **emit_const()** (dual op)
    - Emits two SSA ops: one `Opcode::Const` (Load) and one `Opcode::AddImm` (Flow), same `dest`. Tracked in `const_alternatives` (load_op_idx, add_imm_op_idx).
-   - Used for hash stages, offsets, etc. (see `ssa_emit.rs`).
-   - **Why not ConstChoice here:** Per-section scratch budget model does not yet account for ConstChoice decisions; filtering avoids SSA violations (two writers to one VReg).
-   - **Scheduling**: Before CP-SAT, AddImm ops are **filtered out** (tick_tock_ssa.rs). CP-SAT only sees Load ops. Greedy also skips AddImm alternatives.
+   - Used for hash stages, offsets, FMA multipliers, stage5 XOR, partition base/vlen in the SSA kernel (see ssa_emit.rs). Bootstrap/partition use emit_const_choice.
+   - Per-section scratch model: ConstChoice is one op, one VReg; the existing per-section model already counts it correctly (no extra logic like SelectChoice's FMA sub_temp).
+   - **Scheduling**: Before CP-SAT, AddImm ops from emit_const are **filtered out** (tick_tock_ssa.rs). CP-SAT only sees Load ops for those constants.
    - **Lowering**: Only Load (Const) ops remain in the list; each is lowered to `const`. **No choice at lowering** — we fixed Load at filter time.
 
 **DCE**: ConstChoice pairs (emit_const Load+AddImm) are treated as **atomic**: if the constant is live, both encodings are kept; if dead, both are removed. Single-op ConstChoice is one op and is kept or removed normally.
@@ -87,6 +87,7 @@ emit_select_choice  as unit)        vars)               select_fma_ops
 | Aspect              | ConstChoice (emit_const_choice) | ConstChoice (emit_const)     | SelectChoice        |
 |---------------------|----------------------------------|------------------------------|----------------------|
 | SSA ops emitted     | 1 (ConstChoice)                 | 2 (Const + AddImm)           | 1 (SelectChoice)     |
+| Used in SSA path    | Yes (bootstrap, partition)      | Yes (hash, offsets, etc.)   | Yes                  |
 | CP-SAT models choice| Yes                              | No (AddImm filtered out)     | Yes                  |
 | Choice made when    | Lowering (const_add_imm_ops)    | Never (always Load)          | Lowering (select_fma_ops) |
 | DCE                 | Single op                        | Atomic pair                  | Single op            |
@@ -97,7 +98,7 @@ emit_select_choice  as unit)        vars)               select_fma_ops
 
 - **Emission**: `scheduler_rs/src/kernel_builder/emit_ssa.rs` — `emit_const_choice`, `emit_const`, `emit_select_choice`, `emit_select_choice_with_delta`.
 - **DCE**: `emit_ssa.rs` — `eliminate_ssa_dead_code`; ConstChoice pairs kept/removed via `const_choice_partner` and `mark_live_atomic`.
-- **Filtering (emit_const path)**: `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs` — detect AddImm alternatives, filter before CP-SAT.
+- **Filtering (emit_const path)**: tick_tock_ssa.rs filters AddImm alternatives from emit_const before CP-SAT.
 - **CP-SAT model**: `scheduler_rs/src/cpsat_scheduler.rs` — ConstChoice and SelectChoice decision variables, optional intervals.
 - **Lowering**: `scheduler_rs/src/kernel_builder/ssa_lower.rs` — `lower_ssa_ops_with_shift`; ConstChoice → const or add_imm; SelectChoice → vselect or sub+fma.
 
@@ -107,7 +108,7 @@ emit_select_choice  as unit)        vars)               select_fma_ops
 
 To have **all** constants choose Load vs AddImm at lowering (including those from emit_const()):
 
-1. **Option A**: Use `emit_const_choice()` everywhere and fix the per-section scratch budget model so it accounts for ConstChoice. Then every constant is one op and we choose at lowering.
+1. **Option A**: Use `emit_const_choice()` everywhere and rely on the per-section scratch budget model (it already accounts for ConstChoice). Then every constant is one op and we choose at lowering. Bootstrap/partition already use this path.
 2. **Option B**: Keep emit_const() dual ops but model them in CP-SAT like ConstChoice (one logical op per pair, optional Load vs AddImm). Output which encoding was chosen per pair; at lowering emit only the chosen op (skip the other). Requires passing pair info and decisions into lowering.
 
 See comments in `ssa_emit.rs` and `ssa_lower.rs` for the same options.
