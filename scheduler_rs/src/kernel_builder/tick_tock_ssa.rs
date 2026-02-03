@@ -348,14 +348,10 @@ impl SsaTickTockKernelBuilder {
         let _ = &const_alternatives; // used in greedy path; CP-SAT discovers alternatives from ops
 
         // CP-SAT scratch liveness only models VRegs with at least one use. When DCE ran,
-        // every defined VReg must have a reader; assert so we don't undercount scratch.
+        // every op.dest must have a reader in the SSA op list. (sub_temp_vreg is not
+        // included: it is only read by the FMA that appears after lowering, not by any SsaOp.)
         if self.config.enable_ssa_dce {
-            let mut defined: HashSet<_> = ssa_ops.iter().filter_map(|op| op.dest).collect();
-            for op in &ssa_ops {
-                if let Some(st) = op.sub_temp_vreg {
-                    defined.insert(st);
-                }
-            }
+            let defined: HashSet<_> = ssa_ops.iter().filter_map(|op| op.dest).collect();
             let used: HashSet<_> = ssa_ops.iter().flat_map(|op| op.reads()).collect();
             let dead: Vec<_> = defined.difference(&used).copied().collect();
             assert!(
