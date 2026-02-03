@@ -1734,6 +1734,15 @@ pub fn schedule_ssa_cpsat(
         })
         .collect();
 
+    // SelectChoice ops with sub_temp_vreg (FMA path without delta): result is visible at cycle+2, not cycle+1.
+    // We'll add precedence for their consumers after creating select_choice_vars.
+    let select_choice_with_fma_delay: HashSet<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::SelectChoice && op.sub_temp_vreg.is_some())
+        .map(|(i, _)| i)
+        .collect();
+
     // 5. Add precedence constraints from RAW dependencies
     // Note: For consumers of shifted VALU ops, we'll update these constraints after
     // creating completion_cycle_vars (see below)
@@ -1741,10 +1750,15 @@ pub fn schedule_ssa_cpsat(
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
                 // Skip if dep_idx is a shifted VALU op - we'll handle it after creating completion_cycle_vars
-                if !shiftable_set.contains(&dep_idx) {
-                    // cycle[idx] >= cycle[dep_idx] + 1
-                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                if shiftable_set.contains(&dep_idx) {
+                    continue;
                 }
+                // Skip if dep is SelectChoice with sub_temp (FMA no-delta): consumer precedence added in 5d
+                if select_choice_with_fma_delay.contains(&dep_idx) {
+                    continue;
+                }
+                // cycle[idx] >= cycle[dep_idx] + 1
+                model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
             }
         }
     }
@@ -2061,6 +2075,31 @@ pub fn schedule_ssa_cpsat(
                     vec![sub_interval, fma_interval]
                 };
                 select_valu_intervals.insert(idx, valu_intervals);
+            }
+        }
+    }
+
+    // 5d. Precedence for consumers of SelectChoice FMA (no delta): result is visible at cycle+2, not cycle+1
+    for (idx, op) in ops.iter().enumerate() {
+        for &dep_id in &op.dep_ids {
+            let Some(&dep_idx) = op_id_to_idx.get(&dep_id) else { continue };
+            if !select_choice_with_fma_delay.contains(&dep_idx) {
+                continue;
+            }
+            match select_choice_mode {
+                SelectChoiceMode::ForceVselect => {
+                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                }
+                SelectChoiceMode::ForceFma => {
+                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                }
+                SelectChoiceMode::Optimize => {
+                    let choice_var = select_choice_vars.get(&dep_idx).expect("Optimize has choice var");
+                    // consumer >= dep_cycle + 1 + (1 if FMA else 0). Use auxiliary 0-1 int.
+                    let extra = model.new_int_var_with_name([(0, 1)], format!("select_fma_extra_{}_{}", dep_idx, idx));
+                    model.add_eq(LinearExpr::from(extra), LinearExpr::from(*choice_var));
+                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra));
+                }
             }
         }
     }
@@ -2503,22 +2542,30 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Segment mode: add scratch for SelectChoice FMA sub_temp_vreg (def at op.cycle, last use at op.cycle+1)
-            // Use fixed-size interval (size=2) — cheaper than variable-size; see CP-SAT Primer on interval types.
-            if let Some(fma_ids) = select_choice_hints {
-                for (op_idx, op) in ops.iter().enumerate() {
-                    if op.opcode == Opcode::SelectChoice
-                        && fma_ids.contains(&op.id)
-                        && op.sub_temp_vreg.is_some()
-                    {
-                        if op_idx >= cycle_vars.len() {
-                            continue;
-                        }
-                        let start = cycle_vars[op_idx];
+            // SelectChoice FMA sub_temp_vreg: live [op.cycle, op.cycle+2) when FMA path is chosen.
+            // ForceFma => required interval; Optimize => optional (present when choice_var); ForceVselect => none.
+            for &idx in &select_choice_ops {
+                if ops[idx].sub_temp_vreg.is_none() {
+                    continue; // delta path: no sub_temp
+                }
+                if idx >= cycle_vars.len() {
+                    continue;
+                }
+                let start = cycle_vars[idx];
+                match select_choice_mode {
+                    SelectChoiceMode::ForceFma => {
                         let interval = model.new_fixed_size_interval_var(start, 2);
                         scratch_intervals.push(interval);
-                        scratch_demands.push(8); // vector = VLEN words
+                        scratch_demands.push(8);
                     }
+                    SelectChoiceMode::Optimize => {
+                        if let Some(&choice_var) = select_choice_vars.get(&idx) {
+                            let interval = model.new_optional_fixed_size_interval_var(start, 2, choice_var);
+                            scratch_intervals.push(interval);
+                            scratch_demands.push(8);
+                        }
+                    }
+                    SelectChoiceMode::ForceVselect => {}
                 }
             }
 
@@ -4119,6 +4166,358 @@ mod ssa_tests {
                 }
             }
         }
+    }
+
+    /// Small machine: 1 VALU slot so sub and fma cannot share a cycle (forced consecutive bundles).
+    const SMALL_MACHINE_FMA: crate::types::MachineConfig = crate::types::MachineConfig {
+        valu_slots: 1,
+        alu_slots: 12,
+        load_slots: 2,
+        store_slots: 2,
+        flow_slots: 1,
+    };
+
+    /// Minimal test: one SelectChoice (no delta → sub+fma path), ForceFma.
+    /// Uses small machine (1 VALU slot) so sub and fma are forced into consecutive cycles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_force_fma_minimal() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+        let sel = emit.emit_select_choice(cond, true_val, false_val);
+        let _use = emit.emit_valu(Opcode::Add, sel, sel);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let select_choice_idx = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("one SelectChoice");
+        let select_choice_id = emit.ops[select_choice_idx].id;
+        assert!(emit.ops[select_choice_idx].sub_temp_vreg.is_some(), "no-delta path (sub+fma)");
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                machine: SMALL_MACHINE_FMA,
+                const_choice_mode: ConstChoiceMode::Optimize,
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                valu_shift_mode: ValuShiftMode::Optimize,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+        assert!(result.is_some(), "CP-SAT should find a solution with ForceFma");
+        let cpsat_result = result.unwrap();
+
+        assert!(cpsat_result.select_fma_ops.contains(&select_choice_id), "ForceFma => select_fma_ops contains SelectChoice id");
+        let c = cpsat_result.cycle_assignments[select_choice_idx];
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if op.dep_ids.contains(&select_choice_id) {
+                let consumer_cycle = cpsat_result.cycle_assignments[idx];
+                assert!(consumer_cycle >= c + 2, "consumer must be at cycle >= {} (SelectChoice result visible at C+2), got {}", c + 2, consumer_cycle);
+            }
+        }
+
+        for (idx, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = cpsat_result.cycle_assignments[idx];
+        }
+        let mut config = AddressAssignConfig::default();
+        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        let assign_result = assign_addresses(&emit.ops, &config);
+        assert!(!assign_result.budget_exceeded);
+
+        // With 1 VALU slot, sub and fma must be in consecutive cycles
+        let lowered = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &assign_result.vreg_to_addr,
+            &HashSet::new(),
+            &HashSet::new(),
+            &cpsat_result.select_fma_ops,
+            &cpsat_result.shifted_alu_cycles,
+        );
+        let sub_op = lowered.iter().find(|o| o.id == select_choice_id && o.engine == Engine::Valu && format!("{:?}", o.slot.get(0)).contains("\"-\""));
+        let fma_op = lowered.iter().find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
+        assert!(sub_op.is_some(), "should have sub op");
+        assert!(fma_op.is_some(), "should have fma op");
+        assert_eq!(sub_op.unwrap().cycle, c, "sub at SelectChoice cycle");
+        assert_eq!(fma_op.unwrap().cycle, c + 1, "fma at SelectChoice cycle + 1");
+
+        // Total cycle count must include the FMA: max(lowered cycle)+1 >= c+2 (FMA at c+1).
+        let max_lowered_cycle = lowered.iter().map(|o| o.cycle.max(0)).max().unwrap_or(0);
+        assert!(max_lowered_cycle >= c + 1, "cycle count must include FMA at cycle {}", c + 1);
+    }
+
+    /// Same as test_ssa_cpsat_selectchoice_force_fma_minimal but with DEFAULT machine (6 VALU)
+    /// and no hints. Exercises same-cycle VALU packing: sub and fma may share a cycle with other
+    /// VALU ops. If the FMA bug is tied to packing or hint-driven schedules, this may fail.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_selectchoice_force_fma_default_machine_no_hints() {
+        use std::collections::HashSet;
+        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+        let sel = emit.emit_select_choice(cond, true_val, false_val);
+        let _use = emit.emit_valu(Opcode::Add, sel, sel);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let select_choice_idx = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("one SelectChoice");
+        let select_choice_id = emit.ops[select_choice_idx].id;
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                machine: crate::types::MachineConfig::default(),
+                const_choice_mode: ConstChoiceMode::Optimize,
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                valu_shift_mode: ValuShiftMode::Optimize,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+        assert!(result.is_some(), "CP-SAT should find a solution with default machine + ForceFma");
+        let cpsat_result = result.unwrap();
+
+        let c = cpsat_result.cycle_assignments[select_choice_idx];
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if op.dep_ids.contains(&select_choice_id) {
+                let consumer_cycle = cpsat_result.cycle_assignments[idx];
+                assert!(consumer_cycle >= c + 2, "consumer must be at cycle >= {} (got {})", c + 2, consumer_cycle);
+            }
+        }
+
+        for (idx, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = cpsat_result.cycle_assignments[idx];
+        }
+        let mut config = AddressAssignConfig::default();
+        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        let assign_result = assign_addresses(&emit.ops, &config);
+        assert!(!assign_result.budget_exceeded);
+
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
+        for (v1, addr1) in &assign_result.vreg_to_addr {
+            for (v2, addr2) in &assign_result.vreg_to_addr {
+                if v1 >= v2 { continue; }
+                if addr1 != addr2 { continue; }
+                if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
+                    assert!(!i1.overlaps(i2), "overlapping intervals shared address (default machine)");
+                }
+            }
+        }
+
+        let lowered = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &assign_result.vreg_to_addr,
+            &HashSet::new(),
+            &HashSet::new(),
+            &cpsat_result.select_fma_ops,
+            &cpsat_result.shifted_alu_cycles,
+        );
+        let sub_op = lowered.iter().find(|o| o.id == select_choice_id && o.engine == Engine::Valu && format!("{:?}", o.slot.get(0)).contains("\"-\""));
+        let fma_op = lowered.iter().find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
+        assert!(sub_op.is_some(), "should have sub op");
+        assert!(fma_op.is_some(), "should have fma op");
+        assert_eq!(sub_op.unwrap().cycle, c, "sub at SelectChoice cycle");
+        assert_eq!(fma_op.unwrap().cycle, c + 1, "fma at SelectChoice cycle + 1");
+    }
+
+    /// Two SelectChoice FMA ops: verify consumer precedence (>= dep+2) and that address
+    /// assignment never gives the same address to two VRegs with overlapping intervals.
+    /// Uses small machine (1 VALU slot) so sub/fma pairs are forced into consecutive cycles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_two_selectchoice_force_fma_no_overlap() {
+        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true1 = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false1 = emit.emit_vbroadcast(c20);
+        let sel1 = emit.emit_select_choice(cond, true1, false1);
+        let _u1 = emit.emit_valu(Opcode::Add, sel1, sel1);
+
+        let c30 = emit.emit_const(30);
+        let true2 = emit.emit_vbroadcast(c30);
+        let c40 = emit.emit_const(40);
+        let false2 = emit.emit_vbroadcast(c40);
+        let sel2 = emit.emit_select_choice(cond, true2, false2);
+        let _u2 = emit.emit_valu(Opcode::Add, sel2, sel2);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let idx1 = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("first");
+        let idx2 = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice && o.id != emit.ops[idx1].id).expect("second");
+        let id1 = emit.ops[idx1].id;
+        let id2 = emit.ops[idx2].id;
+        assert!(emit.ops[idx1].sub_temp_vreg.is_some() && emit.ops[idx2].sub_temp_vreg.is_some());
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                machine: SMALL_MACHINE_FMA,
+                const_choice_mode: ConstChoiceMode::Optimize,
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                valu_shift_mode: ValuShiftMode::Optimize,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap();
+
+        assert!(cpsat_result.select_fma_ops.contains(&id1) && cpsat_result.select_fma_ops.contains(&id2));
+        let c1 = cpsat_result.cycle_assignments[idx1];
+        let c2 = cpsat_result.cycle_assignments[idx2];
+        for (idx, op) in emit.ops.iter().enumerate() {
+            if op.dep_ids.contains(&id1) {
+                let consumer_cycle = cpsat_result.cycle_assignments[idx];
+                assert!(consumer_cycle >= c1 + 2, "consumer of sel1 must be >= {} (got {})", c1 + 2, consumer_cycle);
+            }
+            if op.dep_ids.contains(&id2) {
+                let consumer_cycle = cpsat_result.cycle_assignments[idx];
+                assert!(consumer_cycle >= c2 + 2, "consumer of sel2 must be >= {} (got {})", c2 + 2, consumer_cycle);
+            }
+        }
+
+        for (idx, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = cpsat_result.cycle_assignments[idx];
+        }
+        let mut config = AddressAssignConfig::default();
+        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        let assign_result = assign_addresses(&emit.ops, &config);
+        assert!(!assign_result.budget_exceeded);
+
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
+        for (v1, addr1) in &assign_result.vreg_to_addr {
+            for (v2, addr2) in &assign_result.vreg_to_addr {
+                if v1 >= v2 { continue; }
+                if addr1 != addr2 { continue; }
+                if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
+                    assert!(!i1.overlaps(i2), "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap",
+                        v1, v2, addr1, i1.start, i1.end, i2.start, i2.end);
+                }
+            }
+        }
+    }
+
+    /// Full pipeline: CP-SAT ForceFma then assign then lower; verify no overlapping
+    /// intervals share an address (regression test for validation failure).
+    /// Uses small machine (1 VALU slot) so sub and fma are in consecutive bundles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_force_fma_full_pipeline_no_overlap() {
+        use std::collections::HashSet;
+        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+        let sel = emit.emit_select_choice(cond, true_val, false_val);
+        let _use = emit.emit_valu(Opcode::Add, sel, sel);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                machine: SMALL_MACHINE_FMA,
+                const_choice_mode: ConstChoiceMode::Optimize,
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                valu_shift_mode: ValuShiftMode::Optimize,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+        let cpsat_result = result.unwrap();
+        for (idx, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = cpsat_result.cycle_assignments[idx];
+        }
+        let mut config = AddressAssignConfig::default();
+        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        let assign_result = assign_addresses(&emit.ops, &config);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
+        for (v1, addr1) in &assign_result.vreg_to_addr {
+            for (v2, addr2) in &assign_result.vreg_to_addr {
+                if v1 >= v2 { continue; }
+                if addr1 != addr2 { continue; }
+                if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
+                    assert!(!i1.overlaps(i2), "overlapping intervals shared address");
+                }
+            }
+        }
+        let _lowered = lower_ssa_ops_with_shift(
+            &emit.ops,
+            &assign_result.vreg_to_addr,
+            &HashSet::new(),
+            &HashSet::new(),
+            &cpsat_result.select_fma_ops,
+            &cpsat_result.shifted_alu_cycles,
+        );
     }
 }
 
