@@ -34,8 +34,8 @@ ENV/
 *.swo
 *~
 
-# CP-SAT solver logs
-cpsat_*.log
+# Logs
+*.log
 
 # Jupyter
 .ipynb_checkpoints/
