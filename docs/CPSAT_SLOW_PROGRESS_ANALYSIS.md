@@ -25,7 +25,7 @@ What slows things down:
 
 ### 1. Weak LP Relaxation for Cumulatives
 
-- We use **cumulative** constraints for each engine (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
+- We use **cumulative** constraints for each engine (ALU 12, VALU 6, Load 2, Store 2, Flow 1) (default [MachineConfig](scheduler_rs/src/types.rs); configurable via `SsaCpsatConfig::machine`).
 - CP-SAT’s **LP relaxation of cumulative** is weak: the LP does not fully enforce “at most C ops per cycle” in a way that gives a tight lower bound.
 - So `best_bound` (386) stays far below the best solution (429). Proving “no solution with makespan ≤ 428” then requires a lot of search.
 
@@ -96,7 +96,7 @@ The cumulative constraint’s LP is weak. We set **makespan ≥ computed_lower_b
 
 - For each engine: **makespan ≥ ceil(num_ops_engine / capacity)**.
 
-These redundant constraints are added in both `schedule_cpsat` (non-SSA) and `schedule_ssa_cpsat` (SSA) in `scheduler_rs/src/cpsat_scheduler.rs`. Same information as the capacity bound used for the makespan domain, but as linear inequalities they can be used more effectively in the LP relaxation and cut generation. See also **Lower bound strengthening** in `docs/CPSAT_SCHEDULER_IMPLEMENTATION.md`.
+These redundant constraints are added in both `schedule_cpsat` (non-SSA) and `schedule_ssa_cpsat` (SSA) in `scheduler_rs/src/cpsat_scheduler.rs`. In `schedule_ssa_cpsat`, capacity is taken from `config.machine` (MachineConfig). Same information as the capacity bound used for the makespan domain, but as linear inequalities they can be used more effectively in the LP relaxation and cut generation. See also **Lower bound strengthening** in `docs/CPSAT_SCHEDULER_IMPLEMENTATION.md`.
 
 ### 2. Symmetry Breaking
 

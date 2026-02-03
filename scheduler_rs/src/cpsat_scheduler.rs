@@ -423,6 +423,98 @@ fn format_flow_violation_breadcrumbs(
     s
 }
 
+/// Summary of engine usage and choice decisions for verbose reporting.
+#[cfg(feature = "cpsat")]
+struct SsaSolutionSummary {
+    alu_total: usize,
+    valu_total: usize,
+    load_total: usize,
+    store_total: usize,
+    flow_total: usize,
+    const_add_imm: usize,
+    const_load: usize,
+    select_fma: usize,
+    select_vselect: usize,
+}
+
+#[cfg(feature = "cpsat")]
+fn summarise_ssa_solution_engines_and_choices(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    const_add_imm_ops: &HashSet<usize>,
+    select_fma_ops: &HashSet<usize>,
+) -> SsaSolutionSummary {
+    let mut alu_total = 0usize;
+    let mut valu_total = 0usize;
+    let mut load_total = 0usize;
+    let mut store_total = 0usize;
+    let mut flow_total = 0usize;
+
+    for (idx, op) in ops.iter().enumerate() {
+        let cycle = cycle_assignments.get(idx).copied().unwrap_or(0);
+        if cycle < 0 {
+            continue;
+        }
+        let cycle = cycle as usize;
+
+        if op.opcode == Opcode::ConstChoice {
+            if const_add_imm_ops.contains(&op.id) {
+                flow_total += 1;
+            } else {
+                load_total += 1;
+            }
+            continue;
+        }
+        if op.opcode == Opcode::SelectChoice {
+            if select_fma_ops.contains(&op.id) {
+                valu_total += 1;
+                if op.delta_vreg.is_none() {
+                    valu_total += 1;
+                }
+            } else {
+                flow_total += 1;
+            }
+            continue;
+        }
+
+        match op.engine {
+            Engine::Alu => alu_total += 1,
+            Engine::Valu => {
+                if shifted_ops.contains(&op.id) {
+                    alu_total += VLEN as usize;
+                } else {
+                    valu_total += 1;
+                }
+            }
+            Engine::Load => load_total += 1,
+            Engine::Store => store_total += 1,
+            Engine::Flow => flow_total += 1,
+            _ => {}
+        }
+    }
+
+    let const_total = ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+    let const_add_imm = const_add_imm_ops.len();
+    let const_load = const_total.saturating_sub(const_add_imm);
+
+    let select_total = ops.iter().filter(|o| o.opcode == Opcode::SelectChoice).count();
+    let select_fma = select_fma_ops.len();
+    let select_vselect = select_total.saturating_sub(select_fma);
+
+    SsaSolutionSummary {
+        alu_total,
+        valu_total,
+        load_total,
+        store_total,
+        flow_total,
+        const_add_imm,
+        const_load,
+        select_fma,
+        select_vselect,
+    }
+}
+
 /// Validate that a CP-SAT solution respects engine slot limits per cycle.
 /// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
 #[cfg(feature = "cpsat")]
@@ -2641,9 +2733,28 @@ pub fn schedule_ssa_cpsat(
             );
 
             if verbose {
+                let summary = summarise_ssa_solution_engines_and_choices(
+                    ops,
+                    &cycle_assignments,
+                    &shifted_ops,
+                    &const_add_imm_ops,
+                    &select_fma_ops,
+                );
                 eprintln!(
                     "SSA CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
                     actual_makespan, best_bound, status, gap * 100.0, solve_time
+                );
+                eprintln!(
+                    "  Engine usage: ALU={} VALU={} Load={} Store={} Flow={}",
+                    summary.alu_total, summary.valu_total, summary.load_total, summary.store_total, summary.flow_total
+                );
+                eprintln!(
+                    "  ConstChoice: {} AddImm, {} Load",
+                    summary.const_add_imm, summary.const_load
+                );
+                eprintln!(
+                    "  SelectChoice: {} FMA, {} vselect",
+                    summary.select_fma, summary.select_vselect
                 );
                 eprintln!(
                     "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} SelectChoice FMA ops",

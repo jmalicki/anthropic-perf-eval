@@ -265,6 +265,8 @@ const VLEN: usize = 8;               // Vector length
 const LATENCY: usize = 1;            // All ops: 1 cycle, result next cycle
 ```
 
+The **SSA CP-SAT** path uses a configurable machine: `scheduler_rs::types::MachineConfig` (alu_slots, valu_slots, load_slots, store_slots, flow_slots), passed via `SsaCpsatConfig::machine`; the default matches the hardware (12, 6, 2, 2, 1). The greedy scheduler still uses `Engine::slot_limit()` (fixed values).
+
 ### 4.2 Scheduling Decision Variables
 
 Using the `cp_sat` Rust crate:
@@ -318,6 +320,8 @@ model.add_cumulative(
 
 // Load(2), Store(2), Flow(1) similarly
 ```
+
+In the **SSA CP-SAT path** (`schedule_ssa_cpsat`), capacities come from `config.machine` (MachineConfig); the literals 12/6 above are the default values.
 
 **Key insight:** Cumulative with fixed-size intervals and unit demands is equivalent to cardinality constraints per cycle, but propagates much more efficiently via specialized algorithms (edge-finding, theta-trees).
 

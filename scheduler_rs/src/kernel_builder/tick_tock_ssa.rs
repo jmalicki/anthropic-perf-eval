@@ -734,6 +734,16 @@ impl SsaTickTockKernelBuilder {
                 "SSA CP-SAT result: {} cycles (greedy was {}), {} VALU ops shifted",
                 cycles, greedy_cycles, shifted_ops.len()
             );
+            let const_total = ssa_ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+            let const_add_imm = cpsat_result.const_add_imm_ops.len();
+            let const_load = const_total.saturating_sub(const_add_imm);
+            let select_total = ssa_ops.iter().filter(|o| o.opcode == Opcode::SelectChoice).count();
+            let select_fma = cpsat_result.select_fma_ops.len();
+            let select_vselect = select_total.saturating_sub(select_fma);
+            eprintln!(
+                "  ConstChoice: {} AddImm, {} Load | SelectChoice: {} FMA, {} vselect",
+                const_add_imm, const_load, select_fma, select_vselect
+            );
         }
 
         // Filter out dead stores (ops with cycle=-1) before address assignment.
