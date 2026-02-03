@@ -2874,12 +2874,14 @@ pub fn schedule_ssa_cpsat(
     //   (1) True tie-breaker: scale > max_sum, so one extra cycle always dominates the sum.
     //   (2) Leading digits of the objective value are the makespan (cycle count), e.g.
     //       objective 104_042_000 => makespan 104, tie-breaker sum 42_000.
+    let mut objective_scale: Option<i64> = None;
     if let Some((&first_cc, rest)) = completion_cycle_vars.values().next().map(|v| (v, completion_cycle_vars.values().skip(1))) {
         let max_sum = (completion_cycle_vars.len() as i64) * (horizon as i64);
         let mut scale = 1i64;
         while scale <= max_sum {
             scale = scale.saturating_mul(10);
         }
+        objective_scale = Some(scale);
         let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| acc + LinearExpr::from(v));
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
@@ -2964,11 +2966,11 @@ pub fn schedule_ssa_cpsat(
     params.log_search_progress = Some(true);
     params.num_workers = Some(8);
 
-    // Ideal stop: once minimum cycles is proven (bound >= scale*M), i.e. when value - bound <= S
-    // (tie-breaker of current best). So the "right" gap would be S at runtime, not a fixed number.
-    // CP-SAT only accepts a fixed absolute_gap_limit at solve start, so we don't set it here:
-    // the solver runs until time limit or full optimality. If the crate gains solution callbacks,
-    // we could stop when best_bound >= scale * floor(best_objective_value / scale).
+    // Stop when gap <= scale/3: remaining improvement is only in the tie-breaker (sum of completion_cycle).
+    // One extra cycle costs scale in the objective, so scale/3 guarantees we're within ~1 cycle worst case.
+    if let Some(scale) = objective_scale {
+        params.absolute_gap_limit = Some((scale / 3) as f64);
+    }
 
     // Optimize LP relaxation for tighter bounds and faster convergence
     // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
