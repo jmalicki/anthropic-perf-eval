@@ -68,8 +68,13 @@ def main():
     valu_fma = [0] * n
     valu_other = [0] * n
     load = [0] * n
+    load_const = [0] * n
+    load_other = [0] * n
     store = [0] * n
     flow = [0] * n
+    flow_add_imm = [0] * n
+    flow_vselect = [0] * n
+    flow_other = [0] * n
     scratch = [0] * n  # filled from liveness_curve if present
 
     for op in ops:
@@ -90,10 +95,20 @@ def main():
                 valu_other[c] += 1
         elif eng == "load":
             load[c] += 1
+            if opcode == "const":
+                load_const[c] += 1
+            else:
+                load_other[c] += 1  # vload, load, load_offset, etc.
         elif eng == "store":
             store[c] += 1
         elif eng == "flow":
             flow[c] += 1
+            if opcode == "add_imm":
+                flow_add_imm[c] += 1
+            elif opcode == "vselect":
+                flow_vselect[c] += 1
+            else:
+                flow_other[c] += 1
 
     if liveness_curve:
         for entry in liveness_curve:
@@ -115,9 +130,9 @@ def main():
     print(f"Input: {args.input_json}")
     print()
 
-    # Column headers: Decile | Cycle range | ALU | VALU (vbroadcast | FMA | other) | Flow | Load | Store | Scratch
+    # Column headers: Decile | Cycle range | ALU | VALU (vb|FMA|other) | Flow (add_imm|vselect|other) | Load (const|other) | Store | Scratch
     header = (
-        "Decile | Cycle range      | ALU (used/cap %)   | VALU total (vbroadcast | FMA | other) | Flow   | Load  | Store | Scratch (words)"
+        "Decile | Cycle range      | ALU (used/cap %)   | VALU (used/cap %) (vb | FMA | other) | Flow (add_imm | vselect | other) | Load (const | other) | Store | Scratch (words)"
     )
     print(header)
     print("-" * len(header))
@@ -137,8 +152,13 @@ def main():
         other_used = sum(valu_other[c] for c in cycles)
         valu_used = vb_used + fma_used + other_used
         load_used = sum(load[c] for c in cycles)
+        load_const_used = sum(load_const[c] for c in cycles)
+        load_other_used = sum(load_other[c] for c in cycles)
         store_used = sum(store[c] for c in cycles)
         flow_used = sum(flow[c] for c in cycles)
+        flow_add_imm_used = sum(flow_add_imm[c] for c in cycles)
+        flow_vselect_used = sum(flow_vselect[c] for c in cycles)
+        flow_other_used = sum(flow_other[c] for c in cycles)
 
         alu_cap = SLOT_LIMITS["alu"] * n_cy
         valu_cap = SLOT_LIMITS["valu"] * n_cy
@@ -160,18 +180,20 @@ def main():
             scratch_str = "N/A (no liveness_curve)"
 
         alu_str = f"{alu_used}/{alu_cap} ({alu_pct:.1f}%)"
-        valu_break = f"{valu_used} ({vb_used} | {fma_used} | {other_used})"
-        flow_str = f"{flow_used}/{flow_cap} ({flow_pct:.0f}%)"
-        load_str = f"{load_used}/{load_cap} ({load_pct:.0f}%)"
+        valu_break = f"{valu_used}/{valu_cap} ({valu_pct:.1f}%) ({vb_used} | {fma_used} | {other_used})"
+        flow_break = f"{flow_used}/{flow_cap} ({flow_pct:.0f}%) ({flow_add_imm_used} | {flow_vselect_used} | {flow_other_used})"
+        load_break = f"{load_used}/{load_cap} ({load_pct:.0f}%) ({load_const_used} | {load_other_used})"
         store_str = f"{store_used}/{store_cap} ({store_pct:.0f}%)"
 
         row = (
-            f"  {d}     | {cycle_range:15} | {alu_str:18} | {valu_break:28} | {flow_str:6} | {load_str:5} | {store_str:5} | {scratch_str}"
+            f"  {d}     | {cycle_range:15} | {alu_str:18} | {valu_break:45} | {flow_break:42} | {load_break:28} | {store_str:5} | {scratch_str}"
         )
         print(row)
 
     print()
     print("VALU breakdown: vbroadcast and FMA (multiply_add / sub) are not shiftable; other is shiftable.")
+    print("Flow breakdown: add_imm (ConstChoice when true), vselect (SelectChoice when false), other (e.g. jump, halt).")
+    print("Load breakdown: const (ConstChoice when Load chosen), other (vload, load, load_offset).")
     if not liveness_curve:
         print("Scratch: run with liveness_detail=full (default when --output-json is set) to include per-cycle scratch.")
     return 0

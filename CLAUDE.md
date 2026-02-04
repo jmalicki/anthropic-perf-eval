@@ -22,6 +22,8 @@ These values are consistent across all test scripts and should be used when benc
 
 **Batch size constraint:** `batch_size` must be a positive multiple of VLEN (8), because the kernel processes vectors of 8 elements. Invalid values (e.g. 12, 20) produce wrong output or are rejected. Use e.g. 8, 16, 24, 32.
 
+**Terminal / scripting:** Do not use `tail` (or similar) to truncate optimizer or build output. We should see the whole output—run commands without piping to `tail` so the full output is displayed. You may read only the last part of a file or buffer when needed, but present the full output (or the full relevant portion) to the user.
+
 ## Build & Development Commands
 
 ### Python Setup
@@ -96,20 +98,23 @@ uv run generate_ssa_kernel.py --use-greedy
 # Longer optimization (diminishing returns after 10 min)
 uv run generate_ssa_kernel.py --cpsat-time-limit 3600
 
-# Output schedule JSON for analysis
-uv run generate_ssa_kernel.py --output-json schedule.json
+# Output schedule JSON for analysis (recommended: scheduler_output.json)
+uv run generate_ssa_kernel.py --output-json scheduler_output.json
 ```
 
-**CP-SAT solver output:** The script shows full CP-SAT progress by default, including:
-- Kernel building phase (SSA ops, dead code elimination)
-- Solver progress (objective bounds, conflicts, branches)
-- Final statistics (cycles, speedup, scratch usage)
+**Scheduler output JSON (`--output-json`, e.g. `scheduler_output.json`):** When summarizing or analyzing a run, **always prefer using the scheduler output JSON** when available. It contains summarizable information (per-cycle slot usage, liveness curve, VALU shift debug, usage accounting, etc.) that supports slot usage over time, decile analysis, and other reports without re-deriving from the kernel alone. Generate it with `--output-json scheduler_output.json` (or another path); then use that file for any summarization or analysis tasks.
+
+**CP-SAT solver output:** The script shows full CP-SAT progress by default. **Always report** (and ensure the generator prints):
+- **CP-SAT choices:** ConstChoice (AddImm vs Load counts), SelectChoice (FMA vs vselect counts), and how many VALU ops were shifted. This explains what the solver chose for optional encodings.
+- **Slot usage:** For each engine (ALU, VALU, Load, Store, Flow), report used slots, total available slots, and utilization percentage (e.g. `ALU=1774/3696 (48.0%)`). This shows how well the schedule uses each slot type.
+- **VALU breakdown:** Always summarize VALU slot usage by source: FMA (SelectChoice FMA path; not shiftable), vbroadcast (not shiftable), and other (shiftable VALU ops). This clarifies how much of VALU is fixed vs optimizable via shifting.
+- Kernel building phase (SSA ops, dead code elimination), solver progress (objective bounds, conflicts, branches), and final statistics (cycles, speedup, scratch usage).
 
 **Options for `generate_ssa_kernel.py`:**
 - `--use-greedy` - Use greedy scheduler instead of CP-SAT (fast, ~2s, may exceed budget)
 - `--cpsat-time-limit SECONDS` - CP-SAT time limit (default: 600 = 10 min)
 - `--enable-valu-shift` - Enable VALU→ALU shifting (disabled by default)
-- `--output-json PATH` - Write schedule JSON for analysis
+- `--output-json PATH` - Write scheduler output JSON for analysis (e.g. `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
 - `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
 - `--validate-only PATH` - Load kernel from JSON and run validation only (no build). Use after a run with `--validate` to re-check: `uv run generate_ssa_kernel.py --validate-only kernel_to_validate.json`.
 - `--save-kernel PATH` - Save kernel to this path (default when `--validate`: `kernel_to_validate.json`).

@@ -514,6 +514,12 @@ fn format_flow_violation_breadcrumbs(
 struct SsaSolutionSummary {
     alu_total: usize,
     valu_total: usize,
+    /// VALU slots from SelectChoice FMA path (sub+fma or fma only; not shiftable).
+    valu_fma_slots: usize,
+    /// VALU slots from Vbroadcast ops (not shiftable).
+    valu_vbroadcast_slots: usize,
+    /// VALU slots from other VALU ops (arithmetic etc.; shiftable when can_shift_to_alu).
+    valu_other_slots: usize,
     load_total: usize,
     store_total: usize,
     flow_total: usize,
@@ -533,6 +539,9 @@ fn summarise_ssa_solution_engines_and_choices(
 ) -> SsaSolutionSummary {
     let mut alu_total = 0usize;
     let mut valu_total = 0usize;
+    let mut valu_fma_slots = 0usize;
+    let mut valu_vbroadcast_slots = 0usize;
+    let mut valu_other_slots = 0usize;
     let mut load_total = 0usize;
     let mut store_total = 0usize;
     let mut flow_total = 0usize;
@@ -542,7 +551,7 @@ fn summarise_ssa_solution_engines_and_choices(
         if cycle < 0 {
             continue;
         }
-        let cycle = cycle as usize;
+        let _cycle = cycle as usize;
 
         if op.opcode == Opcode::ConstChoice {
             if const_add_imm_ops.contains(&op.id) {
@@ -555,8 +564,10 @@ fn summarise_ssa_solution_engines_and_choices(
         if op.opcode == Opcode::SelectChoice {
             if select_fma_ops.contains(&op.id) {
                 valu_total += 1;
+                valu_fma_slots += 1;
                 if op.delta_vreg.is_none() {
                     valu_total += 1;
+                    valu_fma_slots += 1;
                 }
             } else {
                 flow_total += 1;
@@ -571,6 +582,11 @@ fn summarise_ssa_solution_engines_and_choices(
                     alu_total += VLEN as usize;
                 } else {
                     valu_total += 1;
+                    if op.opcode == Opcode::Vbroadcast {
+                        valu_vbroadcast_slots += 1;
+                    } else {
+                        valu_other_slots += 1;
+                    }
                 }
             }
             Engine::Load => load_total += 1,
@@ -597,6 +613,9 @@ fn summarise_ssa_solution_engines_and_choices(
     SsaSolutionSummary {
         alu_total,
         valu_total,
+        valu_fma_slots,
+        valu_vbroadcast_slots,
+        valu_other_slots,
         load_total,
         store_total,
         flow_total,
@@ -756,6 +775,45 @@ fn validate_ssa_slot_limits(
                     name, cycle, count, limit, detail
                 );
             }
+        }
+    }
+}
+
+/// Verify that every consumer of a SelectChoice FMA (no-delta) result is scheduled at cycle >= dep_cycle + 2.
+/// SelectChoice FMA emits sub at C and fma at C+1; result is visible at C+2. Panics if violated (model bug).
+#[cfg(feature = "cpsat")]
+fn verify_select_choice_fma_consumer_precedence(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    select_fma_ops: &HashSet<usize>,
+) {
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+    for (consumer_idx, op) in ops.iter().enumerate() {
+        let consumer_cycle = cycle_assignments.get(consumer_idx).copied().unwrap_or(-1);
+        for &dep_id in &op.dep_ids {
+            let Some(&producer_idx) = id_to_idx.get(&dep_id) else {
+                continue;
+            };
+            let producer = &ops[producer_idx];
+            if producer.opcode != Opcode::SelectChoice
+                || !select_fma_ops.contains(&producer.id)
+                || producer.sub_temp_vreg.is_none()
+            {
+                continue;
+            }
+            let producer_cycle = cycle_assignments.get(producer_idx).copied().unwrap_or(-1);
+            assert!(
+                consumer_cycle >= producer_cycle + 2,
+                "BUG: consumer of SelectChoice FMA (op.id={}) at cycle {} but result not visible until cycle {} (dep at {})",
+                producer.id,
+                consumer_cycle,
+                producer_cycle + 2,
+                producer_cycle
+            );
         }
     }
 }
@@ -2038,7 +2096,7 @@ pub fn schedule_ssa_cpsat(
                     model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
                 const_flow_intervals.insert(idx, add_imm_interval);
 
-                model.add_hint(choice_var, 0); // false = use Load
+                model.add_hint(choice_var, 0); // false = use Load (solver may still flip to add_imm)
             }
         }
     }
@@ -3339,6 +3397,9 @@ pub fn schedule_ssa_cpsat(
                 &machine,
             );
 
+            // Post-solution validation: SelectChoice FMA result visible at C+2; consumers must be at >= C+2.
+            verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_fma_ops);
+
             if verbose {
                 let summary = summarise_ssa_solution_engines_and_choices(
                     ops,
@@ -3357,18 +3418,30 @@ pub fn schedule_ssa_cpsat(
                 let load_capacity = machine.load_slots as usize * makespan_usize;
                 let store_capacity = machine.store_slots as usize * makespan_usize;
                 let flow_capacity = machine.flow_slots as usize * makespan_usize;
+                let pct = |used: usize, cap: usize| {
+                    if cap > 0 {
+                        (used as f64 / cap as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                };
                 eprintln!(
-                    "  Engine usage: ALU={}/{} VALU={}/{} Load={}/{} Store={}/{} Flow={}/{}",
+                    "  Slot usage: ALU={}/{} ({:.1}%) VALU={}/{} ({:.1}%) Load={}/{} ({:.1}%) Store={}/{} ({:.1}%) Flow={}/{} ({:.1}%)",
                     summary.alu_total,
                     alu_capacity,
+                    pct(summary.alu_total, alu_capacity),
                     summary.valu_total,
                     valu_capacity,
+                    pct(summary.valu_total, valu_capacity),
                     summary.load_total,
                     load_capacity,
+                    pct(summary.load_total, load_capacity),
                     summary.store_total,
                     store_capacity,
+                    pct(summary.store_total, store_capacity),
                     summary.flow_total,
-                    flow_capacity
+                    flow_capacity,
+                    pct(summary.flow_total, flow_capacity)
                 );
                 eprintln!(
                     "  ConstChoice: {} AddImm, {} Load",
@@ -3377,6 +3450,13 @@ pub fn schedule_ssa_cpsat(
                 eprintln!(
                     "  SelectChoice: {} FMA, {} vselect",
                     summary.select_fma, summary.select_vselect
+                );
+                eprintln!(
+                    "  VALU slots: {} total (FMA: {}, vbroadcast: {}, other: {}; FMA and vbroadcast not shiftable)",
+                    summary.valu_total,
+                    summary.valu_fma_slots,
+                    summary.valu_vbroadcast_slots,
+                    summary.valu_other_slots
                 );
                 eprintln!(
                     "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} SelectChoice FMA ops",
