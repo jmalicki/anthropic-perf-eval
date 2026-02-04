@@ -70,6 +70,8 @@ def main():
                         help="CP-SAT SelectChoice: optimize, force fma, or force vselect (default: optimize)")
     parser.add_argument("--valu-shift", choices=["optimize", "alu", "valu"], default="optimize",
                         help="CP-SAT VALU shift: optimize, force alu, or force valu (default: optimize)")
+    parser.add_argument("--force-zero-gap", action="store_true",
+                        help="Force 0 integral gap for proven optimality (debugging only, slower). Uses longer time limit (2h) so CP-SAT can prove optimality.")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -107,7 +109,14 @@ def main():
         else args.per_section_optimize_secs
     )
 
-    scheduler_name = "greedy" if args.use_greedy else f"CP-SAT ({args.cpsat_time_limit:.0f}s)"
+    # With --force-zero-gap, CP-SAT must prove optimality; use longer time limit if needed
+    cpsat_time_limit = args.cpsat_time_limit
+    if args.force_zero_gap and cpsat_time_limit < 7200:
+        cpsat_time_limit = 7200  # 2 hours so solver has time to prove optimality
+        if verbose:
+            print(f"  (force_zero_gap: using cpsat_time_limit={cpsat_time_limit:.0f}s to allow proving optimality)")
+
+    scheduler_name = "greedy" if args.use_greedy else f"CP-SAT ({cpsat_time_limit:.0f}s)"
     print(f"Building SSA kernel with {scheduler_name}...")
     print(f"  forest_height={args.forest_height}, n_nodes={args.n_nodes}")
     print(f"  batch_size={args.batch_size}, rounds={args.rounds}")
@@ -117,6 +126,8 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
+    if args.force_zero_gap:
+        print(f"  force_zero_gap=True")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -129,13 +140,14 @@ def main():
         enable_valu_shift=args.enable_valu_shift,
         verbose=verbose,
         use_cpsat=use_cpsat,
-        cpsat_time_limit=args.cpsat_time_limit,
+        cpsat_time_limit=cpsat_time_limit,
         per_section_optimize_secs=per_section_optimize,
         output_json=args.output_json,
         enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
         const_choice=args.const_choice,
         select_choice=args.select_choice,
         valu_shift=args.valu_shift,
+        force_zero_gap=args.force_zero_gap if use_cpsat else None,
         # Note: liveness_detail parameter not available in Python bindings yet
         # It's only used when output_json is provided anyway
     )

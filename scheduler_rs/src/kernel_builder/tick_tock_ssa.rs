@@ -444,6 +444,7 @@ impl SsaTickTockKernelBuilder {
         const_choice_mode: crate::cpsat_scheduler::ConstChoiceMode,
         select_choice_mode: crate::cpsat_scheduler::SelectChoiceMode,
         valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
+        force_zero_gap: bool,
     ) -> Result<SsaScheduleResult, String> {
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
@@ -850,6 +851,7 @@ impl SsaTickTockKernelBuilder {
             const_choice_mode,
             select_choice_mode,
             valu_shift_mode,
+            force_zero_gap,
             ..Default::default()
         };
 
@@ -4578,6 +4580,7 @@ mod tests {
             ConstChoiceMode::Optimize,
             SelectChoiceMode::Optimize,
             ValuShiftMode::Optimize,
+            false, // force_zero_gap
         );
         assert!(
             result.is_ok(),

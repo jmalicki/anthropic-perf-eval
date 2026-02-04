@@ -1391,8 +1391,8 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
     params.cp_model_probing_level = Some(2);
     params.randomize_search = Some(true);
 
-    // Stop early if we find a good solution (within 2% of greedy)
-    params.relative_gap_limit = Some(0.02);
+    // Force 0 integral gap for proven optimality (no early stopping based on gap)
+    params.relative_gap_limit = Some(0.0);
 
     // Option to stop after finding first feasible solution (useful for testing hints)
     if stop_after_first_solution {
@@ -1495,6 +1495,9 @@ pub struct SsaCpsatConfig {
     pub select_choice_mode: SelectChoiceMode,
     /// VALU shift: Optimize (solver chooses), ForceAlu, or ForceValu.
     pub valu_shift_mode: ValuShiftMode,
+    /// If true, force 0 integral gap for proven optimality (debugging only).
+    /// Default: false (uses scale/3 gap limit for faster convergence).
+    pub force_zero_gap: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1510,6 +1513,7 @@ impl Default for SsaCpsatConfig {
             const_choice_mode: ConstChoiceMode::default(),
             select_choice_mode: SelectChoiceMode::default(),
             valu_shift_mode: ValuShiftMode::default(),
+            force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
         }
     }
 }
@@ -1709,6 +1713,7 @@ pub fn schedule_ssa_cpsat(
         const_choice_mode,
         select_choice_mode,
         valu_shift_mode,
+        force_zero_gap,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -3011,26 +3016,53 @@ pub fn schedule_ssa_cpsat(
         model.add_ge(makespan, LinearExpr::from(cv) + 1);
     }
 
-    // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops (tie-breaker).
+    // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops, ConstChoice ops, shiftable VALU ops, and SelectChoice ops (tie-breaker).
     //
-    // Objective = scale * makespan + sum(completion_cycle).
-    // Scale is chosen as the next power of 10 above max(sum(completion_cycle)):
+    // Objective = scale * makespan + sum(completion_cycle) + sum(const_choice_cycles) + sum(shiftable_valu_cycles) + sum(select_choice_cycles).
+    // Scale is chosen as the next power of 10 above max(sum(completion_cycle) + sum(const_choice_cycles) + sum(shiftable_valu_cycles) + sum(select_choice_cycles)):
     //   (1) True tie-breaker: scale > max_sum, so one extra cycle always dominates the sum.
     //   (2) Leading digits of the objective value are the makespan (cycle count), e.g.
     //       objective 104_042_000 => makespan 104, tie-breaker sum 42_000.
+    //   (3) Including ConstChoice cycles rewards earlier const ops, which naturally prefers add_imm
+    //       when Flow is free (enabling better load balance).
+    //   (4) Including shiftable VALU cycles rewards earlier VALU ops, which encourages shifting to ALU
+    //       when that allows earlier scheduling (freeing VALU slots for other ops).
+    //   (5) Including SelectChoice cycles rewards earlier SelectChoice ops, which may favor FMA over vselect
+    //       when FMA can execute earlier (though FMA uses VALU slots which may be saturated).
     let mut objective_scale: Option<i64> = None;
-    if let Some((&first_cc, rest)) = completion_cycle_vars
-        .values()
-        .next()
-        .map(|v| (v, completion_cycle_vars.values().skip(1)))
-    {
-        let max_sum = (completion_cycle_vars.len() as i64) * (horizon as i64);
+    
+    // Collect all cycle vars for tie-breaker: completion_cycle (shifted VALU) + cycle_vars (ConstChoice + shiftable VALU + SelectChoice)
+    let mut tie_breaker_vars: Vec<IntVar> = Vec::new();
+    
+    // Add completion_cycle vars for shifted VALU ops
+    for &cc_var in completion_cycle_vars.values() {
+        tie_breaker_vars.push(cc_var);
+    }
+    
+    // Add cycle_vars for ConstChoice ops (prefer earlier const ops, which favors add_imm when Flow is free)
+    for &idx in &const_choice_ops {
+        tie_breaker_vars.push(cycle_vars[idx]);
+    }
+    
+    // Add cycle_vars for shiftable VALU ops (prefer earlier VALU ops, which encourages shifting to ALU when beneficial)
+    for &idx in &shiftable_valu {
+        tie_breaker_vars.push(cycle_vars[idx]);
+    }
+    
+    // Add cycle_vars for SelectChoice ops (prefer earlier SelectChoice ops, which may favor FMA over vselect when beneficial)
+    for &idx in &select_choice_ops {
+        tie_breaker_vars.push(cycle_vars[idx]);
+    }
+    
+    if let Some(&first_var) = tie_breaker_vars.first() {
+        let rest = &tie_breaker_vars[1..];
+        let max_sum = (tie_breaker_vars.len() as i64) * (horizon as i64);
         let mut scale = 1i64;
         while scale <= max_sum {
             scale = scale.saturating_mul(10);
         }
         objective_scale = Some(scale);
-        let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| {
+        let sum_completion: LinearExpr = rest.iter().fold(LinearExpr::from(first_var), |acc, &v| {
             acc + LinearExpr::from(v)
         });
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
@@ -3133,9 +3165,15 @@ pub fn schedule_ssa_cpsat(
     params.log_search_progress = Some(true);
     params.num_workers = Some(8);
 
+    // Gap limit: default uses scale/3 for faster convergence, but can force 0 for debugging.
     // Stop when gap <= scale/3: remaining improvement is only in the tie-breaker (sum of completion_cycle).
     // One extra cycle costs scale in the objective, so scale/3 guarantees we're within ~1 cycle worst case.
-    if let Some(scale) = objective_scale {
+    if force_zero_gap {
+        // Force 0 integral gap for proven optimality (debugging only).
+        // This ensures CP-SAT explores all possibilities, including tie-breaker optimizations
+        // like moving ConstChoice ops earlier via add_imm.
+        params.absolute_gap_limit = Some(0.0);
+    } else if let Some(scale) = objective_scale {
         params.absolute_gap_limit = Some((scale / 3) as f64);
     }
 
