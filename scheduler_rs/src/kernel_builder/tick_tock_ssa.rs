@@ -17,6 +17,7 @@ use crate::address_assign::{
     assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult,
 };
 use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VReg, VarType};
+use crate::types::SlotVal;
 
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
@@ -92,6 +93,96 @@ pub struct SsaTickTockKernelBuilder {
     pub(crate) uses_depth3: bool,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
+}
+
+/// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
+fn scratch_write_size(op: &Op) -> usize {
+    match op.engine {
+        Engine::Valu => 8,
+        Engine::Alu => 1,
+        Engine::Flow => 1,
+        Engine::Load => {
+            let first = op.slot.first();
+            match first {
+                Some(SlotVal::Str(s)) if s == "vload" => 8,
+                _ => 1,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Compute contiguous (base, len) ranges from a set of addresses.
+/// Used so we only treat an op as having one scratch write when it's exactly one contiguous block.
+fn contiguous_ranges_from_addresses(addrs: &HashSet<i64>) -> Vec<(i64, usize)> {
+    if addrs.is_empty() {
+        return vec![];
+    }
+    let mut sorted: Vec<i64> = addrs.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut ranges = Vec::new();
+    let mut base = sorted[0];
+    let mut len = 1usize;
+    for &a in &sorted[1..] {
+        if a == base + len as i64 {
+            len += 1;
+        } else {
+            ranges.push((base, len));
+            base = a;
+            len = 1;
+        }
+    }
+    ranges.push((base, len));
+    ranges
+}
+
+/// Panics if two distinct ops in the same cycle write overlapping scratch ranges.
+/// Each op's scratch writes are represented as one or more contiguous (base, size) blocks;
+/// no two such blocks (from any ops in the same cycle) may overlap.
+fn verify_no_same_cycle_scratch_write_conflict(ops: &[Op]) {
+    use std::collections::BTreeMap;
+    // Store (base, len, op_id) to identify which ops conflict
+    let by_cycle: BTreeMap<i32, Vec<(i64, usize, usize)>> = {
+        let mut m: BTreeMap<i32, Vec<(i64, usize, usize)>> = BTreeMap::new();
+        for op in ops {
+            if op.cycle < 0 {
+                continue;
+            }
+            if scratch_write_size(op) == 0 {
+                continue;
+            }
+            if op.writes.is_empty() {
+                continue;
+            }
+            let ranges = contiguous_ranges_from_addresses(&op.writes);
+            for (base, len) in ranges {
+                m.entry(op.cycle).or_default().push((base, len, op.id));
+            }
+        }
+        m
+    };
+    for (_cycle, ranges) in &by_cycle {
+        for (i, &(a1, l1, id1)) in ranges.iter().enumerate() {
+            for &(a2, l2, id2) in ranges.iter().skip(i + 1) {
+                let overlap = a1 < a2 + (l2 as i64) && a2 < a1 + (l1 as i64);
+                if overlap {
+                    // Find the actual ops for better error message
+                    let op1 = ops.iter().find(|o| o.id == id1);
+                    let op2 = ops.iter().find(|o| o.id == id2);
+                    let op1_info = op1.map(|o| format!("{:?} engine={:?}", o.slot.first(), o.engine)).unwrap_or_else(|| "unknown".to_string());
+                    let op2_info = op2.map(|o| format!("{:?} engine={:?}", o.slot.first(), o.engine)).unwrap_or_else(|| "unknown".to_string());
+                    panic!(
+                        "BUG: same-cycle scratch write conflict at cycle {}: op id={} ({}) writes [{}, {}) len {} vs op id={} ({}) writes [{}, {}) len {} (allocator must not assign overlapping scratch to ops in the same cycle)",
+                        _cycle,
+                        id1, op1_info,
+                        a1, a1 + l1 as i64, l1,
+                        id2, op2_info,
+                        a2, a2 + l2 as i64, l2
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl SsaTickTockKernelBuilder {
@@ -966,6 +1057,11 @@ impl SsaTickTockKernelBuilder {
             &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
             &cpsat_result.shifted_alu_cycles, // Individual ALU cycles from CP-SAT
         );
+
+        // Debug: assert no two ops in the same cycle write overlapping scratch addresses.
+        if cfg!(debug_assertions) {
+            verify_no_same_cycle_scratch_write_conflict(&ops);
+        }
 
         // Cycle count must be derived from lowered ops: SelectChoice FMA (no delta) emits
         // sub at C and FMA at C+1, so if the last SSA op was a SelectChoice FMA at C,

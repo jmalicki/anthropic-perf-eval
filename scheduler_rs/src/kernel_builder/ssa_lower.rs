@@ -131,6 +131,12 @@ pub fn lower_ssa_ops_with_shift(
             // Handle SelectChoice based on scheduler decision
             let dest = ssa_op.dest.expect("SelectChoice op must have dest");
             let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
+            if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                eprintln!(
+                    "[DEBUG lower_ssa_ops_with_shift] SelectChoice op.id={} cycle={} select_fma_ops.contains={} sub_temp_vreg={:?}",
+                    ssa_op.id, ssa_op.cycle, select_fma_ops.contains(&ssa_op.id), ssa_op.sub_temp_vreg
+                );
+            }
 
             // Extract operands: cond, true_val, false_val
             if ssa_op.srcs.len() < 3 {
@@ -160,12 +166,27 @@ pub fn lower_ssa_ops_with_shift(
 
             if select_fma_ops.contains(&ssa_op.id) {
                 // FMA path: check if we have a precomputed delta
+                if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                    eprintln!(
+                        "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA path: op.id={} cycle={} delta_vreg={:?} sub_temp_vreg={:?}",
+                        ssa_op.id, ssa_op.cycle, ssa_op.delta_vreg, ssa_op.sub_temp_vreg
+                    );
+                }
                 if let Some(delta_vreg) = ssa_op.delta_vreg {
                     // Precomputed delta available: emit single FMA op
                     // fma = cond * delta + base (where base = false_val)
                     let delta_addr = *vreg_to_addr
                         .get(&delta_vreg)
                         .expect("delta VReg not in mapping");
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA delta path: op.id={} delta_vreg={:?} -> delta_addr={}, dest={:?} -> {}, cond={:?} -> {}, false_val={:?} -> {}",
+                            ssa_op.id, delta_vreg, delta_addr,
+                            ssa_op.dest.unwrap(), dest_addr,
+                            cond_vreg, cond_addr,
+                            false_val_vreg, false_val_addr
+                        );
+                    }
 
                     let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                     fma_slot.push(SlotVal::Str("multiply_add".to_string()));
@@ -175,12 +196,18 @@ pub fn lower_ssa_ops_with_shift(
                     fma_slot.push(SlotVal::Int(false_val_addr));
 
                     let mut fma_reads = HashSet::new();
-                    fma_reads.insert(cond_addr);
-                    fma_reads.insert(delta_addr);
-                    fma_reads.insert(false_val_addr);
+                    // Expand vector addresses: all SelectChoice operands are vectors
+                    for i in 0..VLEN as i64 {
+                        fma_reads.insert(cond_addr + i);
+                        fma_reads.insert(delta_addr + i);
+                        fma_reads.insert(false_val_addr + i);
+                    }
 
                     let mut fma_writes = HashSet::new();
-                    fma_writes.insert(dest_addr);
+                    // dest is a vector VReg
+                    for i in 0..VLEN as i64 {
+                        fma_writes.insert(dest_addr + i);
+                    }
 
                     result.push(Op {
                         id: ssa_op.id,
@@ -205,6 +232,17 @@ pub fn lower_ssa_ops_with_shift(
                     let sub_temp_addr = *vreg_to_addr.get(&sub_temp_vreg).expect(
                         "sub_temp_vreg not in address mapping - was it included in address assignment?"
                     );
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA (op.id={} cycle={}): sub_temp_vreg={:?} -> addr {}, dest={:?} -> addr {}, cond={:?} -> addr {}, true_val={:?} -> addr {}, false_val={:?} -> addr {}",
+                            ssa_op.id, ssa_op.cycle,
+                            sub_temp_vreg, sub_temp_addr,
+                            ssa_op.dest.unwrap(), dest_addr,
+                            cond_vreg, cond_addr,
+                            true_val_vreg, true_val_addr,
+                            false_val_vreg, false_val_addr
+                        );
+                    }
 
                     // Sub op: sub_temp = true_val - false_val
                     let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
@@ -214,13 +252,19 @@ pub fn lower_ssa_ops_with_shift(
                     sub_slot.push(SlotVal::Int(false_val_addr));
 
                     let mut sub_reads = HashSet::new();
-                    sub_reads.insert(true_val_addr);
-                    sub_reads.insert(false_val_addr);
+                    // Expand vector addresses: all SelectChoice operands are vectors
+                    for i in 0..VLEN as i64 {
+                        sub_reads.insert(true_val_addr + i);
+                        sub_reads.insert(false_val_addr + i);
+                    }
 
                     let mut sub_writes = HashSet::new();
-                    sub_writes.insert(sub_temp_addr);
+                    // sub_temp is a vector VReg
+                    for i in 0..VLEN as i64 {
+                        sub_writes.insert(sub_temp_addr + i);
+                    }
 
-                    result.push(Op {
+                    let sub_op = Op {
                         id: ssa_op.id, // Use same ID for sub (will be different for fma)
                         engine: crate::types::Engine::Valu,
                         slot: sub_slot,
@@ -230,7 +274,14 @@ pub fn lower_ssa_ops_with_shift(
                         writes: sub_writes,
                         last_use_reads: HashSet::new(),
                         produces_constant: None,
-                    });
+                    };
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA sub: op.id={} cycle={} writes={:?} reads={:?}",
+                            sub_op.id, sub_op.cycle, sub_op.writes, sub_op.reads
+                        );
+                    }
+                    result.push(sub_op);
 
                     // FMA op: dest = cond * sub_temp + false_val
                     let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
@@ -241,14 +292,20 @@ pub fn lower_ssa_ops_with_shift(
                     fma_slot.push(SlotVal::Int(false_val_addr));
 
                     let mut fma_reads = HashSet::new();
-                    fma_reads.insert(cond_addr);
-                    fma_reads.insert(sub_temp_addr);
-                    fma_reads.insert(false_val_addr);
+                    // Expand vector addresses: all SelectChoice operands are vectors
+                    for i in 0..VLEN as i64 {
+                        fma_reads.insert(cond_addr + i);
+                        fma_reads.insert(sub_temp_addr + i);
+                        fma_reads.insert(false_val_addr + i);
+                    }
 
                     let mut fma_writes = HashSet::new();
-                    fma_writes.insert(dest_addr);
+                    // dest is a vector VReg
+                    for i in 0..VLEN as i64 {
+                        fma_writes.insert(dest_addr + i);
+                    }
 
-                    result.push(Op {
+                    let fma_op = Op {
                         id: ssa_op.id + 1000000, // Different ID for fma op
                         engine: crate::types::Engine::Valu,
                         slot: fma_slot,
@@ -262,7 +319,14 @@ pub fn lower_ssa_ops_with_shift(
                         writes: fma_writes,
                         last_use_reads: HashSet::new(),
                         produces_constant: None,
-                    });
+                    };
+                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA fma: op.id={} cycle={} writes={:?} reads={:?}",
+                            fma_op.id, fma_op.cycle, fma_op.writes, fma_op.reads
+                        );
+                    }
+                    result.push(fma_op);
                 }
             } else {
                 // vselect path: emit vselect op (Flow)

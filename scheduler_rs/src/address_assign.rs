@@ -163,15 +163,22 @@ pub fn compute_live_intervals(
             } else if let Some(cycles) =
                 shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
             {
-                // Shifted VALU: 8 ALU ops write at different cycles; block in use from first write
-                // TODO(valu-shift-liveness): We reserve the entire 8-word vector from the first lane write
-                // onwards. In reality only the lanes that have already been written are live, so this is
-                // conservative. Revisit if we ever model lane-level liveness to allow partial reuse.
+                // Shifted VALU: 8 ALU ops write at different cycles; block in use from first to last write
+                // We must not free the address until after the last lane write, or another op could
+                // be assigned the same range and we get same-cycle scratch write conflict.
                 *cycles.iter().min().unwrap_or(&op.cycle)
             } else {
                 op.cycle
             };
-            intervals.insert(dest, LiveInterval::new(def_cycle, def_cycle));
+            // For shifted VALU dest, end must be at least max(alu_cycles) so we don't reuse before last write
+            let end_cycle = if let Some(cycles) =
+                shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
+            {
+                *cycles.iter().max().unwrap_or(&def_cycle)
+            } else {
+                def_cycle
+            };
+            intervals.insert(dest, LiveInterval::new(def_cycle, end_cycle));
         }
 
         // Handle sub_temp_vreg for SelectChoice ops without delta
@@ -218,17 +225,20 @@ pub fn compute_live_intervals(
             }
         }
 
-        // SelectChoice FMA (no delta): sub at cycle, FMA at cycle+1. The FMA reads cond and false_val
-        // at cycle+1, so their intervals must extend to cycle+1 or the allocator may reuse those
-        // addresses and corrupt the FMA result.
+        // SelectChoice FMA (both delta and sub+fma paths): FMA reads cond, delta (if delta path), and false_val at cycle+1.
+        // For delta path: single FMA at cycle+1 reads cond, delta, false_val.
+        // For sub+fma path: sub at cycle, FMA at cycle+1 reads cond, sub_temp, false_val.
+        // In both cases, cond and false_val are read at cycle+1, so their intervals must extend
+        // to cycle+1 or the allocator may reuse those addresses and corrupt the FMA result.
+        // For delta path, delta is also read at cycle+1, so its interval must extend to cycle+1.
         if op.opcode == Opcode::SelectChoice
             && select_fma_ops.map_or(false, |s| s.contains(&op.id))
-            && op.sub_temp_vreg.is_some()
             && op.srcs.len() >= 3
         {
             let read_at_cycle_plus_one = op.cycle + 1;
             for (i, src) in op.srcs.iter().enumerate() {
                 // cond = srcs[0], false_val = srcs[2] are read again by FMA at cycle+1
+                // (true_val = srcs[1] is only used by sub in sub+fma path, not by FMA)
                 if i != 1 {
                     if let Operand::VReg(vreg) = src {
                         if let Some(interval) = intervals.get_mut(vreg) {
@@ -236,6 +246,14 @@ pub fn compute_live_intervals(
                                 interval.end = read_at_cycle_plus_one;
                             }
                         }
+                    }
+                }
+            }
+            // For delta path: delta_vreg is also read by FMA at cycle+1
+            if let Some(delta_vreg) = op.delta_vreg {
+                if let Some(interval) = intervals.get_mut(&delta_vreg) {
+                    if read_at_cycle_plus_one > interval.end {
+                        interval.end = read_at_cycle_plus_one;
                     }
                 }
             }
@@ -436,35 +454,63 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
             }
         }
 
-        // Try to find a free range that fits this VReg's size
+        // Snapshot active (addr, size) so we can check overlap reliably.
+        let active_ranges: Vec<(i64, usize)> = active
+            .iter()
+            .map(|Reverse((_, a, s))| (*a, *s))
+            .collect();
+
+        let overlaps_any = |addr: i64, len: usize| {
+            let end = addr + len as i64;
+            active_ranges.iter().any(|&(a, s)| {
+                let a_end = a + s as i64;
+                addr < a_end && a < end
+            })
+        };
+
+        // Try to find a free range that fits and doesn't overlap any active allocation.
         let mut new_addr: Option<i64> = None;
         let mut temp_ranges: Vec<(i64, usize)> = Vec::new();
 
         while let Some(Reverse((addr, range_size))) = free_ranges.pop() {
-            if range_size >= size {
-                // Found a suitable range
+            if range_size >= size && !overlaps_any(addr, size) {
                 new_addr = Some(addr);
-                // If there's leftover space, put it back
                 if range_size > size {
                     temp_ranges.push((addr + size as i64, range_size - size));
                 }
                 break;
-            } else {
-                temp_ranges.push((addr, range_size));
             }
+            temp_ranges.push((addr, range_size));
         }
 
-        // Put back ranges we couldn't use
         for (addr, range_size) in temp_ranges {
             free_ranges.push(Reverse((addr, range_size)));
         }
 
-        // If no free range found, allocate fresh
-        let new_addr = new_addr.unwrap_or_else(|| {
-            let addr = next_addr;
-            next_addr += size as i64;
+        let mut new_addr = new_addr.unwrap_or_else(|| {
+            let mut addr = next_addr;
+            for &(a, s) in &active_ranges {
+                let a_end = a + s as i64;
+                if addr < a_end {
+                    addr = a_end;
+                }
+            }
+            next_addr = addr + size as i64;
             addr
         });
+
+        // Final safeguard: chosen address must not overlap any active allocation.
+        if overlaps_any(new_addr, size) {
+            let mut addr = next_addr;
+            for &(a, s) in &active_ranges {
+                let a_end = a + s as i64;
+                if addr < a_end {
+                    addr = a_end;
+                }
+            }
+            new_addr = addr;
+            next_addr = addr + size as i64;
+        }
 
         vreg_to_addr.insert(*vreg, new_addr);
         active.push(Reverse((interval.end, new_addr, size)));
@@ -474,6 +520,21 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
             eprintln!(
                 "[DEBUG assign_addresses] Assigned {:?} -> addr {} (interval [{}, {}])",
                 vreg, new_addr, interval.start, interval.end
+            );
+        }
+
+        // Debug: log all vector assignments to catch allocator bugs
+        if debug && size == 8 {
+            eprintln!(
+                "[DEBUG assign_addresses] VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
+                vreg, new_addr, size, interval.start, interval.end, active_ranges
+            );
+        }
+        // Debug: log all assignments at cycle 3 to catch conflicts
+        if debug && interval.start == 3 {
+            eprintln!(
+                "[DEBUG assign_addresses] CYCLE3: VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
+                vreg, new_addr, size, interval.start, interval.end, active_ranges
             );
         }
     }
