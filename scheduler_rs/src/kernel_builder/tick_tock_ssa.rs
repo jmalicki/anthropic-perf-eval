@@ -13,13 +13,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::address_assign::{assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult};
-use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VarType, VReg};
+use crate::address_assign::{
+    assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult,
+};
+use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VReg, VarType};
 
 use super::barrier_elision::elide_barriers;
 use super::config::{fma_multiplier, KernelConfig};
 use super::context_ssa::SsaScratchContext;
-use super::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code, SsaEmitContext};
+use super::emit_ssa::{
+    compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code,
+    SsaEmitContext,
+};
 use super::ssa_lower::lower_ssa_ops_with_shift;
 
 /// Unroll factor - process 8 groups per iteration
@@ -43,7 +48,6 @@ pub(crate) fn effective_scratch_budget(zero_vreg_reserved: bool) -> usize {
         SCRATCH_BUDGET_HW
     }
 }
-
 
 /// Result of SSA scheduling and address assignment.
 #[derive(Debug)]
@@ -195,8 +199,8 @@ impl SsaTickTockKernelBuilder {
         // Collect SelectChoice decisions from greedy scheduler
         let mut shifted_ops: HashSet<usize> = HashSet::new();
         let mut greedy_select_fma_ops = HashSet::new();
-        let (cycles, sched_budget_exceeded, _sched_peak_live) = 
-            self.schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        let (cycles, sched_budget_exceeded, _sched_peak_live) = self
+            .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
                 enable_valu_shift,
                 &mut shifted_ops,
@@ -217,10 +221,7 @@ impl SsaTickTockKernelBuilder {
         // interval computation (their [-1,-1] intervals get processed first
         // and their addresses freed immediately, potentially allowing live
         // VRegs to incorrectly share addresses with them).
-        let ssa_ops: Vec<SsaOp> = ssa_ops
-            .into_iter()
-            .filter(|op| op.cycle >= 0)
-            .collect();
+        let ssa_ops: Vec<SsaOp> = ssa_ops.into_iter().filter(|op| op.cycle >= 0).collect();
 
         // Assign addresses via linear scan (budget = hardware limit; zero_vreg included in peak so we stay within capacity)
         let mut assign_config = AddressAssignConfig::default();
@@ -232,11 +233,17 @@ impl SsaTickTockKernelBuilder {
             assign_config.zero_vreg = Some(zero);
         }
 
-        eprintln!("[TRACE build_and_schedule] About to call assign_addresses with {} ops", ssa_ops.len());
+        eprintln!(
+            "[TRACE build_and_schedule] About to call assign_addresses with {} ops",
+            ssa_ops.len()
+        );
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
 
-        eprintln!("[TRACE build_and_schedule] assign_addresses returned, peak_live={}", address_result.peak_live);
+        eprintln!(
+            "[TRACE build_and_schedule] assign_addresses returned, peak_live={}",
+            address_result.peak_live
+        );
 
         // Debug: verify all source VRegs have addresses assigned
         if std::env::var("SCHEDULER_DEBUG").is_ok() {
@@ -249,8 +256,10 @@ impl SsaTickTockKernelBuilder {
         if budget_exceeded {
             eprintln!(
                 "Budget exceeded: sched={}, addr_assign={}, peak_live={}, budget={}",
-                sched_budget_exceeded, address_result.budget_exceeded,
-                address_result.peak_live, address_result.budget
+                sched_budget_exceeded,
+                address_result.budget_exceeded,
+                address_result.peak_live,
+                address_result.budget
             );
             return Err(format!(
                 "scratch budget exceeded: peak_live={} > budget={}",
@@ -284,12 +293,22 @@ impl SsaTickTockKernelBuilder {
             &ssa_ops,
             &address_result.vreg_to_addr,
             &shifted_ops,
-            &HashSet::new(), // Greedy always uses Load for ConstChoice
+            &HashSet::new(),        // Greedy always uses Load for ConstChoice
             &greedy_select_fma_ops, // Pass greedy's SelectChoice decisions
-            &HashMap::new(), // Greedy doesn't provide individual ALU cycles
+            &HashMap::new(),        // Greedy doesn't provide individual ALU cycles
         );
 
         let valu_shifted = shifted_ops.len();
+
+        // Cycle count must be derived from lowered ops: SelectChoice FMA (no delta) emits
+        // sub at C and FMA at C+1, so we need max(lowered op cycle)+1.
+        let cycles = ops
+            .iter()
+            .map(|op| op.cycle.max(0) as usize)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(cycles)
+            .max(cycles);
 
         Ok(SsaScheduleResult {
             shifted_alu_cycles: HashMap::new(), // Greedy doesn't provide individual ALU cycles
@@ -335,10 +354,13 @@ impl SsaTickTockKernelBuilder {
         select_choice_mode: crate::cpsat_scheduler::SelectChoiceMode,
         valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
     ) -> Result<SsaScheduleResult, String> {
-        use crate::types::Opcode;
-        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
         use super::barrier_elision::{count_barriers, section_boundaries};
-        use super::round_budget::{sections_exceeding_budget, live_in_for_section_filtered, live_out_from_section, live_through_for_section, vreg_def_section};
+        use super::round_budget::{
+            live_in_for_section_filtered, live_out_from_section, live_through_for_section,
+            sections_exceeding_budget, vreg_def_section,
+        };
+        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+        use crate::types::Opcode;
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
         self.build_internal();
@@ -391,8 +413,8 @@ impl SsaTickTockKernelBuilder {
         let mut greedy_select_fma_ops = HashSet::new();
         let mut greedy_select_sub_cycles = HashMap::new();
         let mut greedy_select_fma_cycles = HashMap::new();
-        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = 
-            self.schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = self
+            .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
                 enable_valu_shift, // Match CP-SAT shift setting for hints
                 &mut greedy_shifted,
@@ -423,14 +445,28 @@ impl SsaTickTockKernelBuilder {
         // Phase 1: Per-section feasibility (only when a section exceeds scratch budget)
         let boundaries = section_boundaries(&ssa_ops);
         let effective_budget = effective_scratch_budget(self.zero_vreg.is_some());
-        let budget_result = sections_exceeding_budget(&ssa_ops, effective_budget, Some(&greedy_select_fma_ops));
-        let n_exceeding: usize = budget_result.section_exceeds_budget.iter().filter(|&&b| b).count();
+        let budget_result =
+            sections_exceeding_budget(&ssa_ops, effective_budget, Some(&greedy_select_fma_ops));
+        let n_exceeding: usize = budget_result
+            .section_exceeds_budget
+            .iter()
+            .filter(|&&b| b)
+            .count();
         if verbose {
             eprintln!();
-            eprintln!("================================================================================");
-            eprintln!("  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)", SCRATCH_BUDGET_HW);
-            eprintln!("  Sections that exceed budget will get a per-section CP-SAT run (feasibility).");
-            eprintln!("================================================================================");
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!(
+                "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)",
+                SCRATCH_BUDGET_HW
+            );
+            eprintln!(
+                "  Sections that exceed budget will get a per-section CP-SAT run (feasibility)."
+            );
+            eprintln!(
+                "================================================================================"
+            );
             eprintln!();
             for (k, &peak) in budget_result.section_peaks.iter().enumerate() {
                 if budget_result.section_exceeds_budget[k] {
@@ -474,11 +510,18 @@ impl SsaTickTockKernelBuilder {
                     .iter()
                     .filter_map(|&i| {
                         let c = ssa_ops[i].cycle;
-                        if c >= 0 { Some(c) } else { None }
+                        if c >= 0 {
+                            Some(c)
+                        } else {
+                            None
+                        }
                     })
                     .fold((i32::MAX, i32::MIN), |(lo, hi), c| (lo.min(c), hi.max(c)));
-                let greedy_section_makespan =
-                    if greedy_min_c <= greedy_max_c { greedy_max_c - greedy_min_c + 1 } else { 0 };
+                let greedy_section_makespan = if greedy_min_c <= greedy_max_c {
+                    greedy_max_c - greedy_min_c + 1
+                } else {
+                    0
+                };
                 let greedy_section_peak = budget_result.section_peaks[k];
 
                 let section_optimize = per_section_optimize_secs.map_or(false, |t| t > 0.0);
@@ -488,12 +531,18 @@ impl SsaTickTockKernelBuilder {
                         "  PER-SECTION CP-SAT:  SECTION {}  ({})",
                         k,
                         if section_optimize {
-                            format!("optimize up to {:.0}s, no VALU shift", per_section_optimize_secs.unwrap_or(0.0))
+                            format!(
+                                "optimize up to {:.0}s, no VALU shift",
+                                per_section_optimize_secs.unwrap_or(0.0)
+                            )
                         } else {
                             "feasibility — find any valid schedule, no VALU shift".to_string()
                         }
                     );
-                    eprintln!("  {} ops in this section. Goal: stay within scratch budget.", global_indices.len());
+                    eprintln!(
+                        "  {} ops in this section. Goal: stay within scratch budget.",
+                        global_indices.len()
+                    );
                     eprintln!("--------------------------------------------------------------------------------");
                     eprintln!();
                 }
@@ -507,7 +556,7 @@ impl SsaTickTockKernelBuilder {
                         op
                     })
                     .collect();
-                
+
                 // Filter out AddImm alternatives from segment_ops (same logic as full-kernel CP-SAT)
                 let mut seg_addimm_alternatives: HashSet<usize> = HashSet::new();
                 for (idx, op) in segment_ops_raw.iter().enumerate() {
@@ -516,7 +565,9 @@ impl SsaTickTockKernelBuilder {
                             for prev_idx in (0..idx).rev() {
                                 let prev_op = &segment_ops_raw[prev_idx];
                                 if prev_op.dest == Some(dest) {
-                                    if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                    if prev_op.engine == Engine::Load
+                                        && prev_op.opcode == Opcode::Const
+                                    {
                                         seg_addimm_alternatives.insert(idx);
                                     }
                                     break;
@@ -540,13 +591,20 @@ impl SsaTickTockKernelBuilder {
                     .filter(|(idx, _)| !seg_addimm_alternatives.contains(idx))
                     .map(|(_, pair)| pair)
                     .collect();
-                let (segment_ops, segment_hints): (Vec<SsaOp>, Vec<i32>) = filtered_segment.into_iter().unzip();
-                
+                let (segment_ops, segment_hints): (Vec<SsaOp>, Vec<i32>) =
+                    filtered_segment.into_iter().unzip();
+
                 // Use filtered segment indices so CP-SAT cycle_vars align with segment_ops
-                let initial_live =
-                    live_in_for_section_filtered(&ssa_ops, &boundaries, k, &vreg_def_sec, &global_indices);
+                let initial_live = live_in_for_section_filtered(
+                    &ssa_ops,
+                    &boundaries,
+                    k,
+                    &vreg_def_sec,
+                    &global_indices,
+                );
                 let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
-                let live_through = live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
+                let live_through =
+                    live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 // Per-section never uses VALU shift (avoids extra scratch pressure in segment).
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false), // Short optimization run
@@ -576,20 +634,30 @@ impl SsaTickTockKernelBuilder {
                         forced_shifts: None,
                         select_choice_hints: seg_select,
                         initial_live: Some(&initial_live),
-                        live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
-                        live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
+                        live_out_vregs: if live_out.is_empty() {
+                            None
+                        } else {
+                            Some(&live_out)
+                        },
+                        live_through_vregs: if live_through.is_empty() {
+                            None
+                        } else {
+                            Some(&live_through)
+                        },
                     },
                 )
-                .ok_or_else(|| {
-                    format!("Per-section CP-SAT failed for section {}", k)
-                })?;
+                .ok_or_else(|| format!("Per-section CP-SAT failed for section {}", k))?;
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < global_indices.len() && cycle >= 0 {
                         ssa_ops[global_indices[seg_idx]].cycle = section_offset + cycle;
                     }
                 }
                 if verbose {
-                    let after_budget = sections_exceeding_budget(&ssa_ops, effective_scratch_budget(self.zero_vreg.is_some()), Some(&greedy_select_fma_ops));
+                    let after_budget = sections_exceeding_budget(
+                        &ssa_ops,
+                        effective_scratch_budget(self.zero_vreg.is_some()),
+                        Some(&greedy_select_fma_ops),
+                    );
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
                     let delta_peak = after_peak as i32 - greedy_section_peak as i32;
@@ -626,7 +694,8 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget.
-        let post_merge_budget = sections_exceeding_budget(&ssa_ops, SCRATCH_BUDGET_HW, Some(&greedy_select_fma_ops));
+        let post_merge_budget =
+            sections_exceeding_budget(&ssa_ops, SCRATCH_BUDGET_HW, Some(&greedy_select_fma_ops));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks
             .iter()
@@ -648,14 +717,23 @@ impl SsaTickTockKernelBuilder {
         // Collect hints for full-kernel CP-SAT: merged schedule (greedy for within-budget
         // sections, per-section feasibility result for sections that exceeded budget).
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
-        let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
-        let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
-        let hint_peak = sections_exceeding_budget(&ssa_ops, effective_budget_hint, Some(&greedy_select_fma_ops))
-            .section_peaks
+        let hint_makespan = greedy_hints
             .iter()
             .copied()
             .max()
+            .map(|c| c + 1)
             .unwrap_or(0);
+        let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
+        let hint_peak = sections_exceeding_budget(
+            &ssa_ops,
+            effective_budget_hint,
+            Some(&greedy_select_fma_ops),
+        )
+        .section_peaks
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
 
         if hint_peak > SCRATCH_BUDGET_HW {
             return Err(format!(
@@ -699,17 +777,17 @@ impl SsaTickTockKernelBuilder {
         // Note: SelectChoice decisions are keyed by op ID, which remains constant after barrier elision
         // We just need to verify the SelectChoice ops still exist after elision
         let mut select_choice_hints_set = HashSet::new();
-        
+
         // Build set of op IDs that exist after barrier elision
         let op_ids_after_elision: HashSet<usize> = ssa_ops.iter().map(|op| op.id).collect();
-        
+
         // Filter greedy SelectChoice decisions to only include ops that still exist after elision
         for &select_choice_id in &greedy_select_fma_ops {
             if op_ids_after_elision.contains(&select_choice_id) {
                 select_choice_hints_set.insert(select_choice_id);
             }
         }
-        
+
         let select_choice_hints = if select_choice_hints_set.is_empty() {
             None
         } else {
@@ -718,17 +796,28 @@ impl SsaTickTockKernelBuilder {
 
         if verbose {
             eprintln!();
-            eprintln!("================================================================================");
-            eprintln!("  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)");
-            eprintln!("  All rounds merged; solving for minimum cycles. Scratch budget = {}.", cpsat_config.scratch_budget);
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!(
+                "  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)"
+            );
+            eprintln!(
+                "  All rounds merged; solving for minimum cycles. Scratch budget = {}.",
+                cpsat_config.scratch_budget
+            );
             eprintln!(
                 "  Before optimization: {} cycles, peak {} words (hint schedule).",
                 hint_makespan, hint_peak
             );
             if greedy_budget_exceeded {
-                eprintln!("  (Greedy exceeded budget; hints may be infeasible — CP-SAT will search.)");
+                eprintln!(
+                    "  (Greedy exceeded budget; hints may be infeasible — CP-SAT will search.)"
+                );
             }
-            eprintln!("================================================================================");
+            eprintln!(
+                "================================================================================"
+            );
             eprintln!();
         }
 
@@ -775,12 +864,20 @@ impl SsaTickTockKernelBuilder {
         if verbose {
             eprintln!(
                 "SSA CP-SAT result: {} cycles (greedy was {}), {} VALU ops shifted",
-                cycles, greedy_cycles, shifted_ops.len()
+                cycles,
+                greedy_cycles,
+                shifted_ops.len()
             );
-            let const_total = ssa_ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+            let const_total = ssa_ops
+                .iter()
+                .filter(|o| o.opcode == Opcode::ConstChoice)
+                .count();
             let const_add_imm = cpsat_result.const_add_imm_ops.len();
             let const_load = const_total.saturating_sub(const_add_imm);
-            let select_total = ssa_ops.iter().filter(|o| o.opcode == Opcode::SelectChoice).count();
+            let select_total = ssa_ops
+                .iter()
+                .filter(|o| o.opcode == Opcode::SelectChoice)
+                .count();
             let select_fma = cpsat_result.select_fma_ops.len();
             let select_vselect = select_total.saturating_sub(select_fma);
             eprintln!(
@@ -794,10 +891,7 @@ impl SsaTickTockKernelBuilder {
         // during greedy hints generation but CP-SAT may also leave some ops
         // unscheduled. Including them in address assignment would corrupt live
         // interval computation.
-        let ssa_ops: Vec<SsaOp> = ssa_ops
-            .into_iter()
-            .filter(|op| op.cycle >= 0)
-            .collect();
+        let ssa_ops: Vec<SsaOp> = ssa_ops.into_iter().filter(|op| op.cycle >= 0).collect();
 
         // Assign addresses via linear scan (zero_vreg included in peak so we stay within 1536)
         let mut assign_config = AddressAssignConfig::default();
@@ -807,6 +901,10 @@ impl SsaTickTockKernelBuilder {
             assign_config.fixed_vregs.insert(zero, 0);
             assign_config.zero_vreg = Some(zero);
         }
+        // SelectChoice FMA (no delta): sub at C, FMA at C+1 → result at C+2; address assigner uses def_cycle+2 for dest
+        assign_config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        // Shifted VALU: 8 ALU ops write at different cycles; def_cycle = min(alu_cycles) for correct allocation
+        assign_config.shifted_alu_cycles = Some(cpsat_result.shifted_alu_cycles.clone());
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
         let budget_exceeded = address_result.budget_exceeded;
@@ -848,6 +946,17 @@ impl SsaTickTockKernelBuilder {
             &cpsat_result.shifted_alu_cycles, // Individual ALU cycles from CP-SAT
         );
 
+        // Cycle count must be derived from lowered ops: SelectChoice FMA (no delta) emits
+        // sub at C and FMA at C+1, so if the last SSA op was a SelectChoice FMA at C,
+        // CP-SAT makespan is C+1 but we need C+2 cycles for the FMA to be emitted.
+        let cycles = ops
+            .iter()
+            .map(|op| op.cycle.max(0) as usize)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(cycles)
+            .max(cycles);
+
         Ok(SsaScheduleResult {
             ops,
             cycles,
@@ -877,7 +986,10 @@ fn verify_vreg_address_consistency(
 ) {
     use crate::types::Operand;
 
-    eprintln!("[DEBUG verify_vreg_address_consistency] Called with {} ops", ops.len());
+    eprintln!(
+        "[DEBUG verify_vreg_address_consistency] Called with {} ops",
+        ops.len()
+    );
 
     let mut missing_vregs = Vec::new();
 
@@ -910,17 +1022,17 @@ fn verify_vreg_address_consistency(
         .collect();
 
     if !vstore_ops.is_empty() {
-        eprintln!("[DEBUG] {} vstore ops found. Checking sources:", vstore_ops.len());
+        eprintln!(
+            "[DEBUG] {} vstore ops found. Checking sources:",
+            vstore_ops.len()
+        );
         for op in vstore_ops {
             eprintln!("  vstore id={} cycle={}", op.id, op.cycle);
             for (i, src) in op.srcs.iter().enumerate() {
                 match src {
                     Operand::VReg(vreg) => {
                         let addr = vreg_to_addr.get(vreg);
-                        eprintln!(
-                            "    src[{}]: {:?} -> addr {:?}",
-                            i, vreg, addr
-                        );
+                        eprintln!("    src[{}]: {:?} -> addr {:?}", i, vreg, addr);
                     }
                     Operand::Imm(val) => {
                         eprintln!("    src[{}]: Imm({})", i, val);
@@ -975,14 +1087,26 @@ mod tests {
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
         let result = builder.build_and_schedule();
-        assert!(result.is_ok(), "Scheduling should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Scheduling should succeed: {:?}",
+            result.err()
+        );
 
         let result = result.unwrap();
-        println!("SSA kernel: {} cycles, {} ops, {} VRegs, peak_live={}",
-            result.cycles, result.ops.len(), result.vreg_count, result.address_result.peak_live);
+        println!(
+            "SSA kernel: {} cycles, {} ops, {} VRegs, peak_live={}",
+            result.cycles,
+            result.ops.len(),
+            result.vreg_count,
+            result.address_result.peak_live
+        );
 
         assert!(result.cycles > 0, "Should have positive cycle count");
-        assert!(!result.address_result.budget_exceeded, "Should not exceed budget");
+        assert!(
+            !result.address_result.budget_exceeded,
+            "Should not exceed budget"
+        );
     }
 
     /// Kernel generation must complete and stay within scratch budget when config fits.
@@ -992,7 +1116,11 @@ mod tests {
         let config = KernelConfig::new(10, 2047, 256, 2);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule();
-        assert!(result.is_ok(), "Kernel generation should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Kernel generation should succeed: {:?}",
+            result.err()
+        );
         let result = result.unwrap();
         assert!(
             result.address_result.peak_live <= SCRATCH_BUDGET_HW,
@@ -1000,7 +1128,10 @@ mod tests {
             result.address_result.peak_live,
             SCRATCH_BUDGET_HW
         );
-        assert!(!result.address_result.budget_exceeded, "Kernel must not report budget_exceeded");
+        assert!(
+            !result.address_result.budget_exceeded,
+            "Kernel must not report budget_exceeded"
+        );
     }
 
     // =========================================================================
@@ -1026,15 +1157,46 @@ mod tests {
         //
         // Peak: 16 words (at cycle 1: v0 + v1)
         let ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(1)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                ],
+                vec![0],
+            ),
             // op2 uses BOTH v0 and v1 - this creates the peak at cycle 1
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![1]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![1],
+            ),
             // Sink to consume v2
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1043,20 +1205,37 @@ mod tests {
 
         // With budget=16, should succeed (peak is 16)
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted, 16
+            &mut ops.clone(),
+            false,
+            &mut shifted,
+            16,
         );
-        assert!(result.is_ok(), "Budget=16 should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Budget=16 should succeed: {:?}",
+            result.err()
+        );
 
         // With budget=8, the scheduler will still succeed due to emergency force-scheduling.
         // The scheduler prefers to exceed budget temporarily rather than fail completely.
         let mut shifted2 = HashSet::new();
         let result2 = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted2, 8
+            &mut ops.clone(),
+            false,
+            &mut shifted2,
+            8,
         );
         // Scheduler uses emergency force-scheduling when budget is tight, so it still succeeds
-        assert!(result2.is_ok(), "Budget=8 should still succeed (emergency force-scheduling): {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "Budget=8 should still succeed (emergency force-scheduling): {:?}",
+            result2.err()
+        );
         let (_cycles2, budget_exceeded, _peak2) = result2.unwrap();
-        assert!(budget_exceeded, "When force-schedule is used (budget=8), budget_exceeded must be true");
+        assert!(
+            budget_exceeded,
+            "When force-schedule is used (budget=8), budget_exceeded must be true"
+        );
     }
 
     /// Test that when scratch budget is exceeded, build_and_schedule returns Err (does not accept the kernel).
@@ -1067,9 +1246,17 @@ mod tests {
         let config = KernelConfig::new(10, 2047, 256, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
         let result = builder.build_and_schedule_with_options(false, Some(8));
-        assert!(result.is_err(), "Build+schedule with budget=8 must return Err when over budget: {:?}", result.ok());
+        assert!(
+            result.is_err(),
+            "Build+schedule with budget=8 must return Err when over budget: {:?}",
+            result.ok()
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("scratch budget exceeded"), "Error message must mention scratch budget exceeded: {}", err);
+        assert!(
+            err.contains("scratch budget exceeded"),
+            "Error message must mention scratch budget exceeded: {}",
+            err
+        );
     }
 
     /// Test that greedy scheduler with generous budget allows parallel ops.
@@ -1077,22 +1264,109 @@ mod tests {
     fn test_greedy_scratch_budget_generous_allows_parallel() {
         // Same 6-producer setup but with generous budget
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(2)), vec![Operand::Imm(3)], vec![]),
-            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)), vec![Operand::Imm(4)], vec![]),
-            make_test_ssa_op(4, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(4)), vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(5, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(5)), vec![Operand::Imm(6)], vec![]),
-            make_test_ssa_op(6, Engine::Valu, Opcode::Add, Some(VReg::vector(6)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(7, Engine::Valu, Opcode::Add, Some(VReg::vector(7)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
-            make_test_ssa_op(8, Engine::Valu, Opcode::Add, Some(VReg::vector(8)),
-                vec![Operand::VReg(VReg::vector(4)), Operand::VReg(VReg::vector(5))], vec![4, 5]),
-            make_test_ssa_op(9, Engine::Valu, Opcode::Add, Some(VReg::vector(9)),
-                vec![Operand::VReg(VReg::vector(6)), Operand::VReg(VReg::vector(7))], vec![6, 7]),
-            make_test_ssa_op(10, Engine::Valu, Opcode::Add, Some(VReg::vector(10)),
-                vec![Operand::VReg(VReg::vector(8)), Operand::VReg(VReg::vector(9))], vec![8, 9]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(2)),
+                vec![Operand::Imm(3)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(3)),
+                vec![Operand::Imm(4)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(4)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                5,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(5)),
+                vec![Operand::Imm(6)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                6,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(6)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                7,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(7)),
+                vec![
+                    Operand::VReg(VReg::vector(2)),
+                    Operand::VReg(VReg::vector(3)),
+                ],
+                vec![2, 3],
+            ),
+            make_test_ssa_op(
+                8,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(8)),
+                vec![
+                    Operand::VReg(VReg::vector(4)),
+                    Operand::VReg(VReg::vector(5)),
+                ],
+                vec![4, 5],
+            ),
+            make_test_ssa_op(
+                9,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(9)),
+                vec![
+                    Operand::VReg(VReg::vector(6)),
+                    Operand::VReg(VReg::vector(7)),
+                ],
+                vec![6, 7],
+            ),
+            make_test_ssa_op(
+                10,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(10)),
+                vec![
+                    Operand::VReg(VReg::vector(8)),
+                    Operand::VReg(VReg::vector(9)),
+                ],
+                vec![8, 9],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1100,17 +1374,16 @@ mod tests {
         let mut shifted = HashSet::new();
 
         // Schedule with generous budget (1000 words)
-        let (cycles, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        ).expect("Should find feasible schedule");
+        let (cycles, _, _) = builder
+            .schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000)
+            .expect("Should find feasible schedule");
 
         // With generous budget and 6 VALU slots, all 6 producers can run at cycle 0
-        let producers_at_cycle_0 = ops[0..6].iter()
-            .filter(|op| op.cycle == 0)
-            .count();
+        let producers_at_cycle_0 = ops[0..6].iter().filter(|op| op.cycle == 0).count();
 
         assert_eq!(
-            producers_at_cycle_0, 6,
+            producers_at_cycle_0,
+            6,
             "With generous budget and 6 VALU slots, all 6 producers should be at cycle 0, got {}. \
              Schedule: {:?}",
             producers_at_cycle_0,
@@ -1126,25 +1399,118 @@ mod tests {
         // Use same ops for both tests
         fn make_ops() -> Vec<SsaOp> {
             vec![
-                make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-                make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-                make_test_ssa_op(2, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(2)), vec![Operand::Imm(3)], vec![]),
-                make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)), vec![Operand::Imm(4)], vec![]),
-                make_test_ssa_op(4, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(4)), vec![Operand::Imm(5)], vec![]),
-                make_test_ssa_op(5, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(5)), vec![Operand::Imm(6)], vec![]),
-                make_test_ssa_op(6, Engine::Valu, Opcode::Add, Some(VReg::vector(6)),
-                    vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-                make_test_ssa_op(7, Engine::Valu, Opcode::Add, Some(VReg::vector(7)),
-                    vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
-                make_test_ssa_op(8, Engine::Valu, Opcode::Add, Some(VReg::vector(8)),
-                    vec![Operand::VReg(VReg::vector(4)), Operand::VReg(VReg::vector(5))], vec![4, 5]),
-                make_test_ssa_op(9, Engine::Valu, Opcode::Add, Some(VReg::vector(9)),
-                    vec![Operand::VReg(VReg::vector(6)), Operand::VReg(VReg::vector(7))], vec![6, 7]),
-                make_test_ssa_op(10, Engine::Valu, Opcode::Add, Some(VReg::vector(10)),
-                    vec![Operand::VReg(VReg::vector(8)), Operand::VReg(VReg::vector(9))], vec![8, 9]),
+                make_test_ssa_op(
+                    0,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(0)),
+                    vec![Operand::Imm(1)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    1,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(1)),
+                    vec![Operand::Imm(2)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    2,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(2)),
+                    vec![Operand::Imm(3)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    3,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(3)),
+                    vec![Operand::Imm(4)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    4,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(4)),
+                    vec![Operand::Imm(5)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    5,
+                    Engine::Valu,
+                    Opcode::Vbroadcast,
+                    Some(VReg::vector(5)),
+                    vec![Operand::Imm(6)],
+                    vec![],
+                ),
+                make_test_ssa_op(
+                    6,
+                    Engine::Valu,
+                    Opcode::Add,
+                    Some(VReg::vector(6)),
+                    vec![
+                        Operand::VReg(VReg::vector(0)),
+                        Operand::VReg(VReg::vector(1)),
+                    ],
+                    vec![0, 1],
+                ),
+                make_test_ssa_op(
+                    7,
+                    Engine::Valu,
+                    Opcode::Add,
+                    Some(VReg::vector(7)),
+                    vec![
+                        Operand::VReg(VReg::vector(2)),
+                        Operand::VReg(VReg::vector(3)),
+                    ],
+                    vec![2, 3],
+                ),
+                make_test_ssa_op(
+                    8,
+                    Engine::Valu,
+                    Opcode::Add,
+                    Some(VReg::vector(8)),
+                    vec![
+                        Operand::VReg(VReg::vector(4)),
+                        Operand::VReg(VReg::vector(5)),
+                    ],
+                    vec![4, 5],
+                ),
+                make_test_ssa_op(
+                    9,
+                    Engine::Valu,
+                    Opcode::Add,
+                    Some(VReg::vector(9)),
+                    vec![
+                        Operand::VReg(VReg::vector(6)),
+                        Operand::VReg(VReg::vector(7)),
+                    ],
+                    vec![6, 7],
+                ),
+                make_test_ssa_op(
+                    10,
+                    Engine::Valu,
+                    Opcode::Add,
+                    Some(VReg::vector(10)),
+                    vec![
+                        Operand::VReg(VReg::vector(8)),
+                        Operand::VReg(VReg::vector(9)),
+                    ],
+                    vec![8, 9],
+                ),
                 // Sink to consume v10
-                make_test_ssa_op(11, Engine::Store, Opcode::Vstore, None,
-                    vec![Operand::Imm(100), Operand::VReg(VReg::vector(10))], vec![10]),
+                make_test_ssa_op(
+                    11,
+                    Engine::Store,
+                    Opcode::Vstore,
+                    None,
+                    vec![Operand::Imm(100), Operand::VReg(VReg::vector(10))],
+                    vec![10],
+                ),
             ]
         }
 
@@ -1155,14 +1521,24 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
 
         let mut shifted_generous = HashSet::new();
-        let (cycles_generous, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops_generous, false, &mut shifted_generous, 1000
-        ).expect("Should find feasible schedule with generous budget");
+        let (cycles_generous, _, _) = builder
+            .schedule_ssa_greedy_with_shift_budget(
+                &mut ops_generous,
+                false,
+                &mut shifted_generous,
+                1000,
+            )
+            .expect("Should find feasible schedule with generous budget");
 
         let mut shifted_tight = HashSet::new();
-        let (cycles_tight, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops_tight, false, &mut shifted_tight, 24  // Only 3 vectors
-        ).expect("Should find feasible schedule with tight budget");
+        let (cycles_tight, _, _) = builder
+            .schedule_ssa_greedy_with_shift_budget(
+                &mut ops_tight,
+                false,
+                &mut shifted_tight,
+                24, // Only 3 vectors
+            )
+            .expect("Should find feasible schedule with tight budget");
 
         // Both should schedule successfully. The tight budget may or may not take longer
         // due to emergency force-scheduling which can exceed budget temporarily.
@@ -1170,7 +1546,8 @@ mod tests {
         assert!(
             cycles_tight >= cycles_generous,
             "Tight budget ({} cycles) should be at least as long as generous ({} cycles).",
-            cycles_tight, cycles_generous
+            cycles_tight,
+            cycles_generous
         );
 
         println!("Generous budget: {} cycles", cycles_generous);
@@ -1200,13 +1577,42 @@ mod tests {
         // Peak is 16 words (at cycle 1). With same-cycle reuse, op2 can schedule
         // even with budget=16 because it frees v0+v1 before needing v2's space.
         let ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![0]), // dep on 0
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![0],
+            ), // dep on 0
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
             // Sink to consume v2
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1215,7 +1621,10 @@ mod tests {
         // With budget=16, should succeed (peak is 16 at cycle 1)
         let mut shifted = HashSet::new();
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted, 16
+            &mut ops.clone(),
+            false,
+            &mut shifted,
+            16,
         );
         assert!(result.is_ok(), "Budget=16 should succeed, peak is 16");
 
@@ -1223,10 +1632,17 @@ mod tests {
         // The scheduler prefers to exceed budget temporarily rather than fail completely.
         let mut shifted2 = HashSet::new();
         let result2 = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops.clone(), false, &mut shifted2, 8
+            &mut ops.clone(),
+            false,
+            &mut shifted2,
+            8,
         );
         // Scheduler uses emergency force-scheduling when budget is tight, so it still succeeds
-        assert!(result2.is_ok(), "Budget=8 should still succeed (emergency force-scheduling): {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "Budget=8 should still succeed (emergency force-scheduling): {:?}",
+            result2.err()
+        );
     }
 
     /// Test that greedy scheduler correctly tracks VReg deaths.
@@ -1244,13 +1660,52 @@ mod tests {
         // NOTE: op3 needs a dependency so it's not greedily scheduled at cycle 0.
         // We add dep on op0 so op3 becomes ready at cycle 1.
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)), vec![Operand::Imm(3)], vec![0]), // dep on op0
-            make_test_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(3)),
+                vec![Operand::Imm(3)],
+                vec![0],
+            ), // dep on op0
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(4)),
+                vec![
+                    Operand::VReg(VReg::vector(2)),
+                    Operand::VReg(VReg::vector(3)),
+                ],
+                vec![2, 3],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1264,9 +1719,9 @@ mod tests {
         // - Cycle 2: op4 -> v2, v3 die, v4 born
         //
         // Without same-cycle reuse, op3 would be delayed to cycle 2.
-        let (cycles, _, _) = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 24
-        ).expect("Should find feasible schedule");
+        let (cycles, _, _) = builder
+            .schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 24)
+            .expect("Should find feasible schedule");
 
         println!("VReg death tracking schedule: {} cycles", cycles);
         for op in &ops {
@@ -1275,7 +1730,11 @@ mod tests {
 
         // With same-cycle reuse, schedule should be 3 cycles (critical path)
         // Without same-cycle reuse, it would be longer
-        assert!(cycles <= 3, "With same-cycle reuse, schedule should be at most 3 cycles, got {}", cycles);
+        assert!(
+            cycles <= 3,
+            "With same-cycle reuse, schedule should be at most 3 cycles, got {}",
+            cycles
+        );
     }
 
     // =========================================================================
@@ -1297,11 +1756,19 @@ mod tests {
         let mut ssa_builder = SsaTickTockKernelBuilder::new(config);
         let ssa_result = ssa_builder.build_and_schedule();
 
-        assert!(ssa_result.is_ok(), "SSA kernel should build: {:?}", ssa_result.err());
+        assert!(
+            ssa_result.is_ok(),
+            "SSA kernel should build: {:?}",
+            ssa_result.err()
+        );
 
         let result = ssa_result.unwrap();
-        println!("SSA kernel: {} cycles, {} ops, {} VRegs",
-            result.cycles, result.ops.len(), result.vreg_count);
+        println!(
+            "SSA kernel: {} cycles, {} ops, {} VRegs",
+            result.cycles,
+            result.ops.len(),
+            result.vreg_count
+        );
 
         assert!(result.cycles > 0, "Should have positive cycle count");
         assert!(!result.ops.is_empty(), "Should have ops");
@@ -1320,10 +1787,33 @@ mod tests {
         // op1: const -> s1 (def at cycle 1)
         // op2: alu(s0, s1) -> s2 (use s0, s1 at cycle 10)
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::Imm(6)], vec![]),
-            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::Imm(6)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(1)),
+                ],
+                vec![0, 1],
+            ),
         ];
 
         // Simulate scheduling
@@ -1331,25 +1821,34 @@ mod tests {
         ops[1].cycle = 1;
         ops[2].cycle = 10;
 
-        let intervals = compute_live_intervals(&ops, None);
+        let intervals = compute_live_intervals(&ops, None, None, None);
 
         // CLOSED intervals: [start, end] where end = last_read_cycle
         //
         // s0: defined at 0, last read at 10 → [0, 10]
-        let s0_interval = intervals.get(&VReg::scalar(0)).expect("s0 should have interval");
+        let s0_interval = intervals
+            .get(&VReg::scalar(0))
+            .expect("s0 should have interval");
         assert_eq!(s0_interval.start, 0, "s0 should start at cycle 0");
         assert_eq!(s0_interval.end, 10, "s0 closed end = last_read = 10");
 
         // s1: defined at 1, last read at 10 → [1, 10]
-        let s1_interval = intervals.get(&VReg::scalar(1)).expect("s1 should have interval");
+        let s1_interval = intervals
+            .get(&VReg::scalar(1))
+            .expect("s1 should have interval");
         assert_eq!(s1_interval.start, 1, "s1 should start at cycle 1");
         assert_eq!(s1_interval.end, 10, "s1 closed end = last_read = 10");
 
         // s2: defined at 10, never read (dead) → [10, 11] (+1 extension)
         // Dead VRegs get interval [D, D+1] with closed convention.
-        let s2_interval = intervals.get(&VReg::scalar(2)).expect("s2 should have interval");
+        let s2_interval = intervals
+            .get(&VReg::scalar(2))
+            .expect("s2 should have interval");
         assert_eq!(s2_interval.start, 10, "s2 should start at cycle 10");
-        assert_eq!(s2_interval.end, 11, "s2 (dead) has closed interval [10, 11] (+1 extension)");
+        assert_eq!(
+            s2_interval.end, 11,
+            "s2 (dead) has closed interval [10, 11] (+1 extension)"
+        );
     }
 
     /// Test that overlapping VRegs get different addresses.
@@ -1365,10 +1864,33 @@ mod tests {
         // op1: const -> s1 (def cycle 2, used at cycle 5)
         // op2: alu(s0, s1) -> s2 (cycle 5)
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::Imm(6)], vec![]),
-            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::Imm(6)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(1)),
+                ],
+                vec![0, 1],
+            ),
         ];
 
         ops[0].cycle = 0;
@@ -1378,12 +1900,20 @@ mod tests {
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&ops, &config);
 
-        let addr_s0 = result.vreg_to_addr.get(&VReg::scalar(0)).expect("s0 should have address");
-        let addr_s1 = result.vreg_to_addr.get(&VReg::scalar(1)).expect("s1 should have address");
+        let addr_s0 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(0))
+            .expect("s0 should have address");
+        let addr_s1 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(1))
+            .expect("s1 should have address");
 
-        assert_ne!(addr_s0, addr_s1,
+        assert_ne!(
+            addr_s0, addr_s1,
             "Overlapping VRegs s0 and s1 must have different addresses: s0={}, s1={}",
-            addr_s0, addr_s1);
+            addr_s0, addr_s1
+        );
     }
 
     /// Test that non-overlapping VRegs can share addresses.
@@ -1414,28 +1944,75 @@ mod tests {
         // - s1 [1,6] and s3 [6,7]: 1 < 7 AND 6 < 6? NO, no overlap (same-cycle reuse)
         // - s2 [5,6] and s3 [6,7]: 5 < 7 AND 6 < 6? NO, no overlap (same-cycle reuse)
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(0))], vec![0]),
-            make_test_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::scalar(2)), vec![Operand::Imm(6)], vec![]),
-            make_test_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)),
-                vec![Operand::VReg(VReg::scalar(1)), Operand::VReg(VReg::scalar(2))], vec![1, 2]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(0)),
+                ],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(2)),
+                vec![Operand::Imm(6)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![
+                    Operand::VReg(VReg::scalar(1)),
+                    Operand::VReg(VReg::scalar(2)),
+                ],
+                vec![1, 2],
+            ),
         ];
 
         ops[0].cycle = 0;
-        ops[1].cycle = 1;  // s0 last used here → s0 [0, 1]
-        ops[2].cycle = 5;  // s2 defined here → s2 [5, 6]
+        ops[1].cycle = 1; // s0 last used here → s0 [0, 1]
+        ops[2].cycle = 5; // s2 defined here → s2 [5, 6]
         ops[3].cycle = 6;
 
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&ops, &config);
 
-        let addr_s0 = result.vreg_to_addr.get(&VReg::scalar(0)).expect("s0 should have address");
-        let addr_s1 = result.vreg_to_addr.get(&VReg::scalar(1)).expect("s1 should have address");
-        let addr_s2 = result.vreg_to_addr.get(&VReg::scalar(2)).expect("s2 should have address");
-        let addr_s3 = result.vreg_to_addr.get(&VReg::scalar(3)).expect("s3 should have address");
+        let addr_s0 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(0))
+            .expect("s0 should have address");
+        let addr_s1 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(1))
+            .expect("s1 should have address");
+        let addr_s2 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(2))
+            .expect("s2 should have address");
+        let addr_s3 = result
+            .vreg_to_addr
+            .get(&VReg::scalar(3))
+            .expect("s3 should have address");
 
-        println!("Addresses: s0={}, s1={}, s2={}, s3={}", addr_s0, addr_s1, addr_s2, addr_s3);
+        println!(
+            "Addresses: s0={}, s1={}, s2={}, s3={}",
+            addr_s0, addr_s1, addr_s2, addr_s3
+        );
 
         // With CLOSED intervals and linear scan allocation:
         // 1. s0 [0,1] gets address 1
@@ -1445,12 +2022,18 @@ mod tests {
         //
         // So: s0=1, s1=1, s2=2, s3=1
         // s2 CANNOT reuse s0's address because s1 took it and s1 overlaps with s2.
-        assert_eq!(addr_s0, addr_s1,
-            "s0 [0,1] and s1 [1,6] allow same-cycle reuse, should share addresses");
-        assert_ne!(addr_s1, addr_s2,
-            "s1 [1,6] and s2 [5,6] overlap, must have different addresses");
-        assert_eq!(addr_s0, addr_s3,
-            "s0=s1 expires before s3 [6,7], s3 can reuse address 1");
+        assert_eq!(
+            addr_s0, addr_s1,
+            "s0 [0,1] and s1 [1,6] allow same-cycle reuse, should share addresses"
+        );
+        assert_ne!(
+            addr_s1, addr_s2,
+            "s1 [1,6] and s2 [5,6] overlap, must have different addresses"
+        );
+        assert_eq!(
+            addr_s0, addr_s3,
+            "s0=s1 expires before s3 [6,7], s3 can reuse address 1"
+        );
 
         // Verify efficient reuse: max_addr should be 2 (addresses 1, 2)
         // - s0 gets addr 1, s1 reuses addr 1, s2 gets addr 2, s3 reuses addr 1
@@ -1464,23 +2047,52 @@ mod tests {
     fn test_greedy_handles_external_deps() {
         // Simple chain: op0 -> op1 -> op2 -> op3 (sink)
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))],
-                vec![0]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(1)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                ],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
         assert!(result.is_ok(), "Should schedule chain: {:?}", result.err());
 
@@ -1493,7 +2105,10 @@ mod tests {
 
         assert!(ops[1].cycle > ops[0].cycle, "Op1 should be after op0");
         assert!(ops[2].cycle > ops[1].cycle, "Op2 should be after op1");
-        assert!(ops[3].cycle > ops[2].cycle, "Op3 (sink) should be after op2");
+        assert!(
+            ops[3].cycle > ops[2].cycle,
+            "Op3 (sink) should be after op2"
+        );
     }
 
     /// Test that a long dependency chain schedules all ops.
@@ -1510,41 +2125,68 @@ mod tests {
             let srcs = if i == 0 {
                 vec![Operand::Imm(1)]
             } else {
-                vec![Operand::VReg(VReg::vector((i - 1) as u32)),
-                     Operand::VReg(VReg::vector((i - 1) as u32))]
+                vec![
+                    Operand::VReg(VReg::vector((i - 1) as u32)),
+                    Operand::VReg(VReg::vector((i - 1) as u32)),
+                ]
             };
-            let opcode = if i == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+            let opcode = if i == 0 {
+                Opcode::Vbroadcast
+            } else {
+                Opcode::Add
+            };
             ops.push(make_test_ssa_op(
-                i, Engine::Valu, opcode,
-                Some(VReg::vector(i as u32)), srcs, deps
+                i,
+                Engine::Valu,
+                opcode,
+                Some(VReg::vector(i as u32)),
+                srcs,
+                deps,
             ));
         }
         // Add sink to consume the final output (v9)
         ops.push(make_test_ssa_op(
-            10, Engine::Store, Opcode::Vstore, None,
-            vec![Operand::Imm(100), Operand::VReg(VReg::vector(9))], vec![9]
+            10,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::Imm(100), Operand::VReg(VReg::vector(9))],
+            vec![9],
         ));
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
-        assert!(result.is_ok(), "Long chain should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Long chain should schedule: {:?}",
+            result.err()
+        );
 
         // Verify ALL ops were scheduled (including sink)
         for (i, op) in ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "Op {} should be scheduled, got cycle {}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "Op {} should be scheduled, got cycle {}",
+                i,
+                op.cycle
+            );
         }
 
         // Verify scheduling order for the chain (0..10)
         for i in 1..10 {
-            assert!(ops[i].cycle > ops[i-1].cycle,
+            assert!(
+                ops[i].cycle > ops[i - 1].cycle,
                 "Op {} (cycle {}) should be after op {} (cycle {})",
-                i, ops[i].cycle, i-1, ops[i-1].cycle);
+                i,
+                ops[i].cycle,
+                i - 1,
+                ops[i - 1].cycle
+            );
         }
     }
 
@@ -1565,36 +2207,73 @@ mod tests {
         //      |
         //    sink
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast,
-                Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Add,
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(1)], vec![0]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add,
+                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(1)],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(2)], vec![0]),
+                vec![Operand::VReg(VReg::vector(0)), Operand::Imm(2)],
+                vec![0],
+            ),
             // op3 depends on BOTH op1 and op2
-            make_test_ssa_op(3, Engine::Valu, Opcode::Add,
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(3)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(2))],
-                vec![1, 2]),
-            make_test_ssa_op(4, Engine::Valu, Opcode::Add,
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(2)),
+                ],
+                vec![1, 2],
+            ),
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(4)),
-                vec![Operand::VReg(VReg::vector(3)), Operand::Imm(1)], vec![3]),
+                vec![Operand::VReg(VReg::vector(3)), Operand::Imm(1)],
+                vec![3],
+            ),
             // Sink to consume v4
-            make_test_ssa_op(5, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(4))], vec![4]),
+            make_test_ssa_op(
+                5,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(4))],
+                vec![4],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
-        assert!(result.is_ok(), "Diamond should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Diamond should schedule: {:?}",
+            result.err()
+        );
 
         // Verify ALL ops were scheduled
         for (i, op) in ops.iter().enumerate() {
@@ -1622,23 +2301,33 @@ mod tests {
             let base = chain * 3;
             // First op in chain - no deps
             ops.push(make_test_ssa_op(
-                base, Engine::Valu, Opcode::Vbroadcast,
+                base,
+                Engine::Valu,
+                Opcode::Vbroadcast,
                 Some(VReg::vector(base as u32)),
-                vec![Operand::Imm(chain as i64)], vec![]
+                vec![Operand::Imm(chain as i64)],
+                vec![],
             ));
             // Second op - depends on first
             ops.push(make_test_ssa_op(
-                base + 1, Engine::Valu, Opcode::Add,
+                base + 1,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector((base + 1) as u32)),
                 vec![Operand::VReg(VReg::vector(base as u32)), Operand::Imm(1)],
-                vec![base]
+                vec![base],
             ));
             // Third op - depends on second
             ops.push(make_test_ssa_op(
-                base + 2, Engine::Valu, Opcode::Add,
+                base + 2,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector((base + 2) as u32)),
-                vec![Operand::VReg(VReg::vector((base + 1) as u32)), Operand::Imm(1)],
-                vec![base + 1]
+                vec![
+                    Operand::VReg(VReg::vector((base + 1) as u32)),
+                    Operand::Imm(1),
+                ],
+                vec![base + 1],
             ));
         }
         // Add sinks to consume each chain's final output (v2, v5, v8, ..., v29)
@@ -1646,9 +2335,15 @@ mod tests {
             let last_vreg = (chain * 3 + 2) as u32;
             let last_op_id = chain * 3 + 2;
             ops.push(make_test_ssa_op(
-                30 + chain, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100 + chain as i64), Operand::VReg(VReg::vector(last_vreg))],
-                vec![last_op_id]
+                30 + chain,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![
+                    Operand::Imm(100 + chain as i64),
+                    Operand::VReg(VReg::vector(last_vreg)),
+                ],
+                vec![last_op_id],
             ));
         }
 
@@ -1656,15 +2351,23 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
-        assert!(result.is_ok(), "Parallel chains should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Parallel chains should schedule: {:?}",
+            result.err()
+        );
 
         // Verify ALL 40 ops were scheduled (30 chain ops + 10 sinks)
         for (i, op) in ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "Op {} should be scheduled, got cycle {}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "Op {} should be scheduled, got cycle {}",
+                i,
+                op.cycle
+            );
         }
     }
 
@@ -1679,16 +2382,26 @@ mod tests {
         let mut ops: Vec<SsaOp> = Vec::new();
         for i in 0..12 {
             ops.push(make_test_ssa_op(
-                i, Engine::Valu, Opcode::Vbroadcast,
+                i,
+                Engine::Valu,
+                Opcode::Vbroadcast,
                 Some(VReg::vector(i as u32)),
-                vec![Operand::Imm(i as i64)], vec![]
+                vec![Operand::Imm(i as i64)],
+                vec![],
             ));
         }
         // Add sinks to consume all 12 VRegs
         for i in 0..12 {
             ops.push(make_test_ssa_op(
-                12 + i, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100 + i as i64), Operand::VReg(VReg::vector(i as u32))], vec![i]
+                12 + i,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![
+                    Operand::Imm(100 + i as i64),
+                    Operand::VReg(VReg::vector(i as u32)),
+                ],
+                vec![i],
             ));
         }
 
@@ -1696,11 +2409,14 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
-        assert!(result.is_ok(), "Slot overflow should still schedule all: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Slot overflow should still schedule all: {:?}",
+            result.err()
+        );
 
         let (cycles, _, _) = result.unwrap();
 
@@ -1710,7 +2426,10 @@ mod tests {
         }
 
         // With 6 VALU slots, 12 independent ops need at least 2 cycles
-        assert!(cycles >= 2, "12 VALU ops + sinks should need at least 2 cycles");
+        assert!(
+            cycles >= 2,
+            "12 VALU ops + sinks should need at least 2 cycles"
+        );
     }
 
     /// Test that budget limits don't cause ops to get stuck.
@@ -1727,29 +2446,71 @@ mod tests {
         // op5: consumes v3, v4 (frees them), produces v5
         // op6: sink to consume v5
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast,
-                Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast,
-                Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add,
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
-                vec![0, 1]),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
             // op3 actually reads v2 (not just depends on op2)
-            make_test_ssa_op(3, Engine::Valu, Opcode::Add,
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(3)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::Imm(3)], vec![2]),
+                vec![Operand::VReg(VReg::vector(2)), Operand::Imm(3)],
+                vec![2],
+            ),
             // op4 also reads v2
-            make_test_ssa_op(4, Engine::Valu, Opcode::Add,
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(4)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::Imm(4)], vec![2]),
-            make_test_ssa_op(5, Engine::Valu, Opcode::Add,
+                vec![Operand::VReg(VReg::vector(2)), Operand::Imm(4)],
+                vec![2],
+            ),
+            make_test_ssa_op(
+                5,
+                Engine::Valu,
+                Opcode::Add,
                 Some(VReg::vector(5)),
-                vec![Operand::VReg(VReg::vector(3)), Operand::VReg(VReg::vector(4))],
-                vec![3, 4]),
+                vec![
+                    Operand::VReg(VReg::vector(3)),
+                    Operand::VReg(VReg::vector(4)),
+                ],
+                vec![3, 4],
+            ),
             // Sink to consume v5
-            make_test_ssa_op(6, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(5))], vec![5]),
+            make_test_ssa_op(
+                6,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(5))],
+                vec![5],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -1758,10 +2519,17 @@ mod tests {
 
         // Use a moderate budget that requires careful scheduling
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 32  // 4 vectors worth
+            &mut ops,
+            false,
+            &mut shifted,
+            32, // 4 vectors worth
         );
 
-        assert!(result.is_ok(), "Budget pressure should still schedule all: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Budget pressure should still schedule all: {:?}",
+            result.err()
+        );
 
         // Verify ALL ops were scheduled
         for (i, op) in ops.iter().enumerate() {
@@ -1784,12 +2552,23 @@ mod tests {
                 let srcs = if pos == 0 {
                     vec![Operand::Imm(chain as i64)]
                 } else {
-                    vec![Operand::VReg(VReg::vector((id - 1) as u32)), Operand::Imm(1)]
+                    vec![
+                        Operand::VReg(VReg::vector((id - 1) as u32)),
+                        Operand::Imm(1),
+                    ]
                 };
-                let opcode = if pos == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+                let opcode = if pos == 0 {
+                    Opcode::Vbroadcast
+                } else {
+                    Opcode::Add
+                };
                 ops.push(make_test_ssa_op(
-                    id, Engine::Valu, opcode,
-                    Some(VReg::vector(id as u32)), srcs, deps
+                    id,
+                    Engine::Valu,
+                    opcode,
+                    Some(VReg::vector(id as u32)),
+                    srcs,
+                    deps,
                 ));
                 id += 1;
             }
@@ -1800,32 +2579,54 @@ mod tests {
             let last_vreg = (chain * 10 + 9) as u32;
             let last_op_id = chain * 10 + 9;
             ops.push(make_test_ssa_op(
-                id, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100 + chain as i64), Operand::VReg(VReg::vector(last_vreg))],
-                vec![last_op_id]
+                id,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![
+                    Operand::Imm(100 + chain as i64),
+                    Operand::VReg(VReg::vector(last_vreg)),
+                ],
+                vec![last_op_id],
             ));
             id += 1;
         }
 
-        assert_eq!(ops.len(), 1100, "Should have 1100 ops (1000 chain ops + 100 sinks)");
+        assert_eq!(
+            ops.len(),
+            1100,
+            "Should have 1100 ops (1000 chain ops + 100 sinks)"
+        );
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 10000  // Large budget
+            &mut ops,
+            false,
+            &mut shifted,
+            10000, // Large budget
         );
 
-        assert!(result.is_ok(), "Large scale should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Large scale should schedule: {:?}",
+            result.err()
+        );
 
         // Verify ALL ops were scheduled
-        let unscheduled: Vec<_> = ops.iter().enumerate()
+        let unscheduled: Vec<_> = ops
+            .iter()
+            .enumerate()
             .filter(|(_, op)| op.cycle < 0)
             .map(|(i, _)| i)
             .collect();
-        assert!(unscheduled.is_empty(),
-            "All 1100 ops should be scheduled, unscheduled: {:?}", &unscheduled[..unscheduled.len().min(10)]);
+        assert!(
+            unscheduled.is_empty(),
+            "All 1100 ops should be scheduled, unscheduled: {:?}",
+            &unscheduled[..unscheduled.len().min(10)]
+        );
     }
 
     /// Test that cross-chain dependencies work correctly.
@@ -1841,23 +2642,34 @@ mod tests {
             for pos in 0..5 {
                 let deps = if pos == 0 {
                     if chain == 0 {
-                        vec![]  // First chain, first op: no deps
+                        vec![] // First chain, first op: no deps
                     } else {
                         // Depends on previous chain's last op
                         vec![chain * 5 - 1]
                     }
                 } else {
-                    vec![id - 1]  // Depends on previous op in chain
+                    vec![id - 1] // Depends on previous op in chain
                 };
                 let srcs = if pos == 0 && chain == 0 {
                     vec![Operand::Imm(1)]
                 } else {
-                    vec![Operand::VReg(VReg::vector((id - 1).max(0) as u32)), Operand::Imm(1)]
+                    vec![
+                        Operand::VReg(VReg::vector((id - 1).max(0) as u32)),
+                        Operand::Imm(1),
+                    ]
                 };
-                let opcode = if pos == 0 && chain == 0 { Opcode::Vbroadcast } else { Opcode::Add };
+                let opcode = if pos == 0 && chain == 0 {
+                    Opcode::Vbroadcast
+                } else {
+                    Opcode::Add
+                };
                 ops.push(make_test_ssa_op(
-                    id, Engine::Valu, opcode,
-                    Some(VReg::vector(id as u32)), srcs, deps
+                    id,
+                    Engine::Valu,
+                    opcode,
+                    Some(VReg::vector(id as u32)),
+                    srcs,
+                    deps,
                 ));
                 id += 1;
             }
@@ -1865,8 +2677,12 @@ mod tests {
 
         // Add sink to consume the final chain's output (v49)
         ops.push(make_test_ssa_op(
-            id, Engine::Store, Opcode::Vstore, None,
-            vec![Operand::Imm(100), Operand::VReg(VReg::vector(49))], vec![49]
+            id,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::Imm(100), Operand::VReg(VReg::vector(49))],
+            vec![49],
         ));
 
         assert_eq!(ops.len(), 51, "Should have 51 ops (50 chain ops + 1 sink)");
@@ -1875,11 +2691,14 @@ mod tests {
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 1000
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
-        assert!(result.is_ok(), "Cross-chain deps should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Cross-chain deps should schedule: {:?}",
+            result.err()
+        );
 
         // Verify ALL ops were scheduled
         for (i, op) in ops.iter().enumerate() {
@@ -1894,7 +2713,7 @@ mod tests {
     #[test]
     fn test_greedy_real_kernel_small() {
         // Use a small config that should produce ~100-200 ops
-        let config = KernelConfig::new(3, 15, 16, 2);  // height=3, nodes=15, batch=16, rounds=2
+        let config = KernelConfig::new(3, 15, 16, 2); // height=3, nodes=15, batch=16, rounds=2
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
         // Build SSA ops
@@ -1903,7 +2722,11 @@ mod tests {
         let mut ops = builder.emit.take_ops();
 
         // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
+            &mut ops,
+            &vreg_def,
+            builder.zero_vreg,
+        );
 
         println!("Generated {} ops", ops.len());
 
@@ -1916,25 +2739,40 @@ mod tests {
                 }
             }
         }
-        let dead_store_count = ops.iter()
-            .filter(|op| op.dest.map_or(false, |d| vreg_users.get(&d).map_or(true, |&n| n == 0)))
+        let dead_store_count = ops
+            .iter()
+            .filter(|op| {
+                op.dest
+                    .map_or(false, |d| vreg_users.get(&d).map_or(true, |&n| n == 0))
+            })
             .count();
-        println!("Detected {} dead stores (will be skipped)", dead_store_count);
-
-        let mut shifted = HashSet::new();
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, true, &mut shifted, 1536
+        println!(
+            "Detected {} dead stores (will be skipped)",
+            dead_store_count
         );
 
-        assert!(result.is_ok(), "Real kernel (small) should schedule: {:?}", result.err());
+        let mut shifted = HashSet::new();
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
+
+        assert!(
+            result.is_ok(),
+            "Real kernel (small) should schedule: {:?}",
+            result.err()
+        );
 
         let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
         // When budget is exceeded, greedy may leave some ops unscheduled (force-schedule path).
         // Only assert all non-dead-store ops scheduled when we stayed within budget.
         if !budget_exceeded {
-            let unscheduled: Vec<_> = ops.iter().enumerate()
+            let unscheduled: Vec<_> = ops
+                .iter()
+                .enumerate()
                 .filter(|(_, op)| {
-                    op.cycle < 0 && !op.dest.map_or(false, |d| vreg_users.get(&d).map_or(true, |&n| n == 0))
+                    op.cycle < 0
+                        && !op
+                            .dest
+                            .map_or(false, |d| vreg_users.get(&d).map_or(true, |&n| n == 0))
                 })
                 .map(|(i, op)| format!("op[{}] id={}", i, op.id))
                 .collect();
@@ -1950,7 +2788,7 @@ mod tests {
     #[test]
     fn test_greedy_real_kernel_medium() {
         // Medium config: ~1000-2000 ops
-        let config = KernelConfig::new(5, 63, 64, 4);  // height=5, nodes=63, batch=64, rounds=4
+        let config = KernelConfig::new(5, 63, 64, 4); // height=5, nodes=63, batch=64, rounds=4
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
         // Same pre-schedule steps as build_and_schedule_with_options
@@ -1976,11 +2814,14 @@ mod tests {
         println!("Generated {} ops (after DCE)", ops.len());
 
         let mut shifted = HashSet::new();
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, true, &mut shifted, 1536
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
 
-        assert!(result.is_ok(), "Real kernel (medium) should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Real kernel (medium) should schedule: {:?}",
+            result.err()
+        );
 
         let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
         if !budget_exceeded {
@@ -1992,7 +2833,8 @@ mod tests {
                         for prev_idx in (0..idx).rev() {
                             let prev_op = &ops[prev_idx];
                             if prev_op.dest == Some(dest) {
-                                if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const {
+                                if prev_op.engine == Engine::Load && prev_op.opcode == Opcode::Const
+                                {
                                     add_imm_alternatives.insert(idx);
                                 }
                                 break;
@@ -2001,11 +2843,15 @@ mod tests {
                     }
                 }
             }
-            let unscheduled: Vec<_> = ops.iter().enumerate()
+            let unscheduled: Vec<_> = ops
+                .iter()
+                .enumerate()
                 .filter(|(_, op)| op.cycle < 0)
                 .map(|(i, op)| format!("op[{}] id={}", i, op.id))
                 .collect();
-            let wrongly_unscheduled: Vec<_> = ops.iter().enumerate()
+            let wrongly_unscheduled: Vec<_> = ops
+                .iter()
+                .enumerate()
                 .filter(|(idx, op)| op.cycle < 0 && !add_imm_alternatives.contains(idx))
                 .map(|(i, op)| format!("op[{}] id={}", i, op.id))
                 .collect();
@@ -2029,16 +2875,23 @@ mod tests {
         let mut ops = builder.emit.take_ops();
 
         // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ops, &vreg_def, builder.zero_vreg);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
+            &mut ops,
+            &vreg_def,
+            builder.zero_vreg,
+        );
 
         println!("Generated {} ops for full-scale kernel", ops.len());
 
         let mut shifted = HashSet::new();
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, true, &mut shifted, 1536
-        );
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
 
-        assert!(result.is_ok(), "Full-scale kernel should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Full-scale kernel should schedule: {:?}",
+            result.err()
+        );
 
         let (_cycles, budget_exceeded, peak_live) = result.unwrap();
         // Greedy can exceed scratch budget for 16-round production config; CP-SAT is used for correct output.
@@ -2051,10 +2904,13 @@ mod tests {
                     }
                 }
             }
-            let dead_store_count = ops.iter()
+            let dead_store_count = ops
+                .iter()
                 .filter(|op| op.dest.is_some() && !vreg_users.contains(&op.dest.unwrap()))
                 .count();
-            let unscheduled: Vec<_> = ops.iter().enumerate()
+            let unscheduled: Vec<_> = ops
+                .iter()
+                .enumerate()
                 .filter(|(_, op)| op.cycle < 0)
                 .filter(|(_, op)| op.dest.is_none() || vreg_users.contains(&op.dest.unwrap()))
                 .map(|(i, op)| format!("op[{}] id={}", i, op.id))
@@ -2063,7 +2919,10 @@ mod tests {
                 "All non-dead-store ops should be scheduled when within budget ({} dead stores filtered), {} unscheduled: {:?}",
                 dead_store_count, unscheduled.len(), &unscheduled[..unscheduled.len().min(10)]);
         } else {
-            println!("Full-scale greedy exceeded budget (peak_live={}); CP-SAT used for production.", peak_live);
+            println!(
+                "Full-scale greedy exceeded budget (peak_live={}); CP-SAT used for production.",
+                peak_live
+            );
         }
     }
 
@@ -2087,37 +2946,85 @@ mod tests {
         // op2 and op3 both depend on op1, so they can run in same cycle.
         // LUC tie-breaker should prefer op2 (frees 2) over op3 (frees 0).
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
             // op2: uses v0 (last use) and v1 (not last - op3 uses v1 too) -> LUC=1
-            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
+            make_test_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(1)),
+                ],
+                vec![0, 1],
+            ),
             // op3: uses v1 twice (last uses for v1) -> LUC=1 (but v1 counted once)
-            make_test_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)),
-                vec![Operand::VReg(VReg::scalar(1)), Operand::VReg(VReg::scalar(1))], vec![1]),
+            make_test_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![
+                    Operand::VReg(VReg::scalar(1)),
+                    Operand::VReg(VReg::scalar(1)),
+                ],
+                vec![1],
+            ),
             // op4: sink to consume v2 and v3
-            make_test_ssa_op(4, Engine::Alu, Opcode::Add, Some(VReg::scalar(4)),
-                vec![Operand::VReg(VReg::scalar(2)), Operand::VReg(VReg::scalar(3))], vec![2, 3]),
+            make_test_ssa_op(
+                4,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(4)),
+                vec![
+                    Operand::VReg(VReg::scalar(2)),
+                    Operand::VReg(VReg::scalar(3)),
+                ],
+                vec![2, 3],
+            ),
             // op5: final sink to consume v4
-            make_test_ssa_op(5, Engine::Store, Opcode::Store, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(4))], vec![4]),
+            make_test_ssa_op(
+                5,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(4))],
+                vec![4],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 100
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 100);
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
 
         // Verify scheduling order at cycle 2 (when op2 and op3 can both run)
         // Both ops depend on cycle-1 ops, so they're ready at cycle 2.
         // The one with higher LUC should come first in the cycle.
-        let cycle_2_ops: Vec<_> = ops.iter()
-            .filter(|op| op.cycle == 2)
-            .collect();
+        let cycle_2_ops: Vec<_> = ops.iter().filter(|op| op.cycle == 2).collect();
 
         // With LUC tie-breaking, the op that frees v0 (op2) should be scheduled.
         // Since we have limited visibility into intra-cycle ordering, just verify both complete.
@@ -2144,21 +3051,75 @@ mod tests {
         // op3 frees 16 (v0+v1), op4 frees 8 (v2).
         // LUC should prefer op3 first.
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(2)), vec![Operand::Imm(3)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(2)),
+                vec![Operand::Imm(3)],
+                vec![],
+            ),
             // op3: uses v0 and v1 (both last uses) -> LUC=2
-            make_test_ssa_op(3, Engine::Valu, Opcode::Add, Some(VReg::vector(3)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(3)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
             // op4: uses v2 twice (last use) -> LUC=1
-            make_test_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(4)),
+                vec![
+                    Operand::VReg(VReg::vector(2)),
+                    Operand::VReg(VReg::vector(2)),
+                ],
+                vec![2],
+            ),
             // op5: sink
-            make_test_ssa_op(5, Engine::Valu, Opcode::Add, Some(VReg::vector(5)),
-                vec![Operand::VReg(VReg::vector(3)), Operand::VReg(VReg::vector(4))], vec![3, 4]),
+            make_test_ssa_op(
+                5,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(5)),
+                vec![
+                    Operand::VReg(VReg::vector(3)),
+                    Operand::VReg(VReg::vector(4)),
+                ],
+                vec![3, 4],
+            ),
             // op6: final sink
-            make_test_ssa_op(6, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(5))], vec![5]),
+            make_test_ssa_op(
+                6,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(5))],
+                vec![5],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2167,14 +3128,22 @@ mod tests {
 
         // With budget = 32, ops 0,1,2 take 24 words. Op3 or op4 can fit (adds 8, frees some).
         // LUC should help choose the better one.
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 32
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 32);
+        assert!(
+            result.is_ok(),
+            "Should schedule with budget=32: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Should schedule with budget=32: {:?}", result.err());
 
         // All ops should be scheduled
         for (i, op) in ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "op{} should be scheduled, cycle={}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "op{} should be scheduled, cycle={}",
+                i,
+                op.cycle
+            );
         }
     }
 
@@ -2194,12 +3163,41 @@ mod tests {
         // op2 would add 8 more (total 24) before freeing v0,v1.
         // Without emergency fallback, this would deadlock.
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2208,14 +3206,22 @@ mod tests {
 
         // With same-cycle reuse, op2 should work: projected = 16 + 8 - 16 = 8
         // But if that doesn't work, emergency fallback should kick in.
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 16
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
+        assert!(
+            result.is_ok(),
+            "Emergency fallback should break deadlock: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Emergency fallback should break deadlock: {:?}", result.err());
 
         // All ops should be scheduled
         for (i, op) in ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "op{} should be scheduled, cycle={}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "op{} should be scheduled, cycle={}",
+                i,
+                op.cycle
+            );
         }
     }
 
@@ -2251,12 +3257,34 @@ mod tests {
         // v0 has 1 user (op1, which uses it twice but counts as 1 use)
         // So when op1 runs, LUC should be 1, not 2.
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
             // DUPLICATE OPERAND: v0 appears twice
-            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
-            make_test_ssa_op(2, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(1))], vec![1]),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(1)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                ],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(1))],
+                vec![1],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2265,9 +3293,16 @@ mod tests {
 
         // Schedule with a budget that requires accurate liveness tracking
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 16  // Just enough for v0 + v1
+            &mut ops,
+            false,
+            &mut shifted,
+            16, // Just enough for v0 + v1
         );
-        assert!(result.is_ok(), "Should schedule with duplicate operands: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule with duplicate operands: {:?}",
+            result.err()
+        );
 
         // Verify all ops were scheduled correctly
         assert!(ops[0].cycle >= 0, "op0 should be scheduled");
@@ -2296,15 +3331,46 @@ mod tests {
         // If op1 double-decrements v0's user count, it would go from 2 -> 0,
         // causing v0 to be freed before op2 runs!
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
             // DUPLICATE OPERAND: v0 appears twice - should only count as 1 use
-            make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(1)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                ],
+                vec![0],
+            ),
             // op2 also uses v0 - this should still work after op1 runs
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2313,14 +3379,24 @@ mod tests {
 
         // Schedule with a tight budget that requires accurate liveness
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 24  // v0 + v1 + v2 = 24 words peak
+            &mut ops,
+            false,
+            &mut shifted,
+            24, // v0 + v1 + v2 = 24 words peak
         );
-        assert!(result.is_ok(), "Should schedule without double-decrement bug: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule without double-decrement bug: {:?}",
+            result.err()
+        );
 
         // All ops should be scheduled in dependency order
         assert!(ops[0].cycle >= 0, "op0 should be scheduled");
         assert!(ops[1].cycle > ops[0].cycle, "op1 must come after op0");
-        assert!(ops[2].cycle > ops[1].cycle, "op2 must come after op1 (and needs v0!)");
+        assert!(
+            ops[2].cycle > ops[1].cycle,
+            "op2 must come after op1 (and needs v0!)"
+        );
         assert!(ops[3].cycle > ops[2].cycle, "op3 must come after op2");
     }
 
@@ -2349,15 +3425,53 @@ mod tests {
         // - Scheduler would think words_freed = 16, projected_live = 8
         // - But reality: projected_live = 16
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
             // DUPLICATE OPERAND: v0 appears twice
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0))], vec![0]),
-            make_test_ssa_op(3, Engine::Valu, Opcode::Add, Some(VReg::vector(3)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(2))], vec![1, 2]),
-            make_test_ssa_op(4, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(3))], vec![3]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                ],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(3)),
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(2)),
+                ],
+                vec![1, 2],
+            ),
+            make_test_ssa_op(
+                4,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(3))],
+                vec![3],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2366,14 +3480,22 @@ mod tests {
 
         // Use a budget of exactly 16 words - this should work with correct calculation
         // Peak liveness: v0 + v1 after cycle 0, or v1 + v2 after cycle 1 = 16 words
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 16
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
+        assert!(
+            result.is_ok(),
+            "Should schedule with accurate words_freed: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Should schedule with accurate words_freed: {:?}", result.err());
 
         // Verify scheduling succeeded
         for (i, op) in ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "op{} should be scheduled, cycle={}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "op{} should be scheduled, cycle={}",
+                i,
+                op.cycle
+            );
         }
     }
 
@@ -2387,12 +3509,34 @@ mod tests {
         // op1: add(s0, s0) -> s1 (1 word), DUPLICATE OPERAND
         // op2: sink s1
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::Imm(42)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(42)],
+                vec![],
+            ),
             // DUPLICATE OPERAND: s0 appears twice
-            make_test_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(0))], vec![0]),
-            make_test_ssa_op(2, Engine::Store, Opcode::Store, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(1))], vec![1]),
+            make_test_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(0)),
+                ],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(1))],
+                vec![1],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2400,9 +3544,16 @@ mod tests {
         let mut shifted = HashSet::new();
 
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 10  // Generous budget for scalars
+            &mut ops,
+            false,
+            &mut shifted,
+            10, // Generous budget for scalars
         );
-        assert!(result.is_ok(), "Should schedule scalar duplicate operands: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule scalar duplicate operands: {:?}",
+            result.err()
+        );
 
         // Verify scheduling order
         assert!(ops[1].cycle > ops[0].cycle, "op1 must come after op0");
@@ -2418,15 +3569,44 @@ mod tests {
     fn test_duplicate_operand_multiply_add() {
         // Test multiply_add(v0, v0, v1) - v0 appears twice
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)), vec![Operand::Imm(2)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)), vec![Operand::Imm(3)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(3)],
+                vec![],
+            ),
             // multiply_add(v0, v0, v1) = v0 * v0 + v1
             // v0 appears twice, v1 once -> 2 unique VRegs
-            make_test_ssa_op(2, Engine::Valu, Opcode::MultiplyAdd, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
-                vec![0, 1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::MultiplyAdd,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2434,13 +3614,26 @@ mod tests {
         let mut shifted = HashSet::new();
 
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 24  // v0 + v1 + v2 = 24 words
+            &mut ops,
+            false,
+            &mut shifted,
+            24, // v0 + v1 + v2 = 24 words
         );
-        assert!(result.is_ok(), "Should schedule multiply_add with duplicate operand: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule multiply_add with duplicate operand: {:?}",
+            result.err()
+        );
 
         // Verify correct scheduling
-        assert!(ops[2].cycle > ops[0].cycle, "multiply_add must come after v0 defined");
-        assert!(ops[2].cycle > ops[1].cycle, "multiply_add must come after v1 defined");
+        assert!(
+            ops[2].cycle > ops[0].cycle,
+            "multiply_add must come after v0 defined"
+        );
+        assert!(
+            ops[2].cycle > ops[1].cycle,
+            "multiply_add must come after v1 defined"
+        );
     }
 
     // =========================================================================
@@ -2471,13 +3664,34 @@ mod tests {
         //
         // Peak liveness: s0 + v0 = 1 + 8 = 9 words
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
-                vec![Operand::Imm(42)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(42)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))],
+                vec![0],
+            ),
             // Sink that uses both - scalar and vector
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![1],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2485,10 +3699,13 @@ mod tests {
         let mut shifted = HashSet::new();
 
         // Budget of 9 words should be enough (s0=1 + v0=8)
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 9
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 9);
+        assert!(
+            result.is_ok(),
+            "Budget=9 should fit scalar(1)+vector(8): {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Budget=9 should fit scalar(1)+vector(8): {:?}", result.err());
 
         // Verify scheduling
         assert!(ops[1].cycle > ops[0].cycle, "broadcast depends on const");
@@ -2502,23 +3719,47 @@ mod tests {
     fn test_valu_requires_vector_sources() {
         // Create VALU op with proper vector sources
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)),
-                vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
-                vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
             // VALU add with vector sources (correct)
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 24
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 24);
+        assert!(
+            result.is_ok(),
+            "VALU with vector sources should work: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "VALU with vector sources should work: {:?}", result.err());
 
         // All vector VRegs should be properly counted
         for op in &ops {
@@ -2535,15 +3776,42 @@ mod tests {
     fn test_alu_uses_scalar_vregs() {
         // Create ALU ops with scalar sources
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
-                vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)),
-                vec![Operand::Imm(10)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::Imm(10)],
+                vec![],
+            ),
             // ALU add with scalar sources
-            make_test_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)),
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Store, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(2))], vec![2]),
+            make_test_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::scalar(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::scalar(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2551,10 +3819,13 @@ mod tests {
         let mut shifted = HashSet::new();
 
         // Budget of 3 words should be enough for 3 scalars
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 3
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 3);
+        assert!(
+            result.is_ok(),
+            "ALU with scalar sources should work: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "ALU with scalar sources should work: {:?}", result.err());
     }
 
     /// Test broadcast: scalar input -> vector output.
@@ -2568,31 +3839,74 @@ mod tests {
         // op2: valu(v0, v0) -> v1 (vector, 8 words)
         let mut ops = vec![
             // Scalar const
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
-                vec![Operand::Imm(42)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(42)],
+                vec![],
+            ),
             // Broadcast takes scalar, produces vector
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))],
+                vec![0],
+            ),
             // VALU uses vector
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         // Verify VReg widths
-        assert!(ops[0].dest.unwrap().is_scalar(), "const dest should be scalar");
-        assert!(ops[1].dest.unwrap().is_vector(), "broadcast dest should be vector");
-        assert!(ops[2].dest.unwrap().is_vector(), "valu dest should be vector");
+        assert!(
+            ops[0].dest.unwrap().is_scalar(),
+            "const dest should be scalar"
+        );
+        assert!(
+            ops[1].dest.unwrap().is_vector(),
+            "broadcast dest should be vector"
+        );
+        assert!(
+            ops[2].dest.unwrap().is_vector(),
+            "valu dest should be vector"
+        );
 
         let config = KernelConfig::new(10, 2047, 256, 1);
         let builder = SsaTickTockKernelBuilder::new(config);
         let mut shifted = HashSet::new();
 
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 17  // s0(1) + v0(8) + v1(8) = 17 peak
+            &mut ops,
+            false,
+            &mut shifted,
+            17, // s0(1) + v0(8) + v1(8) = 17 peak
         );
-        assert!(result.is_ok(), "Broadcast chain should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Broadcast chain should schedule: {:?}",
+            result.err()
+        );
     }
 
     /// Test vload produces vector, vstore consumes vector.
@@ -2603,21 +3917,54 @@ mod tests {
         // vload -> valu -> vstore chain
         let mut ops = vec![
             // Address scalar
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
-                vec![Operand::Imm(200)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(200)],
+                vec![],
+            ),
             // vload produces vector
-            make_test_ssa_op(1, Engine::Load, Opcode::Vload, Some(VReg::vector(1)),
-                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Vload,
+                Some(VReg::vector(1)),
+                vec![Operand::VReg(VReg::scalar(0))],
+                vec![0],
+            ),
             // VALU uses vector
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(1)), Operand::VReg(VReg::vector(1))], vec![1]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(1)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![1],
+            ),
             // vstore consumes vector
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::vector(2))], vec![0, 2]),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![
+                    Operand::VReg(VReg::scalar(0)),
+                    Operand::VReg(VReg::vector(2)),
+                ],
+                vec![0, 2],
+            ),
         ];
 
         // Verify widths
-        assert!(ops[1].dest.unwrap().is_vector(), "vload dest must be vector");
+        assert!(
+            ops[1].dest.unwrap().is_vector(),
+            "vload dest must be vector"
+        );
         // vstore has no dest, but src (second operand) must be vector
         if let Operand::VReg(src) = &ops[3].srcs[1] {
             assert!(src.is_vector(), "vstore src must be vector");
@@ -2628,9 +3975,16 @@ mod tests {
         let mut shifted = HashSet::new();
 
         let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 17  // s0(1) + v1(8) + v2(8)
+            &mut ops,
+            false,
+            &mut shifted,
+            17, // s0(1) + v1(8) + v2(8)
         );
-        assert!(result.is_ok(), "vload/vstore chain should schedule: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "vload/vstore chain should schedule: {:?}",
+            result.err()
+        );
     }
 
     /// Test VALU→ALU shifting preserves width semantics.
@@ -2641,15 +3995,42 @@ mod tests {
     fn test_valu_to_alu_shift_preserves_semantics() {
         // Create a VALU op that could be shifted to ALU
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(0)),
-                vec![Operand::Imm(1)], vec![]),
-            make_test_ssa_op(1, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(1)),
-                vec![Operand::Imm(2)], vec![]),
+            make_test_ssa_op(
+                0,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(0)),
+                vec![Operand::Imm(1)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(1)),
+                vec![Operand::Imm(2)],
+                vec![],
+            ),
             // This Add op can be shifted from VALU to ALU
-            make_test_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))], vec![0, 1]),
-            make_test_ssa_op(3, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))], vec![2]),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![
+                    Operand::VReg(VReg::vector(0)),
+                    Operand::VReg(VReg::vector(1)),
+                ],
+                vec![0, 1],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(2))],
+                vec![2],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2657,10 +4038,13 @@ mod tests {
         let mut shifted = HashSet::new();
 
         // Enable VALU shift
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, true, &mut shifted, 24
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 24);
+        assert!(
+            result.is_ok(),
+            "VALU→ALU shift should work: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "VALU→ALU shift should work: {:?}", result.err());
 
         // Note: The actual shifting happens in lower_ssa_ops_with_shift, not in scheduling.
         // The scheduler just marks which ops to shift.
@@ -2682,7 +4066,10 @@ mod tests {
             Engine::Valu,
             Opcode::Add,
             Some(VReg::vector(2)),
-            vec![Operand::VReg(VReg::vector(0)), Operand::VReg(VReg::vector(1))],
+            vec![
+                Operand::VReg(VReg::vector(0)),
+                Operand::VReg(VReg::vector(1)),
+            ],
         );
         op.cycle = 5;
 
@@ -2702,11 +4089,26 @@ mod tests {
             assert_eq!(alu_op.engine, Engine::Alu, "Expanded op should be ALU");
 
             // Check reads: should read src1[i] and src2[i]
-            assert!(alu_op.reads.contains(&(100 + i as i64)), "Should read src1[{}]=100+{}", i, i);
-            assert!(alu_op.reads.contains(&(200 + i as i64)), "Should read src2[{}]=200+{}", i, i);
+            assert!(
+                alu_op.reads.contains(&(100 + i as i64)),
+                "Should read src1[{}]=100+{}",
+                i,
+                i
+            );
+            assert!(
+                alu_op.reads.contains(&(200 + i as i64)),
+                "Should read src2[{}]=200+{}",
+                i,
+                i
+            );
 
             // Check writes: should write dest[i]
-            assert!(alu_op.writes.contains(&(300 + i as i64)), "Should write dest[{}]=300+{}", i, i);
+            assert!(
+                alu_op.writes.contains(&(300 + i as i64)),
+                "Should write dest[{}]=300+{}",
+                i,
+                i
+            );
         }
     }
 
@@ -2724,7 +4126,10 @@ mod tests {
             Engine::Alu,
             Opcode::Add,
             Some(VReg::scalar(2)),
-            vec![Operand::VReg(VReg::scalar(0)), Operand::VReg(VReg::scalar(1))],
+            vec![
+                Operand::VReg(VReg::scalar(0)),
+                Operand::VReg(VReg::scalar(1)),
+            ],
         );
 
         let mut scalar_mapping = HashMap::new();
@@ -2733,8 +4138,16 @@ mod tests {
         scalar_mapping.insert(VReg::scalar(2), 30);
 
         let lowered_scalar = lower_ssa_op(&scalar_op, &scalar_mapping);
-        assert_eq!(lowered_scalar.reads.len(), 2, "Scalar should read 2 addresses");
-        assert_eq!(lowered_scalar.writes.len(), 1, "Scalar should write 1 address");
+        assert_eq!(
+            lowered_scalar.reads.len(),
+            2,
+            "Scalar should read 2 addresses"
+        );
+        assert_eq!(
+            lowered_scalar.writes.len(),
+            1,
+            "Scalar should write 1 address"
+        );
         assert!(lowered_scalar.reads.contains(&10));
         assert!(lowered_scalar.reads.contains(&20));
         assert!(lowered_scalar.writes.contains(&30));
@@ -2745,7 +4158,10 @@ mod tests {
             Engine::Valu,
             Opcode::Add,
             Some(VReg::vector(5)),
-            vec![Operand::VReg(VReg::vector(3)), Operand::VReg(VReg::vector(4))],
+            vec![
+                Operand::VReg(VReg::vector(3)),
+                Operand::VReg(VReg::vector(4)),
+            ],
         );
 
         let mut vector_mapping = HashMap::new();
@@ -2754,14 +4170,34 @@ mod tests {
         vector_mapping.insert(VReg::vector(5), 300);
 
         let lowered_vector = lower_ssa_op(&vector_op, &vector_mapping);
-        assert_eq!(lowered_vector.reads.len(), 16, "Vector should read 16 addresses (2 srcs × 8)");
-        assert_eq!(lowered_vector.writes.len(), 8, "Vector should write 8 addresses");
+        assert_eq!(
+            lowered_vector.reads.len(),
+            16,
+            "Vector should read 16 addresses (2 srcs × 8)"
+        );
+        assert_eq!(
+            lowered_vector.writes.len(),
+            8,
+            "Vector should write 8 addresses"
+        );
 
         // Check all 8 offsets for each operand
         for i in 0..8 {
-            assert!(lowered_vector.reads.contains(&(100 + i)), "Should read src1[{}]", i);
-            assert!(lowered_vector.reads.contains(&(200 + i)), "Should read src2[{}]", i);
-            assert!(lowered_vector.writes.contains(&(300 + i)), "Should write dest[{}]", i);
+            assert!(
+                lowered_vector.reads.contains(&(100 + i)),
+                "Should read src1[{}]",
+                i
+            );
+            assert!(
+                lowered_vector.reads.contains(&(200 + i)),
+                "Should read src2[{}]",
+                i
+            );
+            assert!(
+                lowered_vector.writes.contains(&(300 + i)),
+                "Should write dest[{}]",
+                i
+            );
         }
     }
 
@@ -2778,18 +4214,57 @@ mod tests {
         // v2 = vadd(v0, v1)  (vector)
         // vstore(addr, v2)   (consumes vector)
         let mut ops = vec![
-            make_test_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)),
-                vec![Operand::Imm(5)], vec![]),
-            make_test_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)),
-                vec![Operand::Imm(10)], vec![]),
-            make_test_ssa_op(2, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(2)),
-                vec![Operand::VReg(VReg::scalar(0))], vec![0]),
-            make_test_ssa_op(3, Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(3)),
-                vec![Operand::VReg(VReg::scalar(1))], vec![1]),
-            make_test_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)),
-                vec![Operand::VReg(VReg::vector(2)), Operand::VReg(VReg::vector(3))], vec![2, 3]),
-            make_test_ssa_op(5, Engine::Store, Opcode::Vstore, None,
-                vec![Operand::Imm(100), Operand::VReg(VReg::vector(4))], vec![4]),
+            make_test_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::Imm(5)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::Imm(10)],
+                vec![],
+            ),
+            make_test_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(2)),
+                vec![Operand::VReg(VReg::scalar(0))],
+                vec![0],
+            ),
+            make_test_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Vbroadcast,
+                Some(VReg::vector(3)),
+                vec![Operand::VReg(VReg::scalar(1))],
+                vec![1],
+            ),
+            make_test_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(4)),
+                vec![
+                    Operand::VReg(VReg::vector(2)),
+                    Operand::VReg(VReg::vector(3)),
+                ],
+                vec![2, 3],
+            ),
+            make_test_ssa_op(
+                5,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![Operand::Imm(100), Operand::VReg(VReg::vector(4))],
+                vec![4],
+            ),
         ];
 
         let config = KernelConfig::new(10, 2047, 256, 1);
@@ -2798,10 +4273,13 @@ mod tests {
 
         // Peak: s0(1) + s1(1) + v2(8) + v3(8) + v4(8) = 26 words
         // But scalars die early, so actual peak is less
-        let result = builder.schedule_ssa_greedy_with_shift_budget(
-            &mut ops, false, &mut shifted, 26
+        let result =
+            builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 26);
+        assert!(
+            result.is_ok(),
+            "Mixed width pipeline should schedule: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Mixed width pipeline should schedule: {:?}", result.err());
 
         // Verify dependency chain
         assert!(ops[2].cycle > ops[0].cycle, "broadcast depends on const");
@@ -2824,9 +4302,9 @@ mod tests {
             Opcode::Select, // select can have mixed operands in theory
             Some(VReg::scalar(3)),
             vec![
-                Operand::VReg(VReg::scalar(0)),  // cond
-                Operand::VReg(VReg::scalar(1)),  // true
-                Operand::VReg(VReg::scalar(1)),  // false (duplicate of true)
+                Operand::VReg(VReg::scalar(0)), // cond
+                Operand::VReg(VReg::scalar(1)), // true
+                Operand::VReg(VReg::scalar(1)), // false (duplicate of true)
             ],
         );
 
@@ -2865,19 +4343,26 @@ mod tests {
         builder.build_internal();
         let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
         let mut ssa_ops = builder.emit.take_ops();
-        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(&mut ssa_ops, &vreg_def, builder.zero_vreg);
+        crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
+            &mut ssa_ops,
+            &vreg_def,
+            builder.zero_vreg,
+        );
 
         // Run greedy scheduler to get hints
         let mut greedy_shifted = HashSet::new();
-        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) =
-            builder.schedule_ssa_greedy_with_shift(
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = builder
+            .schedule_ssa_greedy_with_shift(
                 &mut ssa_ops,
                 false, // no VALU shift
                 &mut greedy_shifted,
-            ).expect("Greedy scheduler should succeed");
+            )
+            .expect("Greedy scheduler should succeed");
 
-        eprintln!("Greedy result: {} cycles, budget_exceeded={}, peak_live={}",
-            greedy_cycles, greedy_budget_exceeded, greedy_peak_live);
+        eprintln!(
+            "Greedy result: {} cycles, budget_exceeded={}, peak_live={}",
+            greedy_cycles, greedy_budget_exceeded, greedy_peak_live
+        );
 
         // Collect hints from greedy schedule
         let greedy_hints: Vec<i32> = ssa_ops.iter().map(|op| op.cycle).collect();
@@ -2891,10 +4376,10 @@ mod tests {
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
             SsaCpsatConfig {
-                time_limit_secs: 60.0,  // Short timeout
+                time_limit_secs: 60.0, // Short timeout
                 verbose: true,
-                stop_after_first_solution: true,  // Return first feasible solution
-                scratch_budget: 1536,  // Hardware limit
+                stop_after_first_solution: true, // Return first feasible solution
+                scratch_budget: 1536,            // Hardware limit
                 enable_valu_shift: false,
                 model_name: None,
                 ..Default::default()
@@ -2912,8 +4397,10 @@ mod tests {
 
         match cpsat_result {
             Some(result) => {
-                eprintln!("CP-SAT found solution: {} cycles, status={:?}",
-                    result.makespan, result.status);
+                eprintln!(
+                    "CP-SAT found solution: {} cycles, status={:?}",
+                    result.makespan, result.status
+                );
 
                 // Check if CP-SAT used the hints directly or found different solution
                 let hints_match = result.cycle_assignments == greedy_hints;
@@ -2924,19 +4411,25 @@ mod tests {
                     eprintln!("Greedy hints were INFEASIBLE - CP-SAT found different solution");
 
                     // Count how many cycle assignments differ
-                    let diff_count = result.cycle_assignments.iter()
+                    let diff_count = result
+                        .cycle_assignments
+                        .iter()
                         .zip(greedy_hints.iter())
                         .filter(|(a, b)| a != b)
                         .count();
-                    eprintln!("  {} of {} cycle assignments differ", diff_count, greedy_hints.len());
+                    eprintln!(
+                        "  {} of {} cycle assignments differ",
+                        diff_count,
+                        greedy_hints.len()
+                    );
                 } else {
                     eprintln!("Greedy hints were FEASIBLE - accepted by CP-SAT");
                 }
 
                 // The test passes if CP-SAT found any solution (feasible or optimal)
                 assert!(
-                    result.status == crate::cpsat_scheduler::CpsatStatus::Feasible ||
-                    result.status == crate::cpsat_scheduler::CpsatStatus::Optimal,
+                    result.status == crate::cpsat_scheduler::CpsatStatus::Feasible
+                        || result.status == crate::cpsat_scheduler::CpsatStatus::Optimal,
                     "CP-SAT should find a feasible solution"
                 );
             }
@@ -2960,22 +4453,25 @@ mod tests {
         let mut builder = SsaTickTockKernelBuilder::new(config);
         use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
         let result = builder.build_and_schedule_cpsat(
-            30.0,   // Short time limit; small kernel solves quickly
-            false,  // verbose
-            true,   // enable_valu_shift
-            None,   // per_section_optimize_secs
-            None,   // forced_shifts
+            30.0,  // Short time limit; small kernel solves quickly
+            false, // verbose
+            true,  // enable_valu_shift
+            None,  // per_section_optimize_secs
+            None,  // forced_shifts
             ConstChoiceMode::Optimize,
             SelectChoiceMode::Optimize,
             ValuShiftMode::Optimize,
         );
-        assert!(result.is_ok(), "build_and_schedule_cpsat should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build_and_schedule_cpsat should succeed: {:?}",
+            result.err()
+        );
         let result = result.unwrap();
         assert!(
             !result.address_result.budget_exceeded,
             "Two-phase CP-SAT must produce a schedule within scratch budget; peak_live={} > {}",
-            result.address_result.peak_live,
-            SCRATCH_BUDGET_HW
+            result.address_result.peak_live, SCRATCH_BUDGET_HW
         );
         assert!(
             result.address_result.peak_live <= SCRATCH_BUDGET_HW,

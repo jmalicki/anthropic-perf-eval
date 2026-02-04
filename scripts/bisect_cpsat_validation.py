@@ -4,9 +4,9 @@
 Runs generate_ssa_kernel.py with --validate -q for:
 - One greedy baseline (expected to pass)
 - Eight CP-SAT runs: each combination of --const-choice, --select-choice, --valu-shift
-  (const_choice in {optimize, load}, select_choice in {optimize, vselect}, valu_shift in {optimize, valu})
+  (const_choice in {optimize, load}, select_choice in {optimize, vselect}, valu_shift in {alu, valu})
 
-Reports which combinations pass or fail so we can see which choice (if any) correlates with the failure.
+Uses forced options (alu, valu) for valu_shift rather than optimize, to isolate which choice correlates with failure.
 
 Usage (from project root):
     uv run python scripts/bisect_cpsat_validation.py
@@ -75,7 +75,7 @@ def main():
     rows = []
     for const_choice in ("optimize", "load"):
         for select_choice in ("optimize", "vselect"):
-            for valu_shift in ("optimize", "valu"):
+            for valu_shift in ("alu", "valu"):
                 label = f"const={const_choice} select={select_choice} shift={valu_shift}"
                 print(f"  Running {label}...", end=" ", flush=True)
                 cmd = base_cmd + [

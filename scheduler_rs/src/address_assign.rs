@@ -56,7 +56,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{EmissionPhase, LiveInterval, Opcode, Operand, SsaOp, VarType, VReg, VLEN};
+use crate::types::{EmissionPhase, LiveInterval, Opcode, Operand, SsaOp, VReg, VarType, VLEN};
 
 /// Result of address assignment.
 #[derive(Debug, Default)]
@@ -90,6 +90,11 @@ pub struct AddressAssignConfig {
     pub fixed_vregs: HashMap<VReg, i64>,
     /// When set, this VReg (address 0) is included in live intervals so peak_live counts it and stays within budget.
     pub zero_vreg: Option<VReg>,
+    /// When set, SelectChoice ops in this set (by op.id) that have sub_temp_vreg use def_cycle+2 for their dest (FMA at cycle+1 produces result at cycle+2).
+    pub select_fma_ops: Option<HashSet<usize>>,
+    /// When set, VALU ops shifted to ALU (op.id in keys) use min(alu_cycles) as def_cycle for their dest.
+    /// The 8 ALU ops write at different cycles; the block is in use from the first write.
+    pub shifted_alu_cycles: Option<std::collections::HashMap<usize, Vec<i32>>>,
 }
 
 impl Default for AddressAssignConfig {
@@ -99,6 +104,8 @@ impl Default for AddressAssignConfig {
             start_addr: 1, // Reserve address 0 - scratch memory is always initialized to 0 at startup, so address 0 always contains 0
             fixed_vregs: HashMap::new(),
             zero_vreg: None,
+            select_fma_ops: None,
+            shifted_alu_cycles: None,
         }
     }
 }
@@ -112,6 +119,10 @@ impl Default for AddressAssignConfig {
 /// - `start` = cycle when the VReg is written (definition cycle)
 /// - `end` = last cycle the VReg is ACCESSED (last read, or def+1 for dead VRegs)
 ///
+/// NOTE: For shifted VALU ops we treat the entire 8-word block as reserved from the first lane write.
+/// This does NOT mean all lanes contain valid data at that moment; it simply blocks reuse until the
+/// vector is fully consumed. See TODO(valu-shift-liveness) if we ever add lane-level modeling.
+///
 /// For a VReg defined at cycle D and last read at cycle R:
 /// - Interval = [D, R] (closed)
 ///
@@ -120,19 +131,48 @@ impl Default for AddressAssignConfig {
 ///
 /// When `zero_vreg` is Some, it is added with interval [0, max_cycle] so peak_live counts it
 /// (address 0 is reserved; total capacity is budget words including zero).
-pub fn compute_live_intervals(ops: &[SsaOp], zero_vreg: Option<VReg>) -> HashMap<VReg, LiveInterval> {
+///
+/// When `select_fma_ops` is Some, SelectChoice ops whose id is in the set and that have
+/// `sub_temp_vreg` (FMA path without delta) define their **dest** at cycle+2: the sub runs at
+/// op.cycle, the FMA runs at op.cycle+1, and results are visible the next cycle, so dest is
+/// visible at op.cycle+2.
+///
+/// When `shifted_alu_cycles` is Some, VALU ops shifted to ALU (op.id in map) use min(alu_cycles)
+/// as def_cycle for their dest. The 8 ALU ops write at different cycles; the vector block is
+/// in use from the first write.
+pub fn compute_live_intervals(
+    ops: &[SsaOp],
+    zero_vreg: Option<VReg>,
+    select_fma_ops: Option<&HashSet<usize>>,
+    shifted_alu_cycles: Option<&std::collections::HashMap<usize, Vec<i32>>>,
+) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
-    // Always print to verify this code is reached
-    eprintln!("[TRACE compute_live_intervals] Called with {} ops, debug={}", ops.len(), debug);
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
     // First pass: record definition cycles.
     // Initialize with [def, def] — will be extended if read.
     for op in ops {
         if let Some(dest) = op.dest {
-            intervals.insert(dest, LiveInterval::new(op.cycle, op.cycle));
+            // SelectChoice FMA (no delta): sub at cycle, FMA at cycle+1 → result visible at cycle+2
+            let def_cycle = if op.opcode == Opcode::SelectChoice
+                && select_fma_ops.map_or(false, |s| s.contains(&op.id))
+                && op.sub_temp_vreg.is_some()
+            {
+                op.cycle + 2
+            } else if let Some(cycles) =
+                shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
+            {
+                // Shifted VALU: 8 ALU ops write at different cycles; block in use from first write
+                // TODO(valu-shift-liveness): We reserve the entire 8-word vector from the first lane write
+                // onwards. In reality only the lanes that have already been written are live, so this is
+                // conservative. Revisit if we ever model lane-level liveness to allow partial reuse.
+                *cycles.iter().min().unwrap_or(&op.cycle)
+            } else {
+                op.cycle
+            };
+            intervals.insert(dest, LiveInterval::new(def_cycle, def_cycle));
         }
-        
+
         // Handle sub_temp_vreg for SelectChoice ops without delta
         // The sub_temp is defined at the SelectChoice's cycle and read at cycle + 1 (by FMA)
         if let Some(sub_temp) = op.sub_temp_vreg {
@@ -278,12 +318,14 @@ pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
 /// Assignment result with VReg -> address mapping and statistics.
 pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressAssignmentResult {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
-    println!("[TRACE assign_addresses] Called with {} ops, debug={}", ops.len(), debug);
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
 
     // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
-    let intervals = compute_live_intervals(ops, config.zero_vreg);
+    let intervals = compute_live_intervals(
+        ops,
+        config.zero_vreg,
+        config.select_fma_ops.as_ref(),
+        config.shifted_alu_cycles.as_ref(),
+    );
 
     // Debug: Collect vstore source VRegs for tracking
     let vstore_vregs: HashSet<VReg> = if debug {
@@ -468,10 +510,7 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
             match src {
                 Operand::VReg(vreg) => {
                     let addr = vreg_to_addr.get(vreg);
-                    eprintln!(
-                        "  src[{}]: VReg {:?} -> addr {:?}",
-                        i, vreg, addr
-                    );
+                    eprintln!("  src[{}]: VReg {:?} -> addr {:?}", i, vreg, addr);
                 }
                 Operand::Imm(val) => {
                     eprintln!("  src[{}]: Imm({})", i, val);
@@ -497,8 +536,10 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         match src {
             Operand::VReg(vreg) => {
                 let addr = vreg_to_addr.get(vreg).copied().unwrap_or_else(|| {
-                    panic!("VReg {:?} not found in address mapping (op id={}, cycle={})",
-                           vreg, ssa_op.id, ssa_op.cycle);
+                    panic!(
+                        "VReg {:?} not found in address mapping (op id={}, cycle={})",
+                        vreg, ssa_op.id, ssa_op.cycle
+                    );
                 });
                 slot.push(SlotVal::Int(addr));
             }
@@ -510,10 +551,13 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
 
     // Debug: print resulting slot for vstore
     if debug && ssa_op.opcode == Opcode::Vstore {
-        let slot_vals: Vec<String> = slot.iter().map(|s| match s {
-            SlotVal::Str(s) => s.clone(),
-            SlotVal::Int(i) => i.to_string(),
-        }).collect();
+        let slot_vals: Vec<String> = slot
+            .iter()
+            .map(|s| match s {
+                SlotVal::Str(s) => s.clone(),
+                SlotVal::Int(i) => i.to_string(),
+            })
+            .collect();
         eprintln!("  -> lowered slot: [{}]", slot_vals.join(", "));
     }
 
@@ -562,7 +606,10 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
 
 /// Lower all SsaOps to concrete Ops.
 pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
-    ssa_ops.iter().map(|op| lower_ssa_op(op, vreg_to_addr)).collect()
+    ssa_ops
+        .iter()
+        .map(|op| lower_ssa_op(op, vreg_to_addr))
+        .collect()
 }
 
 // ============================================================================
@@ -688,7 +735,11 @@ pub fn build_vreg_debug_info(
 
             VRegDebugInfo {
                 id,
-                width: if is_vector { "vector".to_string() } else { "scalar".to_string() },
+                width: if is_vector {
+                    "vector".to_string()
+                } else {
+                    "scalar".to_string()
+                },
                 size_words,
                 interval_start: interval.start,
                 interval_end: interval.end,
@@ -724,8 +775,8 @@ pub fn compute_liveness_curve(
     // Build events: (cycle, vreg, is_start)
     let mut events: Vec<(i32, VReg, bool)> = Vec::new();
     for (&vreg, interval) in intervals {
-        events.push((interval.start, vreg, true));  // becoming live
-        events.push((interval.end, vreg, false));   // dying (at end cycle)
+        events.push((interval.start, vreg, true)); // becoming live
+        events.push((interval.end, vreg, false)); // dying (at end cycle)
     }
     events.sort_by_key(|(cycle, _, is_start)| (*cycle, !*is_start)); // ends before starts at same cycle
 
@@ -759,7 +810,9 @@ pub fn compute_liveness_curve(
             total_live_words += size;
 
             if let Some((var_type, _, _)) = vreg_metadata.get(vreg) {
-                let key = var_type.map(|vt| format!("{:?}", vt)).unwrap_or_else(|| "Unknown".to_string());
+                let key = var_type
+                    .map(|vt| format!("{:?}", vt))
+                    .unwrap_or_else(|| "Unknown".to_string());
                 *by_var_type.entry(key).or_insert(0) += size;
             } else {
                 *by_var_type.entry("Unknown".to_string()).or_insert(0) += size;
@@ -816,17 +869,11 @@ pub fn compute_liveness_summary(
         .unwrap_or_default();
 
     // Count dead VRegs
-    let dead_vregs = intervals
-        .values()
-        .filter(|i| i.end == i.start + 1)
-        .count();
+    let dead_vregs = intervals.values().filter(|i| i.end == i.start + 1).count();
 
     // Interval statistics
     let total_vregs = intervals.len();
-    let interval_lengths: Vec<i32> = intervals
-        .values()
-        .map(|i| i.end - i.start)
-        .collect();
+    let interval_lengths: Vec<i32> = intervals.values().map(|i| i.end - i.start).collect();
     let sum_lengths: i64 = interval_lengths.iter().map(|&x| x as i64).sum();
     let avg_interval_length = sum_lengths as f64 / total_vregs as f64;
     let max_interval_length = *interval_lengths.iter().max().unwrap_or(&0);
@@ -862,7 +909,7 @@ mod tests {
         emit.ops[0].cycle = 0;
         emit.ops[1].cycle = 1;
 
-        let intervals = compute_live_intervals(&emit.ops, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None);
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -880,13 +927,151 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 5;
 
-        let intervals = compute_live_intervals(&emit.ops, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None);
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
         assert_eq!(intervals[&v1], LiveInterval::new(0, 5));
         // v2: defined at 1, last read at 5 → [1, 5]
         assert_eq!(intervals[&v2], LiveInterval::new(1, 5));
+    }
+
+    /// SelectChoice FMA (no delta): dest must be defined at op.cycle+2, sub_temp at [op.cycle, op.cycle+1].
+    #[test]
+    fn test_compute_live_intervals_selectchoice_fma_dest_at_cycle_plus_2() {
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true_val = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false_val = emit.emit_vbroadcast(c20);
+        let sel = emit.emit_select_choice(cond, true_val, false_val);
+        let _use = emit.emit_valu(Opcode::Add, sel, sel);
+
+        let select_choice_idx = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice)
+            .expect("one SelectChoice");
+        let select_choice_id = emit.ops[select_choice_idx].id;
+        assert!(
+            emit.ops[select_choice_idx].sub_temp_vreg.is_some(),
+            "no-delta path"
+        );
+
+        // Simulate schedule: SelectChoice at cycle 5, consumer at cycle 8
+        emit.ops[select_choice_idx].cycle = 5;
+        for (idx, op) in emit.ops.iter_mut().enumerate() {
+            if op.dep_ids.contains(&select_choice_id) {
+                op.cycle = 8;
+            } else if op.cycle < 0 {
+                op.cycle = 0;
+            }
+        }
+
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(select_choice_id);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None);
+
+        let dest = emit.ops[select_choice_idx]
+            .dest
+            .expect("SelectChoice has dest");
+        let sub_temp = emit.ops[select_choice_idx].sub_temp_vreg.expect("sub_temp");
+
+        // Dest is produced by FMA at cycle 6 → visible at cycle 7 (op.cycle+2)
+        assert_eq!(
+            intervals[&dest].start, 7,
+            "SelectChoice FMA dest def_cycle must be op.cycle+2"
+        );
+        assert_eq!(
+            intervals[&dest].end, 8,
+            "dest last read by consumer at cycle 8"
+        );
+
+        // Sub_temp defined at 5, read by FMA at 6 → [5, 6]
+        assert_eq!(intervals[&sub_temp], LiveInterval::new(5, 6));
+    }
+
+    /// Two SelectChoice FMA ops: after assign_addresses, no two VRegs with overlapping
+    /// intervals may share the same address (catches allocation bugs).
+    #[test]
+    fn test_assign_two_selectchoice_fma_no_overlapping_same_addr() {
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let true1 = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let false1 = emit.emit_vbroadcast(c20);
+        let sel1 = emit.emit_select_choice(cond, true1, false1);
+        let _u1 = emit.emit_valu(Opcode::Add, sel1, sel1);
+
+        let c30 = emit.emit_const(30);
+        let true2 = emit.emit_vbroadcast(c30);
+        let c40 = emit.emit_const(40);
+        let false2 = emit.emit_vbroadcast(c40);
+        let sel2 = emit.emit_select_choice(cond, true2, false2);
+        let _u2 = emit.emit_valu(Opcode::Add, sel2, sel2);
+
+        let idx1 = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice)
+            .expect("first");
+        let idx2 = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice && o.id != emit.ops[idx1].id)
+            .expect("second");
+        let id1 = emit.ops[idx1].id;
+        let id2 = emit.ops[idx2].id;
+
+        // Schedule: sel1 at 0 (sub 0, fma 1 → result 2), consumer at 5; sel2 at 2 (sub 2, fma 3 → result 4), consumer at 6
+        for (i, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = if i == idx1 {
+                0
+            } else if op.dep_ids.contains(&id1) && !op.dep_ids.contains(&id2) {
+                5
+            } else if i == idx2 {
+                2
+            } else if op.dep_ids.contains(&id2) {
+                6
+            } else {
+                0
+            };
+        }
+
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(id1);
+        select_fma_ops.insert(id2);
+
+        let mut config = AddressAssignConfig::default();
+        config.select_fma_ops = Some(select_fma_ops.clone());
+        let result = assign_addresses(&emit.ops, &config);
+        assert!(!result.budget_exceeded);
+
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None);
+        for (v1, addr1) in &result.vreg_to_addr {
+            for (v2, addr2) in &result.vreg_to_addr {
+                if v1 >= v2 {
+                    continue;
+                }
+                if addr1 != addr2 {
+                    continue;
+                }
+                let i1 = intervals.get(v1).expect("interval for v1");
+                let i2 = intervals.get(v2).expect("interval for v2");
+                assert!(!i1.overlaps(i2), "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap",
+                    v1, v2, addr1, i1.start, i1.end, i2.start, i2.end);
+            }
+        }
     }
 
     #[test]
@@ -960,7 +1145,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 2;
 
-        let intervals = compute_live_intervals(&emit.ops, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None);
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -997,6 +1182,8 @@ mod tests {
             start_addr: 1,
             fixed_vregs: HashMap::new(),
             zero_vreg: None,
+            select_fma_ops: None,
+            shifted_alu_cycles: None,
         };
         let result = assign_addresses(&emit.ops, &config);
 
@@ -1088,9 +1275,9 @@ mod tests {
         // Use B and LONG at cycle 10 to extend their liveness
         let _c = emit.emit_alu(Opcode::Add, b, long);
 
-        emit.ops[0].cycle = 0;  // A defined → [0, 5]
-        emit.ops[1].cycle = 0;  // LONG defined → [0, 10]
-        emit.ops[2].cycle = 5;  // B = A + LONG → [5, 10]
+        emit.ops[0].cycle = 0; // A defined → [0, 5]
+        emit.ops[1].cycle = 0; // LONG defined → [0, 10]
+        emit.ops[2].cycle = 5; // B = A + LONG → [5, 10]
         emit.ops[3].cycle = 10; // C = B + LONG
 
         let config = AddressAssignConfig::default();
@@ -1161,19 +1348,19 @@ mod tests {
         // VReg A: vector defined at cycle 0, last read at cycle 2 → [0, 2]
         let s1 = emit.emit_const(1);
         let a = emit.emit_vbroadcast_force(s1);
-        let _use_a = emit.emit_valu(Opcode::Add, a, a);  // A read at cycle 2
+        let _use_a = emit.emit_valu(Opcode::Add, a, a); // A read at cycle 2
 
         // VReg B: vector defined at cycle 5 (AFTER A's interval [0,2] ends)
         let s2 = emit.emit_const(2);
         let b = emit.emit_vbroadcast_force(s2);
-        let _use_b = emit.emit_valu(Opcode::Add, b, b);  // B read at cycle 7
+        let _use_b = emit.emit_valu(Opcode::Add, b, b); // B read at cycle 7
 
-        emit.ops[0].cycle = 0;   // s1 defined → [0, 0] then read at cycle 0, so [0, 0] (dead after broadcast)
-        emit.ops[1].cycle = 0;   // A defined → [0, 2] (vector)
-        emit.ops[2].cycle = 2;   // use_a = A + A (A last read)
-        emit.ops[3].cycle = 4;   // s2 defined → [4, 4] then read at cycle 5, so [4, 5]
-        emit.ops[4].cycle = 5;   // B defined → [5, 7] (vector)
-        emit.ops[5].cycle = 7;   // use_b = B + B (B last read)
+        emit.ops[0].cycle = 0; // s1 defined → [0, 0] then read at cycle 0, so [0, 0] (dead after broadcast)
+        emit.ops[1].cycle = 0; // A defined → [0, 2] (vector)
+        emit.ops[2].cycle = 2; // use_a = A + A (A last read)
+        emit.ops[3].cycle = 4; // s2 defined → [4, 4] then read at cycle 5, so [4, 5]
+        emit.ops[4].cycle = 5; // B defined → [5, 7] (vector)
+        emit.ops[5].cycle = 7; // use_b = B + B (B last read)
 
         let config = AddressAssignConfig::default();
         let result = assign_addresses(&emit.ops, &config);
@@ -1214,14 +1401,17 @@ mod tests {
         let v1 = VReg::scalar(1);
         let v2 = VReg::scalar(2);
 
-        intervals.insert(v1, LiveInterval::new(0, 5));  // [0, 5] — last read at 5
+        intervals.insert(v1, LiveInterval::new(0, 5)); // [0, 5] — last read at 5
         intervals.insert(v2, LiveInterval::new(5, 10)); // [5, 10] — defined at 5
 
         let peak = compute_peak_liveness(&intervals);
 
         // Adjacent closed intervals at the same-cycle reuse boundary don't conflict.
         // Peak should be 1 (v1 expires before v2 is allocated)
-        assert_eq!(peak, 1, "Adjacent closed intervals [0,5] and [5,10] allow same-cycle reuse; peak = 1");
+        assert_eq!(
+            peak, 1,
+            "Adjacent closed intervals [0,5] and [5,10] allow same-cycle reuse; peak = 1"
+        );
     }
 
     // ========================================================================
@@ -1251,33 +1441,33 @@ mod tests {
         let mut emit = SsaEmitContext::new();
 
         // VReg A: partition address, closed interval [6, 81]
-        let partition_addr = emit.emit_const_force(2055);  // op 0
+        let partition_addr = emit.emit_const_force(2055); // op 0
 
         // VReg B: computation result, closed interval [10, 17]
-        let x = emit.emit_const_force(256);  // op 1
-        let y = emit.emit_const_force(256);  // op 2 (force to avoid CSE)
-        let computation = emit.emit_alu(Opcode::Add, x, y);  // op 3
+        let x = emit.emit_const_force(256); // op 1
+        let y = emit.emit_const_force(256); // op 2 (force to avoid CSE)
+        let computation = emit.emit_alu(Opcode::Add, x, y); // op 3
 
         // VReg B used at cycle 17
-        let _use_b = emit.emit_alu(Opcode::Add, computation, y);  // op 4
+        let _use_b = emit.emit_alu(Opcode::Add, computation, y); // op 4
 
         // VReg A used by vstore at cycle 81
-        let data = emit.emit_vbroadcast_force(x);  // op 5 (force to avoid CSE)
-        emit.emit_vstore(partition_addr, data);  // op 6
+        let data = emit.emit_vbroadcast_force(x); // op 5 (force to avoid CSE)
+        emit.emit_vstore(partition_addr, data); // op 6
 
         // Schedule all ops
         let n_ops = emit.ops.len();
         assert_eq!(n_ops, 7, "Expected 7 ops");
 
-        emit.ops[0].cycle = 6;   // partition_addr
-        emit.ops[1].cycle = 8;   // x
-        emit.ops[2].cycle = 8;   // y
-        emit.ops[3].cycle = 10;  // computation
-        emit.ops[4].cycle = 17;  // use of computation
-        emit.ops[5].cycle = 80;  // data
-        emit.ops[6].cycle = 81;  // vstore
+        emit.ops[0].cycle = 6; // partition_addr
+        emit.ops[1].cycle = 8; // x
+        emit.ops[2].cycle = 8; // y
+        emit.ops[3].cycle = 10; // computation
+        emit.ops[4].cycle = 17; // use of computation
+        emit.ops[5].cycle = 80; // data
+        emit.ops[6].cycle = 81; // vstore
 
-        let intervals = compute_live_intervals(&emit.ops, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None);
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]
@@ -1293,8 +1483,7 @@ mod tests {
 
         // These MUST have different addresses (the bug is if they're the same)
         assert_ne!(
-            result.vreg_to_addr[&partition_addr],
-            result.vreg_to_addr[&computation],
+            result.vreg_to_addr[&partition_addr], result.vreg_to_addr[&computation],
             "BUG: Overlapping VRegs got the same address"
         );
     }
