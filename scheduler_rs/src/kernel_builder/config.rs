@@ -7,8 +7,8 @@ use crate::types::ConstEncodingFlags;
 /// Hash stage definition: (op1, constant, op2, op3, shift)
 /// Each stage computes: result = (val op1 constant) op2 (val op3 shift)
 pub const HASH_STAGES: [(char, i64, char, char, i64); 6] = [
-    ('+', 0x7ED55D16, '+', '<', 12),  // << is '<' in our shorthand
-    ('^', 0xC761C23C, '^', '>', 19),  // >> is '>'
+    ('+', 0x7ED55D16, '+', '<', 12), // << is '<' in our shorthand
+    ('^', 0xC761C23C, '^', '>', 19), // >> is '>'
     ('+', 0x165667B1, '+', '<', 5),
     ('+', 0xD3A2646C, '^', '<', 9),
     ('+', 0xFD7046C5, '+', '<', 3),
@@ -113,12 +113,7 @@ impl Default for KernelConfig {
 
 impl KernelConfig {
     /// Create a new kernel configuration
-    pub fn new(
-        forest_height: usize,
-        n_nodes: usize,
-        batch_size: usize,
-        rounds: usize,
-    ) -> Self {
+    pub fn new(forest_height: usize, n_nodes: usize, batch_size: usize, rounds: usize) -> Self {
         KernelConfig {
             forest_height,
             n_nodes,
@@ -139,7 +134,7 @@ impl KernelConfig {
         if n == 0 {
             0
         } else {
-            (n + 7) / 8  // UNROLL = 8; ceiling division
+            (n + 7) / 8 // UNROLL = 8; ceiling division
         }
     }
 
@@ -173,5 +168,63 @@ pub fn fma_multiplier(stage: usize) -> Option<i64> {
         Some(1 + (1 << shift))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// n_iters must be ceiling(n_groups/8) so 1..7 groups get one iter.
+    #[test]
+    fn test_n_iters_ceiling_small_groups() {
+        let cfg = KernelConfig {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8, // n_groups = 1
+            rounds: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.n_groups(), 1, "batch 8 -> 1 group");
+        assert_eq!(cfg.n_iters(), 1, "1 group must get 1 iter (ceiling)");
+    }
+
+    #[test]
+    fn test_n_iters_ceiling_two_groups() {
+        let cfg = KernelConfig {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 16, // n_groups = 2
+            rounds: 2,
+            ..Default::default()
+        };
+        assert_eq!(cfg.n_groups(), 2);
+        assert_eq!(cfg.n_iters(), 1, "2 groups -> ceil(2/8)=1");
+    }
+
+    #[test]
+    fn test_n_iters_eight_groups() {
+        let cfg = KernelConfig {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 64, // n_groups = 8
+            rounds: 4,
+            ..Default::default()
+        };
+        assert_eq!(cfg.n_groups(), 8);
+        assert_eq!(cfg.n_iters(), 1);
+    }
+
+    #[test]
+    fn test_n_iters_nine_groups() {
+        let cfg = KernelConfig {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 72, // n_groups = 9
+            rounds: 4,
+            ..Default::default()
+        };
+        assert_eq!(cfg.n_groups(), 9);
+        assert_eq!(cfg.n_iters(), 2, "9 groups -> ceil(9/8)=2");
     }
 }

@@ -59,7 +59,13 @@ impl SchedulingDiagnostics {
     pub fn new() -> Self {
         let mut diag = Self::default();
         // Initialize engine maps for all hardware engines
-        for engine in [Engine::Alu, Engine::Valu, Engine::Load, Engine::Store, Engine::Flow] {
+        for engine in [
+            Engine::Alu,
+            Engine::Valu,
+            Engine::Load,
+            Engine::Store,
+            Engine::Flow,
+        ] {
             diag.blocked_by_engine.insert(engine, 0);
             diag.almost_ready_by_engine.insert(engine, 0);
         }
@@ -80,18 +86,12 @@ impl SchedulingDiagnostics {
 
     pub fn record_blocked(&mut self, engine: Engine) {
         self.total_blocked_ops += 1;
-        *self
-            .blocked_by_engine
-            .entry(engine)
-            .or_insert(0) += 1;
+        *self.blocked_by_engine.entry(engine).or_insert(0) += 1;
     }
 
     pub fn record_almost_ready(&mut self, engine: Engine) {
         self.total_almost_ready_ops += 1;
-        *self
-            .almost_ready_by_engine
-            .entry(engine)
-            .or_insert(0) += 1;
+        *self.almost_ready_by_engine.entry(engine).or_insert(0) += 1;
     }
 
     /// Generate a human-readable summary
@@ -158,7 +158,10 @@ impl SchedulingDiagnostics {
             lines.push(String::new());
             lines.push("--- VALU→ALU Shifting ---".to_string());
             lines.push(format!("  Shifted to ALU: {}", self.valu_shifted));
-            lines.push(format!("  VALU slot available: {}", self.valu_slot_available));
+            lines.push(format!(
+                "  VALU slot available: {}",
+                self.valu_slot_available
+            ));
             lines.push(format!("  Not shiftable: {}", self.valu_not_shiftable));
             lines.push(format!("  ALU no capacity: {}", self.valu_alu_no_capacity));
             lines.push(format!(
@@ -231,9 +234,8 @@ impl SharedTempAnalysis {
 
         lines.push(String::new());
         if self.shared_temp_pct > 10.0 {
-            lines.push(
-                "WARNING: High percentage of dependencies through shared temps!".to_string(),
-            );
+            lines
+                .push("WARNING: High percentage of dependencies through shared temps!".to_string());
             lines.push(
                 "         Per-group temps may significantly improve parallelism.".to_string(),
             );

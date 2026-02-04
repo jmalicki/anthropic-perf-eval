@@ -7,11 +7,11 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::SchedulingDiagnostics;
-use arrayvec::ArrayVec;
 use crate::types::{
-    can_convert_valu_to_alu, expand_valu_to_alu_smart, Engine, Op, SlotVal, VLEN,
-    ConstEncoding, PseudoConst, resolve_pseudo_const, MAX_SLOT_SIZE,
+    can_convert_valu_to_alu, expand_valu_to_alu_smart, resolve_pseudo_const, ConstEncoding, Engine,
+    Op, PseudoConst, SlotVal, MAX_SLOT_SIZE, VLEN,
 };
+use arrayvec::ArrayVec;
 
 /// Result of scheduling
 pub struct ScheduleResult {
@@ -215,10 +215,7 @@ pub fn compute_critical_path(ops: &[Op]) -> HashMap<usize, usize> {
     // Build out-degree for reverse topo processing
     let mut out_degree: HashMap<usize, usize> = HashMap::new();
     for op in ops {
-        out_degree.insert(
-            op.id,
-            successors.get(&op.id).map(|s| s.len()).unwrap_or(0),
-        );
+        out_degree.insert(op.id, successors.get(&op.id).map(|s| s.len()).unwrap_or(0));
     }
 
     // Build op lookup
@@ -372,10 +369,7 @@ fn compute_alap(ops: &[Op], total_cycles: i32) -> HashMap<usize, i32> {
     // Build out-degree
     let mut out_degree: HashMap<usize, usize> = HashMap::new();
     for op in ops {
-        out_degree.insert(
-            op.id,
-            consumers.get(&op.id).map(|c| c.len()).unwrap_or(0),
-        );
+        out_degree.insert(op.id, consumers.get(&op.id).map(|c| c.len()).unwrap_or(0));
     }
 
     // Start with sinks (ops with no consumers)
@@ -450,9 +444,7 @@ pub fn compute_proactive_eliminations(ops: &[Op]) -> HashSet<usize> {
         if op.engine == Engine::Valu && op.slot.len() >= 3 {
             if let SlotVal::Str(op_type) = &op.slot[0] {
                 if op_type == "vbroadcast" {
-                    if let (SlotVal::Int(dest), SlotVal::Int(scalar)) =
-                        (&op.slot[1], &op.slot[2])
-                    {
+                    if let (SlotVal::Int(dest), SlotVal::Int(scalar)) = (&op.slot[1], &op.slot[2]) {
                         broadcast_ops.insert(op.id, *scalar);
                         broadcast_dest_to_id.insert(*dest, op.id);
                     }
@@ -514,15 +506,16 @@ pub fn compute_proactive_eliminations(ops: &[Op]) -> HashSet<usize> {
         .collect();
 
     // Estimate minimum cycles for non-shiftable (they MUST use VALU)
-    let min_cycles_for_non_shiftable =
-        (non_shiftable_valu.len() + VALU_SLOTS - 1) / VALU_SLOTS;
+    let min_cycles_for_non_shiftable = (non_shiftable_valu.len() + VALU_SLOTS - 1) / VALU_SLOTS;
 
     // Total VALU capacity for shiftable ops
     let total_valu_capacity = min_cycles_for_non_shiftable * VALU_SLOTS;
     let valu_slots_for_shiftable = total_valu_capacity.saturating_sub(non_shiftable_valu.len());
 
     // Excess shiftable ops that won't fit in VALU
-    let excess_shiftable = shiftable_valu.len().saturating_sub(valu_slots_for_shiftable);
+    let excess_shiftable = shiftable_valu
+        .len()
+        .saturating_sub(valu_slots_for_shiftable);
 
     if excess_shiftable == 0 || shiftable_valu.is_empty() {
         return HashSet::new(); // No shifting needed
@@ -600,12 +593,14 @@ pub fn schedule_greedy_with_diagnostics(
     };
 
     // Compute slack for slack-based priority modes
-    let slack_map: HashMap<usize, i32> =
-        if matches!(priority_mode, PriorityMode::Slack | PriorityMode::LoadEarlySlack) {
-            compute_slack(ops, critical_path)
-        } else {
-            HashMap::new()
-        };
+    let slack_map: HashMap<usize, i32> = if matches!(
+        priority_mode,
+        PriorityMode::Slack | PriorityMode::LoadEarlySlack
+    ) {
+        compute_slack(ops, critical_path)
+    } else {
+        HashMap::new()
+    };
 
     // Compute last-use information for scratch pressure tracking
     compute_last_uses(ops);
@@ -620,11 +615,8 @@ pub fn schedule_greedy_with_diagnostics(
     let mut pressure_tracker = ScratchPressureTracker::new(SCRATCH_BUDGET);
 
     // Build op lookup (by index for mutation)
-    let op_id_to_idx: HashMap<usize, usize> = ops
-        .iter()
-        .enumerate()
-        .map(|(i, op)| (op.id, i))
-        .collect();
+    let op_id_to_idx: HashMap<usize, usize> =
+        ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
 
     // Build consumer map (reverse of dep_ids) - O(1) lookup of who depends on each op
     let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -677,7 +669,6 @@ pub fn schedule_greedy_with_diagnostics(
         }
     }
 
-
     // Track slot usage per cycle
     let mut slot_usage: HashMap<(usize, Engine), usize> = HashMap::new();
 
@@ -716,17 +707,15 @@ pub fn schedule_greedy_with_diagnostics(
     // Track which broadcasts have been eliminated (their consumers MUST shift)
     let mut eliminated_broadcast_ids: HashSet<usize> = HashSet::new();
 
-    let get_slot_usage =
-        |slot_usage: &HashMap<(usize, Engine), usize>, cycle: usize, engine: Engine| -> usize {
-            *slot_usage
-                .get(&(cycle, engine))
-                .unwrap_or(&0)
-        };
+    let get_slot_usage = |slot_usage: &HashMap<(usize, Engine), usize>,
+                          cycle: usize,
+                          engine: Engine|
+     -> usize { *slot_usage.get(&(cycle, engine)).unwrap_or(&0) };
 
     let _can_schedule_n = |slot_usage: &HashMap<(usize, Engine), usize>,
-                          cycle: usize,
-                          engine: Engine,
-                          count: usize|
+                           cycle: usize,
+                           engine: Engine,
+                           count: usize|
      -> bool {
         let usage = get_slot_usage(slot_usage, cycle, engine);
         let limit = engine.slot_limit();
@@ -778,7 +767,8 @@ pub fn schedule_greedy_with_diagnostics(
             for &other_id in ready_set.iter() {
                 let other_idx = *op_id_to_idx.get(&other_id).unwrap();
                 let other_engine = ops[other_idx].engine;
-                let other_cycle = earliest_cycle_fn(ops, other_id, &op_id_to_idx, &expanded_op_cycles);
+                let other_cycle =
+                    earliest_cycle_fn(ops, other_id, &op_id_to_idx, &expanded_op_cycles);
 
                 if get_slot_usage(&slot_usage, other_cycle, other_engine)
                     >= other_engine.slot_limit()
@@ -923,7 +913,9 @@ pub fn schedule_greedy_with_diagnostics(
             let mut max_alu_cycle = cycle;
             for alu_op in &mut alu_ops {
                 let mut alu_cycle = cycle;
-                while get_slot_usage(&slot_usage, alu_cycle, Engine::Alu) >= Engine::Alu.slot_limit() {
+                while get_slot_usage(&slot_usage, alu_cycle, Engine::Alu)
+                    >= Engine::Alu.slot_limit()
+                {
                     alu_cycle += 1;
                 }
                 alu_op.cycle = alu_cycle as i32;
@@ -1200,7 +1192,8 @@ pub fn try_resolve_pseudo_const(
         }
 
         // Resolve to concrete op
-        if let Some(op) = resolve_pseudo_const(pc, encoding, &tracker.value_to_register, next_op_id) {
+        if let Some(op) = resolve_pseudo_const(pc, encoding, &tracker.value_to_register, next_op_id)
+        {
             return PseudoConstResolution::Resolved(op, encoding.clone());
         }
     }
@@ -1286,7 +1279,9 @@ pub fn schedule_with_pseudo_consts(
 
         for (idx, pc) in pending_consts.iter().enumerate() {
             // Find first encoding whose dependencies are satisfied
-            let encoding = pc.encodings.iter()
+            let encoding = pc
+                .encodings
+                .iter()
                 .find(|enc| enc.is_ready(&tracker.available_values))
                 .cloned();
 
@@ -1310,7 +1305,9 @@ pub fn schedule_with_pseudo_consts(
             // Fall back to Load encoding for all remaining
             for pc in &pending_consts {
                 let fallback_enc = ConstEncoding::Load;
-                if let Some(op) = resolve_pseudo_const(pc, &fallback_enc, &value_to_reg, next_const_op_id) {
+                if let Some(op) =
+                    resolve_pseudo_const(pc, &fallback_enc, &value_to_reg, next_const_op_id)
+                {
                     const_ops.push(op);
                     next_const_op_id += 1;
 
@@ -1373,10 +1370,7 @@ pub fn compute_dependencies(ops: &mut [Op]) {
             if let Some(&writer_id) = last_writer.get(addr) {
                 ops[i].dep_ids.insert(writer_id);
             }
-            readers_since_write
-                .entry(*addr)
-                .or_default()
-                .push(op_id);
+            readers_since_write.entry(*addr).or_default().push(op_id);
         }
 
         // WAR + WAW: depend on ops for values we write
@@ -1710,7 +1704,10 @@ pub fn schedule_ssa_greedy(ops: &mut [SsaOp]) -> SsaScheduleResult {
 /// Schedule SSA ops with a custom scratch budget.
 pub fn schedule_ssa_greedy_with_budget(ops: &mut [SsaOp], budget: usize) -> SsaScheduleResult {
     if ops.is_empty() {
-        return SsaScheduleResult { cycles: 0, peak_live: 0 };
+        return SsaScheduleResult {
+            cycles: 0,
+            peak_live: 0,
+        };
     }
 
     // Build VReg -> defining op ID map
@@ -2078,8 +2075,8 @@ mod ssa_tests {
         let v1 = emit.emit_vbroadcast_force(s1); // 8 words
         let v2 = emit.emit_vbroadcast_force(s1); // 8 words
         let v3 = emit.emit_vbroadcast_force(s1); // 8 words
-        // Consumer that uses all vectors - forces them to be live simultaneously
-        // if scheduled naively
+                                                 // Consumer that uses all vectors - forces them to be live simultaneously
+                                                 // if scheduled naively
         let _ = emit.emit_valu(Opcode::Add, v1, v2);
         let _ = emit.emit_valu(Opcode::Add, v2, v3);
 
@@ -2112,7 +2109,10 @@ mod ssa_tests {
         // s1 (1) + v1 (8) = 9 at peak
         // Then v1 dies, v2 (8) is created: 1 + 8 = 9
         // Then v2 dies, v3 (8) is created: 1 + 8 = 9
-        assert!(result.peak_live <= 10, "Peak liveness should be around 9-10");
+        assert!(
+            result.peak_live <= 10,
+            "Peak liveness should be around 9-10"
+        );
     }
 
     /// Test SSA full pipeline produces valid concrete Ops.
@@ -2153,7 +2153,10 @@ mod ssa_tests {
         for (&vreg, &addr) in &result.vreg_to_addr {
             assert!(addr >= 0, "Address should be non-negative");
             if vreg.is_vector() {
-                assert!(addr + 7 <= result.max_addr, "Vector should fit within allocation");
+                assert!(
+                    addr + 7 <= result.max_addr,
+                    "Vector should fit within allocation"
+                );
             }
         }
 
@@ -2161,11 +2164,19 @@ mod ssa_tests {
         for op in &result.ops {
             // Loads have no reads (or immediate), everything else should have reads
             if op.engine != Engine::Load {
-                assert!(!op.reads.is_empty(), "Non-load ops should have reads: {:?}", op);
+                assert!(
+                    !op.reads.is_empty(),
+                    "Non-load ops should have reads: {:?}",
+                    op
+                );
             }
             // All ops except stores should have writes
             if op.engine != Engine::Store {
-                assert!(!op.writes.is_empty(), "Non-store ops should have writes: {:?}", op);
+                assert!(
+                    !op.writes.is_empty(),
+                    "Non-store ops should have writes: {:?}",
+                    op
+                );
             }
         }
     }
@@ -2184,7 +2195,9 @@ mod ssa_tests {
         let result = schedule_ssa_full(&mut emit.ops).expect("Should succeed");
 
         // Find vector VRegs and verify they got 8-word allocations
-        let vector_vregs: Vec<_> = result.vreg_to_addr.iter()
+        let vector_vregs: Vec<_> = result
+            .vreg_to_addr
+            .iter()
             .filter(|(vreg, _)| vreg.is_vector())
             .collect();
 
@@ -2222,7 +2235,12 @@ mod ssa_tests {
 
         // Schedule with regular greedy scheduler
         let critical_path = compute_critical_path(&lowered_ops);
-        let greedy_result = schedule_greedy(&mut lowered_ops, &critical_path, false, PriorityMode::CriticalPath);
+        let greedy_result = schedule_greedy(
+            &mut lowered_ops,
+            &critical_path,
+            false,
+            PriorityMode::CriticalPath,
+        );
 
         // Should produce valid schedule
         assert!(greedy_result.cycles > 0, "Should produce valid schedule");
@@ -2237,7 +2255,8 @@ mod ssa_tests {
         assert!(
             greedy_result.cycles <= ssa_result.cycles + 2,
             "Greedy on lowered ops ({}) should be close to SSA result ({})",
-            greedy_result.cycles, ssa_result.cycles
+            greedy_result.cycles,
+            ssa_result.cycles
         );
     }
 
@@ -2267,7 +2286,7 @@ mod ssa_tests {
         let mut emit = SsaEmitContext::new();
         let v0 = emit.emit_const(5);
         let v1 = emit.emit_alu(Opcode::Add, v0, v0);
-        emit.emit_store_imm(0, v1);  // Store to address 0, consumes v1
+        emit.emit_store_imm(0, v1); // Store to address 0, consumes v1
 
         // Schedule with budget of 1 (sufficient with same-cycle reuse)
         let result = schedule_ssa_greedy_with_budget(&mut emit.ops, 1);
@@ -2289,7 +2308,7 @@ mod ssa_tests {
         // Address assignment needs budget of 1 with same-cycle reuse
         let config = AddressAssignConfig {
             budget: 1,
-            start_addr: 1,  // Reserve 0 for ZERO_REG
+            start_addr: 1, // Reserve 0 for ZERO_REG
             ..Default::default()
         };
         let assign_result = assign_addresses(&emit.ops, &config);
@@ -2409,7 +2428,13 @@ mod pseudo_const_tests {
 
         match try_resolve_pseudo_const(&pc, 0, &tracker, &slot_usage_full_load, 1) {
             PseudoConstResolution::Resolved(op, encoding) => {
-                assert_eq!(encoding, ConstEncoding::Add { a_value: 2, b_value: 2 });
+                assert_eq!(
+                    encoding,
+                    ConstEncoding::Add {
+                        a_value: 2,
+                        b_value: 2
+                    }
+                );
                 assert_eq!(op.engine, Engine::Alu);
             }
             _ => panic!("Should resolve to Add"),

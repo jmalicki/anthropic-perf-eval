@@ -150,7 +150,10 @@ pub fn can_derive(value: i64, available: &HashSet<i64>) -> Option<ConstantGenera
             if ratio > 0 && (ratio & (ratio - 1)) == 0 {
                 let shift = (ratio as f64).log2() as u8;
                 if shift <= 31 {
-                    return Some(ConstantGeneration::Shift { src: a, amount: shift });
+                    return Some(ConstantGeneration::Shift {
+                        src: a,
+                        amount: shift,
+                    });
                 }
             }
         }
@@ -343,7 +346,9 @@ pub fn emit_constant_generation_ops(
                     SlotVal::Str("const".to_string()),
                     SlotVal::Int(dest),
                     SlotVal::Int(value),
-                ].into_iter().collect(),
+                ]
+                .into_iter()
+                .collect(),
             ),
             ConstantGeneration::XorSelf { source } => {
                 let src_reg = value_to_register.get(source).copied().unwrap_or(*source);
@@ -354,7 +359,9 @@ pub fn emit_constant_generation_ops(
                         SlotVal::Int(dest),
                         SlotVal::Int(src_reg),
                         SlotVal::Int(src_reg),
-                    ].into_iter().collect(),
+                    ]
+                    .into_iter()
+                    .collect(),
                 )
             }
             ConstantGeneration::Add { src1, src2 } => {
@@ -367,7 +374,9 @@ pub fn emit_constant_generation_ops(
                         SlotVal::Int(dest),
                         SlotVal::Int(r1),
                         SlotVal::Int(r2),
-                    ].into_iter().collect(),
+                    ]
+                    .into_iter()
+                    .collect(),
                 )
             }
             ConstantGeneration::Mul { src1, src2 } => {
@@ -380,7 +389,9 @@ pub fn emit_constant_generation_ops(
                         SlotVal::Int(dest),
                         SlotVal::Int(r1),
                         SlotVal::Int(r2),
-                    ].into_iter().collect(),
+                    ]
+                    .into_iter()
+                    .collect(),
                 )
             }
             ConstantGeneration::Shift { src, amount } => {
@@ -397,7 +408,9 @@ pub fn emit_constant_generation_ops(
                             SlotVal::Int(dest),
                             SlotVal::Int(r1),
                             SlotVal::Int(mult_reg),
-                        ].into_iter().collect(),
+                        ]
+                        .into_iter()
+                        .collect(),
                     )
                 } else {
                     // Fall back to direct load
@@ -407,7 +420,9 @@ pub fn emit_constant_generation_ops(
                             SlotVal::Str("const".to_string()),
                             SlotVal::Int(dest),
                             SlotVal::Int(value),
-                        ].into_iter().collect(),
+                        ]
+                        .into_iter()
+                        .collect(),
                     )
                 }
             }

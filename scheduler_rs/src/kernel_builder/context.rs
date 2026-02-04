@@ -20,93 +20,93 @@ pub struct ScratchContext {
     // =========================================================================
     // Pointers (loaded from memory at init)
     // =========================================================================
-    pub forest_p: i64,      // Pointer to forest data
-    pub idx_p: i64,         // Pointer to indices
-    pub val_p: i64,         // Pointer to values
-    pub n_nodes_s: i64,     // Number of nodes (scalar)
+    pub forest_p: i64,  // Pointer to forest data
+    pub idx_p: i64,     // Pointer to indices
+    pub val_p: i64,     // Pointer to values
+    pub n_nodes_s: i64, // Number of nodes (scalar)
 
     // =========================================================================
     // Scalar Temporaries
     // =========================================================================
-    pub st: [i64; 16],      // General-purpose scalar temps
-    pub c: [i64; 16],       // Constants 0-15
+    pub st: [i64; 16], // General-purpose scalar temps
+    pub c: [i64; 16],  // Constants 0-15
 
     // =========================================================================
     // Hash Constants
     // =========================================================================
-    pub hc: [i64; 6],       // Hash constants (scalar)
-    pub hs: [i64; 6],       // Hash shifts (scalar)
+    pub hc: [i64; 6], // Hash constants (scalar)
+    pub hs: [i64; 6], // Hash shifts (scalar)
 
     // =========================================================================
     // Tree Cache (depths 0-2)
     // =========================================================================
-    pub tc: [i64; 7],       // tree[0..6] cached values
-    pub tc_addr: [i64; 7],  // Address registers for parallel tree cache load
-    pub td_1: i64,          // tree[1] - tree[2] (delta for depth 1)
-    pub td_4: i64,          // tree[4] - tree[3] (delta for depth 2)
-    pub td_5: i64,          // tree[5] - tree[3]
-    pub td_6: i64,          // tree[6] - tree[3]
+    pub tc: [i64; 7],      // tree[0..6] cached values
+    pub tc_addr: [i64; 7], // Address registers for parallel tree cache load
+    pub td_1: i64,         // tree[1] - tree[2] (delta for depth 1)
+    pub td_4: i64,         // tree[4] - tree[3] (delta for depth 2)
+    pub td_5: i64,         // tree[5] - tree[3]
+    pub td_6: i64,         // tree[6] - tree[3]
 
     // =========================================================================
     // Depth 3 Cache
     // =========================================================================
-    pub tc_r3: [i64; 8],    // tree[7..14] for depth 3 VALU selection
+    pub tc_r3: [i64; 8],      // tree[7..14] for depth 3 VALU selection
     pub tc_r3_addr: [i64; 8], // Address registers for parallel depth 3 cache load
-    pub c_r3: [i64; 8],     // Constants 7-14
+    pub c_r3: [i64; 8],       // Constants 7-14
 
     // =========================================================================
     // Stage 5 XOR Optimization
     // =========================================================================
-    pub stage5_xor_s: i64,  // 0xB55A4F09 scalar
+    pub stage5_xor_s: i64, // 0xB55A4F09 scalar
 
     // =========================================================================
     // Per-Group Vectors
     // These are dynamically sized based on n_groups
     // =========================================================================
-    pub all_idx: Vec<i64>,  // [n_groups] - base addresses for idx vectors
-    pub all_val: Vec<i64>,  // [n_groups] - base addresses for val vectors
+    pub all_idx: Vec<i64>,   // [n_groups] - base addresses for idx vectors
+    pub all_val: Vec<i64>,   // [n_groups] - base addresses for val vectors
     pub v_nv: Vec<Vec<i64>>, // [n_iters][UNROLL] - tree value vectors
     pub v_t: Vec<Vec<i64>>,  // [n_iters][UNROLL] - temp vectors
 
     // =========================================================================
     // Vector Constants
     // =========================================================================
-    pub v_0: i64,           // Vector of 0s
-    pub v_1: i64,           // Vector of 1s
-    pub v_2: i64,           // Vector of 2s
-    pub v_nn: i64,          // Vector of n_nodes
-    pub v_const: [i64; 8],  // Vector constants 0-7
+    pub v_0: i64,          // Vector of 0s
+    pub v_1: i64,          // Vector of 1s
+    pub v_2: i64,          // Vector of 2s
+    pub v_nn: i64,         // Vector of n_nodes
+    pub v_const: [i64; 8], // Vector constants 0-7
 
     // =========================================================================
     // Vector Hash Constants
     // =========================================================================
-    pub v_hc: [i64; 6],     // Vector hash constants
-    pub v_hs: [i64; 6],     // Vector hash shifts
+    pub v_hc: [i64; 6], // Vector hash constants
+    pub v_hs: [i64; 6], // Vector hash shifts
 
     // =========================================================================
     // Vector Tree Cache
     // =========================================================================
-    pub v_td_1: i64,        // Vector td_1
-    pub v_td_4: i64,        // Vector td_4
-    pub v_td_5: i64,        // Vector td_5
-    pub v_td_6: i64,        // Vector td_6
-    pub v_tc2: i64,         // Vector tc[2]
-    pub v_tc3: i64,         // Vector tc[3]
+    pub v_td_1: i64, // Vector td_1
+    pub v_td_4: i64, // Vector td_4
+    pub v_td_5: i64, // Vector td_5
+    pub v_td_6: i64, // Vector td_6
+    pub v_tc2: i64,  // Vector tc[2]
+    pub v_tc3: i64,  // Vector tc[3]
 
     // =========================================================================
     // Depth 3 Vectors
     // =========================================================================
-    pub v_tc_r3: [i64; 8],  // Vector broadcasts of tc_r3
+    pub v_tc_r3: [i64; 8],    // Vector broadcasts of tc_r3
     pub v_const_r3: [i64; 8], // Vector broadcasts of c_r3
 
     // =========================================================================
     // Depth 3 Tree-Reduce Deltas
     // =========================================================================
     // Scalar deltas: d01 = tree[8]-tree[7], d23 = tree[10]-tree[9], etc.
-    pub td_r3_01: i64,  // tree[8] - tree[7]
-    pub td_r3_23: i64,  // tree[10] - tree[9]
-    pub td_r3_45: i64,  // tree[12] - tree[11]
-    pub td_r3_67: i64,  // tree[14] - tree[13]
+    pub td_r3_01: i64, // tree[8] - tree[7]
+    pub td_r3_23: i64, // tree[10] - tree[9]
+    pub td_r3_45: i64, // tree[12] - tree[11]
+    pub td_r3_67: i64, // tree[14] - tree[13]
 
     // Vector broadcasts of tree-reduce deltas
     pub v_td_r3_01: i64,
@@ -116,10 +116,10 @@ pub struct ScratchContext {
 
     // Per-group scratch registers for tree-reduce (allocated like v_t)
     // These are needed to avoid inter-group dependencies when using tree-reduce
-    pub v_tr_s1: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit0, then p67
-    pub v_tr_s2: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit1
-    pub v_tr_s3: Vec<Vec<i64>>,  // [n_iters][UNROLL] - bit2
-    pub v_tr_s4: Vec<Vec<i64>>,  // [n_iters][UNROLL] - p45, then q47
+    pub v_tr_s1: Vec<Vec<i64>>, // [n_iters][UNROLL] - bit0, then p67
+    pub v_tr_s2: Vec<Vec<i64>>, // [n_iters][UNROLL] - bit1
+    pub v_tr_s3: Vec<Vec<i64>>, // [n_iters][UNROLL] - bit2
+    pub v_tr_s4: Vec<Vec<i64>>, // [n_iters][UNROLL] - p45, then q47
 
     // =========================================================================
     // Stage 5 XOR Vector
@@ -129,20 +129,20 @@ pub struct ScratchContext {
     // =========================================================================
     // FMA Multipliers for Hash Optimization
     // =========================================================================
-    pub hash_fma_mult: [Option<i64>; 6],  // Pre-computed FMA multipliers
-    pub hash_fma_mult_s: HashMap<usize, i64>,  // stage -> scalar address
-    pub v_hash_mult: HashMap<usize, i64>,      // stage -> vector address
+    pub hash_fma_mult: [Option<i64>; 6], // Pre-computed FMA multipliers
+    pub hash_fma_mult_s: HashMap<usize, i64>, // stage -> scalar address
+    pub v_hash_mult: HashMap<usize, i64>, // stage -> vector address
 
     // =========================================================================
     // Partition-specific (TickTock)
     // =========================================================================
-    pub extra_room_p: i64,           // Pointer to extra_room memory
-    pub partition_idx_offset: i64,   // Offset to idx section in partition buffer
-    pub partition_val_offset: i64,   // Offset to val section in partition buffer
-    pub tree_cache_scalars: i64,     // Scalar storage for sorted vload cache
-    pub tree_cache_base_s: i64,      // Base index of cache
-    pub v_cache_base: i64,           // Vector broadcast of cache base
-    pub v_tree_temp: i64,            // Temp vector for tree operations
+    pub extra_room_p: i64,         // Pointer to extra_room memory
+    pub partition_idx_offset: i64, // Offset to idx section in partition buffer
+    pub partition_val_offset: i64, // Offset to val section in partition buffer
+    pub tree_cache_scalars: i64,   // Scalar storage for sorted vload cache
+    pub tree_cache_base_s: i64,    // Base index of cache
+    pub v_cache_base: i64,         // Vector broadcast of cache base
+    pub v_tree_temp: i64,          // Temp vector for tree operations
 
     // =========================================================================
     // Lazy Partition Buffers (for sorted vload tree access)
@@ -150,21 +150,21 @@ pub struct ScratchContext {
     /// Double-buffer base addresses in extra_room
     /// Buffer A: indices at offset 0, values at offset 256
     /// Buffer B: indices at offset 512, values at offset 768
-    pub part_buffer_a_idx: i64,      // Base address for buffer A indices
-    pub part_buffer_a_val: i64,      // Base address for buffer A values
-    pub part_buffer_b_idx: i64,      // Base address for buffer B indices
-    pub part_buffer_b_val: i64,      // Base address for buffer B values
+    pub part_buffer_a_idx: i64, // Base address for buffer A indices
+    pub part_buffer_a_val: i64, // Base address for buffer A values
+    pub part_buffer_b_idx: i64, // Base address for buffer B indices
+    pub part_buffer_b_val: i64, // Base address for buffer B values
 
     /// Partition counters (for stable partition algorithm)
-    pub part_left_count: i64,        // Count of items going to left partition
-    pub part_right_count: i64,       // Count of items going to right partition
+    pub part_left_count: i64, // Count of items going to left partition
+    pub part_right_count: i64, // Count of items going to right partition
 
     /// Constants for partition operations
-    pub part_mask_11bit: i64,        // 0x7FF for index extraction (if packed)
-    pub part_batch_half: i64,        // 128 (batch_size / 2)
+    pub part_mask_11bit: i64, // 0x7FF for index extraction (if packed)
+    pub part_batch_half: i64, // 128 (batch_size / 2)
 
     /// Vector temps for partition operations
-    pub v_part_temp: [i64; 4],       // Temp vectors for partition computation
+    pub v_part_temp: [i64; 4], // Temp vectors for partition computation
 
     // =========================================================================
     // Partition Prefix Sum Support

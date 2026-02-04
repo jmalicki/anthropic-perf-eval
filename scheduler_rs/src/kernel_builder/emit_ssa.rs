@@ -8,7 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, SymmetryHint, VarSource, VarType, VReg};
+use crate::types::{
+    ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, SymmetryHint, VReg,
+    VarSource, VarType,
+};
 
 /// Tracks alternative implementations for a constant.
 ///
@@ -281,7 +284,10 @@ impl SsaEmitContext {
                 "SSA VIOLATION: VReg {:?} already defined by op id={}, \
                  now being redefined by op id={} at {:?}. \
                  This should not happen - emit() should skip already-defined VRegs.",
-                vreg, old_id, op_id, std::panic::Location::caller()
+                vreg,
+                old_id,
+                op_id,
+                std::panic::Location::caller()
             );
         }
         self.vreg_def.insert(vreg, op_id);
@@ -614,7 +620,6 @@ impl SsaEmitContext {
     /// constant 0 will automatically use the reserved VReg.
     #[track_caller]
     pub fn emit_const_choice(&mut self, value: i64) -> VReg {
-
         // CSE: check if already emitted
         if let Some(&existing) = self.const_cache.get(&value) {
             return existing;
@@ -623,10 +628,7 @@ impl SsaEmitContext {
         let dest = self.fresh_scalar();
 
         // Build alternatives for the scheduler
-        let alternatives = vec![
-            ConstEncoding::Load,
-            ConstEncoding::AddImm { value },
-        ];
+        let alternatives = vec![ConstEncoding::Load, ConstEncoding::AddImm { value }];
 
         let mut op = SsaOp::new(
             0,
@@ -835,13 +837,16 @@ impl SsaEmitContext {
     pub fn emit_select_choice(&mut self, cond: VReg, true_val: VReg, false_val: VReg) -> VReg {
         assert!(cond.is_vector(), "SelectChoice cond must be vector");
         assert!(true_val.is_vector(), "SelectChoice true_val must be vector");
-        assert!(false_val.is_vector(), "SelectChoice false_val must be vector");
+        assert!(
+            false_val.is_vector(),
+            "SelectChoice false_val must be vector"
+        );
 
         let dest = self.fresh_vector();
-        
+
         // Detect zero case: if false_val is constant 0, subtraction is not needed
         let needs_subtraction = self.vreg_constants.get(&false_val) != Some(&0);
-        
+
         // Allocate sub_temp_vreg for FMA path without delta
         // This holds the result of (true_val - false_val) if FMA path is chosen
         // The VReg is allocated regardless of scheduler choice - if vselect is chosen,
@@ -851,7 +856,7 @@ impl SsaEmitContext {
         } else {
             None
         };
-        
+
         let mut op = SsaOp::new(
             0,
             Engine::Flow, // Default engine (will be overridden by scheduler choice)
@@ -866,7 +871,7 @@ impl SsaEmitContext {
         op.needs_subtraction = needs_subtraction;
         op.delta_vreg = None; // No precomputed delta
         op.sub_temp_vreg = sub_temp_vreg;
-        
+
         self.emit(op);
         dest
     }
@@ -887,12 +892,12 @@ impl SsaEmitContext {
         // Compute true_val = base + delta for operands (needed for dependency tracking and vselect path)
         // This is computed once per SelectChoice, not globally upfront
         let true_val = self.emit_valu(Opcode::Add, base, delta);
-        
+
         let dest = self.fresh_vector();
-        
+
         // Detect zero case: if base is constant 0, subtraction is not needed
         let needs_subtraction = self.vreg_constants.get(&base) != Some(&0);
-        
+
         let mut op = SsaOp::new(
             0,
             Engine::Flow, // Default engine (will be overridden by scheduler choice)
@@ -906,7 +911,7 @@ impl SsaEmitContext {
         );
         op.needs_subtraction = needs_subtraction;
         op.delta_vreg = Some(delta); // Store precomputed delta for lowering
-        
+
         self.emit(op);
         dest
     }
@@ -1064,7 +1069,11 @@ pub fn eliminate_ssa_dead_code(
     zero_vreg: Option<VReg>,
 ) -> (Vec<SsaOp>, HashMap<VReg, usize>, Vec<ConstAlternative>) {
     if ops.is_empty() {
-        return (ops, std::mem::take(vreg_def), std::mem::take(const_alternatives));
+        return (
+            ops,
+            std::mem::take(vreg_def),
+            std::mem::take(const_alternatives),
+        );
     }
 
     let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
@@ -1283,13 +1292,12 @@ mod tests {
         let mut const_alternatives = emit.take_const_alternatives();
         let ops = emit.take_ops();
         let n_before = ops.len();
-        let (new_ops, _new_vreg_def, _new_alts) = eliminate_ssa_dead_code(
-            ops,
-            &mut vreg_def,
-            &mut const_alternatives,
-            emit.zero_vreg,
+        let (new_ops, _new_vreg_def, _new_alts) =
+            eliminate_ssa_dead_code(ops, &mut vreg_def, &mut const_alternatives, emit.zero_vreg);
+        assert!(
+            new_ops.len() < n_before,
+            "DCE should remove at least the dead const(99) op"
         );
-        assert!(new_ops.len() < n_before, "DCE should remove at least the dead const(99) op");
         let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
         assert!(!has_dead_const, "const(99) should be removed by DCE");
     }
@@ -1543,31 +1551,52 @@ mod tests {
         let mut emit = SsaEmitContext::new();
 
         // "Round 1"
-        let v1 = emit.emit_const(5);  // op 0
-        let v2 = emit.emit_const(6);  // op 1
-        let _v3 = emit.emit_alu(Opcode::Add, v1, v2);  // op 2
+        let v1 = emit.emit_const(5); // op 0
+        let v2 = emit.emit_const(6); // op 1
+        let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 2
 
         // Barrier
-        emit.emit_barrier();  // op 3
+        emit.emit_barrier(); // op 3
 
         // "Round 2"
-        let v4 = emit.emit_const(7);  // op 4
-        let _v5 = emit.emit_alu(Opcode::Mul, v4, v1);  // op 5 (uses v1 from round 1)
+        let v4 = emit.emit_const(7); // op 4
+        let _v5 = emit.emit_alu(Opcode::Mul, v4, v1); // op 5 (uses v1 from round 1)
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Barrier (op 3) should depend on ops 0, 1, 2
-        assert!(emit.ops[3].dep_ids.contains(&0), "Barrier should depend on op 0");
-        assert!(emit.ops[3].dep_ids.contains(&1), "Barrier should depend on op 1");
-        assert!(emit.ops[3].dep_ids.contains(&2), "Barrier should depend on op 2");
+        assert!(
+            emit.ops[3].dep_ids.contains(&0),
+            "Barrier should depend on op 0"
+        );
+        assert!(
+            emit.ops[3].dep_ids.contains(&1),
+            "Barrier should depend on op 1"
+        );
+        assert!(
+            emit.ops[3].dep_ids.contains(&2),
+            "Barrier should depend on op 2"
+        );
 
         // Ops after barrier should depend on it
-        assert!(emit.ops[4].dep_ids.contains(&3), "Op 4 should depend on barrier");
-        assert!(emit.ops[5].dep_ids.contains(&3), "Op 5 should depend on barrier");
+        assert!(
+            emit.ops[4].dep_ids.contains(&3),
+            "Op 4 should depend on barrier"
+        );
+        assert!(
+            emit.ops[5].dep_ids.contains(&3),
+            "Op 5 should depend on barrier"
+        );
 
         // Op 5 should also have RAW dep on op 0 (v1) and op 4 (v4)
-        assert!(emit.ops[5].dep_ids.contains(&0), "Op 5 should have RAW dep on op 0 (v1)");
-        assert!(emit.ops[5].dep_ids.contains(&4), "Op 5 should have RAW dep on op 4 (v4)");
+        assert!(
+            emit.ops[5].dep_ids.contains(&0),
+            "Op 5 should have RAW dep on op 0 (v1)"
+        );
+        assert!(
+            emit.ops[5].dep_ids.contains(&4),
+            "Op 5 should have RAW dep on op 4 (v4)"
+        );
     }
 
     #[test]
@@ -1575,41 +1604,65 @@ mod tests {
         // Test multiple barriers in sequence with chained dependencies
         let mut emit = SsaEmitContext::new();
 
-        let v1 = emit.emit_const(1);  // op 0
-        emit.emit_barrier();  // op 1
-        let v2 = emit.emit_const(2);  // op 2
-        emit.emit_barrier();  // op 3
-        let _v3 = emit.emit_alu(Opcode::Add, v1, v2);  // op 4
+        let v1 = emit.emit_const(1); // op 0
+        emit.emit_barrier(); // op 1
+        let v2 = emit.emit_const(2); // op 2
+        emit.emit_barrier(); // op 3
+        let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 4
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // First barrier depends on op 0 (its section)
-        assert!(emit.ops[1].dep_ids.contains(&0), "First barrier should depend on op 0");
+        assert!(
+            emit.ops[1].dep_ids.contains(&0),
+            "First barrier should depend on op 0"
+        );
 
         // Op 2 depends on first barrier
-        assert!(emit.ops[2].dep_ids.contains(&1), "Op 2 should depend on first barrier");
+        assert!(
+            emit.ops[2].dep_ids.contains(&1),
+            "Op 2 should depend on first barrier"
+        );
 
         // Second barrier depends on:
         // - op 2 (its section - ops between barrier 1 and barrier 3)
         // - barrier 1 (previous barrier - chaining)
-        assert!(emit.ops[3].dep_ids.contains(&2), "Second barrier should depend on op 2");
-        assert!(emit.ops[3].dep_ids.contains(&1), "Second barrier should depend on first barrier (chain)");
+        assert!(
+            emit.ops[3].dep_ids.contains(&2),
+            "Second barrier should depend on op 2"
+        );
+        assert!(
+            emit.ops[3].dep_ids.contains(&1),
+            "Second barrier should depend on first barrier (chain)"
+        );
         // Second barrier does NOT directly depend on op 0 (that's handled by the chain)
-        assert!(!emit.ops[3].dep_ids.contains(&0), "Second barrier should NOT directly depend on op 0 (chained via barrier 1)");
+        assert!(
+            !emit.ops[3].dep_ids.contains(&0),
+            "Second barrier should NOT directly depend on op 0 (chained via barrier 1)"
+        );
 
         // Op 4 depends on second barrier (and has RAW deps on v1, v2)
-        assert!(emit.ops[4].dep_ids.contains(&3), "Op 4 should depend on second barrier");
-        assert!(emit.ops[4].dep_ids.contains(&0), "Op 4 should have RAW dep on v1");
-        assert!(emit.ops[4].dep_ids.contains(&2), "Op 4 should have RAW dep on v2");
+        assert!(
+            emit.ops[4].dep_ids.contains(&3),
+            "Op 4 should depend on second barrier"
+        );
+        assert!(
+            emit.ops[4].dep_ids.contains(&0),
+            "Op 4 should have RAW dep on v1"
+        );
+        assert!(
+            emit.ops[4].dep_ids.contains(&2),
+            "Op 4 should have RAW dep on v2"
+        );
     }
 
     #[test]
     fn test_emit_const_choice() {
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit a ConstChoice constant
         let v1 = emit.emit_const_choice(42);
-        
+
         assert_eq!(emit.ops.len(), 1);
         let op = &emit.ops[0];
         assert_eq!(op.opcode, Opcode::ConstChoice);
@@ -1617,11 +1670,14 @@ mod tests {
         assert_eq!(op.dest, Some(v1));
         assert_eq!(op.produces_constant, Some(42));
         assert!(op.const_alternatives.is_some());
-        
+
         let alternatives = op.const_alternatives.as_ref().unwrap();
         assert_eq!(alternatives.len(), 2);
         assert!(matches!(alternatives[0], ConstEncoding::Load));
-        assert!(matches!(alternatives[1], ConstEncoding::AddImm { value: 42 }));
+        assert!(matches!(
+            alternatives[1],
+            ConstEncoding::AddImm { value: 42 }
+        ));
     }
 
     #[test]
@@ -1639,11 +1695,11 @@ mod tests {
     #[test]
     fn test_emit_const_choice_cse() {
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit same constant twice - should reuse VReg
         let v1 = emit.emit_const_choice(100);
         let v2 = emit.emit_const_choice(100);
-        
+
         assert_eq!(v1, v2, "CSE should return same VReg");
         assert_eq!(emit.ops.len(), 1, "Should only emit one op");
     }
@@ -1656,55 +1712,73 @@ mod tests {
     fn test_emit_const_creates_load_only_without_zero_vreg() {
         // Without zero_vreg set, emit_const should only create Load op (no AddImm alternative)
         let mut emit = SsaEmitContext::new();
-        
+
         let v1 = emit.emit_const(42);
-        
+
         // Should only have 1 op (Load), no AddImm alternative
-        assert_eq!(emit.ops.len(), 1, "Without zero_vreg, should only emit Load op");
+        assert_eq!(
+            emit.ops.len(),
+            1,
+            "Without zero_vreg, should only emit Load op"
+        );
         assert_eq!(emit.ops[0].opcode, Opcode::Const);
         assert_eq!(emit.ops[0].engine, Engine::Load);
         assert_eq!(emit.ops[0].dest, Some(v1));
         assert_eq!(emit.ops[0].produces_constant, Some(42));
-        
+
         // No const_alternatives should be tracked
-        assert!(emit.const_alternatives.is_empty(), 
-            "No alternatives without zero_vreg");
+        assert!(
+            emit.const_alternatives.is_empty(),
+            "No alternatives without zero_vreg"
+        );
     }
 
     #[test]
     fn test_emit_const_creates_load_and_addimm_with_zero_vreg() {
         // With zero_vreg set, emit_const should create BOTH Load and AddImm ops
         let mut emit = SsaEmitContext::new();
-        
+
         // First emit zero constant to set up zero_vreg
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         // Now emit non-zero constant
         let v1 = emit.emit_const(42);
-        
+
         // Should have 3 ops: const(0), const(42), add_imm(42)
-        assert_eq!(emit.ops.len(), 3, "Should emit Load(0), Load(42), AddImm(42)");
-        
+        assert_eq!(
+            emit.ops.len(),
+            3,
+            "Should emit Load(0), Load(42), AddImm(42)"
+        );
+
         // Op 0: const(0)
         assert_eq!(emit.ops[0].opcode, Opcode::Const);
         assert_eq!(emit.ops[0].engine, Engine::Load);
         assert_eq!(emit.ops[0].produces_constant, Some(0));
-        
+
         // Op 1: const(42) - Load alternative
         assert_eq!(emit.ops[1].opcode, Opcode::Const);
         assert_eq!(emit.ops[1].engine, Engine::Load);
         assert_eq!(emit.ops[1].dest, Some(v1));
         assert_eq!(emit.ops[1].produces_constant, Some(42));
-        
+
         // Op 2: add_imm(42) - AddImm alternative (same dest VReg!)
         assert_eq!(emit.ops[2].opcode, Opcode::AddImm);
         assert_eq!(emit.ops[2].engine, Engine::Flow);
-        assert_eq!(emit.ops[2].dest, Some(v1), "AddImm should have same dest as Load");
+        assert_eq!(
+            emit.ops[2].dest,
+            Some(v1),
+            "AddImm should have same dest as Load"
+        );
         assert_eq!(emit.ops[2].produces_constant, Some(42));
-        
+
         // const_alternatives should track the pair
-        assert_eq!(emit.const_alternatives.len(), 1, "Should have 1 alternative pair");
+        assert_eq!(
+            emit.const_alternatives.len(),
+            1,
+            "Should have 1 alternative pair"
+        );
         assert_eq!(emit.const_alternatives[0].value, 42);
         assert_eq!(emit.const_alternatives[0].load_op_idx, 1);
         assert_eq!(emit.const_alternatives[0].add_imm_op_idx, 2);
@@ -1716,44 +1790,48 @@ mod tests {
         // emit_const(0) should NOT create AddImm alternative (even with zero_vreg set)
         // because AddImm(0) would be circular (reads zero to produce zero)
         let mut emit = SsaEmitContext::new();
-        
+
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         // Emit zero again (should just use CSE)
         let zero2 = emit.emit_const(0);
-        
+
         assert_eq!(zero, zero2, "CSE should return same VReg");
         assert_eq!(emit.ops.len(), 1, "Should only have one op for const(0)");
         assert_eq!(emit.ops[0].opcode, Opcode::Const);
-        assert!(emit.const_alternatives.is_empty(), 
-            "Zero constant should not have AddImm alternative");
+        assert!(
+            emit.const_alternatives.is_empty(),
+            "Zero constant should not have AddImm alternative"
+        );
     }
 
     #[test]
     fn test_emit_const_multiple_creates_multiple_addimm_ops() {
         // Each non-zero constant gets its own AddImm op
         let mut emit = SsaEmitContext::new();
-        
+
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         let v1 = emit.emit_const(10);
         let v2 = emit.emit_const(20);
         let v3 = emit.emit_const(30);
-        
+
         // Should have 7 ops: const(0), const(10), add_imm(10), const(20), add_imm(20), const(30), add_imm(30)
         assert_eq!(emit.ops.len(), 7, "Each non-zero const gets Load + AddImm");
-        
+
         // Verify all AddImm ops have Engine::Flow
-        let addimm_ops: Vec<_> = emit.ops.iter()
+        let addimm_ops: Vec<_> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::AddImm)
             .collect();
         assert_eq!(addimm_ops.len(), 3, "Should have 3 AddImm ops");
         for op in &addimm_ops {
             assert_eq!(op.engine, Engine::Flow, "AddImm ops must have Engine::Flow");
         }
-        
+
         // Verify const_alternatives tracking
         assert_eq!(emit.const_alternatives.len(), 3);
         let values: Vec<i64> = emit.const_alternatives.iter().map(|a| a.value).collect();
@@ -1766,16 +1844,16 @@ mod tests {
     fn test_emit_const_addimm_depends_on_zero() {
         // AddImm ops should have dependency on zero VReg
         let mut emit = SsaEmitContext::new();
-        
+
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         let _v1 = emit.emit_const(42);
-        
+
         // The AddImm op (index 2) should read from zero VReg
         let addimm_op = &emit.ops[2];
         assert_eq!(addimm_op.opcode, Opcode::AddImm);
-        
+
         // Check the source operand is the zero VReg
         assert_eq!(addimm_op.srcs.len(), 2);
         match &addimm_op.srcs[0] {
@@ -1793,33 +1871,41 @@ mod tests {
         // emit_const creates 2 separate ops (Load + AddImm)
         // emit_const_choice creates 1 op with alternatives field
         let mut emit = SsaEmitContext::new();
-        
+
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         // emit_const: creates 2 ops
         let v1 = emit.emit_const(100);
         let ops_after_emit_const = emit.ops.len();
-        
+
         // emit_const_choice: creates 1 op
         let v2 = emit.emit_const_choice(200);
         let ops_after_choice = emit.ops.len();
-        
+
         // emit_const added 2 ops (Load + AddImm)
         assert_eq!(ops_after_emit_const - 1, 2, "emit_const should add 2 ops");
-        
+
         // emit_const_choice added 1 op
-        assert_eq!(ops_after_choice - ops_after_emit_const, 1, "emit_const_choice should add 1 op");
-        
+        assert_eq!(
+            ops_after_choice - ops_after_emit_const,
+            1,
+            "emit_const_choice should add 1 op"
+        );
+
         // The ConstChoice op has alternatives in its field, not separate ops
         let choice_op = &emit.ops[ops_after_emit_const];
         assert_eq!(choice_op.opcode, Opcode::ConstChoice);
         assert!(choice_op.const_alternatives.is_some());
         assert_eq!(choice_op.const_alternatives.as_ref().unwrap().len(), 2);
-        
+
         // emit_const tracks pairs in emit.const_alternatives
         // emit_const_choice stores alternatives in the op itself
-        assert_eq!(emit.const_alternatives.len(), 1, "Only emit_const tracks in const_alternatives");
+        assert_eq!(
+            emit.const_alternatives.len(),
+            1,
+            "Only emit_const tracks in const_alternatives"
+        );
         assert_eq!(emit.const_alternatives[0].dest, v1);
     }
 }

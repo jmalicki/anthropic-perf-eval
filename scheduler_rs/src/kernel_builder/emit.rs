@@ -6,7 +6,9 @@
 use arrayvec::ArrayVec;
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{Engine, Op, Opcode, PseudoConst, SlotVal, ConstEncodingFlags, MAX_SLOT_SIZE, VLEN};
+use crate::types::{
+    ConstEncodingFlags, Engine, Op, Opcode, PseudoConst, SlotVal, MAX_SLOT_SIZE, VLEN,
+};
 
 /// Broadcast cache entry - tracks where a scalar value has been broadcast to
 #[derive(Debug, Clone)]
@@ -95,7 +97,10 @@ impl EmitContext {
         self.value_to_pseudo_const_id.clear();
         self.value_to_register.clear();
         // Keep encoding_flags unchanged - they're configuration
-        (std::mem::take(&mut self.ops), std::mem::take(&mut self.pseudo_consts))
+        (
+            std::mem::take(&mut self.ops),
+            std::mem::take(&mut self.pseudo_consts),
+        )
     }
 
     /// Set the encoding flags
@@ -117,7 +122,12 @@ impl EmitContext {
         }
 
         // Create a new pseudo-const with configured encoding flags
-        let pc = PseudoConst::new_with_flags(self.next_pseudo_const_id, value, Some(dest), self.encoding_flags);
+        let pc = PseudoConst::new_with_flags(
+            self.next_pseudo_const_id,
+            value,
+            Some(dest),
+            self.encoding_flags,
+        );
         let pc_id = pc.id;
         self.pseudo_consts.push(pc);
 
@@ -141,7 +151,12 @@ impl EmitContext {
         }
 
         // Create a new critical pseudo-const with configured encoding flags
-        let pc = PseudoConst::new_critical_with_flags(self.next_pseudo_const_id, value, Some(dest), self.encoding_flags);
+        let pc = PseudoConst::new_critical_with_flags(
+            self.next_pseudo_const_id,
+            value,
+            Some(dest),
+            self.encoding_flags,
+        );
         let pc_id = pc.id;
         self.pseudo_consts.push(pc);
 
@@ -291,10 +306,13 @@ impl EmitContext {
         };
 
         // Cache this broadcast for deduplication
-        self.broadcast_cache.insert(src, BroadcastEntry {
-            dest,
-            op_id: self.next_op_id,
-        });
+        self.broadcast_cache.insert(
+            src,
+            BroadcastEntry {
+                dest,
+                op_id: self.next_op_id,
+            },
+        );
 
         self.next_op_id += 1;
         self.ops.push(op);

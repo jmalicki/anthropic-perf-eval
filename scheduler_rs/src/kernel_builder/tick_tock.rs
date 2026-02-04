@@ -89,7 +89,7 @@ impl TickTockKernelBuilder {
         // Allocate scratch
         self.allocate_common(n_groups, n_iters);
         self.allocate_valu_selection();
-        self.allocate_partition();  // After valu_selection so we can reuse tc_r3/v_tc_r3
+        self.allocate_partition(); // After valu_selection so we can reuse tc_r3/v_tc_r3
 
         let usage = self.alloc.usage();
         if usage > SCRATCH_SIZE as i64 {
@@ -259,8 +259,8 @@ impl TickTockKernelBuilder {
             // Allocate separate scratch for idx and val during partition stores
             // Each needs 8 words (VLEN) for vstore/load operations
             // NOTE: Can't reuse tc_r3[0..7] for both - they'd overwrite each other!
-            ctx.part_idx_scratch = alloc.alloc("part_idx_scratch", 8);  // 8 words for idx
-            ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", 8);  // 8 words for val
+            ctx.part_idx_scratch = alloc.alloc("part_idx_scratch", 8); // 8 words for idx
+            ctx.tree_cache_scalars = alloc.alloc("tree_cache_scalars", 8); // 8 words for val
             ctx.tree_cache_base_s = alloc.alloc("tree_cache_base", 1);
 
             // Partition counters - REUSE st[14] and st[15] to save scratch!
@@ -434,7 +434,8 @@ impl TickTockKernelBuilder {
 
         // Compute partition buffer offsets
         self.emit.emit_const(self.ctx.partition_idx_offset, 0);
-        self.emit.emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
+        self.emit
+            .emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
 
         // Load hash constants
         for i in 0..6 {
@@ -452,7 +453,9 @@ impl TickTockKernelBuilder {
         // v_const[0], [1], [2] will be CSE'd to v_0, v_1, v_2 (no new ops emitted)
         // v_const[3..8] will emit new broadcasts
         for i in 0..8 {
-            self.ctx.v_const[i] = self.emit.emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
+            self.ctx.v_const[i] = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
         }
 
         for i in 0..6 {
@@ -461,13 +464,21 @@ impl TickTockKernelBuilder {
         }
 
         // Load Stage 5 XOR constant
-        self.emit.emit_const(self.ctx.stage5_xor_s, STAGE5_XOR_CONST);
-        self.ctx.v_stage5_xor = self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
+        self.emit
+            .emit_const(self.ctx.stage5_xor_s, STAGE5_XOR_CONST);
+        self.ctx.v_stage5_xor = self
+            .emit
+            .emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
 
         // Load tree cache - parallel address computation
         // First compute all addresses (can parallelize in ALU)
         for i in 0..7 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.tc_addr[i], self.ctx.forest_p, self.ctx.c[i]);
+            self.emit.emit_alu(
+                Opcode::Add,
+                self.ctx.tc_addr[i],
+                self.ctx.forest_p,
+                self.ctx.c[i],
+            );
         }
         // Then load all values (2 loads per cycle)
         for i in 0..7 {
@@ -475,10 +486,14 @@ impl TickTockKernelBuilder {
         }
 
         // Compute deltas
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_1, self.ctx.tc[1], self.ctx.tc[2]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_4, self.ctx.tc[4], self.ctx.tc[3]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_1, self.ctx.tc[1], self.ctx.tc[2]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_4, self.ctx.tc[4], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
 
         self.ctx.v_tc2 = self.emit.emit_vbroadcast(self.ctx.v_tc2, self.ctx.tc[2]);
         self.ctx.v_td_1 = self.emit.emit_vbroadcast(self.ctx.v_td_1, self.ctx.td_1);
@@ -551,7 +566,8 @@ impl TickTockKernelBuilder {
 
         // Compute partition buffer offsets (constant values, not addresses)
         self.emit.emit_const(self.ctx.partition_idx_offset, 0);
-        self.emit.emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
+        self.emit
+            .emit_const(self.ctx.partition_val_offset, self.config.batch_size as i64);
 
         // === HASH CONSTANTS ===
         // These are large values that must be loaded directly.
@@ -570,7 +586,9 @@ impl TickTockKernelBuilder {
         self.ctx.v_nn = self.emit.emit_vbroadcast(self.ctx.v_nn, self.ctx.n_nodes_s);
 
         for i in 0..8 {
-            self.ctx.v_const[i] = self.emit.emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
+            self.ctx.v_const[i] = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_const[i], self.ctx.c[i]);
         }
 
         for i in 0..6 {
@@ -580,14 +598,23 @@ impl TickTockKernelBuilder {
 
         // Stage 5 XOR constant
         // NOTE: Capture return value to handle potential value deduplication.
-        self.ctx.stage5_xor_s = self.emit.need_const(STAGE5_XOR_CONST, self.ctx.stage5_xor_s);
-        self.ctx.v_stage5_xor = self.emit.emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
+        self.ctx.stage5_xor_s = self
+            .emit
+            .need_const(STAGE5_XOR_CONST, self.ctx.stage5_xor_s);
+        self.ctx.v_stage5_xor = self
+            .emit
+            .emit_vbroadcast(self.ctx.v_stage5_xor, self.ctx.stage5_xor_s);
 
         // === TREE CACHE ===
         // Load tree[0..6] - these are critical for early tree access!
         // Parallel address computation (can parallelize in ALU)
         for i in 0..7 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.tc_addr[i], self.ctx.forest_p, self.ctx.c[i]);
+            self.emit.emit_alu(
+                Opcode::Add,
+                self.ctx.tc_addr[i],
+                self.ctx.forest_p,
+                self.ctx.c[i],
+            );
         }
         // Then load all values (2 loads per cycle)
         for i in 0..7 {
@@ -595,10 +622,14 @@ impl TickTockKernelBuilder {
         }
 
         // Compute deltas
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_1, self.ctx.tc[1], self.ctx.tc[2]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_4, self.ctx.tc[4], self.ctx.tc[3]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
-        self.emit.emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_1, self.ctx.tc[1], self.ctx.tc[2]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_4, self.ctx.tc[4], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_5, self.ctx.tc[5], self.ctx.tc[3]);
+        self.emit
+            .emit_alu(Opcode::Sub, self.ctx.td_6, self.ctx.tc[6], self.ctx.tc[3]);
 
         self.ctx.v_tc2 = self.emit.emit_vbroadcast(self.ctx.v_tc2, self.ctx.tc[2]);
         self.ctx.v_td_1 = self.emit.emit_vbroadcast(self.ctx.v_td_1, self.ctx.td_1);
@@ -639,21 +670,47 @@ impl TickTockKernelBuilder {
         // Load tree[7..14] - parallel address computation
         // First compute all addresses (can parallelize in ALU)
         for i in 0..8 {
-            self.emit.emit_alu(Opcode::Add, self.ctx.tc_r3_addr[i], self.ctx.forest_p, self.ctx.c_r3[i]);
+            self.emit.emit_alu(
+                Opcode::Add,
+                self.ctx.tc_r3_addr[i],
+                self.ctx.forest_p,
+                self.ctx.c_r3[i],
+            );
         }
         // Then load all values (2 loads per cycle)
         for i in 0..8 {
-            self.emit.emit_load(self.ctx.tc_r3[i], self.ctx.tc_r3_addr[i]);
+            self.emit
+                .emit_load(self.ctx.tc_r3[i], self.ctx.tc_r3_addr[i]);
         }
 
         // Compute tree-reduce deltas for depth 3 (only if tree-reduce enabled)
         // d01 = tree[8] - tree[7], d23 = tree[10] - tree[9], etc.
         // tc_r3[0] = tree[7], tc_r3[1] = tree[8], tc_r3[2] = tree[9], ...
         if self.config.enable_tree_reduce_depth3 {
-            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_01, self.ctx.tc_r3[1], self.ctx.tc_r3[0]);
-            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_23, self.ctx.tc_r3[3], self.ctx.tc_r3[2]);
-            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_45, self.ctx.tc_r3[5], self.ctx.tc_r3[4]);
-            self.emit.emit_alu(Opcode::Sub, self.ctx.td_r3_67, self.ctx.tc_r3[7], self.ctx.tc_r3[6]);
+            self.emit.emit_alu(
+                Opcode::Sub,
+                self.ctx.td_r3_01,
+                self.ctx.tc_r3[1],
+                self.ctx.tc_r3[0],
+            );
+            self.emit.emit_alu(
+                Opcode::Sub,
+                self.ctx.td_r3_23,
+                self.ctx.tc_r3[3],
+                self.ctx.tc_r3[2],
+            );
+            self.emit.emit_alu(
+                Opcode::Sub,
+                self.ctx.td_r3_45,
+                self.ctx.tc_r3[5],
+                self.ctx.tc_r3[4],
+            );
+            self.emit.emit_alu(
+                Opcode::Sub,
+                self.ctx.td_r3_67,
+                self.ctx.tc_r3[7],
+                self.ctx.tc_r3[6],
+            );
         }
 
         // NOTE: Broadcasts are deferred to ensure_depth3_broadcasts() which is called
@@ -677,26 +734,32 @@ impl TickTockKernelBuilder {
         // Broadcast tree values for depth 3 (only even indices needed for tree-reduce base values)
         // v_tc_r3[0], [2], [4], [6] are the bases for FMA at level 0
         for i in 0..8 {
-            self.ctx.v_tc_r3[i] =
-                self.emit.emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
+            self.ctx.v_tc_r3[i] = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_tc_r3[i], self.ctx.tc_r3[i]);
         }
 
         // Broadcast constants - use CSE, some may already be broadcast (e.g., c[7] to v_const[7])
         for i in 0..8 {
-            self.ctx.v_const_r3[i] =
-                self.emit.emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
+            self.ctx.v_const_r3[i] = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_const_r3[i], self.ctx.c_r3[i]);
         }
 
         // Broadcast tree-reduce deltas (only if tree-reduce enabled)
         if self.config.enable_tree_reduce_depth3 {
-            self.ctx.v_td_r3_01 =
-                self.emit.emit_vbroadcast(self.ctx.v_td_r3_01, self.ctx.td_r3_01);
-            self.ctx.v_td_r3_23 =
-                self.emit.emit_vbroadcast(self.ctx.v_td_r3_23, self.ctx.td_r3_23);
-            self.ctx.v_td_r3_45 =
-                self.emit.emit_vbroadcast(self.ctx.v_td_r3_45, self.ctx.td_r3_45);
-            self.ctx.v_td_r3_67 =
-                self.emit.emit_vbroadcast(self.ctx.v_td_r3_67, self.ctx.td_r3_67);
+            self.ctx.v_td_r3_01 = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_td_r3_01, self.ctx.td_r3_01);
+            self.ctx.v_td_r3_23 = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_td_r3_23, self.ctx.td_r3_23);
+            self.ctx.v_td_r3_45 = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_td_r3_45, self.ctx.td_r3_45);
+            self.ctx.v_td_r3_67 = self
+                .emit
+                .emit_vbroadcast(self.ctx.v_td_r3_67, self.ctx.td_r3_67);
         }
     }
 
@@ -719,10 +782,14 @@ impl TickTockKernelBuilder {
             self.emit.emit_const(ctx.st[0], offset_a);
             self.emit.emit_const(ctx.st[1], offset_b);
 
-            self.emit.emit_alu(Opcode::Add, ctx.st[2], ctx.idx_p, ctx.st[0]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[3], ctx.idx_p, ctx.st[1]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[4], ctx.val_p, ctx.st[0]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[5], ctx.val_p, ctx.st[1]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[2], ctx.idx_p, ctx.st[0]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[3], ctx.idx_p, ctx.st[1]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[4], ctx.val_p, ctx.st[0]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[5], ctx.val_p, ctx.st[1]);
 
             self.emit.emit_vload(ctx.all_idx[g], ctx.st[2]);
             self.emit.emit_vload(ctx.all_idx[g + 1], ctx.st[3]);
@@ -751,10 +818,14 @@ impl TickTockKernelBuilder {
             self.emit.emit_const(ctx.st[0], offset_a);
             self.emit.emit_const(ctx.st[1], offset_b);
 
-            self.emit.emit_alu(Opcode::Add, ctx.st[2], ctx.idx_p, ctx.st[0]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[3], ctx.idx_p, ctx.st[1]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[4], ctx.val_p, ctx.st[0]);
-            self.emit.emit_alu(Opcode::Add, ctx.st[5], ctx.val_p, ctx.st[1]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[2], ctx.idx_p, ctx.st[0]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[3], ctx.idx_p, ctx.st[1]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[4], ctx.val_p, ctx.st[0]);
+            self.emit
+                .emit_alu(Opcode::Add, ctx.st[5], ctx.val_p, ctx.st[1]);
 
             self.emit.emit_vstore(ctx.st[2], ctx.all_idx[g]);
             self.emit.emit_vstore(ctx.st[3], ctx.all_idx[g + 1]);
@@ -838,8 +909,10 @@ impl TickTockKernelBuilder {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let t = ctx.v_t[it][i];
-                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_1);
-                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_1, ctx.v_tc2);
+                self.emit
+                    .emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_1);
+                self.emit
+                    .emit_fma(ctx.v_nv[it][i], t, ctx.v_td_1, ctx.v_tc2);
             }
         }
 
@@ -867,16 +940,22 @@ impl TickTockKernelBuilder {
                 let t = ctx.v_t[it][i];
 
                 // Start with tc[3], add delta if idx == 4
-                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[4]);
-                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_4, ctx.v_tc3);
+                self.emit
+                    .emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[4]);
+                self.emit
+                    .emit_fma(ctx.v_nv[it][i], t, ctx.v_td_4, ctx.v_tc3);
 
                 // Add td_5 if idx == 5
-                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[5]);
-                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_5, ctx.v_nv[it][i]);
+                self.emit
+                    .emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[5]);
+                self.emit
+                    .emit_fma(ctx.v_nv[it][i], t, ctx.v_td_5, ctx.v_nv[it][i]);
 
                 // Add td_6 if idx == 6
-                self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[6]);
-                self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_td_6, ctx.v_nv[it][i]);
+                self.emit
+                    .emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const[6]);
+                self.emit
+                    .emit_fma(ctx.v_nv[it][i], t, ctx.v_td_6, ctx.v_nv[it][i]);
             }
         }
 
@@ -935,10 +1014,10 @@ impl TickTockKernelBuilder {
                     // === Bit extraction (5 VALU ops) ===
                     // idx_adj = idx - 7 gives 0-7 for indices 7-14
                     self.emit.emit_valu(Opcode::Sub, t, idx, ctx.v_const[7]); // idx_adj
-                    self.emit.emit_valu(Opcode::And, s1, t, ctx.v_1);         // bit0
-                    self.emit.emit_valu(Opcode::Shr, t, t, ctx.v_1);          // idx_adj >> 1
-                    self.emit.emit_valu(Opcode::And, s2, t, ctx.v_1);         // bit1
-                    self.emit.emit_valu(Opcode::Shr, s3, t, ctx.v_1);         // bit2
+                    self.emit.emit_valu(Opcode::And, s1, t, ctx.v_1); // bit0
+                    self.emit.emit_valu(Opcode::Shr, t, t, ctx.v_1); // idx_adj >> 1
+                    self.emit.emit_valu(Opcode::And, s2, t, ctx.v_1); // bit1
+                    self.emit.emit_valu(Opcode::Shr, s3, t, ctx.v_1); // bit2
 
                     // === Level 0: 4 FMAs for leaf pairs (4 VALU ops) ===
                     // p01 = bit0 * d01 + tree[7]
@@ -946,22 +1025,22 @@ impl TickTockKernelBuilder {
                     // p45 = bit0 * d45 + tree[11]
                     // p67 = bit0 * d67 + tree[13]
                     self.emit.emit_fma(nv, s1, ctx.v_td_r3_01, ctx.v_tc_r3[0]); // p01 in nv
-                    self.emit.emit_fma(t, s1, ctx.v_td_r3_23, ctx.v_tc_r3[2]);  // p23 in t
+                    self.emit.emit_fma(t, s1, ctx.v_td_r3_23, ctx.v_tc_r3[2]); // p23 in t
                     self.emit.emit_fma(s4, s1, ctx.v_td_r3_45, ctx.v_tc_r3[4]); // p45 in s4
                     self.emit.emit_fma(s1, s1, ctx.v_td_r3_67, ctx.v_tc_r3[6]); // p67 in s1 (reuse)
 
                     // === Level 1: Combine pairs (4 VALU ops: 2 SUB + 2 FMA) ===
                     // q03 = bit1 * (p23 - p01) + p01
                     // q47 = bit1 * (p67 - p45) + p45
-                    self.emit.emit_valu(Opcode::Sub, t, t, nv);     // dp03 = p23 - p01
-                    self.emit.emit_fma(nv, s2, t, nv);              // q03 = bit1 * dp03 + p01
-                    self.emit.emit_valu(Opcode::Sub, t, s1, s4);    // dp47 = p67 - p45
-                    self.emit.emit_fma(s4, s2, t, s4);              // q47 = bit1 * dp47 + p45
+                    self.emit.emit_valu(Opcode::Sub, t, t, nv); // dp03 = p23 - p01
+                    self.emit.emit_fma(nv, s2, t, nv); // q03 = bit1 * dp03 + p01
+                    self.emit.emit_valu(Opcode::Sub, t, s1, s4); // dp47 = p67 - p45
+                    self.emit.emit_fma(s4, s2, t, s4); // q47 = bit1 * dp47 + p45
 
                     // === Level 2: Final result (2 VALU ops: 1 SUB + 1 FMA) ===
                     // result = bit2 * (q47 - q03) + q03
-                    self.emit.emit_valu(Opcode::Sub, t, s4, nv);    // d_final = q47 - q03
-                    self.emit.emit_fma(nv, s3, t, nv);              // result = bit2 * d_final + q03
+                    self.emit.emit_valu(Opcode::Sub, t, s4, nv); // d_final = q47 - q03
+                    self.emit.emit_fma(nv, s3, t, nv); // result = bit2 * d_final + q03
                 }
             }
         } else {
@@ -976,13 +1055,21 @@ impl TickTockKernelBuilder {
                     let t = ctx.v_t[it][i];
 
                     // First iteration: initialize result with t * tree_value (no zero-init needed)
-                    self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[0]);
-                    self.emit.emit_valu(Opcode::Mul, ctx.v_nv[it][i], t, ctx.v_tc_r3[0]);
+                    self.emit
+                        .emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[0]);
+                    self.emit
+                        .emit_valu(Opcode::Mul, ctx.v_nv[it][i], t, ctx.v_tc_r3[0]);
 
                     // Remaining iterations: FMA to accumulate
                     for ti in 1..8 {
-                        self.emit.emit_valu(Opcode::Eq, t, ctx.all_idx[base_g + i], ctx.v_const_r3[ti]);
-                        self.emit.emit_fma(ctx.v_nv[it][i], t, ctx.v_tc_r3[ti], ctx.v_nv[it][i]);
+                        self.emit.emit_valu(
+                            Opcode::Eq,
+                            t,
+                            ctx.all_idx[base_g + i],
+                            ctx.v_const_r3[ti],
+                        );
+                        self.emit
+                            .emit_fma(ctx.v_nv[it][i], t, ctx.v_tc_r3[ti], ctx.v_nv[it][i]);
                     }
                 }
             }
@@ -1059,7 +1146,8 @@ impl TickTockKernelBuilder {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let g = base_g + i;
-                self.emit.emit_valu(Opcode::Xor, ctx.all_val[g], ctx.all_val[g], ctx.v_nv[it][i]);
+                self.emit
+                    .emit_valu(Opcode::Xor, ctx.all_val[g], ctx.all_val[g], ctx.v_nv[it][i]);
             }
         }
     }
@@ -1082,12 +1170,15 @@ impl TickTockKernelBuilder {
                     if ctx.hash_fma_mult[hi].is_some() {
                         // FMA optimization
                         let v_mult = *ctx.v_hash_mult.get(&hi).unwrap();
-                        self.emit.emit_fma(ctx.all_val[g], ctx.all_val[g], v_mult, ctx.v_hc[hi]);
+                        self.emit
+                            .emit_fma(ctx.all_val[g], ctx.all_val[g], v_mult, ctx.v_hc[hi]);
                     } else if hi == 5 {
                         // Stage 5 special handling
                         let t = ctx.v_t[it][i];
-                        self.emit.emit_valu(Opcode::Shr, t, ctx.all_val[g], ctx.v_hs[hi]);
-                        self.emit.emit_valu(Opcode::Xor, ctx.all_val[g], ctx.all_val[g], t);
+                        self.emit
+                            .emit_valu(Opcode::Shr, t, ctx.all_val[g], ctx.v_hs[hi]);
+                        self.emit
+                            .emit_valu(Opcode::Xor, ctx.all_val[g], ctx.all_val[g], t);
                     } else {
                         // General case
                         let t = ctx.v_t[it][i];
@@ -1107,9 +1198,16 @@ impl TickTockKernelBuilder {
                             _ => Opcode::Shl,
                         };
 
-                        self.emit.emit_valu(op1_code, t, ctx.all_val[g], ctx.v_hc[hi]);
-                        self.emit.emit_valu(op3_code, ctx.v_nv[it][i], ctx.all_val[g], ctx.v_hs[hi]);
-                        self.emit.emit_valu(op2_code, ctx.all_val[g], t, ctx.v_nv[it][i]);
+                        self.emit
+                            .emit_valu(op1_code, t, ctx.all_val[g], ctx.v_hc[hi]);
+                        self.emit.emit_valu(
+                            op3_code,
+                            ctx.v_nv[it][i],
+                            ctx.all_val[g],
+                            ctx.v_hs[hi],
+                        );
+                        self.emit
+                            .emit_valu(op2_code, ctx.all_val[g], t, ctx.v_nv[it][i]);
                     }
                 }
             }
@@ -1120,7 +1218,13 @@ impl TickTockKernelBuilder {
     // Branch Phase
     // =========================================================================
 
-    fn emit_branch_with_partition(&mut self, n_groups: usize, n_iters: usize, tree_depth: usize, rnd: usize) {
+    fn emit_branch_with_partition(
+        &mut self,
+        n_groups: usize,
+        n_iters: usize,
+        tree_depth: usize,
+        rnd: usize,
+    ) {
         let ctx = &self.ctx;
         let is_wrap_round = tree_depth == self.config.forest_height;
 
@@ -1139,7 +1243,8 @@ impl TickTockKernelBuilder {
                     // Normal branching
                     self.emit.emit_valu(Opcode::And, t, ctx.all_val[g], ctx.v_1);
                     self.emit.emit_valu(Opcode::Sub, t, ctx.v_2, t);
-                    self.emit.emit_fma(ctx.all_idx[g], ctx.all_idx[g], ctx.v_2, t);
+                    self.emit
+                        .emit_fma(ctx.all_idx[g], ctx.all_idx[g], ctx.v_2, t);
                 }
             }
         }
@@ -1189,8 +1294,10 @@ impl TickTockKernelBuilder {
         // Compute base addresses once
         let base_offset = (start_g * VLEN) as i64;
         self.emit.emit_const(ctx.st[8], base_offset);
-        self.emit.emit_alu(Opcode::Add, ctx.st[9], ctx.extra_room_p, ctx.st[8]);
-        self.emit.emit_alu(Opcode::Add, ctx.st[10], ctx.st[9], ctx.partition_val_offset);
+        self.emit
+            .emit_alu(Opcode::Add, ctx.st[9], ctx.extra_room_p, ctx.st[8]);
+        self.emit
+            .emit_alu(Opcode::Add, ctx.st[10], ctx.st[9], ctx.partition_val_offset);
         self.emit.emit_const(ctx.st[11], VLEN as i64);
 
         // Store all groups with incremental addressing
@@ -1201,8 +1308,10 @@ impl TickTockKernelBuilder {
 
             // Increment addresses for next group (except for last)
             if g < end_g - 1 {
-                self.emit.emit_alu(Opcode::Add, ctx.st[9], ctx.st[9], ctx.st[11]);
-                self.emit.emit_alu(Opcode::Add, ctx.st[10], ctx.st[10], ctx.st[11]);
+                self.emit
+                    .emit_alu(Opcode::Add, ctx.st[9], ctx.st[9], ctx.st[11]);
+                self.emit
+                    .emit_alu(Opcode::Add, ctx.st[10], ctx.st[10], ctx.st[11]);
             }
         }
     }

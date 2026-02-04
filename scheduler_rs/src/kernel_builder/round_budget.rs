@@ -429,10 +429,22 @@ mod tests {
         ];
         let result = sections_exceeding_budget(&ops, 2, None);
         assert_eq!(result.section_peaks.len(), 2);
-        assert_eq!(result.section_peaks[0], 2, "Section 0: at cycle 1 both v0 and v1 live");
-        assert_eq!(result.section_peaks[1], 3, "Section 1: v0, v1, v3 live at cycle 3");
-        assert!(!result.section_exceeds_budget[0], "Section 0 peak 2 <= budget 2");
-        assert!(result.section_exceeds_budget[1], "Section 1 peak 3 > budget 2");
+        assert_eq!(
+            result.section_peaks[0], 2,
+            "Section 0: at cycle 1 both v0 and v1 live"
+        );
+        assert_eq!(
+            result.section_peaks[1], 3,
+            "Section 1: v0, v1, v3 live at cycle 3"
+        );
+        assert!(
+            !result.section_exceeds_budget[0],
+            "Section 0 peak 2 <= budget 2"
+        );
+        assert!(
+            result.section_exceeds_budget[1],
+            "Section 1 peak 3 > budget 2"
+        );
     }
 
     #[test]
@@ -618,12 +630,21 @@ mod tests {
         let vds = vreg_def_section(&ops, &boundaries);
         // Section 0 live-out: v0 and v1 are defined in 0, last use in section 1
         let live_out_0 = live_out_from_section(&ops, &boundaries, 0, &vds);
-        assert!(live_out_0.contains(&v0), "v0 defined in section 0, last use in section 1");
-        assert!(live_out_0.contains(&v1), "v1 defined in section 0, last use in section 1");
+        assert!(
+            live_out_0.contains(&v0),
+            "v0 defined in section 0, last use in section 1"
+        );
+        assert!(
+            live_out_0.contains(&v1),
+            "v1 defined in section 0, last use in section 1"
+        );
         assert_eq!(live_out_0.len(), 2);
         // Section 1 live-out: v3 is defined in 1 and last use in 1 -> empty
         let live_out_1 = live_out_from_section(&ops, &boundaries, 1, &vds);
-        assert!(live_out_1.is_empty(), "v3 last use in section 1, no live-out");
+        assert!(
+            live_out_1.is_empty(),
+            "v3 last use in section 1, no live-out"
+        );
     }
 
     /// live_through_for_section: VRegs defined in section k-1, last use in section > k (live for whole of section k).
@@ -674,13 +695,25 @@ mod tests {
         let boundaries = section_boundaries(&ops);
         let vds = vreg_def_section(&ops, &boundaries);
         let live_through_0 = live_through_for_section(&ops, &boundaries, 0, &vds);
-        assert!(live_through_0.is_empty(), "section 0 has no previous section");
+        assert!(
+            live_through_0.is_empty(),
+            "section 0 has no previous section"
+        );
         let live_through_1 = live_through_for_section(&ops, &boundaries, 1, &vds);
-        assert!(live_through_1.contains(&v1), "v1 defined in section 0, last use in section 2");
-        assert!(!live_through_1.contains(&v0), "v0 last use in section 1, not > 1");
+        assert!(
+            live_through_1.contains(&v1),
+            "v1 defined in section 0, last use in section 2"
+        );
+        assert!(
+            !live_through_1.contains(&v0),
+            "v0 last use in section 1, not > 1"
+        );
         assert_eq!(live_through_1.len(), 1);
         let live_through_2 = live_through_for_section(&ops, &boundaries, 2, &vds);
-        assert!(live_through_2.is_empty(), "v2 last use in section 2, so 2 > 2 is false");
+        assert!(
+            live_through_2.is_empty(),
+            "v2 last use in section 2, so 2 > 2 is false"
+        );
     }
 
     /// Test that live_through_for_section correctly handles VRegs from early sections
@@ -740,20 +773,35 @@ mod tests {
         // Section 1 live-through: v0 and v1 are both defined in section 0, last use in section 3 (> 1)
         // v0 is ALSO used in section 1, but its LAST use is in section 3, so it's still live-through
         let live_through_1 = live_through_for_section(&ops, &boundaries, 1, &vds);
-        assert!(live_through_1.contains(&v1), "v1: def=0, last_use=3 > 1, live-through section 1");
-        assert!(live_through_1.contains(&v0), "v0: def=0, last_use=3 > 1 (also used in 1, but LAST use is 3)");
+        assert!(
+            live_through_1.contains(&v1),
+            "v1: def=0, last_use=3 > 1, live-through section 1"
+        );
+        assert!(
+            live_through_1.contains(&v0),
+            "v0: def=0, last_use=3 > 1 (also used in 1, but LAST use is 3)"
+        );
         assert_eq!(live_through_1.len(), 2);
 
         // Section 2 live-through: v0 and v1 are both defined in section 0 (< 2), last use in section 3 (> 2)
         // This is the key test case for the bug fix - v0 and v1 should be live-through section 2
         // even though they were defined in section 0 (not section 1 = prev_sec)
         let live_through_2 = live_through_for_section(&ops, &boundaries, 2, &vds);
-        assert!(live_through_2.contains(&v0), "v0: def=0 < 2, last_use=3 > 2, live-through section 2");
-        assert!(live_through_2.contains(&v1), "v1: def=0 < 2, last_use=3 > 2, live-through section 2");
+        assert!(
+            live_through_2.contains(&v0),
+            "v0: def=0 < 2, last_use=3 > 2, live-through section 2"
+        );
+        assert!(
+            live_through_2.contains(&v1),
+            "v1: def=0 < 2, last_use=3 > 2, live-through section 2"
+        );
         assert_eq!(live_through_2.len(), 2);
 
         // Section 3 live-through: nothing, v0 and v1 are last-used in section 3 (not > 3)
         let live_through_3 = live_through_for_section(&ops, &boundaries, 3, &vds);
-        assert!(live_through_3.is_empty(), "Section 3 has no live-through (all last uses in section 3)");
+        assert!(
+            live_through_3.is_empty(),
+            "Section 3 has no live-through (all last uses in section 3)"
+        );
     }
 }

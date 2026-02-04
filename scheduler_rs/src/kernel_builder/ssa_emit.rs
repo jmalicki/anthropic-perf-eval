@@ -11,7 +11,9 @@
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{HASH_STAGES, STAGE5_XOR_CONST};
-use super::tick_tock_ssa::{SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL};
+use super::tick_tock_ssa::{
+    SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL,
+};
 
 impl SsaTickTockKernelBuilder {
     /// Internal build logic.
@@ -130,7 +132,8 @@ impl SsaTickTockKernelBuilder {
         // Partition buffer offsets
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
         self.emit.set_next_var_type(VarType::Constant);
-        self.ctx.partition_val_offset = Some(self.emit.emit_const_choice(self.config.batch_size as i64));
+        self.ctx.partition_val_offset =
+            Some(self.emit.emit_const_choice(self.config.batch_size as i64));
 
         // Load hash constants and create broadcasts.
         // Only emit constants/broadcasts that are actually used:
@@ -176,7 +179,9 @@ impl SsaTickTockKernelBuilder {
         let forest_p = self.ctx.forest_p.unwrap();
         for i in 0..7 {
             self.emit.set_next_var_type(VarType::Address);
-            let addr = self.emit.emit_alu(Opcode::Add, forest_p, self.ctx.c[i].unwrap());
+            let addr = self
+                .emit
+                .emit_alu(Opcode::Add, forest_p, self.ctx.c[i].unwrap());
             self.ctx.tc_addr[i] = Some(addr);
             self.emit.set_next_var_type(VarType::TreeCache);
             self.ctx.tc[i] = Some(self.emit.emit_load(addr));
@@ -213,13 +218,21 @@ impl SsaTickTockKernelBuilder {
         self.ctx.v_td_5 = Some(self.emit.emit_vbroadcast(self.ctx.td_5.unwrap()));
         // Compute v_tc5 = v_tc3 + v_td_5 for SelectChoice (true_val)
         self.emit.set_next_var_type(VarType::TreeCache);
-        let v_tc5 = self.emit.emit_valu(Opcode::Add, self.ctx.v_tc3.unwrap(), self.ctx.v_td_5.unwrap());
+        let v_tc5 = self.emit.emit_valu(
+            Opcode::Add,
+            self.ctx.v_tc3.unwrap(),
+            self.ctx.v_td_5.unwrap(),
+        );
         self.ctx.v_tc5 = Some(v_tc5);
         self.emit.set_next_var_type(VarType::TreeCache);
         self.ctx.v_td_6 = Some(self.emit.emit_vbroadcast(self.ctx.td_6.unwrap()));
         // Compute v_tc6 = v_tc3 + v_td_6 for SelectChoice (true_val)
         self.emit.set_next_var_type(VarType::TreeCache);
-        let v_tc6 = self.emit.emit_valu(Opcode::Add, self.ctx.v_tc3.unwrap(), self.ctx.v_td_6.unwrap());
+        let v_tc6 = self.emit.emit_valu(
+            Opcode::Add,
+            self.ctx.v_tc3.unwrap(),
+            self.ctx.v_td_6.unwrap(),
+        );
         self.ctx.v_tc6 = Some(v_tc6);
 
         // FMA multipliers
@@ -418,12 +431,22 @@ impl SsaTickTockKernelBuilder {
     // 8-way: bit-tree of 7 selects (4 + 2 + 1 levels).
 
     /// 2-way selection: cond ? true_val : false_val (one SelectChoice).
-    fn select_2way(&mut self, cond: crate::types::VReg, true_val: crate::types::VReg, false_val: crate::types::VReg) -> crate::types::VReg {
+    fn select_2way(
+        &mut self,
+        cond: crate::types::VReg,
+        true_val: crate::types::VReg,
+        false_val: crate::types::VReg,
+    ) -> crate::types::VReg {
         self.emit.emit_select_choice(cond, true_val, false_val)
     }
 
     /// 2-way selection with precomputed delta: cond ? (base + delta) : base (one SelectChoice).
-    fn select_2way_with_delta(&mut self, cond: crate::types::VReg, delta: crate::types::VReg, base: crate::types::VReg) -> crate::types::VReg {
+    fn select_2way_with_delta(
+        &mut self,
+        cond: crate::types::VReg,
+        delta: crate::types::VReg,
+        base: crate::types::VReg,
+    ) -> crate::types::VReg {
         self.emit.emit_select_choice_with_delta(cond, delta, base)
     }
 
@@ -441,15 +464,21 @@ impl SsaTickTockKernelBuilder {
         let c2 = base_idx + 2;
         let c3 = base_idx + 3;
         self.emit.set_next_var_type(VarType::Condition);
-        let cond1 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
+        let cond1 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         let mut result = self.select_2way(cond1, v1, v0);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond2 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
+        let cond2 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond2, v2, result);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond3 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
+        let cond3 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond3, v3, result);
         result
@@ -469,15 +498,21 @@ impl SsaTickTockKernelBuilder {
         let c2 = base_idx + 2;
         let c3 = base_idx + 3;
         self.emit.set_next_var_type(VarType::Condition);
-        let cond1 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
+        let cond1 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         let mut result = self.select_2way_with_delta(cond1, delta, base);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond2 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
+        let cond2 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond2, v2, result);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond3 = self.emit.emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
+        let cond3 = self
+            .emit
+            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond3, v3, result);
         result
@@ -637,7 +672,8 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
                 self.emit.set_next_var_type(VarType::Temporary);
-                let v_nv = self.select_4way_linear_first_delta(idx, BASE_IDX, v_tc3, v_td_4, v_tc5, v_tc6);
+                let v_nv =
+                    self.select_4way_linear_first_delta(idx, BASE_IDX, v_tc3, v_td_4, v_tc5, v_tc6);
                 self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
@@ -715,19 +751,21 @@ impl SsaTickTockKernelBuilder {
                     let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                     // First iteration: Mul
-                    let cond0 = self
-                        .emit
-                        .emit_valu(Opcode::Eq, idx, self.ctx.v_const_r3[0].unwrap());
-                    let mut v_nv = self
-                        .emit
-                        .emit_valu(Opcode::Mul, cond0, self.ctx.v_tc_r3[0].unwrap());
+                    let cond0 =
+                        self.emit
+                            .emit_valu(Opcode::Eq, idx, self.ctx.v_const_r3[0].unwrap());
+                    let mut v_nv =
+                        self.emit
+                            .emit_valu(Opcode::Mul, cond0, self.ctx.v_tc_r3[0].unwrap());
 
                     // Remaining iterations: FMA
                     for ti in 1..8 {
-                        let cond = self
+                        let cond =
+                            self.emit
+                                .emit_valu(Opcode::Eq, idx, self.ctx.v_const_r3[ti].unwrap());
+                        v_nv = self
                             .emit
-                            .emit_valu(Opcode::Eq, idx, self.ctx.v_const_r3[ti].unwrap());
-                        v_nv = self.emit.emit_fma(cond, self.ctx.v_tc_r3[ti].unwrap(), v_nv);
+                            .emit_fma(cond, self.ctx.v_tc_r3[ti].unwrap(), v_nv);
                     }
 
                     self.ctx.v_nv[it][i] =
@@ -923,7 +961,7 @@ impl SsaTickTockKernelBuilder {
             if TICK_STORE_DEPTHS.contains(&tree_depth) {
                 if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
                     eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);
-                    for g in 0..n_groups/2 {
+                    for g in 0..n_groups / 2 {
                         eprintln!("  all_idx[{}] = {:?}", g, self.ctx.all_idx[g]);
                     }
                 }
@@ -942,7 +980,9 @@ impl SsaTickTockKernelBuilder {
         // Compute base addresses
         let base_offset = self.emit.emit_const_choice((start_g * VLEN) as i64);
         let mut idx_addr = self.emit.emit_alu(Opcode::Add, extra_room_p, base_offset);
-        let mut val_addr = self.emit.emit_alu(Opcode::Add, idx_addr, partition_val_offset);
+        let mut val_addr = self
+            .emit
+            .emit_alu(Opcode::Add, idx_addr, partition_val_offset);
         let vlen_const = self.emit.emit_const_choice(VLEN as i64);
 
         // Store all groups
@@ -953,10 +993,8 @@ impl SsaTickTockKernelBuilder {
                 eprintln!("[DEBUG emit_partition_stores] g={}: vstore(idx_addr={:?}, idx={:?}), vstore(val_addr={:?}, val={:?})",
                     g, idx_addr, idx_vreg, val_addr, val_vreg);
             }
-            self.emit
-                .emit_vstore(idx_addr, idx_vreg);
-            self.emit
-                .emit_vstore(val_addr, val_vreg);
+            self.emit.emit_vstore(idx_addr, idx_vreg);
+            self.emit.emit_vstore(val_addr, val_vreg);
 
             // Increment addresses for next group
             if g < end_g - 1 {

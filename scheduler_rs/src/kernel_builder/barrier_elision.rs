@@ -94,13 +94,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn make_op(id: usize, engine: Engine, opcode: Opcode, deps: Vec<usize>) -> SsaOp {
-        let mut op = SsaOp::new(
-            id,
-            engine,
-            opcode,
-            Some(VReg::scalar(id as u32)),
-            vec![],
-        );
+        let mut op = SsaOp::new(id, engine, opcode, Some(VReg::scalar(id as u32)), vec![]);
         op.dep_ids = deps.into_iter().collect();
         op
     }
@@ -139,7 +133,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         // Op 2 should no longer depend on barrier (op 1)
         let op2 = result.iter().find(|op| op.id == 2).unwrap();
-        assert!(!op2.dep_ids.contains(&1), "Should not depend on elided barrier");
+        assert!(
+            !op2.dep_ids.contains(&1),
+            "Should not depend on elided barrier"
+        );
         assert!(op2.dep_ids.contains(&0), "Should still depend on op 0");
     }
 
@@ -159,9 +156,7 @@ mod tests {
 
     #[test]
     fn test_has_barriers() {
-        let without = vec![
-            make_op(0, Engine::Load, Opcode::Const, vec![]),
-        ];
+        let without = vec![make_op(0, Engine::Load, Opcode::Const, vec![])];
         let with = vec![
             make_op(0, Engine::Load, Opcode::Const, vec![]),
             make_barrier(1, vec![0]),

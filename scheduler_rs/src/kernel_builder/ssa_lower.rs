@@ -66,13 +66,16 @@ pub fn lower_ssa_ops_with_shift(
             // Expand shifted VALU op to 8 ALU ops
             // Use individual cycles if available (from CP-SAT), otherwise use completion_cycle
             let alu_cycles = shifted_alu_cycles.get(&ssa_op.id);
-            let expanded = expand_ssa_valu_to_alu(ssa_op, vreg_to_addr, alu_cycles.map(|v| v.as_slice()));
+            let expanded =
+                expand_ssa_valu_to_alu(ssa_op, vreg_to_addr, alu_cycles.map(|v| v.as_slice()));
             result.extend(expanded);
         } else if ssa_op.opcode == Opcode::ConstChoice {
             // Handle ConstChoice based on scheduler decision
             let dest = ssa_op.dest.expect("ConstChoice op must have dest");
             let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
-            let value = ssa_op.produces_constant.expect("ConstChoice op must have produces_constant");
+            let value = ssa_op
+                .produces_constant
+                .expect("ConstChoice op must have produces_constant");
 
             if const_add_imm_ops.contains(&ssa_op.id) {
                 // AddImm: dest = scratch[0] + value
@@ -128,43 +131,57 @@ pub fn lower_ssa_ops_with_shift(
             // Handle SelectChoice based on scheduler decision
             let dest = ssa_op.dest.expect("SelectChoice op must have dest");
             let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
-            
+
             // Extract operands: cond, true_val, false_val
             if ssa_op.srcs.len() < 3 {
                 panic!("SelectChoice op must have 3 operands: cond, true_val, false_val");
             }
-            
+
             use crate::types::Operand;
-            let cond_vreg = ssa_op.srcs[0].as_vreg().expect("SelectChoice cond must be VReg");
-            let true_val_vreg = ssa_op.srcs[1].as_vreg().expect("SelectChoice true_val must be VReg");
-            let false_val_vreg = ssa_op.srcs[2].as_vreg().expect("SelectChoice false_val must be VReg");
-            
-            let cond_addr = *vreg_to_addr.get(&cond_vreg).expect("cond VReg not in mapping");
-            let true_val_addr = *vreg_to_addr.get(&true_val_vreg).expect("true_val VReg not in mapping");
-            let false_val_addr = *vreg_to_addr.get(&false_val_vreg).expect("false_val VReg not in mapping");
+            let cond_vreg = ssa_op.srcs[0]
+                .as_vreg()
+                .expect("SelectChoice cond must be VReg");
+            let true_val_vreg = ssa_op.srcs[1]
+                .as_vreg()
+                .expect("SelectChoice true_val must be VReg");
+            let false_val_vreg = ssa_op.srcs[2]
+                .as_vreg()
+                .expect("SelectChoice false_val must be VReg");
+
+            let cond_addr = *vreg_to_addr
+                .get(&cond_vreg)
+                .expect("cond VReg not in mapping");
+            let true_val_addr = *vreg_to_addr
+                .get(&true_val_vreg)
+                .expect("true_val VReg not in mapping");
+            let false_val_addr = *vreg_to_addr
+                .get(&false_val_vreg)
+                .expect("false_val VReg not in mapping");
 
             if select_fma_ops.contains(&ssa_op.id) {
                 // FMA path: check if we have a precomputed delta
                 if let Some(delta_vreg) = ssa_op.delta_vreg {
                     // Precomputed delta available: emit single FMA op
                     // fma = cond * delta + base (where base = false_val)
-                    let delta_addr = *vreg_to_addr.get(&delta_vreg).expect("delta VReg not in mapping");
-                    
+                    let delta_addr = *vreg_to_addr
+                        .get(&delta_vreg)
+                        .expect("delta VReg not in mapping");
+
                     let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                     fma_slot.push(SlotVal::Str("multiply_add".to_string()));
                     fma_slot.push(SlotVal::Int(dest_addr));
                     fma_slot.push(SlotVal::Int(cond_addr));
                     fma_slot.push(SlotVal::Int(delta_addr));
                     fma_slot.push(SlotVal::Int(false_val_addr));
-                    
+
                     let mut fma_reads = HashSet::new();
                     fma_reads.insert(cond_addr);
                     fma_reads.insert(delta_addr);
                     fma_reads.insert(false_val_addr);
-                    
+
                     let mut fma_writes = HashSet::new();
                     fma_writes.insert(dest_addr);
-                    
+
                     result.push(Op {
                         id: ssa_op.id,
                         engine: crate::types::Engine::Valu,
@@ -180,7 +197,7 @@ pub fn lower_ssa_ops_with_shift(
                     // No precomputed delta: emit sub + fma ops (both VALU, sequential)
                     // sub = true_val - false_val
                     // fma = cond * sub + false_val
-                    
+
                     // Get the sub_temp VReg that was allocated during emission
                     let sub_temp_vreg = ssa_op.sub_temp_vreg.expect(
                         "SelectChoice without delta must have sub_temp_vreg allocated during emission"
@@ -188,21 +205,21 @@ pub fn lower_ssa_ops_with_shift(
                     let sub_temp_addr = *vreg_to_addr.get(&sub_temp_vreg).expect(
                         "sub_temp_vreg not in address mapping - was it included in address assignment?"
                     );
-                    
+
                     // Sub op: sub_temp = true_val - false_val
                     let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                     sub_slot.push(SlotVal::Str("-".to_string()));
                     sub_slot.push(SlotVal::Int(sub_temp_addr));
                     sub_slot.push(SlotVal::Int(true_val_addr));
                     sub_slot.push(SlotVal::Int(false_val_addr));
-                    
+
                     let mut sub_reads = HashSet::new();
                     sub_reads.insert(true_val_addr);
                     sub_reads.insert(false_val_addr);
-                    
+
                     let mut sub_writes = HashSet::new();
                     sub_writes.insert(sub_temp_addr);
-                    
+
                     result.push(Op {
                         id: ssa_op.id, // Use same ID for sub (will be different for fma)
                         engine: crate::types::Engine::Valu,
@@ -214,7 +231,7 @@ pub fn lower_ssa_ops_with_shift(
                         last_use_reads: HashSet::new(),
                         produces_constant: None,
                     });
-                    
+
                     // FMA op: dest = cond * sub_temp + false_val
                     let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                     fma_slot.push(SlotVal::Str("multiply_add".to_string()));
@@ -222,15 +239,15 @@ pub fn lower_ssa_ops_with_shift(
                     fma_slot.push(SlotVal::Int(cond_addr));
                     fma_slot.push(SlotVal::Int(sub_temp_addr));
                     fma_slot.push(SlotVal::Int(false_val_addr));
-                    
+
                     let mut fma_reads = HashSet::new();
                     fma_reads.insert(cond_addr);
                     fma_reads.insert(sub_temp_addr);
                     fma_reads.insert(false_val_addr);
-                    
+
                     let mut fma_writes = HashSet::new();
                     fma_writes.insert(dest_addr);
-                    
+
                     result.push(Op {
                         id: ssa_op.id + 1000000, // Different ID for fma op
                         engine: crate::types::Engine::Valu,
@@ -357,7 +374,7 @@ pub fn expand_ssa_valu_to_alu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Operand, Opcode};
+    use crate::types::{Opcode, Operand};
 
     fn make_const_choice_op(id: usize, value: i64, dest: VReg, cycle: i32) -> SsaOp {
         let mut op = SsaOp::new(
@@ -388,7 +405,14 @@ mod tests {
         let shifted_ops = HashSet::new();
         let const_add_imm_ops = HashSet::new(); // Use Load
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -416,7 +440,14 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(99); // Use AddImm
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -448,14 +479,21 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(1); // op1 uses AddImm, op2 uses Load
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &HashSet::new(), &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(result.len(), 2);
-        
+
         // First op: AddImm
         assert_eq!(result[0].engine, Engine::Flow);
         assert_eq!(result[0].slot[0], SlotVal::Str("add_imm".to_string()));
-        
+
         // Second op: Load
         assert_eq!(result[1].engine, Engine::Load);
         assert_eq!(result[1].slot[0], SlotVal::Str("const".to_string()));
@@ -465,7 +503,14 @@ mod tests {
     // SelectChoice lowering tests
     // =========================================================================
 
-    fn make_select_choice_op(id: usize, cond: VReg, true_val: VReg, false_val: VReg, delta: Option<VReg>, cycle: i32) -> SsaOp {
+    fn make_select_choice_op(
+        id: usize,
+        cond: VReg,
+        true_val: VReg,
+        false_val: VReg,
+        delta: Option<VReg>,
+        cycle: i32,
+    ) -> SsaOp {
         let mut op = SsaOp::new(
             id,
             Engine::Flow, // Default engine
@@ -490,7 +535,7 @@ mod tests {
         let true_val = VReg::vector(2);
         let false_val = VReg::vector(3);
         let dest = VReg::vector(100);
-        
+
         vreg_to_addr.insert(cond, 100);
         vreg_to_addr.insert(true_val, 200);
         vreg_to_addr.insert(false_val, 300);
@@ -504,18 +549,29 @@ mod tests {
         let const_add_imm_ops = HashSet::new();
         let select_fma_ops = HashSet::new(); // vselect path
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &select_fma_ops,
+            &HashMap::new(),
+        );
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
         let op = &result[0];
         assert_eq!(op.slot[0], SlotVal::Str("vselect".to_string()));
-        
+
         // Verify all addresses are valid (< scratch budget)
         for addr in &op.reads {
             assert!(*addr < 1536, "Read address {} exceeds scratch budget", addr);
         }
         for addr in &op.writes {
-            assert!(*addr < 1536, "Write address {} exceeds scratch budget", addr);
+            assert!(
+                *addr < 1536,
+                "Write address {} exceeds scratch budget",
+                addr
+            );
         }
     }
 
@@ -528,7 +584,7 @@ mod tests {
         let false_val = VReg::vector(3);
         let delta = VReg::vector(4);
         let dest = VReg::vector(100);
-        
+
         vreg_to_addr.insert(cond, 100);
         vreg_to_addr.insert(true_val, 200);
         vreg_to_addr.insert(false_val, 300);
@@ -544,18 +600,29 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &select_fma_ops,
+            &HashMap::new(),
+        );
 
         assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
         let op = &result[0];
         assert_eq!(op.slot[0], SlotVal::Str("multiply_add".to_string()));
-        
+
         // Verify all addresses are valid (< scratch budget)
         for addr in &op.reads {
             assert!(*addr < 1536, "Read address {} exceeds scratch budget", addr);
         }
         for addr in &op.writes {
-            assert!(*addr < 1536, "Write address {} exceeds scratch budget", addr);
+            assert!(
+                *addr < 1536,
+                "Write address {} exceeds scratch budget",
+                addr
+            );
         }
     }
 
@@ -570,7 +637,7 @@ mod tests {
         let false_val = VReg::vector(3);
         let dest = VReg::vector(100);
         let sub_temp = VReg::vector(101); // Allocated for sub temp
-        
+
         vreg_to_addr.insert(cond, 100);
         vreg_to_addr.insert(true_val, 200);
         vreg_to_addr.insert(false_val, 300);
@@ -587,30 +654,57 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &select_fma_ops,
+            &HashMap::new(),
+        );
 
         // FMA without delta should produce 2 ops: sub + fma
-        assert_eq!(result.len(), 2, "FMA without delta should produce 2 ops (sub + fma)");
-        
+        assert_eq!(
+            result.len(),
+            2,
+            "FMA without delta should produce 2 ops (sub + fma)"
+        );
+
         let sub_op = &result[0];
         let fma_op = &result[1];
-        
+
         assert_eq!(sub_op.slot[0], SlotVal::Str("-".to_string()));
         assert_eq!(fma_op.slot[0], SlotVal::Str("multiply_add".to_string()));
-        
+
         // CRITICAL: Verify all addresses are valid (< scratch budget)
         // This test should FAIL currently because sub_temp_addr = 10000 + 42 = 10042
         for addr in &sub_op.reads {
-            assert!(*addr < 1536, "Sub read address {} exceeds scratch budget", addr);
+            assert!(
+                *addr < 1536,
+                "Sub read address {} exceeds scratch budget",
+                addr
+            );
         }
         for addr in &sub_op.writes {
-            assert!(*addr < 1536, "Sub write address {} exceeds scratch budget (BUG: using 10000 + op_id)", addr);
+            assert!(
+                *addr < 1536,
+                "Sub write address {} exceeds scratch budget (BUG: using 10000 + op_id)",
+                addr
+            );
         }
         for addr in &fma_op.reads {
-            assert!(*addr < 1536, "FMA read address {} exceeds scratch budget (BUG: reading from sub temp)", addr);
+            assert!(
+                *addr < 1536,
+                "FMA read address {} exceeds scratch budget (BUG: reading from sub temp)",
+                addr
+            );
         }
         for addr in &fma_op.writes {
-            assert!(*addr < 1536, "FMA write address {} exceeds scratch budget", addr);
+            assert!(
+                *addr < 1536,
+                "FMA write address {} exceeds scratch budget",
+                addr
+            );
         }
     }
 
@@ -623,7 +717,7 @@ mod tests {
         let false_val = VReg::vector(3);
         let dest = VReg::vector(100);
         let sub_temp = VReg::vector(101);
-        
+
         vreg_to_addr.insert(cond, 100);
         vreg_to_addr.insert(true_val, 200);
         vreg_to_addr.insert(false_val, 300);
@@ -640,7 +734,14 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(&ssa_ops, &vreg_to_addr, &shifted_ops, &const_add_imm_ops, &select_fma_ops, &HashMap::new());
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &select_fma_ops,
+            &HashMap::new(),
+        );
 
         // Check slot values for invalid addresses
         for op in &result {
@@ -650,7 +751,11 @@ mod tests {
                         *addr < 1536,
                         "Slot contains invalid address {}: {} (op: {:?})",
                         addr,
-                        if *addr >= 10000 { "BUG: using fake temp address 10000 + op_id" } else { "" },
+                        if *addr >= 10000 {
+                            "BUG: using fake temp address 10000 + op_id"
+                        } else {
+                            ""
+                        },
                         op.slot[0]
                     );
                 }

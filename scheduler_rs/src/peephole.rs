@@ -109,8 +109,10 @@ pub fn optimize(ops: &mut Vec<Op>, config: &PeepholeConfig) -> PeepholeStats {
         stats.dce_eliminated = eliminate_dead_code(ops);
     }
 
-    stats.total_eliminated =
-        stats.cse_eliminated + stats.algebraic_simplified + stats.zero_ops_eliminated + stats.dce_eliminated;
+    stats.total_eliminated = stats.cse_eliminated
+        + stats.algebraic_simplified
+        + stats.zero_ops_eliminated
+        + stats.dce_eliminated;
 
     stats
 }
@@ -507,10 +509,16 @@ fn eliminate_dead_code(ops: &mut Vec<Op>) -> usize {
     // Debug: check op 42's reads
     for op in ops.iter() {
         if op.id == 42 {
-            println!("DEBUG op 42: slot={:?}, reads={:?}, writes={:?}", op.slot, op.reads, op.writes);
+            println!(
+                "DEBUG op 42: slot={:?}, reads={:?}, writes={:?}",
+                op.slot, op.reads, op.writes
+            );
         }
         if op.id == 22 {
-            println!("DEBUG op 22: slot={:?}, reads={:?}, writes={:?}", op.slot, op.reads, op.writes);
+            println!(
+                "DEBUG op 22: slot={:?}, reads={:?}, writes={:?}",
+                op.slot, op.reads, op.writes
+            );
         }
     }
 
@@ -639,7 +647,7 @@ mod tests {
     #[ignore] // Disabled: peephole optimizations off by default (commit 531451c)
     fn test_zero_mul_eliminated() {
         let mut ops = vec![
-            make_alu_op(0, "*", 10, 0, 0), // 0 * 0 -> eliminate
+            make_alu_op(0, "*", 10, 0, 0),  // 0 * 0 -> eliminate
             make_alu_op(1, "+", 20, 10, 1), // uses result of above
         ];
 
@@ -656,8 +664,8 @@ mod tests {
     #[ignore] // Disabled: peephole optimizations off by default (commit 531451c)
     fn test_cse_duplicate_add() {
         let mut ops = vec![
-            make_alu_op(0, "+", 10, 1, 2), // First: 1 + 2 -> 10
-            make_alu_op(1, "+", 20, 1, 2), // Duplicate: 1 + 2 -> 20
+            make_alu_op(0, "+", 10, 1, 2),   // First: 1 + 2 -> 10
+            make_alu_op(1, "+", 20, 1, 2),   // Duplicate: 1 + 2 -> 20
             make_alu_op(2, "+", 30, 10, 20), // Uses both results
         ];
 

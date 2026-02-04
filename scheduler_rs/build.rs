@@ -15,8 +15,9 @@ fn main() {
             .parent()
             .map_or(false, |p| p.join("pyproject.toml").exists());
     if is_nested {
-        let ok = std::env::var("BUILD_FROM_PROJECT_ROOT")
-            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true") || v == "yes");
+        let ok = std::env::var("BUILD_FROM_PROJECT_ROOT").map_or(false, |v| {
+            v == "1" || v.eq_ignore_ascii_case("true") || v == "yes"
+        });
         if !ok {
             panic!(
                 "Do not run maturin/cargo from inside scheduler_rs/. \
@@ -32,8 +33,8 @@ fn main() {
         // Priority: LIBRARY_PATH env var, then common Homebrew locations
         let lib_paths = [
             std::env::var("LIBRARY_PATH").ok(),
-            Some("/opt/homebrew/lib".to_string()),  // Apple Silicon Homebrew
-            Some("/usr/local/lib".to_string()),     // Intel Mac Homebrew
+            Some("/opt/homebrew/lib".to_string()), // Apple Silicon Homebrew
+            Some("/usr/local/lib".to_string()),    // Intel Mac Homebrew
         ];
 
         for path in lib_paths.iter().flatten() {

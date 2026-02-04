@@ -163,31 +163,31 @@ impl MachineConfig {
 #[repr(u8)]
 pub enum Opcode {
     // Arithmetic operations
-    Add = 0,       // "+"
-    Sub = 1,       // "-"
-    Mul = 2,       // "*"
-    Div = 3,       // "/"
-    Mod = 4,       // "%"
-    Cdiv = 5,      // "cdiv" (ceiling division)
+    Add = 0,  // "+"
+    Sub = 1,  // "-"
+    Mul = 2,  // "*"
+    Div = 3,  // "/"
+    Mod = 4,  // "%"
+    Cdiv = 5, // "cdiv" (ceiling division)
 
     // Bitwise operations
-    And = 6,       // "&"
-    Or = 7,        // "|"
-    Xor = 8,       // "^"
-    Shl = 9,       // "<<"
-    Shr = 10,      // ">>"
+    And = 6,  // "&"
+    Or = 7,   // "|"
+    Xor = 8,  // "^"
+    Shl = 9,  // "<<"
+    Shr = 10, // ">>"
 
     // Comparison operations
-    Eq = 11,       // "=="
-    Ne = 12,       // "!="
-    Lt = 13,       // "<"
-    Le = 14,       // "<="
-    Gt = 15,       // ">"
-    Ge = 16,       // ">="
+    Eq = 11, // "=="
+    Ne = 12, // "!="
+    Lt = 13, // "<"
+    Le = 14, // "<="
+    Gt = 15, // ">"
+    Ge = 16, // ">="
 
     // Vector-specific operations
     Vbroadcast = 17,
-    MultiplyAdd = 18,  // "multiply_add"
+    MultiplyAdd = 18, // "multiply_add"
 
     // Load operations
     Load = 19,
@@ -213,8 +213,8 @@ pub enum Opcode {
     AddImm = 31,
 
     // Scheduling-only pseudo-ops (elided from output)
-    Barrier = 32,     // Round boundary barrier
-    ConstChoice = 33, // Constant with encoding choice (Load vs AddImm)
+    Barrier = 32,      // Round boundary barrier
+    ConstChoice = 33,  // Constant with encoding choice (Load vs AddImm)
     SelectChoice = 34, // Selection with encoding choice (vselect vs FMA: sub + fma)
 }
 
@@ -348,7 +348,9 @@ pub const SLOT_LIMITS: [(&str, usize); 6] = [
 
 /// Get the slot limit for an engine (legacy string-based version)
 pub fn get_slot_limit(engine: &str) -> usize {
-    Engine::from_str(engine).map(|e| e.slot_limit()).unwrap_or(1)
+    Engine::from_str(engine)
+        .map(|e| e.slot_limit())
+        .unwrap_or(1)
 }
 
 /// VALU ops that can be converted to scalar ALU ops (binary operations)
@@ -364,7 +366,7 @@ pub const VALU_TO_ALU_OPS: &[&str] = &[
 /// Slot value - can be opcode or int
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotVal {
-    Str(String),  // Legacy: will be replaced with Op(Opcode)
+    Str(String), // Legacy: will be replaced with Op(Opcode)
     Int(i64),
 }
 
@@ -449,7 +451,10 @@ impl ConstEncoding {
             ConstEncoding::Add { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Sub { a_value, b_value } => vec![*a_value, *b_value],
             ConstEncoding::Mul { a_value, b_value } => vec![*a_value, *b_value],
-            ConstEncoding::Shift { base_value, shift_amount } => {
+            ConstEncoding::Shift {
+                base_value,
+                shift_amount,
+            } => {
                 // Shift amount must also be available as a constant
                 vec![*base_value, *shift_amount as i64]
             }
@@ -459,14 +464,17 @@ impl ConstEncoding {
     /// Check if this encoding's dependencies are satisfied
     pub fn is_ready(&self, available_values: &HashSet<i64>) -> bool {
         match self {
-            ConstEncoding::Load => true, // No dependencies
+            ConstEncoding::Load => true,          // No dependencies
             ConstEncoding::AddImm { .. } => true, // No dependencies - address 0 always contains 0 (hardware initialization)
             ConstEncoding::Add { a_value, b_value }
             | ConstEncoding::Sub { a_value, b_value }
             | ConstEncoding::Mul { a_value, b_value } => {
                 available_values.contains(a_value) && available_values.contains(b_value)
             }
-            ConstEncoding::Shift { base_value, shift_amount } => {
+            ConstEncoding::Shift {
+                base_value,
+                shift_amount,
+            } => {
                 available_values.contains(base_value)
                     && available_values.contains(&(*shift_amount as i64))
             }
@@ -515,7 +523,12 @@ impl PseudoConst {
     }
 
     /// Create a new pseudo-const with configurable encoding flags
-    pub fn new_with_flags(id: usize, value: i64, dest_register: Option<i64>, flags: ConstEncodingFlags) -> Self {
+    pub fn new_with_flags(
+        id: usize,
+        value: i64,
+        dest_register: Option<i64>,
+        flags: ConstEncodingFlags,
+    ) -> Self {
         let encodings = compute_const_encodings_with_flags(value, flags);
         PseudoConst {
             id,
@@ -535,7 +548,12 @@ impl PseudoConst {
     }
 
     /// Create a critical pseudo-const with configurable encoding flags
-    pub fn new_critical_with_flags(id: usize, value: i64, dest_register: Option<i64>, flags: ConstEncodingFlags) -> Self {
+    pub fn new_critical_with_flags(
+        id: usize,
+        value: i64,
+        dest_register: Option<i64>,
+        flags: ConstEncodingFlags,
+    ) -> Self {
         let mut pc = Self::new_with_flags(id, value, dest_register, flags);
         pc.is_critical = true;
         // For critical constants, put Load first if not already (and if enabled)
@@ -552,8 +570,13 @@ impl PseudoConst {
     }
 
     /// Get the best encoding that can be scheduled now
-    pub fn best_available_encoding(&self, available_values: &HashSet<i64>) -> Option<&ConstEncoding> {
-        self.encodings.iter().find(|enc| enc.is_ready(available_values))
+    pub fn best_available_encoding(
+        &self,
+        available_values: &HashSet<i64>,
+    ) -> Option<&ConstEncoding> {
+        self.encodings
+            .iter()
+            .find(|enc| enc.is_ready(available_values))
     }
 }
 
@@ -660,7 +683,10 @@ pub fn compute_const_encodings(value: i64) -> Vec<ConstEncoding> {
 /// 1. ALU derivations (if dependencies available, saves both load and flow slots)
 /// 2. AddImm via flow slot (no dependencies, flow slots rarely used)
 /// 3. Load (fallback, uses precious load slots)
-pub fn compute_const_encodings_with_flags(value: i64, flags: ConstEncodingFlags) -> Vec<ConstEncoding> {
+pub fn compute_const_encodings_with_flags(
+    value: i64,
+    flags: ConstEncodingFlags,
+) -> Vec<ConstEncoding> {
     let mut encodings = Vec::new();
 
     // ALU-based derivations (highest priority when dependencies are ready)
@@ -846,7 +872,9 @@ pub fn expand_valu_to_alu_smart(
                 SlotVal::Int(dest + i_offset),
                 SlotVal::Int(actual_src1),
                 SlotVal::Int(actual_src2),
-            ].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect(),
             cycle: -1,
             dep_ids: op.dep_ids.clone(),
             reads: [actual_src1, actual_src2].into_iter().collect(),
@@ -887,7 +915,7 @@ pub fn resolve_pseudo_const(
             (Engine::Load, slot, HashSet::new())
         }
 
-            ConstEncoding::AddImm { value } => {
+        ConstEncoding::AddImm { value } => {
             // add_imm dest, scratch[0], value
             // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
             // is guaranteed by hardware initialization. add_imm reads from address 0, but we don't
@@ -949,7 +977,10 @@ pub fn resolve_pseudo_const(
             (Engine::Alu, slot, reads)
         }
 
-        ConstEncoding::Shift { base_value, shift_amount } => {
+        ConstEncoding::Shift {
+            base_value,
+            shift_amount,
+        } => {
             let base_reg = *value_to_register.get(base_value)?;
             let shift_reg = *value_to_register.get(&(*shift_amount as i64))?;
             let slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = [
@@ -1010,12 +1041,18 @@ pub struct VReg {
 impl VReg {
     /// Create a scalar VReg
     pub fn scalar(id: u32) -> Self {
-        Self { id, width: VRegWidth::Scalar }
+        Self {
+            id,
+            width: VRegWidth::Scalar,
+        }
     }
 
     /// Create a vector VReg
     pub fn vector(id: u32) -> Self {
-        Self { id, width: VRegWidth::Vector }
+        Self {
+            id,
+            width: VRegWidth::Vector,
+        }
     }
 
     /// Get the size in words (1 for scalar, VLEN for vector)
@@ -1337,7 +1374,13 @@ pub struct SsaOp {
 
 impl SsaOp {
     /// Create a new unscheduled SsaOp
-    pub fn new(id: usize, engine: Engine, opcode: Opcode, dest: Option<VReg>, srcs: Vec<Operand>) -> Self {
+    pub fn new(
+        id: usize,
+        engine: Engine,
+        opcode: Opcode,
+        dest: Option<VReg>,
+        srcs: Vec<Operand>,
+    ) -> Self {
         Self {
             id,
             engine,
@@ -1353,7 +1396,7 @@ impl SsaOp {
             symmetry_hint: None,
             const_alternatives: None,
             needs_subtraction: true, // Default: subtraction needed (false_val != 0)
-            delta_vreg: None, // Default: no precomputed delta
+            delta_vreg: None,        // Default: no precomputed delta
             select_choice_parent: None, // Default: not part of SelectChoice expansion
             sub_temp_vreg: None, // Default: no sub temp needed (set for SelectChoice without delta)
         }
@@ -1703,7 +1746,9 @@ impl UsageAccounting {
                 total_words += dest.size();
 
                 // Determine round (-1 for init/finalization)
-                let round = op.source_info.as_ref()
+                let round = op
+                    .source_info
+                    .as_ref()
                     .and_then(|s| s.round)
                     .map(|r| r as i32)
                     .unwrap_or(-1);
@@ -1712,29 +1757,34 @@ impl UsageAccounting {
                 let var_type = op.var_type.unwrap_or(VarType::Temporary);
 
                 // Aggregate by round
-                by_round_map.entry(round)
+                by_round_map
+                    .entry(round)
                     .or_insert_with(UsageStats::new)
                     .add_vreg(dest);
 
                 // Aggregate by var_type
-                by_type_map.entry(var_type)
+                by_type_map
+                    .entry(var_type)
                     .or_insert_with(UsageStats::new)
                     .add_vreg(dest);
 
                 // Aggregate bivariate
-                bivariate_map.entry((round, var_type))
+                bivariate_map
+                    .entry((round, var_type))
                     .or_insert_with(UsageStats::new)
                     .add_vreg(dest);
             }
         }
 
         // Convert maps to sorted vectors
-        let mut by_round: Vec<RoundUsage> = by_round_map.into_iter()
+        let mut by_round: Vec<RoundUsage> = by_round_map
+            .into_iter()
             .map(|(round, stats)| RoundUsage { round, stats })
             .collect();
         by_round.sort_by_key(|r| r.round);
 
-        let mut by_var_type: Vec<VarTypeUsage> = by_type_map.into_iter()
+        let mut by_var_type: Vec<VarTypeUsage> = by_type_map
+            .into_iter()
             .map(|(var_type, stats)| VarTypeUsage {
                 var_type: var_type.as_str().to_string(),
                 stats,
@@ -1742,7 +1792,8 @@ impl UsageAccounting {
             .collect();
         by_var_type.sort_by(|a, b| a.var_type.cmp(&b.var_type));
 
-        let mut bivariate: Vec<BivariateUsage> = bivariate_map.into_iter()
+        let mut bivariate: Vec<BivariateUsage> = bivariate_map
+            .into_iter()
             .map(|((round, var_type), stats)| BivariateUsage {
                 round,
                 var_type: var_type.as_str().to_string(),
@@ -1750,7 +1801,8 @@ impl UsageAccounting {
             })
             .collect();
         bivariate.sort_by(|a, b| {
-            a.round.cmp(&b.round)
+            a.round
+                .cmp(&b.round)
                 .then_with(|| a.var_type.cmp(&b.var_type))
         });
 
@@ -1789,10 +1841,22 @@ mod tests {
     fn test_compute_encodings_small() {
         let encodings = compute_const_encodings(4);
         assert!(encodings.contains(&ConstEncoding::Load));
-        assert!(encodings.contains(&ConstEncoding::Add { a_value: 2, b_value: 2 }));
-        assert!(encodings.contains(&ConstEncoding::Mul { a_value: 2, b_value: 2 }));
-        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 1, shift_amount: 2 }));
-        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 2, shift_amount: 1 }));
+        assert!(encodings.contains(&ConstEncoding::Add {
+            a_value: 2,
+            b_value: 2
+        }));
+        assert!(encodings.contains(&ConstEncoding::Mul {
+            a_value: 2,
+            b_value: 2
+        }));
+        assert!(encodings.contains(&ConstEncoding::Shift {
+            base_value: 1,
+            shift_amount: 2
+        }));
+        assert!(encodings.contains(&ConstEncoding::Shift {
+            base_value: 2,
+            shift_amount: 1
+        }));
     }
 
     #[test]
@@ -1800,13 +1864,25 @@ mod tests {
         let encodings = compute_const_encodings(240);
         assert!(encodings.contains(&ConstEncoding::Load));
         // 240 = 120 + 120
-        assert!(encodings.contains(&ConstEncoding::Add { a_value: 120, b_value: 120 }));
+        assert!(encodings.contains(&ConstEncoding::Add {
+            a_value: 120,
+            b_value: 120
+        }));
         // 240 = 128 + 112
-        assert!(encodings.contains(&ConstEncoding::Add { a_value: 112, b_value: 128 }));
+        assert!(encodings.contains(&ConstEncoding::Add {
+            a_value: 112,
+            b_value: 128
+        }));
         // 240 = 15 << 4
-        assert!(encodings.contains(&ConstEncoding::Shift { base_value: 15, shift_amount: 4 }));
+        assert!(encodings.contains(&ConstEncoding::Shift {
+            base_value: 15,
+            shift_amount: 4
+        }));
         // 240 = 15 * 16
-        assert!(encodings.contains(&ConstEncoding::Mul { a_value: 15, b_value: 16 }));
+        assert!(encodings.contains(&ConstEncoding::Mul {
+            a_value: 15,
+            b_value: 16
+        }));
     }
 
     #[test]
@@ -1817,10 +1893,16 @@ mod tests {
         let add_imm = ConstEncoding::AddImm { value: 42 };
         assert_eq!(add_imm.dependencies(), Vec::<i64>::new()); // No dependencies - address 0 always contains 0
 
-        let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        let add = ConstEncoding::Add {
+            a_value: 10,
+            b_value: 20,
+        };
         assert_eq!(add.dependencies(), vec![10, 20]);
 
-        let shift = ConstEncoding::Shift { base_value: 5, shift_amount: 3 };
+        let shift = ConstEncoding::Shift {
+            base_value: 5,
+            shift_amount: 3,
+        };
         assert_eq!(shift.dependencies(), vec![5, 3]);
     }
 
@@ -1834,7 +1916,10 @@ mod tests {
         let add_imm = ConstEncoding::AddImm { value: 42 };
         assert!(add_imm.is_ready(&available)); // Always ready - address 0 always contains 0
 
-        let add = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        let add = ConstEncoding::Add {
+            a_value: 10,
+            b_value: 20,
+        };
         assert!(!add.is_ready(&available));
 
         available.insert(10);
@@ -1857,7 +1942,13 @@ mod tests {
         // Add 120 - now ALU Add is preferred (ALU > AddImm > Load)
         available.insert(120);
         let best = pc.best_available_encoding(&available);
-        assert_eq!(best, Some(&ConstEncoding::Add { a_value: 120, b_value: 120 }));
+        assert_eq!(
+            best,
+            Some(&ConstEncoding::Add {
+                a_value: 120,
+                b_value: 120
+            })
+        );
     }
 
     #[test]
@@ -1885,11 +1976,15 @@ mod tests {
     #[test]
     fn test_resolve_pseudo_const_add() {
         let pc = PseudoConst::new(0, 30, Some(100));
-        let mut value_to_reg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        value_to_reg.insert(10, 50);  // value 10 is in register 50
-        value_to_reg.insert(20, 60);  // value 20 is in register 60
+        let mut value_to_reg: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::new();
+        value_to_reg.insert(10, 50); // value 10 is in register 50
+        value_to_reg.insert(20, 60); // value 20 is in register 60
 
-        let encoding = ConstEncoding::Add { a_value: 10, b_value: 20 };
+        let encoding = ConstEncoding::Add {
+            a_value: 10,
+            b_value: 20,
+        };
         let op = resolve_pseudo_const(&pc, &encoding, &value_to_reg, 1000);
         assert!(op.is_some());
 
@@ -1913,7 +2008,7 @@ mod tests {
 
         let op = op.unwrap();
         assert_eq!(op.engine, Engine::Flow);
-        assert!(op.reads.contains(&0));  // Reads from address 0 (but no precedence constraint needed - always initialized)
+        assert!(op.reads.contains(&0)); // Reads from address 0 (but no precedence constraint needed - always initialized)
         assert!(op.writes.contains(&100));
         assert_eq!(op.produces_constant, Some(42));
     }
@@ -1926,7 +2021,10 @@ mod tests {
         let load = ConstEncoding::Load;
         assert_eq!(load.engine(), Engine::Load);
 
-        let add = ConstEncoding::Add { a_value: 1, b_value: 2 };
+        let add = ConstEncoding::Add {
+            a_value: 1,
+            b_value: 2,
+        };
         assert_eq!(add.engine(), Engine::Alu);
     }
 
@@ -2006,20 +2104,8 @@ mod tests {
 
     #[test]
     fn test_ssa_op_is_vector() {
-        let scalar_op = SsaOp::new(
-            0,
-            Engine::Alu,
-            Opcode::Add,
-            Some(VReg::scalar(0)),
-            vec![],
-        );
-        let vector_op = SsaOp::new(
-            1,
-            Engine::Valu,
-            Opcode::Add,
-            Some(VReg::vector(0)),
-            vec![],
-        );
+        let scalar_op = SsaOp::new(0, Engine::Alu, Opcode::Add, Some(VReg::scalar(0)), vec![]);
+        let vector_op = SsaOp::new(1, Engine::Valu, Opcode::Add, Some(VReg::vector(0)), vec![]);
         assert!(!scalar_op.is_vector());
         assert!(vector_op.is_vector());
     }
@@ -2059,9 +2145,12 @@ mod tests {
         //
         // This correctly models the ISA: reads happen before writes in a cycle,
         // so A's storage is free after the read, before B's write begins.
-        let i1 = LiveInterval::new(0, 5);   // A: last read at cycle 5
-        let i2 = LiveInterval::new(5, 10);  // B: defined at cycle 5
-        assert!(!i1.overlaps(&i2), "Adjacent intervals [0,5] and [5,10] should NOT overlap (same-cycle reuse)");
+        let i1 = LiveInterval::new(0, 5); // A: last read at cycle 5
+        let i2 = LiveInterval::new(5, 10); // B: defined at cycle 5
+        assert!(
+            !i1.overlaps(&i2),
+            "Adjacent intervals [0,5] and [5,10] should NOT overlap (same-cycle reuse)"
+        );
         assert!(!i2.overlaps(&i1), "Overlap check should be symmetric");
     }
 
@@ -2085,9 +2174,12 @@ mod tests {
         // Check: 5 < 10 ✓ AND 5 < 6 ✓ → OVERLAP
         //
         // The +1 extension for dead VRegs ensures this works correctly.
-        let i1 = LiveInterval::new(5, 6);   // A: dead VReg written at 5 (end = 5+1)
-        let i2 = LiveInterval::new(5, 10);  // B: written at 5
-        assert!(i1.overlaps(&i2), "Dead VReg [5,6] MUST overlap with [5,10] (both write at cycle 5)");
+        let i1 = LiveInterval::new(5, 6); // A: dead VReg written at 5 (end = 5+1)
+        let i2 = LiveInterval::new(5, 10); // B: written at 5
+        assert!(
+            i1.overlaps(&i2),
+            "Dead VReg [5,6] MUST overlap with [5,10] (both write at cycle 5)"
+        );
     }
 
     #[test]
@@ -2098,9 +2190,12 @@ mod tests {
         // VReg B: WRITTEN at cycle 6 → [6, ...]
         //
         // Check: 5 < 10 ✓ AND 6 < 6 ✗ → NO overlap (correct!)
-        let i1 = LiveInterval::new(5, 6);   // A: dead VReg at cycle 5
-        let i2 = LiveInterval::new(6, 10);  // B: written at cycle 6
-        assert!(!i1.overlaps(&i2), "Dead VReg [5,6] should NOT overlap with [6,10] (different write cycles)");
+        let i1 = LiveInterval::new(5, 6); // A: dead VReg at cycle 5
+        let i2 = LiveInterval::new(6, 10); // B: written at cycle 6
+        assert!(
+            !i1.overlaps(&i2),
+            "Dead VReg [5,6] should NOT overlap with [6,10] (different write cycles)"
+        );
     }
 
     #[test]
@@ -2108,9 +2203,9 @@ mod tests {
         // Closed interval [2, 7] contains cycles 2,3,4,5,6,7 (both endpoints inclusive)
         let interval = LiveInterval::new(2, 7);
         assert!(!interval.contains(1));
-        assert!(interval.contains(2));  // start is inclusive
+        assert!(interval.contains(2)); // start is inclusive
         assert!(interval.contains(5));
-        assert!(interval.contains(7));  // end is inclusive
+        assert!(interval.contains(7)); // end is inclusive
         assert!(!interval.contains(8));
     }
 
@@ -2197,7 +2292,11 @@ mod tests {
             vec![Operand::vector(1), Operand::vector(1)],
         );
         let unique = op.unique_src_vregs();
-        assert_eq!(unique.len(), 1, "Vector duplicate operands should be deduplicated");
+        assert_eq!(
+            unique.len(),
+            1,
+            "Vector duplicate operands should be deduplicated"
+        );
         assert_eq!(unique[0], VReg::vector(1));
     }
 
@@ -2230,6 +2329,10 @@ mod tests {
         let unique = op.unique_src_vregs();
         assert_eq!(unique.len(), 2);
         assert_eq!(unique[0], VReg::vector(3), "First unique VReg should be v3");
-        assert_eq!(unique[1], VReg::vector(1), "Second unique VReg should be v1");
+        assert_eq!(
+            unique[1],
+            VReg::vector(1),
+            "Second unique VReg should be v1"
+        );
     }
 }

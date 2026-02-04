@@ -41,13 +41,16 @@
 // Allow deprecated usage within this module (internal consistency)
 #![allow(deprecated)]
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::types::{Op, SlotVal, VLEN};
 
 /// A live interval representing the lifetime of a scratch address.
-#[deprecated(since = "0.1.0", note = "Use types::LiveInterval with address_assign module instead")]
+#[deprecated(
+    since = "0.1.0",
+    note = "Use types::LiveInterval with address_assign module instead"
+)]
 #[derive(Clone, Debug)]
 pub struct LiveInterval {
     /// Original address assigned during kernel building
@@ -276,7 +279,8 @@ impl ScratchRegisterAllocator {
         }
 
         // Collect non-fixed intervals sorted by def_cycle
-        let mut intervals: Vec<LiveInterval> = self.intervals
+        let mut intervals: Vec<LiveInterval> = self
+            .intervals
             .iter()
             .filter(|iv| !iv.is_fixed)
             .cloned()
@@ -344,19 +348,17 @@ impl ScratchRegisterAllocator {
         }
 
         // Calculate highest addresses used
-        let max_addr_before = self.intervals
+        let max_addr_before = self
+            .intervals
             .iter()
             .map(|iv| iv.addr + (iv.size as i64 - 1))
             .max()
             .unwrap_or(0);
 
-        let max_addr_after = self.addr_mapping
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(0);
+        let max_addr_after = self.addr_mapping.values().copied().max().unwrap_or(0);
 
-        let remapped_count = self.addr_mapping
+        let remapped_count = self
+            .addr_mapping
             .iter()
             .filter(|(old, new)| old != new)
             .count();
@@ -441,25 +443,31 @@ fn is_vector_address(op: &Op, addr: i64) -> bool {
 /// - reads set
 /// - last_use_reads set
 /// - slot values (only ADDRESS operands, not literal values)
-#[deprecated(since = "0.1.0", note = "Use the SSA path with address_assign::lower_ssa_ops instead")]
+#[deprecated(
+    since = "0.1.0",
+    note = "Use the SSA path with address_assign::lower_ssa_ops instead"
+)]
 pub fn rewrite_addresses(ops: &mut [Op], mapping: &HashMap<i64, i64>) {
     for op in ops {
         // Rewrite writes
-        let new_writes: HashSet<i64> = op.writes
+        let new_writes: HashSet<i64> = op
+            .writes
             .iter()
             .map(|&addr| *mapping.get(&addr).unwrap_or(&addr))
             .collect();
         op.writes = new_writes;
 
         // Rewrite reads
-        let new_reads: HashSet<i64> = op.reads
+        let new_reads: HashSet<i64> = op
+            .reads
             .iter()
             .map(|&addr| *mapping.get(&addr).unwrap_or(&addr))
             .collect();
         op.reads = new_reads;
 
         // Rewrite last_use_reads
-        let new_last_use_reads: HashSet<i64> = op.last_use_reads
+        let new_last_use_reads: HashSet<i64> = op
+            .last_use_reads
             .iter()
             .map(|&addr| *mapping.get(&addr).unwrap_or(&addr))
             .collect();
@@ -509,7 +517,10 @@ pub fn rewrite_addresses(ops: &mut [Op], mapping: &HashMap<i64, i64>) {
 ///
 /// # Returns
 /// Allocation result with statistics. Check `budget_exceeded` to see if allocation is valid.
-#[deprecated(since = "0.1.0", note = "Use the SSA path with address_assign::assign_addresses instead")]
+#[deprecated(
+    since = "0.1.0",
+    note = "Use the SSA path with address_assign::assign_addresses instead"
+)]
 pub fn allocate_registers(
     ops: &mut [Op],
     budget: usize,
@@ -585,10 +596,10 @@ mod tests {
     fn test_non_overlapping_reuse() {
         // Two variables with non-overlapping lifetimes should share an address
         let mut ops = vec![
-            make_op(0, 0, &[], &[100]),      // write to 100 at cycle 0
-            make_op(1, 1, &[100], &[]),      // read 100 at cycle 1 (last use)
-            make_op(2, 2, &[], &[200]),      // write to 200 at cycle 2
-            make_op(3, 3, &[200], &[]),      // read 200 at cycle 3 (last use)
+            make_op(0, 0, &[], &[100]), // write to 100 at cycle 0
+            make_op(1, 1, &[100], &[]), // read 100 at cycle 1 (last use)
+            make_op(2, 2, &[], &[200]), // write to 200 at cycle 2
+            make_op(3, 3, &[200], &[]), // read 200 at cycle 3 (last use)
         ];
         ops[1].last_use_reads.insert(100);
         ops[3].last_use_reads.insert(200);
@@ -599,7 +610,10 @@ mod tests {
         // Both should be mapped to the same address since they don't overlap
         let addr_100 = *result.addr_mapping.get(&100).unwrap();
         let addr_200 = *result.addr_mapping.get(&200).unwrap();
-        assert_eq!(addr_100, addr_200, "Non-overlapping intervals should reuse addresses");
+        assert_eq!(
+            addr_100, addr_200,
+            "Non-overlapping intervals should reuse addresses"
+        );
         assert!(!result.budget_exceeded);
     }
 
@@ -619,15 +633,18 @@ mod tests {
 
         let addr_100 = *result.addr_mapping.get(&100).unwrap();
         let addr_200 = *result.addr_mapping.get(&200).unwrap();
-        assert_ne!(addr_100, addr_200, "Overlapping intervals must use different addresses");
+        assert_ne!(
+            addr_100, addr_200,
+            "Overlapping intervals must use different addresses"
+        );
         assert!(!result.budget_exceeded);
     }
 
     #[test]
     fn test_fixed_addresses() {
         let mut ops = vec![
-            make_op(0, 0, &[0], &[100]),     // read ZERO_REG, write 100
-            make_op(1, 1, &[100], &[]),      // read 100
+            make_op(0, 0, &[0], &[100]), // read ZERO_REG, write 100
+            make_op(1, 1, &[100], &[]),  // read 100
         ];
         ops[1].last_use_reads.insert(100);
 
@@ -647,8 +664,8 @@ mod tests {
         let mut slot: ArrayVec<SlotVal, MAX_SLOT_SIZE> = ArrayVec::new();
         slot.push(SlotVal::Str("+".to_string()));
         slot.push(SlotVal::Int(100)); // dest
-        slot.push(SlotVal::Int(50));  // src1
-        slot.push(SlotVal::Int(60));  // src2
+        slot.push(SlotVal::Int(50)); // src1
+        slot.push(SlotVal::Int(60)); // src2
 
         let mut ops = vec![Op {
             id: 0,

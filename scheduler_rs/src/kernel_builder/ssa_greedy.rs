@@ -85,16 +85,20 @@ impl SsaTickTockKernelBuilder {
                     entry.1 += words;
 
                     // By phase: for Branch, include round (e.g. branch_r3) so we see which round generated the allocation
-                    let phase_label = op.source_info.as_ref().map(|s| {
-                        if s.phase == EmissionPhase::Branch {
-                            match s.round {
-                                Some(r) => format!("branch_r{}", r),
-                                None => s.phase.as_str().to_string(),
+                    let phase_label = op
+                        .source_info
+                        .as_ref()
+                        .map(|s| {
+                            if s.phase == EmissionPhase::Branch {
+                                match s.round {
+                                    Some(r) => format!("branch_r{}", r),
+                                    None => s.phase.as_str().to_string(),
+                                }
+                            } else {
+                                s.phase.as_str().to_string()
                             }
-                        } else {
-                            s.phase.as_str().to_string()
-                        }
-                    }).unwrap_or_else(|| "unknown".to_string());
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
                     let entry = by_phase.entry(phase_label).or_insert((0, 0));
                     entry.0 += 1;
                     entry.1 += words;
@@ -157,7 +161,13 @@ impl SsaTickTockKernelBuilder {
         scratch_budget: usize,
     ) -> Result<(usize, bool, usize), String> {
         self.schedule_ssa_greedy_with_shift_budget_and_selectchoice(
-            ops, enable_valu_shift, shifted_ops, scratch_budget, None, None, None
+            ops,
+            enable_valu_shift,
+            shifted_ops,
+            scratch_budget,
+            None,
+            None,
+            None,
         )
     }
 
@@ -411,8 +421,8 @@ impl SsaTickTockKernelBuilder {
                     let Some(&dep_idx) = id_to_idx.get(dep_id) else {
                         return true; // external/phantom dep - treat as satisfied
                     };
-                    dead_store_indices.contains(&dep_idx) ||
-                    (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
+                    dead_store_indices.contains(&dep_idx)
+                        || (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
                 });
 
                 if deps_ready {
@@ -456,8 +466,11 @@ impl SsaTickTockKernelBuilder {
             // Sort ready_this_cycle by LUC (descending) as tie-breaker for ASAP.
             // Since heap already sorted by ASAP, stable sort preserves that ordering.
             ready_this_cycle.sort_by(|&a, &b| {
-                compute_luc(ops, &vreg_remaining_users, b)
-                    .cmp(&compute_luc(ops, &vreg_remaining_users, a))
+                compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
+                    ops,
+                    &vreg_remaining_users,
+                    a,
+                ))
             });
 
             // Keep retrying as long as we make progress (schedule something or free VRegs)
@@ -466,8 +479,11 @@ impl SsaTickTockKernelBuilder {
 
                 // Sort budget_deferred by LUC (descending) to prioritize ops that free VRegs
                 budget_deferred.sort_by(|&a, &b| {
-                    compute_luc(ops, &vreg_remaining_users, b)
-                        .cmp(&compute_luc(ops, &vreg_remaining_users, a))
+                    compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
+                        ops,
+                        &vreg_remaining_users,
+                        a,
+                    ))
                 });
 
                 // Process ready_this_cycle first, then budget_deferred
@@ -620,8 +636,11 @@ impl SsaTickTockKernelBuilder {
             if !budget_deferred.is_empty() {
                 // Sort by LUC and pick the best one
                 budget_deferred.sort_by(|&a, &b| {
-                    compute_luc(ops, &vreg_remaining_users, b)
-                        .cmp(&compute_luc(ops, &vreg_remaining_users, a))
+                    compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
+                        ops,
+                        &vreg_remaining_users,
+                        a,
+                    ))
                 });
 
                 let force_idx = budget_deferred.remove(0);
@@ -726,11 +745,13 @@ impl SsaTickTockKernelBuilder {
 
         if scheduled.len() < ops.len() {
             // Diagnose why scheduling failed
-            let unscheduled: Vec<usize> = (0..ops.len())
-                .filter(|i| !scheduled.contains(i))
-                .collect();
+            let unscheduled: Vec<usize> =
+                (0..ops.len()).filter(|i| !scheduled.contains(i)).collect();
             let ready_count = ready_heap.len();
-            let blocked_count = unscheduled.iter().filter(|&&i| remaining_deps[i] > 0).count();
+            let blocked_count = unscheduled
+                .iter()
+                .filter(|&&i| remaining_deps[i] > 0)
+                .count();
 
             // Find a sample blocked op and trace its dependency chain
             let sample_blocked = unscheduled
@@ -810,7 +831,7 @@ impl SsaTickTockKernelBuilder {
             }
             fma_ops.extend(selectchoice_to_fma);
         }
-        
+
         if let Some(sub_cycles) = select_sub_cycles {
             // Collect cycles for sub ops
             // Since we no longer expand SelectChoice ops, this will be empty
@@ -822,7 +843,7 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         }
-        
+
         if let Some(fma_cycles) = select_fma_cycles {
             // Collect cycles for fma ops
             // Since we no longer expand SelectChoice ops, this will be empty
@@ -917,9 +938,8 @@ impl SsaTickTockKernelBuilder {
                 let engine = op.engine;
 
                 // Check if this VALU op can be shifted to ALU
-                let can_shift = enable_valu_shift
-                    && engine == Engine::Valu
-                    && can_ssa_valu_shift_to_alu(op);
+                let can_shift =
+                    enable_valu_shift && engine == Engine::Valu && can_ssa_valu_shift_to_alu(op);
 
                 let fits = match engine {
                     Engine::Load => {
@@ -995,7 +1015,9 @@ impl SsaTickTockKernelBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, SsaEmitContext};
+    use crate::kernel_builder::emit_ssa::{
+        compute_ssa_dependencies, compute_ssa_dependencies_with_barriers, SsaEmitContext,
+    };
     use crate::types::Opcode;
 
     // =========================================================================
@@ -1016,13 +1038,13 @@ mod tests {
     #[test]
     fn test_greedy_fallback_sets_budget_exceeded() {
         let mut emit = SsaEmitContext::new();
-        let s1 = emit.emit_const(1);                    // op 0
-        let s2 = emit.emit_const(2);                    // op 1
-        let v1 = emit.emit_vbroadcast(s1);              // op 2 - 8 words
-        let v2 = emit.emit_vbroadcast(s2);               // op 3 - 8 words
-        let v3 = emit.emit_valu(Opcode::Add, v1, v2);    // op 4 - needs v1, v2 live
-        let addr = emit.emit_const(100);                 // op 5
-        emit.emit_vstore(addr, v3);                      // op 6 - sink
+        let s1 = emit.emit_const(1); // op 0
+        let s2 = emit.emit_const(2); // op 1
+        let v1 = emit.emit_vbroadcast(s1); // op 2 - 8 words
+        let v2 = emit.emit_vbroadcast(s2); // op 3 - 8 words
+        let v3 = emit.emit_valu(Opcode::Add, v1, v2); // op 4 - needs v1, v2 live
+        let addr = emit.emit_const(100); // op 5
+        emit.emit_vstore(addr, v3); // op 6 - sink
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1037,7 +1059,11 @@ mod tests {
             8, // Tight budget: 2 vectors (16 words) cannot fit in 8
         );
 
-        assert!(result.is_ok(), "Scheduler should complete (force-schedule): {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Scheduler should complete (force-schedule): {:?}",
+            result.err()
+        );
         let (_cycles, budget_exceeded, peak_live) = result.unwrap();
         assert!(
             budget_exceeded,
@@ -1092,13 +1118,13 @@ mod tests {
         // op1.cycle == -1 fails the deps_ready check.
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(5);       // op 0 - used
-        let _v2 = emit.emit_const(6);      // op 1 - DEAD STORE
-        let v3 = emit.emit_alu(Opcode::Add, v1, v1);  // op 2 - used
-        emit.emit_barrier();                // op 3 - depends on ALL above including dead store
-        let v4 = emit.emit_alu(Opcode::Mul, v1, v3);  // op 4 - used
-        let addr = emit.emit_const(100);   // op 5
-        emit.emit_store(addr, v4);         // op 6 - makes v4 live
+        let v1 = emit.emit_const(5); // op 0 - used
+        let _v2 = emit.emit_const(6); // op 1 - DEAD STORE
+        let v3 = emit.emit_alu(Opcode::Add, v1, v1); // op 2 - used
+        emit.emit_barrier(); // op 3 - depends on ALL above including dead store
+        let v4 = emit.emit_alu(Opcode::Mul, v1, v3); // op 4 - used
+        let addr = emit.emit_const(100); // op 5
+        emit.emit_store(addr, v4); // op 6 - makes v4 live
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1120,15 +1146,26 @@ mod tests {
             1536, // default budget
         );
 
-        assert!(result.is_ok(), "Should schedule despite barrier depending on dead store: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule despite barrier depending on dead store: {:?}",
+            result.err()
+        );
 
         // Verify barrier was scheduled
-        assert!(emit.ops[3].cycle >= 0, "Barrier should be scheduled (cycle={})", emit.ops[3].cycle);
+        assert!(
+            emit.ops[3].cycle >= 0,
+            "Barrier should be scheduled (cycle={})",
+            emit.ops[3].cycle
+        );
 
         // Verify ops after barrier were scheduled
-        assert!(emit.ops[4].cycle > emit.ops[3].cycle,
+        assert!(
+            emit.ops[4].cycle > emit.ops[3].cycle,
             "Op after barrier should be after barrier (op4.cycle={} > barrier.cycle={})",
-            emit.ops[4].cycle, emit.ops[3].cycle);
+            emit.ops[4].cycle,
+            emit.ops[3].cycle
+        );
 
         // Dead store (op1) should remain unscheduled (cycle = -1)
         assert_eq!(emit.ops[1].cycle, -1, "Dead store should not be scheduled");
@@ -1150,21 +1187,30 @@ mod tests {
         // op7: store addr, v5
 
         let mut emit = SsaEmitContext::new();
-        let _v1 = emit.emit_const(1);      // op 0 - DEAD STORE
-        let _v2 = emit.emit_const(2);      // op 1 - DEAD STORE
-        let _v3 = emit.emit_const(3);      // op 2 - DEAD STORE
-        let v4 = emit.emit_const(4);       // op 3 - used
-        emit.emit_barrier();                // op 4 - depends on all above
-        let v5 = emit.emit_alu(Opcode::Add, v4, v4);  // op 5 - used
-        let addr = emit.emit_const(100);   // op 6
-        emit.emit_store(addr, v5);         // op 7
+        let _v1 = emit.emit_const(1); // op 0 - DEAD STORE
+        let _v2 = emit.emit_const(2); // op 1 - DEAD STORE
+        let _v3 = emit.emit_const(3); // op 2 - DEAD STORE
+        let v4 = emit.emit_const(4); // op 3 - used
+        emit.emit_barrier(); // op 4 - depends on all above
+        let v5 = emit.emit_alu(Opcode::Add, v4, v4); // op 5 - used
+        let addr = emit.emit_const(100); // op 6
+        emit.emit_store(addr, v5); // op 7
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify barrier depends on all dead stores
-        assert!(emit.ops[4].dep_ids.contains(&0), "Barrier should depend on dead store op0");
-        assert!(emit.ops[4].dep_ids.contains(&1), "Barrier should depend on dead store op1");
-        assert!(emit.ops[4].dep_ids.contains(&2), "Barrier should depend on dead store op2");
+        assert!(
+            emit.ops[4].dep_ids.contains(&0),
+            "Barrier should depend on dead store op0"
+        );
+        assert!(
+            emit.ops[4].dep_ids.contains(&1),
+            "Barrier should depend on dead store op1"
+        );
+        assert!(
+            emit.ops[4].dep_ids.contains(&2),
+            "Barrier should depend on dead store op2"
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1178,16 +1224,32 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule with multiple dead stores: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule with multiple dead stores: {:?}",
+            result.err()
+        );
 
         // Verify all dead stores remain unscheduled
-        assert_eq!(emit.ops[0].cycle, -1, "Dead store op0 should not be scheduled");
-        assert_eq!(emit.ops[1].cycle, -1, "Dead store op1 should not be scheduled");
-        assert_eq!(emit.ops[2].cycle, -1, "Dead store op2 should not be scheduled");
+        assert_eq!(
+            emit.ops[0].cycle, -1,
+            "Dead store op0 should not be scheduled"
+        );
+        assert_eq!(
+            emit.ops[1].cycle, -1,
+            "Dead store op1 should not be scheduled"
+        );
+        assert_eq!(
+            emit.ops[2].cycle, -1,
+            "Dead store op2 should not be scheduled"
+        );
 
         // Verify barrier and subsequent ops are scheduled
         assert!(emit.ops[4].cycle >= 0, "Barrier should be scheduled");
-        assert!(emit.ops[5].cycle > emit.ops[4].cycle, "Op5 should be after barrier");
+        assert!(
+            emit.ops[5].cycle > emit.ops[4].cycle,
+            "Op5 should be after barrier"
+        );
     }
 
     /// Test barrier chaining with dead stores between barriers.
@@ -1211,26 +1273,35 @@ mod tests {
 
         let mut emit = SsaEmitContext::new();
         // Section 1
-        let v1 = emit.emit_const(1);       // op 0 - used
-        let _v2 = emit.emit_const(2);      // op 1 - DEAD STORE
-        emit.emit_barrier();                // op 2 - barrier1
-        // Section 2
-        let _v3 = emit.emit_const(3);      // op 3 - DEAD STORE
-        let v4 = emit.emit_const(4);       // op 4 - used
-        emit.emit_barrier();                // op 5 - barrier2
-        // Section 3
-        let v5 = emit.emit_alu(Opcode::Add, v1, v4);  // op 6 - used
-        let addr = emit.emit_const(100);   // op 7
-        emit.emit_store(addr, v5);         // op 8
+        let v1 = emit.emit_const(1); // op 0 - used
+        let _v2 = emit.emit_const(2); // op 1 - DEAD STORE
+        emit.emit_barrier(); // op 2 - barrier1
+                             // Section 2
+        let _v3 = emit.emit_const(3); // op 3 - DEAD STORE
+        let v4 = emit.emit_const(4); // op 4 - used
+        emit.emit_barrier(); // op 5 - barrier2
+                             // Section 3
+        let v5 = emit.emit_alu(Opcode::Add, v1, v4); // op 6 - used
+        let addr = emit.emit_const(100); // op 7
+        emit.emit_store(addr, v5); // op 8
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
         // Verify barrier1 depends on dead store op1
-        assert!(emit.ops[2].dep_ids.contains(&1), "Barrier1 should depend on dead store op1");
+        assert!(
+            emit.ops[2].dep_ids.contains(&1),
+            "Barrier1 should depend on dead store op1"
+        );
 
         // Verify barrier2 depends on dead store op3 and barrier1
-        assert!(emit.ops[5].dep_ids.contains(&3), "Barrier2 should depend on dead store op3");
-        assert!(emit.ops[5].dep_ids.contains(&2), "Barrier2 should depend on barrier1 (chain)");
+        assert!(
+            emit.ops[5].dep_ids.contains(&3),
+            "Barrier2 should depend on dead store op3"
+        );
+        assert!(
+            emit.ops[5].dep_ids.contains(&2),
+            "Barrier2 should depend on barrier1 (chain)"
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1244,14 +1315,24 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule with barrier chain and dead stores: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule with barrier chain and dead stores: {:?}",
+            result.err()
+        );
 
         // Verify barriers are scheduled in order
         assert!(emit.ops[2].cycle >= 0, "Barrier1 should be scheduled");
-        assert!(emit.ops[5].cycle > emit.ops[2].cycle, "Barrier2 should be after barrier1");
+        assert!(
+            emit.ops[5].cycle > emit.ops[2].cycle,
+            "Barrier2 should be after barrier1"
+        );
 
         // Verify final ops are after barrier2
-        assert!(emit.ops[6].cycle > emit.ops[5].cycle, "Op6 should be after barrier2");
+        assert!(
+            emit.ops[6].cycle > emit.ops[5].cycle,
+            "Op6 should be after barrier2"
+        );
     }
 
     // =========================================================================
@@ -1276,12 +1357,12 @@ mod tests {
         // v2 is a dead store but sits between used ops.
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(1);  // op 0
+        let v1 = emit.emit_const(1); // op 0
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1); // op 1 - dead store
-        let v3 = emit.emit_const(2);  // op 2
+        let v3 = emit.emit_const(2); // op 2
         let v4 = emit.emit_alu(Opcode::Add, v1, v3); // op 3
         let addr = emit.emit_const(100); // op 4
-        emit.emit_store(addr, v4);     // op 5 - makes v4 live
+        emit.emit_store(addr, v4); // op 5 - makes v4 live
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1296,7 +1377,11 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule with dead store in chain: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule with dead store in chain: {:?}",
+            result.err()
+        );
 
         // Check that non-dead-stores got valid cycles
         assert!(emit.ops[0].cycle >= 0, "op0 should be scheduled");
@@ -1304,7 +1389,10 @@ mod tests {
         assert!(emit.ops[3].cycle >= 0, "op3 should be scheduled");
 
         // op1 (dead store) should remain unscheduled
-        assert_eq!(emit.ops[1].cycle, -1, "Dead store op1 should not be scheduled");
+        assert_eq!(
+            emit.ops[1].cycle, -1,
+            "Dead store op1 should not be scheduled"
+        );
     }
 
     /// Test that transitive dead stores are detected.
@@ -1325,12 +1413,12 @@ mod tests {
         // v2 is dead (never used)
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(1);       // op 0 - transitively dead (only user is dead)
+        let v1 = emit.emit_const(1); // op 0 - transitively dead (only user is dead)
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1); // op 1 - dead store
-        let v3 = emit.emit_const(2);       // op 2 - used
+        let v3 = emit.emit_const(2); // op 2 - used
         let v4 = emit.emit_alu(Opcode::Add, v3, v3); // op 3 - used
-        let addr = emit.emit_const(100);   // op 4
-        emit.emit_store(addr, v4);         // op 5
+        let addr = emit.emit_const(100); // op 4
+        emit.emit_store(addr, v4); // op 5
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1345,7 +1433,11 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule with transitive dead stores: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule with transitive dead stores: {:?}",
+            result.err()
+        );
 
         // Note: Current implementation only detects immediate dead stores,
         // not transitive ones. op0 (v1) is used by op1 (v2), so it's not
@@ -1356,7 +1448,10 @@ mod tests {
         // scheduling doesn't fail.
 
         // op1 (v2) is definitely dead (no users)
-        assert_eq!(emit.ops[1].cycle, -1, "Dead store op1 should not be scheduled");
+        assert_eq!(
+            emit.ops[1].cycle, -1,
+            "Dead store op1 should not be scheduled"
+        );
 
         // Live ops should be scheduled
         assert!(emit.ops[2].cycle >= 0, "op2 should be scheduled");
@@ -1376,8 +1471,8 @@ mod tests {
     fn test_immediate_dead_store() {
         let mut emit = SsaEmitContext::new();
         // Use emit_const_force to avoid CSE (const caching)
-        let v1 = emit.emit_const_force(5);  // op 0 - has reader (op2), not dead
-        let v2 = emit.emit_const_force(6);  // op 1 - has reader (op2), not dead
+        let v1 = emit.emit_const_force(5); // op 0 - has reader (op2), not dead
+        let v2 = emit.emit_const_force(6); // op 1 - has reader (op2), not dead
         let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 2 - DEAD (no readers)
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
@@ -1397,15 +1492,28 @@ mod tests {
         );
 
         // Scheduling should succeed
-        assert!(result.is_ok(), "Scheduling should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Scheduling should succeed: {:?}",
+            result.err()
+        );
         let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
         assert!(!budget_exceeded, "Should not exceed budget");
 
         // Only op2 (the add) is an immediate dead store
         // op0 and op1 (the consts) have readers so they're scheduled
-        assert!(emit.ops[0].cycle >= 0, "op0 should be scheduled (has reader op2)");
-        assert!(emit.ops[1].cycle >= 0, "op1 should be scheduled (has reader op2)");
-        assert_eq!(emit.ops[2].cycle, -1, "op2 should not be scheduled (dead store)");
+        assert!(
+            emit.ops[0].cycle >= 0,
+            "op0 should be scheduled (has reader op2)"
+        );
+        assert!(
+            emit.ops[1].cycle >= 0,
+            "op1 should be scheduled (has reader op2)"
+        );
+        assert_eq!(
+            emit.ops[2].cycle, -1,
+            "op2 should not be scheduled (dead store)"
+        );
     }
 
     // =========================================================================
@@ -1442,15 +1550,15 @@ mod tests {
         // This would leave garbage at the scratch address for v6, causing crashes.
 
         let mut emit = SsaEmitContext::new();
-        let mult_scalar = emit.emit_const(2);           // op 0
-        let offset_scalar = emit.emit_const(100);       // op 1
-        let mult_vec = emit.emit_vbroadcast(mult_scalar);   // op 2
+        let mult_scalar = emit.emit_const(2); // op 0
+        let offset_scalar = emit.emit_const(100); // op 1
+        let mult_vec = emit.emit_vbroadcast(mult_scalar); // op 2
         let offset_vec = emit.emit_vbroadcast(offset_scalar); // op 3
-        let base_scalar = emit.emit_const(0);           // op 4
-        let base_vec = emit.emit_vbroadcast(base_scalar);    // op 5
+        let base_scalar = emit.emit_const(0); // op 4
+        let base_vec = emit.emit_vbroadcast(base_scalar); // op 5
         let fma_result = emit.emit_fma(base_vec, mult_vec, offset_vec); // op 6
-        let addr = emit.emit_const(200);                // op 7
-        emit.emit_vstore(addr, fma_result);             // op 8
+        let addr = emit.emit_const(200); // op 7
+        emit.emit_vstore(addr, fma_result); // op 8
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1467,9 +1575,11 @@ mod tests {
 
         // fma_result (v6) should have at least 1 user (the vstore)
         let fma_result_users = vreg_users.get(&fma_result).map_or(0, |s| s.len());
-        assert!(fma_result_users >= 1,
+        assert!(
+            fma_result_users >= 1,
             "FMA result should have at least 1 user (vstore), but has {} users",
-            fma_result_users);
+            fma_result_users
+        );
 
         // Schedule and verify FMA is NOT a dead store
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1483,22 +1593,33 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // The FMA (op6) should be scheduled (NOT a dead store)
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "FMA op should be scheduled (used by vstore), but has cycle={}",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
 
         // The vstore (op8) should be scheduled
-        assert!(emit.ops[8].cycle >= 0,
+        assert!(
+            emit.ops[8].cycle >= 0,
             "vstore op should be scheduled, but has cycle={}",
-            emit.ops[8].cycle);
+            emit.ops[8].cycle
+        );
 
         // vstore should happen AFTER FMA (dependency order)
-        assert!(emit.ops[8].cycle > emit.ops[6].cycle,
+        assert!(
+            emit.ops[8].cycle > emit.ops[6].cycle,
             "vstore (cycle={}) should be after FMA (cycle={})",
-            emit.ops[8].cycle, emit.ops[6].cycle);
+            emit.ops[8].cycle,
+            emit.ops[6].cycle
+        );
     }
 
     /// Test that store address VRegs are also counted as users.
@@ -1517,11 +1638,11 @@ mod tests {
         // Neither should be marked as dead.
 
         let mut emit = SsaEmitContext::new();
-        let base = emit.emit_const(100);           // op 0
-        let offset = emit.emit_const(8);           // op 1
-        let addr = emit.emit_alu(Opcode::Add, base, offset);  // op 2
-        let data = emit.emit_const(42);            // op 3
-        emit.emit_store(addr, data);               // op 4
+        let base = emit.emit_const(100); // op 0
+        let offset = emit.emit_const(8); // op 1
+        let addr = emit.emit_alu(Opcode::Add, base, offset); // op 2
+        let data = emit.emit_const(42); // op 3
+        emit.emit_store(addr, data); // op 4
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1536,12 +1657,20 @@ mod tests {
         }
 
         // addr should have the store as a user
-        assert!(vreg_users.get(&addr).map_or(false, |users| users.contains(&4)),
-            "addr VReg should have store (op4) as user");
+        assert!(
+            vreg_users
+                .get(&addr)
+                .map_or(false, |users| users.contains(&4)),
+            "addr VReg should have store (op4) as user"
+        );
 
         // data should have the store as a user
-        assert!(vreg_users.get(&data).map_or(false, |users| users.contains(&4)),
-            "data VReg should have store (op4) as user");
+        assert!(
+            vreg_users
+                .get(&data)
+                .map_or(false, |users| users.contains(&4)),
+            "data VReg should have store (op4) as user"
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1555,15 +1684,23 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // addr computation (op2) should be scheduled
-        assert!(emit.ops[2].cycle >= 0,
-            "addr computation should be scheduled (used by store)");
+        assert!(
+            emit.ops[2].cycle >= 0,
+            "addr computation should be scheduled (used by store)"
+        );
 
         // data (op3) should be scheduled
-        assert!(emit.ops[3].cycle >= 0,
-            "data const should be scheduled (used by store)");
+        assert!(
+            emit.ops[3].cycle >= 0,
+            "data const should be scheduled (used by store)"
+        );
     }
 
     // =========================================================================
@@ -1590,11 +1727,11 @@ mod tests {
         // Neither op0 nor op1 should be marked as dead
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(5);           // op 0 - has user (op1)
+        let v1 = emit.emit_const(5); // op 0 - has user (op1)
         let v1_vec = emit.emit_vbroadcast(v1); // op 1 - has user (op2)
         let v2 = emit.emit_valu(Opcode::Add, v1_vec, v1_vec); // op 2 - has user (op3)
-        let addr = emit.emit_const(100);       // op 3 - has user (op4)
-        emit.emit_vstore(addr, v2);            // op 4 - sink (no dest)
+        let addr = emit.emit_const(100); // op 3 - has user (op4)
+        emit.emit_vstore(addr, v2); // op 4 - sink (no dest)
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1610,20 +1747,32 @@ mod tests {
 
         // Verify the invariant: each VReg with users should NOT be dead
         // v1 (scalar) should have user (op1 - vbroadcast)
-        assert!(vreg_users.get(&v1).map_or(false, |users| !users.is_empty()),
-            "v1 should have at least 1 user");
+        assert!(
+            vreg_users.get(&v1).map_or(false, |users| !users.is_empty()),
+            "v1 should have at least 1 user"
+        );
 
         // v1_vec (vector) should have user (op2 - add)
-        assert!(vreg_users.get(&v1_vec).map_or(false, |users| !users.is_empty()),
-            "v1_vec should have at least 1 user");
+        assert!(
+            vreg_users
+                .get(&v1_vec)
+                .map_or(false, |users| !users.is_empty()),
+            "v1_vec should have at least 1 user"
+        );
 
         // v2 (vector) should have user (op4 - vstore)
-        assert!(vreg_users.get(&v2).map_or(false, |users| !users.is_empty()),
-            "v2 should have at least 1 user");
+        assert!(
+            vreg_users.get(&v2).map_or(false, |users| !users.is_empty()),
+            "v2 should have at least 1 user"
+        );
 
         // addr should have user (op4 - vstore)
-        assert!(vreg_users.get(&addr).map_or(false, |users| !users.is_empty()),
-            "addr should have at least 1 user");
+        assert!(
+            vreg_users
+                .get(&addr)
+                .map_or(false, |users| !users.is_empty()),
+            "addr should have at least 1 user"
+        );
 
         // Now schedule and verify none of these are marked as dead
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1637,12 +1786,19 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // All ops except the store should be scheduled (store has no dest, not tracked)
         // ops 0-3 have dests and should all be scheduled
         assert!(emit.ops[0].cycle >= 0, "op0 (const) should be scheduled");
-        assert!(emit.ops[1].cycle >= 0, "op1 (vbroadcast) should be scheduled");
+        assert!(
+            emit.ops[1].cycle >= 0,
+            "op1 (vbroadcast) should be scheduled"
+        );
         assert!(emit.ops[2].cycle >= 0, "op2 (add) should be scheduled");
         assert!(emit.ops[3].cycle >= 0, "op3 (addr) should be scheduled");
         assert!(emit.ops[4].cycle >= 0, "op4 (vstore) should be scheduled");
@@ -1663,12 +1819,12 @@ mod tests {
         // All of v1, v2, v3 have users - none should be dead
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(5);           // op 0
+        let v1 = emit.emit_const(5); // op 0
         let v1_vec = emit.emit_vbroadcast(v1); // op 1
         let v2 = emit.emit_valu(Opcode::Add, v1_vec, v1_vec); // op 2
-        let v3 = emit.emit_valu(Opcode::Mul, v2, v2);         // op 3
-        let addr = emit.emit_const(100);       // op 4
-        emit.emit_vstore(addr, v3);            // op 5
+        let v3 = emit.emit_valu(Opcode::Mul, v2, v2); // op 3
+        let addr = emit.emit_const(100); // op 4
+        emit.emit_vstore(addr, v3); // op 5
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1683,10 +1839,22 @@ mod tests {
         }
 
         // Verify the transitive chain: each VReg should have a user
-        assert!(vreg_users.get(&v1).map_or(0, |s| s.len()) >= 1, "v1 should have user");
-        assert!(vreg_users.get(&v1_vec).map_or(0, |s| s.len()) >= 1, "v1_vec should have user");
-        assert!(vreg_users.get(&v2).map_or(0, |s| s.len()) >= 1, "v2 should have user");
-        assert!(vreg_users.get(&v3).map_or(0, |s| s.len()) >= 1, "v3 should have user");
+        assert!(
+            vreg_users.get(&v1).map_or(0, |s| s.len()) >= 1,
+            "v1 should have user"
+        );
+        assert!(
+            vreg_users.get(&v1_vec).map_or(0, |s| s.len()) >= 1,
+            "v1_vec should have user"
+        );
+        assert!(
+            vreg_users.get(&v2).map_or(0, |s| s.len()) >= 1,
+            "v2 should have user"
+        );
+        assert!(
+            vreg_users.get(&v3).map_or(0, |s| s.len()) >= 1,
+            "v3 should have user"
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1700,11 +1868,20 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule transitive chain: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule transitive chain: {:?}",
+            result.err()
+        );
 
         // All ops in the chain should be scheduled
         for (i, op) in emit.ops.iter().enumerate() {
-            assert!(op.cycle >= 0, "op{} should be scheduled, got cycle={}", i, op.cycle);
+            assert!(
+                op.cycle >= 0,
+                "op{} should be scheduled, got cycle={}",
+                i,
+                op.cycle
+            );
         }
     }
 
@@ -1731,9 +1908,9 @@ mod tests {
         let c = emit.emit_vbroadcast(c_scalar);
 
         // FMA result - ONLY used by vstore
-        let fma_result = emit.emit_fma(a, b, c);  // op 6
-        let addr = emit.emit_const(100);         // op 7
-        emit.emit_vstore(addr, fma_result);      // op 8
+        let fma_result = emit.emit_fma(a, b, c); // op 6
+        let addr = emit.emit_const(100); // op 7
+        emit.emit_vstore(addr, fma_result); // op 8
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1749,9 +1926,11 @@ mod tests {
 
         // The FMA result should have the vstore as its user
         let fma_users = vreg_users.get(&fma_result).map_or(0, |s| s.len());
-        assert!(fma_users >= 1,
+        assert!(
+            fma_users >= 1,
             "FMA result should have at least 1 user (vstore), but has {} users",
-            fma_users);
+            fma_users
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1765,12 +1944,18 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule FMA with store user: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule FMA with store user: {:?}",
+            result.err()
+        );
 
         // The FMA (op 6) should be scheduled, NOT marked as dead
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "FMA op should be scheduled (used by vstore), but has cycle={}",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
     }
 
     // =========================================================================
@@ -1811,11 +1996,11 @@ mod tests {
         // v2 is genuinely dead - no op reads it. DCE should mark op1 as dead.
 
         let mut emit = SsaEmitContext::new();
-        let v1 = emit.emit_const(5);           // op 0
+        let v1 = emit.emit_const(5); // op 0
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1); // op 1 - DEAD (result never used)
-        let v3 = emit.emit_const(10);          // op 2
-        let addr = emit.emit_const(100);       // op 3
-        emit.emit_store(addr, v3);             // op 4
+        let v3 = emit.emit_const(10); // op 2
+        let addr = emit.emit_const(100); // op 3
+        emit.emit_store(addr, v3); // op 4
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1834,7 +2019,10 @@ mod tests {
         assert!(result.is_ok(), "Should schedule: {:?}", result.err());
 
         // op1 (v2) should be marked as dead (cycle = -1)
-        assert_eq!(emit.ops[1].cycle, -1, "Dead store op1 should not be scheduled");
+        assert_eq!(
+            emit.ops[1].cycle, -1,
+            "Dead store op1 should not be scheduled"
+        );
 
         // Other ops should be scheduled
         assert!(emit.ops[0].cycle >= 0, "op0 should be scheduled");
@@ -1858,11 +2046,11 @@ mod tests {
         // The vreg_users map should include op3 as a user of v1.
 
         let mut emit = SsaEmitContext::new();
-        let v0_scalar = emit.emit_const(5);           // op 0
-        let v0 = emit.emit_vbroadcast(v0_scalar);     // op 1
+        let v0_scalar = emit.emit_const(5); // op 0
+        let v0 = emit.emit_vbroadcast(v0_scalar); // op 1
         let v1 = emit.emit_valu(Opcode::Add, v0, v0); // op 2 - ONLY used by vstore
-        let addr = emit.emit_const(100);              // op 3
-        emit.emit_vstore(addr, v1);                   // op 4 - uses v1
+        let addr = emit.emit_const(100); // op 3
+        emit.emit_vstore(addr, v1); // op 4 - uses v1
 
         compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -1879,12 +2067,18 @@ mod tests {
         // v1 should have vstore (op4) as its user
         let v1_users = vreg_users.get(&v1);
         assert!(v1_users.is_some(), "v1 should have users");
-        assert!(v1_users.unwrap().contains(&4),
-            "v1's users should include vstore (op4), but users are: {:?}", v1_users);
+        assert!(
+            v1_users.unwrap().contains(&4),
+            "v1's users should include vstore (op4), but users are: {:?}",
+            v1_users
+        );
 
         // v1 should NOT be considered a dead store (it has the vstore as user)
         let v1_is_dead = vreg_users.get(&v1).map_or(true, |s| s.is_empty());
-        assert!(!v1_is_dead, "v1 should NOT be a dead store (used by vstore)");
+        assert!(
+            !v1_is_dead,
+            "v1 should NOT be a dead store (used by vstore)"
+        );
 
         // Schedule and verify v1 is scheduled
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -1898,12 +2092,18 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // v1 (op2) should be scheduled
-        assert!(emit.ops[2].cycle >= 0,
+        assert!(
+            emit.ops[2].cycle >= 0,
             "v1 (add) should be scheduled (used by vstore), but has cycle={}",
-            emit.ops[2].cycle);
+            emit.ops[2].cycle
+        );
     }
 
     #[test]
@@ -1912,19 +2112,19 @@ mod tests {
         use crate::types::Opcode;
 
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant (required for AddImm)
         let zero = emit.emit_const(0);
-        
+
         // Emit ConstChoice constant
         let c1 = emit.emit_const_choice(42);
-        
+
         // Use the constant in an ALU op
         let _result = emit.emit_alu(Opcode::Add, c1, zero);
 
-        let mut builder = SsaTickTockKernelBuilder::new(
-            super::super::config::KernelConfig::new(10, 2047, 256, 16)
-        );
+        let mut builder = SsaTickTockKernelBuilder::new(super::super::config::KernelConfig::new(
+            10, 2047, 256, 16,
+        ));
         builder.zero_vreg = Some(zero);
 
         let mut shifted_ops = HashSet::new();
@@ -1935,18 +2135,24 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // Find the ConstChoice op
         let const_choice_op = emit.ops.iter().find(|op| op.opcode == Opcode::ConstChoice);
         assert!(const_choice_op.is_some(), "Should have ConstChoice op");
         let const_choice_op = const_choice_op.unwrap();
-        
+
         // ConstChoice should be scheduled (greedy treats it as Load)
-        assert!(const_choice_op.cycle >= 0, 
-            "ConstChoice op should be scheduled, but has cycle={}", 
-            const_choice_op.cycle);
-        
+        assert!(
+            const_choice_op.cycle >= 0,
+            "ConstChoice op should be scheduled, but has cycle={}",
+            const_choice_op.cycle
+        );
+
         // Should be scheduled early (before ops that use it)
         let use_op = emit.ops.iter().find(|op| {
             op.cycle >= 0 && // Only check scheduled ops (skip dead stores)
@@ -2009,22 +2215,22 @@ mod tests {
         // and then used by vstore. The FMA should NOT be marked as dead.
 
         let mut emit = SsaEmitContext::new();
-        let mult_scalar = emit.emit_const(2);           // op 0
-        let offset_scalar = emit.emit_const(100);       // op 1
-        let mult_vec = emit.emit_vbroadcast(mult_scalar);   // op 2
+        let mult_scalar = emit.emit_const(2); // op 0
+        let offset_scalar = emit.emit_const(100); // op 1
+        let mult_vec = emit.emit_vbroadcast(mult_scalar); // op 2
         let offset_vec = emit.emit_vbroadcast(offset_scalar); // op 3
-        let idx_base_scalar = emit.emit_const(0);       // op 4
+        let idx_base_scalar = emit.emit_const(0); // op 4
         let idx_base_vec = emit.emit_vbroadcast(idx_base_scalar); // op 5
-        
+
         // Simulate: ctx.all_idx[g] = Some(emit_fma(...))
         // Store the VReg in a local variable (simulating context variable)
         let idx_new = emit.emit_fma(idx_base_vec, mult_vec, offset_vec); // op 6
-        
-        let addr = emit.emit_const(200);                // op 7
-        
+
+        let addr = emit.emit_const(200); // op 7
+
         // Simulate: emit_vstore(addr, ctx.all_idx[g].unwrap())
         // Use the VReg from the "context variable"
-        emit.emit_vstore(addr, idx_new);               // op 8
+        emit.emit_vstore(addr, idx_new); // op 8
 
         // Use barrier-aware dependencies to match real kernel behavior
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
@@ -2042,9 +2248,11 @@ mod tests {
 
         // idx_new should have at least 1 user (the vstore)
         let idx_new_users = vreg_users.get(&idx_new).map_or(0, |s| s.len());
-        assert!(idx_new_users >= 1,
+        assert!(
+            idx_new_users >= 1,
             "FMA result (idx_new) should have at least 1 user (vstore), but has {} users",
-            idx_new_users);
+            idx_new_users
+        );
 
         // Schedule and verify FMA is NOT a dead store
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -2058,7 +2266,11 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // The FMA (op6) should be scheduled (NOT a dead store)
         // This test may fail if the bug exists - the FMA might be marked as dead
@@ -2068,14 +2280,19 @@ mod tests {
             emit.ops[6].cycle);
 
         // The vstore (op8) should be scheduled
-        assert!(emit.ops[8].cycle >= 0,
+        assert!(
+            emit.ops[8].cycle >= 0,
             "vstore op should be scheduled, but has cycle={}",
-            emit.ops[8].cycle);
+            emit.ops[8].cycle
+        );
 
         // vstore should happen AFTER FMA (dependency order)
-        assert!(emit.ops[8].cycle > emit.ops[6].cycle,
+        assert!(
+            emit.ops[8].cycle > emit.ops[6].cycle,
             "vstore (cycle={}) should be after FMA (cycle={})",
-            emit.ops[8].cycle, emit.ops[6].cycle);
+            emit.ops[8].cycle,
+            emit.ops[6].cycle
+        );
     }
 
     /// Test that MultiplyAdd updating a context variable is NOT marked as dead
@@ -2110,26 +2327,26 @@ mod tests {
         // to fail, causing the FMA to be marked as dead.
 
         let mut emit = SsaEmitContext::new();
-        
+
         // Section 1: Emit MultiplyAdd that updates context variable
-        let mult_scalar = emit.emit_const(2);           // op 0
-        let offset_scalar = emit.emit_const(100);      // op 1
-        let mult_vec = emit.emit_vbroadcast(mult_scalar);   // op 2
+        let mult_scalar = emit.emit_const(2); // op 0
+        let offset_scalar = emit.emit_const(100); // op 1
+        let mult_vec = emit.emit_vbroadcast(mult_scalar); // op 2
         let offset_vec = emit.emit_vbroadcast(offset_scalar); // op 3
-        let idx_base_scalar = emit.emit_const(0);      // op 4
+        let idx_base_scalar = emit.emit_const(0); // op 4
         let idx_base_vec = emit.emit_vbroadcast(idx_base_scalar); // op 5
-        
+
         // Simulate: ctx.all_idx[g] = Some(emit_fma(...)) in round N
         let idx_new = emit.emit_fma(idx_base_vec, mult_vec, offset_vec); // op 6
-        
+
         // Barrier simulates round boundary
-        emit.emit_barrier();                            // op 7
-        
+        emit.emit_barrier(); // op 7
+
         // Section 2: Use context variable in vstore
-        let addr = emit.emit_const(200);               // op 8
-        
+        let addr = emit.emit_const(200); // op 8
+
         // Simulate: emit_vstore(addr, ctx.all_idx[g].unwrap()) in round N+1
-        emit.emit_vstore(addr, idx_new);              // op 9
+        emit.emit_vstore(addr, idx_new); // op 9
 
         // Use barrier-aware dependencies to match real kernel behavior
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
@@ -2147,9 +2364,11 @@ mod tests {
 
         // idx_new should have at least 1 user (the vstore)
         let idx_new_users = vreg_users.get(&idx_new).map_or(0, |s| s.len());
-        assert!(idx_new_users >= 1,
+        assert!(
+            idx_new_users >= 1,
             "FMA result (idx_new) should have at least 1 user (vstore), but has {} users",
-            idx_new_users);
+            idx_new_users
+        );
 
         // Schedule and verify FMA is NOT a dead store
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -2163,34 +2382,50 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // The FMA (op6) should be scheduled (NOT a dead store)
         // This test is expected to FAIL if the bug exists - the FMA will be marked as dead
         // because the dependency across the barrier isn't properly tracked
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "FMA op should be scheduled (used by vstore via context variable across barrier), \
              but has cycle={}. This indicates the bug: MultiplyAdd updating context variable \
              is marked as dead store when used across a barrier.",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
 
         // The barrier (op7) should be scheduled
-        assert!(emit.ops[7].cycle >= 0,
+        assert!(
+            emit.ops[7].cycle >= 0,
             "Barrier op should be scheduled, but has cycle={}",
-            emit.ops[7].cycle);
+            emit.ops[7].cycle
+        );
 
         // The vstore (op9) should be scheduled
-        assert!(emit.ops[9].cycle >= 0,
+        assert!(
+            emit.ops[9].cycle >= 0,
             "vstore op should be scheduled, but has cycle={}",
-            emit.ops[9].cycle);
+            emit.ops[9].cycle
+        );
 
         // vstore should happen AFTER barrier, which should happen AFTER FMA
-        assert!(emit.ops[7].cycle > emit.ops[6].cycle,
+        assert!(
+            emit.ops[7].cycle > emit.ops[6].cycle,
             "Barrier (cycle={}) should be after FMA (cycle={})",
-            emit.ops[7].cycle, emit.ops[6].cycle);
-        assert!(emit.ops[9].cycle > emit.ops[7].cycle,
+            emit.ops[7].cycle,
+            emit.ops[6].cycle
+        );
+        assert!(
+            emit.ops[9].cycle > emit.ops[7].cycle,
             "vstore (cycle={}) should be after barrier (cycle={})",
-            emit.ops[9].cycle, emit.ops[7].cycle);
+            emit.ops[9].cycle,
+            emit.ops[7].cycle
+        );
     }
 
     // =========================================================================
@@ -2219,31 +2454,31 @@ mod tests {
         // Round 2: Operations use all_idx[g] from round 1
 
         let mut emit = SsaEmitContext::new();
-        
+
         // Round 1 setup: Simulate idx update for one group (simplified)
-        let mult_scalar = emit.emit_const(2);           // op 0
-        let offset_scalar = emit.emit_const(100);      // op 1
-        let mult_vec = emit.emit_vbroadcast(mult_scalar);   // op 2
+        let mult_scalar = emit.emit_const(2); // op 0
+        let offset_scalar = emit.emit_const(100); // op 1
+        let mult_vec = emit.emit_vbroadcast(mult_scalar); // op 2
         let offset_vec = emit.emit_vbroadcast(offset_scalar); // op 3
-        let idx_base_scalar = emit.emit_const(0);      // op 4
+        let idx_base_scalar = emit.emit_const(0); // op 4
         let idx_base_vec = emit.emit_vbroadcast(idx_base_scalar); // op 5
-        
+
         // Round 1: MultiplyAdd updates context variable (simulating all_idx[g])
         // This simulates: ctx.all_idx[g] = Some(emit_fma(...)) in round 1
         // NO partition stores happen because tree_depth=10 doesn't match TICK/TOCK_STORE_DEPTHS
         let idx_round1 = emit.emit_fma(idx_base_vec, mult_vec, offset_vec); // op 6
-        
+
         // Barrier between rounds
-        emit.emit_barrier();                            // op 7
-        
+        emit.emit_barrier(); // op 7
+
         // Round 2: Operations that use all_idx[g] from round 1
         // Simulate: Operations in round 2 that read ctx.all_idx[g].unwrap() and use it
         // For example: tree access operations that use the idx
         let idx_round2_use = emit.emit_valu(Opcode::Add, idx_round1, mult_vec); // op 8 - uses idx from round 1
-        
+
         // Eventually store the result (simulating final store)
-        let addr = emit.emit_const(200);               // op 9
-        emit.emit_vstore(addr, idx_round2_use);         // op 10
+        let addr = emit.emit_const(200); // op 9
+        emit.emit_vstore(addr, idx_round2_use); // op 10
 
         // Use barrier-aware dependencies to match real kernel behavior
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
@@ -2277,24 +2512,36 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // The FMA from round 1 (op6) should be scheduled (NOT a dead store)
         // This test is expected to FAIL if Hypothesis 1 is correct - the FMA will be marked as dead
         // because it has no immediate users in round 1 (no stores), even though it's used in round 2
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "FMA from round 1 should be scheduled (used in round 2), but has cycle={}. \
              This indicates Hypothesis 1 is correct: MultiplyAdd with no immediate users \
              (no stores in round 1) is marked as dead, even though it's used in round 2.",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
 
         // Verify dependency order: Round 1 FMA -> Barrier -> Round 2 use -> Store
-        assert!(emit.ops[7].cycle > emit.ops[6].cycle,
+        assert!(
+            emit.ops[7].cycle > emit.ops[6].cycle,
             "Barrier (cycle={}) should be after Round 1 FMA (cycle={})",
-            emit.ops[7].cycle, emit.ops[6].cycle);
-        assert!(emit.ops[8].cycle > emit.ops[7].cycle,
+            emit.ops[7].cycle,
+            emit.ops[6].cycle
+        );
+        assert!(
+            emit.ops[8].cycle > emit.ops[7].cycle,
             "Round 2 use (cycle={}) should be after barrier (cycle={})",
-            emit.ops[8].cycle, emit.ops[7].cycle);
+            emit.ops[8].cycle,
+            emit.ops[7].cycle
+        );
     }
 
     /// Test Hypothesis 2: Last Round Edge Case
@@ -2307,20 +2554,20 @@ mod tests {
     fn test_last_round_edge_case_hypothesis2() {
         // Simulate last round with tree_depth not matching store depths
         // This means idx_update_start=0, idx_update_end=0, so NO idx updates
-        
+
         let mut emit = SsaEmitContext::new();
-        
+
         // Previous round: all_idx[g] was set
-        let idx_prev_round = emit.emit_const(42);       // op 0 - simulates all_idx[g] from prev round
+        let idx_prev_round = emit.emit_const(42); // op 0 - simulates all_idx[g] from prev round
         let idx_prev_vec = emit.emit_vbroadcast(idx_prev_round); // op 1
-        
+
         // Last round: tree_depth doesn't match → NO idx updates
         // But operations might still use all_idx[g] from previous round
         let use_idx = emit.emit_valu(Opcode::Add, idx_prev_vec, idx_prev_vec); // op 2 - uses idx from prev round
-        
+
         // Store the result
-        let addr = emit.emit_const(200);               // op 3
-        emit.emit_vstore(addr, use_idx);               // op 4
+        let addr = emit.emit_const(200); // op 3
+        emit.emit_vstore(addr, use_idx); // op 4
 
         compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
@@ -2336,13 +2583,19 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // This test verifies that previous round's idx values are still tracked
         // If this fails, it might indicate a different issue
-        assert!(emit.ops[1].cycle >= 0,
+        assert!(
+            emit.ops[1].cycle >= 0,
             "Previous round idx should be scheduled (used in last round), but has cycle={}",
-            emit.ops[1].cycle);
+            emit.ops[1].cycle
+        );
     }
 
     /// Test Hypothesis 3: Complex Barrier Pattern
@@ -2358,11 +2611,11 @@ mod tests {
         // Round 1: MultiplyAdd updates context variable
         // Barrier
         // Round 2: Operations use context variable
-        // Barrier  
+        // Barrier
         // Round 3: More operations use context variable
 
         let mut emit = SsaEmitContext::new();
-        
+
         // Round 1: MultiplyAdd updates all_idx[g]
         let mult_scalar = emit.emit_const(2);
         let offset_scalar = emit.emit_const(100);
@@ -2370,17 +2623,17 @@ mod tests {
         let offset_vec = emit.emit_vbroadcast(offset_scalar);
         let idx_base_scalar = emit.emit_const(0);
         let idx_base_vec = emit.emit_vbroadcast(idx_base_scalar);
-        
+
         let idx_round1 = emit.emit_fma(idx_base_vec, mult_vec, offset_vec); // op 6
         emit.emit_barrier(); // op 7
-        
+
         // Round 2: Use idx from round 1
         let idx_round2_use1 = emit.emit_valu(Opcode::Add, idx_round1, mult_vec); // op 8
         emit.emit_barrier(); // op 9
-        
+
         // Round 3: Use idx from round 1 again (through round 2's result)
         let idx_round3_use = emit.emit_valu(Opcode::Mul, idx_round2_use1, mult_vec); // op 10
-        
+
         // Final store
         let addr = emit.emit_const(200);
         emit.emit_vstore(addr, idx_round3_use); // op 12
@@ -2398,9 +2651,11 @@ mod tests {
         }
 
         let idx_round1_users = vreg_users.get(&idx_round1).map_or(0, |s| s.len());
-        assert!(idx_round1_users >= 1,
+        assert!(
+            idx_round1_users >= 1,
             "Round 1 FMA result should have users, but has {} users",
-            idx_round1_users);
+            idx_round1_users
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -2414,16 +2669,22 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // Round 1 FMA should be scheduled (used in round 2 and indirectly in round 3)
         // This test is expected to FAIL if Hypothesis 3 is correct - dependencies across
         // multiple barriers aren't tracked properly
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "Round 1 FMA should be scheduled (used across multiple barriers), but has cycle={}. \
              This indicates Hypothesis 3 is correct: Dependencies across barriers aren't \
              properly tracked for context variables.",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
     }
 
     /// Test Hypothesis 4: VReg Replacement Pattern
@@ -2441,20 +2702,20 @@ mod tests {
         // vstore: uses all_idx[g].unwrap() (which is new_vreg)
 
         let mut emit = SsaEmitContext::new();
-        
+
         // Initial context variable value (simulating all_idx[g] from previous operation)
         let old_idx_scalar = emit.emit_const(10);
         let old_idx_vec = emit.emit_vbroadcast(old_idx_scalar); // op 1 - old VReg
-        
+
         // MultiplyAdd creates new VReg and replaces old one
         let mult_scalar = emit.emit_const(2);
         let offset_scalar = emit.emit_const(100);
         let mult_vec = emit.emit_vbroadcast(mult_scalar);
         let offset_vec = emit.emit_vbroadcast(offset_scalar);
-        
+
         // This simulates: ctx.all_idx[g] = Some(emit_fma(...)) replacing old value
         let new_idx_vec = emit.emit_fma(old_idx_vec, mult_vec, offset_vec); // op 6 - new VReg
-        
+
         // vstore uses the new VReg (simulating emit_vstore(..., ctx.all_idx[g].unwrap()))
         let addr = emit.emit_const(200);
         emit.emit_vstore(addr, new_idx_vec); // op 8
@@ -2472,9 +2733,11 @@ mod tests {
         }
 
         let new_idx_users = vreg_users.get(&new_idx_vec).map_or(0, |s| s.len());
-        assert!(new_idx_users >= 1,
+        assert!(
+            new_idx_users >= 1,
             "New VReg from MultiplyAdd should have at least 1 user (vstore), but has {} users",
-            new_idx_users);
+            new_idx_users
+        );
 
         // Schedule
         let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
@@ -2488,14 +2751,20 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // MultiplyAdd should be scheduled (its result is used by vstore)
         // This test is expected to PASS if VReg replacement works correctly
-        assert!(emit.ops[6].cycle >= 0,
+        assert!(
+            emit.ops[6].cycle >= 0,
             "MultiplyAdd should be scheduled (its result new_idx_vec is used by vstore), \
              but has cycle={}. This might indicate an issue with VReg replacement tracking.",
-            emit.ops[6].cycle);
+            emit.ops[6].cycle
+        );
     }
 
     /// Test Real Kernel Pattern: Conditional Stores on Non-Last Rounds
@@ -2513,36 +2782,36 @@ mod tests {
         // - MultiplyAdd updates all_idx[g] for all groups (simplified to 1 group)
         // - NO partition stores (tree_depth doesn't match)
         // Round 2: Tree access uses all_idx[g] from round 1
-        
+
         let mut emit = SsaEmitContext::new();
-        
+
         // Round 1: Branch computation - MultiplyAdd updates all_idx[g]
         // This simulates: emit_branch() with tree_depth=10 (not in TICK/TOCK_STORE_DEPTHS)
-        let val_scalar = emit.emit_const(1);           // op 0 - val for branch
+        let val_scalar = emit.emit_const(1); // op 0 - val for branch
         let val_vec = emit.emit_vbroadcast(val_scalar); // op 1
         let v_1_scalar = emit.emit_const(1);
         let v_1_vec = emit.emit_vbroadcast(v_1_scalar); // op 2
         let v_2_scalar = emit.emit_const(2);
         let v_2_vec = emit.emit_vbroadcast(v_2_scalar); // op 3
-        
-        let idx_old_scalar = emit.emit_const(5);       // op 4 - old idx value
+
+        let idx_old_scalar = emit.emit_const(5); // op 4 - old idx value
         let idx_old_vec = emit.emit_vbroadcast(idx_old_scalar); // op 5
-        
+
         // Branch computation: idx = idx * 2 + (2 - (val & 1))
         let bit = emit.emit_valu(Opcode::And, val_vec, v_1_vec); // op 6
         let offset = emit.emit_valu(Opcode::Sub, v_2_vec, bit); // op 7
         let idx_new = emit.emit_fma(idx_old_vec, v_2_vec, offset); // op 8 - MultiplyAdd updates all_idx[g]
-        
+
         // NO partition stores happen (tree_depth=10 doesn't match TICK/TOCK_STORE_DEPTHS)
         // So idx_new has no immediate users in this round!
-        
+
         // Barrier between rounds
         emit.emit_barrier(); // op 9
-        
+
         // Round 2: Tree access uses all_idx[g] from round 1
         // This simulates: emit_depth1_access() or similar that reads ctx.all_idx[g].unwrap()
         let idx_used = emit.emit_valu(Opcode::Eq, idx_new, v_1_vec); // op 10 - uses idx from round 1
-        
+
         // Eventually store result
         let result_vec = emit.emit_valu(Opcode::And, idx_used, v_1_vec); // op 11
         let addr = emit.emit_const(200);
@@ -2578,15 +2847,21 @@ mod tests {
             1536,
         );
 
-        assert!(result.is_ok(), "Should schedule successfully: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should schedule successfully: {:?}",
+            result.err()
+        );
 
         // The MultiplyAdd (op8) should be scheduled (used in round 2)
         // This test is designed to FAIL if the bug exists - MultiplyAdd with no immediate
         // users in round 1 (no stores) might be marked as dead, even though it's used in round 2
-        assert!(emit.ops[8].cycle >= 0,
+        assert!(
+            emit.ops[8].cycle >= 0,
             "MultiplyAdd from round 1 should be scheduled (used in round 2), but has cycle={}. \
              This indicates the bug: MultiplyAdd with no immediate users (no stores in round 1) \
              is incorrectly marked as dead, even though it's used in round 2 after barrier.",
-            emit.ops[8].cycle);
+            emit.ops[8].cycle
+        );
     }
 }
