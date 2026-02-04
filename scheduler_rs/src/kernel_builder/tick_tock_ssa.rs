@@ -287,9 +287,10 @@ impl SsaTickTockKernelBuilder {
         let scratch_budget = scratch_budget_override.unwrap_or(SCRATCH_BUDGET_HW);
 
         // Schedule using greedy scheduler with VALU→ALU shifting
-        // Collect SelectChoice decisions from greedy scheduler
+        // Collect SelectChoice and ConstChoice (add_imm) decisions from greedy scheduler
         let mut shifted_ops: HashSet<usize> = HashSet::new();
         let mut greedy_select_fma_ops = HashSet::new();
+        let mut greedy_const_add_imm_ops = HashSet::new();
         let (cycles, sched_budget_exceeded, _sched_peak_live) = self
             .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
@@ -299,6 +300,7 @@ impl SsaTickTockKernelBuilder {
                 Some(&mut greedy_select_fma_ops),
                 None, // Don't need cycle hints for greedy path
                 None,
+                Some(&mut greedy_const_add_imm_ops),
             )?;
 
         // Elide barriers before address assignment and lowering
@@ -369,22 +371,23 @@ impl SsaTickTockKernelBuilder {
         if std::env::var("SCHEDULER_DEBUG_DECISIONS").is_ok() {
             let mut s: Vec<_> = shifted_ops.iter().copied().collect();
             s.sort_unstable();
+            let mut c: Vec<_> = greedy_const_add_imm_ops.iter().copied().collect();
+            c.sort_unstable();
             let mut f: Vec<_> = greedy_select_fma_ops.iter().copied().collect();
             f.sort_unstable();
             eprintln!(
-                "[GREEDY_DECISIONS] shifted_ops={:?} const_add_imm_ops=[] select_fma_ops={:?}",
-                s, f
+                "[GREEDY_DECISIONS] shifted_ops={:?} const_add_imm_ops={:?} select_fma_ops={:?}",
+                s, c, f
             );
         }
 
         // Lower to concrete ops, expanding shifted VALU ops to ALU
-        // Greedy scheduler always uses Load for ConstChoice (no AddImm decisions)
-        // Greedy scheduler chooses SelectChoice path based on resource availability
+        // Greedy schedules ConstChoice as add_imm only when Flow is free and no other Flow op is ready
         let ops = lower_ssa_ops_with_shift(
             &ssa_ops,
             &address_result.vreg_to_addr,
             &shifted_ops,
-            &HashSet::new(),        // Greedy always uses Load for ConstChoice
+            &greedy_const_add_imm_ops,
             &greedy_select_fma_ops, // Pass greedy's SelectChoice decisions
             &HashMap::new(),        // Greedy doesn't provide individual ALU cycles
         );
@@ -500,11 +503,12 @@ impl SsaTickTockKernelBuilder {
 
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
-        // Collect SelectChoice decisions from greedy scheduler
+        // Collect SelectChoice and ConstChoice (add_imm) decisions from greedy scheduler
         let mut greedy_shifted = HashSet::new();
         let mut greedy_select_fma_ops = HashSet::new();
         let mut greedy_select_sub_cycles = HashMap::new();
         let mut greedy_select_fma_cycles = HashMap::new();
+        let mut greedy_const_add_imm_ops = HashSet::new();
         let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = self
             .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
@@ -514,6 +518,7 @@ impl SsaTickTockKernelBuilder {
                 Some(&mut greedy_select_fma_ops),
                 Some(&mut greedy_select_sub_cycles),
                 Some(&mut greedy_select_fma_cycles),
+                Some(&mut greedy_const_add_imm_ops), // Hint ConstChoice as add_imm when greedy used Flow
             )?;
 
         if verbose {
@@ -588,6 +593,7 @@ impl SsaTickTockKernelBuilder {
         let mut section_offset: i32 = 0;
 
         for k in 0..boundaries.len() {
+            let mut this_section_makespan: Option<i32> = None;
             if budget_result.section_exceeds_budget[k] {
                 let (start, end) = boundaries[k];
                 let global_indices: Vec<usize> = (start..end)
@@ -686,13 +692,21 @@ impl SsaTickTockKernelBuilder {
                 let (segment_ops, segment_hints): (Vec<SsaOp>, Vec<i32>) =
                     filtered_segment.into_iter().unzip();
 
-                // Use filtered segment indices so CP-SAT cycle_vars align with segment_ops
+                // Indices into segment_ops must match what live_in_for_section_filtered returns:
+                // pass the filtered global indices so last_use_idx is in [0, segment_ops.len()).
+                let filtered_global_indices: Vec<usize> = global_indices
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !seg_addimm_alternatives.contains(idx))
+                    .map(|(_, &g)| g)
+                    .collect();
+
                 let initial_live = live_in_for_section_filtered(
                     &ssa_ops,
                     &boundaries,
                     k,
                     &vreg_def_sec,
-                    &global_indices,
+                    &filtered_global_indices,
                 );
                 let live_out = live_out_from_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 let live_through =
@@ -725,6 +739,7 @@ impl SsaTickTockKernelBuilder {
                         shift_hints: seg_shift,
                         forced_shifts: None,
                         select_choice_hints: seg_select,
+                        const_add_imm_hints: None, // Segment run: no greedy ConstChoice hints
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() {
                             None
@@ -739,9 +754,10 @@ impl SsaTickTockKernelBuilder {
                     },
                 )
                 .ok_or_else(|| format!("Per-section CP-SAT failed for section {}", k))?;
+                this_section_makespan = Some(seg_result.makespan as i32);
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
-                    if seg_idx < global_indices.len() && cycle >= 0 {
-                        ssa_ops[global_indices[seg_idx]].cycle = section_offset + cycle;
+                    if seg_idx < filtered_global_indices.len() && cycle >= 0 {
+                        ssa_ops[filtered_global_indices[seg_idx]].cycle = section_offset + cycle;
                     }
                 }
                 if verbose {
@@ -770,19 +786,28 @@ impl SsaTickTockKernelBuilder {
                     eprintln!();
                 }
             }
-            // Advance section_offset by this section's makespan
+            // Advance section_offset by this section's makespan.
+            // When we ran segment CP-SAT, use its makespan (wrote to filtered_global_indices only;
+            // filtered-out ops keep greedy cycle, so min/max over all ops would be wrong).
             let (start, end) = boundaries[k];
-            let mut min_c = i32::MAX;
-            let mut max_c = i32::MIN;
-            for op in &ssa_ops[start..end] {
-                if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                    min_c = min_c.min(op.cycle);
-                    max_c = max_c.max(op.cycle);
+            let advance = if let Some(m) = this_section_makespan {
+                m
+            } else {
+                let mut min_c = i32::MAX;
+                let mut max_c = i32::MIN;
+                for op in &ssa_ops[start..end] {
+                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+                        min_c = min_c.min(op.cycle);
+                        max_c = max_c.max(op.cycle);
+                    }
                 }
-            }
-            if min_c <= max_c {
-                section_offset += max_c - min_c + 1;
-            }
+                if min_c <= max_c {
+                    max_c - min_c + 1
+                } else {
+                    0
+                }
+            };
+            section_offset += advance;
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget.
@@ -923,6 +948,7 @@ impl SsaTickTockKernelBuilder {
                 shift_hints,
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
+                const_add_imm_hints: Some(&greedy_const_add_imm_ops),
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
@@ -4508,6 +4534,7 @@ mod tests {
                 shift_hints: None,
                 forced_shifts: None,
                 select_choice_hints: None,
+                const_add_imm_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
