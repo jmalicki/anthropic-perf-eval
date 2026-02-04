@@ -1153,6 +1153,10 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         let window_size = (max_alap - min_asap + 1) as usize;
         if window_size > 10000 {
             // Skip very large windows to avoid O(n*m) computation
+            eprintln!(
+                "  [sparse window bound] Skipping {:?} (window_size={} > 10000); lower bound may be weaker.",
+                engine, window_size
+            );
             continue;
         }
 
@@ -1891,16 +1895,9 @@ pub fn schedule_ssa_cpsat(
                 if let Some(forced) = forced_shifts {
                     if forced.contains(&ops[idx].id) {
                         model.add_eq(LinearExpr::from(shift_var.clone()), 1);
-                        model.add_hint(shift_var.clone(), 1);
                     }
                 }
-
-                if let Some(hints) = shift_hints {
-                    let should_shift = hints.contains(&ops[idx].id);
-                    model.add_hint(shift_var, if should_shift { 1 } else { 0 });
-                } else {
-                    model.add_hint(shift_var, 0);
-                }
+                // Shift hints are added in section 11 with all other hints (avoids duplicate hint for same var)
             }
         }
 
@@ -1921,11 +1918,7 @@ pub fn schedule_ssa_cpsat(
             let alu_interval =
                 model.new_optional_fixed_size_interval_var(alu_cycle, 1, shift_var.clone());
             alu_intervals.push(alu_interval);
-            for &dep_id in &ops[idx].dep_ids {
-                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                    model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
-                }
-            }
+            // Precedence vs deps is added in 5b with shift-activated constraints (see below)
         }
         alu_cycle_vars.insert(idx, alu_cycles.clone());
         alu_optional_intervals.insert(idx, alu_intervals);
@@ -1945,6 +1938,44 @@ pub fn schedule_ssa_cpsat(
                 LinearExpr::from(completion_cycle),
                 LinearExpr::from(cycle_vars[idx]),
             );
+        }
+    }
+
+    // 5b. Precedence for the 8 ALU ops of shifted VALU (second model-building loop; we add
+    // constraints here, not a second solver run). We need completion_cycle_vars for all deps
+    // before we can add these, so they cannot go in the loop above. Use the dependency's shift
+    // variable to activate the right bound: when dep is shifted, require alu_cycle >= completion_cycle[dep]+1;
+    // when dep is not shifted, require alu_cycle >= cycle_vars[dep]+1. Exactly one is active.
+    for &idx in &shiftable_valu {
+        if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
+            for alu_cycle in alu_cycles {
+                for &dep_id in &ops[idx].dep_ids {
+                    if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                        if shiftable_set.contains(&dep_idx) {
+                            let shift_dep = *shift_vars.get(&dep_idx).unwrap();
+                            // When shift[dep]=1: dep is shifted -> wait for completion_cycle
+                            if let Some(&completion_cycle) = completion_cycle_vars.get(&dep_idx) {
+                                let c = model.add_ge(
+                                    *alu_cycle,
+                                    LinearExpr::from(completion_cycle) + 1,
+                                );
+                                model.only_enforce_if(c, [shift_dep]);
+                            }
+                            // When shift[dep]=0: dep stays on VALU -> use cycle_vars[dep]
+                            let c = model.add_ge(
+                                *alu_cycle,
+                                LinearExpr::from(cycle_vars[dep_idx]) + 1,
+                            );
+                            model.only_enforce_if(c, [!shift_dep]);
+                        } else {
+                            model.add_ge(
+                                *alu_cycle,
+                                LinearExpr::from(cycle_vars[dep_idx]) + 1,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
