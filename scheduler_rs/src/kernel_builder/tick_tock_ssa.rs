@@ -909,6 +909,27 @@ impl SsaTickTockKernelBuilder {
         let address_result = assign_addresses(&ssa_ops, &assign_config);
         let budget_exceeded = address_result.budget_exceeded;
 
+        // Assert no two VRegs with overlapping live intervals share the same address.
+        // Uses intervals already computed in assign_addresses (no extra cost).
+        let intervals = &address_result.live_intervals;
+        for (v1, addr1) in &address_result.vreg_to_addr {
+            for (v2, addr2) in &address_result.vreg_to_addr {
+                if v1 >= v2 {
+                    continue;
+                }
+                if addr1 != addr2 {
+                    continue;
+                }
+                if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
+                    assert!(
+                        !i1.overlaps(i2),
+                        "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap",
+                        v1, v2, addr1, i1.start, i1.end, i2.start, i2.end
+                    );
+                }
+            }
+        }
+
         if budget_exceeded {
             // CP-SAT should respect budget, so this indicates a bug in CP-SAT solver
             eprintln!(
