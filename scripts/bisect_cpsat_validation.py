@@ -33,6 +33,15 @@ def main():
     )
     args = parser.parse_args()
 
+    # batch_size must be a multiple of VLEN (8) - kernel processes vectors of 8 elements
+    if args.batch_size % 8 != 0:
+        print(
+            f"Error: batch_size must be a multiple of 8 (VLEN). Got {args.batch_size}. "
+            "Use e.g. 8, 16, 24, 32.",
+            file=sys.stderr,
+        )
+        return 1
+
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = os.path.join(project_root, "generate_ssa_kernel.py")
     if not os.path.isfile(script):

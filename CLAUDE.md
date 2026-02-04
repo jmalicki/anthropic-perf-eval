@@ -20,6 +20,8 @@ The benchmark uses these default parameters:
 
 These values are consistent across all test scripts and should be used when benchmarking.
 
+**Batch size constraint:** `batch_size` must be a positive multiple of VLEN (8), because the kernel processes vectors of 8 elements. Invalid values (e.g. 12, 20) produce wrong output or are rejected. Use e.g. 8, 16, 24, 32.
+
 ## Build & Development Commands
 
 ### Python Setup
@@ -263,6 +265,7 @@ Each cycle executes one bundle (dict of engine → list of operations):
 ## Important Constraints
 
 - **Vector length (VLEN) = 8** - All vector operations process 8 elements
+- **Batch size must be a multiple of 8** - `batch_size` must equal VLEN × n_groups (e.g. 8, 16, 32)
 - **Scratch space = 1536 words** - Limited register/cache space
 - **Write-after-read timing** - Results visible next cycle
 - **Primary bottleneck: Gather operations** - 8 non-contiguous loads per group

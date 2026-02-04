@@ -6,7 +6,7 @@
 |-----------|-------|-------|
 | Tree Height | 10 | Levels below root (11 total levels) |
 | Tree Nodes | 2047 | 2^(h+1) - 1 = 2^11 - 1 |
-| Batch Size | 256 | Number of elements to process |
+| Batch Size | 256 | Number of elements to process; **must be a multiple of VLEN (8)** |
 | Rounds | 16 | Number of tree traversal steps |
 | VLEN | 8 | Elements per vector operation |
 | N_CORES | 1 | Single core |

@@ -47,7 +47,7 @@ def main():
     parser.add_argument("--n-nodes", type=int, default=2047,
                         help="Number of tree nodes (default: 2047 = 2^10 - 1)")
     parser.add_argument("--batch-size", type=int, default=256,
-                        help="Number of parallel traversals (default: 256)")
+                        help="Number of parallel traversals; must be a multiple of 8 (VLEN) (default: 256)")
     parser.add_argument("--rounds", type=int, default=16,
                         help="Hash rounds per traversal (default: 16)")
 

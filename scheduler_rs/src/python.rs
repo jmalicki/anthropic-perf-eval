@@ -13,19 +13,21 @@ use crate::constants::{
     analyze_constant_usage, build_constant_plan, emit_constant_generation_ops,
     print_constant_plan_summary,
 };
+use crate::diagnostics::{
+    analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis,
+};
 use crate::peephole::{optimize as peephole_optimize, PeepholeConfig};
-use crate::diagnostics::{analyze_shared_temp_dependencies, SchedulingDiagnostics, SharedTempAnalysis};
 use crate::scheduler::{
     compute_critical_path, compute_last_uses, schedule_greedy, schedule_greedy_with_diagnostics,
     schedule_with_pseudo_consts, schedule_with_slot_filling, PriorityMode, ALL_PRIORITY_MODES,
 };
 use arrayvec::ArrayVec;
 
-use crate::types::{Engine, Op, SlotVal, UsageAccounting, MAX_SLOT_SIZE, VLEN};
 use crate::address_assign::{
-    build_vreg_debug_info, compute_liveness_curve, compute_liveness_summary,
-    CycleLiveness, LivenessSummary, VRegDebugInfo,
+    build_vreg_debug_info, compute_liveness_curve, compute_liveness_summary, CycleLiveness,
+    LivenessSummary, VRegDebugInfo,
 };
+use crate::types::{Engine, Op, SlotVal, UsageAccounting, MAX_SLOT_SIZE, VLEN};
 
 // =============================================================================
 // Parsing: Python -> Rust
@@ -52,48 +54,44 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                 let op_type: String = slot_tuple.get_item(0)?.extract()?;
 
                 match engine.as_str() {
-                    "load" => {
-                        match op_type.as_str() {
-                            "const" => {
-                                let dest: i64 = slot_tuple.get_item(1)?.extract()?;
-                                writes.insert(dest);
-                            }
-                            "load" => {
-                                let dest: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let src: i64 = slot_tuple.get_item(2)?.extract()?;
-                                writes.insert(dest);
-                                reads.insert(src);
-                            }
-                            "vload" => {
-                                let dest: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let src: i64 = slot_tuple.get_item(2)?.extract()?;
-                                for i in 0..VLEN as i64 {
-                                    writes.insert(dest + i);
-                                }
-                                reads.insert(src);
-                            }
-                            _ => {}
+                    "load" => match op_type.as_str() {
+                        "const" => {
+                            let dest: i64 = slot_tuple.get_item(1)?.extract()?;
+                            writes.insert(dest);
                         }
-                    }
-                    "store" => {
-                        match op_type.as_str() {
-                            "store" => {
-                                let addr: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let data: i64 = slot_tuple.get_item(2)?.extract()?;
-                                reads.insert(addr);
-                                reads.insert(data);
-                            }
-                            "vstore" => {
-                                let addr: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let data: i64 = slot_tuple.get_item(2)?.extract()?;
-                                reads.insert(addr);
-                                for i in 0..VLEN as i64 {
-                                    reads.insert(data + i);
-                                }
-                            }
-                            _ => {}
+                        "load" => {
+                            let dest: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let src: i64 = slot_tuple.get_item(2)?.extract()?;
+                            writes.insert(dest);
+                            reads.insert(src);
                         }
-                    }
+                        "vload" => {
+                            let dest: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let src: i64 = slot_tuple.get_item(2)?.extract()?;
+                            for i in 0..VLEN as i64 {
+                                writes.insert(dest + i);
+                            }
+                            reads.insert(src);
+                        }
+                        _ => {}
+                    },
+                    "store" => match op_type.as_str() {
+                        "store" => {
+                            let addr: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let data: i64 = slot_tuple.get_item(2)?.extract()?;
+                            reads.insert(addr);
+                            reads.insert(data);
+                        }
+                        "vstore" => {
+                            let addr: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let data: i64 = slot_tuple.get_item(2)?.extract()?;
+                            reads.insert(addr);
+                            for i in 0..VLEN as i64 {
+                                reads.insert(data + i);
+                            }
+                        }
+                        _ => {}
+                    },
                     "alu" => {
                         let dest: i64 = slot_tuple.get_item(1)?.extract()?;
                         let src1: i64 = slot_tuple.get_item(2)?.extract()?;
@@ -137,48 +135,44 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                             }
                         }
                     }
-                    "flow" => {
-                        match op_type.as_str() {
-                            "vselect" => {
-                                let dest: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let src1: i64 = slot_tuple.get_item(2)?.extract()?;
-                                let src2: i64 = slot_tuple.get_item(3)?.extract()?;
-                                let src3: i64 = slot_tuple.get_item(4)?.extract()?;
-                                for i in 0..VLEN as i64 {
-                                    writes.insert(dest + i);
-                                    reads.insert(src1 + i);
-                                    reads.insert(src2 + i);
-                                    reads.insert(src3 + i);
-                                }
+                    "flow" => match op_type.as_str() {
+                        "vselect" => {
+                            let dest: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let src1: i64 = slot_tuple.get_item(2)?.extract()?;
+                            let src2: i64 = slot_tuple.get_item(3)?.extract()?;
+                            let src3: i64 = slot_tuple.get_item(4)?.extract()?;
+                            for i in 0..VLEN as i64 {
+                                writes.insert(dest + i);
+                                reads.insert(src1 + i);
+                                reads.insert(src2 + i);
+                                reads.insert(src3 + i);
                             }
-                            "add_imm" => {
-                                let dest: i64 = slot_tuple.get_item(1)?.extract()?;
-                                let src: i64 = slot_tuple.get_item(2)?.extract()?;
-                                writes.insert(dest);
-                                reads.insert(src);
-                            }
-                            "cond_jump" => {
-                                let cond: i64 = slot_tuple.get_item(1)?.extract()?;
-                                reads.insert(cond);
-                            }
-                            _ => {}
                         }
-                    }
-                    "debug" => {
-                        match op_type.as_str() {
-                            "vcompare" => {
-                                let loc: i64 = slot_tuple.get_item(1)?.extract()?;
-                                for i in 0..VLEN as i64 {
-                                    reads.insert(loc + i);
-                                }
-                            }
-                            "compare" => {
-                                let loc: i64 = slot_tuple.get_item(1)?.extract()?;
-                                reads.insert(loc);
-                            }
-                            _ => {}
+                        "add_imm" => {
+                            let dest: i64 = slot_tuple.get_item(1)?.extract()?;
+                            let src: i64 = slot_tuple.get_item(2)?.extract()?;
+                            writes.insert(dest);
+                            reads.insert(src);
                         }
-                    }
+                        "cond_jump" => {
+                            let cond: i64 = slot_tuple.get_item(1)?.extract()?;
+                            reads.insert(cond);
+                        }
+                        _ => {}
+                    },
+                    "debug" => match op_type.as_str() {
+                        "vcompare" => {
+                            let loc: i64 = slot_tuple.get_item(1)?.extract()?;
+                            for i in 0..VLEN as i64 {
+                                reads.insert(loc + i);
+                            }
+                        }
+                        "compare" => {
+                            let loc: i64 = slot_tuple.get_item(1)?.extract()?;
+                            reads.insert(loc);
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
 
@@ -239,10 +233,7 @@ pub fn compute_dependencies(ops: &mut [Op]) {
             if let Some(&writer_id) = last_writer.get(addr) {
                 ops[i].dep_ids.insert(writer_id);
             }
-            readers_since_write
-                .entry(*addr)
-                .or_default()
-                .push(op_id);
+            readers_since_write.entry(*addr).or_default().push(op_id);
         }
 
         // WAR + WAW: depend on ops for values we write
@@ -293,7 +284,10 @@ pub fn emit_scheduled_with_expanded<'py>(
 
         // Emit regular ops, SKIP shifted_valu (these are replaced by expanded ALU ops)
         for op in ops {
-            if op.cycle == cycle as i32 && op.engine != Engine::ShiftedValu && op.engine != Engine::EliminatedBroadcast {
+            if op.cycle == cycle as i32
+                && op.engine != Engine::ShiftedValu
+                && op.engine != Engine::EliminatedBroadcast
+            {
                 emit_op_to_dict(py, op, &instr)?;
             }
         }
@@ -314,11 +308,7 @@ pub fn emit_scheduled_with_expanded<'py>(
 }
 
 /// Helper to emit a single op to a dict
-fn emit_op_to_dict<'py>(
-    py: Python<'py>,
-    op: &Op,
-    instr: &Bound<'py, PyDict>,
-) -> PyResult<()> {
+fn emit_op_to_dict<'py>(py: Python<'py>, op: &Op, instr: &Bound<'py, PyDict>) -> PyResult<()> {
     let engine_str = op.engine.as_str();
 
     // Get or create the list for this engine
@@ -694,8 +684,8 @@ fn format_addr(val: i64, context: &str, slot_idx: usize) -> String {
             }
         }
         "vselect" | "multiply_add" | "vmultiply_add" => format!("v{}", val),
-        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "==" | "!=" | "<"
-        | "<=" | ">" | ">=" => format!("s{}", val),
+        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "==" | "!=" | "<" | "<="
+        | ">" | ">=" => format!("s{}", val),
         "add_imm" => {
             if slot_idx == 3 {
                 format!("i{}", val)
@@ -835,8 +825,8 @@ pub fn schedule_to_json(
                 for (idx, slot_val) in op.slot.iter_mut().enumerate() {
                     if let SlotVal::Int(reg) = slot_val {
                         let is_source = match opcode.as_str() {
-                            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
-                            | "==" | "!=" | "<" | "<=" | ">" | ">=" => idx >= 2,
+                            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "=="
+                            | "!=" | "<" | "<=" | ">" | ">=" => idx >= 2,
                             "multiply_add" | "vmultiply_add" => idx >= 2,
                             "vbroadcast" => idx == 2,
                             "vselect" => idx >= 2,
@@ -960,7 +950,10 @@ pub fn schedule_to_json(
 
         // Process regular ops
         for op in &ops {
-            if op.cycle == cycle as i32 && op.engine != Engine::ShiftedValu && op.engine != Engine::EliminatedBroadcast {
+            if op.cycle == cycle as i32
+                && op.engine != Engine::ShiftedValu
+                && op.engine != Engine::EliminatedBroadcast
+            {
                 let opcode = op
                     .slot
                     .get(0)
@@ -980,7 +973,8 @@ pub fn schedule_to_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
-                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
+                let formatted =
+                    format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 match op.engine {
                     Engine::Load => load_ops.push(formatted),
@@ -1015,7 +1009,8 @@ pub fn schedule_to_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
-                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
+                let formatted =
+                    format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 alu_ops.push(formatted);
             }
@@ -1158,7 +1153,11 @@ pub fn optimize_constants<'py>(
             // Return unscheduled ops as-is
             return emit_unscheduled(py, &ops);
         }
-        let max_cycle = ops.iter().map(|op| op.cycle.max(0) as usize).max().unwrap_or(0);
+        let max_cycle = ops
+            .iter()
+            .map(|op| op.cycle.max(0) as usize)
+            .max()
+            .unwrap_or(0);
         return emit_scheduled(py, &ops, max_cycle + 1);
     }
 
@@ -1364,7 +1363,8 @@ fn write_schedule_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
-                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
+                let formatted =
+                    format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 match op.engine {
                     Engine::Load => load_ops.push(formatted),
@@ -1399,7 +1399,8 @@ fn write_schedule_json(
                     })
                     .collect();
                 let compact = parts.join(" ");
-                let formatted = format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
+                let formatted =
+                    format_op_with_comment(op, compact, &op_id_to_cycle, &dependents_map);
 
                 alu_ops.push(formatted);
             }
@@ -1580,27 +1581,37 @@ fn write_ssa_schedule_json(
     use crate::types::SlotVal;
 
     // Convert ops to debug info
-    let ops_debug: Vec<OpDebugInfo> = result.ops.iter().map(|op| {
-        // Convert slot values to strings
-        let slot: Vec<String> = op.slot.iter().map(|sv| match sv {
-            SlotVal::Str(s) => s.clone(),
-            SlotVal::Int(i) => i.to_string(),
-        }).collect();
+    let ops_debug: Vec<OpDebugInfo> = result
+        .ops
+        .iter()
+        .map(|op| {
+            // Convert slot values to strings
+            let slot: Vec<String> = op
+                .slot
+                .iter()
+                .map(|sv| match sv {
+                    SlotVal::Str(s) => s.clone(),
+                    SlotVal::Int(i) => i.to_string(),
+                })
+                .collect();
 
-        OpDebugInfo {
-            id: op.id,
-            cycle: op.cycle,
-            engine: op.engine.as_str().to_string(),
-            opcode: slot.first().cloned().unwrap_or_default(),
-            slot,
-            dep_ids: op.dep_ids.iter().copied().collect(),
-            reads: op.reads.iter().copied().collect(),
-            writes: op.writes.iter().copied().collect(),
-        }
-    }).collect();
+            OpDebugInfo {
+                id: op.id,
+                cycle: op.cycle,
+                engine: op.engine.as_str().to_string(),
+                opcode: slot.first().cloned().unwrap_or_default(),
+                slot,
+                dep_ids: op.dep_ids.iter().copied().collect(),
+                reads: op.reads.iter().copied().collect(),
+                writes: op.writes.iter().copied().collect(),
+            }
+        })
+        .collect();
 
     // Convert vreg_to_addr to string keys for JSON serialization
-    let vreg_to_addr: std::collections::HashMap<String, i64> = result.address_result.vreg_to_addr
+    let vreg_to_addr: std::collections::HashMap<String, i64> = result
+        .address_result
+        .vreg_to_addr
         .iter()
         .map(|(vreg, addr)| (format!("{:?}", vreg), *addr))
         .collect();
@@ -1623,10 +1634,8 @@ fn write_ssa_schedule_json(
         )
     } else {
         // Compute full liveness summary
-        let summary = compute_liveness_summary(
-            &result.address_result.live_intervals,
-            &result.vreg_metadata,
-        );
+        let summary =
+            compute_liveness_summary(&result.address_result.live_intervals, &result.vreg_metadata);
 
         if liveness_detail == LivenessDetail::Full {
             // Build VReg debug info
@@ -1656,11 +1665,11 @@ fn write_ssa_schedule_json(
         let mut clustered_count = 0;
         let mut spread_samples = Vec::new();
         let mut clustered_samples = Vec::new();
-        
+
         for (op_id, cycles) in &result.shifted_alu_cycles {
             let unique: HashSet<i32> = cycles.iter().copied().collect();
             let is_spread = unique.len() > 1;
-            
+
             if is_spread {
                 spread_count += 1;
                 if spread_samples.len() < 10 {
@@ -1683,10 +1692,10 @@ fn write_ssa_schedule_json(
                 }
             }
         }
-        
+
         let mut samples = spread_samples;
         samples.extend(clustered_samples);
-        
+
         Some(ValuShiftDebug {
             total_shifted: result.shifted_alu_cycles.len(),
             spread_count,
@@ -1714,9 +1723,11 @@ fn write_ssa_schedule_json(
         valu_shift_debug,
     };
 
-    let json = serde_json::to_string_pretty(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
+    let json = serde_json::to_string_pretty(&output)
+        .map_err(|e| format!("JSON serialization failed: {}", e))?;
 
-    std::fs::write(output_path, &json).map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
+    std::fs::write(output_path, &json)
+        .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
 
     Ok(())
 }
@@ -1837,11 +1848,12 @@ pub fn build_tick_tock_kernel<'py>(
     let mut builder = TickTockKernelBuilder::new(config.clone());
 
     // Get ops and optionally pseudo-consts
-    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) = if enable_pseudo_consts {
-        builder.build_with_pseudo_consts()
-    } else {
-        (builder.build(), Vec::new())
-    };
+    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) =
+        if enable_pseudo_consts {
+            builder.build_with_pseudo_consts()
+        } else {
+            (builder.build(), Vec::new())
+        };
 
     if verbose {
         println!("Generated {} ops", ops.len());
@@ -1880,10 +1892,8 @@ pub fn build_tick_tock_kernel<'py>(
     let critical_path = compute_critical_path(&ops);
 
     // Clone dep_ids for reuse
-    let dep_ids_map: HashMap<usize, HashSet<usize>> = ops
-        .iter()
-        .map(|op| (op.id, op.dep_ids.clone()))
-        .collect();
+    let dep_ids_map: HashMap<usize, HashSet<usize>> =
+        ops.iter().map(|op| (op.id, op.dep_ids.clone())).collect();
 
     // Fixed addresses that should not be remapped during register allocation
     let fixed_addrs: HashSet<i64> = [0i64].into_iter().collect(); // Address 0 always contains 0 (hardware initialization)
@@ -1945,7 +1955,7 @@ pub fn build_tick_tock_kernel<'py>(
                     &critical_path,
                     enable_valu_shift,
                     mode,
-                    2000,  // const_register_start
+                    2000, // const_register_start
                 );
 
                 let mut final_expanded = result.expanded_ops;
@@ -1978,7 +1988,8 @@ pub fn build_tick_tock_kernel<'py>(
                     op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
                 }
 
-                let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+                let result =
+                    schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
 
                 let mut final_expanded = result.expanded_ops;
                 let allocation_result = apply_register_allocation(
@@ -2007,9 +2018,16 @@ pub fn build_tick_tock_kernel<'py>(
         .expect("No scheduling results");
 
     if verbose {
-        println!("Best: {:?} with {} cycles (parallel multipass)", best.mode, best.cycles);
+        println!(
+            "Best: {:?} with {} cycles (parallel multipass)",
+            best.mode, best.cycles
+        );
         if let Some(ref alloc) = best.allocation_result {
-            let status = if alloc.budget_exceeded { " EXCEEDED BUDGET!" } else { "" };
+            let status = if alloc.budget_exceeded {
+                " EXCEEDED BUDGET!"
+            } else {
+                ""
+            };
             println!(
                 "Register allocation: max addr {} -> {} (peak live: {}/{}, {} remapped, {} fixed){}",
                 alloc.max_addr_before, alloc.max_addr_after, alloc.peak_live, alloc.budget,
@@ -2032,7 +2050,16 @@ pub fn build_tick_tock_kernel<'py>(
     // Build final list with pause wrappers
     let result = PyList::empty(py);
     let pause_dict = PyDict::new(py);
-    pause_dict.set_item("flow", PyList::new(py, &[PyTuple::new(py, &["pause".into_pyobject(py).unwrap().into_any()])?])?)?;
+    pause_dict.set_item(
+        "flow",
+        PyList::new(
+            py,
+            &[PyTuple::new(
+                py,
+                &["pause".into_pyobject(py).unwrap().into_any()],
+            )?],
+        )?,
+    )?;
     result.append(&pause_dict)?;
 
     for item in scheduled.iter() {
@@ -2110,11 +2137,12 @@ pub fn build_tick_tock_kernel_ops(
     let mut builder = TickTockKernelBuilder::new(config.clone());
 
     // Get ops and optionally pseudo-consts
-    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) = if enable_pseudo_consts {
-        builder.build_with_pseudo_consts()
-    } else {
-        (builder.build(), Vec::new())
-    };
+    let (mut ops, pseudo_consts): (Vec<Op>, Vec<crate::types::PseudoConst>) =
+        if enable_pseudo_consts {
+            builder.build_with_pseudo_consts()
+        } else {
+            (builder.build(), Vec::new())
+        };
 
     if verbose {
         println!("Generated {} ops", ops.len());
@@ -2153,10 +2181,8 @@ pub fn build_tick_tock_kernel_ops(
     let critical_path = compute_critical_path(&ops);
 
     // Clone dep_ids for reuse
-    let dep_ids_map: HashMap<usize, HashSet<usize>> = ops
-        .iter()
-        .map(|op| (op.id, op.dep_ids.clone()))
-        .collect();
+    let dep_ids_map: HashMap<usize, HashSet<usize>> =
+        ops.iter().map(|op| (op.id, op.dep_ids.clone())).collect();
 
     // Run all priority modes in parallel using Rayon
     let results: Vec<(PriorityMode, usize)> = if enable_slot_filling {
@@ -2197,7 +2223,7 @@ pub fn build_tick_tock_kernel_ops(
                     &critical_path,
                     enable_valu_shift,
                     mode,
-                    2000,  // const_register_start
+                    2000, // const_register_start
                 );
                 (mode, result.cycles)
             })
@@ -2213,7 +2239,8 @@ pub fn build_tick_tock_kernel_ops(
                     op.dep_ids = dep_ids_map.get(&op.id).cloned().unwrap_or_default();
                 }
 
-                let result = schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
+                let result =
+                    schedule_greedy(&mut test_ops, &critical_path, enable_valu_shift, mode);
                 (mode, result.cycles)
             })
             .collect()
@@ -2226,7 +2253,10 @@ pub fn build_tick_tock_kernel_ops(
         .expect("No scheduling results");
 
     if verbose {
-        println!("Best: {:?} with {} cycles (parallel multipass)", best_mode, best_cycles);
+        println!(
+            "Best: {:?} with {} cycles (parallel multipass)",
+            best_mode, best_cycles
+        );
         if enable_register_allocation {
             println!("Note: Register allocation enabled but only affects address layout, not cycle count");
             println!("Use build_tick_tock_kernel() for full allocation statistics");
@@ -2315,7 +2345,10 @@ pub fn schedule_cpsat<'py>(
         }
 
         if verbose {
-            eprintln!("CP-SAT hint: {} cycles (multipass, no VALU-shift)", best_cycles);
+            eprintln!(
+                "CP-SAT hint: {} cycles (multipass, no VALU-shift)",
+                best_cycles
+            );
         }
 
         best_hint
@@ -2383,7 +2416,7 @@ pub fn cpsat_available() -> bool {
 // SSA Kernel Building Functions
 // =============================================================================
 
-use crate::kernel_builder::{SsaTickTockKernelBuilder, SsaScheduleResult};
+use crate::kernel_builder::{SsaScheduleResult, SsaTickTockKernelBuilder};
 
 /// Build a tick-tock kernel using SSA-based emission.
 ///
@@ -2428,6 +2461,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     liveness_detail: Option<String>,
     forced_shifts: Option<Vec<usize>>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+    if batch_size == 0 || batch_size % VLEN != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "batch_size must be a positive multiple of VLEN ({}) (got {}). Use e.g. 8, 16, 32.",
+            VLEN, batch_size
+        )));
+    }
+
     let config = KernelConfig {
         forest_height,
         n_nodes,
@@ -2456,7 +2496,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     }
 
     if verbose {
-        println!("Building SSA kernel{}...", if use_cpsat { " (CP-SAT)" } else { "" });
+        println!(
+            "Building SSA kernel{}...",
+            if use_cpsat { " (CP-SAT)" } else { "" }
+        );
     }
 
     let const_choice_mode = crate::cpsat_scheduler::ConstChoiceMode::from_str(const_choice)
@@ -2466,11 +2509,23 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let valu_shift_mode = crate::cpsat_scheduler::ValuShiftMode::from_str(valu_shift)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
-    let forced_shifts_set: Option<std::collections::HashSet<usize>> = forced_shifts.map(|v| v.into_iter().collect());
+    let forced_shifts_set: Option<std::collections::HashSet<usize>> =
+        forced_shifts.map(|v| v.into_iter().collect());
     let result = if use_cpsat {
-        builder.build_and_schedule_cpsat(cpsat_time_limit, verbose, enable_valu_shift, per_section_optimize_secs, forced_shifts_set, const_choice_mode, select_choice_mode, valu_shift_mode).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
-        })?
+        builder
+            .build_and_schedule_cpsat(
+                cpsat_time_limit,
+                verbose,
+                enable_valu_shift,
+                per_section_optimize_secs,
+                forced_shifts_set,
+                const_choice_mode,
+                select_choice_mode,
+                valu_shift_mode,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
+            })?
     } else {
         builder.build_and_schedule().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
@@ -2497,7 +2552,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let pause_dict = PyDict::new(py);
     pause_dict.set_item(
         "flow",
-        PyList::new(py, &[PyTuple::new(py, &["pause".into_pyobject(py).unwrap().into_any()])?])?,
+        PyList::new(
+            py,
+            &[PyTuple::new(
+                py,
+                &["pause".into_pyobject(py).unwrap().into_any()],
+            )?],
+        )?,
     )?;
     instrs.append(&pause_dict)?;
 
@@ -2517,7 +2578,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("valu_shifted", result.valu_shifted)?;
 
     // Add usage accounting as JSON
-    let usage_json = serde_json::to_string(&result.usage_accounting).unwrap_or_else(|_| "{}".to_string());
+    let usage_json =
+        serde_json::to_string(&result.usage_accounting).unwrap_or_else(|_| "{}".to_string());
     stats.set_item("usage_accounting_json", usage_json)?;
 
     // Also add summary stats for easy access
@@ -2538,7 +2600,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             pyo3::exceptions::PyIOError::new_err(format!("Failed to write output JSON: {}", e))
         })?;
         if verbose {
-            println!("Wrote schedule output with usage accounting to {} (liveness: {:?})", output_path, detail);
+            println!(
+                "Wrote schedule output with usage accounting to {} (liveness: {:?})",
+                output_path, detail
+            );
         }
     }
 
