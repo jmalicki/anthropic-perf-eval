@@ -150,7 +150,10 @@ impl FromStr for ConstChoiceMode {
             "optimize" => Ok(Self::Optimize),
             "add_imm" => Ok(Self::ForceAddImm),
             "load" => Ok(Self::ForceLoad),
-            _ => Err(format!("invalid const_choice '{}', expected optimize, add_imm, or load", s)),
+            _ => Err(format!(
+                "invalid const_choice '{}', expected optimize, add_imm, or load",
+                s
+            )),
         }
     }
 }
@@ -176,7 +179,10 @@ impl FromStr for SelectChoiceMode {
             "optimize" => Ok(Self::Optimize),
             "fma" => Ok(Self::ForceFma),
             "vselect" => Ok(Self::ForceVselect),
-            _ => Err(format!("invalid select_choice '{}', expected optimize, fma, or vselect", s)),
+            _ => Err(format!(
+                "invalid select_choice '{}', expected optimize, fma, or vselect",
+                s
+            )),
         }
     }
 }
@@ -202,7 +208,10 @@ impl FromStr for ValuShiftMode {
             "optimize" => Ok(Self::Optimize),
             "alu" => Ok(Self::ForceAlu),
             "valu" => Ok(Self::ForceValu),
-            _ => Err(format!("invalid valu_shift '{}', expected optimize, alu, or valu", s)),
+            _ => Err(format!(
+                "invalid valu_shift '{}', expected optimize, alu, or valu",
+                s
+            )),
         }
     }
 }
@@ -334,10 +343,7 @@ pub fn compute_alap(ops: &[Op], horizon: i32) -> HashMap<usize, i32> {
     // Build out-degree
     let mut out_degree: HashMap<usize, usize> = HashMap::new();
     for op in ops {
-        out_degree.insert(
-            op.id,
-            consumers.get(&op.id).map(|c| c.len()).unwrap_or(0),
-        );
+        out_degree.insert(op.id, consumers.get(&op.id).map(|c| c.len()).unwrap_or(0));
     }
 
     // Start with sinks (ops with no consumers)
@@ -399,7 +405,8 @@ fn build_flow_audit(
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
     let makespan_usize = makespan.max(0) as usize;
     let mut flow_per_cycle: Vec<i32> = vec![0; makespan_usize];
-    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> = vec![Vec::new(); makespan_usize];
+    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> =
+        vec![Vec::new(); makespan_usize];
     let mut all_flow_rows: Vec<FlowAuditRow> = Vec::new();
 
     for (idx, op) in ops.iter().enumerate() {
@@ -573,11 +580,17 @@ fn summarise_ssa_solution_engines_and_choices(
         }
     }
 
-    let const_total = ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+    let const_total = ops
+        .iter()
+        .filter(|o| o.opcode == Opcode::ConstChoice)
+        .count();
     let const_add_imm = const_add_imm_ops.len();
     let const_load = const_total.saturating_sub(const_add_imm);
 
-    let select_total = ops.iter().filter(|o| o.opcode == Opcode::SelectChoice).count();
+    let select_total = ops
+        .iter()
+        .filter(|o| o.opcode == Opcode::SelectChoice)
+        .count();
     let select_fma = select_fma_ops.len();
     let select_vselect = select_total.saturating_sub(select_fma);
 
@@ -616,7 +629,8 @@ fn validate_ssa_slot_limits(
     let mut store_per_cycle: Vec<i32> = vec![0; makespan as usize];
     let mut flow_per_cycle: Vec<i32> = vec![0; makespan as usize];
     // For Flow violations: which ops contribute Flow at each cycle (for diagnostics).
-    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> = vec![Vec::new(); makespan as usize];
+    let mut flow_contributors_per_cycle: Vec<Vec<(usize, String)>> =
+        vec![Vec::new(); makespan as usize];
 
     for (idx, op) in ops.iter().enumerate() {
         let cycle = cycle_assignments.get(idx).copied().unwrap_or(0) as usize;
@@ -628,7 +642,8 @@ fn validate_ssa_slot_limits(
             if const_add_imm_ops.contains(&op.id) {
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
-                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} ConstChoice→AddImm", op.id)));
+                    flow_contributors_per_cycle[cycle]
+                        .push((idx, format!("op{} ConstChoice→AddImm", op.id)));
                 }
             } else {
                 load_per_cycle[cycle] += 1;
@@ -647,7 +662,8 @@ fn validate_ssa_slot_limits(
             } else {
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
-                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} SelectChoice→vselect", op.id)));
+                    flow_contributors_per_cycle[cycle]
+                        .push((idx, format!("op{} SelectChoice→vselect", op.id)));
                 }
             }
             continue;
@@ -679,7 +695,8 @@ fn validate_ssa_slot_limits(
             Engine::Flow => {
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
-                    flow_contributors_per_cycle[cycle].push((idx, format!("op{} Flow({:?})", op.id, op.opcode)));
+                    flow_contributors_per_cycle[cycle]
+                        .push((idx, format!("op{} Flow({:?})", op.id, op.opcode)));
                 }
             }
             _ => {}
@@ -727,7 +744,10 @@ fn validate_ssa_slot_limits(
                             cycle_assignments,
                         )
                     };
-                    format!(" contributors at cycle {}: {:?}.{}", cycle, contribs, breadcrumbs)
+                    format!(
+                        " contributors at cycle {}: {:?}.{}",
+                        cycle, contribs, breadcrumbs
+                    )
                 } else {
                     String::new()
                 };
@@ -1036,10 +1056,8 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         // Also, ops with ALAP = d contribute "energy" that must finish by d+1.
         for d in 0..=max_alap.min(horizon) {
             // Count ops that must complete by cycle d (ALAP <= d)
-            let mandatory_count: i64 = bounds
-                .iter()
-                .filter(|(_, alap_val)| *alap_val <= d)
-                .count() as i64;
+            let mandatory_count: i64 =
+                bounds.iter().filter(|(_, alap_val)| *alap_val <= d).count() as i64;
 
             if mandatory_count > 0 {
                 // mandatory_count ops must fit in (d+1) cycles with capacity slots each
@@ -1310,7 +1328,7 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
     params.cp_model_presolve = Some(true);
     params.cp_model_probing_level = Some(2);
     params.randomize_search = Some(true);
-    
+
     // Stop early if we find a good solution (within 2% of greedy)
     params.relative_gap_limit = Some(0.02);
 
@@ -1552,10 +1570,7 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
     // Build out-degree
     let mut out_degree: HashMap<usize, usize> = HashMap::new();
     for op in ops {
-        out_degree.insert(
-            op.id,
-            consumers.get(&op.id).map(|c| c.len()).unwrap_or(0),
-        );
+        out_degree.insert(op.id, consumers.get(&op.id).map(|c| c.len()).unwrap_or(0));
     }
 
     // Start with sinks (ops with no consumers)
@@ -1691,19 +1706,35 @@ pub fn schedule_ssa_cpsat(
     if verbose {
         let total_valu_ops: usize = ops.iter().filter(|op| op.engine == Engine::Valu).count();
         let non_shiftable_valu_count = total_valu_ops - shiftable_valu.len();
-        let vbroadcast_count = ops.iter().filter(|op| op.engine == Engine::Valu && op.opcode == Opcode::Vbroadcast).count();
-        let multiply_add_count = ops.iter().filter(|op| op.engine == Engine::Valu && op.opcode == Opcode::MultiplyAdd).count();
-        let select_choice_count = ops.iter().filter(|op| op.opcode == Opcode::SelectChoice).count();
+        let vbroadcast_count = ops
+            .iter()
+            .filter(|op| op.engine == Engine::Valu && op.opcode == Opcode::Vbroadcast)
+            .count();
+        let multiply_add_count = ops
+            .iter()
+            .filter(|op| op.engine == Engine::Valu && op.opcode == Opcode::MultiplyAdd)
+            .count();
+        let select_choice_count = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::SelectChoice)
+            .count();
         eprintln!(
             "SSA CP-SAT: {} ops, critical path {}, horizon {}, scratch_budget={}",
             n, critical_path_len, horizon, scratch_budget
         );
         eprintln!(
             "  VALU ops: {} total ({} shiftable, {} non-shiftable: {} vbroadcast, {} multiply_add)",
-            total_valu_ops, shiftable_valu.len(), non_shiftable_valu_count, vbroadcast_count, multiply_add_count
+            total_valu_ops,
+            shiftable_valu.len(),
+            non_shiftable_valu_count,
+            vbroadcast_count,
+            multiply_add_count
         );
         if select_choice_count > 0 {
-            eprintln!("  SelectChoice ops: {} (can expand to FMA/VALU or vselect/Flow)", select_choice_count);
+            eprintln!(
+                "  SelectChoice ops: {} (can expand to FMA/VALU or vselect/Flow)",
+                select_choice_count
+            );
         }
     }
 
@@ -1749,7 +1780,7 @@ pub fn schedule_ssa_cpsat(
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                // Skip if dep_idx is a shifted VALU op - we'll handle it after creating completion_cycle_vars
+                // Skip if dep_idx is a shiftable VALU op - we'll handle it after creating completion_cycle_vars
                 if shiftable_set.contains(&dep_idx) {
                     continue;
                 }
@@ -1769,11 +1800,16 @@ pub fn schedule_ssa_cpsat(
         use std::collections::HashMap;
         let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
-            let Some(ref hint) = op.symmetry_hint else { continue };
+            let Some(ref hint) = op.symmetry_hint else {
+                continue;
+            };
             if hint.ordering_group.is_empty() {
                 continue;
             }
-            groups.entry(hint.ordering_group.clone()).or_default().push(idx);
+            groups
+                .entry(hint.ordering_group.clone())
+                .or_default()
+                .push(idx);
         }
         for (_key, indices) in groups.iter() {
             for w in indices.windows(2) {
@@ -1783,7 +1819,11 @@ pub fn schedule_ssa_cpsat(
         }
         if verbose && !groups.is_empty() {
             let total_constraints: usize = groups.values().map(|v| v.len().saturating_sub(1)).sum();
-            eprintln!("  Symmetry breaking (ordering): {} groups, {} constraints", groups.len(), total_constraints);
+            eprintln!(
+                "  Symmetry breaking (ordering): {} groups, {} constraints",
+                groups.len(),
+                total_constraints
+            );
         }
     }
 
@@ -1793,8 +1833,12 @@ pub fn schedule_ssa_cpsat(
         use std::collections::{BTreeMap, HashMap};
         let mut streams: HashMap<Vec<i64>, BTreeMap<i64, Vec<usize>>> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
-            let Some(ref hint) = op.symmetry_hint else { continue };
-            let Some((ref stream_key, item_key)) = hint.lexicographic_stream else { continue };
+            let Some(ref hint) = op.symmetry_hint else {
+                continue;
+            };
+            let Some((ref stream_key, item_key)) = hint.lexicographic_stream else {
+                continue;
+            };
             streams
                 .entry(stream_key.clone())
                 .or_default()
@@ -1814,7 +1858,10 @@ pub fn schedule_ssa_cpsat(
             }
         }
         if verbose && lex_constraints > 0 {
-            eprintln!("  Symmetry breaking (lex streams): {} streams, {} constraints", n_streams, lex_constraints);
+            eprintln!(
+                "  Symmetry breaking (lex streams): {} streams, {} constraints",
+                n_streams, lex_constraints
+            );
         }
     }
 
@@ -1824,106 +1871,80 @@ pub fn schedule_ssa_cpsat(
     let mut valu_optional_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     // Store 8 intervals per shifted VALU op (one per ALU op) - optional when Optimize, required when ForceAlu
     let mut alu_optional_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
-    let mut alu_required_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
     // Store 8 cycle variables per shifted VALU op (one per ALU op)
     let mut alu_cycle_vars: HashMap<usize, Vec<IntVar>> = HashMap::new();
     // Store completion cycle variable (max of 8 ALU cycles) per shifted VALU op
     let mut completion_cycle_vars: HashMap<usize, IntVar> = HashMap::new();
 
-    match valu_shift_mode {
-        ValuShiftMode::ForceValu => {
-            // No shift vars, no ALU intervals. VALU cumulative will add required intervals for shiftable.
-        }
-        ValuShiftMode::ForceAlu => {
-            for &idx in &shiftable_valu {
-                let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-                let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+    for &idx in &shiftable_valu {
+        let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
+        shift_vars.insert(idx, shift_var);
 
-                let mut alu_cycles = Vec::with_capacity(VLEN);
-                let mut alu_intervals = Vec::with_capacity(VLEN);
-
-                for i in 0..VLEN {
-                    let alu_cycle = model.new_int_var_with_name(
-                        [(op_asap, op_alap)],
-                        format!("alu_c{}_{}", idx, i),
-                    );
-                    alu_cycles.push(alu_cycle);
-                    for &dep_id in &ops[idx].dep_ids {
-                        if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                            model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
-                        }
-                    }
-                    let alu_interval = model.new_fixed_size_interval_var(alu_cycle, 1);
-                    alu_intervals.push(alu_interval);
-                }
-                alu_cycle_vars.insert(idx, alu_cycles.clone());
-                alu_required_intervals.insert(idx, alu_intervals);
-
-                let completion_cycle = model.new_int_var_with_name(
-                    [(op_asap, op_alap)],
-                    format!("completion_c{}", idx),
-                );
-                completion_cycle_vars.insert(idx, completion_cycle);
-                for &alu_cycle in &alu_cycles {
-                    model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
-                }
+        match valu_shift_mode {
+            ValuShiftMode::ForceValu => {
+                model.add_eq(LinearExpr::from(shift_var.clone()), 0);
             }
-        }
-        ValuShiftMode::Optimize => {
-            for &idx in &shiftable_valu {
-                let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
-                shift_vars.insert(idx, shift_var);
-
+            ValuShiftMode::ForceAlu => {
+                model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+            }
+            ValuShiftMode::Optimize => {
                 if let Some(forced) = forced_shifts {
-                    let op_id = ops[idx].id;
-                    if forced.contains(&op_id) {
-                        model.add_eq(shift_var, 1);
+                    if forced.contains(&ops[idx].id) {
+                        model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+                        model.add_hint(shift_var.clone(), 1);
                     }
                 }
 
-                let valu_interval = model.new_optional_fixed_size_interval_var(
-                    cycle_vars[idx],
-                    1,
-                    shift_var.not(),
-                );
-                valu_optional_intervals.insert(idx, valu_interval);
-
-                let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-                let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
-
-                let mut alu_cycles = Vec::with_capacity(VLEN);
-                let mut alu_intervals = Vec::with_capacity(VLEN);
-
-                for i in 0..VLEN {
-                    let alu_cycle = model.new_int_var_with_name(
-                        [(op_asap, op_alap)],
-                        format!("alu_c{}_{}", idx, i),
-                    );
-                    alu_cycles.push(alu_cycle);
-                    let alu_interval = model.new_optional_fixed_size_interval_var(
-                        alu_cycle,
-                        1,
-                        shift_var,
-                    );
-                    alu_intervals.push(alu_interval);
-                    for &dep_id in &ops[idx].dep_ids {
-                        if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                            model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
-                        }
-                    }
-                }
-                alu_cycle_vars.insert(idx, alu_cycles.clone());
-                alu_optional_intervals.insert(idx, alu_intervals);
-
-                let completion_cycle = model.new_int_var_with_name(
-                    [(op_asap, op_alap)],
-                    format!("completion_c{}", idx),
-                );
-                completion_cycle_vars.insert(idx, completion_cycle);
-                for &alu_cycle in &alu_cycles {
-                    model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+                if let Some(hints) = shift_hints {
+                    let should_shift = hints.contains(&ops[idx].id);
+                    model.add_hint(shift_var, if should_shift { 1 } else { 0 });
+                } else {
+                    model.add_hint(shift_var, 0);
                 }
             }
+        }
+
+        let valu_interval =
+            model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, shift_var.not());
+        valu_optional_intervals.insert(idx, valu_interval);
+
+        let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+        let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+
+        let mut alu_cycles = Vec::with_capacity(VLEN);
+        let mut alu_intervals = Vec::with_capacity(VLEN);
+
+        for i in 0..VLEN {
+            let alu_cycle =
+                model.new_int_var_with_name([(op_asap, op_alap)], format!("alu_c{}_{}", idx, i));
+            alu_cycles.push(alu_cycle);
+            let alu_interval =
+                model.new_optional_fixed_size_interval_var(alu_cycle, 1, shift_var.clone());
+            alu_intervals.push(alu_interval);
+            for &dep_id in &ops[idx].dep_ids {
+                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                    model.add_ge(alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                }
+            }
+        }
+        alu_cycle_vars.insert(idx, alu_cycles.clone());
+        alu_optional_intervals.insert(idx, alu_intervals);
+
+        let completion_cycle =
+            model.new_int_var_with_name([(op_asap, op_alap)], format!("completion_c{}", idx));
+        completion_cycle_vars.insert(idx, completion_cycle);
+        model.add_ge(
+            LinearExpr::from(completion_cycle),
+            LinearExpr::from(cycle_vars[idx]),
+        );
+        for &alu_cycle in &alu_cycles {
+            model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+        }
+        if matches!(valu_shift_mode, ValuShiftMode::ForceValu) {
+            model.add_eq(
+                LinearExpr::from(completion_cycle),
+                LinearExpr::from(cycle_vars[idx]),
+            );
         }
     }
 
@@ -1945,7 +1966,8 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 6b. Create ConstChoice decision variables and optional intervals
-    let const_choice_ops: Vec<usize> = ops.iter()
+    let const_choice_ops: Vec<usize> = ops
+        .iter()
         .enumerate()
         .filter(|(_, op)| op.opcode == Opcode::ConstChoice)
         .map(|(idx, _)| idx)
@@ -1981,11 +2003,8 @@ pub fn schedule_ssa_cpsat(
                 );
                 const_load_intervals.insert(idx, load_interval);
 
-                let add_imm_interval = model.new_optional_fixed_size_interval_var(
-                    cycle_vars[idx],
-                    1,
-                    choice_var,
-                );
+                let add_imm_interval =
+                    model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
                 const_flow_intervals.insert(idx, add_imm_interval);
 
                 model.add_hint(choice_var, 0); // false = use Load
@@ -1994,7 +2013,8 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 6c. Create SelectChoice decision variables and optional intervals
-    let select_choice_ops: Vec<usize> = ops.iter()
+    let select_choice_ops: Vec<usize> = ops
+        .iter()
         .enumerate()
         .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
         .map(|(idx, _)| idx)
@@ -2021,7 +2041,10 @@ pub fn schedule_ssa_cpsat(
                         [(fma_asap as i64, fma_alap as i64)],
                         format!("fma_cycle_{}", idx),
                     );
-                    model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
+                    model.add_eq(
+                        LinearExpr::from(fma_cycle_var),
+                        LinearExpr::from(cycle_vars[idx]) + 1,
+                    );
                     let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
                     vec![sub_interval, fma_interval]
                 };
@@ -2049,29 +2072,22 @@ pub fn schedule_ssa_cpsat(
                 select_flow_intervals.insert(idx, flow_interval);
 
                 let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
-                    vec![model.new_optional_fixed_size_interval_var(
-                        cycle_vars[idx],
-                        1,
-                        choice_var,
-                    )]
+                    vec![model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var)]
                 } else {
-                    let sub_interval = model.new_optional_fixed_size_interval_var(
-                        cycle_vars[idx],
-                        1,
-                        choice_var,
-                    );
+                    let sub_interval =
+                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
                     let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
                     let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
                     let fma_cycle_var = model.new_int_var_with_name(
                         [(fma_asap as i64, fma_alap as i64)],
                         format!("fma_cycle_{}", idx),
                     );
-                    model.add_eq(LinearExpr::from(fma_cycle_var), LinearExpr::from(cycle_vars[idx]) + 1);
-                    let fma_interval = model.new_optional_fixed_size_interval_var(
-                        fma_cycle_var,
-                        1,
-                        choice_var,
+                    model.add_eq(
+                        LinearExpr::from(fma_cycle_var),
+                        LinearExpr::from(cycle_vars[idx]) + 1,
                     );
+                    let fma_interval =
+                        model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
                     vec![sub_interval, fma_interval]
                 };
                 select_valu_intervals.insert(idx, valu_intervals);
@@ -2082,7 +2098,9 @@ pub fn schedule_ssa_cpsat(
     // 5d. Precedence for consumers of SelectChoice FMA (no delta): result is visible at cycle+2, not cycle+1
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
-            let Some(&dep_idx) = op_id_to_idx.get(&dep_id) else { continue };
+            let Some(&dep_idx) = op_id_to_idx.get(&dep_id) else {
+                continue;
+            };
             if !select_choice_with_fma_delay.contains(&dep_idx) {
                 continue;
             }
@@ -2094,11 +2112,19 @@ pub fn schedule_ssa_cpsat(
                     model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
                 }
                 SelectChoiceMode::Optimize => {
-                    let choice_var = select_choice_vars.get(&dep_idx).expect("Optimize has choice var");
+                    let choice_var = select_choice_vars
+                        .get(&dep_idx)
+                        .expect("Optimize has choice var");
                     // consumer >= dep_cycle + 1 + (1 if FMA else 0). Use auxiliary 0-1 int.
-                    let extra = model.new_int_var_with_name([(0, 1)], format!("select_fma_extra_{}_{}", dep_idx, idx));
+                    let extra = model.new_int_var_with_name(
+                        [(0, 1)],
+                        format!("select_fma_extra_{}_{}", dep_idx, idx),
+                    );
                     model.add_eq(LinearExpr::from(extra), LinearExpr::from(*choice_var));
-                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra));
+                    model.add_ge(
+                        cycle_vars[idx],
+                        LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
+                    );
                 }
             }
         }
@@ -2109,7 +2135,10 @@ pub fn schedule_ssa_cpsat(
     let select_choice_set: HashSet<usize> = select_choice_ops.iter().copied().collect();
     let mut regular_intervals: Vec<IntervalVar> = Vec::new();
     for (idx, _) in ops.iter().enumerate() {
-        if !shiftable_set.contains(&idx) && !const_choice_set.contains(&idx) && !select_choice_set.contains(&idx) {
+        if !shiftable_set.contains(&idx)
+            && !const_choice_set.contains(&idx)
+            && !select_choice_set.contains(&idx)
+        {
             regular_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
         }
     }
@@ -2120,7 +2149,11 @@ pub fn schedule_ssa_cpsat(
     let non_shiftable_valu: Vec<usize> = ops
         .iter()
         .enumerate()
-        .filter(|(idx, op)| op.engine == Engine::Valu && !shiftable_set.contains(idx) && op.opcode != Opcode::SelectChoice)
+        .filter(|(idx, op)| {
+            op.engine == Engine::Valu
+                && !shiftable_set.contains(idx)
+                && op.opcode != Opcode::SelectChoice
+        })
         .map(|(idx, _)| idx)
         .collect();
 
@@ -2188,12 +2221,6 @@ pub fn schedule_ssa_cpsat(
 
         // Add ALU intervals for shifted VALU ops: ForceAlu => required intervals; Optimize => optional
         for &idx in &shiftable_valu {
-            if let Some(intervals) = alu_required_intervals.get(&idx) {
-                for iv in intervals {
-                    alu_intervals.push(*iv);
-                    alu_demands.push(1);
-                }
-            }
             if let Some(intervals) = alu_optional_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
@@ -2209,7 +2236,8 @@ pub fn schedule_ssa_cpsat(
 
     // Load cumulative: regular Load ops + optional Load intervals from ConstChoice
     {
-        let regular_load_ops: Vec<usize> = ops.iter()
+        let regular_load_ops: Vec<usize> = ops
+            .iter()
             .enumerate()
             .filter(|(_, op)| op.engine == Engine::Load && op.opcode != Opcode::ConstChoice)
             .map(|(idx, _)| idx)
@@ -2239,7 +2267,8 @@ pub fn schedule_ssa_cpsat(
 
     // Store cumulative (unchanged - no ConstChoice)
     {
-        let store_ops: Vec<usize> = ops.iter()
+        let store_ops: Vec<usize> = ops
+            .iter()
             .enumerate()
             .filter(|(_, op)| op.engine == Engine::Store)
             .map(|(idx, _)| idx)
@@ -2266,14 +2295,14 @@ pub fn schedule_ssa_cpsat(
     // ConstChoice ops are different - they're a single op with alternatives modeled
     // via choice variables. SelectChoice ops are similar (vselect vs FMA path).
     {
-        let regular_flow_ops: Vec<usize> = ops.iter()
+        let regular_flow_ops: Vec<usize> = ops
+            .iter()
             .enumerate()
             .filter(|(_idx, op)| {
                 // Include all Flow ops EXCEPT:
                 // - SelectChoice (has optional intervals via choice var)
                 // - Note: Opcode::AddImm IS included (from emit_const() pairs)
-                op.engine == Engine::Flow 
-                    && op.opcode != Opcode::SelectChoice
+                op.engine == Engine::Flow && op.opcode != Opcode::SelectChoice
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -2308,7 +2337,10 @@ pub fn schedule_ssa_cpsat(
                 "[Flow model breadcrumbs] regular_flow_ops={} (indices {:?}, op.ids {:?})",
                 regular_flow_ops.len(),
                 regular_flow_ops,
-                regular_flow_ops.iter().map(|&i| ops[i].id).collect::<Vec<_>>()
+                regular_flow_ops
+                    .iter()
+                    .map(|&i| ops[i].id)
+                    .collect::<Vec<_>>()
             );
             eprintln!(
                 "[Flow model breadcrumbs] const_choice_ops={} (optional Flow when choice=true; indices {:?}, op.ids {:?})",
@@ -2324,7 +2356,8 @@ pub fn schedule_ssa_cpsat(
             );
             eprintln!(
                 "[Flow model breadcrumbs] Flow cumulative: total intervals={}, capacity={}",
-                flow_intervals.len(), flow_cap
+                flow_intervals.len(),
+                flow_cap
             );
         }
 
@@ -2372,7 +2405,8 @@ pub fn schedule_ssa_cpsat(
                 let should_update = if let Some(hints) = greedy_hints {
                     // Use cycle from hints to determine if this is a later use
                     let current_cycle = hints.get(idx).copied().unwrap_or(0);
-                    let existing_cycle = vreg_last_use.get(&vreg)
+                    let existing_cycle = vreg_last_use
+                        .get(&vreg)
                         .and_then(|&existing_idx| hints.get(existing_idx).copied())
                         .unwrap_or(-1);
                     current_cycle > existing_cycle
@@ -2417,19 +2451,18 @@ pub fn schedule_ssa_cpsat(
 
         // Segment mode with live-out or live-through: need segment_end so we can model
         // VRegs live until end of segment (live-out = defined here, used later; live-through = defined in prev section, used later).
-        let segment_end_var: Option<IntVar> =
-            if initial_live.is_some()
-                && (live_out_vregs.is_some_and(|s| !s.is_empty())
-                    || live_through_vregs.is_some_and(|s| !s.is_empty()))
-            {
-                let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
-                for cv in &cycle_vars {
-                    model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
-                }
-                Some(m)
-            } else {
-                None
-            };
+        let segment_end_var: Option<IntVar> = if initial_live.is_some()
+            && (live_out_vregs.is_some_and(|s| !s.is_empty())
+                || live_through_vregs.is_some_and(|s| !s.is_empty()))
+        {
+            let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
+            for cv in &cycle_vars {
+                model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
+            }
+            Some(m)
+        } else {
+            None
+        };
 
         if !live_vregs.is_empty() {
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
@@ -2481,16 +2514,11 @@ pub fn schedule_ssa_cpsat(
 
                 // Create a size variable: size = end - start
                 // Size must be >= 1 (def and last_use could be same cycle)
-                let size = model.new_int_var_with_name(
-                    [(1, horizon + 1)],
-                    format!("live_size_{}", vreg.id),
-                );
+                let size = model
+                    .new_int_var_with_name([(1, horizon + 1)], format!("live_size_{}", vreg.id));
 
                 // Constraint: cycle[def] + size = end
-                model.add_eq(
-                    LinearExpr::from(start) + LinearExpr::from(size),
-                    end_expr,
-                );
+                model.add_eq(LinearExpr::from(start) + LinearExpr::from(size), end_expr);
 
                 let interval = model.new_interval_var(start, size, end_for_interval);
                 scratch_intervals.push(interval);
@@ -2560,7 +2588,8 @@ pub fn schedule_ssa_cpsat(
                     }
                     SelectChoiceMode::Optimize => {
                         if let Some(&choice_var) = select_choice_vars.get(&idx) {
-                            let interval = model.new_optional_fixed_size_interval_var(start, 2, choice_var);
+                            let interval =
+                                model.new_optional_fixed_size_interval_var(start, 2, choice_var);
                             scratch_intervals.push(interval);
                             scratch_demands.push(8);
                         }
@@ -2669,7 +2698,7 @@ pub fn schedule_ssa_cpsat(
                         hints.get(last_use_idx).copied().unwrap_or(def_cycle)
                     };
                     let size = vreg.size() as i64;
-                    events.push((def_cycle, size));           // VReg becomes live
+                    events.push((def_cycle, size)); // VReg becomes live
                     events.push((last_use_cycle + 1, -size)); // VReg dies after last use
                 }
                 // SelectChoice FMA sub_temp: live [c, c+2)
@@ -2705,7 +2734,10 @@ pub fn schedule_ssa_cpsat(
                         peak, scratch_budget
                     );
                 } else if verbose {
-                    eprintln!("  Hint verification: peak_live={} <= budget={} OK", peak, scratch_budget);
+                    eprintln!(
+                        "  Hint verification: peak_live={} <= budget={} OK",
+                        peak, scratch_budget
+                    );
                 }
             }
 
@@ -2761,13 +2793,19 @@ pub fn schedule_ssa_cpsat(
         for cycle in 0..max_cycle {
             if (valu_per_cycle[cycle] as i64) > valu_cap {
                 if valu_violations < 3 && verbose {
-                    eprintln!("  WARNING: VALU overflow at cycle {}: {} > {}", cycle, valu_per_cycle[cycle], valu_cap);
+                    eprintln!(
+                        "  WARNING: VALU overflow at cycle {}: {} > {}",
+                        cycle, valu_per_cycle[cycle], valu_cap
+                    );
                 }
                 valu_violations += 1;
             }
             if (alu_per_cycle[cycle] as i64) > alu_cap {
                 if alu_violations < 3 && verbose {
-                    eprintln!("  WARNING: ALU overflow at cycle {}: {} > {}", cycle, alu_per_cycle[cycle], alu_cap);
+                    eprintln!(
+                        "  WARNING: ALU overflow at cycle {}: {} > {}",
+                        cycle, alu_per_cycle[cycle], alu_cap
+                    );
                 }
                 alu_violations += 1;
             }
@@ -2786,7 +2824,10 @@ pub fn schedule_ssa_cpsat(
         }
 
         if verbose {
-            eprintln!("  Engine capacity verification: OK (VALU<={}, ALU<={} at all cycles)", valu_cap, alu_cap);
+            eprintln!(
+                "  Engine capacity verification: OK (VALU<={}, ALU<={} at all cycles)",
+                valu_cap, alu_cap
+            );
         }
     }
 
@@ -2809,7 +2850,11 @@ pub fn schedule_ssa_cpsat(
     // With shifting: at least need enough cycles for VALU and ALU (solver may shift to balance)
     if enable_valu_shift {
         let valu_bound_cap = (valu_count + valu_cap - 1) / valu_cap;
-        let alu_bound_cap = if alu_count > 0 { (alu_count + alu_cap - 1) / alu_cap } else { 0 };
+        let alu_bound_cap = if alu_count > 0 {
+            (alu_count + alu_cap - 1) / alu_cap
+        } else {
+            0
+        };
         let combined = valu_bound_cap.max(alu_bound_cap);
         if combined > capacity_lower_bound {
             capacity_lower_bound = combined;
@@ -2817,22 +2862,32 @@ pub fn schedule_ssa_cpsat(
     }
 
     // Other engine bounds
-    let load_bound = if load_cap > 0 { (load_count + load_cap - 1) / load_cap } else { 0 };
-    let store_bound = if store_cap > 0 { (store_count + store_cap - 1) / store_cap } else { 0 };
+    let load_bound = if load_cap > 0 {
+        (load_count + load_cap - 1) / load_cap
+    } else {
+        0
+    };
+    let store_bound = if store_cap > 0 {
+        (store_count + store_cap - 1) / store_cap
+    } else {
+        0
+    };
     capacity_lower_bound = capacity_lower_bound.max(load_bound).max(store_bound);
 
     if verbose {
         eprintln!(
             "  Capacity bounds: VALU={}, ALU={}, Load={}, Store={}, combined={}",
-            valu_only_bound, (alu_count + alu_cap - 1) / alu_cap, load_bound, store_bound, capacity_lower_bound
+            valu_only_bound,
+            (alu_count + alu_cap - 1) / alu_cap,
+            load_bound,
+            store_bound,
+            capacity_lower_bound
         );
     }
 
     // 10. Create makespan variable and objective
-    let makespan = model.new_int_var_with_name(
-        [(capacity_lower_bound, horizon)],
-        "makespan".to_string(),
-    );
+    let makespan =
+        model.new_int_var_with_name([(capacity_lower_bound, horizon)], "makespan".to_string());
 
     // Redundant linear capacity constraints: makespan >= ceil(num_ops / capacity) per engine.
     // The cumulative constraint's LP relaxation is weak; adding these as explicit linear
@@ -2875,14 +2930,20 @@ pub fn schedule_ssa_cpsat(
     //   (2) Leading digits of the objective value are the makespan (cycle count), e.g.
     //       objective 104_042_000 => makespan 104, tie-breaker sum 42_000.
     let mut objective_scale: Option<i64> = None;
-    if let Some((&first_cc, rest)) = completion_cycle_vars.values().next().map(|v| (v, completion_cycle_vars.values().skip(1))) {
+    if let Some((&first_cc, rest)) = completion_cycle_vars
+        .values()
+        .next()
+        .map(|v| (v, completion_cycle_vars.values().skip(1)))
+    {
         let max_sum = (completion_cycle_vars.len() as i64) * (horizon as i64);
         let mut scale = 1i64;
         while scale <= max_sum {
             scale = scale.saturating_mul(10);
         }
         objective_scale = Some(scale);
-        let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| acc + LinearExpr::from(v));
+        let sum_completion: LinearExpr = rest.fold(LinearExpr::from(first_cc), |acc, &v| {
+            acc + LinearExpr::from(v)
+        });
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
     } else {
@@ -2919,22 +2980,39 @@ pub fn schedule_ssa_cpsat(
 
     // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings.
     // Use greedy's shift decisions when provided; otherwise default to no shift (0).
-    if !shift_vars.is_empty() && verbose {
-        let hinted_shift_count = shift_hints.map(|h| shiftable_valu.iter().filter(|&&idx| h.contains(&ops[idx].id)).count()).unwrap_or(0);
-        eprintln!(
-            "  Hinting {} shift variables ({} with shift=true, {} with shift=false)",
-            shift_vars.len(),
-            hinted_shift_count,
-            shift_vars.len() - hinted_shift_count
-        );
-    }
     if !shift_vars.is_empty() {
+        let mut hinted_true = 0usize;
         for &idx in &shiftable_valu {
-            let shift_var = shift_vars.get(&idx).expect("shift_var should exist for all shiftable ops");
-            let should_shift = shift_hints
-                .map(|hints| hints.contains(&ops[idx].id))
+            let shift_var = shift_vars
+                .get(&idx)
+                .expect("shift_var should exist for all shiftable ops");
+            let op_id = ops[idx].id;
+            let forced_value = match valu_shift_mode {
+                ValuShiftMode::ForceValu => Some(false),
+                ValuShiftMode::ForceAlu => Some(true),
+                ValuShiftMode::Optimize => forced_shifts.and_then(|forced| {
+                    if forced.contains(&op_id) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }),
+            };
+            let should_shift = forced_value
+                .or_else(|| shift_hints.map(|h| h.contains(&op_id)))
                 .unwrap_or(false);
+            if should_shift {
+                hinted_true += 1;
+            }
             model.add_hint(*shift_var, if should_shift { 1 } else { 0 });
+        }
+        if verbose {
+            eprintln!(
+                "  Hinting {} shift variables ({} with shift=true, {} with shift=false)",
+                shift_vars.len(),
+                hinted_true,
+                shift_vars.len() - hinted_true
+            );
         }
     }
 
@@ -3012,28 +3090,38 @@ pub fn schedule_ssa_cpsat(
                     match valu_shift_mode {
                         ValuShiftMode::ForceAlu => {
                             if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
-                                cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
+                                cycle_assignments
+                                    .push(completion_cycle_var.solution_value(&response) as i32);
                             } else {
-                                cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                cycle_assignments
+                                    .push(cycle_vars[idx].solution_value(&response) as i32);
                             }
                         }
                         ValuShiftMode::ForceValu => {
-                            cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                            cycle_assignments
+                                .push(cycle_vars[idx].solution_value(&response) as i32);
                         }
                         ValuShiftMode::Optimize => {
                             if let Some(shift_var) = shift_vars.get(&idx) {
                                 let is_shifted = shift_var.solution_value(&response);
                                 if is_shifted {
-                                    if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
-                                        cycle_assignments.push(completion_cycle_var.solution_value(&response) as i32);
+                                    if let Some(&completion_cycle_var) =
+                                        completion_cycle_vars.get(&idx)
+                                    {
+                                        cycle_assignments
+                                            .push(completion_cycle_var.solution_value(&response)
+                                                as i32);
                                     } else {
-                                        cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                        cycle_assignments
+                                            .push(cycle_vars[idx].solution_value(&response) as i32);
                                     }
                                 } else {
-                                    cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                    cycle_assignments
+                                        .push(cycle_vars[idx].solution_value(&response) as i32);
                                 }
                             } else {
-                                cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
+                                cycle_assignments
+                                    .push(cycle_vars[idx].solution_value(&response) as i32);
                             }
                         }
                     }
@@ -3062,7 +3150,10 @@ pub fn schedule_ssa_cpsat(
             };
 
             // Debug: Extract shift decisions for high-impact ops
-            let high_impact_op_ids: HashSet<usize> = [244, 287, 291, 285, 323, 289, 262].iter().copied().collect();
+            let high_impact_op_ids: HashSet<usize> = [244, 287, 291, 285, 323, 289, 262]
+                .iter()
+                .copied()
+                .collect();
             if verbose && !shift_vars.is_empty() {
                 for &idx in &shiftable_valu {
                     let op_id = ops[idx].id;
@@ -3070,7 +3161,7 @@ pub fn schedule_ssa_cpsat(
                         let shift_var = shift_vars.get(&idx).expect("shift_var should exist");
                         let is_shifted = shift_var.solution_value(&response);
                         eprintln!("  High-impact op {}: shifted={}", op_id, is_shifted);
-                        
+
                         if is_shifted {
                             // Extract what cycles CP-SAT would assign
                             if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
@@ -3078,11 +3169,18 @@ pub fn schedule_ssa_cpsat(
                                     .iter()
                                     .map(|cv| cv.solution_value(&response) as i32)
                                     .collect();
-                                let unique_cycles: std::collections::HashSet<i32> = cycles.iter().copied().collect();
-                                eprintln!("    ALU cycles: {:?} ({} unique)", cycles, unique_cycles.len());
-                                
-                                if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
-                                    let completion = completion_cycle_var.solution_value(&response) as i32;
+                                let unique_cycles: std::collections::HashSet<i32> =
+                                    cycles.iter().copied().collect();
+                                eprintln!(
+                                    "    ALU cycles: {:?} ({} unique)",
+                                    cycles,
+                                    unique_cycles.len()
+                                );
+
+                                if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx)
+                                {
+                                    let completion =
+                                        completion_cycle_var.solution_value(&response) as i32;
                                     eprintln!("    Completion cycle: {}", completion);
                                 }
                             }
@@ -3114,7 +3212,9 @@ pub fn schedule_ssa_cpsat(
 
             // Extract ConstChoice: ForceAddImm => all; ForceLoad => none; Optimize => from solver
             let const_add_imm_ops: HashSet<usize> = match const_choice_mode {
-                ConstChoiceMode::ForceAddImm => const_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
+                ConstChoiceMode::ForceAddImm => {
+                    const_choice_ops.iter().map(|&idx| ops[idx].id).collect()
+                }
                 ConstChoiceMode::ForceLoad => HashSet::new(),
                 ConstChoiceMode::Optimize => {
                     if const_choice_vars.is_empty() {
@@ -3131,7 +3231,9 @@ pub fn schedule_ssa_cpsat(
 
             // Extract SelectChoice: ForceFma => all; ForceVselect => none; Optimize => from solver
             let select_fma_ops: HashSet<usize> = match select_choice_mode {
-                SelectChoiceMode::ForceFma => select_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
+                SelectChoiceMode::ForceFma => {
+                    select_choice_ops.iter().map(|&idx| ops[idx].id).collect()
+                }
                 SelectChoiceMode::ForceVselect => HashSet::new(),
                 SelectChoiceMode::Optimize => {
                     if select_choice_vars.is_empty() {
@@ -3148,15 +3250,20 @@ pub fn schedule_ssa_cpsat(
 
             // Solution breadcrumbs: log Flow audit when verbose (before validation)
             if verbose {
-                let (flow_rows, flow_per_cycle, _) = build_flow_audit(
-                    ops,
-                    &cycle_assignments,
-                    &const_add_imm_ops,
-                    &select_fma_ops,
+                let (flow_rows, flow_per_cycle, _) =
+                    build_flow_audit(ops, &cycle_assignments, &const_add_imm_ops, &select_fma_ops);
+                eprintln!(
+                    "[Flow solution breadcrumbs] Total Flow-contributing ops: {}",
+                    flow_rows.len()
                 );
-                eprintln!("[Flow solution breadcrumbs] Total Flow-contributing ops: {}", flow_rows.len());
-                eprintln!("[Flow solution breadcrumbs] const_add_imm_ops (op.id) = {:?}", const_add_imm_ops);
-                eprintln!("[Flow solution breadcrumbs] select_fma_ops (op.id)   = {:?}", select_fma_ops);
+                eprintln!(
+                    "[Flow solution breadcrumbs] const_add_imm_ops (op.id) = {:?}",
+                    const_add_imm_ops
+                );
+                eprintln!(
+                    "[Flow solution breadcrumbs] select_fma_ops (op.id)   = {:?}",
+                    select_fma_ops
+                );
                 for r in &flow_rows {
                     eprintln!(
                         "  idx={} op.id={} opcode={:?} cycle={} {}",
@@ -3170,7 +3277,10 @@ pub fn schedule_ssa_cpsat(
                     .map(|(cycle_idx, &count)| (cycle_idx, count))
                     .collect();
                 if !overloaded.is_empty() {
-                    eprintln!("[Flow solution breadcrumbs] WARNING: cycles with Flow count > 1: {:?}", overloaded);
+                    eprintln!(
+                        "[Flow solution breadcrumbs] WARNING: cycles with Flow count > 1: {:?}",
+                        overloaded
+                    );
                 }
             }
 
@@ -3218,11 +3328,16 @@ pub fn schedule_ssa_cpsat(
                 let flow_capacity = machine.flow_slots as usize * makespan_usize;
                 eprintln!(
                     "  Engine usage: ALU={}/{} VALU={}/{} Load={}/{} Store={}/{} Flow={}/{}",
-                    summary.alu_total, alu_capacity,
-                    summary.valu_total, valu_capacity,
-                    summary.load_total, load_capacity,
-                    summary.store_total, store_capacity,
-                    summary.flow_total, flow_capacity
+                    summary.alu_total,
+                    alu_capacity,
+                    summary.valu_total,
+                    valu_capacity,
+                    summary.load_total,
+                    load_capacity,
+                    summary.store_total,
+                    store_capacity,
+                    summary.flow_total,
+                    flow_capacity
                 );
                 eprintln!(
                     "  ConstChoice: {} AddImm, {} Load",
@@ -3234,7 +3349,9 @@ pub fn schedule_ssa_cpsat(
                 );
                 eprintln!(
                     "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} SelectChoice FMA ops",
-                    shifted_ops.len(), const_add_imm_ops.len(), select_fma_ops.len()
+                    shifted_ops.len(),
+                    const_add_imm_ops.len(),
+                    select_fma_ops.len()
                 );
             }
 
@@ -3273,7 +3390,7 @@ pub fn schedule_ssa_cpsat(
 #[cfg(test)]
 mod ssa_tests {
     use super::*;
-    use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
     use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
     use crate::types::{Engine, Opcode, SlotVal};
     use std::collections::{HashMap, HashSet};
@@ -3283,14 +3400,14 @@ mod ssa_tests {
     fn test_ssa_cpsat_constchoice_decisions() {
         // Build a simple kernel with ConstChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let _zero = emit.emit_const(0);
-        
+
         // Emit ConstChoice constants
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
-        
+
         // Use constants in ALU ops
         let _sum = emit.emit_alu(Opcode::Add, c1, c2);
 
@@ -3321,8 +3438,10 @@ mod ssa_tests {
 
         // Verify ConstChoice decisions are extracted
         // The result should contain const_add_imm_ops (may be empty if solver chose Load)
-        assert!(result.const_add_imm_ops.len() <= 2, 
-            "Should have at most 2 ConstChoice ops using AddImm");
+        assert!(
+            result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm"
+        );
 
         // Note: AddImm operations can use address 0 directly without waiting for zero
         // to be "ready" since scratch memory is always initialized to 0 at startup.
@@ -3334,15 +3453,15 @@ mod ssa_tests {
     fn test_ssa_cpsat_constchoice_roundtrip() {
         // Build a simple kernel with ConstChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let zero = emit.emit_const(0);
-        
+
         // Emit ConstChoice constants
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
         let c4 = emit.emit_const_choice(4);
-        
+
         // Use constants in ALU ops
         let _sum1 = emit.emit_alu(Opcode::Add, c1, c2);
         let _sum2 = emit.emit_alu(Opcode::Add, c4, zero);
@@ -3373,19 +3492,29 @@ mod ssa_tests {
         assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
 
         // Find ConstChoice op IDs and their values
-        let const_choice_info: Vec<(usize, i64)> = emit.ops.iter()
+        let const_choice_info: Vec<(usize, i64)> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .map(|op| {
-                let value = op.srcs[0].as_imm().expect("ConstChoice should have immediate operand");
+                let value = op.srcs[0]
+                    .as_imm()
+                    .expect("ConstChoice should have immediate operand");
                 (op.id, value)
             })
             .collect();
 
-        assert_eq!(const_choice_info.len(), 3, "Should have 3 ConstChoice ops (1, 2, 4)");
+        assert_eq!(
+            const_choice_info.len(),
+            3,
+            "Should have 3 ConstChoice ops (1, 2, 4)"
+        );
 
         // Verify CP-SAT decisions are extracted
-        assert!(cpsat_result.const_add_imm_ops.len() <= 3,
-            "Should have at most 3 ConstChoice ops using AddImm");
+        assert!(
+            cpsat_result.const_add_imm_ops.len() <= 3,
+            "Should have at most 3 ConstChoice ops using AddImm"
+        );
 
         // Now test round-trip: lower using CP-SAT decisions
         let mut vreg_to_addr = HashMap::new();
@@ -3400,7 +3529,7 @@ mod ssa_tests {
         let lowered_ops = lower_ssa_ops_with_shift(
             &emit.ops,
             &vreg_to_addr,
-            &HashSet::new(), // No shifted ops
+            &HashSet::new(),                 // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
@@ -3408,39 +3537,61 @@ mod ssa_tests {
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
-            let lowered_op = lowered_ops.iter()
+            let lowered_op = lowered_ops
+                .iter()
                 .find(|op| op.produces_constant == Some(*expected_value))
-                .expect(&format!("Should find lowered op for ConstChoice producing {}", expected_value));
+                .expect(&format!(
+                    "Should find lowered op for ConstChoice producing {}",
+                    expected_value
+                ));
 
             if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
                 // CP-SAT chose AddImm - verify it's a Flow op
-                assert_eq!(lowered_op.engine, Engine::Flow,
-                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)", const_choice_id, expected_value);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Flow,
+                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)",
+                    const_choice_id,
+                    expected_value
+                );
                 match &lowered_op.slot[0] {
-                    SlotVal::Str(s) => assert_eq!(s, "add_imm",
-                        "ConstChoice op {} should be add_imm", const_choice_id),
+                    SlotVal::Str(s) => assert_eq!(
+                        s, "add_imm",
+                        "ConstChoice op {} should be add_imm",
+                        const_choice_id
+                    ),
                     _ => panic!("AddImm slot[0] should be Str"),
                 }
                 match &lowered_op.slot[2] {
-                    SlotVal::Int(addr) => assert_eq!(*addr, 0,
-                        "AddImm should read from address 0"),
+                    SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
             } else {
                 // CP-SAT chose Load - verify it's a Load op
-                assert_eq!(lowered_op.engine, Engine::Load,
-                    "ConstChoice op {} (value {}) should be lowered to Load", const_choice_id, expected_value);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Load,
+                    "ConstChoice op {} (value {}) should be lowered to Load",
+                    const_choice_id,
+                    expected_value
+                );
                 match &lowered_op.slot[0] {
-                    SlotVal::Str(s) => assert_eq!(s, "const",
-                        "ConstChoice op {} should be const", const_choice_id),
+                    SlotVal::Str(s) => assert_eq!(
+                        s, "const",
+                        "ConstChoice op {} should be const",
+                        const_choice_id
+                    ),
                     _ => panic!("Const slot[0] should be Str"),
                 }
             }
         }
 
         // Verify all ConstChoice ops were lowered
-        assert_eq!(lowered_ops.len(), emit.ops.len(),
-            "All ops should be lowered");
+        assert_eq!(
+            lowered_ops.len(),
+            emit.ops.len(),
+            "All ops should be lowered"
+        );
     }
 
     #[cfg(feature = "cpsat")]
@@ -3448,19 +3599,19 @@ mod ssa_tests {
     fn test_ssa_cpsat_constchoice_prefers_addimm_when_load_slots_full() {
         // Create a scenario where Load slots are heavily used, forcing CP-SAT to choose AddImm
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let zero = emit.emit_const(0);
-        
+
         // Emit many Load ops to fill Load slots
         for i in 0..10 {
             emit.emit_const(i + 100); // Regular Load ops
         }
-        
+
         // Emit ConstChoice ops - CP-SAT should prefer AddImm to avoid Load slot pressure
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
-        
+
         // Use constants
         let _sum = emit.emit_alu(Opcode::Add, c1, c2);
 
@@ -3487,7 +3638,9 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         // Find ConstChoice op IDs
-        let const_choice_ids: Vec<usize> = emit.ops.iter()
+        let const_choice_ids: Vec<usize> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .map(|op| op.id)
             .collect();
@@ -3495,8 +3648,10 @@ mod ssa_tests {
         assert_eq!(const_choice_ids.len(), 2, "Should have 2 ConstChoice ops");
 
         // Verify decisions were extracted
-        assert!(cpsat_result.const_add_imm_ops.len() <= 2,
-            "Should have at most 2 ConstChoice ops using AddImm");
+        assert!(
+            cpsat_result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm"
+        );
 
         // Test lowering with the decisions
         let mut vreg_to_addr = HashMap::new();
@@ -3518,25 +3673,41 @@ mod ssa_tests {
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
-            let ssa_op = emit.ops.iter().find(|op| op.id == *const_choice_id).unwrap();
+            let ssa_op = emit
+                .ops
+                .iter()
+                .find(|op| op.id == *const_choice_id)
+                .unwrap();
             let expected_value = ssa_op.srcs[0].as_imm().unwrap();
-            
-            let lowered_op = lowered_ops.iter()
+
+            let lowered_op = lowered_ops
+                .iter()
                 .find(|op| op.produces_constant == Some(expected_value))
-                .expect(&format!("Should find lowered op for ConstChoice {}", const_choice_id));
+                .expect(&format!(
+                    "Should find lowered op for ConstChoice {}",
+                    const_choice_id
+                ));
 
             if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
                 // Verify AddImm was chosen
-                assert_eq!(lowered_op.engine, Engine::Flow,
-                    "ConstChoice {} should use AddImm when Load slots are full", const_choice_id);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Flow,
+                    "ConstChoice {} should use AddImm when Load slots are full",
+                    const_choice_id
+                );
                 match &lowered_op.slot[0] {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
             } else {
                 // Verify Load was chosen
-                assert_eq!(lowered_op.engine, Engine::Load,
-                    "ConstChoice {} should use Load", const_choice_id);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Load,
+                    "ConstChoice {} should use Load",
+                    const_choice_id
+                );
             }
         }
     }
@@ -3546,7 +3717,7 @@ mod ssa_tests {
     fn test_ssa_cpsat_selectchoice_decisions() {
         // Build a simple kernel with SelectChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit vector condition and values (use locals to avoid double mutable borrow)
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
@@ -3557,11 +3728,11 @@ mod ssa_tests {
         let true_val = emit.emit_vbroadcast(c10);
         let c20 = emit.emit_const(20);
         let false_val = emit.emit_vbroadcast(c20);
-        
+
         // Emit SelectChoice ops
         let sel1 = emit.emit_select_choice(cond, true_val, false_val);
         let sel2 = emit.emit_select_choice(cond, true_val, false_val);
-        
+
         // Use results
         let _sum = emit.emit_valu(Opcode::Add, sel1, sel2);
 
@@ -3592,8 +3763,10 @@ mod ssa_tests {
 
         // Verify SelectChoice decisions are extracted
         // The result should contain select_fma_ops (may be empty if solver chose vselect)
-        assert!(result.select_fma_ops.len() <= 2, 
-            "Should have at most 2 SelectChoice ops using FMA path");
+        assert!(
+            result.select_fma_ops.len() <= 2,
+            "Should have at most 2 SelectChoice ops using FMA path"
+        );
     }
 
     /// Toy test: 3 parallel chains SelectChoice -> valu1 (shiftable) -> valu2, with a toy
@@ -3629,7 +3802,11 @@ mod ssa_tests {
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Toy machine: 1 VALU, 8 ALU so one shifted VALU fits in ALU.
-        let toy_machine = MachineConfig { valu_slots: 1, alu_slots: 8, ..Default::default() };
+        let toy_machine = MachineConfig {
+            valu_slots: 1,
+            alu_slots: 8,
+            ..Default::default()
+        };
         let result = schedule_ssa_cpsat(
             &emit.ops,
             SsaCpsatConfig {
@@ -3645,12 +3822,18 @@ mod ssa_tests {
             SsaCpsatHints::default(),
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution with 1 VALU / 8 ALU toy caps");
+        assert!(
+            result.is_some(),
+            "CP-SAT should find a solution with 1 VALU / 8 ALU toy caps"
+        );
         let r = result.unwrap();
         assert_eq!(r.cycle_assignments.len(), emit.ops.len());
 
         // With 1 VALU slot and 3 chains (6 VALU ops), shifting at least one valu1 to ALU should help.
-        let shifted_valu1 = valu1_op_ids.iter().filter(|&id| r.shifted_ops.contains(id)).count();
+        let shifted_valu1 = valu1_op_ids
+            .iter()
+            .filter(|&id| r.shifted_ops.contains(id))
+            .count();
         assert!(
             shifted_valu1 >= 1,
             "With 1 VALU and 8 ALU slots and 3 chains, at least one of the 3 shiftable valu1 ops should be shifted; got shifted_ops={:?}, valu1_op_ids={:?}",
@@ -3668,7 +3851,7 @@ mod ssa_tests {
         // all be scheduled in the same cycle. The Flow slot limit (1) should force them
         // into different cycles when they choose vselect path.
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit vector condition and values
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
@@ -3679,12 +3862,12 @@ mod ssa_tests {
         let true_val = emit.emit_vbroadcast(c10);
         let c20 = emit.emit_const(20);
         let false_val = emit.emit_vbroadcast(c20);
-        
+
         // Emit 3 SelectChoice ops - they are independent so could run in parallel if allowed
         let sel1 = emit.emit_select_choice(cond, true_val, false_val);
         let sel2 = emit.emit_select_choice(cond, true_val, false_val);
         let sel3 = emit.emit_select_choice(cond, true_val, false_val);
-        
+
         // Use results
         let sum12 = emit.emit_valu(Opcode::Add, sel1, sel2);
         let _sum123 = emit.emit_valu(Opcode::Add, sum12, sel3);
@@ -3698,7 +3881,7 @@ mod ssa_tests {
             &emit.ops,
             SsaCpsatConfig {
                 time_limit_secs: 30.0,
-                verbose: true, // Show Flow breadcrumbs
+                verbose: true,                    // Show Flow breadcrumbs
                 stop_after_first_solution: false, // Let it optimize
                 enable_valu_shift: false,
                 scratch_budget: 1536,
@@ -3712,39 +3895,49 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         // Find SelectChoice op indices and their cycles
-        let select_choice_info: Vec<(usize, usize, i32)> = emit.ops.iter()
+        let select_choice_info: Vec<(usize, usize, i32)> = emit
+            .ops
+            .iter()
             .enumerate()
             .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
             .map(|(idx, op)| (idx, op.id, cpsat_result.cycle_assignments[idx]))
             .collect();
 
-        assert_eq!(select_choice_info.len(), 3, "Should have 3 SelectChoice ops");
+        assert_eq!(
+            select_choice_info.len(),
+            3,
+            "Should have 3 SelectChoice ops"
+        );
         eprintln!("SelectChoice ops: {:?}", select_choice_info);
         eprintln!("select_fma_ops: {:?}", cpsat_result.select_fma_ops);
 
         // Count how many SelectChoice ops chose vselect path (not in select_fma_ops)
-        let vselect_ops: Vec<_> = select_choice_info.iter()
+        let vselect_ops: Vec<_> = select_choice_info
+            .iter()
             .filter(|(_, op_id, _)| !cpsat_result.select_fma_ops.contains(op_id))
             .collect();
-        
+
         if vselect_ops.len() > 1 {
             // If multiple vselect ops, verify they're in different cycles
             let vselect_cycles: Vec<i32> = vselect_ops.iter().map(|(_, _, cy)| *cy).collect();
             eprintln!("vselect ops cycles: {:?}", vselect_cycles);
-            
+
             // Check no duplicates (each cycle should appear at most once)
             let mut cycle_counts: HashMap<i32, usize> = HashMap::new();
             for cy in &vselect_cycles {
                 *cycle_counts.entry(*cy).or_default() += 1;
             }
-            
+
             for (cy, count) in &cycle_counts {
-                assert!(*count <= 1, 
-                    "Flow slot limit violated: {} vselect ops in cycle {} (limit is 1)", 
-                    count, cy);
+                assert!(
+                    *count <= 1,
+                    "Flow slot limit violated: {} vselect ops in cycle {} (limit is 1)",
+                    count,
+                    cy
+                );
             }
         }
-        
+
         eprintln!("test_ssa_cpsat_selectchoice_flow_slot_limit PASSED");
     }
 
@@ -3760,18 +3953,18 @@ mod ssa_tests {
     #[test]
     fn test_ssa_cpsat_addimm_ops_counted_in_flow_constraint() {
         let mut emit = SsaEmitContext::new();
-        
+
         // Set up zero_vreg so emit_const creates AddImm alternatives
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         // Emit 5 non-zero constants - each creates Load + AddImm ops
         let c1 = emit.emit_const(1);
         let c2 = emit.emit_const(2);
         let c3 = emit.emit_const(3);
         let c4 = emit.emit_const(4);
         let c5 = emit.emit_const(5);
-        
+
         // Use the constants to create dependencies
         let sum1 = emit.emit_alu(Opcode::Add, c1, c2);
         let sum2 = emit.emit_alu(Opcode::Add, c3, c4);
@@ -3783,7 +3976,9 @@ mod ssa_tests {
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Count AddImm ops
-        let addimm_count = emit.ops.iter()
+        let addimm_count = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::AddImm)
             .count();
         assert_eq!(addimm_count, 5, "Should have 5 AddImm ops from emit_const");
@@ -3807,7 +4002,9 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         // Collect all Flow-engine ops and their cycles
-        let flow_ops: Vec<(usize, i32)> = emit.ops.iter()
+        let flow_ops: Vec<(usize, i32)> = emit
+            .ops
+            .iter()
             .enumerate()
             .filter(|(_, op)| op.engine == Engine::Flow)
             .map(|(idx, _)| (idx, cpsat_result.cycle_assignments[idx]))
@@ -3822,10 +4019,13 @@ mod ssa_tests {
         }
 
         for (cy, count) in &cycle_counts {
-            assert!(*count <= 1, 
+            assert!(
+                *count <= 1,
                 "Flow slot limit violated: {} Flow ops in cycle {} (limit is 1). \
-                This would indicate AddImm ops are not properly constrained.", 
-                count, cy);
+                This would indicate AddImm ops are not properly constrained.",
+                count,
+                cy
+            );
         }
 
         eprintln!("test_ssa_cpsat_addimm_ops_counted_in_flow_constraint PASSED: {} AddImm ops properly scheduled in different cycles", addimm_count);
@@ -3837,12 +4037,24 @@ mod ssa_tests {
     #[test]
     fn test_validate_ssa_slot_limits_detects_flow_violation() {
         // Create minimal ops that would violate Flow limit if scheduled in same cycle
-        let mut op0 = SsaOp::new(0, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(0)), vec![]);
+        let mut op0 = SsaOp::new(
+            0,
+            Engine::Flow,
+            Opcode::AddImm,
+            Some(VReg::scalar(0)),
+            vec![],
+        );
         op0.produces_constant = Some(1);
-        
-        let mut op1 = SsaOp::new(1, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(1)), vec![]);
+
+        let mut op1 = SsaOp::new(
+            1,
+            Engine::Flow,
+            Opcode::AddImm,
+            Some(VReg::scalar(1)),
+            vec![],
+        );
         op1.produces_constant = Some(2);
-        
+
         let ops = vec![op0, op1];
 
         // Schedule both in cycle 0 - this should violate Flow limit
@@ -3864,9 +4076,11 @@ mod ssa_tests {
             );
         });
 
-        assert!(result.is_err(), 
-            "validate_ssa_slot_limits should panic when 2 Flow ops are in same cycle");
-        
+        assert!(
+            result.is_err(),
+            "validate_ssa_slot_limits should panic when 2 Flow ops are in same cycle"
+        );
+
         eprintln!("test_validate_ssa_slot_limits_detects_flow_violation PASSED");
     }
 
@@ -3874,12 +4088,24 @@ mod ssa_tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_validate_ssa_slot_limits_passes_valid_schedule() {
-        let mut op0 = SsaOp::new(0, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(0)), vec![]);
+        let mut op0 = SsaOp::new(
+            0,
+            Engine::Flow,
+            Opcode::AddImm,
+            Some(VReg::scalar(0)),
+            vec![],
+        );
         op0.produces_constant = Some(1);
-        
-        let mut op1 = SsaOp::new(1, Engine::Flow, Opcode::AddImm, Some(VReg::scalar(1)), vec![]);
+
+        let mut op1 = SsaOp::new(
+            1,
+            Engine::Flow,
+            Opcode::AddImm,
+            Some(VReg::scalar(1)),
+            vec![],
+        );
         op1.produces_constant = Some(2);
-        
+
         let ops = vec![op0, op1];
 
         // Schedule in different cycles - this should be valid
@@ -3898,7 +4124,7 @@ mod ssa_tests {
             &select_fma_ops,
             &MachineConfig::default(),
         );
-        
+
         eprintln!("test_validate_ssa_slot_limits_passes_valid_schedule PASSED");
     }
 
@@ -3908,12 +4134,12 @@ mod ssa_tests {
     #[test]
     fn test_ssa_cpsat_constchoice_addimm_uses_flow_slot() {
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit several ConstChoice constants
         let c1 = emit.emit_const_choice(10);
         let c2 = emit.emit_const_choice(20);
         let c3 = emit.emit_const_choice(30);
-        
+
         // Use them
         let sum = emit.emit_alu(Opcode::Add, c1, c2);
         let _sum2 = emit.emit_alu(Opcode::Add, sum, c3);
@@ -3923,7 +4149,9 @@ mod ssa_tests {
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Verify we have ConstChoice ops
-        let constchoice_count = emit.ops.iter()
+        let constchoice_count = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .count();
         assert_eq!(constchoice_count, 3, "Should have 3 ConstChoice ops");
@@ -3948,14 +4176,21 @@ mod ssa_tests {
 
         // If any ConstChoice ops chose AddImm path, they should be in different cycles
         if !cpsat_result.const_add_imm_ops.is_empty() {
-            let addimm_cycles: Vec<i32> = emit.ops.iter()
+            let addimm_cycles: Vec<i32> = emit
+                .ops
+                .iter()
                 .enumerate()
-                .filter(|(_, op)| op.opcode == Opcode::ConstChoice 
-                    && cpsat_result.const_add_imm_ops.contains(&op.id))
+                .filter(|(_, op)| {
+                    op.opcode == Opcode::ConstChoice
+                        && cpsat_result.const_add_imm_ops.contains(&op.id)
+                })
                 .map(|(idx, _)| cpsat_result.cycle_assignments[idx])
                 .collect();
 
-            eprintln!("ConstChoice ops using AddImm path, cycles: {:?}", addimm_cycles);
+            eprintln!(
+                "ConstChoice ops using AddImm path, cycles: {:?}",
+                addimm_cycles
+            );
 
             // Check no duplicates
             let mut cycle_counts: HashMap<i32, usize> = HashMap::new();
@@ -3963,12 +4198,15 @@ mod ssa_tests {
                 *cycle_counts.entry(*cy).or_default() += 1;
             }
             for (cy, count) in &cycle_counts {
-                assert!(*count <= 1, 
-                    "Flow slot limit violated: {} ConstChoice AddImm ops in cycle {}", 
-                    count, cy);
+                assert!(
+                    *count <= 1,
+                    "Flow slot limit violated: {} ConstChoice AddImm ops in cycle {}",
+                    count,
+                    cy
+                );
             }
         }
-        
+
         eprintln!("test_ssa_cpsat_constchoice_addimm_uses_flow_slot PASSED");
     }
 
@@ -3978,17 +4216,17 @@ mod ssa_tests {
     #[test]
     fn test_ssa_cpsat_mixed_addimm_and_constchoice_flow_constraint() {
         let mut emit = SsaEmitContext::new();
-        
+
         // Set up zero_vreg for emit_const AddImm ops
         let zero = emit.emit_const(0);
         emit.zero_vreg = Some(zero);
-        
+
         // Mix of emit_const (creates Load+AddImm) and emit_const_choice (creates ConstChoice)
-        let c1 = emit.emit_const(10);      // Creates Load + AddImm
+        let c1 = emit.emit_const(10); // Creates Load + AddImm
         let c2 = emit.emit_const_choice(20); // Creates ConstChoice
-        let c3 = emit.emit_const(30);      // Creates Load + AddImm
+        let c3 = emit.emit_const(30); // Creates Load + AddImm
         let c4 = emit.emit_const_choice(40); // Creates ConstChoice
-        
+
         // Use them
         let sum1 = emit.emit_alu(Opcode::Add, c1, c2);
         let sum2 = emit.emit_alu(Opcode::Add, c3, c4);
@@ -3999,14 +4237,21 @@ mod ssa_tests {
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
         // Count ops
-        let addimm_count = emit.ops.iter()
+        let addimm_count = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::AddImm)
             .count();
-        let constchoice_count = emit.ops.iter()
+        let constchoice_count = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .count();
-        
-        eprintln!("AddImm ops: {}, ConstChoice ops: {}", addimm_count, constchoice_count);
+
+        eprintln!(
+            "AddImm ops: {}, ConstChoice ops: {}",
+            addimm_count, constchoice_count
+        );
         assert_eq!(addimm_count, 2, "Should have 2 AddImm ops from emit_const");
         assert_eq!(constchoice_count, 2, "Should have 2 ConstChoice ops");
 
@@ -4032,13 +4277,14 @@ mod ssa_tests {
         // 1. AddImm ops (from emit_const)
         // 2. ConstChoice ops that chose AddImm path
         let mut flow_users: Vec<(usize, i32, &str)> = Vec::new();
-        
+
         for (idx, op) in emit.ops.iter().enumerate() {
             let cycle = cpsat_result.cycle_assignments[idx];
             if op.opcode == Opcode::AddImm {
                 flow_users.push((idx, cycle, "AddImm"));
-            } else if op.opcode == Opcode::ConstChoice 
-                && cpsat_result.const_add_imm_ops.contains(&op.id) {
+            } else if op.opcode == Opcode::ConstChoice
+                && cpsat_result.const_add_imm_ops.contains(&op.id)
+            {
                 flow_users.push((idx, cycle, "ConstChoice→AddImm"));
             }
         }
@@ -4050,13 +4296,17 @@ mod ssa_tests {
         for (_, cy, kind) in &flow_users {
             cycle_counts.entry(*cy).or_default().push(kind);
         }
-        
+
         for (cy, kinds) in &cycle_counts {
-            assert!(kinds.len() <= 1, 
-                "Flow slot limit violated: {} ops in cycle {}: {:?}", 
-                kinds.len(), cy, kinds);
+            assert!(
+                kinds.len() <= 1,
+                "Flow slot limit violated: {} ops in cycle {}: {:?}",
+                kinds.len(),
+                cy,
+                kinds
+            );
         }
-        
+
         eprintln!("test_ssa_cpsat_mixed_addimm_and_constchoice_flow_constraint PASSED");
     }
 
@@ -4065,7 +4315,7 @@ mod ssa_tests {
     fn test_ssa_cpsat_selectchoice_roundtrip() {
         // Build a simple kernel with SelectChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit vector condition and values (use locals to avoid double mutable borrow)
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
@@ -4076,11 +4326,11 @@ mod ssa_tests {
         let true_val = emit.emit_vbroadcast(c10);
         let c20 = emit.emit_const(20);
         let false_val = emit.emit_vbroadcast(c20);
-        
+
         // Emit SelectChoice ops
         let sel1 = emit.emit_select_choice(cond, true_val, false_val);
         let sel2 = emit.emit_select_choice(cond, true_val, false_val);
-        
+
         // Use results
         let _sum = emit.emit_valu(Opcode::Add, sel1, sel2);
 
@@ -4107,7 +4357,9 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         // Find SelectChoice op IDs
-        let select_choice_ids: Vec<usize> = emit.ops.iter()
+        let select_choice_ids: Vec<usize> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::SelectChoice)
             .map(|op| op.id)
             .collect();
@@ -4115,8 +4367,10 @@ mod ssa_tests {
         assert_eq!(select_choice_ids.len(), 2, "Should have 2 SelectChoice ops");
 
         // Verify decisions were extracted
-        assert!(cpsat_result.select_fma_ops.len() <= 2,
-            "Should have at most 2 SelectChoice ops using FMA path");
+        assert!(
+            cpsat_result.select_fma_ops.len() <= 2,
+            "Should have at most 2 SelectChoice ops using FMA path"
+        );
 
         // Now test round-trip: lower using CP-SAT decisions
         let mut vreg_to_addr = HashMap::new();
@@ -4129,9 +4383,9 @@ mod ssa_tests {
         let lowered_ops = lower_ssa_ops_with_shift(
             &emit.ops,
             &vreg_to_addr,
-            &HashSet::new(), // No shifted ops
-            &HashSet::new(), // No ConstChoice AddImm ops
-            &cpsat_result.select_fma_ops, // Use CP-SAT decisions
+            &HashSet::new(),                  // No shifted ops
+            &HashSet::new(),                  // No ConstChoice AddImm ops
+            &cpsat_result.select_fma_ops,     // Use CP-SAT decisions
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
         );
 
@@ -4139,31 +4393,50 @@ mod ssa_tests {
         for select_choice_id in &select_choice_ids {
             if cpsat_result.select_fma_ops.contains(select_choice_id) {
                 // CP-SAT chose FMA path - verify sub and fma ops exist
-                let sub_op = lowered_ops.iter()
+                let sub_op = lowered_ops
+                    .iter()
                     .find(|op| op.id == *select_choice_id && op.engine == Engine::Valu);
-                assert!(sub_op.is_some(), 
-                    "SelectChoice op {} should be lowered to sub op (VALU)", select_choice_id);
-                
-                let fma_op = lowered_ops.iter()
+                assert!(
+                    sub_op.is_some(),
+                    "SelectChoice op {} should be lowered to sub op (VALU)",
+                    select_choice_id
+                );
+
+                let fma_op = lowered_ops
+                    .iter()
                     .find(|op| op.id == *select_choice_id + 1000000 && op.engine == Engine::Valu);
-                assert!(fma_op.is_some(), 
-                    "SelectChoice op {} should be lowered to fma op (VALU)", select_choice_id);
-                
+                assert!(
+                    fma_op.is_some(),
+                    "SelectChoice op {} should be lowered to fma op (VALU)",
+                    select_choice_id
+                );
+
                 // Verify fma is scheduled after sub
                 let sub_cycle = sub_op.unwrap().cycle;
                 let fma_cycle = fma_op.unwrap().cycle;
-                assert!(fma_cycle > sub_cycle,
-                    "FMA should be scheduled after sub: sub={}, fma={}", sub_cycle, fma_cycle);
+                assert!(
+                    fma_cycle > sub_cycle,
+                    "FMA should be scheduled after sub: sub={}, fma={}",
+                    sub_cycle,
+                    fma_cycle
+                );
             } else {
                 // CP-SAT chose vselect path - verify vselect op exists
-                let vselect_op = lowered_ops.iter()
+                let vselect_op = lowered_ops
+                    .iter()
                     .find(|op| op.id == *select_choice_id && op.engine == Engine::Flow);
-                assert!(vselect_op.is_some(), 
-                    "SelectChoice op {} should be lowered to vselect op (Flow)", select_choice_id);
-                
+                assert!(
+                    vselect_op.is_some(),
+                    "SelectChoice op {} should be lowered to vselect op (Flow)",
+                    select_choice_id
+                );
+
                 match &vselect_op.unwrap().slot[0] {
-                    SlotVal::Str(s) => assert_eq!(s, "vselect",
-                        "SelectChoice op {} should be vselect", select_choice_id),
+                    SlotVal::Str(s) => assert_eq!(
+                        s, "vselect",
+                        "SelectChoice op {} should be vselect",
+                        select_choice_id
+                    ),
                     _ => panic!("vselect slot[0] should be Str"),
                 }
             }
@@ -4185,7 +4458,7 @@ mod ssa_tests {
     #[test]
     fn test_ssa_cpsat_selectchoice_force_fma_minimal() {
         use crate::address_assign::{assign_addresses, AddressAssignConfig};
-        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
 
         let mut emit = SsaEmitContext::new();
         let c0 = emit.emit_const(0);
@@ -4203,9 +4476,16 @@ mod ssa_tests {
         let vreg_def = std::mem::take(&mut emit.vreg_def);
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
-        let select_choice_idx = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("one SelectChoice");
+        let select_choice_idx = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice)
+            .expect("one SelectChoice");
         let select_choice_id = emit.ops[select_choice_idx].id;
-        assert!(emit.ops[select_choice_idx].sub_temp_vreg.is_some(), "no-delta path (sub+fma)");
+        assert!(
+            emit.ops[select_choice_idx].sub_temp_vreg.is_some(),
+            "no-delta path (sub+fma)"
+        );
 
         let result = schedule_ssa_cpsat(
             &emit.ops,
@@ -4224,15 +4504,26 @@ mod ssa_tests {
             },
             SsaCpsatHints::default(),
         );
-        assert!(result.is_some(), "CP-SAT should find a solution with ForceFma");
+        assert!(
+            result.is_some(),
+            "CP-SAT should find a solution with ForceFma"
+        );
         let cpsat_result = result.unwrap();
 
-        assert!(cpsat_result.select_fma_ops.contains(&select_choice_id), "ForceFma => select_fma_ops contains SelectChoice id");
+        assert!(
+            cpsat_result.select_fma_ops.contains(&select_choice_id),
+            "ForceFma => select_fma_ops contains SelectChoice id"
+        );
         let c = cpsat_result.cycle_assignments[select_choice_idx];
         for (idx, op) in emit.ops.iter().enumerate() {
             if op.dep_ids.contains(&select_choice_id) {
                 let consumer_cycle = cpsat_result.cycle_assignments[idx];
-                assert!(consumer_cycle >= c + 2, "consumer must be at cycle >= {} (SelectChoice result visible at C+2), got {}", c + 2, consumer_cycle);
+                assert!(
+                    consumer_cycle >= c + 2,
+                    "consumer must be at cycle >= {} (SelectChoice result visible at C+2), got {}",
+                    c + 2,
+                    consumer_cycle
+                );
             }
         }
 
@@ -4253,16 +4544,80 @@ mod ssa_tests {
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
         );
-        let sub_op = lowered.iter().find(|o| o.id == select_choice_id && o.engine == Engine::Valu && format!("{:?}", o.slot.get(0)).contains("\"-\""));
-        let fma_op = lowered.iter().find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
+        let sub_op = lowered.iter().find(|o| {
+            o.id == select_choice_id
+                && o.engine == Engine::Valu
+                && format!("{:?}", o.slot.get(0)).contains("\"-\"")
+        });
+        let fma_op = lowered
+            .iter()
+            .find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
         assert!(sub_op.is_some(), "should have sub op");
         assert!(fma_op.is_some(), "should have fma op");
         assert_eq!(sub_op.unwrap().cycle, c, "sub at SelectChoice cycle");
-        assert_eq!(fma_op.unwrap().cycle, c + 1, "fma at SelectChoice cycle + 1");
+        assert_eq!(
+            fma_op.unwrap().cycle,
+            c + 1,
+            "fma at SelectChoice cycle + 1"
+        );
 
         // Total cycle count must include the FMA: max(lowered cycle)+1 >= c+2 (FMA at c+1).
         let max_lowered_cycle = lowered.iter().map(|o| o.cycle.max(0)).max().unwrap_or(0);
-        assert!(max_lowered_cycle >= c + 1, "cycle count must include FMA at cycle {}", c + 1);
+        assert!(
+            max_lowered_cycle >= c + 1,
+            "cycle count must include FMA at cycle {}",
+            c + 1
+        );
+    }
+
+    /// Force VALU shift off (ForceValu) and ensure consumers respect precedence.
+    /// Regression test for bug where we skipped RAW constraints for shiftable ops even when shift was disabled.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_force_valu_precedence() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let v0 = emit.emit_vbroadcast(c0);
+        let shiftable = emit.emit_valu(Opcode::Add, v0, v0); // Shiftable VALU op
+        let consumer = emit.emit_valu(Opcode::Sub, shiftable, v0); // Consumer must run later
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let shift_idx = emit
+            .ops
+            .iter()
+            .position(|op| op.dest == Some(shiftable))
+            .expect("shiftable op");
+        let consumer_idx = emit
+            .ops
+            .iter()
+            .position(|op| op.dest == Some(consumer))
+            .expect("consumer op");
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                enable_valu_shift: true,
+                valu_shift_mode: ValuShiftMode::ForceValu,
+                time_limit_secs: 10.0,
+                scratch_budget: 1536,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        )
+        .expect("CP-SAT ForceValu schedule");
+
+        let shift_cycle = result.cycle_assignments[shift_idx];
+        let consumer_cycle = result.cycle_assignments[consumer_idx];
+        assert!(
+            consumer_cycle >= shift_cycle + 1,
+            "ForceValu must respect RAW precedence: consumer_cycle={} < shift_cycle+1={}",
+            consumer_cycle,
+            shift_cycle + 1
+        );
     }
 
     /// Same as test_ssa_cpsat_selectchoice_force_fma_minimal but with DEFAULT machine (6 VALU)
@@ -4271,10 +4626,12 @@ mod ssa_tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_selectchoice_force_fma_default_machine_no_hints() {
-        use std::collections::HashSet;
-        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
-        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::address_assign::{
+            assign_addresses, compute_live_intervals, AddressAssignConfig,
+        };
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
         use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use std::collections::HashSet;
 
         let mut emit = SsaEmitContext::new();
         let c0 = emit.emit_const(0);
@@ -4292,7 +4649,11 @@ mod ssa_tests {
         let vreg_def = std::mem::take(&mut emit.vreg_def);
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
-        let select_choice_idx = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("one SelectChoice");
+        let select_choice_idx = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice)
+            .expect("one SelectChoice");
         let select_choice_id = emit.ops[select_choice_idx].id;
 
         let result = schedule_ssa_cpsat(
@@ -4312,14 +4673,22 @@ mod ssa_tests {
             },
             SsaCpsatHints::default(),
         );
-        assert!(result.is_some(), "CP-SAT should find a solution with default machine + ForceFma");
+        assert!(
+            result.is_some(),
+            "CP-SAT should find a solution with default machine + ForceFma"
+        );
         let cpsat_result = result.unwrap();
 
         let c = cpsat_result.cycle_assignments[select_choice_idx];
         for (idx, op) in emit.ops.iter().enumerate() {
             if op.dep_ids.contains(&select_choice_id) {
                 let consumer_cycle = cpsat_result.cycle_assignments[idx];
-                assert!(consumer_cycle >= c + 2, "consumer must be at cycle >= {} (got {})", c + 2, consumer_cycle);
+                assert!(
+                    consumer_cycle >= c + 2,
+                    "consumer must be at cycle >= {} (got {})",
+                    c + 2,
+                    consumer_cycle
+                );
             }
         }
 
@@ -4334,10 +4703,17 @@ mod ssa_tests {
         let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
-                if v1 >= v2 { continue; }
-                if addr1 != addr2 { continue; }
+                if v1 >= v2 {
+                    continue;
+                }
+                if addr1 != addr2 {
+                    continue;
+                }
                 if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
-                    assert!(!i1.overlaps(i2), "overlapping intervals shared address (default machine)");
+                    assert!(
+                        !i1.overlaps(i2),
+                        "overlapping intervals shared address (default machine)"
+                    );
                 }
             }
         }
@@ -4350,12 +4726,22 @@ mod ssa_tests {
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
         );
-        let sub_op = lowered.iter().find(|o| o.id == select_choice_id && o.engine == Engine::Valu && format!("{:?}", o.slot.get(0)).contains("\"-\""));
-        let fma_op = lowered.iter().find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
+        let sub_op = lowered.iter().find(|o| {
+            o.id == select_choice_id
+                && o.engine == Engine::Valu
+                && format!("{:?}", o.slot.get(0)).contains("\"-\"")
+        });
+        let fma_op = lowered
+            .iter()
+            .find(|o| o.id == select_choice_id + 1000000 && o.engine == Engine::Valu);
         assert!(sub_op.is_some(), "should have sub op");
         assert!(fma_op.is_some(), "should have fma op");
         assert_eq!(sub_op.unwrap().cycle, c, "sub at SelectChoice cycle");
-        assert_eq!(fma_op.unwrap().cycle, c + 1, "fma at SelectChoice cycle + 1");
+        assert_eq!(
+            fma_op.unwrap().cycle,
+            c + 1,
+            "fma at SelectChoice cycle + 1"
+        );
     }
 
     /// Two SelectChoice FMA ops: verify consumer precedence (>= dep+2) and that address
@@ -4364,7 +4750,9 @@ mod ssa_tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_two_selectchoice_force_fma_no_overlap() {
-        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::address_assign::{
+            assign_addresses, compute_live_intervals, AddressAssignConfig,
+        };
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
 
         let mut emit = SsaEmitContext::new();
@@ -4390,8 +4778,16 @@ mod ssa_tests {
         let vreg_def = std::mem::take(&mut emit.vreg_def);
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
 
-        let idx1 = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("first");
-        let idx2 = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice && o.id != emit.ops[idx1].id).expect("second");
+        let idx1 = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice)
+            .expect("first");
+        let idx2 = emit
+            .ops
+            .iter()
+            .position(|o| o.opcode == Opcode::SelectChoice && o.id != emit.ops[idx1].id)
+            .expect("second");
         let id1 = emit.ops[idx1].id;
         let id2 = emit.ops[idx2].id;
         assert!(emit.ops[idx1].sub_temp_vreg.is_some() && emit.ops[idx2].sub_temp_vreg.is_some());
@@ -4416,17 +4812,30 @@ mod ssa_tests {
         assert!(result.is_some(), "CP-SAT should find a solution");
         let cpsat_result = result.unwrap();
 
-        assert!(cpsat_result.select_fma_ops.contains(&id1) && cpsat_result.select_fma_ops.contains(&id2));
+        assert!(
+            cpsat_result.select_fma_ops.contains(&id1)
+                && cpsat_result.select_fma_ops.contains(&id2)
+        );
         let c1 = cpsat_result.cycle_assignments[idx1];
         let c2 = cpsat_result.cycle_assignments[idx2];
         for (idx, op) in emit.ops.iter().enumerate() {
             if op.dep_ids.contains(&id1) {
                 let consumer_cycle = cpsat_result.cycle_assignments[idx];
-                assert!(consumer_cycle >= c1 + 2, "consumer of sel1 must be >= {} (got {})", c1 + 2, consumer_cycle);
+                assert!(
+                    consumer_cycle >= c1 + 2,
+                    "consumer of sel1 must be >= {} (got {})",
+                    c1 + 2,
+                    consumer_cycle
+                );
             }
             if op.dep_ids.contains(&id2) {
                 let consumer_cycle = cpsat_result.cycle_assignments[idx];
-                assert!(consumer_cycle >= c2 + 2, "consumer of sel2 must be >= {} (got {})", c2 + 2, consumer_cycle);
+                assert!(
+                    consumer_cycle >= c2 + 2,
+                    "consumer of sel2 must be >= {} (got {})",
+                    c2 + 2,
+                    consumer_cycle
+                );
             }
         }
 
@@ -4441,8 +4850,12 @@ mod ssa_tests {
         let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
-                if v1 >= v2 { continue; }
-                if addr1 != addr2 { continue; }
+                if v1 >= v2 {
+                    continue;
+                }
+                if addr1 != addr2 {
+                    continue;
+                }
                 if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
                     assert!(!i1.overlaps(i2), "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap",
                         v1, v2, addr1, i1.start, i1.end, i2.start, i2.end);
@@ -4457,10 +4870,12 @@ mod ssa_tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_force_fma_full_pipeline_no_overlap() {
-        use std::collections::HashSet;
-        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::address_assign::{
+            assign_addresses, compute_live_intervals, AddressAssignConfig,
+        };
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
         use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use std::collections::HashSet;
 
         let mut emit = SsaEmitContext::new();
         let c0 = emit.emit_const(0);
@@ -4505,8 +4920,12 @@ mod ssa_tests {
         let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops));
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
-                if v1 >= v2 { continue; }
-                if addr1 != addr2 { continue; }
+                if v1 >= v2 {
+                    continue;
+                }
+                if addr1 != addr2 {
+                    continue;
+                }
                 if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
                     assert!(!i1.overlaps(i2), "overlapping intervals shared address");
                 }
@@ -4533,9 +4952,7 @@ pub fn schedule_optimal(
     cpsat_time_limit: f64,
     verbose: bool,
 ) -> CpsatResult {
-    use crate::scheduler::{
-        compute_critical_path, schedule_greedy_with_diagnostics, PriorityMode,
-    };
+    use crate::scheduler::{compute_critical_path, schedule_greedy_with_diagnostics, PriorityMode};
 
     // Get greedy solution first (for hints and fallback)
     let critical_path = compute_critical_path(ops);
@@ -4838,19 +5255,19 @@ mod tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_constchoice_decisions() {
-        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
         use crate::types::Opcode;
 
         // Build a simple kernel with ConstChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let _zero = emit.emit_const(0);
-        
+
         // Emit ConstChoice constants
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
-        
+
         // Use constants in ALU ops
         let _sum = emit.emit_alu(Opcode::Add, c1, c2);
 
@@ -4881,8 +5298,10 @@ mod tests {
 
         // Verify ConstChoice decisions are extracted
         // The result should contain const_add_imm_ops (may be empty if solver chose Load)
-        assert!(result.const_add_imm_ops.len() <= 2, 
-            "Should have at most 2 ConstChoice ops using AddImm");
+        assert!(
+            result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm"
+        );
 
         // Note: AddImm operations can use address 0 directly without waiting for zero
         // to be "ready" since scratch memory is always initialized to 0 at startup.
@@ -4892,22 +5311,22 @@ mod tests {
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_constchoice_roundtrip() {
-        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
         use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
         use crate::types::{Engine, Opcode, SlotVal};
         use std::collections::HashMap;
 
         // Build a simple kernel with ConstChoice ops
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let zero = emit.emit_const(0);
-        
+
         // Emit ConstChoice constants
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
         let c4 = emit.emit_const_choice(4);
-        
+
         // Use constants in ALU ops
         let _sum1 = emit.emit_alu(Opcode::Add, c1, c2);
         let _sum2 = emit.emit_alu(Opcode::Add, c4, zero);
@@ -4938,19 +5357,29 @@ mod tests {
         assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
 
         // Find ConstChoice op IDs and their values
-        let const_choice_info: Vec<(usize, i64)> = emit.ops.iter()
+        let const_choice_info: Vec<(usize, i64)> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .map(|op| {
-                let value = op.srcs[0].as_imm().expect("ConstChoice should have immediate operand");
+                let value = op.srcs[0]
+                    .as_imm()
+                    .expect("ConstChoice should have immediate operand");
                 (op.id, value)
             })
             .collect();
 
-        assert_eq!(const_choice_info.len(), 3, "Should have 3 ConstChoice ops (1, 2, 4)");
+        assert_eq!(
+            const_choice_info.len(),
+            3,
+            "Should have 3 ConstChoice ops (1, 2, 4)"
+        );
 
         // Verify CP-SAT decisions are extracted
-        assert!(cpsat_result.const_add_imm_ops.len() <= 3,
-            "Should have at most 3 ConstChoice ops using AddImm");
+        assert!(
+            cpsat_result.const_add_imm_ops.len() <= 3,
+            "Should have at most 3 ConstChoice ops using AddImm"
+        );
 
         // Now test round-trip: lower using CP-SAT decisions
         let mut vreg_to_addr = HashMap::new();
@@ -4965,7 +5394,7 @@ mod tests {
         let lowered_ops = lower_ssa_ops_with_shift(
             &emit.ops,
             &vreg_to_addr,
-            &HashSet::new(), // No shifted ops
+            &HashSet::new(),                 // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
@@ -4973,64 +5402,86 @@ mod tests {
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
-            let lowered_op = lowered_ops.iter()
+            let lowered_op = lowered_ops
+                .iter()
                 .find(|op| op.produces_constant == Some(*expected_value))
-                .expect(&format!("Should find lowered op for ConstChoice producing {}", expected_value));
+                .expect(&format!(
+                    "Should find lowered op for ConstChoice producing {}",
+                    expected_value
+                ));
 
             if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
                 // CP-SAT chose AddImm - verify it's a Flow op
-                assert_eq!(lowered_op.engine, Engine::Flow,
-                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)", const_choice_id, expected_value);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Flow,
+                    "ConstChoice op {} (value {}) should be lowered to Flow (AddImm)",
+                    const_choice_id,
+                    expected_value
+                );
                 match &lowered_op.slot[0] {
-                    SlotVal::Str(s) => assert_eq!(s, "add_imm",
-                        "ConstChoice op {} should be add_imm", const_choice_id),
+                    SlotVal::Str(s) => assert_eq!(
+                        s, "add_imm",
+                        "ConstChoice op {} should be add_imm",
+                        const_choice_id
+                    ),
                     _ => panic!("AddImm slot[0] should be Str"),
                 }
                 match &lowered_op.slot[2] {
-                    SlotVal::Int(addr) => assert_eq!(*addr, 0,
-                        "AddImm should read from address 0"),
+                    SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
             } else {
                 // CP-SAT chose Load - verify it's a Load op
-                assert_eq!(lowered_op.engine, Engine::Load,
-                    "ConstChoice op {} (value {}) should be lowered to Load", const_choice_id, expected_value);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Load,
+                    "ConstChoice op {} (value {}) should be lowered to Load",
+                    const_choice_id,
+                    expected_value
+                );
                 match &lowered_op.slot[0] {
-                    SlotVal::Str(s) => assert_eq!(s, "const",
-                        "ConstChoice op {} should be const", const_choice_id),
+                    SlotVal::Str(s) => assert_eq!(
+                        s, "const",
+                        "ConstChoice op {} should be const",
+                        const_choice_id
+                    ),
                     _ => panic!("Const slot[0] should be Str"),
                 }
             }
         }
 
         // Verify all ConstChoice ops were lowered
-        assert_eq!(lowered_ops.len(), emit.ops.len(),
-            "All ops should be lowered");
+        assert_eq!(
+            lowered_ops.len(),
+            emit.ops.len(),
+            "All ops should be lowered"
+        );
     }
 
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_constchoice_prefers_addimm_when_load_slots_full() {
-        use crate::kernel_builder::emit_ssa::{SsaEmitContext, compute_ssa_dependencies};
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
         use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
         use crate::types::{Engine, Opcode, SlotVal};
         use std::collections::HashMap;
 
         // Create a scenario where Load slots are heavily used, forcing CP-SAT to choose AddImm
         let mut emit = SsaEmitContext::new();
-        
+
         // Emit zero constant
         let zero = emit.emit_const(0);
-        
+
         // Emit many Load ops to fill Load slots
         for i in 0..10 {
             emit.emit_const(i + 100); // Regular Load ops
         }
-        
+
         // Emit ConstChoice ops - CP-SAT should prefer AddImm to avoid Load slot pressure
         let c1 = emit.emit_const_choice(1);
         let c2 = emit.emit_const_choice(2);
-        
+
         // Use constants
         let _sum = emit.emit_alu(Opcode::Add, c1, c2);
 
@@ -5057,7 +5508,9 @@ mod tests {
         let cpsat_result = result.unwrap();
 
         // Find ConstChoice op IDs
-        let const_choice_ids: Vec<usize> = emit.ops.iter()
+        let const_choice_ids: Vec<usize> = emit
+            .ops
+            .iter()
             .filter(|op| op.opcode == Opcode::ConstChoice)
             .map(|op| op.id)
             .collect();
@@ -5065,8 +5518,10 @@ mod tests {
         assert_eq!(const_choice_ids.len(), 2, "Should have 2 ConstChoice ops");
 
         // Verify decisions were extracted
-        assert!(cpsat_result.const_add_imm_ops.len() <= 2,
-            "Should have at most 2 ConstChoice ops using AddImm");
+        assert!(
+            cpsat_result.const_add_imm_ops.len() <= 2,
+            "Should have at most 2 ConstChoice ops using AddImm"
+        );
 
         // Test lowering with the decisions
         let mut vreg_to_addr = HashMap::new();
@@ -5088,25 +5543,41 @@ mod tests {
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
-            let ssa_op = emit.ops.iter().find(|op| op.id == *const_choice_id).unwrap();
+            let ssa_op = emit
+                .ops
+                .iter()
+                .find(|op| op.id == *const_choice_id)
+                .unwrap();
             let expected_value = ssa_op.srcs[0].as_imm().unwrap();
-            
-            let lowered_op = lowered_ops.iter()
+
+            let lowered_op = lowered_ops
+                .iter()
                 .find(|op| op.produces_constant == Some(expected_value))
-                .expect(&format!("Should find lowered op for ConstChoice {}", const_choice_id));
+                .expect(&format!(
+                    "Should find lowered op for ConstChoice {}",
+                    const_choice_id
+                ));
 
             if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
                 // Verify AddImm was chosen
-                assert_eq!(lowered_op.engine, Engine::Flow,
-                    "ConstChoice {} should use AddImm when Load slots are full", const_choice_id);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Flow,
+                    "ConstChoice {} should use AddImm when Load slots are full",
+                    const_choice_id
+                );
                 match &lowered_op.slot[0] {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
             } else {
                 // Verify Load was chosen
-                assert_eq!(lowered_op.engine, Engine::Load,
-                    "ConstChoice {} should use Load", const_choice_id);
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Load,
+                    "ConstChoice {} should use Load",
+                    const_choice_id
+                );
             }
         }
     }
@@ -5214,9 +5685,9 @@ mod tests {
     fn test_hint_index_mapping() {
         // Create ops with non-sequential IDs to test index mapping
         let ops = vec![
-            make_op(100, Engine::Alu, vec![]),      // slice idx 0, op.id 100
-            make_op(200, Engine::Alu, vec![100]),   // slice idx 1, op.id 200
-            make_op(300, Engine::Alu, vec![200]),   // slice idx 2, op.id 300
+            make_op(100, Engine::Alu, vec![]),    // slice idx 0, op.id 100
+            make_op(200, Engine::Alu, vec![100]), // slice idx 1, op.id 200
+            make_op(300, Engine::Alu, vec![200]), // slice idx 2, op.id 300
         ];
 
         // Verify the ops have the expected structure
@@ -5326,7 +5797,10 @@ mod tests {
                 .with_stop_after_first_solution(true),
         );
 
-        assert!(cpsat_result.is_some(), "CP-SAT should accept SSA-lowered ops with hints");
+        assert!(
+            cpsat_result.is_some(),
+            "CP-SAT should accept SSA-lowered ops with hints"
+        );
 
         let r = cpsat_result.unwrap();
         assert!(
@@ -5339,7 +5813,8 @@ mod tests {
         assert!(
             r.result.makespan <= ssa_result.cycles + 1,
             "CP-SAT makespan ({}) should be close to SSA result ({})",
-            r.result.makespan, ssa_result.cycles
+            r.result.makespan,
+            ssa_result.cycles
         );
     }
 
@@ -5377,7 +5852,10 @@ mod tests {
                 .with_stop_after_first_solution(true),
         );
 
-        assert!(cpsat_result.is_some(), "CP-SAT should accept SSA vector ops");
+        assert!(
+            cpsat_result.is_some(),
+            "CP-SAT should accept SSA vector ops"
+        );
 
         let r = cpsat_result.unwrap();
         assert!(
@@ -5430,7 +5908,10 @@ mod tests {
                 .with_stop_after_first_solution(true),
         );
 
-        assert!(cpsat_result.is_some(), "CP-SAT should work with SSA diamond pattern");
+        assert!(
+            cpsat_result.is_some(),
+            "CP-SAT should work with SSA diamond pattern"
+        );
 
         let r = cpsat_result.unwrap();
         assert!(
@@ -5475,9 +5956,30 @@ mod tests {
         // op1: alu(v0) -> v1
         // op2: alu(v1) -> v2
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(1), Operand::imm(2)],
+                vec![1],
+            ),
         ];
 
         // With generous budget, should succeed
@@ -5486,15 +5988,22 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: true,
-                scratch_budget: 100,  // More than enough
+                scratch_budget: 100, // More than enough
                 ..Default::default()
             },
             SsaCpsatHints::default(),
         );
 
-        assert!(result.is_some(), "Should find solution with generous budget");
+        assert!(
+            result.is_some(),
+            "Should find solution with generous budget"
+        );
         let r = result.unwrap();
-        assert_eq!(r.status, CpsatStatus::Optimal, "Should be optimal for simple chain");
+        assert_eq!(
+            r.status,
+            CpsatStatus::Optimal,
+            "Should be optimal for simple chain"
+        );
         eprintln!("Basic test: makespan={}, status={:?}", r.makespan, r.status);
     }
 
@@ -5520,11 +6029,46 @@ mod tests {
         //   Cycle 1: op3 scheduled -> v0, v1, v2, v3 live, then v0, v1 die = still ~24 words at peak
         //   Cycle 2: op4 scheduled -> v2, v3, v4 live
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
-            make_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::vector(2)), vec![Operand::imm(3)], vec![]),
-            make_ssa_op(3, Engine::Valu, Opcode::Add, Some(VReg::vector(3)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(4, Engine::Valu, Opcode::Add, Some(VReg::vector(4)), vec![Operand::vector(2), Operand::vector(3)], vec![2, 3]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(2)),
+                vec![Operand::imm(3)],
+                vec![],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(3)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(4)),
+                vec![Operand::vector(2), Operand::vector(3)],
+                vec![2, 3],
+            ),
         ];
 
         // With large budget (e.g., 100 words), should allow parallel loads
@@ -5539,9 +6083,15 @@ mod tests {
             SsaCpsatHints::default(),
         );
 
-        assert!(result_generous.is_some(), "Should find solution with generous budget");
+        assert!(
+            result_generous.is_some(),
+            "Should find solution with generous budget"
+        );
         let r_generous = result_generous.unwrap();
-        eprintln!("Generous budget: makespan={}, status={:?}", r_generous.makespan, r_generous.status);
+        eprintln!(
+            "Generous budget: makespan={}, status={:?}",
+            r_generous.makespan, r_generous.status
+        );
 
         // With tight budget (16 words = 2 vectors), should need to serialize more
         let result_tight = schedule_ssa_cpsat(
@@ -5549,7 +6099,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: true,
-                scratch_budget: 16,  // Only 2 vectors can be live at once
+                scratch_budget: 16, // Only 2 vectors can be live at once
                 ..Default::default()
             },
             SsaCpsatHints::default(),
@@ -5559,13 +6109,17 @@ mod tests {
         // 1. Force a longer schedule (more cycles to reduce concurrent live values), or
         // 2. Return infeasible if impossible
         if let Some(r_tight) = result_tight {
-            eprintln!("Tight budget: makespan={}, status={:?}", r_tight.makespan, r_tight.status);
+            eprintln!(
+                "Tight budget: makespan={}, status={:?}",
+                r_tight.makespan, r_tight.status
+            );
             // With tight budget, makespan should be >= generous budget makespan
             // (can't do better, might need more cycles)
             assert!(
                 r_tight.makespan >= r_generous.makespan,
                 "Tight budget makespan ({}) should be >= generous ({}) or infeasible",
-                r_tight.makespan, r_generous.makespan
+                r_tight.makespan,
+                r_generous.makespan
             );
         } else {
             eprintln!("Tight budget: infeasible (expected if budget too small)");
@@ -5579,9 +6133,30 @@ mod tests {
         use crate::types::Opcode;
 
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
-            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
         ];
 
         // With budget=0, constraint is disabled
@@ -5590,15 +6165,21 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: true,
-                scratch_budget: 0,  // Disabled
+                scratch_budget: 0, // Disabled
                 ..Default::default()
             },
             SsaCpsatHints::default(),
         );
 
-        assert!(result.is_some(), "Should find solution when scratch constraint disabled");
+        assert!(
+            result.is_some(),
+            "Should find solution when scratch constraint disabled"
+        );
         let r = result.unwrap();
-        eprintln!("Disabled constraint: makespan={}, status={:?}", r.makespan, r.status);
+        eprintln!(
+            "Disabled constraint: makespan={}, status={:?}",
+            r.makespan, r.status
+        );
         // Should be optimal minimal schedule (2 cycles: loads then add)
         assert_eq!(r.makespan, 2, "Minimal schedule should be 2 cycles");
     }
@@ -5612,9 +6193,30 @@ mod tests {
 
         // Create a simple dependency chain
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(1), Operand::imm(2)],
+                vec![1],
+            ),
         ];
 
         // Valid ASAP schedule: op0 at 0, op1 at 1, op2 at 2
@@ -5645,12 +6247,16 @@ mod tests {
         let r = result.unwrap();
 
         // Critical: with stop_after_first_solution, we should get exactly the hinted solution
-        assert_eq!(r.cycle_assignments, hints,
-            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution"
+        );
         assert_eq!(r.makespan, 3, "Makespan should be 3 (cycles 0, 1, 2)");
 
-        eprintln!("Hint roundtrip (no scratch): assignments={:?}, makespan={}",
-            r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Hint roundtrip (no scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test that SSA CP-SAT hints with scratch constraint are complete and feasible.
@@ -5665,9 +6271,30 @@ mod tests {
         // op1: alu(v0) -> v1 (cycle 1) - v0 live from 0 to 1, size = 2
         // op2: alu(v1) -> v2 (cycle 2) - v1 live from 1 to 2, size = 2
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(1), Operand::imm(2)],
+                vec![1],
+            ),
         ];
 
         // Valid ASAP schedule
@@ -5689,16 +6316,23 @@ mod tests {
             },
         );
 
-        assert!(result.is_some(), "Should find solution with valid hints and scratch constraint");
+        assert!(
+            result.is_some(),
+            "Should find solution with valid hints and scratch constraint"
+        );
         let r = result.unwrap();
 
         // Critical: hints should be feasible with scratch constraint
-        assert_eq!(r.cycle_assignments, hints,
-            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution"
+        );
         assert_eq!(r.makespan, 3, "Makespan should be 3");
 
-        eprintln!("Hint roundtrip (with scratch): assignments={:?}, makespan={}",
-            r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Hint roundtrip (with scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test that SSA CP-SAT hints with vectors and scratch constraint are feasible.
@@ -5715,9 +6349,30 @@ mod tests {
         // At cycle 0: v0, v1 defined = 16 words
         // At cycle 1: v0, v1 used, v2 defined = peak 24 words (v0, v1 still live during use)
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
-            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
         ];
 
         // Schedule: op0 and op1 at cycle 0 (parallel loads), op2 at cycle 1
@@ -5739,16 +6394,23 @@ mod tests {
             },
         );
 
-        assert!(result.is_some(), "Should find solution with valid vector hints and scratch constraint");
+        assert!(
+            result.is_some(),
+            "Should find solution with valid vector hints and scratch constraint"
+        );
         let r = result.unwrap();
 
         // Critical: hints should be feasible
-        assert_eq!(r.cycle_assignments, hints,
-            "With stop_after_first_solution, should return exactly the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "With stop_after_first_solution, should return exactly the hinted solution"
+        );
         assert_eq!(r.makespan, 2, "Makespan should be 2 (cycles 0 and 1)");
 
-        eprintln!("Hint roundtrip (vectors with scratch): assignments={:?}, makespan={}",
-            r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Hint roundtrip (vectors with scratch): assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test that infeasible hints with tight scratch budget are detected.
@@ -5765,9 +6427,30 @@ mod tests {
         // If op0, op1 at cycle 0: 16 words live at cycle 0
         // At cycle 1 when op2 runs: v0, v1, v2 all live = 24 words
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
-            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
         ];
 
         // Hints that would work without scratch constraint but violate tight budget
@@ -5796,7 +6479,10 @@ mod tests {
         if let Some(r) = result {
             // If it found a solution, it should NOT be the original hint
             // because that hint violates the scratch budget
-            eprintln!("Found alternative schedule: {:?}, makespan={}", r.cycle_assignments, r.makespan);
+            eprintln!(
+                "Found alternative schedule: {:?}, makespan={}",
+                r.cycle_assignments, r.makespan
+            );
             // The solver might find a valid schedule by serializing the loads
             // e.g., [0, 1, 2] instead of [0, 0, 1]
             assert!(r.makespan >= 2, "Should need at least 2 cycles");
@@ -5823,8 +6509,22 @@ mod tests {
         // Let's create: op0 defines v0, op1 defines v1 using v0, and v1 is never used again.
         // v1's interval: def_cycle=1, last_use_cycle=1 (no further uses), size=1
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
         ];
 
         // Hints: op0 at cycle 0, op1 at cycle 1
@@ -5847,11 +6547,20 @@ mod tests {
             },
         );
 
-        assert!(result.is_some(), "Should find solution with same-cycle interval (size=1)");
+        assert!(
+            result.is_some(),
+            "Should find solution with same-cycle interval (size=1)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should return the hinted solution"
+        );
         assert_eq!(r.makespan, 2, "Makespan should be 2");
-        eprintln!("Same-cycle interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Same-cycle interval test: assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test scratch interval size for VReg defined at cycle N and used at cycle N+1.
@@ -5865,8 +6574,22 @@ mod tests {
         // op1: add v0, imm -> v1 (cycle 1, uses v0)
         // v0 interval: def_cycle=0, last_use_cycle=1, size=2
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
         ];
 
         // Hints: op0 at cycle 0, op1 at cycle 1
@@ -5887,11 +6610,20 @@ mod tests {
             },
         );
 
-        assert!(result.is_some(), "Should find solution with consecutive-cycle interval (size=2)");
+        assert!(
+            result.is_some(),
+            "Should find solution with consecutive-cycle interval (size=2)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should return the hinted solution"
+        );
         assert_eq!(r.makespan, 2, "Makespan should be 2");
-        eprintln!("Consecutive-cycle interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Consecutive-cycle interval test: assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test scratch interval size for VReg defined at cycle 0 and used at cycle 5.
@@ -5912,13 +6644,62 @@ mod tests {
         // op6: add v5, v0 -> v6 (cycle 5) - finally uses v0
         // v0 interval: def_cycle=0, last_use_cycle=5, size=6
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(10)], vec![]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(1)], vec![1]),
-            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(2), Operand::imm(1)], vec![2]),
-            make_ssa_op(4, Engine::Alu, Opcode::Add, Some(VReg::scalar(4)), vec![Operand::scalar(3), Operand::imm(1)], vec![3]),
-            make_ssa_op(5, Engine::Alu, Opcode::Add, Some(VReg::scalar(5)), vec![Operand::scalar(4), Operand::imm(1)], vec![4]),
-            make_ssa_op(6, Engine::Alu, Opcode::Add, Some(VReg::scalar(6)), vec![Operand::scalar(5), Operand::scalar(0)], vec![5, 0]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::imm(10)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(1), Operand::imm(1)],
+                vec![1],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(2), Operand::imm(1)],
+                vec![2],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(4)),
+                vec![Operand::scalar(3), Operand::imm(1)],
+                vec![3],
+            ),
+            make_ssa_op(
+                5,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(5)),
+                vec![Operand::scalar(4), Operand::imm(1)],
+                vec![4],
+            ),
+            make_ssa_op(
+                6,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(6)),
+                vec![Operand::scalar(5), Operand::scalar(0)],
+                vec![5, 0],
+            ),
         ];
 
         // Hints: op0 and op1 at cycle 0, then op2-op6 at cycles 1-5
@@ -5941,11 +6722,20 @@ mod tests {
             },
         );
 
-        assert!(result.is_some(), "Should find solution with gap interval (size=6)");
+        assert!(
+            result.is_some(),
+            "Should find solution with gap interval (size=6)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should return the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should return the hinted solution"
+        );
         assert_eq!(r.makespan, 6, "Makespan should be 6");
-        eprintln!("Gap interval test: assignments={:?}, makespan={}", r.cycle_assignments, r.makespan);
+        eprintln!(
+            "Gap interval test: assignments={:?}, makespan={}",
+            r.cycle_assignments, r.makespan
+        );
     }
 
     /// Test engine capacity: 6 independent VALU ops at the same cycle (exactly at limit).
@@ -5961,17 +6751,73 @@ mod tests {
         // op6-op11: valu add (cycle 1) - all 6 VALU ops at same cycle (exactly at limit)
         let ops = vec![
             // Load ops for first operands (cycle 0)
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::vector(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
             // Note: only 2 load slots per cycle, so we need more cycles
             // Actually, let's use consts with immediates to avoid load slot issues
             // Create 6 VALU ops that use immediates as second operand
-            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(3, Engine::Valu, Opcode::Sub, Some(VReg::vector(3)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(4, Engine::Valu, Opcode::Mul, Some(VReg::vector(4)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(5, Engine::Valu, Opcode::Xor, Some(VReg::vector(5)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(6, Engine::Valu, Opcode::And, Some(VReg::vector(6)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
-            make_ssa_op(7, Engine::Valu, Opcode::Or, Some(VReg::vector(7)), vec![Operand::vector(0), Operand::vector(1)], vec![0, 1]),
+            make_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Valu,
+                Opcode::Sub,
+                Some(VReg::vector(3)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Valu,
+                Opcode::Mul,
+                Some(VReg::vector(4)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                5,
+                Engine::Valu,
+                Opcode::Xor,
+                Some(VReg::vector(5)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                6,
+                Engine::Valu,
+                Opcode::And,
+                Some(VReg::vector(6)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                7,
+                Engine::Valu,
+                Opcode::Or,
+                Some(VReg::vector(7)),
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![0, 1],
+            ),
         ];
 
         // Hints: 2 loads at cycle 0, 6 VALU ops all at cycle 1 (exactly at VALU limit of 6)
@@ -5994,10 +6840,19 @@ mod tests {
         );
 
         // The verification code should NOT panic, and we should get a valid result
-        assert!(result.is_some(), "Should find solution with 6 VALU ops at same cycle (exactly at limit)");
+        assert!(
+            result.is_some(),
+            "Should find solution with 6 VALU ops at same cycle (exactly at limit)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
-        eprintln!("VALU capacity test: 6 VALU ops at cycle 1, result={:?}", r.cycle_assignments);
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should accept the hinted solution"
+        );
+        eprintln!(
+            "VALU capacity test: 6 VALU ops at cycle 1, result={:?}",
+            r.cycle_assignments
+        );
     }
 
     /// Test engine capacity: 12 independent ALU ops at the same cycle (exactly at limit).
@@ -6013,21 +6868,119 @@ mod tests {
         // op2-op13: 12 ALU ops (cycle 1) - all 12 ALU ops at same cycle (exactly at limit)
         let ops = vec![
             // Load ops
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
             // 12 ALU ops - all depend on loads, can run in parallel
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(3, Engine::Alu, Opcode::Sub, Some(VReg::scalar(3)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(4, Engine::Alu, Opcode::Mul, Some(VReg::scalar(4)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(5, Engine::Alu, Opcode::Xor, Some(VReg::scalar(5)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(6, Engine::Alu, Opcode::And, Some(VReg::scalar(6)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(7, Engine::Alu, Opcode::Or, Some(VReg::scalar(7)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(8, Engine::Alu, Opcode::Shl, Some(VReg::scalar(8)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(9, Engine::Alu, Opcode::Shr, Some(VReg::scalar(9)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(10, Engine::Alu, Opcode::Lt, Some(VReg::scalar(10)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(11, Engine::Alu, Opcode::Eq, Some(VReg::scalar(11)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(12, Engine::Alu, Opcode::Add, Some(VReg::scalar(12)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
-            make_ssa_op(13, Engine::Alu, Opcode::Sub, Some(VReg::scalar(13)), vec![Operand::scalar(0), Operand::scalar(1)], vec![0, 1]),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Sub,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Alu,
+                Opcode::Mul,
+                Some(VReg::scalar(4)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                5,
+                Engine::Alu,
+                Opcode::Xor,
+                Some(VReg::scalar(5)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                6,
+                Engine::Alu,
+                Opcode::And,
+                Some(VReg::scalar(6)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                7,
+                Engine::Alu,
+                Opcode::Or,
+                Some(VReg::scalar(7)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                8,
+                Engine::Alu,
+                Opcode::Shl,
+                Some(VReg::scalar(8)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                9,
+                Engine::Alu,
+                Opcode::Shr,
+                Some(VReg::scalar(9)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                10,
+                Engine::Alu,
+                Opcode::Lt,
+                Some(VReg::scalar(10)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                11,
+                Engine::Alu,
+                Opcode::Eq,
+                Some(VReg::scalar(11)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                12,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(12)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
+            make_ssa_op(
+                13,
+                Engine::Alu,
+                Opcode::Sub,
+                Some(VReg::scalar(13)),
+                vec![Operand::scalar(0), Operand::scalar(1)],
+                vec![0, 1],
+            ),
         ];
 
         // Hints: 2 loads at cycle 0, 12 ALU ops all at cycle 1 (exactly at ALU limit of 12)
@@ -6050,10 +7003,19 @@ mod tests {
         );
 
         // The verification code should NOT panic, and we should get a valid result
-        assert!(result.is_some(), "Should find solution with 12 ALU ops at same cycle (exactly at limit)");
+        assert!(
+            result.is_some(),
+            "Should find solution with 12 ALU ops at same cycle (exactly at limit)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
-        eprintln!("ALU capacity test: 12 ALU ops at cycle 1, result={:?}", r.cycle_assignments);
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should accept the hinted solution"
+        );
+        eprintln!(
+            "ALU capacity test: 12 ALU ops at cycle 1, result={:?}",
+            r.cycle_assignments
+        );
     }
 
     /// Test engine capacity: A shiftable VALU op shifted to ALU uses 8 slots.
@@ -6071,15 +7033,64 @@ mod tests {
         // Total ALU slots at cycle 1: 8 (shifted VALU) + 4 (ALU) = 12 (exactly at limit)
         let ops = vec![
             // Load ops
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::vector(0)), vec![Operand::imm(1)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(2)], vec![]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::imm(2)],
+                vec![],
+            ),
             // 1 VALU op that will be shifted to ALU (uses 8 ALU slots)
-            make_ssa_op(2, Engine::Valu, Opcode::Add, Some(VReg::vector(2)), vec![Operand::vector(0), Operand::vector(0)], vec![0]),
+            make_ssa_op(
+                2,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(2)),
+                vec![Operand::vector(0), Operand::vector(0)],
+                vec![0],
+            ),
             // 4 ALU ops (4 slots)
-            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
-            make_ssa_op(4, Engine::Alu, Opcode::Sub, Some(VReg::scalar(4)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
-            make_ssa_op(5, Engine::Alu, Opcode::Mul, Some(VReg::scalar(5)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
-            make_ssa_op(6, Engine::Alu, Opcode::Xor, Some(VReg::scalar(6)), vec![Operand::scalar(1), Operand::scalar(1)], vec![1]),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(1), Operand::scalar(1)],
+                vec![1],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Alu,
+                Opcode::Sub,
+                Some(VReg::scalar(4)),
+                vec![Operand::scalar(1), Operand::scalar(1)],
+                vec![1],
+            ),
+            make_ssa_op(
+                5,
+                Engine::Alu,
+                Opcode::Mul,
+                Some(VReg::scalar(5)),
+                vec![Operand::scalar(1), Operand::scalar(1)],
+                vec![1],
+            ),
+            make_ssa_op(
+                6,
+                Engine::Alu,
+                Opcode::Xor,
+                Some(VReg::scalar(6)),
+                vec![Operand::scalar(1), Operand::scalar(1)],
+                vec![1],
+            ),
         ];
 
         // Hints: loads at cycle 0, shifted VALU + 4 ALU ops at cycle 1
@@ -6095,7 +7106,7 @@ mod tests {
                 time_limit_secs: 10.0,
                 verbose: true,
                 stop_after_first_solution: true,
-                scratch_budget: 0, // Disable scratch constraint for this test
+                scratch_budget: 0,       // Disable scratch constraint for this test
                 enable_valu_shift: true, // Enable VALU shifting
                 ..Default::default()
             },
@@ -6113,15 +7124,24 @@ mod tests {
         // Note: The verification happens BEFORE solver runs (at lines 1462-1525) and uses
         // shift_hints to verify that the greedy hints don't violate capacity. If the verification
         // panicked, we wouldn't reach this point. Getting a result means verification passed.
-        assert!(result.is_some(), "Should find solution with shifted VALU (8) + 4 ALU = 12 (at limit)");
+        assert!(
+            result.is_some(),
+            "Should find solution with shifted VALU (8) + 4 ALU = 12 (at limit)"
+        );
         let r = result.unwrap();
-        assert_eq!(r.cycle_assignments, hints, "Should accept the hinted solution");
+        assert_eq!(
+            r.cycle_assignments, hints,
+            "Should accept the hinted solution"
+        );
 
         // Note: The solver's shifted_ops may or may not contain our op depending on whether
         // the solver decides to shift. The key test is that the verification code (which uses
         // shift_hints to count ALU usage) did not panic. If it had panicked, we wouldn't get here.
         eprintln!("Shifted VALU capacity test: 1 shifted VALU (8 slots) + 4 ALU (4 slots) = 12 total at cycle 1");
-        eprintln!("Result: {:?}, shifted_ops from solver: {:?}", r.cycle_assignments, r.shifted_ops);
+        eprintln!(
+            "Result: {:?}, shifted_ops from solver: {:?}",
+            r.cycle_assignments, r.shifted_ops
+        );
 
         // Also verify: if the solver did NOT shift op 2, then we have 1 VALU + 4 ALU at cycle 1,
         // which is fine (within limits). If the solver DID shift it, we have 0 VALU + 12 ALU.
@@ -6152,10 +7172,38 @@ mod tests {
         // op2: alu(v1) -> v2 (reads v1, defines v2)
         // op3: alu(v2) -> v3 (reads v2, defines v3)
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
-            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(2), Operand::imm(3)], vec![2]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(1), Operand::imm(2)],
+                vec![1],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(2), Operand::imm(3)],
+                vec![2],
+            ),
         ];
 
         // ASAP schedule: each op depends on the previous
@@ -6183,13 +7231,31 @@ mod tests {
         assert!(result.is_some(), "Simple chain should be schedulable");
         let r = result.unwrap();
         // Verify basic constraints are satisfied
-        assert!(r.makespan >= 4, "Need at least 4 cycles for 4-op dependency chain");
-        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
+        assert!(
+            r.makespan >= 4,
+            "Need at least 4 cycles for 4-op dependency chain"
+        );
+        assert!(
+            r.cycle_assignments.len() == 4,
+            "Should have 4 cycle assignments"
+        );
         // Verify dependency order is respected
-        assert!(r.cycle_assignments[1] > r.cycle_assignments[0], "op1 must be after op0");
-        assert!(r.cycle_assignments[2] > r.cycle_assignments[1], "op2 must be after op1");
-        assert!(r.cycle_assignments[3] > r.cycle_assignments[2], "op3 must be after op2");
-        eprintln!("test_vreg_last_use_simple_chain: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
+        assert!(
+            r.cycle_assignments[1] > r.cycle_assignments[0],
+            "op1 must be after op0"
+        );
+        assert!(
+            r.cycle_assignments[2] > r.cycle_assignments[1],
+            "op2 must be after op1"
+        );
+        assert!(
+            r.cycle_assignments[3] > r.cycle_assignments[2],
+            "op3 must be after op2"
+        );
+        eprintln!(
+            "test_vreg_last_use_simple_chain: makespan={}, assignments={:?}",
+            r.makespan, r.cycle_assignments
+        );
     }
 
     /// Test vreg_last_use with reordered hints (greedy schedule differs from index order).
@@ -6209,10 +7275,38 @@ mod tests {
         // But greedy might schedule: op0 (cycle 0), op1 (cycle 0), op3 (cycle 1), op2 (cycle 1)
         // or with explicit hints we can force reordering
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Load, Opcode::Const, Some(VReg::scalar(1)), vec![Operand::imm(10)], vec![]),
-            make_ssa_op(2, Engine::Alu, Opcode::Add, Some(VReg::scalar(2)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(1), Operand::imm(2)], vec![1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::imm(10)],
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(2)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(1), Operand::imm(2)],
+                vec![1],
+            ),
         ];
 
         // Hints where op3 (index 3) runs at cycle 1, op2 (index 2) runs at cycle 2
@@ -6242,9 +7336,18 @@ mod tests {
         assert!(result.is_some(), "Reordered schedule should be schedulable");
         let r = result.unwrap();
         // Verify basic constraints are satisfied
-        assert!(r.makespan >= 2, "Need at least 2 cycles (loads then ALU ops)");
-        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
-        eprintln!("test_vreg_last_use_with_reordered_hints: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
+        assert!(
+            r.makespan >= 2,
+            "Need at least 2 cycles (loads then ALU ops)"
+        );
+        assert!(
+            r.cycle_assignments.len() == 4,
+            "Should have 4 cycle assignments"
+        );
+        eprintln!(
+            "test_vreg_last_use_with_reordered_hints: makespan={}, assignments={:?}",
+            r.makespan, r.cycle_assignments
+        );
     }
 
     /// Test vreg_last_use with multiple readers of the same VReg at different cycles.
@@ -6267,10 +7370,38 @@ mod tests {
         // we'd correctly pick op3. To test the cycle-based logic, we need a case where
         // the LOWER index has a HIGHER cycle - see the test below.
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::imm(1)], vec![0]),
-            make_ssa_op(2, Engine::Load, Opcode::Const, Some(VReg::scalar(2)), vec![Operand::imm(10)], vec![]),
-            make_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![Operand::scalar(0), Operand::scalar(2)], vec![0, 2]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(2)),
+                vec![Operand::imm(10)],
+                vec![],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(3)),
+                vec![Operand::scalar(0), Operand::scalar(2)],
+                vec![0, 2],
+            ),
         ];
 
         // Hints: op0 at 0, op1 at 1, op2 at 0, op3 at 2
@@ -6298,9 +7429,18 @@ mod tests {
         assert!(result.is_some(), "Multiple readers should be schedulable");
         let r = result.unwrap();
         // Verify basic constraints are satisfied
-        assert!(r.makespan >= 2, "Need at least 2 cycles (loads then ALU ops)");
-        assert!(r.cycle_assignments.len() == 4, "Should have 4 cycle assignments");
-        eprintln!("test_vreg_last_use_multiple_readers: makespan={}, assignments={:?}", r.makespan, r.cycle_assignments);
+        assert!(
+            r.makespan >= 2,
+            "Need at least 2 cycles (loads then ALU ops)"
+        );
+        assert!(
+            r.cycle_assignments.len() == 4,
+            "Should have 4 cycle assignments"
+        );
+        eprintln!(
+            "test_vreg_last_use_multiple_readers: makespan={}, assignments={:?}",
+            r.makespan, r.cycle_assignments
+        );
     }
 
     /// Test that CP-SAT can schedule with a small scratch budget.
@@ -6327,9 +7467,30 @@ mod tests {
         // v1 = add(v0, v0)  -- v0's last use
         // store(0, v1)      -- v1's last use
         let ops = vec![
-            make_ssa_op(0, Engine::Load, Opcode::Const, Some(VReg::scalar(0)), vec![Operand::imm(5)], vec![]),
-            make_ssa_op(1, Engine::Alu, Opcode::Add, Some(VReg::scalar(1)), vec![Operand::scalar(0), Operand::scalar(0)], vec![0]),
-            make_ssa_op(2, Engine::Store, Opcode::Store, None, vec![Operand::imm(0), Operand::scalar(1)], vec![1]),
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(5)],
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(1)),
+                vec![Operand::scalar(0), Operand::scalar(0)],
+                vec![0],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::imm(0), Operand::scalar(1)],
+                vec![1],
+            ),
         ];
 
         // Schedule with CP-SAT and budget of 2 (CP-SAT doesn't support same-cycle reuse)
@@ -6338,7 +7499,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: true,
-                scratch_budget: 2,  // CP-SAT needs 2 because no same-cycle reuse
+                scratch_budget: 2, // CP-SAT needs 2 because no same-cycle reuse
                 ..Default::default()
             },
             SsaCpsatHints::default(),
@@ -6357,7 +7518,11 @@ mod tests {
         );
 
         // Verify all ops are scheduled
-        assert_eq!(r.cycle_assignments.len(), 3, "All 3 ops should be scheduled");
+        assert_eq!(
+            r.cycle_assignments.len(),
+            3,
+            "All 3 ops should be scheduled"
+        );
 
         // Apply cycle assignments to a mutable copy for address assignment
         let mut scheduled_ops = ops.clone();
@@ -6369,7 +7534,7 @@ mod tests {
         // (even though CP-SAT required budget=2)
         let config = AddressAssignConfig {
             budget: 2,
-            start_addr: 1,  // Reserve 0 for ZERO_REG
+            start_addr: 1, // Reserve 0 for ZERO_REG
             ..Default::default()
         };
         let assign_result = assign_addresses(&scheduled_ops, &config);

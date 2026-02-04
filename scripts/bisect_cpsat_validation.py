@@ -50,12 +50,12 @@ def main():
         "-q",
     ]
 
-    # Greedy baseline
+    # Greedy baseline (fast; show output so user sees progress)
     print("Greedy (baseline)...", flush=True)
     cmd = base_cmd + ["--use-greedy"]
-    result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=project_root, text=True)
     greedy_ok = result.returncode == 0
-    print(f"  Greedy (baseline): {'PASS' if greedy_ok else 'FAIL'}")
+    print(f"\n  Greedy (baseline): {'PASS' if greedy_ok else 'FAIL'}")
     if not greedy_ok and result.stderr:
         for line in result.stderr.strip().splitlines()[-5:]:
             print(f"    {line}")
@@ -67,6 +67,8 @@ def main():
     for const_choice in ("optimize", "load"):
         for select_choice in ("optimize", "vselect"):
             for valu_shift in ("optimize", "valu"):
+                label = f"const={const_choice} select={select_choice} shift={valu_shift}"
+                print(f"  Running {label}...", end=" ", flush=True)
                 cmd = base_cmd + [
                     "--cpsat-time-limit",
                     str(args.cpsat_time_limit),
@@ -77,13 +79,11 @@ def main():
                     "--valu-shift",
                     valu_shift,
                 ]
-
                 result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True)
                 ok = result.returncode == 0
-                label = f"const={const_choice} select={select_choice} shift={valu_shift}"
                 status = "PASS" if ok else "FAIL"
                 rows.append((label, status))
-                print(f"  {label}  {status}")
+                print(status)
 
     print()
     print("Interpretation:")
