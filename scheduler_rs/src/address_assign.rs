@@ -90,7 +90,7 @@ pub struct AddressAssignConfig {
     pub fixed_vregs: HashMap<VReg, i64>,
     /// When set, this VReg (address 0) is included in live intervals so peak_live counts it and stays within budget.
     pub zero_vreg: Option<VReg>,
-    /// When set, SelectChoice ops in this set (by op.id) that have sub_temp_vreg use def_cycle+2 for their dest (FMA at cycle+1 produces result at cycle+2).
+    /// When set, SelectChoice ops in this set (by op.id) that have sub_temp_vreg use def_cycle=op.cycle+1 for their dest (FMA writes at cycle+1; address reserved from then).
     pub select_fma_ops: Option<HashSet<usize>>,
     /// When set, VALU ops shifted to ALU (op.id in keys) use min(alu_cycles) as def_cycle for their dest.
     /// The 8 ALU ops write at different cycles; the block is in use from the first write.
@@ -133,9 +133,10 @@ impl Default for AddressAssignConfig {
 /// (address 0 is reserved; total capacity is budget words including zero).
 ///
 /// When `select_fma_ops` is Some, SelectChoice ops whose id is in the set and that have
-/// `sub_temp_vreg` (FMA path without delta) define their **dest** at cycle+2: the sub runs at
-/// op.cycle, the FMA runs at op.cycle+1, and results are visible the next cycle, so dest is
-/// visible at op.cycle+2.
+/// `sub_temp_vreg` (FMA path without delta) use **def_cycle = op.cycle+1** for their dest for
+/// allocation: the FMA *writes* at op.cycle+1, so the address must be reserved from that cycle
+/// to avoid another op (e.g. another SelectChoice's sub at cycle+1) reusing the same address.
+/// (Results are visible at cycle+2; precedence constraints enforce that.)
 ///
 /// When `shifted_alu_cycles` is Some, VALU ops shifted to ALU (op.id in map) use min(alu_cycles)
 /// as def_cycle for their dest. The 8 ALU ops write at different cycles; the vector block is
@@ -153,12 +154,12 @@ pub fn compute_live_intervals(
     // Initialize with [def, def] — will be extended if read.
     for op in ops {
         if let Some(dest) = op.dest {
-            // SelectChoice FMA (no delta): sub at cycle, FMA at cycle+1 → result visible at cycle+2
+            // SelectChoice FMA (no delta): FMA writes at cycle+1 → reserve dest address from cycle+1
             let def_cycle = if op.opcode == Opcode::SelectChoice
                 && select_fma_ops.map_or(false, |s| s.contains(&op.id))
                 && op.sub_temp_vreg.is_some()
             {
-                op.cycle + 2
+                op.cycle + 1
             } else if let Some(cycles) =
                 shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
             {
@@ -213,6 +214,29 @@ pub fn compute_live_intervals(
                         "  WARNING: VReg {:?} read by vstore but not in intervals!",
                         vreg
                     );
+                }
+            }
+        }
+
+        // SelectChoice FMA (no delta): sub at cycle, FMA at cycle+1. The FMA reads cond and false_val
+        // at cycle+1, so their intervals must extend to cycle+1 or the allocator may reuse those
+        // addresses and corrupt the FMA result.
+        if op.opcode == Opcode::SelectChoice
+            && select_fma_ops.map_or(false, |s| s.contains(&op.id))
+            && op.sub_temp_vreg.is_some()
+            && op.srcs.len() >= 3
+        {
+            let read_at_cycle_plus_one = op.cycle + 1;
+            for (i, src) in op.srcs.iter().enumerate() {
+                // cond = srcs[0], false_val = srcs[2] are read again by FMA at cycle+1
+                if i != 1 {
+                    if let Operand::VReg(vreg) = src {
+                        if let Some(interval) = intervals.get_mut(vreg) {
+                            if read_at_cycle_plus_one > interval.end {
+                                interval.end = read_at_cycle_plus_one;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -936,9 +960,9 @@ mod tests {
         assert_eq!(intervals[&v2], LiveInterval::new(1, 5));
     }
 
-    /// SelectChoice FMA (no delta): dest must be defined at op.cycle+2, sub_temp at [op.cycle, op.cycle+1].
+    /// SelectChoice FMA (no delta): dest def_cycle = op.cycle+1 (FMA writes then; reserve address), sub_temp at [op.cycle, op.cycle+1].
     #[test]
-    fn test_compute_live_intervals_selectchoice_fma_dest_at_cycle_plus_2() {
+    fn test_compute_live_intervals_selectchoice_fma_dest_at_cycle_plus_1() {
         let mut emit = SsaEmitContext::new();
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
@@ -963,13 +987,16 @@ mod tests {
             "no-delta path"
         );
 
-        // Simulate schedule: SelectChoice at cycle 5, consumer at cycle 8
+        // Simulate schedule: SelectChoice at cycle 5, consumer (Add) at cycle 8.
+        // Note: dep_ids may be empty if compute_ssa_dependencies wasn't run, so set consumer cycle by finding the op that uses sel.
         emit.ops[select_choice_idx].cycle = 5;
-        for (idx, op) in emit.ops.iter_mut().enumerate() {
-            if op.dep_ids.contains(&select_choice_id) {
-                op.cycle = 8;
-            } else if op.cycle < 0 {
+        let dest_vreg = emit.ops[select_choice_idx].dest.unwrap();
+        for op in emit.ops.iter_mut() {
+            if op.cycle < 0 {
                 op.cycle = 0;
+            }
+            if op.srcs.iter().any(|s| s.as_vreg() == Some(dest_vreg)) {
+                op.cycle = 8; // consumer of SelectChoice result
             }
         }
 
@@ -982,10 +1009,10 @@ mod tests {
             .expect("SelectChoice has dest");
         let sub_temp = emit.ops[select_choice_idx].sub_temp_vreg.expect("sub_temp");
 
-        // Dest is produced by FMA at cycle 6 → visible at cycle 7 (op.cycle+2)
+        // Dest is written by FMA at cycle 6 → reserve address from cycle 6 (op.cycle+1)
         assert_eq!(
-            intervals[&dest].start, 7,
-            "SelectChoice FMA dest def_cycle must be op.cycle+2"
+            intervals[&dest].start, 6,
+            "SelectChoice FMA dest def_cycle must be op.cycle+1 for allocation"
         );
         assert_eq!(
             intervals[&dest].end, 8,
