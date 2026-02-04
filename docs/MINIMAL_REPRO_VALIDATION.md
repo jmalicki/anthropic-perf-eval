@@ -1,29 +1,30 @@
 # Minimal reproducible test case for validation failure (non-16-round)
 
-When running the SSA kernel with **rounds < 16** (e.g. 1, 2, or 3), the generated kernel **builds and schedules** but **fails validation**: output does not match the reference kernel. This doc records the smallest configs that reproduce the failure for debugging.
+When running the SSA kernel with **rounds < 16** and **CP-SAT** (not greedy), the generated kernel can **fail validation**: output does not match the reference. With **greedy** scheduling the same configs pass. This doc records the minimum failing config for debugging.
 
-## Minimal (fastest) repro
+## Minimum failing problem (CP-SAT)
 
-- **rounds=2, batch_size=16**
-- Build: ~0.1s, 7 cycles
-- Validation: **FAIL** (value/index mismatch vs reference)
+- **rounds=2, batch_size=16**, **use CP-SAT** (do not use `--use-greedy`)
+- Build: ~0.04s with short CP-SAT limit, 7 cycles
+- Validation: **FAIL** (value/index mismatch; often first at batch index 1)
+- **Same config with greedy: PASS**
 
-```bash
-uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --cpsat-time-limit 120 --validate --save-kernel kernel_2r_16b.json
-```
-
-## Even smaller (1 round, 1 group)
-
-- **rounds=1, batch_size=8** (n_groups=1)
-- Requires the `n_groups=1` fix in `ssa_emit.rs` (emit_load_data / emit_store_data) so the single-group case doesn’t panic.
-- Build: ~0.03s, 7 cycles
-- Validation: **FAIL**
+So the smallest problem that fails is **2 rounds, batch 16, CP-SAT**. Larger batches (32, 64, 128, 256) also fail with CP-SAT; greedy passes for all tested sizes.
 
 ```bash
-uv run generate_ssa_kernel.py --rounds 1 --batch-size 8 --cpsat-time-limit 60 --validate --save-kernel kernel_1r_8b.json
+# Fails (CP-SAT)
+uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --cpsat-time-limit 30 --validate -q
+
+# Passes (greedy)
+uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --use-greedy --validate -q
 ```
+
+## Configs that pass (after fixes)
+
+- **1 round, batch 8** (n_groups=1): passes with both greedy and CP-SAT (fixed via n_iters ceiling and n_groups bounds).
+- **2 rounds, batch 16** (and 32, 64, 128, 256): passes with **greedy** only; fails with CP-SAT.
 
 ## Notes
 
-- **batch_size=8** used to panic (index out of bounds in `ssa_emit.rs`) because load/store assumed at least two groups (pairs). The fix handles `n_groups == 1` (and odd group count) by only emitting the second load/store when `g + 1 < n_groups`.
-- For **batch_size < 64**, `n_iters = n_groups / 8` is 0 when `n_groups < 8`, so the hash/xor phases may emit no work for small batches; that may be part of the wrong-output cause and would need a separate fix (e.g. partial iters or `n_iters = max(1, n_groups/8)` with bounds checks).
+- The failure is tied to **CP-SAT’s schedule or choices** (ConstChoice / SelectChoice / shift), not to problem size alone: greedy produces a correct kernel for the same size.
+- **batch_size=8** (n_groups=1) used to panic; fixed by single-group load/store and `n_iters = ceil(n_groups/8)` with `g < n_groups` guards in xor/hash/depth.

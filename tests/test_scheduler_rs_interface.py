@@ -119,3 +119,59 @@ def test_4_round_submission_correctness():
         use_cpsat=False,
     )
     _run_kernel_and_assert_matches_reference(instrs, mem, FOUR_ROUND_BATCH_SIZE)
+
+
+# Edge cases: small batches and few rounds (n_groups=1, partial iters)
+def test_ssa_1_round_batch_8_correctness():
+    """1 round, batch 8 (n_groups=1): kernel must build and match reference.
+
+    Exercises n_iters ceiling (1 iter for 1 group), single-group load/store,
+    and g < n_groups guards in xor/hash/depth phases.
+    """
+    import scheduler_rs
+
+    forest_height = 10
+    n_nodes = 2047
+    batch_size = 8
+    rounds = 1
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+    )
+    assert not stats.get("budget_exceeded", False), "1r8b should stay within budget"
+    _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
+def test_ssa_2_rounds_batch_16_correctness():
+    """2 rounds, batch 16 (n_groups=2): kernel must build and match reference.
+
+    Minimal small config; exercises ceiling n_iters and partial-iter guards.
+    """
+    import scheduler_rs
+
+    forest_height = 10
+    n_nodes = 2047
+    batch_size = 16
+    rounds = 2
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+    )
+    assert not stats.get("budget_exceeded", False), "2r16b should stay within budget"
+    _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
