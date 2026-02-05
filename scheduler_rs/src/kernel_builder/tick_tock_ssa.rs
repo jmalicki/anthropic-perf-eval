@@ -72,6 +72,16 @@ pub struct SsaScheduleResult {
     /// Individual ALU cycle assignments for shifted VALU ops (from CP-SAT)
     /// Maps op_id -> [cycle0, cycle1, ..., cycle7] (8 cycles, one per ALU op)
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
+    /// Empty cycle count from CP-SAT (None for greedy path). When > 0, makespan has gaps.
+    pub empty_cycle_count: Option<usize>,
+    /// When true, makespan was driven by capacity lower bound (structural). None for greedy.
+    pub makespan_driven_by_capacity: Option<bool>,
+    /// Same constraints as CP-SAT model (for bulk-move simulator). None for greedy path.
+    pub schedule_constraints: Option<Vec<crate::schedule_constraints::ScheduleConstraint>>,
+    /// SSA-level cycle for each op (same order/length as schedule_constraints index space). For bulk-move from JSON.
+    pub ssa_cycle_assignments: Option<Vec<i32>>,
+    /// SSA-level (id, dep_ids) per op in same order. For bulk-move from JSON.
+    pub ssa_ops_bulk_move: Option<Vec<(usize, Vec<usize>)>>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -414,6 +424,11 @@ impl SsaTickTockKernelBuilder {
             budget_exceeded,
             usage_accounting,
             vreg_metadata,
+            empty_cycle_count: None,
+            makespan_driven_by_capacity: None,
+            schedule_constraints: None,
+            ssa_cycle_assignments: None,
+            ssa_ops_bulk_move: None,
         })
     }
 
@@ -731,6 +746,16 @@ impl SsaTickTockKernelBuilder {
                 } else {
                     Some(&greedy_select_fma_ops)
                 };
+                // Hint ConstChoice (add_imm vs Load) from greedy so the segment model gets a full hint (avoids UNKNOWN from incomplete hint).
+                let seg_const_add_imm: HashSet<usize> = greedy_const_add_imm_ops
+                    .intersection(&segment_op_ids)
+                    .copied()
+                    .collect();
+                let seg_const_add_imm_hints = if seg_const_add_imm.is_empty() {
+                    None
+                } else {
+                    Some(&seg_const_add_imm)
+                };
                 let seg_result = schedule_ssa_cpsat(
                     &segment_ops,
                     config_feasibility,
@@ -739,7 +764,7 @@ impl SsaTickTockKernelBuilder {
                         shift_hints: seg_shift,
                         forced_shifts: None,
                         select_choice_hints: seg_select,
-                        const_add_imm_hints: None, // Segment run: no greedy ConstChoice hints
+                        const_add_imm_hints: seg_const_add_imm_hints,
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() {
                             None
@@ -786,12 +811,12 @@ impl SsaTickTockKernelBuilder {
                     eprintln!();
                 }
             }
-            // Advance section_offset by this section's makespan.
-            // When we ran segment CP-SAT, use its makespan (wrote to filtered_global_indices only;
-            // filtered-out ops keep greedy cycle, so min/max over all ops would be wrong).
+            // Concatenate sections: every section occupies [section_offset, section_offset + span).
+            // When we ran per-section CP-SAT we already wrote back with section_offset. When we did
+            // not, rebase this section's ops so they sit in that range (no overlap with other sections).
             let (start, end) = boundaries[k];
-            let advance = if let Some(m) = this_section_makespan {
-                m
+            let (advance, section_min_cycle) = if let Some(m) = this_section_makespan {
+                (m, None)
             } else {
                 let mut min_c = i32::MAX;
                 let mut max_c = i32::MIN;
@@ -801,12 +826,20 @@ impl SsaTickTockKernelBuilder {
                         max_c = max_c.max(op.cycle);
                     }
                 }
-                if min_c <= max_c {
+                let span = if min_c <= max_c {
                     max_c - min_c + 1
                 } else {
                     0
-                }
+                };
+                (span, if span > 0 { Some(min_c) } else { None })
             };
+            if let Some(min_c) = section_min_cycle {
+                for op in &mut ssa_ops[start..end] {
+                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+                        op.cycle = section_offset + (op.cycle - min_c);
+                    }
+                }
+            }
             section_offset += advance;
         }
 
@@ -1005,6 +1038,13 @@ impl SsaTickTockKernelBuilder {
             );
         }
 
+        // Capture SSA-level schedule for bulk-move simulator (same index space as schedule_constraints).
+        let ssa_cycle_assignments = cpsat_result.cycle_assignments.clone();
+        let ssa_ops_bulk_move: Vec<(usize, Vec<usize>)> = ssa_ops
+            .iter()
+            .map(|o| (o.id, o.dep_ids.iter().copied().collect()))
+            .collect();
+
         // Filter out dead stores (ops with cycle=-1) before address assignment.
         // Dead stores are ops whose dest VReg has no users - they were detected
         // during greedy hints generation but CP-SAT may also leave some ops
@@ -1112,6 +1152,11 @@ impl SsaTickTockKernelBuilder {
             usage_accounting,
             vreg_metadata,
             shifted_alu_cycles: cpsat_result.shifted_alu_cycles.clone(),
+            empty_cycle_count: Some(cpsat_result.empty_cycle_count),
+            makespan_driven_by_capacity: Some(cpsat_result.makespan_driven_by_capacity),
+            schedule_constraints: Some(cpsat_result.schedule_constraints.clone()),
+            ssa_cycle_assignments: Some(ssa_cycle_assignments),
+            ssa_ops_bulk_move: Some(ssa_ops_bulk_move),
         })
     }
 
