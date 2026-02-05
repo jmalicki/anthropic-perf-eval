@@ -168,6 +168,7 @@ impl SsaTickTockKernelBuilder {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -190,6 +191,7 @@ impl SsaTickTockKernelBuilder {
         select_choice_fma_ops: Option<&mut HashSet<usize>>,
         select_sub_cycles: Option<&mut HashMap<usize, i32>>,
         select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+        mut const_add_imm_ops: Option<&mut HashSet<usize>>,
     ) -> Result<(usize, bool, usize), String> {
         if ops.is_empty() {
             return Ok((0, false, 0));
@@ -492,14 +494,30 @@ impl SsaTickTockKernelBuilder {
                     .chain(budget_deferred.drain(..))
                     .collect();
 
+                // Count ready Flow ops that are not ConstChoice (vselect, jump, halt, etc.).
+                // We schedule ConstChoice as add_imm only when Flow is free and no other Flow op is ready.
+                let flow_other_ready = ops_to_try
+                    .iter()
+                    .filter(|&&idx| {
+                        !scheduled.contains(&idx)
+                            && ops[idx].engine == Engine::Flow
+                            && ops[idx].opcode != Opcode::ConstChoice
+                    })
+                    .count();
+
                 for idx in ops_to_try {
                     if scheduled.contains(&idx) {
                         continue;
                     }
 
-                    // Map ConstChoice to Load for greedy scheduler (default encoding)
+                    // ConstChoice: use add_imm (Flow) only if there is a free Flow slot and no
+                    // other schedulable Flow op (vselect, jump, etc.); otherwise use Load.
                     let engine = if ops[idx].opcode == Opcode::ConstChoice {
-                        Engine::Load
+                        if flow_used < 1 && flow_other_ready == 0 {
+                            Engine::Flow
+                        } else {
+                            Engine::Load
+                        }
                     } else {
                         ops[idx].engine
                     };
@@ -567,7 +585,15 @@ impl SsaTickTockKernelBuilder {
                                 valu_used += 1;
                             }
                         }
-                        Engine::Flow => flow_used += 1,
+                        Engine::Flow => {
+                            flow_used += 1;
+                            // Record ConstChoice scheduled as add_imm for lowering
+                            if ops[idx].opcode == Opcode::ConstChoice {
+                                if let Some(ref mut set) = const_add_imm_ops {
+                                    set.insert(op_id);
+                                }
+                            }
+                        }
                         _ => {}
                     }
 
