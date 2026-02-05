@@ -34,10 +34,13 @@ pub struct SectionBudgetResult {
 ///
 /// * `ops`: Full SSA op list with barriers; each op must have `cycle` set (from greedy).
 /// * `scratch_budget`: Max allowed simultaneous live words.
-/// * `select_fma_op_ids`: When provided (e.g. greedy or CP-SAT SelectChoice decisions), any
-///   SelectChoice op whose id is in this set and that has `sub_temp_vreg` is treated as using
-///   the FMA path; the sub_temp VReg is then counted in peak (def at op.cycle, last use at
-///   op.cycle+1). Pass `None` when no provisional selection is available.
+/// * `select_fma_op_ids`: Default SelectChoice FMA set (e.g. greedy). Used for sections that
+///   do not have a per-section override.
+/// * `section_select_fma_overrides`: When provided, overrides[k] is the SelectChoice FMA set
+///   for section k (e.g. from per-section CP-SAT). Use this when measuring peak for sections
+///   that were re-scheduled by per-section CP-SAT so the same FMA/vselect decisions are used.
+///   This supports the merged-hint flow: each section's peak is measured with that section's
+///   actual solution (greedy or per-section CP-SAT), so post-merge check matches segment model.
 /// * ConstChoice ops: each is a single op with one dest VReg. Scratch usage is one word
 ///   regardless of whether we later lower to Load or AddImm, so no extra parameter or
 ///   logic is needed (unlike SelectChoice's sub_temp_vreg when FMA is chosen).
@@ -45,6 +48,7 @@ pub fn sections_exceeding_budget(
     ops: &[SsaOp],
     scratch_budget: usize,
     select_fma_op_ids: Option<&HashSet<usize>>,
+    section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
 ) -> SectionBudgetResult {
     let boundaries = section_boundaries(ops);
 
@@ -73,23 +77,29 @@ pub fn sections_exceeding_budget(
         }
     }
 
-    // When FMA path is provisionally selected for a SelectChoice, count its sub_temp_vreg
-    // (def at op.cycle, read by lowered FMA at op.cycle+1).
-    if let Some(fma_ids) = select_fma_op_ids {
-        for op in ops.iter() {
-            if op.cycle >= 0 && fma_ids.contains(&op.id) {
-                if let Some(sub_temp) = op.sub_temp_vreg {
-                    vreg_def_cycle.insert(sub_temp, op.cycle);
-                    vreg_last_use_cycle.insert(sub_temp, op.cycle + 1);
-                }
-            }
-        }
-    }
-
     let mut section_peaks = Vec::with_capacity(boundaries.len());
     let mut section_exceeds_budget = Vec::with_capacity(boundaries.len());
 
-    for &(start, end) in &boundaries {
+    for (k, &(start, end)) in boundaries.iter().enumerate() {
+        // Section-specific FMA set: override (e.g. from per-section CP-SAT) or default
+        let fma_ids: Option<&HashSet<usize>> = section_select_fma_overrides
+            .and_then(|o| o.get(k).and_then(|x| x.as_ref()))
+            .or(select_fma_op_ids);
+
+        // When FMA path is selected for a SelectChoice in this section, count its sub_temp_vreg
+        let mut section_def = vreg_def_cycle.clone();
+        let mut section_last_use = vreg_last_use_cycle.clone();
+        if let Some(fma_ids) = fma_ids {
+            for op in &ops[start..end] {
+                if op.cycle >= 0 && fma_ids.contains(&op.id) {
+                    if let Some(sub_temp) = op.sub_temp_vreg {
+                        section_def.insert(sub_temp, op.cycle);
+                        section_last_use.insert(sub_temp, op.cycle + 1);
+                    }
+                }
+            }
+        }
+
         // Cycle range for this section: min and max cycle among non-barrier ops with cycle >= 0
         let mut min_c = i32::MAX;
         let mut max_c = i32::MIN;
@@ -107,8 +117,8 @@ pub fn sections_exceeding_budget(
             let mut peak_words = 0usize;
             for t in min_c..=max_c {
                 let mut live = 0usize;
-                for (vreg, &def_c) in &vreg_def_cycle {
-                    let last_c = vreg_last_use_cycle.get(vreg).copied().unwrap_or(def_c);
+                for (vreg, &def_c) in &section_def {
+                    let last_c = section_last_use.get(vreg).copied().unwrap_or(def_c);
                     if def_c <= t && t <= last_c {
                         live += vreg.size();
                     }
@@ -427,7 +437,7 @@ mod tests {
                 3,
             ),
         ];
-        let result = sections_exceeding_budget(&ops, 2, None);
+        let result = sections_exceeding_budget(&ops, 2, None, None);
         assert_eq!(result.section_peaks.len(), 2);
         assert_eq!(
             result.section_peaks[0], 2,
@@ -459,7 +469,7 @@ mod tests {
             vec![],
             0,
         )];
-        let result = sections_exceeding_budget(&ops, 1536, None);
+        let result = sections_exceeding_budget(&ops, 1536, None, None);
         assert_eq!(result.section_peaks.len(), 1);
         assert_eq!(result.section_peaks[0], 1);
         assert!(!result.section_exceeds_budget[0]);
@@ -496,7 +506,7 @@ mod tests {
         let ops = vec![op];
 
         // Without passing select_fma_op_ids, sub_temp is not counted -> peak = 8 (dest only).
-        let result_no_fma = sections_exceeding_budget(&ops, 1536, None);
+        let result_no_fma = sections_exceeding_budget(&ops, 1536, None, None);
         assert_eq!(result_no_fma.section_peaks.len(), 1);
         assert_eq!(
             result_no_fma.section_peaks[0], 8,
@@ -508,7 +518,7 @@ mod tests {
         let mut select_fma = HashSet::new();
         select_fma.insert(1);
 
-        let result_with_fma = sections_exceeding_budget(&ops, 1536, Some(&select_fma));
+        let result_with_fma = sections_exceeding_budget(&ops, 1536, Some(&select_fma), None);
         assert_eq!(result_with_fma.section_peaks.len(), 1);
         assert_eq!(
             result_with_fma.section_peaks[0], 16,

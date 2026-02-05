@@ -40,6 +40,12 @@ pub(crate) const TOCK_STORE_DEPTHS: [usize; 4] = [3, 7, 8, 9];
 /// Hardware scratch size in words (addresses 0..SCRATCH_BUDGET_HW-1).
 pub(crate) const SCRATCH_BUDGET_HW: usize = 1536;
 
+/// Minimum time (seconds) for per-section feasibility CP-SAT. We require a feasible schedule
+/// for each section that exceeds scratch budget; give the solver enough time to find one.
+const PER_SECTION_FEASIBILITY_MIN_SECS: f64 = 600.0;
+/// Cap per-section feasibility time so one section cannot consume the whole run.
+const PER_SECTION_FEASIBILITY_MAX_SECS: f64 = 3600.0;
+
 /// When address 0 is reserved for zero, only 1535 words are assignable; use this as the scheduler
 /// scratch budget so we never schedule more than 1535 assignable words (peak_live then includes zero = 1536).
 pub(crate) fn effective_scratch_budget(zero_vreg_reserved: bool) -> usize {
@@ -558,7 +564,12 @@ impl SsaTickTockKernelBuilder {
         let boundaries = section_boundaries(&ssa_ops);
         let effective_budget = effective_scratch_budget(self.zero_vreg.is_some());
         let budget_result =
-            sections_exceeding_budget(&ssa_ops, effective_budget, Some(&greedy_select_fma_ops));
+            sections_exceeding_budget(
+                &ssa_ops,
+                effective_budget,
+                Some(&greedy_select_fma_ops),
+                None,
+            );
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
             .iter()
@@ -606,6 +617,16 @@ impl SsaTickTockKernelBuilder {
         }
         let vreg_def_sec = vreg_def_section(&ssa_ops, &boundaries);
         let mut section_offset: i32 = 0;
+        // Per-section SelectChoice FMA sets from segment CP-SAT; used when measuring peak so we match segment decisions.
+        let mut section_select_fma_overrides: Vec<Option<HashSet<usize>>> =
+            vec![None; boundaries.len()];
+        // Merged hint state: cycles live on ssa_ops; choice hints maintained here.
+        // Before any per-section run, the hint for every section is greedy. When we run per-section
+        // CP-SAT for a section, we pass the current hint for that section into the segment; after
+        // it runs we update cycles and these choice sets so the final model gets greedy-or-CP-SAT
+        // per section consistently.
+        let mut current_select_fma: HashSet<usize> = greedy_select_fma_ops.clone();
+        let mut current_const_add_imm: HashSet<usize> = greedy_const_add_imm_ops.clone();
 
         for k in 0..boundaries.len() {
             let mut this_section_makespan: Option<i32> = None;
@@ -614,10 +635,8 @@ impl SsaTickTockKernelBuilder {
                 let global_indices: Vec<usize> = (start..end)
                     .filter(|&i| ssa_ops[i].opcode != Opcode::Barrier)
                     .collect();
-                if global_indices.is_empty() {
-                    section_offset += 0;
-                    continue;
-                }
+                if !global_indices.is_empty() {
+                // Section's hint is current merged state (greedy for this section until we run CP-SAT)
                 // Greedy section makespan and peak (for delta reporting after feasibility)
                 let (greedy_min_c, greedy_max_c) = global_indices
                     .iter()
@@ -727,9 +746,21 @@ impl SsaTickTockKernelBuilder {
                 let live_through =
                     live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 // Per-section never uses VALU shift (avoids extra scratch pressure in segment).
+                // Feasibility: we require a feasible solution; give enough time and stop as soon as we find one.
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false), // Short optimization run
-                    _ => ((time_limit_secs * 0.25).min(900.0), true), // Feasibility only
+                    _ => {
+                        let limit = (time_limit_secs * 0.5)
+                            .max(PER_SECTION_FEASIBILITY_MIN_SECS)
+                            .min(PER_SECTION_FEASIBILITY_MAX_SECS);
+                        if verbose {
+                            eprintln!(
+                                "  Per-section feasibility time limit: {:.0}s (min {}, max {}).",
+                                limit, PER_SECTION_FEASIBILITY_MIN_SECS, PER_SECTION_FEASIBILITY_MAX_SECS
+                            );
+                        }
+                        (limit, true) // Feasibility: stop after first solution
+                    }
                 };
                 let config_feasibility = SsaCpsatConfig {
                     time_limit_secs: section_time_limit,
@@ -740,14 +771,27 @@ impl SsaTickTockKernelBuilder {
                     model_name: Some(format!("section_{}_feasibility", k)),
                     ..Default::default()
                 };
-                let seg_shift: Option<&HashSet<usize>> = None; // Per-section: no shift hints
-                let seg_select = if greedy_select_fma_ops.is_empty() {
+                // Pass which segment ops were shifted in the full-kernel greedy so hint verification
+                // counts them as ALU (merged hint must not violate slot capacity).
+                let seg_shift_set: HashSet<usize> = greedy_shifted
+                    .intersection(&segment_op_ids)
+                    .copied()
+                    .collect();
+                let seg_shift: Option<&HashSet<usize>> =
+                    if seg_shift_set.is_empty() {
+                        None
+                    } else {
+                        Some(&seg_shift_set)
+                    };
+                // Hint this section with current merged choices (greedy for this section until we run and update).
+                let seg_select_set: HashSet<usize> =
+                    current_select_fma.intersection(&segment_op_ids).copied().collect();
+                let seg_select = if seg_select_set.is_empty() {
                     None
                 } else {
-                    Some(&greedy_select_fma_ops)
+                    Some(&seg_select_set)
                 };
-                // Hint ConstChoice (add_imm vs Load) from greedy so the segment model gets a full hint (avoids UNKNOWN from incomplete hint).
-                let seg_const_add_imm: HashSet<usize> = greedy_const_add_imm_ops
+                let seg_const_add_imm: HashSet<usize> = current_const_add_imm
                     .intersection(&segment_op_ids)
                     .copied()
                     .collect();
@@ -756,7 +800,7 @@ impl SsaTickTockKernelBuilder {
                 } else {
                     Some(&seg_const_add_imm)
                 };
-                let seg_result = schedule_ssa_cpsat(
+                let seg_result = match schedule_ssa_cpsat(
                     &segment_ops,
                     config_feasibility,
                     SsaCpsatHints {
@@ -778,19 +822,56 @@ impl SsaTickTockKernelBuilder {
                         },
                     },
                     Some(false), // section exceeded budget, so greedy was infeasible
-                )
-                .ok_or_else(|| format!("Per-section CP-SAT failed for section {}", k))?;
-                this_section_makespan = Some(seg_result.makespan as i32);
+                ) {
+                    Some(r) => r,
+                    None => panic!(
+                        "Per-section CP-SAT must find a feasible schedule for section {} (scratch budget {}). \
+                         No solution found within {:.0}s. Either the segment is infeasible (bug in model/liveness) \
+                         or the time limit was too short; per-section feasibility uses at least {}s.",
+                        k, effective_budget, section_time_limit, PER_SECTION_FEASIBILITY_MIN_SECS
+                    ),
+                };
+                section_select_fma_overrides[k] = Some(seg_result.select_fma_ops.clone());
+                // Update merged hint with this section's solution so the final model gets it as hint.
+                for &i in &global_indices {
+                    current_select_fma.remove(&ssa_ops[i].id);
+                }
+                for &id in &seg_result.select_fma_ops {
+                    current_select_fma.insert(id);
+                }
+                let (start, end) = boundaries[k];
+                for op in &ssa_ops[start..end] {
+                    if op.opcode == Opcode::ConstChoice {
+                        current_const_add_imm.remove(&op.id);
+                    }
+                }
+                for &id in &seg_result.const_add_imm_ops {
+                    current_const_add_imm.insert(id);
+                }
+                // Write back cycles: this section's solution (segment result) is now the hint for this section.
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
                         ssa_ops[filtered_global_indices[seg_idx]].cycle = section_offset + cycle;
                     }
                 }
+                // Rebase ops not in segment (e.g. AddImm alternatives) so section is strictly [section_offset, section_offset + span)
+                let filtered_set: HashSet<usize> =
+                    filtered_global_indices.iter().copied().collect();
+                for &i in &global_indices {
+                    if !filtered_set.contains(&i) && ssa_ops[i].cycle >= 0 {
+                        ssa_ops[i].cycle =
+                            section_offset + (ssa_ops[i].cycle - greedy_min_c);
+                    }
+                }
+                this_section_makespan = Some(
+                    (seg_result.makespan as i32).max(greedy_section_makespan),
+                );
                 if verbose {
                     let after_budget = sections_exceeding_budget(
                         &ssa_ops,
                         effective_scratch_budget(self.zero_vreg.is_some()),
                         Some(&greedy_select_fma_ops),
+                        Some(&section_select_fma_overrides),
                     );
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
@@ -811,6 +892,7 @@ impl SsaTickTockKernelBuilder {
                     );
                     eprintln!();
                 }
+                } // end if !global_indices.is_empty()
             }
             // Concatenate sections: every section occupies [section_offset, section_offset + span).
             // When we ran per-section CP-SAT we already wrote back with section_offset. When we did
@@ -845,8 +927,13 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget.
-        let post_merge_budget =
-            sections_exceeding_budget(&ssa_ops, SCRATCH_BUDGET_HW, Some(&greedy_select_fma_ops));
+        // Use per-section SelectChoice (segment result) so peak matches segment scratch model.
+        let post_merge_budget = sections_exceeding_budget(
+            &ssa_ops,
+            SCRATCH_BUDGET_HW,
+            Some(&greedy_select_fma_ops),
+            Some(&section_select_fma_overrides),
+        );
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks
             .iter()
@@ -859,6 +946,15 @@ impl SsaTickTockKernelBuilder {
                 sec, *peak, SCRATCH_BUDGET_HW
             ));
         }
+
+        // Op IDs in sections that ran per-section CP-SAT: their cycles come from the segment (no shift).
+        // Full-kernel hint verification must not count them as shifted even if they were in greedy_shifted.
+        let rescheduled_by_section_cpsat: HashSet<usize> = boundaries
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| budget_result.section_exceeds_budget[*k])
+            .flat_map(|(_, &(start, end))| ssa_ops[start..end].iter().map(|op| op.id))
+            .collect();
 
         // Elide barriers before CP-SAT
         // CP-SAT has proper liveness constraints via ILP, so barriers are unnecessary
@@ -875,10 +971,12 @@ impl SsaTickTockKernelBuilder {
             .map(|c| c + 1)
             .unwrap_or(0);
         let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
+        // After elision there is one section; use current choice hints (greedy + per-section updates).
         let hint_peak = sections_exceeding_budget(
             &ssa_ops,
             effective_budget_hint,
-            Some(&greedy_select_fma_ops),
+            Some(&current_select_fma),
+            None,
         )
         .section_peaks
         .iter()
@@ -914,27 +1012,29 @@ impl SsaTickTockKernelBuilder {
             ..Default::default()
         };
 
-        // Pass shift hints if VALU shift is enabled
-        // When disabled, no shift variables are created so no hints needed
-        // (The 16 "unhinted" variables in CP-SAT are symmetry-breaking variables from preprocessing)
-        let shift_hints = if enable_valu_shift {
-            Some(&greedy_shifted)
+        // Pass shift hints if VALU shift is enabled. Exclude ops that were re-scheduled by per-section
+        // CP-SAT (their cycles come from the segment, which doesn't use shift; counting them as shifted
+        // would overcount ALU in hint verification).
+        let full_kernel_shift_set: HashSet<usize> = if enable_valu_shift {
+            greedy_shifted
+                .difference(&rescheduled_by_section_cpsat)
+                .copied()
+                .collect()
         } else {
+            HashSet::new()
+        };
+        let shift_hints = if full_kernel_shift_set.is_empty() {
             None
+        } else {
+            Some(&full_kernel_shift_set)
         };
 
         let greedy_hints_opt = Some(&greedy_hints);
 
-        // Pass SelectChoice hints from greedy scheduler
-        // Note: SelectChoice decisions are keyed by op ID, which remains constant after barrier elision
-        // We just need to verify the SelectChoice ops still exist after elision
-        let mut select_choice_hints_set = HashSet::new();
-
-        // Build set of op IDs that exist after barrier elision
+        // Pass SelectChoice hints: use current choices (maintained from greedy + per-section CP-SAT).
         let op_ids_after_elision: HashSet<usize> = ssa_ops.iter().map(|op| op.id).collect();
-
-        // Filter greedy SelectChoice decisions to only include ops that still exist after elision
-        for &select_choice_id in &greedy_select_fma_ops {
+        let mut select_choice_hints_set = HashSet::new();
+        for &select_choice_id in &current_select_fma {
             if op_ids_after_elision.contains(&select_choice_id) {
                 select_choice_hints_set.insert(select_choice_id);
             }
@@ -982,7 +1082,7 @@ impl SsaTickTockKernelBuilder {
                 shift_hints,
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
-                const_add_imm_hints: Some(&greedy_const_add_imm_ops),
+                const_add_imm_hints: Some(&current_const_add_imm),
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
@@ -4637,6 +4737,9 @@ mod tests {
 
     /// Regression: two-phase CP-SAT (per-section feasibility then full-kernel optimization) must
     /// produce a merged hint schedule that stays within scratch budget so the final result does not exceed 1536.
+    /// The merged hint (cycles + SelectChoice/ConstChoice) is maintained per section: before running
+    /// per-section CP-SAT we pass the current merged choices for that section; after it runs we update
+    /// cycles and choice sets so the final full-kernel CP-SAT is hinted with greedy-or-CP-SAT per section.
     /// Presolves (per-section CP-SAT with live_out and live_through) guarantee the merged schedule is feasible;
     /// if not, build_and_schedule_cpsat returns Err. This test asserts the happy path.
     #[cfg(feature = "cpsat")]

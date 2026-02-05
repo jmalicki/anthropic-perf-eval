@@ -59,7 +59,7 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 
 ### Why per-section CP-SAT might not find a feasible solution
 
-When we run per-section CP-SAT for a section that exceeds budget (e.g. greedy peak 1700 > 1536), we pass the **greedy** segment schedule as a hint. That hint is **infeasible** (peak &gt; budget), so the solver cannot “validate hint”; it must search for **any** feasible assignment. If the run fails, it’s for one of these reasons:
+When we run per-section CP-SAT for a section that exceeds budget (e.g. greedy peak 1700 > 1536), we pass the **current merged** hint for that section (cycles + SelectChoice/ConstChoice from `current_select_fma` and `current_const_add_imm` restricted to the segment; before any per-section run that is greedy; after earlier sections run it can include their CP-SAT results). That hint is **infeasible** (peak &gt; budget), so the solver cannot “validate hint”; it must search for **any** feasible assignment. If the run fails, it’s for one of these reasons:
 
 1. **Timeout (status `Unknown`)**  
    The solver hits the per-section time limit (e.g. 900s) without finding a feasible schedule. The search space is huge (many ops, many cycles, precedence + slot + scratch constraints). With an infeasible hint, CP-SAT may spend time in bad regions. **Check logs**: “SSA CP-SAT: no solution found, status Unknown” ⇒ need more time or better search heuristics.
@@ -87,10 +87,10 @@ When we run per-section CP-SAT for a section that exceeds budget (e.g. greedy pe
 
 When CP-SAT is used, the flow is:
 
-1. **Greedy with barriers** – Schedule the full kernel with barriers between rounds. Compute peak scratch per *section* (ops between barriers).
-2. **Per-section CP-SAT (feasibility)** – For any section whose greedy peak exceeds 1536, run CP-SAT on that section only to find a feasible schedule that fits in the budget.
-3. **Merge** – Write per-section cycle assignments back into the full `ssa_ops` (local cycle + `section_offset`).
-4. **Check** – Re-run `sections_exceeding_budget(&ssa_ops, 1536)`. If any section peak > 1536, we return the error you see.
+1. **Greedy with barriers** – Schedule the full kernel with barriers between rounds. Compute peak scratch per *section* (ops between barriers). Initialize merged choice hints from greedy (`current_select_fma`, `current_const_add_imm`).
+2. **Per-section CP-SAT (feasibility)** – For any section whose greedy peak exceeds 1536, run CP-SAT on that section only. The segment is hinted with the *current* merged state for that section’s ops (cycles + choices). After it runs, we update cycles on `ssa_ops` for that section and update `current_select_fma` / `current_const_add_imm` with the segment result so the merged hint stays consistent.
+3. **Merge** – Sections that skipped CP-SAT are rebased so every section occupies `[section_offset, section_offset + span)`; sections that ran CP-SAT already have cycles written. The merged hint to the final model is thus: for each section, either greedy or per-section CP-SAT solution (cycles + choices).
+4. **Check** – Re-run `sections_exceeding_budget(&ssa_ops, 1536, default_select_fma, Some(&section_select_fma_overrides))`. Per-section peaks use each section’s actual choices (segment result when we ran CP-SAT, else greedy). If any section peak > 1536, we return the error you see.
 
 So the bug: **per-section CP-SAT says “feasible” for a section, but after merge the full-kernel peak for that section is > 1536** (e.g. section 2 peak 1544).
 
@@ -152,4 +152,4 @@ Before per-section CP-SAT we filter out AddImm alternatives from the *segment* o
 
 - **Section boundaries and peak:** `scheduler_rs/src/kernel_builder/round_budget.rs`: `sections_exceeding_budget`, `live_in_for_section`, `live_out_from_section`, `live_through_for_section`.
 - **Segment CP-SAT scratch model:** `scheduler_rs/src/cpsat_scheduler.rs`: segment mode with `initial_live`, `live_through_vregs`, `live_out_vregs`, `segment_end_var`, and cumulative constraint.
-- **Merge and check:** `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`: after the per-section loop, `section_offset` update and `sections_exceeding_budget(&ssa_ops, 1536)` that triggers “section N has peak P words (budget 1536).”
+- **Merge and check:** `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`: after the per-section loop, `section_offset` update and `sections_exceeding_budget(..., Some(&section_select_fma_overrides))` so each section's peak uses that section's solution (greedy or per-section CP-SAT). Choice hints (`current_select_fma`, `current_const_add_imm`) are maintained and passed to the final CP-SAT. That check triggers “section N has peak P words (budget 1536).”
