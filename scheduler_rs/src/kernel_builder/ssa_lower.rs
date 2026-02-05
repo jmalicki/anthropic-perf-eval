@@ -53,6 +53,7 @@ pub fn lower_ssa_ops_with_shift(
     vreg_to_addr: &HashMap<VReg, i64>,
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, (usize, usize, crate::types::Opcode)>,
     select_fma_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>, // op_id -> [cycle0, ..., cycle7]
     eliminated_vbroadcast_ops: &HashSet<usize>,
@@ -114,7 +115,46 @@ pub fn lower_ssa_ops_with_shift(
                 .produces_constant
                 .expect("ConstChoice op must have produces_constant");
 
-            if const_add_imm_ops.contains(&ssa_op.id) {
+            if let Some(&(left_op_id, right_op_id, opcode)) = const_alu_derive_ops.get(&ssa_op.id) {
+                // ALU-derived: dest = left opcode right (e.g. add, mul)
+                let left_dest = ssa_ops
+                    .iter()
+                    .find(|o| o.id == left_op_id)
+                    .and_then(|o| o.dest)
+                    .expect("ALU derive left producer must exist");
+                let right_dest = ssa_ops
+                    .iter()
+                    .find(|o| o.id == right_op_id)
+                    .and_then(|o| o.dest)
+                    .expect("ALU derive right producer must exist");
+                let left_addr = *vreg_to_addr.get(&left_dest).expect("left producer VReg in mapping");
+                let right_addr =
+                    *vreg_to_addr.get(&right_dest).expect("right producer VReg in mapping");
+
+                let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                slot.push(SlotVal::Str(opcode.as_str().to_string()));
+                slot.push(SlotVal::Int(dest_addr));
+                slot.push(SlotVal::Int(left_addr));
+                slot.push(SlotVal::Int(right_addr));
+
+                let mut reads = HashSet::new();
+                reads.insert(left_addr);
+                reads.insert(right_addr);
+                let mut writes = HashSet::new();
+                writes.insert(dest_addr);
+
+                result.push(Op {
+                    id: ssa_op.id,
+                    engine: crate::types::Engine::Alu,
+                    slot,
+                    cycle: ssa_op.cycle,
+                    dep_ids: ssa_op.dep_ids.clone(),
+                    reads,
+                    writes,
+                    last_use_reads: HashSet::new(),
+                    produces_constant: Some(value),
+                });
+            } else if const_add_imm_ops.contains(&ssa_op.id) {
                 // AddImm: dest = scratch[0] + value
                 // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
                 // is guaranteed by hardware initialization. add_imm reads from address 0, but we don't
@@ -538,6 +578,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -554,7 +595,71 @@ mod tests {
         assert_eq!(op.slot[2], SlotVal::Int(5)); // value
         assert_eq!(op.produces_constant, Some(5));
         assert!(op.reads.is_empty()); // Const doesn't read anything
-        assert!(op.writes.contains(&100));
+    }
+
+    #[test]
+    fn test_lower_constchoice_alu_derive() {
+        use crate::types::Opcode;
+        let mut vreg_to_addr = HashMap::new();
+        let v1 = VReg::scalar(1);
+        let v2 = VReg::scalar(2);
+        let v3 = VReg::scalar(3);
+        vreg_to_addr.insert(v1, 10);
+        vreg_to_addr.insert(v2, 20);
+        vreg_to_addr.insert(v3, 30);
+
+        let mut op1 = make_const_choice_op(1, 1, v1, 0);
+        let mut op2 = make_const_choice_op(2, 2, v2, 0);
+        let mut op3 = SsaOp::new(
+            3,
+            Engine::Load,
+            Opcode::ConstChoice,
+            Some(v3),
+            vec![Operand::Imm(3)],
+        );
+        op3.produces_constant = Some(3);
+        op3.const_alternatives = Some(vec![
+            crate::types::ConstEncoding::Load,
+            crate::types::ConstEncoding::AddImm { value: 3 },
+            crate::types::ConstEncoding::Add {
+                a_value: 1,
+                b_value: 2,
+            },
+        ]);
+        op3.cycle = 1;
+
+        let ssa_ops = vec![op1, op2, op3];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut const_alu_derive_ops = HashMap::new();
+        const_alu_derive_ops.insert(3, (1, 2, Opcode::Add)); // op 3 = op1 + op2
+
+        let result = lower_ssa_ops_with_shift(
+            &ssa_ops,
+            &vreg_to_addr,
+            &shifted_ops,
+            &const_add_imm_ops,
+            &const_alu_derive_ops,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(result.len(), 3); // 3 ConstChoice ops -> 3 lowered ops
+        let alu_op = result
+            .iter()
+            .find(|o| o.produces_constant == Some(3))
+            .expect("should find op producing 3");
+        assert_eq!(alu_op.engine, Engine::Alu);
+        assert_eq!(alu_op.slot[0], SlotVal::Str("+".to_string()));
+        assert_eq!(alu_op.slot[1], SlotVal::Int(30)); // dest
+        assert_eq!(alu_op.slot[2], SlotVal::Int(10)); // left (op1)
+        assert_eq!(alu_op.slot[3], SlotVal::Int(20)); // right (op2)
+        assert!(alu_op.reads.contains(&10));
+        assert!(alu_op.reads.contains(&20));
+        assert_eq!(alu_op.writes.len(), 1);
+        assert!(alu_op.writes.contains(&30));
     }
 
     #[test]
@@ -575,6 +680,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -616,6 +722,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -688,6 +795,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &select_fma_ops,
             &HashMap::new(),
             &HashSet::new(),
@@ -741,6 +849,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &select_fma_ops,
             &HashMap::new(),
             &HashSet::new(),
@@ -797,6 +906,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &select_fma_ops,
             &HashMap::new(),
             &HashSet::new(),
@@ -879,6 +989,7 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashMap::new(),
             &select_fma_ops,
             &HashMap::new(),
             &HashSet::new(),

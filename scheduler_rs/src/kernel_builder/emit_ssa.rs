@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{
-    ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, SsaOp, SymmetryHint, VReg,
-    VarSource, VarType,
+    compute_const_encodings_alu_ready, ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode,
+    Operand, SsaOp, SymmetryHint, VReg, VarSource, VarType,
 };
 
 /// Tracks alternative implementations for a constant.
@@ -627,8 +627,16 @@ impl SsaEmitContext {
 
         let dest = self.fresh_scalar();
 
-        // Build alternatives for the scheduler
-        let alternatives = vec![ConstEncoding::Load, ConstEncoding::AddImm { value }];
+        // Build alternatives: Load, AddImm, and optionally ALU-derived (when operands are available)
+        let mut alternatives: Vec<ConstEncoding> = vec![ConstEncoding::Load, ConstEncoding::AddImm { value }];
+        let available: HashSet<i64> = self
+            .const_cache
+            .keys()
+            .copied()
+            .chain(self.zero_vreg.map(|_| 0i64))
+            .collect();
+        let alu_ready = compute_const_encodings_alu_ready(value, &available, 2);
+        alternatives.extend(alu_ready);
 
         let mut op = SsaOp::new(
             0,

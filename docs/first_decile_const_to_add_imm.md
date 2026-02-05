@@ -104,3 +104,7 @@ Concrete choices (one per cycle; the other const in that cycle stays Load):
 ## Expectation
 
 The CP-SAT model already allows this: ConstChoice has optional Load and optional Flow intervals, and Flow is uncongested in the first decile. So the solver *can* choose add_imm for some of these consts. **If it does not find this optimization, this indicates a bug in the search/exploration** (e.g. hint bias, branching order, or objective not properly rewarding Load balance). Adding a secondary objective or branching priority to prefer add_imm when Load is saturated (or Flow free) could make the solver more likely to find this pattern.
+
+## Third option: ALU-derived constants
+
+ConstChoice also supports a **third encoding**: produce a constant via one ALU op from two previously materialized constants (e.g. 4 = 2+2 or 2×2, 3 = 2+1). When chosen, the op uses an ALU slot and is scheduled after both operand producers (enforced by CP-SAT). This can free Load slots in early cycles where ALU is underused, so more consts or data loads can be scheduled earlier. The solver decides per ConstChoice op whether to use Load, AddImm, or an ALU derivation when operands are available.

@@ -480,6 +480,17 @@ impl ConstEncoding {
             }
         }
     }
+
+    /// Opcode for ALU encodings (Add, Sub, Mul, Shift). None for Load/AddImm.
+    pub fn alu_opcode(&self) -> Option<Opcode> {
+        match self {
+            ConstEncoding::Load | ConstEncoding::AddImm { .. } => None,
+            ConstEncoding::Add { .. } => Some(Opcode::Add),
+            ConstEncoding::Sub { .. } => Some(Opcode::Sub),
+            ConstEncoding::Mul { .. } => Some(Opcode::Mul),
+            ConstEncoding::Shift { .. } => Some(Opcode::Shl),
+        }
+    }
 }
 
 /// A pseudo-operation representing "need constant value V available in a register".
@@ -760,6 +771,31 @@ pub fn compute_const_encodings_with_flags(
     }
 
     encodings
+}
+
+/// Compute ALU-only encodings (Add, Sub, Mul, Shift) for a constant value
+/// whose operands are in `available`. Returns at most `max_count` encodings.
+/// Used by emit_const_choice to offer ALU-derived as a third option when
+/// operand constants are already materialized earlier in the kernel.
+pub fn compute_const_encodings_alu_ready(
+    value: i64,
+    available: &HashSet<i64>,
+    max_count: usize,
+) -> Vec<ConstEncoding> {
+    if max_count == 0 {
+        return vec![];
+    }
+    let flags = ConstEncodingFlags {
+        enable_add_imm: false,
+        enable_load: false,
+        enable_alu: true,
+        max_alu_depth: Some(4), // keep derivation chain short
+    };
+    let all = compute_const_encodings_with_flags(value, flags);
+    all.into_iter()
+        .filter(|e| e.is_ready(available))
+        .take(max_count)
+        .collect()
 }
 
 // ============================================================================
