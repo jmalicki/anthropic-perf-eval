@@ -29,6 +29,7 @@ Benchmark/default parameters:
 When working in this repo, read and follow these project-specific skills when they apply:
 
 - **Debugging makespan / empty cycles** — Read [.cursor/skills/use-bulk-move/SKILL.md](.cursor/skills/use-bulk-move/SKILL.md). Use the bulk-move simulator to see if empty cycles can be compacted (ReachedEnd) or which constraint blocks (Blocked). Requires CP-SAT run with `--output-json`; run `uv run scripts/simulate_bulk_move.py` on that JSON.
+- **Schedule debug / per-decile slot utilization** — Read [.cursor/skills/use-schedule-debug/SKILL.md](.cursor/skills/use-schedule-debug/SKILL.md). Use per-decile slot utilization to find optimization opportunities (slot balance, encoding improvements). Run `uv run scripts/slot_usage_by_decile.py` on scheduler output JSON; see [docs/PER_DECILE_SLOT_UTILIZATION.md](docs/PER_DECILE_SLOT_UTILIZATION.md).
 - **Bug tracking** — Read [.cursor/skills/use-bugs-md/SKILL.md](.cursor/skills/use-bugs-md/SKILL.md). Use BUGS.md at the repo root: read before fixing, update when fixing or reporting, keep entries short.
 - **Bisecting validation failures / minimal repros** — Read [.cursor/skills/use-bisection-tools/SKILL.md](.cursor/skills/use-bisection-tools/SKILL.md). Use `scripts/bisect_cpsat_validation.py` to find which choice options (ConstChoice, SelectChoice, valu shift) correlate with failure, and `scripts/bisect_minimal_fma.py` for smallest rounds/batch/height that reproduces.
 
