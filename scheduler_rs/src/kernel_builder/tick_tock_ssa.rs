@@ -630,8 +630,34 @@ impl SsaTickTockKernelBuilder {
 
         for k in 0..boundaries.len() {
             let mut this_section_makespan: Option<i32> = None;
+            let (start, end) = boundaries[k];
+            // Rebase this section into [section_offset, section_offset + span) so the merged
+            // schedule is a strict concatenation. Do this every iteration (whether we run
+            // per-section CP-SAT or not) so segment_hints (c - section_offset) are correct.
+            let section_span_after_rebase: i32 = {
+                let mut min_c = i32::MAX;
+                let mut max_c = i32::MIN;
+                for op in &ssa_ops[start..end] {
+                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+                        min_c = min_c.min(op.cycle);
+                        max_c = max_c.max(op.cycle);
+                    }
+                }
+                let span = if min_c <= max_c {
+                    max_c - min_c + 1
+                } else {
+                    0
+                };
+                if span > 0 {
+                    for op in &mut ssa_ops[start..end] {
+                        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+                            op.cycle = section_offset + (op.cycle - min_c);
+                        }
+                    }
+                }
+                span
+            };
             if budget_result.section_exceeds_budget[k] {
-                let (start, end) = boundaries[k];
                 let global_indices: Vec<usize> = (start..end)
                     .filter(|&i| ssa_ops[i].opcode != Opcode::Barrier)
                     .collect();
@@ -896,35 +922,9 @@ impl SsaTickTockKernelBuilder {
                 }
                 } // end if !global_indices.is_empty()
             }
-            // Concatenate sections: every section occupies [section_offset, section_offset + span).
-            // When we ran per-section CP-SAT we already wrote back with section_offset. When we did
-            // not, rebase this section's ops so they sit in that range (no overlap with other sections).
-            let (start, end) = boundaries[k];
-            let (advance, section_min_cycle) = if let Some(m) = this_section_makespan {
-                (m, None)
-            } else {
-                let mut min_c = i32::MAX;
-                let mut max_c = i32::MIN;
-                for op in &ssa_ops[start..end] {
-                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                        min_c = min_c.min(op.cycle);
-                        max_c = max_c.max(op.cycle);
-                    }
-                }
-                let span = if min_c <= max_c {
-                    max_c - min_c + 1
-                } else {
-                    0
-                };
-                (span, if span > 0 { Some(min_c) } else { None })
-            };
-            if let Some(min_c) = section_min_cycle {
-                for op in &mut ssa_ops[start..end] {
-                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                        op.cycle = section_offset + (op.cycle - min_c);
-                    }
-                }
-            }
+            // Advance section_offset by this section's span. We already rebased at start of
+            // iteration; if we ran per-section CP-SAT the writeback may have changed the span.
+            let advance = this_section_makespan.unwrap_or(section_span_after_rebase);
             section_offset += advance;
         }
 

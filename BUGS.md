@@ -27,7 +27,7 @@
 
 **Cause (fixed):** Only sections that exceeded the scratch budget ran per-section CP-SAT and got their cycles written back as `section_offset + local_cycle`. Sections that stayed within budget were never rebased; they kept the initial greedy schedule’s cycles, which overlap with other sections (greedy schedules the whole kernel in one space). So the “merged” hint was a mix of concatenated sections and overlapping greedy cycles.
 
-**Fix:** In `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`, after the per-section loop we now **rebase** every section that did *not* run per-section CP-SAT: for each such section, set `op.cycle = section_offset + (op.cycle - min_c)` so that section occupies `[section_offset, section_offset + span)`. Then advance `section_offset` by that span. The merged schedule is thus a strict concatenation of sections.
+**Fix:** In `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`, at the **start** of each section’s iteration we **rebase** that section (whether we run per-section CP-SAT or not): set `op.cycle = section_offset + (op.cycle - min_c)` so the section occupies `[section_offset, section_offset + span)`. Then advance `section_offset` by that span. Rebase-at-start ensures `segment_hints` (e.g. `c - section_offset`) are in local cycle space when building the segment model. The merged schedule is thus a strict concatenation of sections.
 
 **Verification:** We are allowed to exceed scratch in the greedy scheduler, but not slot constraints. If the merged hint ever has VALU/ALU capacity violations, `scheduler_rs/src/cpsat_scheduler.rs` panics (merge bug or single-section schedule exceeding capacity).
 
