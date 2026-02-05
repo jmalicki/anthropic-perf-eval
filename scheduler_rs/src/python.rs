@@ -1531,6 +1531,9 @@ struct SsaScheduleOutput {
     /// SSA-level ops (id, dep_ids) in same order as schedule_constraints. Use for bulk-move.
     #[serde(skip_serializing_if = "Option::is_none")]
     ssa_ops_bulk_move: Option<Vec<SsaOpBulkMoveOut>>,
+    /// Op IDs of vbroadcasts eliminated by CP-SAT (not emitted).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    eliminated_vbroadcast_ops: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -1766,6 +1769,7 @@ fn write_ssa_schedule_json(
                 })
                 .collect()
         }),
+        eliminated_vbroadcast_ops: result.eliminated_vbroadcast_ops.clone(),
     };
 
     let json = serde_json::to_string_pretty(&output)
@@ -2486,7 +2490,7 @@ use crate::kernel_builder::{SsaScheduleResult, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2506,6 +2510,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     liveness_detail: Option<String>,
     forced_shifts: Option<Vec<usize>>,
     force_zero_gap: Option<bool>,
+    enable_vbroadcast_elimination: Option<bool>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -2558,12 +2563,14 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let forced_shifts_set: Option<std::collections::HashSet<usize>> =
         forced_shifts.map(|v| v.into_iter().collect());
     let force_zero_gap = force_zero_gap.unwrap_or(false);
+    let enable_vbroadcast_elimination = enable_vbroadcast_elimination.unwrap_or(enable_valu_shift);
     let result = if use_cpsat {
         builder
             .build_and_schedule_cpsat(
                 cpsat_time_limit,
                 verbose,
                 enable_valu_shift,
+                enable_vbroadcast_elimination,
                 per_section_optimize_secs,
                 forced_shifts_set,
                 const_choice_mode,

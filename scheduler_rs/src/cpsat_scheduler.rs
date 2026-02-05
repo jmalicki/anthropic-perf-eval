@@ -654,6 +654,7 @@ fn summarise_ssa_solution_engines_and_choices(
 
 /// Validate that a CP-SAT solution respects engine slot limits per cycle.
 /// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
+/// Eliminated vbroadcast ops (when vb elimination is used) do not consume VALU slots and are not counted.
 #[cfg(feature = "cpsat")]
 fn validate_ssa_slot_limits(
     ops: &[SsaOp],
@@ -662,6 +663,7 @@ fn validate_ssa_slot_limits(
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
     select_fma_ops: &HashSet<usize>,
+    eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
 ) {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
@@ -732,7 +734,10 @@ fn validate_ssa_slot_limits(
                         alu_per_cycle[cycle] += VLEN as i32;
                     }
                 } else {
-                    valu_per_cycle[cycle] += 1;
+                    // Eliminated vbroadcasts do not use a VALU slot (optional interval absent)
+                    if !eliminated_vbroadcast_ops.contains(&op.id) {
+                        valu_per_cycle[cycle] += 1;
+                    }
                 }
             }
             Engine::Load => load_per_cycle[cycle] += 1,
@@ -814,6 +819,7 @@ fn try_validate_ssa_slot_limits(
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
     select_fma_ops: &HashSet<usize>,
+    eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
 ) -> Result<(), String> {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
@@ -868,7 +874,9 @@ fn try_validate_ssa_slot_limits(
                         alu_per_cycle[cycle] += VLEN as i32;
                     }
                 } else {
-                    valu_per_cycle[cycle] += 1;
+                    if !eliminated_vbroadcast_ops.contains(&op.id) {
+                        valu_per_cycle[cycle] += 1;
+                    }
                 }
             }
             Engine::Load => load_per_cycle[cycle] += 1,
@@ -1654,6 +1662,9 @@ pub struct SsaCpsatConfig {
     pub select_choice_mode: SelectChoiceMode,
     /// VALU shift: Optimize (solver chooses), ForceAlu, or ForceValu.
     pub valu_shift_mode: ValuShiftMode,
+    /// If true, allow eliminating vbroadcasts when all consumers are shifted to ALU (single scalar producer).
+    /// Only applies when enable_valu_shift is true. Default: true when enable_valu_shift is true.
+    pub enable_vbroadcast_elimination: bool,
     /// If true, force 0 integral gap for proven optimality (debugging only).
     /// Default: false (uses scale/3 gap limit for faster convergence).
     pub force_zero_gap: bool,
@@ -1672,6 +1683,7 @@ impl Default for SsaCpsatConfig {
             const_choice_mode: ConstChoiceMode::default(),
             select_choice_mode: SelectChoiceMode::default(),
             valu_shift_mode: ValuShiftMode::default(),
+            enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
         }
     }
@@ -1897,6 +1909,8 @@ pub struct SsaCpsatHints<'a> {
     pub live_out_vregs: Option<&'a HashSet<VReg>>,
     /// Segment mode: VRegs defined in the previous section but last-used in a later section (live for the whole of this segment). Their scratch interval is [0, segment_end].
     pub live_through_vregs: Option<&'a HashSet<VReg>>,
+    /// Op IDs of vbroadcasts to hint for elimination (try eliminate_vb = true).
+    pub eliminate_vbroadcast_hints: Option<&'a HashSet<usize>>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
@@ -1926,6 +1940,10 @@ pub struct SsaCpsatResult {
     pub empty_cycle_count: usize,
     /// True when makespan equals capacity lower bound (structural bound caused the gap).
     pub makespan_driven_by_capacity: bool,
+    /// Op IDs of vbroadcasts that were eliminated (not emitted; consumers use scalar producer).
+    pub eliminated_vbroadcast_ops: HashSet<usize>,
+    /// For each eliminated vb op ID, the op ID of its scalar producer (for lowering).
+    pub eliminated_vb_to_scalar_producer: HashMap<usize, usize>,
     /// Same constraints as the CP-SAT model (for bulk-move simulator and validation).
     pub schedule_constraints: Vec<crate::schedule_constraints::ScheduleConstraint>,
 }
@@ -2083,6 +2101,7 @@ pub fn schedule_ssa_cpsat(
         const_choice_mode,
         select_choice_mode,
         valu_shift_mode,
+        enable_vbroadcast_elimination,
         force_zero_gap,
     } = config;
 
@@ -2096,6 +2115,7 @@ pub fn schedule_ssa_cpsat(
     let forced_shifts = hints.forced_shifts;
     let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
+    let eliminate_vbroadcast_hints = hints.eliminate_vbroadcast_hints;
     let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
@@ -2115,6 +2135,8 @@ pub fn schedule_ssa_cpsat(
             select_fma_ops: HashSet::new(),
             empty_cycle_count: 0,
             makespan_driven_by_capacity: false,
+            eliminated_vbroadcast_ops: HashSet::new(),
+            eliminated_vb_to_scalar_producer: HashMap::new(),
             schedule_constraints: vec![],
         });
     }
@@ -2378,27 +2400,46 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5b. Precedence for the 8 ALU ops of shifted VALU (second model-building loop; we add
-    // constraints here, not a second solver run). We need completion_cycle_vars for all deps
-    // before we can add these, so they cannot go in the loop above. Use the dependency's shift
-    // variable to activate the right bound: when dep is shifted, require alu_cycle >= completion_cycle[dep]+1;
-    // when dep is not shifted, require alu_cycle >= cycle_vars[dep]+1. Exactly one is active.
+    // 5a. Element-wise dependency map for shifted VALU -> shifted VALU: op lane i depends on dep lane j.
+    // Default: same lane (i -> i). Used in 5b so that when both op and dep are shifted we use
+    // alu_cycle[op][i] >= alu_cycle[dep][j]+1 instead of completion_cycle[dep].
+    let element_dep_map: HashMap<(usize, usize), Vec<usize>> = {
+        let mut m = HashMap::new();
+        for &idx in &shiftable_valu {
+            for &dep_id in &ops[idx].dep_ids {
+                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                    if shiftable_set.contains(&dep_idx) {
+                        // Standard: lane i depends on dep's lane i. (Broadcast deps are not shiftable.)
+                        m.insert((idx, dep_idx), (0..VLEN).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+        m
+    };
+
+    // 5b. Precedence for the 8 ALU ops of shifted VALU. When dep is shifted use element-wise
+    // alu_cycle[op][i] >= alu_cycle[dep][j]+1 (j from element_dep_map); when dep not shifted use
+    // cycle_vars[dep]+1.
     for &idx in &shiftable_valu {
         if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-            for alu_cycle in alu_cycles {
+            for (lane_i, alu_cycle) in alu_cycles.iter().enumerate() {
                 for &dep_id in &ops[idx].dep_ids {
                     if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
                         if shiftable_set.contains(&dep_idx) {
                             let shift_dep = *shift_vars.get(&dep_idx).unwrap();
-                            // When shift[dep]=1: dep is shifted -> wait for completion_cycle
-                            if let Some(&completion_cycle) = completion_cycle_vars.get(&dep_idx) {
-                                let c = model.add_ge(
-                                    *alu_cycle,
-                                    LinearExpr::from(completion_cycle) + 1,
-                                );
-                                model.only_enforce_if(c, [shift_dep]);
-                            }
-                            // When shift[dep]=0: dep stays on VALU -> use cycle_vars[dep]
+                            let dep_alu_cycles = alu_cycle_vars.get(&dep_idx).unwrap();
+                            let j = element_dep_map
+                                .get(&(idx, dep_idx))
+                                .map(|v| v[lane_i])
+                                .unwrap_or(lane_i);
+                            // When shift[dep]=1: element-wise alu_cycle[op][i] >= alu_cycle[dep][j]+1
+                            let c = model.add_ge(
+                                *alu_cycle,
+                                LinearExpr::from(dep_alu_cycles[j]) + 1,
+                            );
+                            model.only_enforce_if(c, [shift_dep]);
+                            // When shift[dep]=0: use cycle_vars[dep]
                             let c = model.add_ge(
                                 *alu_cycle,
                                 LinearExpr::from(cycle_vars[dep_idx]) + 1,
@@ -2432,6 +2473,101 @@ pub fn schedule_ssa_cpsat(
             }
         }
     }
+
+    // 5d. Eliminable vbroadcasts: optional VALU interval (presence = !eliminate_vb), precedence when eliminated
+    let (eliminable_vbs, eliminate_vb_vars, valu_optional_vb_intervals): (
+        Vec<(usize, usize, Vec<usize>)>,
+        HashMap<usize, BoolVar>,
+        HashMap<usize, IntervalVar>,
+    ) = if enable_valu_shift && enable_vbroadcast_elimination && !shiftable_valu.is_empty() {
+        let mut consumers_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            for &dep_id in &op.dep_ids {
+                consumers_of.entry(dep_id).or_default().push(idx);
+            }
+        }
+        let mut list: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+        let mut vars: HashMap<usize, BoolVar> = HashMap::new();
+        let mut intervals: HashMap<usize, IntervalVar> = HashMap::new();
+        for (vb_idx, op) in ops.iter().enumerate() {
+            if op.engine != Engine::Valu || op.opcode != Opcode::Vbroadcast {
+                continue;
+            }
+            let dep_id = match op.dep_ids.iter().next() {
+                Some(&id) if op.dep_ids.len() == 1 => id,
+                _ => continue,
+            };
+            let Some(&scalar_producer_idx) = op_id_to_idx.get(&dep_id) else {
+                continue;
+            };
+            if ops[scalar_producer_idx].engine == Engine::Valu {
+                continue;
+            }
+            let consumers = consumers_of.get(&op.id).map_or(&[] as &[usize], |v| v.as_slice());
+            let shiftable_consumers: Vec<usize> = consumers
+                .iter()
+                .copied()
+                .filter(|&c| shiftable_set.contains(&c))
+                .collect();
+            if shiftable_consumers.is_empty() {
+                continue;
+            }
+            let all_consumers_shiftable = consumers.iter().all(|&c| shiftable_set.contains(&c));
+            if !all_consumers_shiftable {
+                continue;
+            }
+            list.push((vb_idx, scalar_producer_idx, shiftable_consumers.clone()));
+            let eliminate_var = model.new_bool_var_with_name(format!("eliminate_vb_{}", vb_idx));
+            vars.insert(vb_idx, eliminate_var);
+            // eliminate_var = AND(shift[C] for C in shiftable_consumers): encode as
+            // (1) eliminate_var <= shift_c for each c, (2) eliminate_var >= sum(shift_c) - (k-1)
+            for &c in &shiftable_consumers {
+                let shift_c = *shift_vars.get(&c).unwrap();
+                model.add_ge(LinearExpr::from(shift_c), LinearExpr::from(eliminate_var.clone()));
+            }
+            let k = shiftable_consumers.len() as i64;
+            let first_shift = *shift_vars.get(&shiftable_consumers[0]).unwrap();
+            let sum_shifts: LinearExpr = shiftable_consumers[1..]
+                .iter()
+                .fold(LinearExpr::from(first_shift), |acc, &c| {
+                    acc + LinearExpr::from(*shift_vars.get(&c).unwrap())
+                });
+            model.add_ge(
+                LinearExpr::from(eliminate_var.clone()),
+                sum_shifts - (k - 1),
+            );
+            let vb_interval = model.new_optional_fixed_size_interval_var(
+                cycle_vars[vb_idx],
+                1,
+                eliminate_var.not(),
+            );
+            intervals.insert(vb_idx, vb_interval);
+            if let Some(hints) = eliminate_vbroadcast_hints {
+                if hints.contains(&op.id) {
+                    model.add_hint(eliminate_var, 1);
+                }
+            }
+            for &c in &shiftable_consumers {
+                if let Some(alu_cycles) = alu_cycle_vars.get(&c) {
+                    for alu_cycle in alu_cycles {
+                        let c_elim = model.add_ge(
+                            *alu_cycle,
+                            LinearExpr::from(cycle_vars[scalar_producer_idx]) + 1,
+                        );
+                        model.only_enforce_if(c_elim, [eliminate_var.clone()]);
+                        let c_keep = model.add_ge(
+                            *alu_cycle,
+                            LinearExpr::from(cycle_vars[vb_idx]) + 1,
+                        );
+                        model.only_enforce_if(c_keep, [eliminate_var.not()]);
+                    }
+                }
+            }
+        }
+        (list, vars, intervals)
+    } else {
+        (Vec::new(), HashMap::new(), HashMap::new())
+    };
 
     // 6b. Create ConstChoice decision variables and optional intervals
     let const_choice_ops: Vec<usize> = ops
@@ -2643,15 +2779,27 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, _)| idx)
         .collect();
 
-    // VALU cumulative: non-shiftable VALU + optional VALU intervals from shiftable ops
+    // VALU cumulative: non-shiftable VALU (always present except eliminable vb) + optional vb + shiftable + SelectChoice
     {
+        let eliminable_vb_set: HashSet<usize> =
+            eliminable_vbs.iter().map(|(vb_idx, _, _)| *vb_idx).collect();
         let mut valu_intervals: Vec<IntervalVar> = Vec::new();
         let mut valu_demands: Vec<i64> = Vec::new();
 
-        // Add non-shiftable VALU ops (always present)
+        // Add non-shiftable VALU ops that are not eliminable vbroadcasts (always present)
         for &idx in &non_shiftable_valu {
+            if eliminable_vb_set.contains(&idx) {
+                continue;
+            }
             valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
             valu_demands.push(1);
+        }
+        // Add optional VALU intervals for eliminable vbroadcasts (presence = !eliminate_vb)
+        for (vb_idx, _, _) in &eliminable_vbs {
+            if let Some(&iv) = valu_optional_vb_intervals.get(vb_idx) {
+                valu_intervals.push(iv);
+                valu_demands.push(1);
+            }
         }
 
         // Add VALU intervals for shiftable ops: ForceValu => required; ForceAlu => none; Optimize => optional
@@ -3593,6 +3741,9 @@ pub fn schedule_ssa_cpsat(
         shiftable_chosen_cycle.insert(idx, chosen);
     }
 
+    // Tie-breaker "chosen cycle" for SelectChoice: always the *last* cycle of the op for the path
+    // that was chosen (FMA path → fma_last; vselect path → cycle_vars[idx]). So the objective
+    // tie-breaker uses the actual completion cycle of the chosen variant.
     let mut select_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
     for &idx in &select_choice_ops {
         if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
@@ -3603,11 +3754,28 @@ pub fn schedule_ssa_cpsat(
                 [(op_asap, op_alap)],
                 format!("select_chosen_cycle_{}", idx),
             );
-            let choice_var = *select_choice_vars.get(&idx).unwrap();
-            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
-            model.only_enforce_if(c, [choice_var]);
-            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
-            model.only_enforce_if(c, [!choice_var]);
+            if let Some(&choice_var) = select_choice_vars.get(&idx) {
+                // Last cycle for the choice made: FMA → fma_last (C+1); vselect → cycle_vars[idx] (C).
+                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
+                model.only_enforce_if(c, [choice_var]);
+                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
+                model.only_enforce_if(c, [!choice_var]);
+            } else {
+                // ForceFma: no choice_var; last cycle is always fma_last.
+                model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
+            }
+            select_chosen_cycle.insert(idx, chosen);
+        } else if let Some(&choice_var) = select_choice_vars.get(&idx) {
+            // Optimize but no fma_last (e.g. FMA has delta_vreg → single cycle). Both paths
+            // end at cycle_vars[idx], so last cycle for the choice made is cycle_vars[idx].
+            let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+            let default_alap = (horizon - 1) as i32;
+            let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+            let chosen = model.new_int_var_with_name(
+                [(op_asap, op_alap)],
+                format!("select_chosen_cycle_{}", idx),
+            );
+            model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
             select_chosen_cycle.insert(idx, chosen);
         }
     }
@@ -4085,6 +4253,21 @@ pub fn schedule_ssa_cpsat(
                 }
             };
 
+            // Extract eliminated vbroadcasts and vb -> scalar producer map
+            let (eliminated_vbroadcast_ops, eliminated_vb_to_scalar_producer) = {
+                let mut eliminated = HashSet::new();
+                let mut vb_to_scalar = HashMap::new();
+                for (vb_idx, scalar_producer_idx, _) in &eliminable_vbs {
+                    if let Some(&ev) = eliminate_vb_vars.get(vb_idx) {
+                        if ev.solution_value(&response) {
+                            eliminated.insert(ops[*vb_idx].id);
+                            vb_to_scalar.insert(ops[*vb_idx].id, ops[*scalar_producer_idx].id);
+                        }
+                    }
+                }
+                (eliminated, vb_to_scalar)
+            };
+
             // Build schedule constraints once (same as CP-SAT; used for active-set binding list and bulk-move).
             let schedule_constraints = crate::schedule_constraints::build_ssa_schedule_constraints(
                 ops,
@@ -4428,6 +4611,7 @@ pub fn schedule_ssa_cpsat(
                 &shifted_alu_cycles,
                 &const_add_imm_ops,
                 &select_fma_ops,
+                &eliminated_vbroadcast_ops,
                 &machine,
             );
 
@@ -4565,6 +4749,7 @@ pub fn schedule_ssa_cpsat(
                     &out_shifted_alu_cycles,
                     &const_add_imm_ops,
                     &select_fma_ops,
+                    &eliminated_vbroadcast_ops,
                     &machine,
                 ) {
                     if verbose {
@@ -4609,6 +4794,7 @@ pub fn schedule_ssa_cpsat(
                             &compact_shifted,
                             &const_add_imm_ops,
                             &select_fma_ops,
+                            &eliminated_vbroadcast_ops,
                             &machine,
                         );
                         if constraints_ok.is_ok() && capacity_ok.is_ok() {
@@ -4726,6 +4912,8 @@ pub fn schedule_ssa_cpsat(
                 select_fma_ops,
                 empty_cycle_count: out_empty_count,
                 makespan_driven_by_capacity: (out_makespan as i64) == capacity_lower_bound,
+                eliminated_vbroadcast_ops,
+                eliminated_vb_to_scalar_producer,
                 schedule_constraints,
             })
         }
@@ -4943,6 +5131,8 @@ mod ssa_tests {
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -5080,6 +5270,8 @@ mod ssa_tests {
             &cpsat_result.const_add_imm_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Verify ConstChoice ops were lowered correctly
@@ -5487,6 +5679,7 @@ mod ssa_tests {
                 &HashMap::new(), // shifted_alu_cycles
                 &const_add_imm_ops,
                 &select_fma_ops,
+                &HashSet::new(), // eliminated_vbroadcast_ops
                 &MachineConfig::default(),
             );
         });
@@ -5537,6 +5730,7 @@ mod ssa_tests {
             &HashMap::new(), // shifted_alu_cycles
             &const_add_imm_ops,
             &select_fma_ops,
+            &HashSet::new(), // eliminated_vbroadcast_ops
             &MachineConfig::default(),
         );
 
@@ -5805,6 +5999,8 @@ mod ssa_tests {
             &HashSet::new(),                  // No ConstChoice AddImm ops
             &cpsat_result.select_fma_ops,     // Use CP-SAT decisions
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
@@ -5962,6 +6158,8 @@ mod ssa_tests {
             &HashSet::new(),
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
@@ -6038,6 +6236,129 @@ mod ssa_tests {
             consumer_cycle,
             shift_cycle + 1
         );
+    }
+
+    /// Element-wise ALU precedence: when VALU1 -> VALU2 -> VALU3 are all shifted, each lane i of
+    /// VALU2 must satisfy alu_cycle[VALU2][i] >= alu_cycle[VALU1][i]+1 (and same for VALU3/VALU2).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_element_wise_valu_shift_chain() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+        use crate::types::VLEN;
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let v0 = emit.emit_vbroadcast(c0);
+        let valu1 = emit.emit_valu(Opcode::Add, v0, v0);
+        let id1 = emit.ops.last().unwrap().id;
+        let valu2 = emit.emit_valu(Opcode::Add, valu1, valu1);
+        let id2 = emit.ops.last().unwrap().id;
+        let valu3 = emit.emit_valu(Opcode::Add, valu2, valu2);
+        let id3 = emit.ops.last().unwrap().id;
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let toy_machine = MachineConfig {
+            valu_slots: 1,
+            alu_slots: 24,
+            ..Default::default()
+        };
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                enable_valu_shift: true,
+                valu_shift_mode: ValuShiftMode::ForceAlu,
+                time_limit_secs: 10.0,
+                scratch_budget: 1536,
+                machine: toy_machine,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        )
+        .expect("CP-SAT should find solution for vb -> valu1 -> valu2 -> valu3 with ForceAlu");
+
+        let alu1 = result
+            .shifted_alu_cycles
+            .get(&id1)
+            .expect("valu1 should be shifted and have per-lane cycles");
+        let alu2 = result
+            .shifted_alu_cycles
+            .get(&id2)
+            .expect("valu2 should be shifted");
+        let alu3 = result
+            .shifted_alu_cycles
+            .get(&id3)
+            .expect("valu3 should be shifted");
+
+        for i in 0..VLEN {
+            assert!(
+                alu2[i] >= alu1[i] + 1,
+                "element-wise: alu2[{}]={} must be >= alu1[{}]+1={}",
+                i,
+                alu2[i],
+                i,
+                alu1[i] + 1
+            );
+            assert!(
+                alu3[i] >= alu2[i] + 1,
+                "element-wise: alu3[{}]={} must be >= alu2[{}]+1={}",
+                i,
+                alu3[i],
+                i,
+                alu2[i] + 1
+            );
+        }
+    }
+
+    /// Vbroadcast elimination: const -> vbroadcast -> shiftable VALU; with enable_valu_shift and
+    /// enable_vbroadcast_elimination the solver may eliminate the vb and use scalar producer for precedence.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_vbroadcast_elimination_feasible() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let _c0 = emit.emit_const(0);
+        let vb = emit.emit_vbroadcast(_c0);
+        let vb_id = emit.ops.last().unwrap().id;
+        let add_vreg = emit.emit_valu(Opcode::Add, vb, vb);
+        let add_id = emit.ops.last().unwrap().id;
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let toy_machine = MachineConfig {
+            valu_slots: 1,
+            alu_slots: 8,
+            ..Default::default()
+        };
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                enable_valu_shift: true,
+                enable_vbroadcast_elimination: true,
+                valu_shift_mode: ValuShiftMode::Optimize,
+                time_limit_secs: 10.0,
+                scratch_budget: 1536,
+                machine: toy_machine,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution");
+        let r = result.unwrap();
+        if r.shifted_ops.contains(&add_id) {
+            assert!(
+                r.eliminated_vbroadcast_ops.contains(&vb_id),
+                "when consumer is shifted, vb should be eliminated; shifted_ops={:?} eliminated={:?}",
+                r.shifted_ops,
+                r.eliminated_vbroadcast_ops
+            );
+        }
     }
 
     /// Same as test_ssa_cpsat_selectchoice_force_fma_minimal but with DEFAULT machine (6 VALU)
@@ -6146,6 +6467,8 @@ mod ssa_tests {
             &HashSet::new(),
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
@@ -6361,6 +6684,8 @@ mod ssa_tests {
             &HashSet::new(),
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
     }
 }
@@ -6823,6 +7148,8 @@ mod tests {
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -6965,6 +7292,8 @@ mod tests {
             &cpsat_result.const_add_imm_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Verify ConstChoice ops were lowered correctly
@@ -7668,6 +7997,7 @@ mod tests {
                 forced_shifts: None,
                 select_choice_hints: None,
                 const_add_imm_hints: None,
+                eliminate_vbroadcast_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,

@@ -55,19 +55,56 @@ pub fn lower_ssa_ops_with_shift(
     const_add_imm_ops: &HashSet<usize>,
     select_fma_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>, // op_id -> [cycle0, ..., cycle7]
+    eliminated_vbroadcast_ops: &HashSet<usize>,
+    eliminated_vb_to_scalar_producer: &HashMap<usize, usize>, // vb op_id -> scalar producer op_id
 ) -> Vec<Op> {
     use crate::types::{Opcode, SlotVal};
     use arrayvec::ArrayVec;
 
     let mut result = Vec::new();
 
+    // Build map: eliminated vb dest VReg -> scalar producer address (for shifted consumers reading from vb)
+    let eliminated_vb_vreg_to_scalar_addr: HashMap<VReg, i64> = {
+        let mut m = HashMap::new();
+        for (&vb_id, &scalar_id) in eliminated_vb_to_scalar_producer {
+            if !eliminated_vbroadcast_ops.contains(&vb_id) {
+                continue;
+            }
+            let vb_dest = ssa_ops
+                .iter()
+                .find(|o| o.id == vb_id)
+                .and_then(|o| o.dest);
+            let scalar_dest = ssa_ops
+                .iter()
+                .find(|o| o.id == scalar_id)
+                .and_then(|o| o.dest);
+            if let (Some(vreg), Some(svreg)) = (vb_dest, scalar_dest) {
+                if let Some(&addr) = vreg_to_addr.get(&svreg) {
+                    m.insert(vreg, addr);
+                }
+            }
+        }
+        m
+    };
+
     for ssa_op in ssa_ops {
+        if eliminated_vbroadcast_ops.contains(&ssa_op.id) {
+            continue;
+        }
         if shifted_ops.contains(&ssa_op.id) {
             // Expand shifted VALU op to 8 ALU ops
             // Use individual cycles if available (from CP-SAT), otherwise use completion_cycle
             let alu_cycles = shifted_alu_cycles.get(&ssa_op.id);
-            let expanded =
-                expand_ssa_valu_to_alu(ssa_op, vreg_to_addr, alu_cycles.map(|v| v.as_slice()));
+            let expanded = expand_ssa_valu_to_alu(
+                ssa_op,
+                vreg_to_addr,
+                alu_cycles.map(|v| v.as_slice()),
+                if eliminated_vb_vreg_to_scalar_addr.is_empty() {
+                    None
+                } else {
+                    Some(&eliminated_vb_vreg_to_scalar_addr)
+                },
+            );
             result.extend(expanded);
         } else if ssa_op.opcode == Opcode::ConstChoice {
             // Handle ConstChoice based on scheduler decision
@@ -369,22 +406,39 @@ pub fn lower_ssa_ops_with_shift(
 }
 
 /// Expand a shifted SSA VALU op into 8 scalar ALU ops.
+/// When `eliminated_vb_vreg_to_scalar_addr` is set, a source VReg that was produced by an
+/// eliminated vbroadcast uses the given scalar address for all 8 lanes (broadcast semantics).
 pub fn expand_ssa_valu_to_alu(
     ssa_op: &SsaOp,
     vreg_to_addr: &HashMap<VReg, i64>,
     alu_cycles: Option<&[i32]>, // Individual cycles for 8 ALU ops (if available from CP-SAT)
+    eliminated_vb_vreg_to_scalar_addr: Option<&HashMap<VReg, i64>>,
 ) -> Vec<Op> {
     use crate::types::Operand;
 
     let dest = ssa_op.dest.expect("VALU op must have dest");
     let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
 
-    // Get source addresses
-    let (src1_addr, src2_addr) = match (&ssa_op.srcs[..], ssa_op.opcode) {
+    let resolve_addr = |vreg: &VReg| -> i64 {
+        eliminated_vb_vreg_to_scalar_addr
+            .and_then(|m| m.get(vreg).copied())
+            .unwrap_or_else(|| *vreg_to_addr.get(vreg).expect("VReg not in mapping"))
+    };
+    let is_eliminated_vb_src = |vreg: &VReg| -> bool {
+        eliminated_vb_vreg_to_scalar_addr.map_or(false, |m| m.contains_key(vreg))
+    };
+
+    // Get base source addresses and whether each is scalar (eliminated vb -> same addr for all lanes)
+    let (src1_base, src2_base, src1_scalar, src2_scalar) = match (&ssa_op.srcs[..], ssa_op.opcode) {
         ([Operand::VReg(s1), Operand::VReg(s2)], _) => {
-            let a1 = *vreg_to_addr.get(s1).expect("src1 VReg not in mapping");
-            let a2 = *vreg_to_addr.get(s2).expect("src2 VReg not in mapping");
-            (a1, a2)
+            let a1 = resolve_addr(s1);
+            let a2 = resolve_addr(s2);
+            (
+                a1,
+                a2,
+                is_eliminated_vb_src(s1),
+                is_eliminated_vb_src(s2),
+            )
         }
         _ => return vec![], // Can't expand non-binary ops
     };
@@ -397,17 +451,27 @@ pub fn expand_ssa_valu_to_alu(
     let mut ops = Vec::with_capacity(VLEN);
     for i in 0..VLEN {
         let i_offset = i as i64;
+        let src1_addr_i = if src1_scalar {
+            src1_base
+        } else {
+            src1_base + i_offset
+        };
+        let src2_addr_i = if src2_scalar {
+            src2_base
+        } else {
+            src2_base + i_offset
+        };
 
         let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
         slot.push(SlotVal::Str(ssa_op.opcode.as_str().to_string()));
         slot.push(SlotVal::Int(dest_addr + i_offset));
-        slot.push(SlotVal::Int(src1_addr + i_offset));
-        slot.push(SlotVal::Int(src2_addr + i_offset));
+        slot.push(SlotVal::Int(src1_addr_i));
+        slot.push(SlotVal::Int(src2_addr_i));
 
         // Build reads/writes sets
         let mut reads = HashSet::new();
-        reads.insert(src1_addr + i_offset);
-        reads.insert(src2_addr + i_offset);
+        reads.insert(src1_addr_i);
+        reads.insert(src2_addr_i);
 
         let mut writes = HashSet::new();
         writes.insert(dest_addr + i_offset);
@@ -476,6 +540,8 @@ mod tests {
             &const_add_imm_ops,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -509,6 +575,8 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashSet::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
         );
@@ -548,6 +616,8 @@ mod tests {
             &vreg_to_addr,
             &shifted_ops,
             &const_add_imm_ops,
+            &HashSet::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
         );
@@ -620,6 +690,8 @@ mod tests {
             &const_add_imm_ops,
             &select_fma_ops,
             &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
@@ -670,6 +742,8 @@ mod tests {
             &shifted_ops,
             &const_add_imm_ops,
             &select_fma_ops,
+            &HashMap::new(),
+            &HashSet::new(),
             &HashMap::new(),
         );
 
@@ -724,6 +798,8 @@ mod tests {
             &shifted_ops,
             &const_add_imm_ops,
             &select_fma_ops,
+            &HashMap::new(),
+            &HashSet::new(),
             &HashMap::new(),
         );
 
@@ -804,6 +880,8 @@ mod tests {
             &shifted_ops,
             &const_add_imm_ops,
             &select_fma_ops,
+            &HashMap::new(),
+            &HashSet::new(),
             &HashMap::new(),
         );
 

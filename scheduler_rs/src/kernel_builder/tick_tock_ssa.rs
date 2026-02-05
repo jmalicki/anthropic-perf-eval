@@ -88,6 +88,8 @@ pub struct SsaScheduleResult {
     pub ssa_cycle_assignments: Option<Vec<i32>>,
     /// SSA-level (id, dep_ids) per op in same order. For bulk-move from JSON.
     pub ssa_ops_bulk_move: Option<Vec<(usize, Vec<usize>)>>,
+    /// Op IDs of vbroadcasts eliminated by CP-SAT (not emitted; consumers use scalar producer). Empty for greedy.
+    pub eliminated_vbroadcast_ops: Vec<usize>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -406,6 +408,8 @@ impl SsaTickTockKernelBuilder {
             &greedy_const_add_imm_ops,
             &greedy_select_fma_ops, // Pass greedy's SelectChoice decisions
             &HashMap::new(),        // Greedy doesn't provide individual ALU cycles
+            &HashSet::new(),        // Greedy doesn't eliminate vbroadcasts
+            &HashMap::new(),
         );
 
         let valu_shifted = shifted_ops.len();
@@ -435,6 +439,7 @@ impl SsaTickTockKernelBuilder {
             schedule_constraints: None,
             ssa_cycle_assignments: None,
             ssa_ops_bulk_move: None,
+            eliminated_vbroadcast_ops: vec![],
         })
     }
 
@@ -463,6 +468,7 @@ impl SsaTickTockKernelBuilder {
         time_limit_secs: f64,
         verbose: bool,
         enable_valu_shift: bool,
+        enable_vbroadcast_elimination: bool,
         per_section_optimize_secs: Option<f64>,
         forced_shifts: Option<HashSet<usize>>,
         const_choice_mode: crate::cpsat_scheduler::ConstChoiceMode,
@@ -837,6 +843,7 @@ impl SsaTickTockKernelBuilder {
                         forced_shifts: None,
                         select_choice_hints: seg_select,
                         const_add_imm_hints: seg_const_add_imm_hints,
+                        eliminate_vbroadcast_hints: None,
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() {
                             None
@@ -1005,6 +1012,7 @@ impl SsaTickTockKernelBuilder {
             verbose,
             stop_after_first_solution: false,
             enable_valu_shift,
+            enable_vbroadcast_elimination,
             scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
             const_choice_mode,
@@ -1085,6 +1093,7 @@ impl SsaTickTockKernelBuilder {
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
                 const_add_imm_hints: Some(&current_const_add_imm),
+                eliminate_vbroadcast_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
@@ -1228,6 +1237,8 @@ impl SsaTickTockKernelBuilder {
             const_add_imm_ops,
             &cpsat_result.select_fma_ops, // CP-SAT decisions for SelectChoice
             &cpsat_result.shifted_alu_cycles, // Individual ALU cycles from CP-SAT
+            &cpsat_result.eliminated_vbroadcast_ops,
+            &cpsat_result.eliminated_vb_to_scalar_producer,
         );
 
         // Debug: assert no two ops in the same cycle write overlapping scratch addresses.
@@ -1261,6 +1272,7 @@ impl SsaTickTockKernelBuilder {
             schedule_constraints: Some(cpsat_result.schedule_constraints.clone()),
             ssa_cycle_assignments: Some(ssa_cycle_assignments),
             ssa_ops_bulk_move: Some(ssa_ops_bulk_move),
+            eliminated_vbroadcast_ops: cpsat_result.eliminated_vbroadcast_ops.iter().copied().collect(),
         })
     }
 
@@ -4374,7 +4386,7 @@ mod tests {
         vreg_to_addr.insert(VReg::vector(2), 300);
 
         // Expand
-        let expanded = expand_ssa_valu_to_alu(&op, &vreg_to_addr, None); // Test doesn't have individual cycles
+        let expanded = expand_ssa_valu_to_alu(&op, &vreg_to_addr, None, None); // Test doesn't have individual cycles
 
         // Should produce 8 ALU ops
         assert_eq!(expanded.len(), 8, "Should expand to 8 ALU ops");
@@ -4684,6 +4696,7 @@ mod tests {
                 forced_shifts: None,
                 select_choice_hints: None,
                 const_add_imm_hints: None,
+                eliminate_vbroadcast_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
@@ -4755,6 +4768,7 @@ mod tests {
             30.0,  // Short time limit; small kernel solves quickly
             false, // verbose
             true,  // enable_valu_shift
+            true,  // enable_vbroadcast_elimination
             None,  // per_section_optimize_secs
             None,  // forced_shifts
             ConstChoiceMode::Optimize,

@@ -2,6 +2,11 @@
 //!
 //! We build the exact precedence, ordering, and domain constraints that the CP-SAT
 //! model uses, so the bulk-move simulator can check them without duplicating logic.
+//!
+//! **Eliminated vbroadcasts:** When CP-SAT eliminates a vbroadcast (optional VALU interval
+//! absent), that op still has a cycle assignment and appears in `ssa_cycle_assignments` and
+//! in the constraint list (Domain/Precedence). It is not emitted in lowering. Bulk-move
+//! and constraint checking use the same index space, so no special handling is needed.
 
 use std::collections::{HashMap, HashSet};
 
