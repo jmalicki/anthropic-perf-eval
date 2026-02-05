@@ -2,7 +2,7 @@
 Re-scheduler for VLIW kernels.
 
 DEPRECATED: For new code, use the Rust scheduler (scheduler_rs module) instead.
-The kernel builders (tick_tock.py, modular.py) now use scheduler_rs by default.
+KernelBuilder uses scheduler_rs (SSA); modular.py can use scheduler_rs.schedule_multipass.
 
 This module is kept for:
 - Legacy tools and analysis scripts

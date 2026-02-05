@@ -80,10 +80,11 @@ SPECIAL_SHIFTABLE_OPS = {'multiply_add'}  # Requires 16 ALU slots (2 ops × 8)
 ### Key Parameters
 
 ```python
-generate_precomputed_kernel(
-    full_solve_time=3600.0,     # Time limit for full CP-SAT solve (seconds)
-    require_optimal=True,       # Require OPTIMAL status (not just FEASIBLE)
-    enable_valu_shift=True,     # Enable VALU→ALU shifting
+# Kernel generation uses build_tick_tock_kernel_ssa (see generate_ssa_kernel.py)
+scheduler_rs.build_tick_tock_kernel_ssa(
+    ...,
+    cpsat_time_limit=3600.0,    # Time limit for CP-SAT (seconds)
+    enable_valu_shift=False,    # Disabled by default to avoid scratch budget issues
 )
 ```
 

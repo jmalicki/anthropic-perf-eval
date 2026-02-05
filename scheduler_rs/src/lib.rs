@@ -21,7 +21,6 @@
 use pyo3::prelude::*;
 
 pub mod address_assign;
-pub mod allocator;
 pub mod constants;
 pub mod cpsat_scheduler;
 pub mod diagnostics;
@@ -48,11 +47,6 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Constant optimization functions
     m.add_function(wrap_pyfunction!(python::analyze_constants, m)?)?;
     m.add_function(wrap_pyfunction!(python::optimize_constants, m)?)?;
-    // Kernel building functions
-    m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel, m)?)?;
-    m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ops, m)?)?;
-    // CP-SAT scheduler functions
-    m.add_function(wrap_pyfunction!(python::schedule_cpsat, m)?)?;
     m.add_function(wrap_pyfunction!(python::cpsat_available, m)?)?;
     // SSA kernel building functions
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ssa, m)?)?;

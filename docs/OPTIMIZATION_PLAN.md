@@ -199,16 +199,16 @@ Opportunities:
 | `interleaved_unrolled_kernel.py` | Kernel generation |
 | `round_chunked_scheduler.py` | Multi-phase scheduling |
 | `iterative_reschedule.py` | VALU→ALU shifting |
-| `generate_precomputed_kernel.py` | Offline compilation |
+| `generate_ssa_kernel.py` | Kernel generation (SSA + CP-SAT) |
 
 ## Running Experiments
 
 ```bash
 # Generate new kernel with different parameters
-python generate_precomputed_kernel.py --full-solve-time 7200
+uv run generate_ssa_kernel.py --cpsat-time-limit 7200
 
 # Test the kernel
-python test_optimized.py
+uv run test_optimized.py
 
 # Run full experiment suite with W&B logging
 python run_experiment.py

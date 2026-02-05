@@ -63,7 +63,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 ### Running Tests
 
-**Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel`, `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). Solver tests in `solver/` and `tests/submission_tests.py` exercise the **Python** kernel builders and pipeline.
+**Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). Solver tests in `solver/` and `tests/submission_tests.py` exercise the **Python** kernel builders and pipeline.
 
 ```bash
 # Rust: full scheduler_rs test suite (from project root)
@@ -141,12 +141,6 @@ uv run generate_ssa_kernel.py --output-json scheduler_output.json
 - **CP-SAT** (default) is required for correct results with the SSA builder.
 - VALU shift is disabled by default because it increases scratch pressure.
 
-**Legacy: Python builder** (deprecated):
-```bash
-uv run generate_precomputed_kernel.py --use-greedy
-uv run generate_precomputed_kernel.py --full-solve-time 600
-```
-
 **Scheduler Selection Guide:**
 - **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), results may exceed budget
 - **SSA + CP-SAT 10 min** (default): Production runs, benchmarking (recommended, correct output)
@@ -177,20 +171,20 @@ uv run run_experiment.py --offline # Without W&B
 ┌────────▼─────────────────────┐   ┌───────────────▼───────────────┐
 │   Kernel Builders             │   │   Rust Module (scheduler_rs/) │
 │                               │   │                               │
-│   scheduler_rs/ (RECOMMENDED) │   │   kernel_builder/             │
-│   └── build_tick_tock_kernel  │   │   └── tick_tock.rs (builder)  │
-│                               │   │   └── emit.rs (Op emission)   │
-│   solver/kernel_builder/      │   │                               │
-│   (Python, DEPRECATED)        │   │   scheduler.rs (parallel)     │
-│   └── tick_tock.py            │   │   constants.rs (derivation)   │
-└───────────────────────────────┘   └───────────────────────────────┘
+│   scheduler_rs/ (SSA only)    │   │   kernel_builder/             │
+│   └── build_tick_tock_kernel_ssa │   │   └── tick_tock_ssa.rs       │
+│                               │   │   └── emit_ssa.rs             │
+│   solver/kernel_builder/      │   │   scheduler.rs (parallel)     │
+│   └── SSAKernelBuilder (wrapper)│   │   constants.rs (derivation)   │
+│   └── ModularKernelBuilder    │   └───────────────────────────────┘
+└───────────────────────────────┘
 ```
 
-### Rust Kernel Builders
+### Rust Kernel Builder (SSA only)
 
-Two Rust kernel builders are available via `scheduler_rs`:
+The only Rust kernel builder is the SSA builder via `scheduler_rs`:
 
-**SSA Builder (Recommended)** - Eliminates false dependencies for better scheduling:
+**SSA Builder** - Eliminates false dependencies for better scheduling:
 ```python
 import scheduler_rs
 
@@ -207,19 +201,6 @@ instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
     output_json=None
 )
 print(f"Cycles: {stats['cycles']}, Budget exceeded: {stats['budget_exceeded']}")
-```
-
-**Non-SSA Builder** - Fast greedy scheduling:
-```python
-# Non-SSA with greedy scheduler (~2 seconds)
-instrs = scheduler_rs.build_tick_tock_kernel(
-    forest_height=10,
-    n_nodes=2047,
-    batch_size=256,
-    rounds=16,
-    enable_valu_shift=True,
-    verbose=True
-)
 ```
 
 Benefits of Rust builders:
@@ -273,9 +254,9 @@ Each cycle executes one bundle (dict of engine → list of operations):
 | `perf_takehome.py` | Main test harness for performance measurement |
 | `test_optimized.py` | Test kernel correctness and performance |
 | `generate_ssa_kernel.py` | **Generate kernels with SSA builder + CP-SAT (recommended)** |
-| `scheduler_rs/src/kernel_builder/` | Rust kernel builders (SSA and non-SSA) |
+| `scheduler_rs/src/kernel_builder/` | Rust SSA kernel builder (tick_tock_ssa) |
 | `scheduler_rs/src/scheduler.rs` | Rust greedy list scheduler with parallel multipass |
-| `solver/kernel_builder/tick_tock.py` | Python kernel builder (deprecated) |
+| `solver/kernel_builder/ssa_wrapper.py` | Python wrapper (KernelBuilder) calling build_tick_tock_kernel_ssa |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
 
 ## Important Constraints
@@ -291,9 +272,7 @@ Each cycle executes one bundle (dict of engine → list of operations):
 All kernels are validated against `reference_kernel2()` in `problem.py`. The kernel must produce identical outputs to be considered correct.
 
 ```bash
-# Validate with Rust builder (fastest, ~2 seconds)
+# Validate (default uses KernelBuilder = SSA; --rust-builder calls build_tick_tock_kernel_ssa directly)
+uv run test_optimized.py
 uv run test_optimized.py --rust-builder
-
-# Validate with Python builder (slower, ~80 seconds)
-uv run test_optimized.py --tick-tock
 ```

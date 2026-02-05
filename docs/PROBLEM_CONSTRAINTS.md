@@ -134,7 +134,7 @@ From `interleaved_unrolled_kernel.py`:
 | Kernel | Cycles | Speedup | Status |
 |--------|--------|---------|--------|
 | Baseline | 147,734 | 1.0x | Reference |
-| **Current (precomputed)** | **2,390** | **61.8x** | Production |
+| **Current (SSA)** | **2,390** | **61.8x** | Production |
 | Target | 1,487 | 99.3x | Goal |
 
 ### Efficiency Analysis

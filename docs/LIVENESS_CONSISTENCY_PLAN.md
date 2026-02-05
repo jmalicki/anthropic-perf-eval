@@ -23,33 +23,15 @@ tick_tock_ssa.rs → schedule_ssa_*() → address_assign.rs → lower_ssa_ops()
 - `types.rs::LiveInterval` defines the interval type
 - **Correctly implements same-cycle reuse**
 
-### Non-SSA Path (Deprecated)
+### Non-SSA Path (Removed)
 
-```
-tick_tock.rs → schedule_with_slot_filling() → allocator.rs
-```
+The non-SSA path has been **removed** from the codebase. It previously used:
 
-- Pre-assigns physical addresses during kernel building
-- `allocator.rs` compacts addresses post-scheduling
-- Has its own `LiveInterval` type with different semantics
-- **Does NOT correctly implement same-cycle reuse**
+- `tick_tock.rs` → `schedule_with_slot_filling()` → `allocator.rs`
+- Pre-assigned physical addresses during kernel building
+- `allocator.rs` compacted addresses post-scheduling
 
-## Status Update (2024)
-
-### `allocator.rs` — NOW DEPRECATED
-
-The `allocator.rs` module has been marked as deprecated with `#[deprecated]` attributes.
-It is only used by the legacy non-SSA path (`build_tick_tock_kernel`).
-
-**Deprecation rationale:**
-- The SSA path (`build_tick_tock_kernel_ssa`) is the recommended approach
-- Fixing `allocator.rs` would require effort for a deprecated code path
-- Better to direct users to migrate to the SSA path
-
-**What was added:**
-- Module-level deprecation documentation
-- `#[deprecated]` on `LiveInterval`, `ScratchRegisterAllocator`, `allocate_registers()`, `rewrite_addresses()`
-- Compiler warnings now appear when using these APIs
+**Removal (2025):** The deprecated non-SSA path (`build_tick_tock_kernel`, `allocator.rs`, `tick_tock.rs`, `partition.rs`, `context.rs`, `emit.rs`) and the Python precomputed/tick_tock builders were deleted. The only supported path is SSA (`build_tick_tock_kernel_ssa`, `address_assign.rs`, `tick_tock_ssa.rs`).
 
 ## Resolved Inconsistencies (SSA Path)
 
@@ -81,19 +63,19 @@ enough budget to fit.
 
 ## Resolved Issues
 
-The following issues from the original plan are now resolved by deprecating `allocator.rs`:
+The following issues from the original plan are now resolved; the non-SSA path and `allocator.rs` have been removed:
 
 | Original Issue | Resolution |
 |----------------|------------|
-| Interval expiration `<=` vs `<` | `address_assign.rs` uses correct `<=`; `allocator.rs` deprecated |
-| Two `overlaps()` implementations | `types.rs::LiveInterval::overlaps()` is canonical; `allocator.rs` deprecated |
-| Peak liveness calculation offset | `address_assign.rs::compute_peak_liveness()` is canonical; `allocator.rs` deprecated |
+| Interval expiration `<=` vs `<` | `address_assign.rs` uses correct `<=`; non-SSA path removed |
+| Two `overlaps()` implementations | `types.rs::LiveInterval::overlaps()` is canonical; `allocator.rs` removed |
+| Peak liveness calculation offset | `address_assign.rs::compute_peak_liveness()` is canonical; non-SSA path removed |
 
 ## Implementation Plan (Revised)
 
-### Phase 1: Documentation (DONE)
+### Phase 1: Documentation (DONE) → Non-SSA path removed
 
-1. ~~Deprecate `allocator.rs`~~ ✅
+1. ~~Deprecate `allocator.rs`~~ ✅ (later **removed** with full non-SSA path)
 2. ~~Add deprecation warnings to public APIs~~ ✅
 3. ~~Document known issues in module docs~~ ✅
 
@@ -148,7 +130,7 @@ Added tests to verify same-cycle reuse semantics:
 
 | File | Changes |
 |------|---------|
-| `scheduler_rs/src/allocator.rs` | ~~Fix comparisons~~ → DEPRECATED instead ✅ |
+| `scheduler_rs/src/allocator.rs` | ~~Deprecated~~ → **Removed** (non-SSA path removed) ✅ |
 | `scheduler_rs/src/address_assign.rs` | Verified correct; added 3 boundary tests ✅ |
 | `scheduler_rs/src/types.rs` | Added full liveness model docs + 3 boundary tests ✅ |
 | `scheduler_rs/src/cpsat_scheduler.rs` | Documented same-cycle limitation ✅ |
@@ -160,13 +142,13 @@ Added tests to verify same-cycle reuse semantics:
 2. ✅ New boundary tests pass (6 new tests added)
 3. ✅ `generate_ssa_kernel.py --validate --use-greedy` builds successfully
 4. ℹ️ Budget warnings expected with greedy scheduler (see CLAUDE.md - use CP-SAT for correct results)
-5. ✅ Deprecation warnings appear when using the non-SSA path
+5. ✅ Non-SSA path removed (no longer present)
 
 ## Summary
 
 The liveness consistency plan is **complete**. The codebase now has:
 
-1. **Deprecated `allocator.rs`** - Compiler warnings guide users to SSA path
+1. **Removed non-SSA path** - `allocator.rs`, `tick_tock.rs`, and related code deleted; only SSA path remains
 2. **Documented CP-SAT limitation** - Explains why CP-SAT is slightly more conservative
 3. **Full liveness model documentation** in `types.rs::LiveInterval`
 4. **Comprehensive boundary tests** verifying same-cycle reuse semantics

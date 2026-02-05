@@ -18,11 +18,17 @@ The key insight is that the kernel has well-defined phases:
 
 Each phase can use different strategies while sharing common infrastructure.
 
+Default production builder: KernelBuilder uses the Rust SSA path (build_tick_tock_kernel_ssa).
+
 Usage:
     from solver.kernel_builder import (
         KernelConfig, TreeAccessMode, SchedulingMode,
-        ModularKernelBuilder, TickTockKernelBuilder,
+        ModularKernelBuilder, KernelBuilder,
     )
+
+    # Default: SSA Rust builder (recommended)
+    builder = KernelBuilder()
+    builder.build_kernel(forest_height=10, n_nodes=2047, batch_size=256, rounds=16)
 
     # Modular approach
     config = KernelConfig(
@@ -31,10 +37,6 @@ Usage:
     )
     builder = ModularKernelBuilder(config)
     builder.build()
-
-    # Or use the optimized TickTockKernelBuilder
-    builder = TickTockKernelBuilder()
-    builder.build_kernel(forest_height=10, n_nodes=2047, batch_size=256, rounds=16)
 
     # Access results
     instrs = builder.instrs
@@ -54,7 +56,7 @@ from .modular import (
     create_tree_strategy,
     create_hash_strategy,
 )
-from .tick_tock import TickTockKernelBuilder
+from .ssa_wrapper import SSAKernelBuilder
 from .strategies import (
     TreeAccessStrategy,
     ScatteredLoadStrategy,
@@ -69,9 +71,8 @@ from .strategies import (
     VALUHashStrategy,
 )
 
-# Alias for backward compatibility - use the best performing builder
-# TickTockKernelBuilder achieves ~1767 cycles (83.5x) vs ModularKernelBuilder's ~1822 (81x)
-KernelBuilder = TickTockKernelBuilder
+# Default production builder: SSA Rust path (CP-SAT scheduling)
+KernelBuilder = SSAKernelBuilder
 
 __all__ = [
     # Configuration
@@ -84,8 +85,8 @@ __all__ = [
     # Builders
     'BaseKernelBuilder',
     'ModularKernelBuilder',
-    'TickTockKernelBuilder',
-    'KernelBuilder',  # Alias
+    'SSAKernelBuilder',
+    'KernelBuilder',  # Alias for SSAKernelBuilder
     # Factory functions
     'create_tree_strategy',
     'create_hash_strategy',

@@ -30,8 +30,6 @@ def test_optimized_kernel(
     batch_size: int = 256,
     seed: int = 123,
     trace: bool = False,
-    use_precomputed: bool = False,
-    use_tick_tock: bool = True,
     use_rust_builder: bool = False,
 ):
     print(f"Testing optimized kernel: {forest_height=}, {rounds=}, {batch_size=}")
@@ -45,29 +43,21 @@ def test_optimized_kernel(
     build_start = time.time()
 
     if use_rust_builder:
-        # Use pure Rust kernel builder (fastest)
+        # Use Rust SSA kernel builder directly (same as KernelBuilder, explicit path)
         import scheduler_rs
-        print("Using Rust kernel builder with parallel multipass scheduling...")
-        instrs = scheduler_rs.build_tick_tock_kernel(
+        print("Using Rust SSA kernel builder (build_tick_tock_kernel_ssa)...")
+        instrs, _stats = scheduler_rs.build_tick_tock_kernel_ssa(
             forest.height, len(forest.values), len(inp.indices), rounds,
-            enable_valu_shift=True, verbose=True
+            enable_valu_shift=False,
+            verbose=True,
+            use_cpsat=True,
+            cpsat_time_limit=600.0,
         )
         kb = RustKernelBuilderWrapper(list(instrs))
-    elif use_precomputed:
-        # Use precomputed (pre-scheduled) kernel
-        from solver.kernel_gen import OptimizedKernelBuilder
-        from solver.precomputed_kernel import build_kernel as precomputed_build_kernel
-        kb = OptimizedKernelBuilder()
-        precomputed_build_kernel(kb, forest.height, len(forest.values), len(inp.indices), rounds)
-    elif use_tick_tock:
-        # Use tick-tock kernel builder with Rust scheduler (default)
-        from solver.kernel_builder.tick_tock import TickTockKernelBuilder
-        kb = TickTockKernelBuilder()
-        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     else:
-        # Generate with basic builder (unscheduled)
-        from solver.kernel_gen import OptimizedKernelBuilder
-        kb = OptimizedKernelBuilder()
+        # Default: KernelBuilder (SSA Rust path via Python wrapper)
+        from solver.kernel_builder import KernelBuilder
+        kb = KernelBuilder()
         kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
 
     build_time = time.time() - build_start
@@ -126,13 +116,7 @@ if __name__ == "__main__":
 
     # Kernel builder selection
     parser.add_argument("--rust-builder", action="store_true",
-                       help="Use pure Rust kernel builder (fastest, parallel scheduling)")
-    parser.add_argument("--tick-tock", action="store_true", default=True,
-                       help="Use tick-tock kernel builder with Rust scheduler (default)")
-    parser.add_argument("--no-tick-tock", dest="tick_tock", action="store_false",
-                       help="Disable tick-tock, use basic builder")
-    parser.add_argument("--precomputed", action="store_true",
-                       help="Use precomputed (pre-scheduled) kernel")
+                       help="Use Rust SSA kernel builder directly (default: KernelBuilder = same SSA path)")
 
     # Problem parameters
     parser.add_argument("--forest-height", type=int, default=10)
@@ -149,8 +133,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         seed=args.seed,
         trace=args.trace,
-        use_precomputed=args.precomputed,
-        use_tick_tock=args.tick_tock and not args.precomputed and not args.rust_builder,
         use_rust_builder=args.rust_builder,
     )
     if correct:
