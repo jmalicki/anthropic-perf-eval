@@ -359,6 +359,9 @@ struct SsaScheduleOutput {
     git_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
+    /// Proven lower bound on cycles (CP-SAT only). When optimal, equals total_cycles; when feasible, solver best_bound in cycles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lb_cycles: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -572,6 +575,7 @@ pub fn write_ssa_schedule_json(
         run_options,
         git_sha,
         comment,
+        lb_cycles: result.lb_cycles,
     };
 
     let json = serde_json::to_string_pretty(&output)

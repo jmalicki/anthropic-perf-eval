@@ -551,6 +551,7 @@ struct SsaSolutionSummary {
     flow_total: usize,
     const_add_imm: usize,
     const_load: usize,
+    const_alu_derive: usize,
     select_fma: usize,
     select_vselect: usize,
 }
@@ -561,6 +562,7 @@ fn summarise_ssa_solution_engines_and_choices(
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
     select_fma_ops: &HashSet<usize>,
 ) -> SsaSolutionSummary {
     let mut alu_total = 0usize;
@@ -580,7 +582,9 @@ fn summarise_ssa_solution_engines_and_choices(
         let _cycle = cycle as usize;
 
         if op.opcode == Opcode::ConstChoice {
-            if const_add_imm_ops.contains(&op.id) {
+            if const_alu_derive_ops.contains_key(&op.id) {
+                alu_total += 1;
+            } else if const_add_imm_ops.contains(&op.id) {
                 flow_total += 1;
             } else {
                 load_total += 1;
@@ -627,7 +631,10 @@ fn summarise_ssa_solution_engines_and_choices(
         .filter(|o| o.opcode == Opcode::ConstChoice)
         .count();
     let const_add_imm = const_add_imm_ops.len();
-    let const_load = const_total.saturating_sub(const_add_imm);
+    let const_alu_derive = const_alu_derive_ops.len();
+    let const_load = const_total
+        .saturating_sub(const_add_imm)
+        .saturating_sub(const_alu_derive);
 
     let select_total = ops
         .iter()
@@ -647,6 +654,7 @@ fn summarise_ssa_solution_engines_and_choices(
         flow_total,
         const_add_imm,
         const_load,
+        const_alu_derive,
         select_fma,
         select_vselect,
     }
@@ -662,6 +670,7 @@ fn validate_ssa_slot_limits(
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
     select_fma_ops: &HashSet<usize>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
@@ -686,7 +695,9 @@ fn validate_ssa_slot_limits(
         }
 
         if op.opcode == Opcode::ConstChoice {
-            if const_add_imm_ops.contains(&op.id) {
+            if const_alu_derive_ops.contains_key(&op.id) {
+                alu_per_cycle[cycle] += 1;
+            } else if const_add_imm_ops.contains(&op.id) {
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
                     flow_contributors_per_cycle[cycle]
@@ -818,6 +829,7 @@ fn try_validate_ssa_slot_limits(
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
     select_fma_ops: &HashSet<usize>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
@@ -838,7 +850,9 @@ fn try_validate_ssa_slot_limits(
             continue;
         }
         if op.opcode == Opcode::ConstChoice {
-            if const_add_imm_ops.contains(&op.id) {
+            if const_alu_derive_ops.contains_key(&op.id) {
+                alu_per_cycle[cycle] += 1;
+            } else if const_add_imm_ops.contains(&op.id) {
                 flow_per_cycle[cycle] += 1;
             } else {
                 load_per_cycle[cycle] += 1;
@@ -1394,12 +1408,16 @@ pub struct SsaCpsatResult {
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
     /// Set of ConstChoice op IDs that should use AddImm (Flow) instead of Load
     pub const_add_imm_ops: HashSet<usize>,
+    /// ConstChoice ops that chose ALU-derived encoding: op_id -> (left_producer_op_id, right_producer_op_id, opcode)
+    pub const_alu_derive_ops: HashMap<usize, (usize, usize, Opcode)>,
     /// Set of SelectChoice op IDs that should use FMA path (VALU) instead of vselect (Flow)
     pub select_fma_ops: HashSet<usize>,
     /// Number of empty cycles (makespan minus max cycle used). 0 when schedule has no gaps.
     pub empty_cycle_count: usize,
     /// True when makespan equals capacity lower bound (structural bound caused the gap).
     pub makespan_driven_by_capacity: bool,
+    /// Proven lower bound on makespan (cycles). When status is Optimal, equals makespan; when Feasible, solver's best_bound in cycles.
+    pub lb_cycles: Option<usize>,
     /// Op IDs of vbroadcasts that were eliminated (not emitted; consumers use scalar producer).
     pub eliminated_vbroadcast_ops: HashSet<usize>,
     /// For each eliminated vb op ID, the op ID of its scalar producer (for lowering).
@@ -1592,9 +1610,11 @@ pub fn schedule_ssa_cpsat(
             shifted_ops: HashSet::new(),
             shifted_alu_cycles: HashMap::new(),
             const_add_imm_ops: HashSet::new(),
+            const_alu_derive_ops: HashMap::new(),
             select_fma_ops: HashSet::new(),
             empty_cycle_count: 0,
             makespan_driven_by_capacity: false,
+            lb_cycles: Some(0),
             eliminated_vbroadcast_ops: HashSet::new(),
             eliminated_vb_to_scalar_producer: HashMap::new(),
             schedule_constraints: vec![],
@@ -2037,6 +2057,17 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, _)| idx)
         .collect();
 
+    // Map constant value -> op index (first producer). Used for ALU-derived precedence.
+    let value_to_producer_idx: HashMap<i64, usize> = {
+        let mut m = HashMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            if let Some(v) = op.produces_constant {
+                m.entry(v).or_insert(idx);
+            }
+        }
+        m
+    };
+
     // Note: We don't need to find zero VReg op for AddImm precedence constraints.
     // Scratch memory is ALWAYS initialized to 0 at startup, so address 0 always contains 0.
     // AddImm operations can use address 0 directly without waiting for any op to "produce" zero.
@@ -2045,8 +2076,20 @@ pub fn schedule_ssa_cpsat(
     let mut const_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
     let mut const_load_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
+    // N-way ConstChoice (Load | AddImm | ALU_0 | ALU_1 | ...): encoding vars and ALU option info for extraction
+    let mut const_choice_encoding_vars: HashMap<usize, Vec<BoolVar>> = HashMap::new();
+    let mut const_choice_alu_encoding_info: HashMap<usize, Vec<(usize, usize, Opcode)>> =
+        HashMap::new();
+    let mut const_choice_alu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
 
     for &idx in &const_choice_ops {
+        let has_alu_options = ops[idx]
+            .const_alternatives
+            .as_ref()
+            .map(|a| a.len() > 2)
+            .unwrap_or(false);
+        let alternatives = ops[idx].const_alternatives.as_deref();
+
         match const_choice_mode {
             ConstChoiceMode::ForceLoad => {
                 let load_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
@@ -2057,23 +2100,90 @@ pub fn schedule_ssa_cpsat(
                 const_flow_intervals.insert(idx, add_imm_interval);
             }
             ConstChoiceMode::Optimize => {
-                let choice_var = model.new_bool_var_with_name(format!("const_choice_{}", idx));
-                const_choice_vars.insert(idx, choice_var);
+                if !has_alu_options {
+                    // Binary: Load vs AddImm (current behavior)
+                    let choice_var =
+                        model.new_bool_var_with_name(format!("const_choice_{}", idx));
+                    const_choice_vars.insert(idx, choice_var);
 
-                let load_interval = model.new_optional_fixed_size_interval_var(
-                    cycle_vars[idx],
-                    1,
-                    choice_var.not(),
-                );
-                const_load_intervals.insert(idx, load_interval);
+                    let load_interval = model.new_optional_fixed_size_interval_var(
+                        cycle_vars[idx],
+                        1,
+                        choice_var.not(),
+                    );
+                    const_load_intervals.insert(idx, load_interval);
 
-                let add_imm_interval =
-                    model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
-                const_flow_intervals.insert(idx, add_imm_interval);
+                    let add_imm_interval =
+                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
+                    const_flow_intervals.insert(idx, add_imm_interval);
 
-                // Hint: use greedy's ConstChoice decision if provided, else default to Load (0)
-                let use_add_imm = const_add_imm_hints.map_or(false, |h| h.contains(&ops[idx].id));
-                model.add_hint(choice_var, if use_add_imm { 1 } else { 0 });
+                    let use_add_imm =
+                        const_add_imm_hints.map_or(false, |h| h.contains(&ops[idx].id));
+                    model.add_hint(choice_var, if use_add_imm { 1 } else { 0 });
+                } else {
+                    // N-way: Load, AddImm, and optionally ALU-derived encodings
+                    let alts = alternatives.unwrap();
+                    let n = alts.len();
+                    let mut use_vars: Vec<BoolVar> = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let b = model.new_bool_var_with_name(format!(
+                            "const_choice_enc_{}_{}",
+                            idx, i
+                        ));
+                        use_vars.push(b);
+                    }
+                    // Exactly one encoding
+                    let sum_expr = use_vars
+                        .iter()
+                        .fold(LinearExpr::from(use_vars[0]), |acc, &b| {
+                            acc + LinearExpr::from(b)
+                        });
+                    model.add_eq(sum_expr, 1);
+
+                    let use_load = use_vars[0];
+                    let use_add_imm = use_vars[1];
+
+                    let load_interval =
+                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, use_load);
+                    const_load_intervals.insert(idx, load_interval);
+
+                    let add_imm_interval = model.new_optional_fixed_size_interval_var(
+                        cycle_vars[idx], 1, use_add_imm,
+                    );
+                    const_flow_intervals.insert(idx, add_imm_interval);
+
+                    let mut alu_info: Vec<(usize, usize, Opcode)> = Vec::new();
+                    for (k, enc) in alts[2..].iter().enumerate() {
+                        let use_alu_k = use_vars[2 + k];
+                        let alu_interval = model.new_optional_fixed_size_interval_var(
+                            cycle_vars[idx], 1, use_alu_k,
+                        );
+                        const_choice_alu_intervals
+                            .entry(idx)
+                            .or_default()
+                            .push(alu_interval);
+
+                        let deps = enc.dependencies();
+                        if deps.len() >= 2 {
+                            let left_idx = *value_to_producer_idx.get(&deps[0]).unwrap_or(&idx);
+                            let right_idx = *value_to_producer_idx.get(&deps[1]).unwrap_or(&idx);
+                            if let Some(opcode) = enc.alu_opcode() {
+                                alu_info.push((left_idx, right_idx, opcode));
+                                let c_left =
+                                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[left_idx]) + 1);
+                                model.only_enforce_if(c_left, [use_alu_k]);
+                                let c_right =
+                                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[right_idx]) + 1);
+                                model.only_enforce_if(c_right, [use_alu_k]);
+                            }
+                        }
+                    }
+                    const_choice_encoding_vars.insert(idx, use_vars);
+                    const_choice_alu_encoding_info.insert(idx, alu_info);
+
+                    // Hint: default Load (index 0)
+                    model.add_hint(use_load, 1);
+                }
             }
         }
     }
@@ -2308,6 +2418,16 @@ pub fn schedule_ssa_cpsat(
         // Add ALU intervals for shifted VALU ops: ForceAlu => required intervals; Optimize => optional
         for &idx in &shiftable_valu {
             if let Some(intervals) = alu_optional_intervals.get(&idx) {
+                for iv in intervals {
+                    alu_intervals.push(*iv);
+                    alu_demands.push(1);
+                }
+            }
+        }
+
+        // Add optional ALU intervals from ConstChoice ops (when ALU-derived encoding is chosen)
+        for &idx in &const_choice_ops {
+            if let Some(intervals) = const_choice_alu_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
                     alu_demands.push(1);
@@ -3676,23 +3796,47 @@ pub fn schedule_ssa_cpsat(
             }
 
             // Extract ConstChoice: ForceAddImm => all; ForceLoad => none; Optimize => from solver
-            let const_add_imm_ops: HashSet<usize> = match const_choice_mode {
-                ConstChoiceMode::ForceAddImm => {
-                    const_choice_ops.iter().map(|&idx| ops[idx].id).collect()
-                }
-                ConstChoiceMode::ForceLoad => HashSet::new(),
-                ConstChoiceMode::Optimize => {
-                    if const_choice_vars.is_empty() {
-                        HashSet::new()
-                    } else {
-                        const_choice_vars
-                            .iter()
-                            .filter(|(_, &var)| var.solution_value(&response))
-                            .map(|(&idx, _)| ops[idx].id)
-                            .collect()
+            // Also extract ALU-derived choices (op_id -> (left_id, right_id, opcode))
+            let (const_add_imm_ops, const_alu_derive_ops): (HashSet<usize>, HashMap<usize, (usize, usize, Opcode)>) =
+                match const_choice_mode {
+                    ConstChoiceMode::ForceAddImm => (
+                        const_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
+                        HashMap::new(),
+                    ),
+                    ConstChoiceMode::ForceLoad => (HashSet::new(), HashMap::new()),
+                    ConstChoiceMode::Optimize => {
+                        let mut add_imm = HashSet::new();
+                        let mut alu_derive = HashMap::new();
+                        for &idx in &const_choice_ops {
+                            if let Some(use_vars) = const_choice_encoding_vars.get(&idx) {
+                                let chosen = use_vars
+                                    .iter()
+                                    .position(|&b| b.solution_value(&response));
+                                if chosen == Some(1) {
+                                    add_imm.insert(ops[idx].id);
+                                } else if let Some(k) = chosen {
+                                    if k >= 2 {
+                                        if let Some(info) = const_choice_alu_encoding_info.get(&idx) {
+                                            let i = k - 2;
+                                            if i < info.len() {
+                                                let (li, ri, opcode) = info[i];
+                                                alu_derive.insert(
+                                                    ops[idx].id,
+                                                    (ops[li].id, ops[ri].id, opcode),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(&var) = const_choice_vars.get(&idx) {
+                                if var.solution_value(&response) {
+                                    add_imm.insert(ops[idx].id);
+                                }
+                            }
+                        }
+                        (add_imm, alu_derive)
                     }
-                }
-            };
+                };
 
             // Extract SelectChoice: ForceFma => all; ForceVselect => none; Optimize => from solver
             let select_fma_ops: HashSet<usize> = match select_choice_mode {
@@ -4070,6 +4214,7 @@ pub fn schedule_ssa_cpsat(
                 &shifted_ops,
                 &shifted_alu_cycles,
                 &const_add_imm_ops,
+                &const_alu_derive_ops,
                 &select_fma_ops,
                 &eliminated_vbroadcast_ops,
                 &machine,
@@ -4099,6 +4244,7 @@ pub fn schedule_ssa_cpsat(
                     &cycle_assignments,
                     &shifted_ops,
                     &const_add_imm_ops,
+                    &const_alu_derive_ops,
                     &select_fma_ops,
                 );
                 eprintln!(
@@ -4168,8 +4314,8 @@ pub fn schedule_ssa_cpsat(
                     pct(summary.flow_total, flow_capacity)
                 );
                 eprintln!(
-                    "  ConstChoice: {} AddImm, {} Load",
-                    summary.const_add_imm, summary.const_load
+                    "  ConstChoice: {} AddImm, {} Load, {} AluDerive",
+                    summary.const_add_imm, summary.const_load, summary.const_alu_derive
                 );
                 eprintln!(
                     "  SelectChoice: {} FMA, {} vselect",
@@ -4183,9 +4329,10 @@ pub fn schedule_ssa_cpsat(
                     summary.valu_other_slots
                 );
                 eprintln!(
-                    "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} SelectChoice FMA ops",
+                    "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} ConstChoice AluDerive ops, {} SelectChoice FMA ops",
                     shifted_ops.len(),
                     const_add_imm_ops.len(),
+                    const_alu_derive_ops.len(),
                     select_fma_ops.len()
                 );
             }
@@ -4208,6 +4355,7 @@ pub fn schedule_ssa_cpsat(
                     &shifted_ops,
                     &out_shifted_alu_cycles,
                     &const_add_imm_ops,
+                    &const_alu_derive_ops,
                     &select_fma_ops,
                     &eliminated_vbroadcast_ops,
                     &machine,
@@ -4253,6 +4401,7 @@ pub fn schedule_ssa_cpsat(
                             &shifted_ops,
                             &compact_shifted,
                             &const_add_imm_ops,
+                            &const_alu_derive_ops,
                             &select_fma_ops,
                             &eliminated_vbroadcast_ops,
                             &machine,
@@ -4360,6 +4509,14 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
+            let lb_cycles = if status == CpsatStatus::Optimal {
+                Some(out_makespan)
+            } else {
+                objective_scale.map(|scale| {
+                    (response.best_objective_bound / (scale as f64)).floor() as usize
+                })
+            };
+
             Some(SsaCpsatResult {
                 cycle_assignments: out_cycle_assignments,
                 makespan: out_makespan,
@@ -4369,9 +4526,11 @@ pub fn schedule_ssa_cpsat(
                 shifted_ops,
                 shifted_alu_cycles: out_shifted_alu_cycles,
                 const_add_imm_ops,
+                const_alu_derive_ops,
                 select_fma_ops,
                 empty_cycle_count: out_empty_count,
                 makespan_driven_by_capacity: (out_makespan as i64) == capacity_lower_bound,
+                lb_cycles,
                 eliminated_vbroadcast_ops,
                 eliminated_vb_to_scalar_producer,
                 schedule_constraints,
@@ -4589,6 +4748,7 @@ mod ssa_tests {
             &vreg_to_addr,
             &HashSet::new(),                 // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -4728,6 +4888,7 @@ mod ssa_tests {
             &vreg_to_addr,
             &HashSet::new(),
             &cpsat_result.const_add_imm_ops,
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -4763,6 +4924,14 @@ mod ssa_tests {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
+            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+                // Verify ALU-derived was chosen
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Alu,
+                    "ConstChoice {} should use ALU when AluDerive chosen",
+                    const_choice_id
+                );
             } else {
                 // Verify Load was chosen
                 assert_eq!(
@@ -5138,6 +5307,7 @@ mod ssa_tests {
                 &shifted_ops,
                 &HashMap::new(), // shifted_alu_cycles
                 &const_add_imm_ops,
+                &HashMap::new(), // const_alu_derive_ops
                 &select_fma_ops,
                 &HashSet::new(), // eliminated_vbroadcast_ops
                 &MachineConfig::default(),
@@ -5189,6 +5359,7 @@ mod ssa_tests {
             &shifted_ops,
             &HashMap::new(), // shifted_alu_cycles
             &const_add_imm_ops,
+            &HashMap::new(), // const_alu_derive_ops
             &select_fma_ops,
             &HashSet::new(), // eliminated_vbroadcast_ops
             &MachineConfig::default(),
@@ -5457,6 +5628,7 @@ mod ssa_tests {
             &vreg_to_addr,
             &HashSet::new(),                  // No shifted ops
             &HashSet::new(),                  // No ConstChoice AddImm ops
+            &HashMap::new(),                  // No ConstChoice ALU-derived
             &cpsat_result.select_fma_ops,     // Use CP-SAT decisions
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -5616,6 +5788,7 @@ mod ssa_tests {
             &assign_result.vreg_to_addr,
             &HashSet::new(),
             &HashSet::new(),
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -5925,6 +6098,7 @@ mod ssa_tests {
             &assign_result.vreg_to_addr,
             &HashSet::new(),
             &HashSet::new(),
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -6142,6 +6316,7 @@ mod ssa_tests {
             &assign_result.vreg_to_addr,
             &HashSet::new(),
             &HashSet::new(),
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -6404,6 +6579,7 @@ mod tests {
             &vreg_to_addr,
             &HashSet::new(),                 // No shifted ops
             &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -6548,6 +6724,7 @@ mod tests {
             &vreg_to_addr,
             &HashSet::new(),
             &cpsat_result.const_add_imm_ops,
+            &cpsat_result.const_alu_derive_ops,
             &cpsat_result.select_fma_ops,
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
@@ -6583,6 +6760,14 @@ mod tests {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
+            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+                // Verify ALU-derived was chosen
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Alu,
+                    "ConstChoice {} should use ALU when AluDerive chosen",
+                    const_choice_id
+                );
             } else {
                 // Verify Load was chosen
                 assert_eq!(
