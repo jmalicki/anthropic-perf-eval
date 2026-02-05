@@ -83,6 +83,32 @@
 //!
 //! Minimize makespan (total cycles).
 //!
+//! ## Empty cycles and the "bulk move" invariant
+//!
+//! When there is an empty cycle C (no op runs at C), every op at C+1 could run at C by precedence
+//! (no dep runs at C, so no dep result is only available at C+1). So shifting **every** op at
+//! C+1, C+2, … one cycle earlier (to C, C+1, …) preserves precedence, symmetry (cycle[i] ≤ cycle[j]),
+//! and cumulative (same ops per cycle, just shifted); makespan can decrease by 1. Therefore **no
+//! single hard constraint in the model should preclude that bulk move**. If any constraint did,
+//! it would be a bug. The tie-breaker (minimize sum of cycles) encourages the solver to find that
+//! solution; empty cycles then only persist due to capacity lower bound (structural) or search.
+//!
+//! ## Debugging: makespan active set
+//!
+//! When `verbose` is true and a solution is found, we print which constraints on makespan are
+//! **binding** (hold with equality): `[Makespan active set]` and a one-line summary after the
+//! result. Use this to see why makespan is what it is:
+//! - **Ops at last cycle**: which op(s) have `effective_last_cycle == max_cycle` (they "define"
+//!   the end of the schedule). If only one op is binding, moving that op earlier (or relaxing
+//!   its deps) could reduce makespan.
+//! - **Capacity bounds binding**: whether `makespan == capacity_lower_bound` or one of the
+//!   redundant linear bounds (capacity_lower_bound, load_bound, store_bound). If true,
+//!   the structural capacity is limiting; improving choices (shift, ConstChoice, SelectChoice)
+//!   may lower the bound.
+//! - **Direct capacity constraints**: VALU/ALU/Flow/Load linear constraints that are tight.
+//! Run with `uv run generate_ssa_kernel.py` (no `-q`) and search for `[Makespan active set]` or
+//! `Active set:` in the output.
+//!
 //! ## Warm Start (Hints)
 //!
 //! We provide the greedy schedule as hints to help CP-SAT find good solutions quickly.
@@ -779,6 +805,107 @@ fn validate_ssa_slot_limits(
     }
 }
 
+/// Same as validate_ssa_slot_limits but returns Err(msg) instead of panicking. Used for diagnostic checks.
+#[cfg(feature = "cpsat")]
+fn try_validate_ssa_slot_limits(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    const_add_imm_ops: &HashSet<usize>,
+    select_fma_ops: &HashSet<usize>,
+    machine: &MachineConfig,
+) -> Result<(), String> {
+    let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
+    if makespan <= 0 {
+        return Ok(());
+    }
+    let mut alu_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut valu_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut load_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut store_per_cycle: Vec<i32> = vec![0; makespan as usize];
+    let mut flow_per_cycle: Vec<i32> = vec![0; makespan as usize];
+
+    for (idx, op) in ops.iter().enumerate() {
+        let cycle = cycle_assignments.get(idx).copied().unwrap_or(0) as usize;
+        if cycle >= alu_per_cycle.len() {
+            continue;
+        }
+        if op.opcode == Opcode::ConstChoice {
+            if const_add_imm_ops.contains(&op.id) {
+                flow_per_cycle[cycle] += 1;
+            } else {
+                load_per_cycle[cycle] += 1;
+            }
+            continue;
+        }
+        if op.opcode == Opcode::SelectChoice {
+            if select_fma_ops.contains(&op.id) {
+                valu_per_cycle[cycle] += 1;
+                if op.delta_vreg.is_none() {
+                    let cycle2 = cycle + 1;
+                    if cycle2 < valu_per_cycle.len() {
+                        valu_per_cycle[cycle2] += 1;
+                    }
+                }
+            } else {
+                flow_per_cycle[cycle] += 1;
+            }
+            continue;
+        }
+        match op.engine {
+            Engine::Alu => alu_per_cycle[cycle] += 1,
+            Engine::Valu => {
+                if shifted_ops.contains(&op.id) {
+                    if let Some(alu_cycles) = shifted_alu_cycles.get(&op.id) {
+                        for &alu_cycle in alu_cycles {
+                            let alu_cycle_usize = alu_cycle as usize;
+                            if alu_cycle_usize < alu_per_cycle.len() {
+                                alu_per_cycle[alu_cycle_usize] += 1;
+                            }
+                        }
+                    } else {
+                        alu_per_cycle[cycle] += VLEN as i32;
+                    }
+                } else {
+                    valu_per_cycle[cycle] += 1;
+                }
+            }
+            Engine::Load => load_per_cycle[cycle] += 1,
+            Engine::Store => store_per_cycle[cycle] += 1,
+            Engine::Flow => flow_per_cycle[cycle] += 1,
+            _ => {}
+        }
+    }
+
+    let limits: [(u32, &str); 5] = [
+        (machine.slot_limit(Engine::Alu), "ALU"),
+        (machine.slot_limit(Engine::Valu), "VALU"),
+        (machine.slot_limit(Engine::Load), "Load"),
+        (machine.slot_limit(Engine::Store), "Store"),
+        (machine.slot_limit(Engine::Flow), "Flow"),
+    ];
+    let counts = [
+        &alu_per_cycle,
+        &valu_per_cycle,
+        &load_per_cycle,
+        &store_per_cycle,
+        &flow_per_cycle,
+    ];
+    for (cycle, _) in alu_per_cycle.iter().enumerate() {
+        for (limit_idx, (limit, name)) in limits.iter().enumerate() {
+            let count = counts[limit_idx][cycle];
+            if count > *limit as i32 {
+                return Err(format!(
+                    "{} slot limit at cycle {}: {} > {}",
+                    name, cycle, count, limit
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify that every consumer of a SelectChoice FMA (no-delta) result is scheduled at cycle >= dep_cycle + 2.
 /// SelectChoice FMA emits sub at C and fma at C+1; result is visible at C+2. Panics if violated (model bug).
 #[cfg(feature = "cpsat")]
@@ -1300,10 +1427,34 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
         }
     }
 
+    // Optional: log every hint we add (OR-Tools does not log which var had "moved var hint").
+    let hint_debug = std::env::var("CPSAT_HINT_DEBUG").is_ok();
+
     // 8. Add hints from greedy scheduler
+    // By construction greedy never schedules before ASAP (it respects deps). ALAP is from the same
+    // SSA graph. If hint falls outside [ASAP, ALAP], fix the greedy scheduler or ASAP/ALAP computation.
+    // OR-Tools may log "moved var hint within its domain" after presolve without naming the variable;
+    // set CPSAT_HINT_DEBUG=1 to log every hint we add (op idx, id, value, domain) to correlate.
     if let Some(hints) = greedy_hints {
         for (idx, &cycle) in hints.iter().enumerate() {
             if idx < cycle_vars.len() && cycle >= 0 {
+                if idx < ops.len() {
+                    let op = &ops[idx];
+                    let lb = *asap.get(&op.id).unwrap_or(&0) as i64;
+                    let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
+                    let c = cycle as i64;
+                    if hint_debug {
+                        eprintln!(
+                            "[CPSAT_HINT_DEBUG] cycle_hint idx={} op_id={} hint={} domain=[{}, {}]",
+                            idx, op.id, c, lb, ub
+                        );
+                    }
+                    assert!(
+                        c >= lb && c <= ub,
+                        "cycle hint outside [ASAP, ALAP]: op id={} idx={} hint_cycle={} domain=[{}, {}] (fix greedy or ASAP/ALAP)",
+                        op.id, idx, c, lb, ub
+                    );
+                }
                 model.add_hint(cycle_vars[idx], cycle as i64);
             }
         }
@@ -1370,6 +1521,14 @@ pub fn schedule_cpsat(ops: &[Op], config: CpsatConfig<'_>) -> Option<CpsatResult
     // 11. Configure solver parameters
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
+
+    // Optional: crash when presolve adjusts a hint (confirms "moved var hint" is presolve-related).
+    // We don't enable this by default: presolve can legitimately tighten domains so a hint that was
+    // valid pre-presolve falls outside the tightened domain; OR-Tools then clamps it. That's
+    // expected and the solve continues correctly. Crashing would abort normal runs.
+    if std::env::var("CPSAT_DEBUG_PRESOLVE_HINT").is_ok() {
+        params.debug_crash_if_presolve_breaks_hint = Some(true);
+    }
 
     // Optimize LP relaxation for tighter bounds and faster convergence
     // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
@@ -1518,6 +1677,205 @@ impl Default for SsaCpsatConfig {
     }
 }
 
+/// Result of capacity lower bound computation (for makespan domain and redundant constraints).
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityLowerBoundResult {
+    pub capacity_lower_bound: i64,
+    pub valu_alu_global_min: i64,
+    pub load_bound: i64,
+    pub store_bound: i64,
+}
+
+/// Compute capacity-based lower bound on makespan by minimizing over choice variables (x, y, z).
+/// No CP-SAT needed: pure triple loop over small integer ranges.
+///
+/// - x = number of shiftable VALU that stay on VALU (0..=shiftable_count)
+/// - y = number of ConstChoice that choose add_imm/Flow (0..=const_choice_count)
+/// - z = number of SelectChoice that choose FMA/VALU (0..=select_choice_count); each adds 2 VALU ops (sub + fma)
+///
+/// For each (x,y,z), computes max(ceil(VALU/6), ceil(ALU/12), ceil(Load/2), Flow, ceil(Store/2))
+/// then returns the minimum over all (x,y,z), capped below by critical_path_len.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_capacity_lower_bound_global(
+    valu_count: i64,
+    alu_count: i64,
+    load_count: i64,
+    store_count: i64,
+    flow_base: i64,
+    shiftable_count: i64,
+    const_choice_count: i64,
+    select_choice_count: i64,
+    enable_valu_shift: bool,
+    valu_cap: i64,
+    alu_cap: i64,
+    load_cap: i64,
+    store_cap: i64,
+    _flow_cap: i64,
+    critical_path_len: i64,
+) -> CapacityLowerBoundResult {
+    let mut capacity_lower_bound = critical_path_len;
+    if !enable_valu_shift && valu_count > 0 && valu_cap > 0 {
+        let valu_only = (valu_count + valu_cap - 1) / valu_cap;
+        capacity_lower_bound = capacity_lower_bound.max(valu_only);
+    }
+    let store_bound = if store_cap > 0 && store_count > 0 {
+        (store_count + store_cap - 1) / store_cap
+    } else {
+        0
+    };
+    let mut global_min = i64::MAX;
+    for x in 0..=shiftable_count {
+        let valu_ops = if enable_valu_shift {
+            (valu_count - shiftable_count + x).max(0)
+        } else {
+            valu_count
+        };
+        let alu_ops = if enable_valu_shift {
+            alu_count + 8 * (shiftable_count - x)
+        } else {
+            alu_count
+        };
+        for y in 0..=const_choice_count {
+            let load_ops = (load_count - y).max(0);
+            for z in 0..=select_choice_count {
+                // Each SelectChoice FMA adds 2 VALU ops (sub + fma).
+                let valu_with_select = valu_ops + 2 * z;
+                // flow_base already counts all Flow ops (including SelectChoice). When z choose FMA they use VALU;
+                // (select_choice_count - z) use vselect (1 Flow each). So total Flow = flow_base + y - z.
+                let flow_ops = flow_base + y - z;
+                let v = if valu_with_select > 0 && valu_cap > 0 {
+                    (valu_with_select + valu_cap - 1) / valu_cap
+                } else {
+                    0
+                };
+                let a = if alu_ops > 0 && alu_cap > 0 {
+                    (alu_ops + alu_cap - 1) / alu_cap
+                } else {
+                    0
+                };
+                let ld = if load_cap > 0 && load_ops > 0 {
+                    (load_ops + load_cap - 1) / load_cap
+                } else {
+                    0
+                };
+                let fl = flow_ops;
+                let lb = v.max(a).max(ld).max(fl).max(store_bound);
+                global_min = global_min.min(lb);
+            }
+        }
+    }
+    if global_min != i64::MAX {
+        capacity_lower_bound = capacity_lower_bound.max(global_min);
+    }
+    let valu_alu_global_min = if enable_valu_shift && (valu_count > 0 || alu_count > 0 || shiftable_count > 0) {
+        (0..=shiftable_count)
+            .map(|x| {
+                let valu_ops = (valu_count - shiftable_count + x).max(0);
+                let alu_ops = alu_count + 8 * (shiftable_count - x);
+                let v = if valu_ops > 0 && valu_cap > 0 {
+                    (valu_ops + valu_cap - 1) / valu_cap
+                } else {
+                    0
+                };
+                let a = if alu_ops > 0 && alu_cap > 0 {
+                    (alu_ops + alu_cap - 1) / alu_cap
+                } else {
+                    0
+                };
+                v.max(a)
+            })
+            .min()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let load_bound = if load_cap > 0 && (load_count - const_choice_count).max(0) > 0 {
+        ((load_count - const_choice_count).max(0) + load_cap - 1) / load_cap
+    } else {
+        0
+    };
+    CapacityLowerBoundResult {
+        capacity_lower_bound,
+        valu_alu_global_min,
+        load_bound,
+        store_bound,
+    }
+}
+
+#[cfg(test)]
+mod capacity_lb_tests {
+    use super::compute_capacity_lower_bound_global;
+
+    fn default_caps() -> (i64, i64, i64, i64, i64) {
+        (6, 12, 2, 2, 1) // valu, alu, load, store, flow
+    }
+
+    #[test]
+    fn test_capacity_lb_no_choices() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        let r = compute_capacity_lower_bound_global(
+            18, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 1,
+        );
+        assert_eq!(r.capacity_lower_bound, 3, "18 VALU / 6 = 3 cycles");
+        assert_eq!(r.store_bound, 0);
+    }
+
+    #[test]
+    fn test_capacity_lb_critical_path_dominates() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        let r = compute_capacity_lower_bound_global(
+            6, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 10,
+        );
+        assert_eq!(r.capacity_lower_bound, 10, "critical_path 10 dominates 6/6=1");
+    }
+
+    #[test]
+    fn test_capacity_lb_shift_global_min() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // 6 VALU, 3 shiftable. x=0 (all shift): VALU=3, ALU=24 => max(1,2)=2. x=3 (none shift): VALU=6, ALU=0 => max(1,0)=1. Global min = 1.
+        let r_no_shift = compute_capacity_lower_bound_global(
+            6, 0, 0, 0, 0, 3, 0, 0, false, vc, ac, lc, sc, fc, 1,
+        );
+        let r_shift = compute_capacity_lower_bound_global(
+            6, 0, 0, 0, 0, 3, 0, 0, true, vc, ac, lc, sc, fc, 1,
+        );
+        assert_eq!(r_no_shift.capacity_lower_bound, 1);
+        assert_eq!(r_shift.capacity_lower_bound, 1, "min over x: best is x=3 => 1 cycle");
+    }
+
+    #[test]
+    fn test_capacity_lb_const_choice_reduces_load() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // 4 Load ops, 2 ConstChoice. If both add_imm: 2 Load => 1 cycle. If both load: 4 Load => 2 cycles.
+        let r = compute_capacity_lower_bound_global(
+            0, 0, 4, 0, 0, 0, 2, 0, false, vc, ac, lc, sc, fc, 1,
+        );
+        assert!(r.capacity_lower_bound >= 1 && r.capacity_lower_bound <= 2);
+        assert_eq!(r.load_bound, 1, "min Load = 2 ops => ceil(2/2)=1");
+    }
+
+    #[test]
+    fn test_capacity_lb_flow_dominates() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // 5 Flow ops (flow_base=5), no others. Makespan must be >= 5.
+        let r = compute_capacity_lower_bound_global(
+            0, 0, 0, 0, 5, 0, 0, 0, false, vc, ac, lc, sc, fc, 1,
+        );
+        assert_eq!(r.capacity_lower_bound, 5);
+    }
+
+    #[test]
+    fn test_capacity_lb_triple_choice_global_min() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // Small mix: some VALU (shiftable), some ConstChoice, some SelectChoice. Just check it runs and returns >= critical_path.
+        let r = compute_capacity_lower_bound_global(
+            6, 12, 2, 0, 1, 3, 1, 1, true, vc, ac, lc, sc, fc, 5,
+        );
+        assert!(r.capacity_lower_bound >= 5);
+        assert!(r.capacity_lower_bound >= r.store_bound);
+    }
+}
+
 /// Optional hints and segment input for SSA CP-SAT.
 /// Use struct literal syntax to pass only what you need; omit fields for `None`.
 /// Example: `SsaCpsatHints { greedy_hints: Some(&hints), ..Default::default() }`
@@ -1531,6 +1889,8 @@ pub struct SsaCpsatHints<'a> {
     pub forced_shifts: Option<&'a HashSet<usize>>,
     /// SelectChoice decisions from greedy (op ID -> use FMA path).
     pub select_choice_hints: Option<&'a HashSet<usize>>,
+    /// ConstChoice decisions from greedy (op ID -> use add_imm / Flow). If set, ops in this set get hint 1 (add_imm).
+    pub const_add_imm_hints: Option<&'a HashSet<usize>>,
     /// Segment mode: (VReg, op index of last use); adds fixed [0, end] intervals to scratch (per-section feasibility).
     pub initial_live: Option<&'a [(VReg, usize)]>,
     /// Segment mode: VRegs defined in this segment but last-used in a later section. Their scratch interval must extend to segment end (max cycle).
@@ -1562,6 +1922,12 @@ pub struct SsaCpsatResult {
     pub const_add_imm_ops: HashSet<usize>,
     /// Set of SelectChoice op IDs that should use FMA path (VALU) instead of vselect (Flow)
     pub select_fma_ops: HashSet<usize>,
+    /// Number of empty cycles (makespan minus max cycle used). 0 when schedule has no gaps.
+    pub empty_cycle_count: usize,
+    /// True when makespan equals capacity lower bound (structural bound caused the gap).
+    pub makespan_driven_by_capacity: bool,
+    /// Same constraints as the CP-SAT model (for bulk-move simulator and validation).
+    pub schedule_constraints: Vec<crate::schedule_constraints::ScheduleConstraint>,
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
@@ -1724,6 +2090,7 @@ pub fn schedule_ssa_cpsat(
     let greedy_hints = hints.greedy_hints;
     let shift_hints = hints.shift_hints;
     let forced_shifts = hints.forced_shifts;
+    let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
     let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
@@ -1742,6 +2109,9 @@ pub fn schedule_ssa_cpsat(
             shifted_alu_cycles: HashMap::new(),
             const_add_imm_ops: HashSet::new(),
             select_fma_ops: HashSet::new(),
+            empty_cycle_count: 0,
+            makespan_driven_by_capacity: false,
+            schedule_constraints: vec![],
         });
     }
 
@@ -2101,7 +2471,9 @@ pub fn schedule_ssa_cpsat(
                     model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
                 const_flow_intervals.insert(idx, add_imm_interval);
 
-                model.add_hint(choice_var, 0); // false = use Load (solver may still flip to add_imm)
+                // Hint: use greedy's ConstChoice decision if provided, else default to Load (0)
+                let use_add_imm = const_add_imm_hints.map_or(false, |h| h.contains(&ops[idx].id));
+                model.add_hint(choice_var, if use_add_imm { 1 } else { 0 });
             }
         }
     }
@@ -2117,6 +2489,8 @@ pub fn schedule_ssa_cpsat(
     let mut select_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
     let mut select_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
+    // For SelectChoice FMA (no-delta): last cycle of op is fma_cycle_var (sub at cycle_var, fma at cycle_var+1). Used so makespan is constrained by chosen path only.
+    let mut select_choice_fma_last_cycle: HashMap<usize, IntVar> = HashMap::new();
 
     for &idx in &select_choice_ops {
         match select_choice_mode {
@@ -2139,6 +2513,7 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(fma_cycle_var),
                         LinearExpr::from(cycle_vars[idx]) + 1,
                     );
+                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
                     let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
                     vec![sub_interval, fma_interval]
                 };
@@ -2180,6 +2555,7 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(fma_cycle_var),
                         LinearExpr::from(cycle_vars[idx]) + 1,
                     );
+                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
                     let fma_interval =
                         model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
                     vec![sub_interval, fma_interval]
@@ -2190,6 +2566,9 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 5d. Precedence for consumers of SelectChoice FMA (no delta): result is visible at cycle+2, not cycle+1
+    // Store select_fma_extra vars so we can hint them (avoids "solution hint is incomplete").
+    let mut select_fma_extra_vars: std::collections::HashMap<(usize, usize), IntVar> =
+        std::collections::HashMap::new();
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             let Some(&dep_idx) = op_id_to_idx.get(&dep_id) else {
@@ -2219,6 +2598,7 @@ pub fn schedule_ssa_cpsat(
                         cycle_vars[idx],
                         LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
                     );
+                    select_fma_extra_vars.insert((dep_idx, idx), extra);
                 }
             }
         }
@@ -2925,104 +3305,195 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 9. Compute capacity-based lower bounds
-    // With VALU shifting, we can potentially use ALU capacity for VALU overflow
-    let mut capacity_lower_bound = critical_path_len as i64;
-
-    // Count ops by engine
+    // 9. Compute capacity-based lower bounds via global min over (x, y, z)
     let valu_count = ops.iter().filter(|op| op.engine == Engine::Valu).count() as i64;
     let alu_count = ops.iter().filter(|op| op.engine == Engine::Alu).count() as i64;
     let load_count = ops.iter().filter(|op| op.engine == Engine::Load).count() as i64;
     let store_count = ops.iter().filter(|op| op.engine == Engine::Store).count() as i64;
+    let shiftable_count = shiftable_set.len() as i64;
+    let const_choice_count = const_choice_ops.len() as i64;
+    let select_choice_count = select_choice_ops.len() as i64;
+    let flow_base = ops.iter().filter(|op| op.engine == Engine::Flow).count() as i64;
 
-    // Without shifting: VALU bound
-    let valu_only_bound = (valu_count + valu_cap - 1) / valu_cap;
-    if !enable_valu_shift && valu_only_bound > capacity_lower_bound {
-        capacity_lower_bound = valu_only_bound;
-    }
-
-    // With shifting: at least need enough cycles for VALU and ALU (solver may shift to balance)
-    if enable_valu_shift {
-        let valu_bound_cap = (valu_count + valu_cap - 1) / valu_cap;
-        let alu_bound_cap = if alu_count > 0 {
-            (alu_count + alu_cap - 1) / alu_cap
-        } else {
-            0
-        };
-        let combined = valu_bound_cap.max(alu_bound_cap);
-        if combined > capacity_lower_bound {
-            capacity_lower_bound = combined;
-        }
-    }
-
-    // Other engine bounds
-    let load_bound = if load_cap > 0 {
-        (load_count + load_cap - 1) / load_cap
-    } else {
-        0
-    };
-    let store_bound = if store_cap > 0 {
-        (store_count + store_cap - 1) / store_cap
-    } else {
-        0
-    };
-    capacity_lower_bound = capacity_lower_bound.max(load_bound).max(store_bound);
+    let cap_result = compute_capacity_lower_bound_global(
+        valu_count,
+        alu_count,
+        load_count,
+        store_count,
+        flow_base,
+        shiftable_count,
+        const_choice_count,
+        select_choice_count,
+        enable_valu_shift,
+        valu_cap,
+        alu_cap,
+        load_cap,
+        store_cap,
+        flow_cap,
+        critical_path_len as i64,
+    );
+    let capacity_lower_bound = cap_result.capacity_lower_bound;
+    let mut valu_alu_global_min = cap_result.valu_alu_global_min;
+    let load_bound = cap_result.load_bound;
+    let store_bound = cap_result.store_bound;
 
     if verbose {
         eprintln!(
-            "  Capacity bounds: VALU={}, ALU={}, Load={}, Store={}, combined={}",
-            valu_only_bound,
-            (alu_count + alu_cap - 1) / alu_cap,
+            "  Capacity bounds (conservative): shiftable={}, const_choice={}; Load={}, Store={}, final_LB={}",
+            shiftable_count,
+            const_choice_count,
             load_bound,
             store_bound,
             capacity_lower_bound
         );
     }
 
-    // 10. Create makespan variable and objective
+    // 10. Create makespan and max_cycle variables; tie makespan to actual last cycle so CP-SAT minimizes it.
+    // max_cycle = max over all cycle_vars, completion_cycle_vars, select_choice_fma_last_cycle.
+    // makespan = max_cycle + 1 (so minimizing makespan forces packing).
+    let max_cycle_lb = (capacity_lower_bound - 1).max(0);
+    let max_cycle =
+        model.new_int_var_with_name([(max_cycle_lb, (horizon - 1) as i64)], "max_cycle".to_string());
     let makespan =
         model.new_int_var_with_name([(capacity_lower_bound, horizon)], "makespan".to_string());
+    model.add_eq(LinearExpr::from(makespan), LinearExpr::from(max_cycle) + 1);
+    for &cv in cycle_vars.iter() {
+        model.add_ge(max_cycle, LinearExpr::from(cv));
+    }
+    for (_, &completion_var) in completion_cycle_vars.iter() {
+        model.add_ge(max_cycle, LinearExpr::from(completion_var));
+    }
+    for (_, &fma_last) in select_choice_fma_last_cycle.iter() {
+        model.add_ge(max_cycle, LinearExpr::from(fma_last));
+    }
 
-    // Redundant linear capacity constraints: makespan >= ceil(num_ops / capacity) per engine.
-    // The cumulative constraint's LP relaxation is weak; adding these as explicit linear
-    // constraints helps the LP see the bound and can improve best_objective_bound.
-    let alu_bound = if alu_count > 0 {
-        (alu_count + alu_cap - 1) / alu_cap
-    } else {
-        0
-    };
-    let valu_bound = (valu_count + valu_cap - 1) / valu_cap;
-    if alu_bound > 0 {
-        let alu_lb = model.new_int_var([(alu_bound, alu_bound)]);
-        model.add_ge(makespan, LinearExpr::from(alu_lb));
-    }
-    if valu_bound > 0 {
-        let valu_lb = model.new_int_var([(valu_bound, valu_bound)]);
-        model.add_ge(makespan, LinearExpr::from(valu_lb));
-    }
-    if load_count > 0 && load_cap > 0 {
-        let load_bound = (load_count + load_cap - 1) / load_cap;
+    // Redundant linear capacity constraints: only add bounds that are valid for *any* choice.
+    // capacity_lower_bound (makespan domain) is already the min over (x,y,z) from compute_capacity_lower_bound_global.
+    // Do NOT add makespan >= ceil(alu_count+8*shiftable/12) or makespan >= ceil(valu_count-shiftable/6): those are
+    // bounds for one extreme (all shift / no shift) and would over-constrain when the solver picks a different choice
+    // (e.g. shift 163 only → ALU need 121 cycles, but "all shift" bound would force makespan >= 609).
+    // Load and store bounds are valid global mins (min over const_choice for load; store is fixed).
+    if load_bound > 0 {
         let load_lb = model.new_int_var([(load_bound, load_bound)]);
         model.add_ge(makespan, LinearExpr::from(load_lb));
     }
-    if store_count > 0 && store_cap > 0 {
-        let store_bound = (store_count + store_cap - 1) / store_cap;
+    if store_bound > 0 {
         let store_lb = model.new_int_var([(store_bound, store_bound)]);
         model.add_ge(makespan, LinearExpr::from(store_lb));
     }
 
-    // makespan >= max(cycle[i]) + 1 for all ops
-    for &cv in &cycle_vars {
-        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+    // Direct capacity constraints: link makespan to choice variables (x = shift, y = ConstChoice AddImm, z = SelectChoice FMA count)
+    // so CP-SAT can optimize over (x,y,z) during search instead of relying only on the pre-computed capacity_lower_bound.
+    // Uses same formulas as compute_capacity_lower_bound_global: VALU_ops = valu_count - sum(shift) + 2*sum(select_fma), etc.
+    {
+        let zero_var = model.new_int_var([(0, 0)]);
+        let sum_shift: Option<LinearExpr> = shiftable_valu
+            .iter()
+            .filter_map(|&idx| shift_vars.get(&idx).copied())
+            .fold(None, |acc, b| {
+                Some(match acc {
+                    None => LinearExpr::from(b),
+                    Some(a) => a + LinearExpr::from(b),
+                })
+            });
+        let sum_select_fma: Option<LinearExpr> = select_choice_ops
+            .iter()
+            .filter_map(|&idx| select_choice_vars.get(&idx).copied())
+            .fold(None, |acc, b| {
+                Some(match acc {
+                    None => LinearExpr::from(b),
+                    Some(a) => a + LinearExpr::from(b),
+                })
+            });
+        let sum_const_add_imm: Option<LinearExpr> = const_choice_ops
+            .iter()
+            .filter_map(|&idx| const_choice_vars.get(&idx).copied())
+            .fold(None, |acc, b| {
+                Some(match acc {
+                    None => LinearExpr::from(b),
+                    Some(a) => a + LinearExpr::from(b),
+                })
+            });
+        let s = sum_shift.unwrap_or_else(|| LinearExpr::from(zero_var));
+        let z = sum_select_fma.unwrap_or_else(|| LinearExpr::from(zero_var));
+        let y = sum_const_add_imm.unwrap_or_else(|| LinearExpr::from(zero_var));
+
+        // VALU: each SelectChoice FMA = 2 VALU ops (sub + fma). So 6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)
+        if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
+            let lhs = LinearExpr::from(makespan) * 6 + s.clone() - z.clone() * 2;
+            let rhs = model.new_int_var([(valu_count, valu_count)]);
+            model.add_ge(lhs, LinearExpr::from(rhs));
+        }
+        // ALU: 12*makespan >= alu_count + 8*sum(shift)  =>  12*makespan - 8*s >= alu_count
+        if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
+            let lhs = LinearExpr::from(makespan) * 12 - s.clone() * 8;
+            let rhs = model.new_int_var([(alu_count, alu_count)]);
+            model.add_ge(lhs, LinearExpr::from(rhs));
+        }
+        // Flow: makespan >= flow_base + sum(const_add_imm) - sum(select_fma)  =>  makespan + z - y >= flow_base
+        if flow_base > 0 || const_choice_count > 0 || select_choice_count > 0 {
+            let lhs = LinearExpr::from(makespan) + z.clone() - y.clone();
+            let rhs = model.new_int_var([(flow_base, flow_base)]);
+            model.add_ge(lhs, LinearExpr::from(rhs));
+        }
+        // Load: 2*makespan >= load_count - sum(const_add_imm)
+        if load_count > 0 && const_choice_count > 0 {
+            let lhs = LinearExpr::from(makespan) * 2 + y;
+            let rhs = model.new_int_var([(load_count, load_count)]);
+            model.add_ge(lhs, LinearExpr::from(rhs));
+        }
     }
+
+    // makespan >= max(chosen_cycle[i]) + 1: for each op use the cycle of the chosen execution path.
+    // Shiftable: when shifted use completion_cycle, when not use cycle_vars[idx].
+    // SelectChoice: when FMA (no-delta) use fma_cycle_var (last cycle), else use cycle_vars[idx]. ConstChoice: both paths use cycle_vars[idx].
+    for (idx, &cv) in cycle_vars.iter().enumerate() {
+        if shiftable_set.contains(&idx) {
+            let shift_var = *shift_vars.get(&idx).unwrap();
+            if let Some(&completion_var) = completion_cycle_vars.get(&idx) {
+                let c = model.add_ge(makespan, LinearExpr::from(completion_var) + 1);
+                model.only_enforce_if(c, [shift_var]);
+            }
+            let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+            model.only_enforce_if(c, [!shift_var]);
+        } else if select_choice_set.contains(&idx) {
+            match select_choice_mode {
+                SelectChoiceMode::ForceVselect => {
+                    model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                }
+                SelectChoiceMode::ForceFma => {
+                    if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
+                        model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
+                    } else {
+                        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                    }
+                }
+                SelectChoiceMode::Optimize => {
+                    if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
+                        let choice_var = *select_choice_vars.get(&idx).unwrap();
+                        let c = model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
+                        model.only_enforce_if(c, [choice_var]);
+                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                        model.only_enforce_if(c, [!choice_var]);
+                    } else {
+                        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                    }
+                }
+            }
+        } else {
+            model.add_ge(makespan, LinearExpr::from(cv) + 1);
+        }
+    }
+
+    // makespan = max_cycle + 1 and max_cycle >= every cycle var already force all work into [0, max_cycle];
+    // no need for explicit cycle <= makespan-1.
 
     // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops, ConstChoice ops, shiftable VALU ops, and SelectChoice ops (tie-breaker).
     //
     // Objective = scale * makespan + sum(completion_cycle) + sum(const_choice_cycles) + sum(shiftable_valu_cycles) + sum(select_choice_cycles).
-    // Scale is chosen as the next power of 10 above max(sum(completion_cycle) + sum(const_choice_cycles) + sum(shiftable_valu_cycles) + sum(select_choice_cycles)):
-    //   (1) True tie-breaker: scale > max_sum, so one extra cycle always dominates the sum.
-    //   (2) Leading digits of the objective value are the makespan (cycle count), e.g.
-    //       objective 104_042_000 => makespan 104, tie-breaker sum 42_000.
+    // Scale is a power of 10 chosen so that scale > max_sum (max possible value of that sum). Then:
+    //   (1) Tie-breaker: one extra cycle costs scale, so scale > max_sum ensures makespan dominates.
+    //   (2) Leading digits: tie_breaker < scale, so floor(objective / scale) = makespan — the quotient is the cycle count (e.g. objective 2_000_042_000 with scale 1e7 => makespan 200, not 2000; tie-breaker 42_000 in lower digits).
     //   (3) Including ConstChoice cycles rewards earlier const ops, which naturally prefers add_imm
     //       when Flow is free (enabling better load balance).
     //   (4) Including shiftable VALU cycles rewards earlier VALU ops, which encourages shifting to ALU
@@ -3030,41 +3501,106 @@ pub fn schedule_ssa_cpsat(
     //   (5) Including SelectChoice cycles rewards earlier SelectChoice ops, which may favor FMA over vselect
     //       when FMA can execute earlier (though FMA uses VALU slots which may be saturated).
     let mut objective_scale: Option<i64> = None;
-    
-    // Collect all cycle vars for tie-breaker: completion_cycle (shifted VALU) + cycle_vars (ConstChoice + shiftable VALU + SelectChoice)
-    let mut tie_breaker_vars: Vec<IntVar> = Vec::new();
-    
-    // Add completion_cycle vars for shifted VALU ops
-    for &cc_var in completion_cycle_vars.values() {
-        tie_breaker_vars.push(cc_var);
+
+    // Tie-breaker should sum only the chosen path's cycle per op (same as makespan constraints).
+    // Create auxiliary "chosen cycle" vars for shiftable and SelectChoice so the objective matches.
+    let mut shiftable_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
+    for &idx in &shiftable_valu {
+        let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+        let default_alap = (horizon - 1) as i32;
+        let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+        let chosen = model.new_int_var_with_name(
+            [(op_asap, op_alap)],
+            format!("shift_chosen_cycle_{}", idx),
+        );
+        let shift_var = *shift_vars.get(&idx).unwrap();
+        if let Some(&cc_var) = completion_cycle_vars.get(&idx) {
+            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cc_var));
+            model.only_enforce_if(c, [shift_var]);
+        }
+        let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
+        model.only_enforce_if(c, [!shift_var]);
+        shiftable_chosen_cycle.insert(idx, chosen);
     }
-    
-    // Add cycle_vars for ConstChoice ops (prefer earlier const ops, which favors add_imm when Flow is free)
+
+    let mut select_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
+    for &idx in &select_choice_ops {
+        if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
+            let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+            let default_alap = (horizon - 1) as i32;
+            let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+            let chosen = model.new_int_var_with_name(
+                [(op_asap, op_alap)],
+                format!("select_chosen_cycle_{}", idx),
+            );
+            let choice_var = *select_choice_vars.get(&idx).unwrap();
+            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
+            model.only_enforce_if(c, [choice_var]);
+            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
+            model.only_enforce_if(c, [!choice_var]);
+            select_chosen_cycle.insert(idx, chosen);
+        }
+    }
+
+    // Collect tie-breaker vars: one "effective cycle" per op so that when makespan is equal we
+    // prefer packing ops earlier (minimize sum of cycles). Without this, ops not in shiftable/
+    // ConstChoice/SelectChoice have no incentive to move from C+1 to empty C.
+    let mut tie_breaker_vars: Vec<IntVar> = Vec::new();
+
+    // Shiftable VALU: one chosen cycle per op (completion_cycle when shifted, cycle_var when not)
+    for &idx in &shiftable_valu {
+        tie_breaker_vars.push(*shiftable_chosen_cycle.get(&idx).unwrap());
+    }
+
+    // ConstChoice: both paths use same cycle_vars[idx]
     for &idx in &const_choice_ops {
         tie_breaker_vars.push(cycle_vars[idx]);
     }
-    
-    // Add cycle_vars for shiftable VALU ops (prefer earlier VALU ops, which encourages shifting to ALU when beneficial)
-    for &idx in &shiftable_valu {
-        tie_breaker_vars.push(cycle_vars[idx]);
-    }
-    
-    // Add cycle_vars for SelectChoice ops (prefer earlier SelectChoice ops, which may favor FMA over vselect when beneficial)
+
+    // SelectChoice: chosen cycle (fma_cycle when FMA no-delta, else cycle_var)
     for &idx in &select_choice_ops {
-        tie_breaker_vars.push(cycle_vars[idx]);
+        if let Some(&chosen) = select_chosen_cycle.get(&idx) {
+            tie_breaker_vars.push(chosen);
+        } else {
+            tie_breaker_vars.push(cycle_vars[idx]);
+        }
     }
-    
+
+    // All other ops: use cycle_vars so every op contributes to tie-breaker (reward moving any op earlier)
+    for (idx, _) in ops.iter().enumerate() {
+        if !shiftable_set.contains(&idx)
+            && !const_choice_set.contains(&idx)
+            && !select_choice_set.contains(&idx)
+        {
+            tie_breaker_vars.push(cycle_vars[idx]);
+        }
+    }
+
     if let Some(&first_var) = tie_breaker_vars.first() {
         let rest = &tie_breaker_vars[1..];
-        let max_sum = (tie_breaker_vars.len() as i64) * (horizon as i64);
+        // Max possible value of sum(tie_breaker_vars): each var in [0, horizon-1], so sum <= n * horizon.
+        // Use saturating mul so overflow doesn't produce a tiny scale and break "leading digits = makespan".
+        let max_sum = (tie_breaker_vars.len() as i64).saturating_mul(horizon);
+        // Scale must be > max_sum so that floor(objective/scale) = makespan (tie-breaker stays in lower digits).
+        // Presolve can "ExpandObjective" (substitute tight equalities), adding more terms so the actual
+        // objective tie-breaker can exceed max_sum. Use an extra factor of 10 so scale stays ahead.
         let mut scale = 1i64;
         while scale <= max_sum {
             scale = scale.saturating_mul(10);
+        }
+        if scale <= max_sum {
+            // Can happen if scale saturated (overflow); objective structure is then wrong.
+            eprintln!(
+                "  CP-SAT objective scale saturated (max_sum={}); leading digits may not equal makespan",
+                max_sum
+            );
         }
         objective_scale = Some(scale);
         let sum_completion: LinearExpr = rest.iter().fold(LinearExpr::from(first_var), |acc, &v| {
             acc + LinearExpr::from(v)
         });
+        // Explicitly bound tie-breaker below scale so floor(objective/scale) = makespan always.
+        model.add_le(sum_completion.clone(), scale.saturating_sub(1));
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
     } else {
@@ -3075,14 +3611,30 @@ pub fn schedule_ssa_cpsat(
     // We skip cycle hints for ops with hint_cycle < 0 (dead stores). Greedy marks those as -1
     // and does not assign a real cycle, so CP-SAT must choose.
     //
-    // Why "solution hint is incomplete: K out of N non fixed variables hinted" with many unhinted?
-    // For each shiftable VALU op we have 8 alu_cycle vars + 1 completion_cycle var that are never
-    // hinted unless we do it here. So with ~1400 shiftable ops, ~12600 vars are unhinted, which
-    // dominates the total. We hint them from the greedy cycle below so the solver gets a full hint.
+    // We hint cycle, shift, completion_cycle, alu_cycle, shiftable_chosen_cycle, select_chosen_cycle,
+    // const_choice, select_choice, segment sizes, makespan, max_cycle so the solution hint is complete.
+    // Set CPSAT_HINT_DEBUG=1 to log every cycle hint (op idx, id, value, domain) to correlate with "moved var hint".
+    let hint_debug_ssa = std::env::var("CPSAT_HINT_DEBUG").is_ok();
     if let Some(hints) = greedy_hints {
         let mut skipped_cycle_hints = 0usize;
         for (idx, &hint_cycle) in hints.iter().enumerate() {
             if idx < cycle_vars.len() && hint_cycle >= 0 {
+                if idx < ops.len() {
+                    let lb = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                    let ub = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) as i64;
+                    let c = hint_cycle as i64;
+                    if hint_debug_ssa {
+                        eprintln!(
+                            "[CPSAT_HINT_DEBUG] cycle_hint idx={} op_id={} hint={} domain=[{}, {}]",
+                            idx, ops[idx].id, c, lb, ub
+                        );
+                    }
+                    assert!(
+                        c >= lb && c <= ub,
+                        "cycle hint outside [ASAP, ALAP]: op id={} idx={} hint_cycle={} domain=[{}, {}] (fix greedy or ASAP/ALAP)",
+                        ops[idx].id, idx, c, lb, ub
+                    );
+                }
                 model.add_hint(cycle_vars[idx], hint_cycle as i64);
             } else if idx < cycle_vars.len() && hint_cycle < 0 {
                 skipped_cycle_hints += 1;
@@ -3094,9 +3646,10 @@ pub fn schedule_ssa_cpsat(
                 skipped_cycle_hints
             );
         }
-        // Hint the makespan too
+        // Hint makespan and max_cycle so the solver starts from a tight schedule (makespan = max_cycle + 1).
         let hint_makespan = hints.iter().max().copied().unwrap_or(0) + 1;
         model.add_hint(makespan, hint_makespan as i64);
+        model.add_hint(max_cycle, (hint_makespan - 1) as i64);
     }
 
     // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings.
@@ -3140,6 +3693,7 @@ pub fn schedule_ssa_cpsat(
     // Hint completion_cycle and alu_cycle for shiftable ops so CP-SAT gets a full solution hint.
     // Greedy gives one cycle per op; we use that for completion_cycle and all 8 alu_cycles
     // (valid when shifted: all 8 ALU ops at same cycle -> completion_cycle = that cycle).
+    // By construction greedy never schedules before ASAP; if this fires, fix greedy or ASAP/ALAP.
     if let Some(hints) = greedy_hints {
         for &idx in &shiftable_valu {
             let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
@@ -3147,6 +3701,13 @@ pub fn schedule_ssa_cpsat(
                 continue;
             }
             let c = hint_cycle as i64;
+            let lb = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+            let ub = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+            assert!(
+                c >= lb && c <= ub,
+                "completion/alu cycle hint outside [ASAP, ALAP]: op id={} idx={} hint_cycle={} domain=[{}, {}] (fix greedy or ASAP/ALAP)",
+                ops[idx].id, idx, c, lb, ub
+            );
             if let Some(completion_var) = completion_cycle_vars.get(&idx) {
                 model.add_hint(*completion_var, c);
             }
@@ -3158,9 +3719,55 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // Hint shiftable_chosen_cycle and select_chosen_cycle so "solution hint is complete" (no unhinted vars).
+    // These tie-breaker vars are equal to the effective cycle (completion_cycle when shifted, cycle when not;
+    // fma_last when FMA, cycle when vselect). Greedy gives one cycle per op -> use that for chosen.
+    if let Some(hints) = greedy_hints {
+        for &idx in &shiftable_valu {
+            let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
+            if hint_cycle < 0 {
+                continue;
+            }
+            if let Some(&chosen) = shiftable_chosen_cycle.get(&idx) {
+                model.add_hint(chosen, hint_cycle as i64);
+            }
+        }
+        for &idx in &select_choice_ops {
+            let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
+            if hint_cycle < 0 {
+                continue;
+            }
+            if let Some(&chosen) = select_chosen_cycle.get(&idx) {
+                // vselect path: chosen = cycle; FMA path: chosen = fma_last (often cycle+1). Use hint_cycle as hint.
+                model.add_hint(chosen, hint_cycle as i64);
+            }
+        }
+        // Hint select_choice_fma_last_cycle (FMA path: fma_cycle = cycle + 1) so hint is complete.
+        let use_fma = |idx: usize| -> bool {
+            select_choice_hints.map_or(false, |h| h.contains(&ops[idx].id))
+        };
+        for (&idx, &fma_last_var) in &select_choice_fma_last_cycle {
+            if use_fma(idx) {
+                let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
+                if hint_cycle >= 0 {
+                    model.add_hint(fma_last_var, (hint_cycle + 1) as i64);
+                }
+            }
+        }
+        // Hint select_fma_extra vars (0 or 1 = same as choice_var) so hint is complete.
+        for (&(dep_idx, _idx), &extra_var) in &select_fma_extra_vars {
+            model.add_hint(extra_var, if use_fma(dep_idx) { 1 } else { 0 });
+        }
+    }
+
     // 12. Configure solver
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
+    // Optional: crash when presolve adjusts a hint. Not default: presolve can tighten domains and
+    // clamp hints; that's expected and the solve still succeeds.
+    if std::env::var("CPSAT_DEBUG_PRESOLVE_HINT").is_ok() {
+        params.debug_crash_if_presolve_breaks_hint = Some(true);
+    }
     // Always log search progress by default - user must go out of their way to suppress
     params.log_search_progress = Some(true);
     params.num_workers = Some(8);
@@ -3257,7 +3864,34 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            let actual_makespan = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
+            // Reported makespan must match the objective's leading digits (floor(objective/scale)).
+            // The model constrains makespan >= cycle_var+1 for every cycle_var; for shiftable ops we
+            // put completion_cycle into cycle_assignments when shifted, so max(cycle_assignments)+1
+            // can be lower than the solver's makespan (which is driven by cycle_vars). Use the
+            // makespan variable's solution value so we report the same number that appears in the objective.
+            let actual_makespan = makespan.solution_value(&response) as i32;
+
+            // Sanity: makespan variable should be >= max(cycle_assignments)+1 (model constraint).
+            let max_cycle_from_assignments = cycle_assignments.iter().max().copied().unwrap_or(0) + 1;
+            if actual_makespan < max_cycle_from_assignments && verbose {
+                eprintln!(
+                    "  Inconsistency: makespan var={} but max(cycle_assignments)+1={}",
+                    actual_makespan, max_cycle_from_assignments
+                );
+            }
+
+            // Empty-cycle gap: when makespan > max_cycle_from_assignments, we have empty cycles.
+            let empty_count = (actual_makespan - max_cycle_from_assignments).max(0) as usize;
+            if empty_count > 0 && verbose {
+                let driven_by_bound = (actual_makespan as i64) == capacity_lower_bound;
+                eprintln!(
+                    "  Empty cycles: {} (actual_makespan={}, max_cycle_from_assignments+1={}, makespan_driven_by_capacity_bound={})",
+                    empty_count,
+                    actual_makespan,
+                    max_cycle_from_assignments,
+                    driven_by_bound
+                );
+            }
 
             // Extract shift decisions: ForceAlu => all shiftable; ForceValu => none; Optimize => from solver
             let shifted_ops: HashSet<usize> = match valu_shift_mode {
@@ -3375,6 +4009,292 @@ pub fn schedule_ssa_cpsat(
                 }
             };
 
+            // Build schedule constraints once (same as CP-SAT; used for active-set binding list and bulk-move).
+            let schedule_constraints = crate::schedule_constraints::build_ssa_schedule_constraints(
+                ops,
+                &op_id_to_idx,
+                &asap,
+                &alap,
+                &shiftable_set,
+                &shifted_ops,
+                &select_choice_with_fma_delay,
+                &select_fma_ops,
+                horizon as i32,
+            );
+
+            // Makespan active set: which constraints are binding at the solution (hold with equality).
+            if verbose {
+                let max_cycle_val = max_cycle.solution_value(&response) as i32;
+                let mut binding_ops: Vec<(usize, usize, &str)> = Vec::new(); // (idx, op_id, reason)
+                for (idx, _) in ops.iter().enumerate() {
+                    let effective_last = if shiftable_set.contains(&idx) {
+                        let is_shifted = shift_vars
+                            .get(&idx)
+                            .map(|v| v.solution_value(&response))
+                            .unwrap_or(false);
+                        if is_shifted {
+                            completion_cycle_vars
+                                .get(&idx)
+                                .map(|v| v.solution_value(&response) as i32)
+                                .unwrap_or(cycle_assignments[idx])
+                        } else {
+                            cycle_assignments[idx]
+                        }
+                    } else if let Some(&fma_last_var) = select_choice_fma_last_cycle.get(&idx) {
+                        let is_fma = select_choice_vars
+                            .get(&idx)
+                            .map(|v| v.solution_value(&response))
+                            .unwrap_or(false);
+                        if is_fma {
+                            fma_last_var.solution_value(&response) as i32
+                        } else {
+                            cycle_assignments[idx]
+                        }
+                    } else {
+                        cycle_assignments[idx]
+                    };
+                    if effective_last == max_cycle_val {
+                        let reason = if shiftable_set.contains(&idx) {
+                            if shift_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false) {
+                                "shifted (completion_cycle)"
+                            } else {
+                                "VALU cycle"
+                            }
+                        } else if select_choice_fma_last_cycle.contains_key(&idx) {
+                            if select_choice_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false) {
+                                "SelectChoice FMA (fma_last)"
+                            } else {
+                                "SelectChoice vselect"
+                            }
+                        } else {
+                            "cycle"
+                        };
+                        binding_ops.push((idx, ops[idx].id, reason));
+                    }
+                }
+                eprintln!("  [Makespan active set] makespan={} max_cycle={}", actual_makespan, max_cycle_val);
+                eprintln!("    makespan = max_cycle + 1: always binding");
+                if !binding_ops.is_empty() {
+                    eprintln!(
+                        "    max_cycle >= effective_last: {} op(s) binding (define last cycle)",
+                        binding_ops.len()
+                    );
+                    for (idx, op_id, reason) in binding_ops.iter().take(15) {
+                        eprintln!("      idx={} op.id={} {}", idx, op_id, *reason);
+                    }
+                    if binding_ops.len() > 15 {
+                        eprintln!("      ... and {} more", binding_ops.len() - 15);
+                    }
+                }
+                let m = actual_makespan as i64;
+                let binding_capacity_bounds: Vec<&str> = [
+                    (m == capacity_lower_bound, "capacity_lower_bound"),
+                    (load_bound > 0 && m == load_bound, "load_bound"),
+                    (store_bound > 0 && m == store_bound, "store_bound"),
+                ]
+                .iter()
+                .filter(|(b, _)| *b)
+                .map(|(_, name)| *name)
+                .collect();
+                if !binding_capacity_bounds.is_empty() {
+                    eprintln!(
+                        "    makespan >= X (redundant linear): binding for {}",
+                        binding_capacity_bounds.join(", ")
+                    );
+                    // Sanity: if makespan is driven by a capacity bound but the schedule has many empty cycles,
+                    // that bound may be wrong (over-constraining). Bulk-move only checks precedence/ordering/domain,
+                    // not capacity, so it cannot detect an incorrect capacity bound.
+                    if empty_count > 10 {
+                        eprintln!(
+                            "    WARNING: {} empty cycles but makespan binding on {} — bound may be incorrect (over-constraining); bulk-move cannot check capacity.",
+                            empty_count,
+                            binding_capacity_bounds.join(", ")
+                        );
+                    }
+                }
+                if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
+                    let s = shifted_ops.len() as i64;
+                    let z = select_fma_ops.len() as i64;
+                    let lhs_valu = 6 * (actual_makespan as i64) + s - 2 * z;
+                    let binding_valu = lhs_valu == valu_count;
+                    if binding_valu {
+                        eprintln!(
+                            "    Direct VALU (6*makespan + shift - 2*select_fma >= valu_count): binding (LHS={})",
+                            lhs_valu
+                        );
+                    }
+                }
+                if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
+                    let s = shifted_ops.len() as i64;
+                    let lhs_alu = 12 * (actual_makespan as i64) - 8 * s;
+                    let binding_alu = lhs_alu == alu_count;
+                    if binding_alu {
+                        eprintln!(
+                            "    Direct ALU (12*makespan - 8*shift >= alu_count): binding (LHS={})",
+                            lhs_alu
+                        );
+                    }
+                }
+                if flow_base > 0 || const_choice_count > 0 || select_choice_count > 0 {
+                    let z = select_fma_ops.len() as i64;
+                    let y = const_add_imm_ops.len() as i64;
+                    let lhs_flow = (actual_makespan as i64) + z - y;
+                    let binding_flow = lhs_flow == flow_base;
+                    if binding_flow {
+                        eprintln!(
+                            "    Direct Flow (makespan + select_fma - const_add_imm >= flow_base): binding (LHS={})",
+                            lhs_flow
+                        );
+                    }
+                }
+                if load_count > 0 && const_choice_count > 0 {
+                    let y = const_add_imm_ops.len() as i64;
+                    let lhs_load = 2 * (actual_makespan as i64) + y;
+                    let binding_load = lhs_load == load_count;
+                    if binding_load {
+                        eprintln!(
+                            "    Direct Load (2*makespan + const_add_imm >= load_count): binding (LHS={})",
+                            lhs_load
+                        );
+                    }
+                }
+                // Binding precedence/ordering/domain (same checks bulk-move uses). When bulk-move blocks, it should report one of these.
+                let binding = crate::schedule_constraints::binding_schedule_constraints(
+                    ops,
+                    &cycle_assignments,
+                    &shifted_alu_cycles,
+                    &schedule_constraints,
+                );
+                let n_precedence = binding.iter().filter(|(c, _)| matches!(c, crate::schedule_constraints::ScheduleConstraint::Precedence { .. })).count();
+                let n_ordering = binding.iter().filter(|(c, _)| matches!(c, crate::schedule_constraints::ScheduleConstraint::Ordering { .. })).count();
+                let n_domain = binding.iter().filter(|(c, _)| matches!(c, crate::schedule_constraints::ScheduleConstraint::Domain { .. })).count();
+                eprintln!(
+                    "    Binding schedule constraints (bulk-move uses these): {} precedence, {} ordering, {} domain — when bulk-move blocks, the violation should be one of these.",
+                    n_precedence, n_ordering, n_domain
+                );
+                let max_cycle_val = max_cycle.solution_value(&response) as i32;
+                use crate::schedule_constraints::dep_effective_cycle as dep_eff;
+                let binding_at_last: Vec<_> = binding
+                    .iter()
+                    .filter(|(c, _)| {
+                        match c {
+                            crate::schedule_constraints::ScheduleConstraint::Precedence {
+                                consumer_idx,
+                                dep_idx,
+                                dep_is_shifted,
+                                ..
+                            } => {
+                                let cy_c = cycle_assignments.get(*consumer_idx).copied().unwrap_or(-1);
+                                let cy_d = dep_eff(
+                                    *dep_idx,
+                                    *dep_is_shifted,
+                                    &cycle_assignments,
+                                    &shifted_alu_cycles,
+                                    ops,
+                                );
+                                cy_c == max_cycle_val || cy_d == max_cycle_val
+                            }
+                            crate::schedule_constraints::ScheduleConstraint::Ordering {
+                                before_idx,
+                                after_idx,
+                                ..
+                            } => {
+                                let before_c = cycle_assignments.get(*before_idx).copied().unwrap_or(-1);
+                                let after_c = cycle_assignments.get(*after_idx).copied().unwrap_or(-1);
+                                before_c == max_cycle_val || after_c == max_cycle_val
+                            }
+                            crate::schedule_constraints::ScheduleConstraint::Domain { idx, .. } => {
+                                cycle_assignments.get(*idx).copied().unwrap_or(-1) == max_cycle_val
+                            }
+                        }
+                    })
+                    .take(15)
+                    .collect();
+                if !binding_at_last.is_empty() {
+                    eprintln!("    Binding at last cycle (max_cycle={}):", max_cycle_val);
+                    for (c, msg) in binding_at_last {
+                        let short = match c {
+                            crate::schedule_constraints::ScheduleConstraint::Precedence { consumer_idx, dep_idx, .. } => {
+                                format!("Precedence consumer {} dep {}", consumer_idx, dep_idx)
+                            }
+                            crate::schedule_constraints::ScheduleConstraint::Ordering { before_idx, after_idx, .. } => {
+                                format!("Ordering {} <= {}", before_idx, after_idx)
+                            }
+                            crate::schedule_constraints::ScheduleConstraint::Domain { idx, .. } => {
+                                format!("Domain idx {}", idx)
+                            }
+                        };
+                        eprintln!("      {} | {}", short, msg);
+                    }
+                }
+            }
+
+            // Empty-cycle breadcrumbs: for each empty C, list all ops at C+1 and why they weren't at C (do not filter by ASAP/ALAP).
+            // Invariant: no constraint should preclude every op at C+1 from moving to C (bulk move); if they're all at C+1 it's solver/tie-breaker.
+            if verbose && empty_count > 0 {
+                let used_cycles: HashSet<i32> = cycle_assignments.iter().copied().collect();
+                let empty_cycles_list: Vec<i32> = (0..actual_makespan)
+                    .filter(|&c| !used_cycles.contains(&c))
+                    .take(15)
+                    .collect();
+                eprintln!("  [Empty-cycle breadcrumbs] {} empty cycles; showing ops at C+1 for first {} empty C",
+                    empty_count, empty_cycles_list.len());
+                for &c in &empty_cycles_list {
+                    for (idx, &cy) in cycle_assignments.iter().enumerate() {
+                        if cy != c + 1 {
+                            continue;
+                        }
+                        let op = &ops[idx];
+                        let op_id = op.id;
+                        let engine_str = op.engine.as_str();
+                        let opcode_str = format!("{:?}", op.opcode);
+                        let mut latest_dep_result = -1i32;
+                        let mut blocking_dep_id = 0usize;
+                        let mut blocking_dep_opcode = String::new();
+                        let mut blocking_dep_cycle = -1i32;
+                        for &dep_id in &op.dep_ids {
+                            let Some(&dep_idx) = op_id_to_idx.get(&dep_id) else {
+                                continue;
+                            };
+                            let dep_cycle = cycle_assignments[dep_idx];
+                            let result_cycle = if select_choice_with_fma_delay.contains(&dep_idx)
+                                && select_fma_ops.contains(&dep_id)
+                            {
+                                dep_cycle + 2
+                            } else {
+                                dep_cycle + 1
+                            };
+                            if result_cycle > latest_dep_result {
+                                latest_dep_result = result_cycle;
+                                blocking_dep_id = dep_id;
+                                blocking_dep_opcode = format!("{:?}", ops[dep_idx].opcode);
+                                blocking_dep_cycle = dep_cycle;
+                            }
+                        }
+                        // Result at cycle R means consumer can run at R or later. So op is blocked from C only when latest_dep_result > C.
+                        if latest_dep_result > c {
+                            eprintln!(
+                                "  Empty {}: op id={} (engine={}, opcode={}) at C+1 blocked by precedence: dep id={} (opcode={}) at cycle {} -> result at {}.",
+                                c, op_id, engine_str, opcode_str, blocking_dep_id, blocking_dep_opcode, blocking_dep_cycle, latest_dep_result
+                            );
+                        } else {
+                            eprintln!(
+                                "  Empty {}: op id={} (engine={}, opcode={}) at C+1 could run at C (BUG: should not be at C+1); latest dep result at {}.",
+                                c, op_id, engine_str, opcode_str, latest_dep_result
+                            );
+                            let op_asap = *asap.get(&op_id).unwrap_or(&0);
+                            let op_alap = *alap.get(&op_id).unwrap_or(&(horizon as i32 - 1));
+                            if c < op_asap || c > op_alap {
+                                eprintln!(
+                                    "    BUG: ASAP/ALAP excludes empty cycle {} (asap={}, alap={})",
+                                    c, op_asap, op_alap
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Solution breadcrumbs: log Flow audit when verbose (before validation)
             if verbose {
                 let (flow_rows, flow_per_cycle, _) =
@@ -3439,6 +4359,21 @@ pub fn schedule_ssa_cpsat(
             verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_fma_ops);
 
             if verbose {
+                // Verify objective structure: objective = scale*makespan + tie_breaker, so floor(objective/scale) should equal makespan.
+                if let Some(scale) = objective_scale {
+                    let obj_val = response.objective_value;
+                    let recovered_makespan = (obj_val / (scale as f64)).floor() as i32;
+                    if (recovered_makespan - actual_makespan).abs() > 1 {
+                        eprintln!(
+                            "  Objective structure check: objective_value={:.0}, scale={}, floor(obj/scale)={} vs actual_makespan={}",
+                            obj_val, scale, recovered_makespan, actual_makespan
+                        );
+                    }
+                    eprintln!(
+                        "  Objective: scale={}, so makespan is leading digits (floor({:.0}/{})= {}), tie-breaker in lower digits",
+                        scale, obj_val, scale, recovered_makespan
+                    );
+                }
                 let summary = summarise_ssa_solution_engines_and_choices(
                     ops,
                     &cycle_assignments,
@@ -3450,6 +4385,37 @@ pub fn schedule_ssa_cpsat(
                     "SSA CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
                     actual_makespan, best_bound, status, gap * 100.0, solve_time
                 );
+                // One-line active set summary for debugging (full "[Makespan active set]" is printed earlier).
+                {
+                    let max_cycle_val = max_cycle.solution_value(&response) as i32;
+                    let mut n_binding_ops = 0usize;
+                    for (idx, _) in ops.iter().enumerate() {
+                        let effective_last = if shiftable_set.contains(&idx) {
+                            let is_shifted = shift_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false);
+                            if is_shifted {
+                                completion_cycle_vars.get(&idx).map(|v| v.solution_value(&response) as i32).unwrap_or(cycle_assignments[idx])
+                            } else {
+                                cycle_assignments[idx]
+                            }
+                        } else if let Some(&fma_last_var) = select_choice_fma_last_cycle.get(&idx) {
+                            let is_fma = select_choice_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false);
+                            if is_fma { fma_last_var.solution_value(&response) as i32 } else { cycle_assignments[idx] }
+                        } else {
+                            cycle_assignments[idx]
+                        };
+                        if effective_last == max_cycle_val {
+                            n_binding_ops += 1;
+                        }
+                    }
+                    let m = actual_makespan as i64;
+                    let capacity_binding = m == capacity_lower_bound
+                        || (load_bound > 0 && m == load_bound)
+                        || (store_bound > 0 && m == store_bound);
+                    eprintln!(
+                        "  Active set: {} op(s) at last cycle (max_cycle={}); capacity_bound_binding={} (see [Makespan active set] above for details)",
+                        n_binding_ops, max_cycle_val, capacity_binding
+                    );
+                }
                 let makespan_usize = actual_makespan as usize;
                 let alu_capacity = machine.alu_slots as usize * makespan_usize;
                 let valu_capacity = machine.valu_slots as usize * makespan_usize;
@@ -3504,21 +4470,197 @@ pub fn schedule_ssa_cpsat(
                 );
             }
 
+            // schedule_constraints already built above (for active set and bulk-move).
+
+            // When CP-SAT returns a makespan > actual last cycle (empty cycles), try to compact and use
+            // the compacted schedule so the pipeline gets a tight makespan and CP-SAT effectively optimizes.
+            let mut out_cycle_assignments = cycle_assignments;
+            let mut out_shifted_alu_cycles = shifted_alu_cycles;
+            let mut out_makespan = actual_makespan as usize;
+            let mut out_empty_count = empty_count;
+
+            if empty_count > 0 {
+                // Check capacity first: validate current schedule (with empty cycles) satisfies per-cycle slot limits.
+                // If it doesn't, we'd catch a bug before attempting compaction.
+                if let Err(e) = try_validate_ssa_slot_limits(
+                    ops,
+                    &out_cycle_assignments,
+                    &shifted_ops,
+                    &out_shifted_alu_cycles,
+                    &const_add_imm_ops,
+                    &select_fma_ops,
+                    &machine,
+                ) {
+                    if verbose {
+                        eprintln!(
+                            "  [compact] Schedule already violates capacity before bulk-move: {}",
+                            e
+                        );
+                    }
+                }
+                let mut compact_cycles = out_cycle_assignments.clone();
+                let mut compact_shifted = out_shifted_alu_cycles
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                use crate::schedule_constraints::{run_bulk_move_simulator, BulkMoveResult};
+                let bulk_result = run_bulk_move_simulator(
+                    ops,
+                    &mut compact_cycles,
+                    &mut compact_shifted,
+                    &schedule_constraints,
+                    actual_makespan as i32,
+                    false,
+                );
+                match &bulk_result {
+                    BulkMoveResult::ReachedEnd {
+                        original_max_cycle_plus_one,
+                        final_max_cycle_plus_one,
+                        steps,
+                    } if *final_max_cycle_plus_one < *original_max_cycle_plus_one => {
+                        let compacted = *final_max_cycle_plus_one as i64;
+                        use crate::schedule_constraints::check_schedule_constraints;
+                        let constraints_ok = check_schedule_constraints(
+                            ops,
+                            &compact_cycles,
+                            &compact_shifted,
+                            &schedule_constraints,
+                        );
+                        let capacity_ok = try_validate_ssa_slot_limits(
+                            ops,
+                            &compact_cycles,
+                            &shifted_ops,
+                            &compact_shifted,
+                            &const_add_imm_ops,
+                            &select_fma_ops,
+                            &machine,
+                        );
+                        if constraints_ok.is_ok() && capacity_ok.is_ok() {
+                            out_cycle_assignments = compact_cycles;
+                            out_shifted_alu_cycles = compact_shifted
+                                .into_iter()
+                                .map(|(k, v)| (k, v))
+                                .collect();
+                            out_makespan = (*final_max_cycle_plus_one) as usize;
+                            out_empty_count = 0;
+                            if verbose {
+                                eprintln!(
+                                    "  [compact] Using compacted schedule: makespan {} -> {} ({} steps); empty cycles eliminated.",
+                                    original_max_cycle_plus_one, final_max_cycle_plus_one, steps
+                                );
+                            }
+                        } else if verbose {
+                            eprintln!(
+                                "  [compact diagnostic] Bulk-move reduced makespan {} -> {} ({} steps). Capacity LB={}.",
+                                original_max_cycle_plus_one,
+                                final_max_cycle_plus_one,
+                                steps,
+                                capacity_lower_bound
+                            );
+                            if let Err(v) = &constraints_ok {
+                                eprintln!(
+                                    "  [compact diagnostic] Compacted schedule violates constraints: {}",
+                                    v.message
+                                );
+                            }
+                            if let Err(e) = &capacity_ok {
+                                eprintln!(
+                                    "  [compact diagnostic] Compacted schedule violates capacity: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if verbose && out_empty_count > 0 {
+                    if let BulkMoveResult::ReachedEnd {
+                        original_max_cycle_plus_one,
+                        final_max_cycle_plus_one,
+                        steps,
+                    } = &bulk_result
+                    {
+                        if *final_max_cycle_plus_one < *original_max_cycle_plus_one {
+                            let compacted = *final_max_cycle_plus_one as i64;
+                            if capacity_lower_bound > compacted {
+                                eprintln!(
+                                    "  [compact diagnostic] Cause (2): capacity LB was too high ({} > {}).",
+                                    capacity_lower_bound, compacted
+                                );
+                            } else {
+                                eprintln!(
+                                    "  [compact diagnostic] Cause (1): LB is fine ({} <= {}). A constraint in the model forbids the tighter schedule.",
+                                    capacity_lower_bound, compacted
+                                );
+                            }
+                        }
+                    } else if let BulkMoveResult::Blocked { empty_c, violation, steps } = &bulk_result {
+                        eprintln!(
+                            "  [compact diagnostic] Bulk-move blocked at empty cycle {} after {} steps: {}",
+                            empty_c, steps, violation.message
+                        );
+                        let binding = crate::schedule_constraints::binding_schedule_constraints(
+                            ops,
+                            &out_cycle_assignments,
+                            &out_shifted_alu_cycles,
+                            &schedule_constraints,
+                        );
+                        let in_active_set = binding.iter().any(|(c, _)| c == &violation.constraint);
+                        if in_active_set {
+                            eprintln!(
+                                "  [compact diagnostic] Blocking constraint IS in active set (binding) — bulk-move correctly identified a tight constraint."
+                            );
+                        } else {
+                            eprintln!(
+                                "  [compact diagnostic] Blocking constraint NOT in active set (binding) — possible bug: constraint was not tight in current solution."
+                            );
+                            let short = match &violation.constraint {
+                                crate::schedule_constraints::ScheduleConstraint::Precedence {
+                                    consumer_idx,
+                                    dep_idx,
+                                    result_offset,
+                                    dep_is_shifted,
+                                } => format!(
+                                    "Precedence consumer_idx={} dep_idx={} result_offset={} dep_is_shifted={}",
+                                    consumer_idx, dep_idx, result_offset, dep_is_shifted
+                                ),
+                                crate::schedule_constraints::ScheduleConstraint::Ordering {
+                                    before_idx,
+                                    after_idx,
+                                } => format!("Ordering before_idx={} after_idx={}", before_idx, after_idx),
+                                crate::schedule_constraints::ScheduleConstraint::Domain { idx, lb, ub } => {
+                                    format!("Domain idx={} lb={} ub={}", idx, lb, ub)
+                                }
+                            };
+                            eprintln!("  [compact diagnostic] Blocking constraint: {}", short);
+                        }
+                    }
+                }
+            }
+
             Some(SsaCpsatResult {
-                cycle_assignments,
-                makespan: actual_makespan as usize,
+                cycle_assignments: out_cycle_assignments,
+                makespan: out_makespan,
                 status,
                 solve_time_secs: solve_time,
                 gap,
                 shifted_ops,
-                shifted_alu_cycles,
+                shifted_alu_cycles: out_shifted_alu_cycles,
                 const_add_imm_ops,
                 select_fma_ops,
+                empty_cycle_count: out_empty_count,
+                makespan_driven_by_capacity: (out_makespan as i64) == capacity_lower_bound,
+                schedule_constraints,
             })
         }
         _ => {
             if verbose {
                 eprintln!("SSA CP-SAT: no solution found, status {:?}", status);
+                if status == CpsatStatus::Unknown {
+                    eprintln!(
+                        "  (Unknown usually means time limit or incomplete hint; ensure cycle, ConstChoice, SelectChoice, and segment vars are hinted.)"
+                    );
+                }
             }
             None
         }
@@ -3595,6 +4737,45 @@ mod ssa_tests {
         // Note: AddImm operations can use address 0 directly without waiting for zero
         // to be "ready" since scratch memory is always initialized to 0 at startup.
         // There is no precedence constraint requiring zero to be scheduled before AddImm.
+    }
+
+    /// Sanity check: ForceAddImm must be feasible. If this fails, AddImm constraints are wrong.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_constchoice_force_add_imm_feasible() {
+        let mut emit = SsaEmitContext::new();
+        let _zero = emit.emit_const(0);
+        let c1 = emit.emit_const_choice(1);
+        let c2 = emit.emit_const_choice(2);
+        let _sum = emit.emit_alu(Opcode::Add, c1, c2);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                stop_after_first_solution: true,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                const_choice_mode: ConstChoiceMode::ForceAddImm,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+        );
+        assert!(
+            result.is_some(),
+            "ForceAddImm must be feasible; if this fails, AddImm constraints are wrong"
+        );
+        let r = result.unwrap();
+        let n_const = emit.ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+        assert_eq!(
+            r.const_add_imm_ops.len(),
+            n_const,
+            "ForceAddImm: all ConstChoice ops must be AddImm"
+        );
     }
 
     #[cfg(feature = "cpsat")]
@@ -6386,6 +7567,7 @@ mod tests {
                 shift_hints: None,
                 forced_shifts: None,
                 select_choice_hints: None,
+                const_add_imm_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
