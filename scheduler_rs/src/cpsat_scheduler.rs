@@ -3797,7 +3797,13 @@ pub fn schedule_ssa_cpsat(
     }
     // Always log search progress by default - user must go out of their way to suppress
     params.log_search_progress = Some(true);
-    params.num_workers = Some(8);
+    // With multiple workers, CP-SAT may keep improving after one worker finds a feasible solution;
+    // use a single worker when we only need feasibility so stop_after_first_solution is honored.
+    params.num_workers = if stop_after_first_solution {
+        Some(1)
+    } else {
+        Some(8)
+    };
 
     // Gap limit: default uses scale/3 for faster convergence, but can force 0 for debugging.
     // Stop when gap <= scale/3: remaining improvement is only in the tie-breaker (sum of completion_cycle).

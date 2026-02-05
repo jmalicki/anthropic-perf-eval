@@ -747,6 +747,8 @@ impl SsaTickTockKernelBuilder {
                     live_through_for_section(&ssa_ops, &boundaries, k, &vreg_def_sec);
                 // Per-section never uses VALU shift (avoids extra scratch pressure in segment).
                 // Feasibility: we require a feasible solution; give enough time and stop as soon as we find one.
+                // SSA CP-SAT uses num_workers=1 when stop_after_first_solution is true so the solver
+                // actually stops at the first feasible (multi-worker would keep improving past it).
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false), // Short optimization run
                     _ => {
