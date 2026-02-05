@@ -27,4 +27,4 @@
 
 **Fix:** In `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`, after the per-section loop we now **rebase** every section that did *not* run per-section CP-SAT: for each such section, set `op.cycle = section_offset + (op.cycle - min_c)` so that section occupies `[section_offset, section_offset + span)`. Then advance `section_offset` by that span. The merged schedule is thus a strict concatenation of sections.
 
-**If overflow still appears:** The hint may still violate VALU/ALU in other cases, e.g. the **initial** greedy schedule (before any per-section CP-SAT) can exceed capacity within a single section. Hint verification and “CP-SAT will rebalance” remain in `scheduler_rs/src/cpsat_scheduler.rs`; only the first 3 VALU and first 3 ALU violations are printed.
+**Verification:** We are allowed to exceed scratch in the greedy scheduler, but not slot constraints. If the merged hint ever has VALU/ALU capacity violations, `scheduler_rs/src/cpsat_scheduler.rs` panics (merge bug or single-section schedule exceeding capacity).

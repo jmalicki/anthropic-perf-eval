@@ -3290,15 +3290,15 @@ pub fn schedule_ssa_cpsat(
         }
 
         if valu_violations > 0 || alu_violations > 0 {
-            // This can happen when merging independent section schedules. Each section's CP-SAT
-            // respects VALU limits locally, but when merged, sections can overlap on VALU cycles.
-            // The full-kernel CP-SAT will rebalance as needed. Warn but don't panic.
-            if verbose {
-                eprintln!(
-                    "  Note: Merged hint has engine capacity issues (VALU: {}, ALU: {}). CP-SAT will rebalance.",
-                    valu_violations, alu_violations
-                );
-            }
+            // Merged hint must be strict concatenation of sections in time; we are allowed to exceed
+            // scratch in the greedy scheduler, but never slot constraints. If the hint violates
+            // VALU/ALU capacity, the merge/rebasing logic is wrong or a single-section schedule
+            // exceeded capacity (both are bugs).
+            panic!(
+                "Merged hint violates engine capacity (VALU: {} cycles, ALU: {} cycles). \
+                 Slot limits must never be exceeded; scratch may be exceeded in greedy, but not VALU/ALU.",
+                valu_violations, alu_violations
+            );
         }
 
         if verbose {
