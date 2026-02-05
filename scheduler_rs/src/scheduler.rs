@@ -1393,6 +1393,27 @@ pub fn compute_dependencies(ops: &mut [Op]) {
     }
 }
 
+/// Cycles that have no op emitted (skip ShiftedValu and EliminatedBroadcast).
+pub fn empty_cycles(
+    ops: &[Op],
+    expanded_ops: &[Op],
+    max_cycle: usize,
+) -> Vec<usize> {
+    let used: HashSet<i32> = ops
+        .iter()
+        .filter(|op| {
+            op.cycle >= 0
+                && op.engine != Engine::ShiftedValu
+                && op.engine != Engine::EliminatedBroadcast
+        })
+        .map(|op| op.cycle)
+        .chain(expanded_ops.iter().filter(|op| op.cycle >= 0).map(|op| op.cycle))
+        .collect();
+    (0..max_cycle)
+        .filter(|&c| !used.contains(&(c as i32)))
+        .collect()
+}
+
 // ============================================================================
 // Post-Scheduling Slot Filling
 // ============================================================================
