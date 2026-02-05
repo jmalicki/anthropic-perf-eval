@@ -3007,6 +3007,35 @@ pub fn schedule_ssa_cpsat(
                 scratch_demands.push(demand);
             }
 
+            // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
+            // These VRegs are not in live_vregs (because vreg_last_use only includes uses within the segment),
+            // but they must be accounted for in scratch since they're live until segment end.
+            if let Some(lo) = live_out_vregs {
+                if let Some(seg_end) = segment_end_var {
+                    for vreg in lo {
+                        // Only add if not already processed (not in live_vregs)
+                        if !live_vregs.contains(vreg) {
+                            // This VReg is defined in segment but only used after
+                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                let start = cycle_vars[def_idx];
+                                let end_expr = LinearExpr::from(seg_end) + 1;
+                                let size = model.new_int_var_with_name(
+                                    [(1, horizon + 1)],
+                                    format!("live_out_size_{}", vreg.id),
+                                );
+                                model.add_eq(
+                                    LinearExpr::from(start) + LinearExpr::from(size),
+                                    end_expr.clone(),
+                                );
+                                let interval = model.new_interval_var(start, size, end_expr);
+                                scratch_intervals.push(interval);
+                                scratch_demands.push(vreg.size() as i64);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Segment mode: add fixed [0, last_use_cycle+1] intervals for live-in VRegs
             if let Some(il) = initial_live {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
@@ -3178,6 +3207,20 @@ pub fn schedule_ssa_cpsat(
                     let size = vreg.size() as i64;
                     events.push((def_cycle, size)); // VReg becomes live
                     events.push((last_use_cycle + 1, -size)); // VReg dies after last use
+                }
+                // Add live_out VRegs that are defined in segment but not used within segment
+                if let Some(lo) = live_out_vregs {
+                    for vreg in lo {
+                        if !live_vregs.contains(vreg) {
+                            // This VReg is defined in segment but only used after
+                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                                let size = vreg.size() as i64;
+                                events.push((def_cycle, size)); // VReg becomes live
+                                events.push((max_hint + 1, -size)); // VReg dies at segment end
+                            }
+                        }
+                    }
                 }
                 // SelectChoice FMA sub_temp: live [c, c+2)
                 if let Some(fma_ids) = select_choice_hints {

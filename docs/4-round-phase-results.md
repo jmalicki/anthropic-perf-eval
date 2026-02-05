@@ -100,7 +100,7 @@ For a segment (one section’s ops), CP-SAT gets:
 
 - **Segment ops** – Only ops in that section (by *op index* in the full list; section = `boundaries[k]`).
 - **initial_live** – VRegs live at segment start: defined in an earlier section, last use in *this* section. From `live_in_for_section`; each entry is `(VReg, segment_last_use_idx)`.
-- **live_out** – VRegs defined in *this* section, last use in a *later* section. Must stay live until segment end.
+- **live_out** – VRegs defined in *this* section, last use in a *later* section. Must stay live until segment end. **Fixed:** The segment scratch model now correctly includes all live_out VRegs, even those not used within the segment (previously only VRegs with uses within the segment were included, causing underestimation).
 - **live_through** – VRegs defined in an *earlier* section, last use in a *later* section. Live for the whole segment `[0, segment_end]`.
 
 Section membership is by **op index** (which ops fall in `boundaries[k]`), not by cycle. Liveness uses **cycles** (def_cycle, last_use_cycle). So we mix “section by index” with “live range by cycle”.
@@ -143,7 +143,17 @@ So in theory the segment scratch model should match “this section’s cycles i
 
 ---
 
-#### 4. Filtering and indices
+#### 4. ~~live_out VRegs missing from segment scratch model~~ (FIXED)
+
+**Symptom:** Per-section CP-SAT found a feasible solution within scratch budget, but post-merge check reported the same section exceeded budget (e.g., section 13: peak 1594 words vs budget 1536).
+
+**Root cause:** The segment scratch model in `cpsat_scheduler.rs` collected `live_vregs` by filtering `vreg_def_op.keys()` to only include VRegs that had a use *within the segment* (`vreg_last_use.contains_key(v)`). This excluded VRegs defined in the segment but only used *after* the segment (true `live_out` VRegs), causing the model to underestimate peak scratch. The post-merge check correctly included these VRegs, leading to a mismatch.
+
+**Fix.** After building scratch intervals for `live_vregs`, add missing `live_out` VRegs that are defined in the segment but not used within it. For each such VReg, add an interval `[def_cycle, segment_end+1)` to the scratch model. Also updated hint verification to include these VRegs. `scheduler_rs/src/cpsat_scheduler.rs` (lines ~3009-3030 for scratch model, ~3210-3224 for hint verification). Unit tests added in `round_budget.rs` to verify `sections_exceeding_budget` correctly counts live_out VRegs.
+
+---
+
+#### 5. Filtering and indices
 
 Before per-section CP-SAT we filter out AddImm alternatives from the *segment* ops (same logic as full-kernel CP-SAT: remove the AddImm op when a Const op with the same dest exists). Segment hints are then aligned to the *filtered* segment (one hint per filtered op, in order). If any indexing or hint mapping is off — e.g. `segment_last_use_idx` in `initial_live` refers to segment op indices, and the segment is filtered — then the scratch model's notion of "which op last uses this VReg" or "which cycle range an initial_live VReg occupies" could be wrong. That could make the segment model optimistic (under-count overlap) or pessimistic; if optimistic, the merged schedule can exceed 1536. The exact failure mode depends on how `live_in_for_section` and the CP-SAT segment code map segment indices to ops and cycles; any mismatch between filtered segment order and the full-kernel op list can cause inconsistency.
 

@@ -814,4 +814,76 @@ mod tests {
             "Section 3 has no live-through (all last uses in section 3)"
         );
     }
+
+    /// Test that live_out VRegs (defined in section, used after) are counted correctly in peak calculation.
+    /// This validates that sections_exceeding_budget correctly accounts for VRegs that extend beyond
+    /// the section's cycle range.
+    #[test]
+    fn test_live_out_vregs_counted_in_peak() {
+        // Create 3 sections: section 1 defines VReg A (only used in section 2)
+        let vreg_a = VReg::scalar(100);
+        let vreg_1 = VReg::scalar(1);
+        let vreg_3 = VReg::scalar(3);
+
+        // Section 0: some ops
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Alu, Opcode::Add, Some(vreg_1), vec![], vec![], 0),
+            // Barrier between section 0 and 1
+            make_barrier_with_cycle(10, vec![0], 5),
+            // Section 1: defines A at cycle 10
+            make_op_with_cycle(1, Engine::Alu, Opcode::Add, Some(vreg_a), vec![], vec![10], 10),
+            // Barrier between section 1 and 2
+            make_barrier_with_cycle(11, vec![1], 15),
+            // Section 2: uses A at cycle 20
+            make_op_with_cycle(
+                2,
+                Engine::Alu,
+                Opcode::Add,
+                Some(vreg_3),
+                vec![Operand::VReg(vreg_a)],
+                vec![1, 11],
+                20,
+            ),
+        ];
+
+        // Check section 1's peak: A should be counted as live throughout section 1 (cycle 10)
+        // even though it's only used in section 2 (cycle 20)
+        let result = sections_exceeding_budget(&ops, 1000, None, None);
+        assert_eq!(result.section_peaks.len(), 3);
+        // Section 1 should have peak >= vreg_a.size() (A is live at cycle 10)
+        assert!(
+            result.section_peaks[1] >= vreg_a.size(),
+            "Section 1 peak should include live_out VReg A"
+        );
+    }
+
+    /// Test that sections_exceeding_budget correctly handles VRegs defined and used within a section.
+    /// This is a sanity check that regular VRegs (not live_out) are counted correctly.
+    #[test]
+    fn test_regular_vregs_counted_in_peak() {
+        // Section 0: defines VReg A at cycle 5, uses it at cycle 10
+        let vreg_a = VReg::scalar(100);
+        let vreg_200 = VReg::scalar(200);
+
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Alu, Opcode::Add, Some(vreg_a), vec![], vec![], 5),
+            make_op_with_cycle(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(vreg_200),
+                vec![Operand::VReg(vreg_a)],
+                vec![0],
+                10,
+            ),
+        ];
+
+        let result = sections_exceeding_budget(&ops, 1000, None, None);
+        assert_eq!(result.section_peaks.len(), 1);
+        // Peak should be at least vreg_a.size() (A is live from cycle 5 to 10)
+        assert!(
+            result.section_peaks[0] >= vreg_a.size(),
+            "Section 0 peak should include VReg A"
+        );
+    }
 }
