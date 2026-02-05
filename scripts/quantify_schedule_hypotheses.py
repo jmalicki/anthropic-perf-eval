@@ -78,6 +78,98 @@ def vbroadcast_eliminability(data, shifted, consumers_by_id):
     return eliminable, slots_by_cycle
 
 
+def vbroadcast_elimination_asap_impact(data, shifted, consumers_by_id):
+    """
+    Find chains vbroadcast → valu1 (shifted only) → valu2. If we eliminate the vbroadcast
+    (feed valu1 via 8 scalar constants at cycle 0), valu1 can complete at cycle 1,
+    so valu2's ASAP drops from 1+completion(valu1) to 2.
+    Returns (list of (vb_id, vb_cycle, valu1_id, completion_valu1, valu2_id, asap_current, asap_if_elim, reduction), set of vbroadcast ids that are profitably eliminable).
+    """
+    ops = data.get("ops", [])
+    op_by_id = {op["id"]: op for op in ops if "id" in op}
+    EARLIEST_SCALAR = 0
+    VALU1_COMPLETION_IF_ELIM = EARLIEST_SCALAR + 1
+    VALU2_ASAP_IF_ELIM = VALU1_COMPLETION_IF_ELIM + 1
+
+    chains = []
+    vb_profitable = set()
+
+    for op in ops:
+        if op.get("engine", "").lower() != "valu" or (op.get("opcode") or "").strip() != "vbroadcast":
+            continue
+        vb_id = op["id"]
+        vb_cycle = op.get("cycle", 0)
+        valu1_list = consumers_by_id.get(vb_id, [])
+        for valu1 in valu1_list:
+            v1_id = valu1["id"]
+            if v1_id not in shifted or len(shifted[v1_id]) < VLEN:
+                continue
+            completion_v1 = max(shifted[v1_id])
+            valu2_list = consumers_by_id.get(v1_id, [])
+            for valu2 in valu2_list:
+                v2_id = valu2["id"]
+                asap_current = 1 + completion_v1
+                asap_if_elim = VALU2_ASAP_IF_ELIM
+                reduction = asap_current - asap_if_elim
+                if reduction <= 0:
+                    continue
+                chains.append((vb_id, vb_cycle, v1_id, completion_v1, v2_id, asap_current, asap_if_elim, reduction))
+                vb_profitable.add(vb_id)
+
+    return chains, vb_profitable
+
+
+def vbroadcast_shift_elimination_chains(data, shifted, consumers_by_id):
+    """
+    Find all chains vbroadcast → valu1 → valu2 (valu1 any VALU op, not necessarily shifted).
+    Combined transform: shift valu1 to ALU + eliminate vbroadcast (feed valu1 via 8 scalars at cycle 0)
+    → valu1 completes at 1, so valu2 ASAP = 2.
+    Returns (chains with (vb_id, vb_cycle, valu1_id, valu1_cycle, completion_v1, valu1_already_shifted, valu2_id, asap_current, asap_if_combined, reduction), set of vb ids with positive reduction).
+    """
+    ops = data.get("ops", [])
+    op_by_id = {op["id"]: op for op in ops if "id" in op}
+    EARLIEST_SCALAR = 0
+    VALU1_COMPLETION_IF_ELIM = EARLIEST_SCALAR + 1
+    VALU2_ASAP_IF_ELIM = VALU1_COMPLETION_IF_ELIM + 1
+
+    chains = []
+    vb_profitable = set()
+
+    for op in ops:
+        if op.get("engine", "").lower() != "valu" or (op.get("opcode") or "").strip() != "vbroadcast":
+            continue
+        vb_id = op["id"]
+        vb_cycle = op.get("cycle", 0)
+        valu1_list = consumers_by_id.get(vb_id, [])
+        for valu1 in valu1_list:
+            v1_id = valu1["id"]
+            # valu1 must be VALU (consumer of vbroadcast is typically VALU)
+            if (valu1.get("engine") or "").lower() != "valu":
+                continue
+            if v1_id in shifted and len(shifted[v1_id]) >= VLEN:
+                completion_v1 = max(shifted[v1_id])
+                v1_already_shifted = True
+            else:
+                completion_v1 = valu1.get("cycle", 0)
+                v1_already_shifted = False
+            v1_cycle = valu1.get("cycle", 0)
+            valu2_list = consumers_by_id.get(v1_id, [])
+            for valu2 in valu2_list:
+                v2_id = valu2["id"]
+                asap_current = 1 + completion_v1
+                asap_if_elim = VALU2_ASAP_IF_ELIM
+                reduction = asap_current - asap_if_elim
+                if reduction <= 0:
+                    continue
+                chains.append((
+                    vb_id, vb_cycle, v1_id, v1_cycle, completion_v1, v1_already_shifted,
+                    v2_id, asap_current, asap_if_elim, reduction,
+                ))
+                vb_profitable.add(vb_id)
+
+    return chains, vb_profitable
+
+
 def element_wise_slack(data, shifted):
     """Return (slack_list per (producer_id, consumer_id), theoretical_cycle_saving)."""
     ops = data.get("ops", [])
@@ -136,6 +228,57 @@ def early_slot_slack(data, total_cycles, num_deciles=2):
         cycles_with_alu = [c for c in range(c_lo, c_hi) if alu[c] < alu_cap]
         result.append((d, c_lo, c_hi - 1, alu_slack, valu_slack, cycles_with_alu))
     return result
+
+
+def asap_bounds(data, shifted):
+    """
+    Compute precedence-based ASAP for each op.
+    - ASAP (current): 1 + max over deps of completion_cycle. Shifted dep completion = max(alu_cycles).
+    - ASAP_per_lane: 1 + max over deps of (min(alu_cycles)+0 for shifted, else dep_cycle); i.e. consumer
+      could start at 1 + max(min(alu_cycles) for shifted deps, dep_cycle for others). So completion
+      for per-lane = min(alu_cycles) for shifted (earliest lane completes), else dep_cycle.
+    Returns list of (op, asap, asap_per_lane, limiting_dep_id, completion_max, completion_min).
+    """
+    ops = data.get("ops", [])
+    op_by_id = {op["id"]: op for op in ops if "id" in op}
+    results = []
+    for op in ops:
+        op_id = op["id"]
+        dep_ids = op.get("dep_ids") or []
+        if not dep_ids:
+            asap = 0
+            asap_per_lane = 0
+            limiting = None
+            comp_max_lim = comp_min_lim = None
+        else:
+            completions_max = []
+            completions_min = []
+            for d in dep_ids:
+                if d in shifted and len(shifted[d]) >= VLEN:
+                    completions_max.append(max(shifted[d]))
+                    completions_min.append(min(shifted[d]))
+                elif d in op_by_id:
+                    c = op_by_id[d].get("cycle", 0)
+                    completions_max.append(c)
+                    completions_min.append(c)
+                else:
+                    completions_max.append(-1)
+                    completions_min.append(-1)
+            comp_max = max(completions_max) if completions_max else -1
+            comp_min = max(completions_min) if completions_min else -1
+            asap = 1 + comp_max
+            asap_per_lane = 1 + comp_min
+            # Which dep limited (the one with max completion for current ASAP)
+            limiting = dep_ids[completions_max.index(comp_max)] if dep_ids else None
+            comp_max_lim = comp_min_lim = None
+            if limiting and limiting in shifted and len(shifted.get(limiting, [])) >= VLEN:
+                comp_max_lim = max(shifted[limiting])
+                comp_min_lim = min(shifted[limiting])
+            elif limiting and limiting in op_by_id:
+                comp_max_lim = op_by_id[limiting].get("cycle")
+                comp_min_lim = comp_max_lim
+        results.append((op, asap, asap_per_lane, limiting, comp_max_lim, comp_min_lim))
+    return results
 
 
 def decile0_constchoice(data):
@@ -244,6 +387,56 @@ def main():
                     )
         print()
 
+    # --- Vbroadcast elimination + VALU shift (combined) ---
+    if md:
+        print("## Vbroadcast elimination + VALU shift (combined)\n")
+    else:
+        print("=== Vbroadcast elimination + VALU shift (combined) ===\n")
+    vb_count = len([o for o in data.get("ops", []) if (o.get("engine") or "").lower() == "valu" and (o.get("opcode") or "").strip() == "vbroadcast"])
+    combined_chains, vb_profitable_combined = vbroadcast_shift_elimination_chains(data, shifted if shifted else {}, consumers_by_id)
+    print(
+        "Chains vb → valu1 → valu2: if we **combine** (1) shift valu1 to ALU and (2) eliminate vbroadcast (feed valu1 via 8 scalars at cycle 0), then valu1 completes at 1 and valu2's ASAP drops to 2."
+    )
+    print(f"Vbroadcasts that can be profitably eliminated with this combined transform: {len(vb_profitable_combined)} (of {vb_count} total)")
+    print(f"Chains with positive ASAP reduction: {len(combined_chains)}")
+    if combined_chains:
+        already_shifted = sum(1 for c in combined_chains if c[5])
+        print(f"Of those chains: valu1 already shifted in {already_shifted}, would need to shift in {len(combined_chains) - already_shifted}")
+        chains = combined_chains
+        chains.sort(key=lambda c: (-c[9], c[1]))
+        vb_id, vb_cycle, v1_id, v1_cycle, completion_v1, v1_already_shifted, v2_id, asap_cur, asap_elim, reduction = chains[0]
+        op_by_id = {op["id"]: op for op in data.get("ops", []) if "id" in op}
+        v1 = op_by_id.get(v1_id, {})
+        v2 = op_by_id.get(v2_id, {})
+        print("\n**Example chain:**")
+        print(f"  vbroadcast id={vb_id} at cycle {vb_cycle}")
+        print(f"  → valu1 id={v1_id} ({v1.get('opcode', '')}), cycle={v1_cycle}, completion={completion_v1}, already_shifted={v1_already_shifted}")
+        print(f"  → valu2 id={v2_id} ({v2.get('opcode', '')}), scheduled cycle {v2.get('cycle', '?')}")
+        print(f"  Current: valu2 ASAP = 1 + completion(valu1) = {asap_cur}. Combine: shift valu1 to ALU (if not already) + eliminate vb (feed valu1 via 8 scalars at 0) → valu1 completes at 1, valu2 ASAP = 2.")
+        print(f"  **ASAP reduction for valu2: {asap_cur} → 2 (reduction = {reduction} cycles).**")
+        n_show = min(12, len(chains))
+        print(f"\nChains with largest ASAP reduction (up to {n_show}):")
+        if md:
+            print("\n| vb id | vb cycle | valu1 id | valu1 shifted? | completion(valu1) | valu2 id | ASAP current | ASAP if combined | reduction |")
+            print("|-------|----------|----------|-----------------|-------------------|----------|--------------|------------------|-----------|")
+        for c in chains[:n_show]:
+            vb_id, vb_cycle, v1_id, v1_cycle, completion_v1, v1_already_shifted, v2_id, asap_cur, asap_elim, reduction = c
+            ys = "yes" if v1_already_shifted else "no"
+            if md:
+                print(f"| {vb_id} | {vb_cycle} | {v1_id} | {ys} | {completion_v1} | {v2_id} | {asap_cur} | {asap_elim} | {reduction} |")
+            else:
+                print(f"  vb {vb_id} (cycle {vb_cycle}) → valu1 {v1_id} (shifted={v1_already_shifted}, completion {completion_v1}) → valu2 {v2_id}: ASAP {asap_cur} → {asap_elim}, reduction {reduction}")
+        if len(chains) > n_show:
+            print(f"  ... and {len(chains) - n_show} more.")
+    else:
+        print(
+            "No chains vb → valu1 → valu2 with positive ASAP reduction (every such valu2 already has ASAP ≤ 2, or there are no downstream consumers)."
+        )
+        print(
+            "Combine: shift valu1 to ALU and eliminate vbroadcast (feed valu1 via 8 scalars at cycle 0) → valu1 completes at 1, valu2 ASAP = 2."
+        )
+    print()
+
     # --- Element-wise slack ---
     if md:
         print("## Element-wise slack (shifted ops)\n")
@@ -264,6 +457,40 @@ def main():
             print(
                 f"Theoretical cycle saving (upper bound if dependents scheduled per-lane): {theoretical_saving}"
             )
+        print()
+
+    # --- ASAP bounds that could be reduced (per-lane completion) ---
+    if md:
+        print("## ASAP bounds that could be reduced (per-lane completion)\n")
+    else:
+        print("=== ASAP bounds that could be reduced (per-lane completion) ===\n")
+    if not shifted:
+        print("N/A (run with --enable-valu-shift and output-json for shifted_alu_cycles).\n")
+    else:
+        asap_list = asap_bounds(data, shifted)
+        reducible = [(op, asap, asap_per_lane, lim, c_max, c_min) for op, asap, asap_per_lane, lim, c_max, c_min in asap_list if asap_per_lane < asap and (op.get("dep_ids"))]
+        print(f"Ops whose ASAP could be reduced (per-lane completion of shifted dep): {len(reducible)}")
+        if reducible:
+            # Sort by reduction amount (largest first)
+            reducible.sort(key=lambda r: (r[1] - r[2], -r[0].get("cycle", 0)))
+            n_show = min(15, len(reducible))
+            print(f"Showing {n_show} examples (largest ASAP reduction first):\n")
+            if md:
+                print("| op id | engine | opcode | current cycle | ASAP (current) | ASAP (per-lane) | limiting dep | dep completion max→min |")
+                print("|-------|--------|--------|---------------|----------------|-----------------|--------------|------------------------|")
+            for op, asap, asap_per_lane, lim, c_max, c_min in reducible[:n_show]:
+                oid = op.get("id")
+                eng = (op.get("engine") or "").lower()
+                opcode = (op.get("opcode") or "").strip()[:12]
+                cur = op.get("cycle", 0)
+                lim_str = str(lim) if lim is not None else ""
+                comp_str = f"{c_max}→{c_min}" if c_max is not None and c_min is not None and c_max != c_min else str(c_max) if c_max is not None else ""
+                if md:
+                    print(f"| {oid} | {eng} | {opcode} | {cur} | {asap} | {asap_per_lane} | {lim_str} | {comp_str} |")
+                else:
+                    print(f"  op {oid} ({eng} {opcode}): cycle={cur} ASAP={asap} → {asap_per_lane} (limiting dep {lim_str}, completion {comp_str})")
+            if len(reducible) > n_show:
+                print(f"\n... and {len(reducible) - n_show} more.")
         print()
 
     # --- Early-slot slack (fillable capacity) ---

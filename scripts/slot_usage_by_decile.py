@@ -3,6 +3,11 @@
 Report slot usage and scratch by decile of the program (first 10% of cycles, next 10%, etc.)
 from a scheduler output JSON (e.g. from generate_ssa_kernel.py --output-json scheduler_output.json).
 
+The table includes subtype columns:
+- VALU: vb (vbroadcast), FMA (multiply_add/sub), other (shiftable). vb and FMA are not shiftable.
+- Flow: add_imm (ConstChoice when true), vselect (SelectChoice when false), other (e.g. jump, halt).
+- Load: const (ConstChoice when Load chosen), other (vload, load, load_offset).
+
 Usage (from project root):
   uv run python scripts/slot_usage_by_decile.py [scheduler_output.json]
   uv run python scripts/slot_usage_by_decile.py   # uses scheduler_output.json
@@ -34,6 +39,12 @@ def main():
         nargs="?",
         default="scheduler_output.json",
         help="Scheduler output JSON path (default: scheduler_output.json)",
+    )
+    parser.add_argument(
+        "--markdown",
+        "-m",
+        action="store_true",
+        help="Output table as markdown (renders in docs/notebooks)",
     )
     args = parser.parse_args()
 
@@ -125,18 +136,8 @@ def main():
             d = num_deciles - 1
         decile_cycles[d].append(cycle)
 
-    # Table header
-    print(f"Slot usage and scratch by decile (total cycles = {n})")
-    print(f"Input: {args.input_json}")
-    print()
-
-    # Column headers: Decile | Cycle range | ALU | VALU (vb|FMA|other) | Flow (add_imm|vselect|other) | Load (const|other) | Store | Scratch
-    header = (
-        "Decile | Cycle range      | ALU (used/cap %)   | VALU (used/cap %) (vb | FMA | other) | Flow (add_imm | vselect | other) | Load (const | other) | Store | Scratch (words)"
-    )
-    print(header)
-    print("-" * len(header))
-
+    # Collect decile rows for both output formats
+    rows_data = []
     for d in range(num_deciles):
         cycles = decile_cycles[d]
         if not cycles:
@@ -180,20 +181,65 @@ def main():
             scratch_str = "N/A (no liveness_curve)"
 
         alu_str = f"{alu_used}/{alu_cap} ({alu_pct:.1f}%)"
-        valu_break = f"{valu_used}/{valu_cap} ({valu_pct:.1f}%) ({vb_used} | {fma_used} | {other_used})"
-        flow_break = f"{flow_used}/{flow_cap} ({flow_pct:.0f}%) ({flow_add_imm_used} | {flow_vselect_used} | {flow_other_used})"
-        load_break = f"{load_used}/{load_cap} ({load_pct:.0f}%) ({load_const_used} | {load_other_used})"
+        valu_str = f"{valu_used}/{valu_cap} ({valu_pct:.1f}%)"
+        flow_str = f"{flow_used}/{flow_cap} ({flow_pct:.0f}%)"
+        load_str = f"{load_used}/{load_cap} ({load_pct:.0f}%)"
         store_str = f"{store_used}/{store_cap} ({store_pct:.0f}%)"
 
-        row = (
-            f"  {d}     | {cycle_range:15} | {alu_str:18} | {valu_break:45} | {flow_break:42} | {load_break:28} | {store_str:5} | {scratch_str}"
+        rows_data.append(
+            {
+                "d": d,
+                "cycle_range": cycle_range,
+                "alu_str": alu_str,
+                "valu_str": valu_str,
+                "vb_used": vb_used,
+                "fma_used": fma_used,
+                "other_used": other_used,
+                "flow_str": flow_str,
+                "flow_add_imm_used": flow_add_imm_used,
+                "flow_vselect_used": flow_vselect_used,
+                "flow_other_used": flow_other_used,
+                "load_str": load_str,
+                "load_const_used": load_const_used,
+                "load_other_used": load_other_used,
+                "store_str": store_str,
+                "scratch_str": scratch_str,
+            }
         )
-        print(row)
 
-    print()
-    print("VALU breakdown: vbroadcast and FMA (multiply_add / sub) are not shiftable; other is shiftable.")
-    print("Flow breakdown: add_imm (ConstChoice when true), vselect (SelectChoice when false), other (e.g. jump, halt).")
-    print("Load breakdown: const (ConstChoice when Load chosen), other (vload, load, load_offset).")
+    if args.markdown:
+        # Markdown table (renders in docs/notebooks)
+        print(f"Slot usage and scratch by decile (total cycles = {n})")
+        print(f"Input: {args.input_json}")
+        print()
+        print("| Decile | Cycle range | ALU | VALU | VALU vb | VALU FMA | VALU other | Flow | Flow add_imm | Flow vselect | Flow other | Load | Load const | Load other | Store | Scratch |")
+        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for r in rows_data:
+            print(f"| {r['d']} | {r['cycle_range']} | {r['alu_str']} | {r['valu_str']} | {r['vb_used']} | {r['fma_used']} | {r['other_used']} | {r['flow_str']} | {r['flow_add_imm_used']} | {r['flow_vselect_used']} | {r['flow_other_used']} | {r['load_str']} | {r['load_const_used']} | {r['load_other_used']} | {r['store_str']} | {r['scratch_str']} |")
+        print()
+        print("VALU: vb/FMA = not shiftable; other = shiftable. Flow: add_imm = ConstChoice true, vselect = SelectChoice false. Load: const = ConstChoice Load, other = vload/load/load_offset.")
+    else:
+        # Plain terminal table
+        print(f"Slot usage and scratch by decile (total cycles = {n})")
+        print(f"Input: {args.input_json}")
+        print()
+        header = (
+            "Decile | Cycle range  | ALU (used/cap %) | VALU (used/cap %) | VALU vb | VALU FMA | VALU other | "
+            "Flow (used/cap %) | Flow add_imm | Flow vselect | Flow other | Load (used/cap %) | Load const | Load other | Store | Scratch"
+        )
+        print(header)
+        print("-" * len(header))
+        for r in rows_data:
+            row = (
+                f"  {r['d']}     | {r['cycle_range']:12} | {r['alu_str']:17} | {r['valu_str']:17} | {r['vb_used']:7} | {r['fma_used']:8} | {r['other_used']:10} | "
+                f"{r['flow_str']:17} | {r['flow_add_imm_used']:11} | {r['flow_vselect_used']:12} | {r['flow_other_used']:9} | "
+                f"{r['load_str']:17} | {r['load_const_used']:10} | {r['load_other_used']:9} | {r['store_str']:5} | {r['scratch_str']}"
+            )
+            print(row)
+        print()
+        print("VALU breakdown: vbroadcast and FMA (multiply_add / sub) are not shiftable; other is shiftable.")
+        print("Flow breakdown: add_imm (ConstChoice when true), vselect (SelectChoice when false), other (e.g. jump, halt).")
+        print("Load breakdown: const (ConstChoice when Load chosen), other (vload, load, load_offset).")
     if not liveness_curve:
         print("Scratch: run with liveness_detail=full (default when --output-json is set) to include per-cycle scratch.")
     return 0
