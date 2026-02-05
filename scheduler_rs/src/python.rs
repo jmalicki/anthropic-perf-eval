@@ -260,6 +260,23 @@ pub fn compute_dependencies(ops: &mut [Op]) {
 // Emission: Rust -> Python
 // =============================================================================
 
+/// Cycles that have no op emitted (same logic as emit_scheduled_with_expanded: skip ShiftedValu, EliminatedBroadcast).
+pub fn empty_cycles(ops: &[Op], expanded_ops: &[Op], max_cycle: usize) -> Vec<usize> {
+    let used: HashSet<i32> = ops
+        .iter()
+        .filter(|op| {
+            op.cycle >= 0
+                && op.engine != Engine::ShiftedValu
+                && op.engine != Engine::EliminatedBroadcast
+        })
+        .map(|op| op.cycle)
+        .chain(expanded_ops.iter().filter(|op| op.cycle >= 0).map(|op| op.cycle))
+        .collect();
+    (0..max_cycle)
+        .filter(|&c| !used.contains(&(c as i32)))
+        .collect()
+}
+
 /// Emit scheduled ops back to Python instruction list
 pub fn emit_scheduled<'py>(
     py: Python<'py>,
@@ -299,9 +316,8 @@ pub fn emit_scheduled_with_expanded<'py>(
             }
         }
 
-        if !instr.is_empty() {
-            instrs.append(instr)?;
-        }
+        // Emit one bundle per cycle so program length = makespan (machine runs one cycle per instruction).
+        instrs.append(instr)?;
     }
 
     Ok(instrs)
@@ -1503,6 +1519,24 @@ struct SsaScheduleOutput {
     /// Debug info about shifted VALU ops and their ALU cycle assignments
     #[serde(skip_serializing_if = "Option::is_none")]
     valu_shift_debug: Option<ValuShiftDebug>,
+    /// Same constraints as CP-SAT (for bulk-move simulator). Present when schedule was from CP-SAT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_constraints: Option<Vec<crate::schedule_constraints::ScheduleConstraint>>,
+    /// Full shifted ALU cycles map (op_id -> [cycle0..7]) for bulk-move simulator.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    shifted_alu_cycles: std::collections::HashMap<usize, Vec<i32>>,
+    /// SSA-level cycle per op (same index space as schedule_constraints). Use for bulk-move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssa_cycle_assignments: Option<Vec<i32>>,
+    /// SSA-level ops (id, dep_ids) in same order as schedule_constraints. Use for bulk-move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssa_ops_bulk_move: Option<Vec<SsaOpBulkMoveOut>>,
+}
+
+#[derive(Serialize)]
+struct SsaOpBulkMoveOut {
+    id: usize,
+    dep_ids: Vec<usize>,
 }
 
 /// Debug info about shifted VALU ops
@@ -1721,6 +1755,17 @@ fn write_ssa_schedule_json(
         vregs,
         liveness_curve,
         valu_shift_debug,
+        schedule_constraints: result.schedule_constraints.clone(),
+        shifted_alu_cycles: result.shifted_alu_cycles.clone(),
+        ssa_cycle_assignments: result.ssa_cycle_assignments.clone(),
+        ssa_ops_bulk_move: result.ssa_ops_bulk_move.as_ref().map(|v| {
+            v.iter()
+                .map(|(id, dep_ids)| SsaOpBulkMoveOut {
+                    id: *id,
+                    dep_ids: dep_ids.clone(),
+                })
+                .collect()
+        }),
     };
 
     let json = serde_json::to_string_pretty(&output)
@@ -2545,9 +2590,38 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             result.address_result.max_addr,
             result.valu_shifted
         );
+        let empty = empty_cycles(&result.ops, &[], result.cycles);
+        if !empty.is_empty() {
+            const MAX_SHOW: usize = 25;
+            let show: Vec<String> = empty
+                .iter()
+                .take(MAX_SHOW)
+                .map(|c| c.to_string())
+                .collect();
+            let rest = empty.len().saturating_sub(MAX_SHOW);
+            if rest > 0 {
+                println!(
+                    "  Empty cycles: {} at {} (suboptimal; first {} shown)",
+                    empty.len(),
+                    show.join(", ") + &format!(" ... and {} more", rest),
+                    MAX_SHOW
+                );
+            } else {
+                println!("  Empty cycles: {} at {}", empty.len(), show.join(", "));
+            }
+            if let (Some(ec), Some(true)) = (result.empty_cycle_count, result.makespan_driven_by_capacity) {
+                if ec > 0 {
+                    let last_op_cycle_plus_one = result.cycles.saturating_sub(ec);
+                    println!(
+                        "  Makespan is driven by capacity lower bound ({}); last op cycle+1 = {}.",
+                        result.cycles, last_op_cycle_plus_one
+                    );
+                }
+            }
+        }
     }
 
-    // Emit scheduled ops
+    // Emit scheduled ops (one bundle per cycle; do not elide empty cycles)
     let scheduled = emit_scheduled(py, &result.ops, result.cycles)?;
 
     // Build final list with pause wrappers
@@ -2579,6 +2653,12 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("max_addr", result.address_result.max_addr)?;
     stats.set_item("budget_exceeded", result.budget_exceeded)?;
     stats.set_item("valu_shifted", result.valu_shifted)?;
+    if let Some(ec) = result.empty_cycle_count {
+        stats.set_item("empty_cycle_count", ec)?;
+    }
+    if let Some(md) = result.makespan_driven_by_capacity {
+        stats.set_item("makespan_driven_by_capacity", md)?;
+    }
 
     // Add usage accounting as JSON
     let usage_json =
@@ -2611,4 +2691,182 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     }
 
     Ok((instrs, stats))
+}
+
+// =============================================================================
+// Bulk-move simulator (load from JSON, run Rust simulator, return result)
+// =============================================================================
+
+#[derive(serde::Deserialize)]
+struct BulkMoveJsonInput {
+    total_cycles: usize,
+    #[serde(default)]
+    ops: Option<Vec<OpBulkMove>>,
+    #[serde(default)]
+    schedule_constraints: Option<Vec<crate::schedule_constraints::ScheduleConstraint>>,
+    /// JSON object keys are strings (op id as string)
+    #[serde(default)]
+    shifted_alu_cycles: std::collections::HashMap<String, Vec<i32>>,
+    /// SSA-level data (same index space as schedule_constraints). Prefer over ops for bulk-move.
+    #[serde(default)]
+    ssa_cycle_assignments: Option<Vec<i32>>,
+    /// SSA ops: id and dep_ids only; cycle comes from ssa_cycle_assignments by index.
+    #[serde(default)]
+    ssa_ops_bulk_move: Option<Vec<SsaOpBulkMoveIn>>,
+}
+
+#[derive(serde::Deserialize)]
+struct SsaOpBulkMoveIn {
+    id: usize,
+    #[serde(default)]
+    dep_ids: Vec<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpBulkMove {
+    id: usize,
+    cycle: i32,
+    #[serde(default)]
+    dep_ids: Vec<usize>,
+}
+
+/// Run the bulk-move simulator on an SSA schedule JSON file.
+///
+/// The file must be the output of `build_tick_tock_kernel_ssa(..., output_json=path)` with
+/// CP-SAT (so it contains `schedule_constraints` and `shifted_alu_cycles`). Uses the same
+/// constraint logic as the CP-SAT model to validate each move.
+///
+/// Returns a dict with:
+/// - "result": "NoEmptyCycles" | "ReachedEnd" | "Blocked"
+/// - If ReachedEnd: "original_makespan", "final_makespan", "steps"
+/// - If Blocked: "empty_c", "violation_message", "steps"
+#[pyfunction]
+#[pyo3(signature = (path, verbose=false))]
+pub fn run_bulk_move_simulator_from_json<'py>(
+    py: Python<'py>,
+    path: &str,
+    verbose: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::schedule_constraints::{run_bulk_move_simulator, BulkMoveResult};
+    use crate::types::{Engine, Opcode, Operand, SsaOp};
+
+    let json_str = std::fs::read_to_string(path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e))
+    })?;
+    let input: BulkMoveJsonInput = serde_json::from_str(&json_str).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Invalid SSA schedule JSON (need schedule_constraints and ops with id, cycle, dep_ids): {}",
+            e
+        ))
+    })?;
+
+    let constraints = input.schedule_constraints.as_deref().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(
+            "JSON has no schedule_constraints (run with CP-SAT and output_json to generate it)",
+        )
+    })?;
+
+    // Prefer SSA-level data (same index space as constraints); fall back to lowered ops (may mismatch).
+    let (ops, mut cycle_assignments) = if let (Some(ssa_ops), Some(ssa_cy)) = (
+        input.ssa_ops_bulk_move.as_ref(),
+        input.ssa_cycle_assignments.as_ref(),
+    ) {
+        if ssa_ops.len() != ssa_cy.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ssa_ops_bulk_move length {} != ssa_cycle_assignments length {}",
+                ssa_ops.len(),
+                ssa_cy.len()
+            )));
+        }
+        let ops: Vec<SsaOp> = ssa_ops
+            .iter()
+            .map(|o| {
+                let mut op = SsaOp::new(
+                    o.id,
+                    Engine::Alu,
+                    Opcode::Add,
+                    None,
+                    Vec::<Operand>::new(),
+                );
+                op.dep_ids = o.dep_ids.iter().copied().collect();
+                op
+            })
+            .collect();
+        let cy: Vec<i32> = ssa_cy.clone();
+        (ops, cy)
+    } else if let Some(lowered_ops) = &input.ops {
+        let ops: Vec<SsaOp> = lowered_ops
+            .iter()
+            .map(|o| {
+                let mut op = SsaOp::new(
+                    o.id,
+                    Engine::Alu,
+                    Opcode::Add,
+                    None,
+                    Vec::<Operand>::new(),
+                );
+                op.dep_ids = o.dep_ids.iter().copied().collect();
+                op
+            })
+            .collect();
+        let cy: Vec<i32> = lowered_ops.iter().map(|o| o.cycle).collect();
+        (ops, cy)
+    } else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "JSON has neither ssa_ops_bulk_move/ssa_cycle_assignments nor ops (re-run with CP-SAT and output_json)",
+        ));
+    };
+
+    let n = ops.len();
+    let total_cycles = input.total_cycles as i32;
+    let mut shifted_alu_cycles: HashMap<usize, Vec<i32>> = input
+        .shifted_alu_cycles
+        .into_iter()
+        .filter_map(|(k, v)| k.parse::<usize>().ok().map(|id| (id, v)))
+        .collect();
+
+    if cycle_assignments.len() != n {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "ops/ssa length {} != cycle_assignments length {}",
+            n,
+            cycle_assignments.len()
+        )));
+    }
+
+    let result = run_bulk_move_simulator(
+        &ops,
+        &mut cycle_assignments[..],
+        &mut shifted_alu_cycles,
+        constraints,
+        total_cycles,
+        verbose,
+    );
+
+    let out = PyDict::new(py);
+    match result {
+        BulkMoveResult::NoEmptyCycles => {
+            out.set_item("result", "NoEmptyCycles")?;
+        }
+        BulkMoveResult::ReachedEnd {
+            original_max_cycle_plus_one,
+            final_max_cycle_plus_one,
+            steps,
+        } => {
+            out.set_item("result", "ReachedEnd")?;
+            out.set_item("original_makespan", original_max_cycle_plus_one)?;
+            out.set_item("final_makespan", final_max_cycle_plus_one)?;
+            out.set_item("steps", steps)?;
+        }
+        BulkMoveResult::Blocked {
+            empty_c,
+            violation,
+            steps,
+        } => {
+            out.set_item("result", "Blocked")?;
+            out.set_item("empty_c", empty_c)?;
+            out.set_item("violation_message", violation.message)?;
+            out.set_item("steps", steps)?;
+        }
+    }
+    Ok(out)
 }
