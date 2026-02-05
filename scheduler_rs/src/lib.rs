@@ -28,6 +28,7 @@ pub mod diagnostics;
 pub mod kernel_builder;
 pub mod peephole;
 pub mod python;
+pub mod schedule_constraints;
 pub mod scheduler;
 pub mod types;
 
