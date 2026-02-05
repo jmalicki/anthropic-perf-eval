@@ -1534,6 +1534,15 @@ struct SsaScheduleOutput {
     /// Op IDs of vbroadcasts eliminated by CP-SAT (not emitted).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     eliminated_vbroadcast_ops: Vec<usize>,
+    /// Run options (e.g. rounds, cpsat_time_limit) from the generator script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_options: Option<serde_json::Value>,
+    /// Git SHA at run time (HEAD) for reproducibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_sha: Option<String>,
+    /// Optional comment describing the run (e.g. "2-round 60s CP-SAT").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1614,6 +1623,9 @@ fn write_ssa_schedule_json(
     result: &SsaScheduleResult,
     output_path: &str,
     liveness_detail: LivenessDetail,
+    run_options: Option<serde_json::Value>,
+    git_sha: Option<String>,
+    comment: Option<String>,
 ) -> Result<(), String> {
     use crate::types::SlotVal;
 
@@ -1770,6 +1782,9 @@ fn write_ssa_schedule_json(
                 .collect()
         }),
         eliminated_vbroadcast_ops: result.eliminated_vbroadcast_ops.clone(),
+        run_options,
+        git_sha,
+        comment,
     };
 
     let json = serde_json::to_string_pretty(&output)
@@ -2490,7 +2505,7 @@ use crate::kernel_builder::{SsaScheduleResult, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2511,6 +2526,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     forced_shifts: Option<Vec<usize>>,
     force_zero_gap: Option<bool>,
     enable_vbroadcast_elimination: Option<bool>,
+    run_options_json: Option<String>,
+    git_sha: Option<String>,
+    comment: Option<String>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -2686,7 +2704,18 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             .map(|s| LivenessDetail::from_str(s))
             .unwrap_or(LivenessDetail::Full);
 
-        write_ssa_schedule_json(&result, &output_path, detail).map_err(|e| {
+        let run_options: Option<serde_json::Value> = run_options_json
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        write_ssa_schedule_json(
+            &result,
+            &output_path,
+            detail,
+            run_options,
+            git_sha,
+            comment,
+        )
+        .map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to write output JSON: {}", e))
         })?;
         if verbose {

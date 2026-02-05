@@ -15,11 +15,15 @@ Use **per-decile slot utilization** to see where each engine (ALU, VALU, Load, S
 
 ## How to run
 
-1. **Prerequisite:** Scheduler output JSON. **Kernel generation produces this JSON** when run with `--output-json`; use the file from the run you want to analyze (e.g. the run you just generated):
+1. **Prerequisite:** Scheduler output JSON. **Kernel generation always writes** a schedule JSON. If you omit `--output-json`, it writes **`scheduler_output.json`** by default (with `run_options`, `git_sha`, and optional `comment`).
+
+   **For this workflow (schedule debug / comparing runs):** each time you run the generator, **specify a different file** with `--output-json` and add `--comment` so runs don’t overwrite each other and each file is identifiable:
    ```bash
-   uv run generate_ssa_kernel.py --output-json scheduler_output.json
+   uv run generate_ssa_kernel.py --rounds 2 --output-json scheduler_output_2r_60s.json --comment "2-round 60s CP-SAT"
+   # next run, use a different path, e.g.:
+   uv run generate_ssa_kernel.py --rounds 4 --output-json scheduler_output_4r_handopt.json --comment "4-round hand-tuned"
    ```
-   Use `--rounds 2` for quick iteration. The JSON written here is what you should pass to the decile script.
+   If you don’t pass `--output-json`, the run still writes to the default `scheduler_output.json`. The JSON produced (default or specified path) is what you pass to the decile script.
 
 2. **Per-decile slot usage and scratch:**
    ```bash

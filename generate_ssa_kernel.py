@@ -28,12 +28,31 @@ Example usage:
 import argparse
 import json
 import random
+import subprocess
 import sys
 import time
 
 import scheduler_rs
 
+DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
+
 BASELINE = 147734
+
+
+def get_git_sha():
+    """Return git HEAD SHA (short) or None if not a repo or git unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode == 0 and out.stdout:
+            return out.stdout.strip()[:12]  # short SHA
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def main():
@@ -75,7 +94,9 @@ def main():
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
-                        help="Output schedule JSON for analysis")
+                        help=f"Output schedule JSON path (default: {DEFAULT_SCHEDULER_JSON})")
+    parser.add_argument("--comment", type=str, default=None,
+                        help="Comment stored in the schedule JSON to describe the run")
     parser.add_argument("--liveness-detail", type=str, default=None,
                         choices=["none", "summary", "full"],
                         help="Liveness detail level in JSON: none, summary, or full (default: full)")
@@ -131,6 +152,25 @@ def main():
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
+    # Always write schedule JSON (default path or user-specified); include run metadata
+    output_json_path = args.output_json if args.output_json is not None else DEFAULT_SCHEDULER_JSON
+    run_options = {
+        "forest_height": args.forest_height,
+        "n_nodes": args.n_nodes,
+        "batch_size": args.batch_size,
+        "rounds": args.rounds,
+        "use_cpsat": use_cpsat,
+        "cpsat_time_limit": cpsat_time_limit,
+        "per_section_optimize_secs": per_section_optimize,
+        "enable_valu_shift": args.enable_valu_shift,
+        "enable_tree_reduce_depth3": args.enable_tree_reduce_depth3,
+        "const_choice": args.const_choice,
+        "select_choice": args.select_choice,
+        "valu_shift": args.valu_shift,
+        "force_zero_gap": args.force_zero_gap and use_cpsat,
+    }
+    git_sha = get_git_sha()
+
     start_time = time.time()
     instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
         forest_height=args.forest_height,
@@ -142,14 +182,15 @@ def main():
         use_cpsat=use_cpsat,
         cpsat_time_limit=cpsat_time_limit,
         per_section_optimize_secs=per_section_optimize,
-        output_json=args.output_json,
+        output_json=output_json_path,
         enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
         const_choice=args.const_choice,
         select_choice=args.select_choice,
         valu_shift=args.valu_shift,
         force_zero_gap=args.force_zero_gap if use_cpsat else None,
-        # Note: liveness_detail parameter not available in Python bindings yet
-        # It's only used when output_json is provided anyway
+        run_options_json=json.dumps(run_options),
+        git_sha=git_sha,
+        comment=args.comment,
     )
     build_time = time.time() - start_time
 
@@ -171,8 +212,7 @@ def main():
         print("  The greedy scheduler does not currently respect budget constraints.")
         print("  Use CP-SAT scheduler (default) for correct results.")
 
-    if args.output_json:
-        print(f"\n  Schedule JSON written to: {args.output_json}")
+    print(f"\n  Schedule JSON written to: {output_json_path}")
 
     # Always save kernel before validating so failures can be analyzed without re-running.
     kernel_path = args.save_kernel
