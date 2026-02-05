@@ -81,7 +81,15 @@
 //!
 //! ## Objective
 //!
-//! Minimize makespan (total cycles).
+//! Minimize makespan (total cycles). When makespan is fixed, we minimize a **tie-breaker**: the sum
+//! of effective completion cycles over all ops (one per op; for choice vars we use the chosen path's
+//! completion).
+//!
+//! **Philosophy of the tie-breaker:** "Early completion of computation is better." Even when we
+//! cannot reduce cycles yet, preferring schedules that get more results done earlier is a
+//! **smoother objective** than raw makespan alone: it steers the solver toward packings that
+//! leave room to shrink the schedule (e.g. by removing empty cycles or freeing capacity). So the
+//! tie-breaker is not only for breaking ties—it helps find paths that lead to cycle reduction.
 //!
 //! ## Empty cycles and the "bulk move" invariant
 //!
@@ -90,8 +98,8 @@
 //! C+1, C+2, … one cycle earlier (to C, C+1, …) preserves precedence, symmetry (cycle[i] ≤ cycle[j]),
 //! and cumulative (same ops per cycle, just shifted); makespan can decrease by 1. Therefore **no
 //! single hard constraint in the model should preclude that bulk move**. If any constraint did,
-//! it would be a bug. The tie-breaker (minimize sum of cycles) encourages the solver to find that
-//! solution; empty cycles then only persist due to capacity lower bound (structural) or search.
+//! it would be a bug. The tie-breaker encourages the solver to find that solution; empty cycles
+//! then only persist due to capacity lower bound (structural) or search.
 //!
 //! ## Debugging: makespan active set
 //!
@@ -3286,18 +3294,21 @@ pub fn schedule_ssa_cpsat(
     // makespan = max_cycle + 1 and max_cycle >= every cycle var already force all work into [0, max_cycle];
     // no need for explicit cycle <= makespan-1.
 
-    // Minimize makespan; when equal, prefer earlier completion_cycle for shifted ops, ConstChoice ops, shiftable VALU ops, and SelectChoice ops (tie-breaker).
+    // Minimize makespan; when equal, minimize sum of effective completion cycles (tie-breaker).
+    // Philosophy: "early completion of computation is better"—a smoother objective that steers
+    // search toward packings that can lead to cycle reduction, not only for breaking ties.
     //
-    // Objective = scale * makespan + sum(completion_cycle) + sum(const_choice_cycles) + sum(shiftable_valu_cycles) + sum(select_choice_cycles).
+    // Design: every op contributes exactly one "effective completion cycle"; for choice vars we
+    // use the chosen path's completion so the objective fully accounts for the choice.
+    //
+    // Objective = scale * makespan + sum(effective_completion_cycle over all ops).
     // Scale is a power of 10 chosen so that scale > max_sum (max possible value of that sum). Then:
     //   (1) Tie-breaker: one extra cycle costs scale, so scale > max_sum ensures makespan dominates.
-    //   (2) Leading digits: tie_breaker < scale, so floor(objective / scale) = makespan — the quotient is the cycle count (e.g. objective 2_000_042_000 with scale 1e7 => makespan 200, not 2000; tie-breaker 42_000 in lower digits).
-    //   (3) Including ConstChoice cycles rewards earlier const ops, which naturally prefers add_imm
-    //       when Flow is free (enabling better load balance).
-    //   (4) Including shiftable VALU cycles rewards earlier VALU ops, which encourages shifting to ALU
-    //       when that allows earlier scheduling (freeing VALU slots for other ops).
-    //   (5) Including SelectChoice cycles rewards earlier SelectChoice ops, which may favor FMA over vselect
-    //       when FMA can execute earlier (though FMA uses VALU slots which may be saturated).
+    //   (2) Leading digits: tie_breaker < scale, so floor(objective / scale) = makespan.
+    //   (3) Shiftable VALU: chosen path's completion (completion_cycle when shifted, cycle_var when not).
+    //   (4) ConstChoice: all encodings (Load, AddImm, ALU-derived) use cycle_vars[idx] as scheduled cycle.
+    //   (5) SelectChoice: chosen path's last cycle (fma_last when FMA, cycle_var when vselect).
+    //   (6) All other ops: cycle_vars[idx].
     let mut objective_scale: Option<i64> = None;
 
     // Tie-breaker should sum only the chosen path's cycle per op (same as makespan constraints).
@@ -3360,22 +3371,21 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // Collect tie-breaker vars: one "effective cycle" per op so that when makespan is equal we
-    // prefer packing ops earlier (minimize sum of cycles). Without this, ops not in shiftable/
-    // ConstChoice/SelectChoice have no incentive to move from C+1 to empty C.
+    // Collect tie-breaker vars: one effective completion cycle per op (chosen path for choice ops).
+    // Minimizing this sum implements "early completion of computation is better" when makespan is equal.
     let mut tie_breaker_vars: Vec<IntVar> = Vec::new();
 
-    // Shiftable VALU: one chosen cycle per op (completion_cycle when shifted, cycle_var when not)
+    // Shiftable VALU: chosen path completion (completion_cycle when shifted, cycle_var when not)
     for &idx in &shiftable_valu {
         tie_breaker_vars.push(*shiftable_chosen_cycle.get(&idx).unwrap());
     }
 
-    // ConstChoice: both paths use same cycle_vars[idx]
+    // ConstChoice: all encodings (Load, AddImm, ALU-derived) schedule at cycle_vars[idx]
     for &idx in &const_choice_ops {
         tie_breaker_vars.push(cycle_vars[idx]);
     }
 
-    // SelectChoice: chosen cycle (fma_cycle when FMA no-delta, else cycle_var)
+    // SelectChoice: chosen path last cycle (fma_last when FMA, cycle_var when vselect)
     for &idx in &select_choice_ops {
         if let Some(&chosen) = select_chosen_cycle.get(&idx) {
             tie_breaker_vars.push(chosen);
@@ -3384,7 +3394,7 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // All other ops: use cycle_vars so every op contributes to tie-breaker (reward moving any op earlier)
+    // All other ops: execution cycle so every op contributes (reward earlier completion)
     for (idx, _) in ops.iter().enumerate() {
         if !shiftable_set.contains(&idx)
             && !const_choice_set.contains(&idx)
