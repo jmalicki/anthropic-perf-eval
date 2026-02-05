@@ -24,6 +24,10 @@ pub const VLEN: usize = 8;
 /// Maximum scratch space available
 pub const SCRATCH_SIZE: usize = 1536;
 
+/// Maximum tree depth for which we have tree-reduce emission (depth 3 = 8-way).
+/// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
+pub const MAX_TREE_REDUCE_DEPTH: u32 = 3;
+
 /// Kernel configuration parameters
 #[derive(Debug, Clone)]
 pub struct KernelConfig {
@@ -72,12 +76,9 @@ pub struct KernelConfig {
     /// None means unlimited (default). Recommended: 4-6 to prevent long critical paths.
     pub max_alu_depth: Option<usize>,
 
-    /// Enable tree-reduce approach for depth 3 selects.
-    /// This saves 1 VALU op per group (15 vs 16 ops) but uses 36 additional
-    /// words of scratch (4 scalars + 4 vectors for delta broadcasts).
-    /// DISABLED BY DEFAULT because it exceeds the 1536 word scratch budget.
-    /// Enable only if other optimizations free up sufficient scratch space.
-    pub enable_tree_reduce_depth3: bool,
+    /// Maximum tree depth (0..=N) for which tree-reduce selection is used.
+    /// Default 3 (8-way at depth 3). Minimum allowed is 2. Cannot exceed MAX_TREE_REDUCE_DEPTH (3).
+    pub tree_reduce_max_depth: u32,
 
     /// Enable SSA dead code elimination before scheduling.
     /// When enabled (default), ops whose result has no users are removed,
@@ -103,8 +104,8 @@ impl Default for KernelConfig {
             enable_const_load: true,
             enable_const_alu: true,
             max_alu_depth: None, // No limit by default
-            // Tree-reduce disabled by default (exceeds scratch budget)
-            enable_tree_reduce_depth3: false,
+            // Tree-reduce up to depth 3 by default (8-way at depth 3; min allowed is 2)
+            tree_reduce_max_depth: 3,
             // SSA DCE on by default (removes dead code before scheduling)
             enable_ssa_dce: true,
         }
@@ -151,6 +152,13 @@ impl KernelConfig {
             enable_alu: self.enable_const_alu,
             max_alu_depth: self.max_alu_depth,
         }
+    }
+
+    /// True if tree-reduce selection should be used at the given tree depth.
+    /// Only depths 0..=MAX_TREE_REDUCE_DEPTH have tree-reduce emission; higher depths use fallback.
+    /// tree_reduce_max_depth is clamped to 2..=MAX_TREE_REDUCE_DEPTH at the API boundary.
+    pub fn use_tree_reduce_at_depth(&self, depth: usize) -> bool {
+        depth <= self.tree_reduce_max_depth.min(MAX_TREE_REDUCE_DEPTH) as usize
     }
 }
 

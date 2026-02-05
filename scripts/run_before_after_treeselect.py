@@ -22,7 +22,7 @@ BASELINE = 147734
 def run(
     rounds: int,
     enable_valu_shift: bool,
-    enable_tree_reduce_depth3: bool,
+    tree_reduce_max_depth: int,
     use_cpsat: bool,
     cpsat_time_limit: float,
     verbose: bool,
@@ -40,7 +40,7 @@ def run(
             use_cpsat=use_cpsat,
             cpsat_time_limit=cpsat_time_limit,
             output_json=None,
-            enable_tree_reduce_depth3=enable_tree_reduce_depth3,
+            tree_reduce_max_depth=tree_reduce_max_depth,
         )
     except Exception as e:
         return {
@@ -62,7 +62,7 @@ def run(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Before/after treeselect (tree_reduce_depth3) with full options"
+        description="Before/after treeselect (tree_reduce_max_depth 2 vs 3) with full options"
     )
     ap.add_argument("--rounds", type=int, default=4, help="Rounds (default 4)")
     ap.add_argument(
@@ -88,25 +88,25 @@ def main():
     print(f"  rounds={args.rounds}")
     print("=" * 60)
 
-    # BEFORE: tree selection OFF
-    print("\n--- BEFORE (enable_tree_reduce_depth3=False) ---")
+    # BEFORE: tree-reduce up to depth 2 only
+    print("\n--- BEFORE (tree_reduce_max_depth=2) ---")
     sys.stdout.flush()
     before = run(
         rounds=args.rounds,
         enable_valu_shift=True,
-        enable_tree_reduce_depth3=False,
+        tree_reduce_max_depth=2,
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time,
         verbose=verbose,
     )
 
-    # AFTER: tree selection ON
-    print("\n--- AFTER (enable_tree_reduce_depth3=True) ---")
+    # AFTER: tree-reduce including depth 3 (8-way)
+    print("\n--- AFTER (tree_reduce_max_depth=3) ---")
     sys.stdout.flush()
     after = run(
         rounds=args.rounds,
         enable_valu_shift=True,
-        enable_tree_reduce_depth3=True,
+        tree_reduce_max_depth=3,
         use_cpsat=use_cpsat,
         cpsat_time_limit=args.cpsat_time,
         verbose=verbose,

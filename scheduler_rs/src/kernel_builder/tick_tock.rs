@@ -310,8 +310,8 @@ impl TickTockKernelBuilder {
             }
             // c_r3[i] will alias to c[7+i] in emit_valu_selection_init - no separate allocation needed
 
-            // Tree-reduce resources - only allocate if enabled
-            if self.config.enable_tree_reduce_depth3 {
+            // Tree-reduce resources - only allocate if enabled for depth 3
+            if self.config.use_tree_reduce_at_depth(3) {
                 // Scalar deltas (4 words)
                 ctx.td_r3_01 = alloc.alloc("td_r3_01", 1);
                 ctx.td_r3_23 = alloc.alloc("td_r3_23", 1);
@@ -686,7 +686,7 @@ impl TickTockKernelBuilder {
         // Compute tree-reduce deltas for depth 3 (only if tree-reduce enabled)
         // d01 = tree[8] - tree[7], d23 = tree[10] - tree[9], etc.
         // tc_r3[0] = tree[7], tc_r3[1] = tree[8], tc_r3[2] = tree[9], ...
-        if self.config.enable_tree_reduce_depth3 {
+        if self.config.use_tree_reduce_at_depth(3) {
             self.emit.emit_alu(
                 Opcode::Sub,
                 self.ctx.td_r3_01,
@@ -747,7 +747,7 @@ impl TickTockKernelBuilder {
         }
 
         // Broadcast tree-reduce deltas (only if tree-reduce enabled)
-        if self.config.enable_tree_reduce_depth3 {
+        if self.config.use_tree_reduce_at_depth(3) {
             self.ctx.v_td_r3_01 = self
                 .emit
                 .emit_vbroadcast(self.ctx.v_td_r3_01, self.ctx.td_r3_01);
@@ -978,7 +978,7 @@ impl TickTockKernelBuilder {
 
         let ctx = &self.ctx;
 
-        if self.config.enable_tree_reduce_depth3 {
+        if self.config.use_tree_reduce_at_depth(3) {
             // Tree-reduce approach for 8-way selection (15 VALU ops vs 16)
             //
             // Indices 7-14 -> idx_adj = idx - 7 gives 0-7 (3 bits)

@@ -23,11 +23,11 @@ Record after each phase: git SHA, exact uv command, liveness peak, cycles, and c
 
 | Config | Cycles | Peak liveness (words) |
 |--------|--------|------------------------|
-| **BEFORE** (enable_tree_reduce_depth3=False) | 465 | 1529 |
-| **AFTER** (enable_tree_reduce_depth3=True)   | 460 | 1522 |
+| **BEFORE** (tree_reduce_max_depth=2) | 465 | 1529 |
+| **AFTER** (tree_reduce_max_depth=3)  | 460 | 1522 |
 | **Delta**                                    | **-5** | **-7** |
 
-Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness for this configuration. The `--enable-tree-reduce-depth3` flag is exposed in `generate_ssa_kernel.py` and in the SSA Python binding (`enable_tree_reduce_depth3`).
+Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness for this configuration. Use `--tree-reduce-max-depth=3` in `generate_ssa_kernel.py` (default); or `--tree-reduce-max-depth=2` to disable depth-3 8-way (saves scratch). Allowed range is 2..3.
 
 ---
 

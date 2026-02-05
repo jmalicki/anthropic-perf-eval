@@ -268,8 +268,8 @@ impl SsaTickTockKernelBuilder {
             self.ctx.tc_r3[i] = Some(self.emit.emit_load(addr));
         }
 
-        // Tree-reduce deltas (if enabled)
-        if self.config.enable_tree_reduce_depth3 {
+        // Tree-reduce deltas (if enabled for depth 3)
+        if self.config.use_tree_reduce_at_depth(3) {
             let tc_r3_0 = self.ctx.tc_r3[0].unwrap();
             let tc_r3_1 = self.ctx.tc_r3[1].unwrap();
             let tc_r3_2 = self.ctx.tc_r3[2].unwrap();
@@ -301,7 +301,7 @@ impl SsaTickTockKernelBuilder {
             self.ctx.v_const_r3[i] = Some(self.emit.emit_vbroadcast(self.ctx.c_r3[i].unwrap()));
         }
 
-        if self.config.enable_tree_reduce_depth3 {
+        if self.config.use_tree_reduce_at_depth(3) {
             self.ctx.v_td_r3_01 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_01.unwrap()));
             self.ctx.v_td_r3_23 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_23.unwrap()));
             self.ctx.v_td_r3_45 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_45.unwrap()));
@@ -687,7 +687,7 @@ impl SsaTickTockKernelBuilder {
 
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
-        if self.config.enable_tree_reduce_depth3 {
+        if self.config.use_tree_reduce_at_depth(3) {
             // Tree-reduce: 3 levels of 2-way by bits (same shape as select_8way_bit_tree), but using direct FMA for lower op count.
             // For a SelectChoice-based 8-way use select_8way_bit_tree(idx, 7, &[v_tc_r3[0], ..., v_tc_r3[7]]).
             let v_const_7 = self.ctx.v_const[7].unwrap();

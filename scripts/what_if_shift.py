@@ -206,7 +206,7 @@ def main():
             cpsat_time_limit=args.cpsat_time_limit,
             per_section_optimize_secs=None,
             output_json=args.output_json,
-            enable_tree_reduce_depth3=False,
+            tree_reduce_max_depth=2,
             liveness_detail="summary",
             forced_shifts=forced_shifts,
         )

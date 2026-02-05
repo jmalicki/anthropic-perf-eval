@@ -1868,7 +1868,7 @@ fn apply_register_allocation(
 /// - Compacts scratch usage by reusing addresses when live ranges don't overlap
 /// - Uses linear scan algorithm for efficient allocation
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false, enable_tree_reduce_depth3=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, output_json=None, enable_lazy_partition=false, partition_frequency=3, enable_pseudo_consts=false, enable_add_imm=true, enable_const_load=true, enable_const_alu=true, enable_slot_filling=false, max_alu_depth=None, enable_register_allocation=false, tree_reduce_max_depth=3))]
 pub fn build_tick_tock_kernel<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1887,8 +1887,10 @@ pub fn build_tick_tock_kernel<'py>(
     enable_slot_filling: bool,
     max_alu_depth: Option<usize>,
     enable_register_allocation: bool,
-    enable_tree_reduce_depth3: bool,
+    tree_reduce_max_depth: u32,
 ) -> PyResult<Bound<'py, PyList>> {
+    use crate::kernel_builder::config::MAX_TREE_REDUCE_DEPTH;
+    let tree_reduce_max_depth = tree_reduce_max_depth.clamp(2, MAX_TREE_REDUCE_DEPTH);
     let config = KernelConfig {
         forest_height,
         n_nodes,
@@ -1904,7 +1906,7 @@ pub fn build_tick_tock_kernel<'py>(
         enable_const_load,
         enable_const_alu,
         max_alu_depth,
-        enable_tree_reduce_depth3,
+        tree_reduce_max_depth,
         enable_ssa_dce: true,
     };
 
@@ -2193,7 +2195,7 @@ pub fn build_tick_tock_kernel_ops(
         enable_const_load,
         enable_const_alu,
         max_alu_depth,
-        enable_tree_reduce_depth3: false, // Disabled - exceeds scratch budget
+        tree_reduce_max_depth: 3, // Default: depth-3 8-way tree-reduce (min allowed is 2)
         enable_ssa_dce: true,
     };
 
@@ -2505,7 +2507,7 @@ use crate::kernel_builder::{SsaScheduleResult, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, enable_tree_reduce_depth3=false, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -2518,7 +2520,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     cpsat_time_limit: f64,
     per_section_optimize_secs: Option<f64>,
     output_json: Option<String>,
-    enable_tree_reduce_depth3: bool,
+    tree_reduce_max_depth: u32,
     const_choice: &str,
     select_choice: &str,
     valu_shift: &str,
@@ -2536,7 +2538,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             VLEN, batch_size
         )));
     }
-
+    use crate::kernel_builder::config::MAX_TREE_REDUCE_DEPTH;
+    let tree_reduce_max_depth = tree_reduce_max_depth.clamp(2, MAX_TREE_REDUCE_DEPTH);
     let config = KernelConfig {
         forest_height,
         n_nodes,
@@ -2552,7 +2555,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         enable_const_load: true,
         enable_const_alu: true,
         max_alu_depth: None,
-        enable_tree_reduce_depth3,
+        tree_reduce_max_depth,
         enable_ssa_dce: true, // Remove dead code before scheduling (saves cycles, optimizer time, scratch)
     };
 

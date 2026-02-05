@@ -81,8 +81,8 @@ def main():
                         help="Enable VALU->ALU shifting (default: True)")
     parser.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
                         help="Disable VALU->ALU shifting (e.g. if hitting scratch budget)")
-    parser.add_argument("--enable-tree-reduce-depth3", action="store_true",
-                        help="Enable tree-reduce for depth-3 (8-way) selection (uses more scratch)")
+    parser.add_argument("--tree-reduce-max-depth", type=int, default=3, metavar="N",
+                        help="Max tree depth for tree-reduce selection (2..3). Default 3; use 2 to disable depth-3 8-way (saves scratch).")
     parser.add_argument("--const-choice", choices=["optimize", "add_imm", "load"], default="optimize",
                         help="CP-SAT ConstChoice: optimize, force add_imm, or force load (default: optimize)")
     parser.add_argument("--select-choice", choices=["optimize", "fma", "vselect"], default="optimize",
@@ -125,6 +125,10 @@ def main():
 
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
+    # Clamp to allowed range (min 2, max 3)
+    tree_reduce_max_depth = max(2, min(3, args.tree_reduce_max_depth))
+    if tree_reduce_max_depth != args.tree_reduce_max_depth and verbose:
+        print(f"  tree_reduce_max_depth clamped to {tree_reduce_max_depth} (allowed 2..3)")
     per_section_optimize = (
         None if args.per_section_optimize_secs is None or args.per_section_optimize_secs <= 0
         else args.per_section_optimize_secs
@@ -142,7 +146,7 @@ def main():
     print(f"  forest_height={args.forest_height}, n_nodes={args.n_nodes}")
     print(f"  batch_size={args.batch_size}, rounds={args.rounds}")
     print(f"  enable_valu_shift={args.enable_valu_shift}")
-    print(f"  enable_tree_reduce_depth3={args.enable_tree_reduce_depth3}")
+    print(f"  tree_reduce_max_depth={tree_reduce_max_depth}")
     if per_section_optimize is not None:
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
@@ -163,7 +167,7 @@ def main():
         "cpsat_time_limit": cpsat_time_limit,
         "per_section_optimize_secs": per_section_optimize,
         "enable_valu_shift": args.enable_valu_shift,
-        "enable_tree_reduce_depth3": args.enable_tree_reduce_depth3,
+        "tree_reduce_max_depth": tree_reduce_max_depth,
         "const_choice": args.const_choice,
         "select_choice": args.select_choice,
         "valu_shift": args.valu_shift,
@@ -183,7 +187,7 @@ def main():
         cpsat_time_limit=cpsat_time_limit,
         per_section_optimize_secs=per_section_optimize,
         output_json=output_json_path,
-        enable_tree_reduce_depth3=args.enable_tree_reduce_depth3,
+        tree_reduce_max_depth=tree_reduce_max_depth,
         const_choice=args.const_choice,
         select_choice=args.select_choice,
         valu_shift=args.valu_shift,
