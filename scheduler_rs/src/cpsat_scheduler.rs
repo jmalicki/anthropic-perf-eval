@@ -2056,6 +2056,9 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
 /// * `ops` - SSA operations to schedule (with dep_ids computed)
 /// * `config` - Solver configuration (time limit, scratch budget, etc.)
 /// * `hints` - Optional warm-start and segment input; use `SsaCpsatHints::default()` for none
+/// * `greedy_within_scratch_budget` - When `Some(true)`, the greedy schedule (hints) is within scratch budget;
+///   when `Some(false)` or `None`, greedy may have exceeded budget (hints can be infeasible). Used only to
+///   sanity-check: we panic if greedy makespan < capacity_lower_bound only when this is `Some(true)`.
 ///
 /// # Returns
 /// * `Some(SsaCpsatResult)` if a solution was found (includes shift decisions)
@@ -2065,6 +2068,7 @@ pub fn schedule_ssa_cpsat(
     ops: &[SsaOp],
     config: SsaCpsatConfig,
     hints: SsaCpsatHints<'_>,
+    greedy_within_scratch_budget: Option<bool>,
 ) -> Option<SsaCpsatResult> {
     use cp_sat::builder::BoolVar;
 
@@ -3315,6 +3319,11 @@ pub fn schedule_ssa_cpsat(
     let select_choice_count = select_choice_ops.len() as i64;
     let flow_base = ops.iter().filter(|op| op.engine == Engine::Flow).count() as i64;
 
+    // Use 0 for dependency floor: critical_path_len (max ASAP + 1) assumes +1 per edge, but the model
+    // uses variable-length steps (completion_cycle for shifted, +2 for SelectChoice FMA), so it can
+    // overestimate. The capacity-derived minimum over (x,y,z) is a valid lower bound; precedence
+    // constraints in the model enforce any dependency lower bound, so the solver cannot find
+    // makespan below the true minimum.
     let cap_result = compute_capacity_lower_bound_global(
         valu_count,
         alu_count,
@@ -3330,7 +3339,7 @@ pub fn schedule_ssa_cpsat(
         load_cap,
         store_cap,
         flow_cap,
-        critical_path_len as i64,
+        0i64, // dependency floor: don't inflate capacity_lower_bound with ASAP-based critical path
     );
     let capacity_lower_bound = cap_result.capacity_lower_bound;
     let mut valu_alu_global_min = cap_result.valu_alu_global_min;
@@ -3348,9 +3357,27 @@ pub fn schedule_ssa_cpsat(
         );
     }
 
+    // Sanity: when greedy is within scratch budget, it must respect capacity lower bound (infeasible greedy can use fewer cycles).
+    let greedy_ok = greedy_within_scratch_budget == Some(true);
+    if greedy_ok {
+        if let Some(h) = greedy_hints {
+            let greedy_makespan = (h.iter().max().copied().unwrap_or(0) + 1) as i64;
+            if greedy_makespan < capacity_lower_bound {
+                panic!(
+                    "greedy makespan {} < capacity_lower_bound {} (greedy schedule would violate capacity; \
+                     capacity_lb is a valid lower bound so this indicates a bug in greedy or in capacity_lb)",
+                    greedy_makespan, capacity_lower_bound
+                );
+            }
+        }
+    }
+
     // 10. Create makespan and max_cycle variables; tie makespan to actual last cycle so CP-SAT minimizes it.
     // max_cycle = max over all cycle_vars, completion_cycle_vars, select_choice_fma_last_cycle.
     // makespan = max_cycle + 1 (so minimizing makespan forces packing).
+    // capacity_lower_bound is a valid lower bound (capacity-derived min over choices); we pass 0 for
+    // the dependency floor in compute_capacity_lower_bound_global so it is not inflated by ASAP-based
+    // critical path, which overestimates when the model uses variable-length steps.
     let max_cycle_lb = (capacity_lower_bound - 1).max(0);
     let max_cycle =
         model.new_int_var_with_name([(max_cycle_lb, (horizon - 1) as i64)], "max_cycle".to_string());
@@ -4673,6 +4700,7 @@ pub fn schedule_ssa_cpsat(
     _ops: &[SsaOp],
     _config: SsaCpsatConfig,
     _hints: SsaCpsatHints<'_>,
+    _greedy_within_scratch_budget: Option<bool>,
 ) -> Option<SsaCpsatResult> {
     eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
     None
@@ -4719,6 +4747,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -4764,6 +4793,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
         assert!(
             result.is_some(),
@@ -4813,6 +4843,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -4962,6 +4993,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5083,6 +5115,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5150,6 +5183,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(
@@ -5219,6 +5253,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5326,6 +5361,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5499,6 +5535,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5598,6 +5635,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5681,6 +5719,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -5833,6 +5872,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
         assert!(
             result.is_some(),
@@ -5937,6 +5977,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         )
         .expect("CP-SAT ForceValu schedule");
 
@@ -6002,6 +6043,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
         assert!(
             result.is_some(),
@@ -6138,6 +6180,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
         assert!(result.is_some(), "CP-SAT should find a solution");
         let cpsat_result = result.unwrap();
@@ -6239,6 +6282,7 @@ mod ssa_tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
         let cpsat_result = result.unwrap();
         for (idx, op) in emit.ops.iter_mut().enumerate() {
@@ -6618,6 +6662,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -6678,6 +6723,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -6832,6 +6878,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(result.is_some(), "CP-SAT should find a solution");
@@ -7322,6 +7369,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(
@@ -7411,6 +7459,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(
@@ -7433,6 +7482,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         // The tight budget should either:
@@ -7499,6 +7549,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         assert!(
@@ -7572,6 +7623,7 @@ mod tests {
                 live_out_vregs: None,
                 live_through_vregs: None,
             },
+            Some(true), // valid hints, within scratch
         );
 
         assert!(result.is_some(), "Should find solution with valid hints");
@@ -7645,6 +7697,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         assert!(
@@ -7723,6 +7776,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         assert!(
@@ -7801,6 +7855,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The solver should either:
@@ -7876,6 +7931,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         assert!(
@@ -7939,6 +7995,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         assert!(
@@ -8051,6 +8108,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         assert!(
@@ -8168,6 +8226,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The verification code should NOT panic, and we should get a valid result
@@ -8331,6 +8390,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The verification code should NOT panic, and we should get a valid result
@@ -8446,6 +8506,7 @@ mod tests {
                 shift_hints: Some(&shift_hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The verification code should NOT panic:
@@ -8555,6 +8616,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -8659,6 +8721,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -8752,6 +8815,7 @@ mod tests {
                 greedy_hints: Some(&hints),
                 ..Default::default()
             },
+            None,
         );
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
@@ -8834,6 +8898,7 @@ mod tests {
                 ..Default::default()
             },
             SsaCpsatHints::default(),
+            None,
         );
 
         // CP-SAT should find a solution with budget=2

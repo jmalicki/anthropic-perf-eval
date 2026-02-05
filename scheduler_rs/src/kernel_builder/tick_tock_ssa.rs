@@ -777,6 +777,7 @@ impl SsaTickTockKernelBuilder {
                             Some(&live_through)
                         },
                     },
+                    Some(false), // section exceeded budget, so greedy was infeasible
                 )
                 .ok_or_else(|| format!("Per-section CP-SAT failed for section {}", k))?;
                 this_section_makespan = Some(seg_result.makespan as i32);
@@ -986,6 +987,7 @@ impl SsaTickTockKernelBuilder {
                 live_out_vregs: None,
                 live_through_vregs: None,
             },
+            Some(!greedy_budget_exceeded), // same as used for "Greedy exceeded budget" report above
         )
         .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
 
@@ -4584,6 +4586,7 @@ mod tests {
                 live_out_vregs: None,
                 live_through_vregs: None,
             },
+            Some(true), // greedy was within budget in this test
         );
 
         match cpsat_result {

@@ -15,9 +15,9 @@ The **bulk-move simulator** checks whether empty cycles in a CP-SAT schedule cou
 
 ## Prerequisites
 
-1. **SSA schedule JSON** from a CP-SAT run with `--output-json`:
+1. **SSA schedule JSON** from a CP-SAT run with `--output-json` (use `--rounds 2` for dev):
    ```bash
-   uv run generate_ssa_kernel.py --output-json scheduler_output.json
+   uv run generate_ssa_kernel.py --rounds 2 --output-json scheduler_output.json
    ```
    The file must contain `schedule_constraints` and `ssa_ops_bulk_move` / `ssa_cycle_assignments` (greedy output does not).
 
@@ -86,6 +86,16 @@ Use it to get a higher-level view of why ops sit at C+1; use bulk-move to get th
   - `run_bulk_move_simulator`, `check_schedule_constraints`, `binding_schedule_constraints`
 - **How constraints are built (CP-SAT):** `scheduler_rs/src/cpsat_scheduler.rs` (search for `build_ssa_schedule_constraints`, "bulk-move", "Binding schedule constraints")
 - **Python wrapper:** `scripts/simulate_bulk_move.py`; Rust API: `scheduler_rs.run_bulk_move_simulator_from_json(path, verbose=...)`
+
+## Capacity lower bound sanity check
+
+When **greedy is within scratch budget**, CP-SAT requires `greedy_makespan >= capacity_lower_bound` and **panics** otherwise (so we only assert when the greedy schedule is supposed to be feasible). If you see:
+
+```text
+greedy makespan X < capacity_lower_bound Y (greedy schedule would violate capacity; ...)
+```
+
+then either (1) **capacity_lower_bound** is wrong (e.g. in `compute_capacity_lower_bound_global`, `cpsat_scheduler.rs`), or (2) the **greedy scheduler** produced an invalid schedule (too few cycles for the chosen shift/ConstChoice/SelectChoice). The check is skipped when greedy exceeded scratch (`greedy_within_scratch_budget: Some(false)` or `None`), because infeasible greedy can legally use fewer cycles.
 
 ## Limitation
 

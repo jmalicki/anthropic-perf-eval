@@ -62,3 +62,5 @@ current.json
 optimized_*.json
 *_schedule.json
 schedule_analysis.json
+kernel_*.json
+ssa_*.json

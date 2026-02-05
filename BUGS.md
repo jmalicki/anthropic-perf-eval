@@ -1,8 +1,18 @@
 # Known bugs and limitations
 
-## Greedy / merged hint violates engine capacity (VALU, ALU)
+## Open
 
-**Symptom:** When building the CP-SAT model with greedy hints, you see warnings like:
+(none at the moment)
+
+## Fixed
+
+- [x] **CP-SAT loose makespan** – Makespan domain was forced to `[capacity_lower_bound, horizon]` with `capacity_lower_bound` inflated by `critical_path_len` (max ASAP + 1). That overestimates because the model uses variable-length steps (completion_cycle for shifted, +2 for SelectChoice FMA). Solver found 609 with 416 empty cycles; compaction reduced to 192. **Fix:** Pass 0 for the dependency floor when calling `compute_capacity_lower_bound_global` in the SSA path so `capacity_lower_bound` is the actual capacity-derived lower bound (min over x,y,z only). Precedence constraints in the model enforce any dependency lower bound. `scheduler_rs/src/cpsat_scheduler.rs`.
+
+## Fixed (historical)
+
+- [x] **Greedy / merged hint violates engine capacity (VALU, ALU)** – Fix: rebase all sections in `tick_tock_ssa.rs` so merged hint is strict concatenation. See below for details.
+
+**Symptom (historical):** When building the CP-SAT model with greedy hints, you see warnings like:
 
 ```
   WARNING: VALU overflow at cycle 175: 7 > 6

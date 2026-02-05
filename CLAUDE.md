@@ -13,14 +13,12 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 ## Default Problem Size
 
-The benchmark uses these default parameters:
+**Current development: use 2 rounds** for kernel generation, CP-SAT debugging, bulk-move, and iteration (e.g. `uv run generate_ssa_kernel.py --rounds 2`). The script default is still 16 for benchmarking.
+
+Benchmark/default parameters:
 - `forest_height=10` - Tree depth (2^10 - 1 = 2047 nodes)
 - `batch_size=256` - Number of parallel traversals
-- `rounds=16` - Hash rounds per traversal
-
-These values are consistent across all test scripts and should be used when benchmarking.
-
-**For now:** Development and iteration use **2 rounds** (e.g. `uv run generate_ssa_kernel.py --rounds 2`) for faster runs; the default remains 16 for benchmarking.
+- `rounds=16` - Hash rounds per traversal (use `--rounds 2` for dev)
 
 **Batch size constraint:** `batch_size` must be a positive multiple of VLEN (8), because the kernel processes vectors of 8 elements. Invalid values (e.g. 12, 20) produce wrong output or are rejected. Use e.g. 8, 16, 24, 32.
 
