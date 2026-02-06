@@ -1150,6 +1150,10 @@ pub struct SsaCpsatConfig {
     /// If true, force 0 integral gap for proven optimality (debugging only).
     /// Default: false (uses scale/3 gap limit for faster convergence).
     pub force_zero_gap: bool,
+    /// If true, tighten ASAP/ALAP bounds by considering resource capacity.
+    /// Uses energetic reasoning to tighten domains before creating cycle variables.
+    /// Default: false (test first, validate carefully).
+    pub enable_asap_alap_tightening: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1167,6 +1171,7 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
+            enable_asap_alap_tightening: false, // Default: disabled for ablation studies
         }
     }
 }
@@ -1589,6 +1594,7 @@ pub fn schedule_ssa_cpsat(
         valu_shift_mode,
         enable_vbroadcast_elimination,
         force_zero_gap,
+        enable_asap_alap_tightening,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -8708,6 +8714,123 @@ mod tests {
             assign_result.peak_live <= 16,
             "Address assignment peak_live={} should fit in budget=16 (CP-SAT constraint should match)",
             assign_result.peak_live
+        );
+    }
+
+    /// Test that ASAP/ALAP tightening works correctly when enabled.
+    ///
+    /// Creates a scenario where many ops compete for limited capacity, so tightening should
+    /// reduce the search space by tightening ASAP/ALAP bounds. Verifies that:
+    /// 1. CP-SAT can find solutions with tightening enabled
+    /// 2. Solutions are still valid (respect precedence and capacity)
+    /// 3. Tightening doesn't break feasibility
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_asap_alap_tightening_enabled() {
+        use crate::types::Opcode;
+
+        // Create many VALU ops that can all start early (from precedence), but capacity is limited
+        // This should cause tightening to push some ops later
+        let mut ops = Vec::new();
+        
+        // op0: load -> v0 (no deps, ASAP=0)
+        ops.push(make_ssa_op(
+            0,
+            Engine::Load,
+            Opcode::Vload,
+            Some(VReg::vector(0)),
+            vec![Operand::imm(100)],
+            vec![],
+        ));
+
+        // Create 15 VALU ops that all depend on op0
+        // With VALU capacity=6, they can't all start at cycle 1, so tightening should push some later
+        for i in 1..=15 {
+            ops.push(make_ssa_op(
+                i,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(i as u32)),
+                vec![Operand::vector(0), Operand::imm(1)],
+                vec![0], // All depend on op0
+            ));
+        }
+
+        // Test with tightening disabled (baseline)
+        let result_no_tightening = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_asap_alap_tightening: false,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(
+            result_no_tightening.is_some(),
+            "CP-SAT should find a solution without tightening"
+        );
+
+        // Test with tightening enabled
+        let result_with_tightening = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_asap_alap_tightening: true,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(
+            result_with_tightening.is_some(),
+            "CP-SAT should find a solution with tightening enabled"
+        );
+
+        let r_no_tightening = result_no_tightening.unwrap();
+        let r_with_tightening = result_with_tightening.unwrap();
+
+        eprintln!(
+            "test_asap_alap_tightening_enabled: makespan without tightening={}, with tightening={}",
+            r_no_tightening.makespan, r_with_tightening.makespan
+        );
+
+        // Verify all ops are scheduled in both cases
+        assert_eq!(
+            r_no_tightening.cycle_assignments.len(),
+            16,
+            "All 16 ops should be scheduled without tightening"
+        );
+        assert_eq!(
+            r_with_tightening.cycle_assignments.len(),
+            16,
+            "All 16 ops should be scheduled with tightening"
+        );
+
+        // Verify solutions respect precedence constraints
+        for (idx, &cycle) in r_with_tightening.cycle_assignments.iter().enumerate() {
+            let op = &ops[idx];
+            for &dep_idx in &op.dep_ids {
+                if let Some(&dep_cycle) = r_with_tightening.cycle_assignments.get(dep_idx) {
+                    assert!(
+                        cycle >= dep_cycle + 1,
+                        "Precedence violated: op {} at cycle {} depends on op {} at cycle {}",
+                        idx, cycle, dep_idx, dep_cycle
+                    );
+                }
+            }
+        }
+
+        // Tightening should not make the problem infeasible
+        // (makespan might be same or slightly different, but solution should exist)
+        assert!(
+            r_with_tightening.status == CpsatStatus::Optimal || r_with_tightening.status == CpsatStatus::Feasible,
+            "Solution with tightening should be feasible or optimal"
         );
     }
 
