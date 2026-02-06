@@ -1154,9 +1154,9 @@ pub struct SsaCpsatConfig {
     /// Uses energetic reasoning to tighten domains before creating cycle variables.
     /// Default: false (test first, validate carefully).
     pub enable_asap_alap_tightening: bool,
-    /// If true, also consider scratch constraints when tightening ASAP/ALAP bounds.
-    /// Requires enable_asap_alap_tightening to be true. Computes min/max scratch usage
-    /// over choices and tightens bounds to avoid cycles where even minimum scratch exceeds budget.
+    /// If true, consider scratch constraints when tightening ASAP/ALAP bounds.
+    /// Can be used independently of enable_asap_alap_tightening. Computes maximum scratch usage
+    /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
     /// Default: false (test first, validate carefully).
     pub enable_scratch_tightening: bool,
 }
@@ -1958,12 +1958,16 @@ pub fn schedule_ssa_cpsat(
     let alap = compute_ssa_alap(ops, horizon as i32);
 
     // 1b. Tighten ASAP/ALAP bounds if enabled
-    let (final_asap, final_alap) = if enable_asap_alap_tightening {
-        // First, tighten by slot constraints
+    // Can apply slot tightening, scratch tightening, or both independently
+    let mut current_asap = asap.clone();
+    let mut current_alap = alap.clone();
+
+    // Apply slot-aware tightening if enabled
+    if enable_asap_alap_tightening {
         let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
             ops,
-            &asap,
-            &alap,
+            &current_asap,
+            &current_alap,
             horizon as i32,
             valu_cap,
             alu_cap,
@@ -1972,25 +1976,28 @@ pub fn schedule_ssa_cpsat(
             flow_cap,
             verbose,
         )
-        .unwrap_or_else(|| (asap.clone(), alap.clone()));
+        .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
+        current_asap = slot_asap;
+        current_alap = slot_alap;
+    }
 
-        // Then, optionally tighten by scratch constraints
-        if enable_scratch_tightening {
-            tighten_asap_alap_by_scratch(
-                ops,
-                &slot_asap,
-                &slot_alap,
-                horizon as i32,
-                scratch_budget as i32,
-                verbose,
-            )
-            .unwrap_or_else(|| (slot_asap.clone(), slot_alap.clone()))
-        } else {
-            (slot_asap, slot_alap)
-        }
-    } else {
-        (asap.clone(), alap.clone())
-    };
+    // Apply scratch-aware tightening if enabled (works independently of slot tightening)
+    if enable_scratch_tightening {
+        let (scratch_asap, scratch_alap) = tighten_asap_alap_by_scratch(
+            ops,
+            &current_asap,
+            &current_alap,
+            horizon as i32,
+            scratch_budget as i32,
+            verbose,
+        )
+        .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
+        current_asap = scratch_asap;
+        current_alap = scratch_alap;
+    }
+
+    let final_asap = current_asap;
+    let final_alap = current_alap;
 
     // 2. Identify shiftable VALU ops
     let shiftable_valu: Vec<usize> = if enable_valu_shift {
