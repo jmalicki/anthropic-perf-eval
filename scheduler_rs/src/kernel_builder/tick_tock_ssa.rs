@@ -4788,6 +4788,8 @@ mod tests {
             SelectChoiceMode::Optimize,
             ValuShiftMode::Optimize,
             false, // force_zero_gap
+            false, // enable_asap_alap_tightening
+            false, // enable_scratch_tightening
         );
         assert!(
             result.is_ok(),

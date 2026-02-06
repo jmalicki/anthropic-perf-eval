@@ -9186,6 +9186,237 @@ mod tests {
         );
     }
 
+    /// Test that scratch-aware tightening works correctly when enabled independently.
+    ///
+    /// Creates a scenario with high scratch pressure (many VRegs live simultaneously)
+    /// to verify that scratch-aware tightening can tighten bounds independently of slot tightening.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_tightening_enabled() {
+        use crate::types::Opcode;
+
+        // Create ops that produce many VRegs that are all live simultaneously
+        // This creates scratch pressure without necessarily creating slot pressure
+        let mut ops = Vec::new();
+        
+        // op0: load -> v0 (no deps, ASAP=0)
+        ops.push(make_ssa_op(
+            0,
+            Engine::Load,
+            Opcode::Vload,
+            Some(VReg::vector(0)),
+            vec![Operand::imm(100)],
+            vec![],
+        ));
+
+        // Create 20 ALU ops that all depend on op0 and produce different VRegs
+        // These can all start at cycle 1, but if they all produce VRegs that stay live,
+        // we'll have high scratch pressure
+        for i in 1..=20 {
+            ops.push(make_ssa_op(
+                i,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(i as u32)),
+                vec![Operand::scalar(0), Operand::imm(1)],
+                vec![0], // All depend on op0
+            ));
+        }
+
+        // Create consumers that use all these VRegs much later (creates long lifetimes)
+        for i in 1..=20 {
+            ops.push(make_ssa_op(
+                20 + i,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(100 + i as u32)),
+                vec![Operand::scalar(i as u32), Operand::imm(1)],
+                vec![i], // Depends on producer
+            ));
+        }
+
+        // Test with scratch tightening disabled (baseline)
+        let result_no_tightening = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_asap_alap_tightening: false,
+                enable_scratch_tightening: false,
+                scratch_budget: 10, // Tight budget to force scratch pressure
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(
+            result_no_tightening.is_some(),
+            "CP-SAT should find a solution without scratch tightening"
+        );
+
+        // Test with scratch tightening enabled (but slot tightening disabled)
+        let result_with_scratch_tightening = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_asap_alap_tightening: false,
+                enable_scratch_tightening: true,
+                scratch_budget: 10, // Tight budget
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(
+            result_with_scratch_tightening.is_some(),
+            "CP-SAT should find a solution with scratch tightening enabled"
+        );
+
+        let r_no_tightening = result_no_tightening.unwrap();
+        let r_with_scratch = result_with_scratch_tightening.unwrap();
+
+        eprintln!(
+            "test_scratch_tightening_enabled: makespan without tightening={}, with scratch tightening={}",
+            r_no_tightening.makespan, r_with_scratch.makespan
+        );
+
+        // Verify all ops are scheduled in both cases
+        assert_eq!(
+            r_no_tightening.cycle_assignments.len(),
+            ops.len(),
+            "All ops should be scheduled without scratch tightening"
+        );
+        assert_eq!(
+            r_with_scratch.cycle_assignments.len(),
+            ops.len(),
+            "All ops should be scheduled with scratch tightening"
+        );
+
+        // Verify solutions respect precedence constraints
+        for (idx, &cycle) in r_with_scratch.cycle_assignments.iter().enumerate() {
+            let op = &ops[idx];
+            for &dep_idx in &op.dep_ids {
+                if let Some(&dep_cycle) = r_with_scratch.cycle_assignments.get(dep_idx) {
+                    assert!(
+                        cycle >= dep_cycle + 1,
+                        "Op {} scheduled at cycle {} should be after dep {} at cycle {}",
+                        idx, cycle, dep_idx, dep_cycle
+                    );
+                }
+            }
+        }
+
+        // Scratch tightening should not make the problem infeasible
+        assert!(
+            r_with_scratch.status == CpsatStatus::Optimal || r_with_scratch.status == CpsatStatus::Feasible,
+            "Solution with scratch tightening should be feasible or optimal"
+        );
+    }
+
+    /// Test that both slot and scratch tightening can work together.
+    ///
+    /// Creates a scenario with both slot pressure and scratch pressure to verify
+    /// that both tightening methods can be applied together.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_both_tightening_methods_together() {
+        use crate::types::Opcode;
+
+        // Create ops that create both slot pressure (many VALU ops) and scratch pressure (long lifetimes)
+        let mut ops = Vec::new();
+        
+        // op0: load -> v0 (no deps, ASAP=0)
+        ops.push(make_ssa_op(
+            0,
+            Engine::Load,
+            Opcode::Vload,
+            Some(VReg::vector(0)),
+            vec![Operand::imm(100)],
+            vec![],
+        ));
+
+        // Create 15 VALU ops that all depend on op0 (slot pressure)
+        for i in 1..=15 {
+            ops.push(make_ssa_op(
+                i,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(i as u32)),
+                vec![Operand::vector(0), Operand::imm(1)],
+                vec![0], // All depend on op0
+            ));
+        }
+
+        // Create consumers much later (scratch pressure - long lifetimes)
+        for i in 1..=15 {
+            ops.push(make_ssa_op(
+                15 + i,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(100 + i as u32)),
+                vec![Operand::vector(i as u32), Operand::imm(1)],
+                vec![i], // Depends on VALU producer
+            ));
+        }
+
+        // Test with both tightening methods enabled
+        let result_both = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_asap_alap_tightening: true,
+                enable_scratch_tightening: true,
+                scratch_budget: 20, // Moderate budget
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(
+            result_both.is_some(),
+            "CP-SAT should find a solution with both tightening methods enabled"
+        );
+
+        let r_both = result_both.unwrap();
+
+        eprintln!(
+            "test_both_tightening_methods_together: makespan with both tightening={}",
+            r_both.makespan
+        );
+
+        // Verify all ops are scheduled
+        assert_eq!(
+            r_both.cycle_assignments.len(),
+            ops.len(),
+            "All ops should be scheduled with both tightening methods"
+        );
+
+        // Verify solutions respect precedence constraints
+        for (idx, &cycle) in r_both.cycle_assignments.iter().enumerate() {
+            let op = &ops[idx];
+            for &dep_idx in &op.dep_ids {
+                if let Some(&dep_cycle) = r_both.cycle_assignments.get(dep_idx) {
+                    assert!(
+                        cycle >= dep_cycle + 1,
+                        "Op {} scheduled at cycle {} should be after dep {} at cycle {}",
+                        idx, cycle, dep_idx, dep_cycle
+                    );
+                }
+            }
+        }
+
+        // Both tightening methods should not make the problem infeasible
+        assert!(
+            r_both.status == CpsatStatus::Optimal || r_both.status == CpsatStatus::Feasible,
+            "Solution with both tightening methods should be feasible or optimal"
+        );
+    }
+
     /// Test that CP-SAT scratch constraint correctly models SelectChoice FMA reads at cycle+1.
     ///
     /// Bug fix: SelectChoice FMA reads cond/false_val/delta at cycle+1, so interval end should be
