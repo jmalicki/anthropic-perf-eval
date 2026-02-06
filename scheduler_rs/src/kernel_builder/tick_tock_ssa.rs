@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use crate::address_assign::{
     assign_addresses, build_vreg_metadata, AddressAssignConfig, AddressAssignmentResult,
 };
-use crate::types::{Engine, Op, Opcode, SsaOp, UsageAccounting, VReg, VarType};
+use crate::types::{Engine, MachineConfig, Op, Opcode, SsaOp, UsageAccounting, VReg, VarType};
 use crate::types::SlotVal;
 
 use super::barrier_elision::elide_barriers;
@@ -479,6 +479,8 @@ impl SsaTickTockKernelBuilder {
         select_choice_mode: crate::cpsat_scheduler::SelectChoiceMode,
         valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
         force_zero_gap: bool,
+        enable_asap_alap_tightening: bool,
+        enable_scratch_tightening: bool,
     ) -> Result<SsaScheduleResult, String> {
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
@@ -1019,11 +1021,13 @@ impl SsaTickTockKernelBuilder {
             enable_vbroadcast_elimination,
             scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
+            machine: MachineConfig::default(),
             const_choice_mode,
             select_choice_mode,
             valu_shift_mode,
             force_zero_gap,
-            ..Default::default()
+            enable_asap_alap_tightening,
+            enable_scratch_tightening,
         };
 
         // Pass shift hints if VALU shift is enabled. Exclude ops that were re-scheduled by per-section

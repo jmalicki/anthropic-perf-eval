@@ -91,6 +91,10 @@ def main():
                         help="CP-SAT VALU shift: optimize, force alu, or force valu (default: optimize)")
     parser.add_argument("--force-zero-gap", action="store_true",
                         help="Force 0 integral gap for proven optimality (debugging only, slower). Uses longer time limit (2h) so CP-SAT can prove optimality.")
+    parser.add_argument("--enable-asap-alap-tightening", action="store_true",
+                        help="Enable ASAP/ALAP tightening by considering slot capacity (experimental, for ablation studies)")
+    parser.add_argument("--enable-scratch-tightening", action="store_true",
+                        help="Enable scratch-aware tightening (requires --enable-asap-alap-tightening). Considers scratch constraints when tightening bounds (experimental, for ablation studies)")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -153,6 +157,13 @@ def main():
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
     if args.force_zero_gap:
         print(f"  force_zero_gap=True")
+    if args.enable_asap_alap_tightening:
+        print(f"  enable_asap_alap_tightening=True")
+    if args.enable_scratch_tightening:
+        if not args.enable_asap_alap_tightening:
+            print("ERROR: --enable-scratch-tightening requires --enable-asap-alap-tightening", file=sys.stderr)
+            return 1
+        print(f"  enable_scratch_tightening=True")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -172,6 +183,8 @@ def main():
         "select_choice": args.select_choice,
         "valu_shift": args.valu_shift,
         "force_zero_gap": args.force_zero_gap and use_cpsat,
+        "enable_asap_alap_tightening": args.enable_asap_alap_tightening and use_cpsat,
+        "enable_scratch_tightening": args.enable_scratch_tightening and use_cpsat and args.enable_asap_alap_tightening,
     }
     git_sha = get_git_sha()
 
@@ -192,6 +205,8 @@ def main():
         select_choice=args.select_choice,
         valu_shift=args.valu_shift,
         force_zero_gap=args.force_zero_gap if use_cpsat else None,
+        enable_asap_alap_tightening=args.enable_asap_alap_tightening if use_cpsat else None,
+        enable_scratch_tightening=args.enable_scratch_tightening if use_cpsat and args.enable_asap_alap_tightening else None,
         run_options_json=json.dumps(run_options),
         git_sha=git_sha,
         comment=args.comment,

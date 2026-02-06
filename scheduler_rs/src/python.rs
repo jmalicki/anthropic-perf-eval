@@ -1005,7 +1005,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, enable_asap_alap_tightening=None, enable_scratch_tightening=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1029,6 +1029,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     run_options_json: Option<String>,
     git_sha: Option<String>,
     comment: Option<String>,
+    enable_asap_alap_tightening: Option<bool>,
+    enable_scratch_tightening: Option<bool>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1083,6 +1085,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         forced_shifts.map(|v| v.into_iter().collect());
     let force_zero_gap = force_zero_gap.unwrap_or(false);
     let enable_vbroadcast_elimination = enable_vbroadcast_elimination.unwrap_or(enable_valu_shift);
+    let enable_asap_alap_tightening = enable_asap_alap_tightening.unwrap_or(false);
+    let enable_scratch_tightening = enable_scratch_tightening.unwrap_or(false);
     let result = if use_cpsat {
         builder
             .build_and_schedule_cpsat(
@@ -1096,6 +1100,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 select_choice_mode,
                 valu_shift_mode,
                 force_zero_gap,
+                enable_asap_alap_tightening,
+                enable_scratch_tightening,
             )
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))

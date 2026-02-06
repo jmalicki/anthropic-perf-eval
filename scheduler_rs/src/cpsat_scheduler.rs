@@ -1154,6 +1154,11 @@ pub struct SsaCpsatConfig {
     /// Uses energetic reasoning to tighten domains before creating cycle variables.
     /// Default: false (test first, validate carefully).
     pub enable_asap_alap_tightening: bool,
+    /// If true, also consider scratch constraints when tightening ASAP/ALAP bounds.
+    /// Requires enable_asap_alap_tightening to be true. Computes min/max scratch usage
+    /// over choices and tightens bounds to avoid cycles where even minimum scratch exceeds budget.
+    /// Default: false (test first, validate carefully).
+    pub enable_scratch_tightening: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1172,6 +1177,7 @@ impl Default for SsaCpsatConfig {
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
             enable_asap_alap_tightening: false, // Default: disabled for ablation studies
+            enable_scratch_tightening: false, // Default: disabled for ablation studies
         }
     }
 }
@@ -1550,6 +1556,309 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
     alap
 }
 
+/// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
+/// Uses difference arrays and prefix sums for O(n + horizon) complexity.
+///
+/// For each engine, builds a resource profile of ops that CAN start at each cycle,
+/// then checks if windows have enough capacity. Tightens bounds iteratively until convergence.
+fn tighten_asap_alap_by_slots(
+    ops: &[SsaOp],
+    asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+    horizon: i32,
+    valu_cap: i64,
+    alu_cap: i64,
+    load_cap: i64,
+    store_cap: i64,
+    flow_cap: i64,
+    verbose: bool,
+) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
+    use std::collections::HashMap as StdHashMap;
+
+    let n = ops.len();
+    let horizon_usize = horizon as usize;
+
+    // Build engine capacity map
+    let mut engine_caps: StdHashMap<Engine, i64> = StdHashMap::new();
+    engine_caps.insert(Engine::Valu, valu_cap);
+    engine_caps.insert(Engine::Alu, alu_cap);
+    engine_caps.insert(Engine::Load, load_cap);
+    engine_caps.insert(Engine::Store, store_cap);
+    engine_caps.insert(Engine::Flow, flow_cap);
+
+    // Track which ops belong to which engine
+    let mut ops_by_engine: StdHashMap<Engine, Vec<usize>> = StdHashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if engine_caps.contains_key(&op.engine) {
+            ops_by_engine.entry(op.engine).or_default().push(idx);
+        }
+    }
+
+    let mut new_asap = asap.clone();
+    let mut new_alap = alap.clone();
+    let mut changed = true;
+    let mut iter = 0;
+    const MAX_ITER: usize = 3; // Limit iterations
+
+    while changed && iter < MAX_ITER {
+        changed = false;
+        iter += 1;
+
+        // For each engine, build resource profile and tighten bounds
+        for (engine, cap) in &engine_caps {
+            let engine_ops = match ops_by_engine.get(engine) {
+                Some(ops) => ops,
+                None => continue,
+            };
+            if engine_ops.is_empty() {
+                continue;
+            }
+
+            // Build resource profile using difference array
+            // profile[t] = number of ops on this engine that CAN start at cycle t
+            let mut diff = vec![0i64; horizon_usize + 2];
+            for &idx in engine_ops {
+                let op_id = ops[idx].id;
+                let asap_t = *new_asap.get(&op_id)? as usize;
+                let alap_t = *new_alap.get(&op_id)? as usize;
+                if asap_t <= alap_t && alap_t < horizon_usize {
+                    diff[asap_t] += 1;
+                    if alap_t + 1 < diff.len() {
+                        diff[alap_t + 1] -= 1;
+                    }
+                }
+            }
+
+            // Compute prefix sums to get actual profile
+            let mut profile = vec![0i64; horizon_usize + 1];
+            let mut sum = 0i64;
+            for t in 0..=horizon_usize {
+                sum += diff[t];
+                profile[t] = sum;
+            }
+
+            // Build prefix sums of profile for O(1) window queries
+            let mut prefix = vec![0i64; horizon_usize + 2];
+            for t in 0..=horizon_usize {
+                prefix[t + 1] = prefix[t] + profile[t];
+            }
+
+            // For each op on this engine, check if window has enough capacity
+            for &idx in engine_ops {
+                let op_id = ops[idx].id;
+                let old_asap = *new_asap.get(&op_id)?;
+                let old_alap = *new_alap.get(&op_id)?;
+                let window_size = (old_alap - old_asap + 1) as i64;
+
+                if window_size <= 0 {
+                    continue;
+                }
+
+                // Count total ops that CAN start in this window
+                let window_start = old_asap as usize;
+                let window_end = old_alap as usize;
+                if window_end >= prefix.len() - 1 {
+                    continue;
+                }
+                let total_ops_in_window = prefix[window_end + 1] - prefix[window_start];
+
+                // Check if window is too small (energetic reasoning)
+                // If total ops > capacity * window_size, we need a larger window
+                if total_ops_in_window > *cap * window_size {
+                    // Tighten ASAP forward: find earliest cycle where there's enough capacity
+                    let mut new_asap_val = old_asap;
+                    for t in (old_asap as usize)..=(old_alap as usize) {
+                        if t >= prefix.len() - 1 {
+                            break;
+                        }
+                        // Check if window [t, old_alap] has enough capacity
+                        let remaining_window = (old_alap - t as i32 + 1) as i64;
+                        if remaining_window <= 0 {
+                            break;
+                        }
+                        let ops_in_remaining = prefix[old_alap as usize + 1] - prefix[t];
+                        if ops_in_remaining <= *cap * remaining_window {
+                            new_asap_val = t as i32;
+                            break;
+                        }
+                    }
+
+                    // Tighten ALAP backward: find latest cycle where there's enough capacity
+                    let mut new_alap_val = old_alap;
+                    for t in ((old_asap as usize)..=(old_alap as usize)).rev() {
+                        if t >= prefix.len() - 1 {
+                            continue;
+                        }
+                        // Check if window [old_asap, t] has enough capacity
+                        let remaining_window = (t as i32 - old_asap + 1) as i64;
+                        if remaining_window <= 0 {
+                            break;
+                        }
+                        let ops_in_remaining = prefix[t + 1] - prefix[old_asap as usize];
+                        if ops_in_remaining <= *cap * remaining_window {
+                            new_alap_val = t as i32;
+                            break;
+                        }
+                    }
+
+                    // Update bounds if tightened
+                    if new_asap_val > old_asap || new_alap_val < old_alap {
+                        if new_asap_val > old_asap {
+                            new_asap.insert(op_id, new_asap_val);
+                            changed = true;
+                        }
+                        if new_alap_val < old_alap {
+                            new_alap.insert(op_id, new_alap_val);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if verbose && iter > 0 {
+        eprintln!(
+            "  Slot-aware tightening: {} iterations, tightened {} ops",
+            iter,
+            new_asap.len().max(new_alap.len())
+        );
+    }
+
+    Some((new_asap, new_alap))
+}
+
+/// Tighten ASAP/ALAP bounds using scratch memory constraints.
+/// Computes min/max scratch usage over choices and tightens bounds to avoid cycles
+/// where even minimum scratch exceeds budget.
+fn tighten_asap_alap_by_scratch(
+    ops: &[SsaOp],
+    asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+    horizon: i32,
+    scratch_budget: i32,
+    verbose: bool,
+) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
+    use std::collections::HashMap as StdHashMap;
+
+    // Build VReg -> defining op index mapping
+    let mut vreg_def_op: StdHashMap<VReg, usize> = StdHashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(dest) = op.dest {
+            vreg_def_op.insert(dest, idx);
+        }
+    }
+
+    // Build VReg -> last use op index mapping (conservative: use latest index)
+    let mut vreg_last_use: StdHashMap<VReg, usize> = StdHashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        for vreg in op.reads() {
+            vreg_last_use.insert(vreg, idx);
+        }
+    }
+
+    // Collect VRegs that have both definition and use
+    let live_vregs: Vec<VReg> = vreg_def_op
+        .keys()
+        .filter(|v| vreg_last_use.contains_key(v))
+        .copied()
+        .collect();
+
+    if live_vregs.is_empty() {
+        return Some((asap.clone(), alap.clone()));
+    }
+
+    // Build maximum scratch usage profile over cycles
+    // For each cycle t, compute maximum scratch usage assuming worst-case scheduling
+    // (VRegs live for their longest possible lifetime: def at ASAP, use at ALAP)
+    let horizon_usize = horizon as usize;
+    let mut max_scratch = vec![0i32; horizon_usize + 1];
+
+    // For each VReg, determine its maximum lifetime based on op windows
+    for vreg in &live_vregs {
+        let def_idx = *vreg_def_op.get(vreg)?;
+        let use_idx = *vreg_last_use.get(vreg)?;
+        let def_op_id = ops[def_idx].id;
+        let use_op_id = ops[use_idx].id;
+
+        let def_asap = *asap.get(&def_op_id)? as usize;
+        let def_alap = *alap.get(&def_op_id)? as usize;
+        let use_asap = *asap.get(&use_op_id)? as usize;
+        let use_alap = *alap.get(&use_op_id)? as usize;
+
+        // Maximum lifetime: def at ASAP, use at ALAP (longest possible)
+        // This gives us the worst-case scratch usage
+        let max_def = def_asap;
+        let max_use = use_alap.min(horizon_usize);
+
+        // VReg is live from def cycle to use cycle (inclusive)
+        // Update scratch profile for this maximum lifetime
+        for t in max_def..=max_use {
+            if t <= horizon_usize {
+                max_scratch[t] += 1;
+            }
+        }
+    }
+
+    // Find cycles where max scratch exceeds budget
+    let mut new_asap = asap.clone();
+    let mut new_alap = alap.clone();
+    let mut changed = false;
+
+    // For each op, if its window includes cycles where max scratch > budget,
+    // tighten bounds to avoid those cycles
+    for (idx, op) in ops.iter().enumerate() {
+        let op_id = op.id;
+        let old_asap = *new_asap.get(&op_id)?;
+        let old_alap = *new_alap.get(&op_id)?;
+
+        // Find earliest cycle in window where scratch is within budget
+        let mut new_asap_val = old_asap;
+        for t in (old_asap as usize)..=(old_alap as usize) {
+            if t > horizon_usize {
+                break;
+            }
+            if max_scratch[t] <= scratch_budget {
+                new_asap_val = t as i32;
+                break;
+            }
+        }
+
+        // Find latest cycle in window where scratch is within budget
+        let mut new_alap_val = old_alap;
+        for t in ((old_asap as usize)..=(old_alap as usize)).rev() {
+            if t > horizon_usize {
+                continue;
+            }
+            if max_scratch[t] <= scratch_budget {
+                new_alap_val = t as i32;
+                break;
+            }
+        }
+
+        // Update bounds if tightened
+        if new_asap_val > old_asap || new_alap_val < old_alap {
+            if new_asap_val > old_asap {
+                new_asap.insert(op_id, new_asap_val);
+                changed = true;
+            }
+            if new_alap_val < old_alap {
+                new_alap.insert(op_id, new_alap_val);
+                changed = true;
+            }
+        }
+    }
+
+    if verbose && changed {
+        eprintln!(
+            "  Scratch-aware tightening: tightened {} ops to avoid scratch budget violations",
+            new_asap.len().max(new_alap.len())
+        );
+    }
+
+    Some((new_asap, new_alap))
+}
+
 /// Schedule SSA operations using CP-SAT solver.
 ///
 /// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
@@ -1595,6 +1904,7 @@ pub fn schedule_ssa_cpsat(
         enable_vbroadcast_elimination,
         force_zero_gap,
         enable_asap_alap_tightening,
+        enable_scratch_tightening,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -1646,6 +1956,41 @@ pub fn schedule_ssa_cpsat(
     let horizon = (critical_path_len * 2).max(greedy_max).max(n as i32) as i64;
 
     let alap = compute_ssa_alap(ops, horizon as i32);
+
+    // 1b. Tighten ASAP/ALAP bounds if enabled
+    let (final_asap, final_alap) = if enable_asap_alap_tightening {
+        // First, tighten by slot constraints
+        let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
+            ops,
+            &asap,
+            &alap,
+            horizon as i32,
+            valu_cap,
+            alu_cap,
+            load_cap,
+            store_cap,
+            flow_cap,
+            verbose,
+        )
+        .unwrap_or_else(|| (asap.clone(), alap.clone()));
+
+        // Then, optionally tighten by scratch constraints
+        if enable_scratch_tightening {
+            tighten_asap_alap_by_scratch(
+                ops,
+                &slot_asap,
+                &slot_alap,
+                horizon as i32,
+                scratch_budget as i32,
+                verbose,
+            )
+            .unwrap_or_else(|| (slot_asap.clone(), slot_alap.clone()))
+        } else {
+            (slot_asap, slot_alap)
+        }
+    } else {
+        (asap.clone(), alap.clone())
+    };
 
     // 2. Identify shiftable VALU ops
     let shiftable_valu: Vec<usize> = if enable_valu_shift {
@@ -1716,8 +2061,8 @@ pub fn schedule_ssa_cpsat(
         .iter()
         .enumerate()
         .map(|(idx, op)| {
-            let lb = *asap.get(&op.id).unwrap_or(&0) as i64;
-            let ub = *alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
+            let lb = *final_asap.get(&op.id).unwrap_or(&0) as i64;
+            let ub = *final_alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
             model.new_int_var_with_name([(lb, ub)], format!("c{}", idx))
         })
         .collect();

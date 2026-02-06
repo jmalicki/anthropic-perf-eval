@@ -114,16 +114,76 @@ Based on analysis of [`scheduler_rs/src/cpsat_scheduler.rs`](scheduler_rs/src/cp
 
 **Addresses propagation weakness #3**: Resource-aware ASAP/ALAP tightening directly addresses the issue that precedence-only bounds create loose initial domains. By tightening domains before creating cycle variables, we reduce the search space from the start.
 
+**Resources Used:** The tightening currently uses **slot constraints only** (ALU, VALU, Load, Store, Flow capacities), but **scratch-aware tightening is also possible** and could provide additional tightening.
+
+**Current Implementation (Slot Constraints Only):**
+- Tightening happens before cycle variables are created (before scratch liveness is computed)
+- Slot constraints are simpler to reason about (fixed capacity per engine per cycle)
+- Slot capacity violations are easier to detect via energetic reasoning (count ops per engine in a window)
+
+**Why Scratch Constraints Could Also Be Used:**
+- **Slot constraints also depend on choices**: Shifted VALU ops (shift_var), ConstChoice (Load vs AddImm), SelectChoice (FMA vs vselect) all affect slot usage, just like scratch. So slot constraints have min/max bounds over choices too.
+- **Scratch constraints have min/max bounds over choices**: For each cycle t, we can compute:
+  - **Minimum scratch usage** (best case): Assume all choices minimize scratch:
+    - ConstChoice: Use AddImm instead of Load (avoids temp VRegs)
+    - SelectChoice: Use vselect instead of FMA (avoids sub_temp_vreg)
+    - Shifted VALU: Assume earliest possible write cycle (min of ASAP bounds for the 8 ALU ops)
+  - **Maximum scratch usage** (worst case): Assume all choices maximize scratch:
+    - ConstChoice: Use Load instead of AddImm (creates temp VRegs)
+    - SelectChoice: Use FMA instead of vselect (creates sub_temp_vreg)
+    - Shifted VALU: Assume latest possible write cycle (max of ALAP bounds for the 8 ALU ops)
+- **If min scratch > budget, bounds can be tightened**: If even in the best case (minimum scratch), we exceed the scratch budget at cycle t, then some ops MUST be scheduled earlier/later, regardless of choices. This can tighten ASAP/ALAP bounds further.
+- **This could tighten bounds further**: Scratch-aware tightening could provide additional tightening beyond slot-aware tightening, especially when scratch is the bottleneck (e.g., when many VRegs are live simultaneously).
+
+**Implementation Approach for Scratch-Aware Tightening:**
+1. **After slot-aware tightening**: First tighten using slot constraints (current implementation)
+2. **Compute min/max scratch usage**: For each cycle t in [0, horizon-1]:
+   - Build liveness intervals assuming minimum scratch choices (best case)
+   - Build liveness intervals assuming maximum scratch choices (worst case)
+   - Compute scratch usage profile: `scratch[t] = sum of live VReg sizes at cycle t`
+3. **Tighten if min scratch > budget**: For each cycle t where `min_scratch[t] > scratch_budget`:
+   - Find ops that contribute to scratch at cycle t (VRegs that are live at t)
+   - Tighten ASAP forward or ALAP backward to avoid cycle t
+4. **Iterate**: Repeat until convergence (typically 1-2 passes)
+
+**Computational Cost:**
+- **Single pass cost**: O(n + horizon), same as slot-aware tightening:
+  - Build `vreg_def_op` and `vreg_last_use`: O(n) - one pass through ops
+  - Build scratch profile using difference arrays: O(n + horizon) - similar to slot profile
+  - Check for violations: O(horizon) - scan profile once
+  - Tighten bounds: O(n) - update ASAP/ALAP for affected ops
+- **Iterative updates are cheap**: Each iteration is O(n + horizon), so multiple passes are still efficient
+- **Convergence**: Typically 1-2 passes (similar to slot-aware tightening), so total cost is O(k × (n + horizon)) where k = 1-2
+- **Comparison to slot-aware**: Same complexity! Scratch-aware tightening is no more expensive than slot-aware tightening
+
+**Why a Single Pass Could Help a Lot:**
+- **Scratch violations are "global"**: When scratch exceeds budget at cycle t, many VRegs are live simultaneously. Tightening bounds to avoid cycle t fixes a whole region, not just one op.
+- **Even partial tightening helps**: Even if we don't fully resolve all scratch violations in one pass, tightening bounds reduces search space significantly.
+- **No need for perfect convergence**: A single pass that tightens bounds by 10-20% could still provide significant benefit (exponential search space reduction).
+
+**Implementation Challenges:**
+- Scratch liveness depends on write cycles (def_cycle) and last read cycles (last_use_cycle), which depend on scheduling decisions
+- Need to compute liveness intervals for different choice scenarios (min/max scratch)
+- More complex than slot constraints (need to track VReg liveness, not just count ops), but same computational complexity
+- Iterative updates are cheap (O(n + horizon) per iteration), so convergence is not a concern
+
+**Future Enhancement:**
+- Consider adding scratch-aware tightening as a second pass after slot-aware tightening
+- Compute min/max scratch usage over choices for each cycle t
+- If min scratch > budget at cycle t, tighten ASAP/ALAP bounds to avoid that cycle
+- This could provide additional tightening when scratch is the bottleneck (e.g., when many VRegs are live simultaneously)
+- Test on problems where scratch is tight (peak liveness near budget) to see if it helps
+
 **Implementation (O(n + horizon) algorithm):**
 
-1. Build resource profile using difference array:
-   - Initialize `profile[t] = 0` for all cycles t
-   - For each op i: `profile[ASAP[i]]++`, `profile[ALAP[i]+1]--`
-   - Compute prefix sums to get actual counts: `profile[t] = sum of ops that CAN start at t`
-2. Build prefix sums of profile for O(1) window queries
-3. For each op i, check if window [ASAP[i], ALAP[i]] has enough capacity:
-   - Query prefix sums: `total_capacity_needed = sum(profile[ASAP[i]..ALAP[i]])`
-   - If `total_capacity_needed > capacity * (ALAP[i] - ASAP[i] + 1)`, tighten window
+1. For each engine (ALU, VALU, Load, Store, Flow), build resource profile using difference array:
+   - Initialize `profile[engine][t] = 0` for all cycles t
+   - For each op i on engine e: `profile[e][ASAP[i]]++`, `profile[e][ALAP[i]+1]--`
+   - Compute prefix sums to get actual counts: `profile[e][t] = sum of ops on engine e that CAN start at t`
+2. Build prefix sums of profile for O(1) window queries per engine
+3. For each op i, check if window [ASAP[i], ALAP[i]] has enough capacity for its engine:
+   - Query prefix sums: `total_capacity_needed = sum(profile[engine[i]][ASAP[i]..ALAP[i]])`
+   - If `total_capacity_needed > capacity[engine[i]] * (ALAP[i] - ASAP[i] + 1)`, tighten window
 4. Iterate until convergence (typically 1-2 passes)
 5. Use tightened ASAP/ALAP to set cycle variable domains
 
@@ -131,11 +191,11 @@ Based on analysis of [`scheduler_rs/src/cpsat_scheduler.rs`](scheduler_rs/src/cp
 
 The tightening algorithm uses **energetic reasoning** to determine when a window is too small:
 
-- For each op i with window [ASAP[i], ALAP[i]]:
-  - Count total ops that CAN start in this window (using prefix sums of resource profile)
-  - If total ops > capacity × window_size, the window is too small
-  - Tighten ASAP forward: Find earliest cycle t where there's enough capacity for all ops that MUST start by t
-  - Tighten ALAP backward: Find latest cycle t where there's enough capacity for all ops that MUST start by t
+- For each op i with window [ASAP[i], ALAP[i]] on engine e:
+  - Count total ops on engine e that CAN start in this window (using prefix sums of resource profile for engine e)
+  - If total ops > capacity[e] × window_size, the window is too small
+  - Tighten ASAP forward: Find earliest cycle t where there's enough capacity for all ops on engine e that MUST start by t
+  - Tighten ALAP backward: Find latest cycle t where there's enough capacity for all ops on engine e that MUST start by t
 
 **Location:** After [`compute_ssa_asap`](scheduler_rs/src/cpsat_scheduler.rs#L1439) and [`compute_ssa_alap`](scheduler_rs/src/cpsat_scheduler.rs#L1490) calls (around [lines 1636-1642](scheduler_rs/src/cpsat_scheduler.rs#L1636)), before creating cycle variables ([line 1708](scheduler_rs/src/cpsat_scheduler.rs#L1708)) in [`scheduler_rs/src/cpsat_scheduler.rs`](scheduler_rs/src/cpsat_scheduler.rs).
 
