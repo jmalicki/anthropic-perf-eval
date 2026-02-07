@@ -2257,15 +2257,18 @@ pub fn schedule_ssa_cpsat(
 
         match valu_shift_mode {
             ValuShiftMode::ForceValu => {
-                model.add_eq(LinearExpr::from(shift_var.clone()), 0);
+                let c = model.add_eq(LinearExpr::from(shift_var.clone()), 0);
+                model.set_constraint_name(c, &format!("shift_fix_{}_0", idx));
             }
             ValuShiftMode::ForceAlu => {
-                model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+                let c = model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+                model.set_constraint_name(c, &format!("shift_fix_{}_1", idx));
             }
             ValuShiftMode::Optimize => {
                 if let Some(forced) = forced_shifts {
                     if forced.contains(&ops[idx].id) {
-                        model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+                        let c = model.add_eq(LinearExpr::from(shift_var.clone()), 1);
+                        model.set_constraint_name(c, &format!("shift_fix_{}_1", idx));
                     }
                 }
                 // Shift hints are added in section 11 with all other hints (avoids duplicate hint for same var)
@@ -2297,18 +2300,21 @@ pub fn schedule_ssa_cpsat(
         let completion_cycle =
             model.new_int_var_with_name([(op_asap, op_alap)], format!("completion_c{}", idx));
         completion_cycle_vars.insert(idx, completion_cycle);
-        model.add_ge(
+        let c = model.add_ge(
             LinearExpr::from(completion_cycle),
             LinearExpr::from(cycle_vars[idx]),
         );
-        for &alu_cycle in &alu_cycles {
-            model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+        model.set_constraint_name(c, &format!("completion_ge_start_{}", idx));
+        for (lane_i, &alu_cycle) in alu_cycles.iter().enumerate() {
+            let c = model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
+            model.set_constraint_name(c, &format!("completion_ge_alu_{}_{}", idx, lane_i));
         }
         if matches!(valu_shift_mode, ValuShiftMode::ForceValu) {
-            model.add_eq(
+            let c = model.add_eq(
                 LinearExpr::from(completion_cycle),
                 LinearExpr::from(cycle_vars[idx]),
             );
+            model.set_constraint_name(c, &format!("completion_eq_cycle_{}", idx));
         }
     }
 
@@ -2351,17 +2357,20 @@ pub fn schedule_ssa_cpsat(
                                 LinearExpr::from(dep_alu_cycles[j]) + 1,
                             );
                             model.only_enforce_if(c, [shift_dep]);
+                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_on", idx, lane_i, dep_idx));
                             // When shift[dep]=0: use cycle_vars[dep]
                             let c = model.add_ge(
                                 *alu_cycle,
                                 LinearExpr::from(cycle_vars[dep_idx]) + 1,
                             );
                             model.only_enforce_if(c, [!shift_dep]);
+                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_off", idx, lane_i, dep_idx));
                         } else {
-                            model.add_ge(
+                            let c = model.add_ge(
                                 *alu_cycle,
                                 LinearExpr::from(cycle_vars[dep_idx]) + 1,
                             );
+                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_valu", idx, lane_i, dep_idx));
                         }
                     }
                 }
@@ -2379,7 +2388,8 @@ pub fn schedule_ssa_cpsat(
                     if let Some(&completion_cycle) = completion_cycle_vars.get(&dep_idx) {
                         // cycle[idx] >= completion_cycle[dep_idx] + 1
                         // This ensures consumer waits for all 8 ALU ops to complete
-                        model.add_ge(cycle_vars[idx], LinearExpr::from(completion_cycle) + 1);
+                        let c = model.add_ge(cycle_vars[idx], LinearExpr::from(completion_cycle) + 1);
+                        model.set_constraint_name(c, &format!("consumer_after_completion_{}_{}", idx, dep_idx));
                     }
                 }
             }
@@ -2435,7 +2445,8 @@ pub fn schedule_ssa_cpsat(
             // (1) eliminate_var <= shift_c for each c, (2) eliminate_var >= sum(shift_c) - (k-1)
             for &c in &shiftable_consumers {
                 let shift_c = *shift_vars.get(&c).unwrap();
-                model.add_ge(LinearExpr::from(shift_c), LinearExpr::from(eliminate_var.clone()));
+                let ct = model.add_ge(LinearExpr::from(shift_c), LinearExpr::from(eliminate_var.clone()));
+                model.set_constraint_name(ct, &format!("vb_elim_{}_shift_ge_c{}", vb_idx, c));
             }
             let k = shiftable_consumers.len() as i64;
             let first_shift = *shift_vars.get(&shiftable_consumers[0]).unwrap();
@@ -2444,10 +2455,11 @@ pub fn schedule_ssa_cpsat(
                 .fold(LinearExpr::from(first_shift), |acc, &c| {
                     acc + LinearExpr::from(*shift_vars.get(&c).unwrap())
                 });
-            model.add_ge(
+            let ct = model.add_ge(
                 LinearExpr::from(eliminate_var.clone()),
                 sum_shifts - (k - 1),
             );
+            model.set_constraint_name(ct, &format!("vb_elim_{}_sum_ge", vb_idx));
             let vb_interval = model.new_optional_fixed_size_interval_var(
                 cycle_vars[vb_idx],
                 1,
@@ -2461,17 +2473,25 @@ pub fn schedule_ssa_cpsat(
             }
             for &c in &shiftable_consumers {
                 if let Some(alu_cycles) = alu_cycle_vars.get(&c) {
-                    for alu_cycle in alu_cycles {
+                    for (lane_i, alu_cycle) in alu_cycles.iter().enumerate() {
                         let c_elim = model.add_ge(
                             *alu_cycle,
                             LinearExpr::from(cycle_vars[scalar_producer_idx]) + 1,
                         );
                         model.only_enforce_if(c_elim, [eliminate_var.clone()]);
+                        model.set_constraint_name(
+                            c_elim,
+                            &format!("vb_elim_{}_prec_elim_c{}_lane{}", vb_idx, c, lane_i),
+                        );
                         let c_keep = model.add_ge(
                             *alu_cycle,
                             LinearExpr::from(cycle_vars[vb_idx]) + 1,
                         );
                         model.only_enforce_if(c_keep, [eliminate_var.not()]);
+                        model.set_constraint_name(
+                            c_keep,
+                            &format!("vb_elim_{}_prec_keep_c{}_lane{}", vb_idx, c, lane_i),
+                        );
                     }
                 }
             }
@@ -2570,7 +2590,8 @@ pub fn schedule_ssa_cpsat(
                         .fold(LinearExpr::from(use_vars[0]), |acc, &b| {
                             acc + LinearExpr::from(b)
                         });
-                    model.add_eq(sum_expr, 1);
+                    let c = model.add_eq(sum_expr, 1);
+                    model.set_constraint_name(c, &format!("const_choice_one_{}", idx));
 
                     let use_load = use_vars[0];
                     let use_add_imm = use_vars[1];
@@ -2604,9 +2625,11 @@ pub fn schedule_ssa_cpsat(
                                 let c_left =
                                     model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[left_idx]) + 1);
                                 model.only_enforce_if(c_left, [use_alu_k]);
+                                model.set_constraint_name(c_left, &format!("const_choice_prec_{}_k_{}_left", idx, k));
                                 let c_right =
                                     model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[right_idx]) + 1);
                                 model.only_enforce_if(c_right, [use_alu_k]);
+                                model.set_constraint_name(c_right, &format!("const_choice_prec_{}_k_{}_right", idx, k));
                             }
                         }
                     }
@@ -2651,10 +2674,11 @@ pub fn schedule_ssa_cpsat(
                         [(fma_asap as i64, fma_alap as i64)],
                         format!("fma_cycle_{}", idx),
                     );
-                    model.add_eq(
+                    let c = model.add_eq(
                         LinearExpr::from(fma_cycle_var),
                         LinearExpr::from(cycle_vars[idx]) + 1,
                     );
+                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
                     select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
                     let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
                     vec![sub_interval, fma_interval]
@@ -2693,10 +2717,11 @@ pub fn schedule_ssa_cpsat(
                         [(fma_asap as i64, fma_alap as i64)],
                         format!("fma_cycle_{}", idx),
                     );
-                    model.add_eq(
+                    let c = model.add_eq(
                         LinearExpr::from(fma_cycle_var),
                         LinearExpr::from(cycle_vars[idx]) + 1,
                     );
+                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
                     select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
                     let fma_interval =
                         model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
@@ -2721,10 +2746,12 @@ pub fn schedule_ssa_cpsat(
             }
             match select_choice_mode {
                 SelectChoiceMode::ForceVselect => {
-                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                    let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                    model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_vselect", idx, dep_idx));
                 }
                 SelectChoiceMode::ForceFma => {
-                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                    let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                    model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_fma", idx, dep_idx));
                 }
                 SelectChoiceMode::Optimize => {
                     let choice_var = select_choice_vars
@@ -2735,11 +2762,13 @@ pub fn schedule_ssa_cpsat(
                         [(0, 1)],
                         format!("select_fma_extra_{}_{}", dep_idx, idx),
                     );
-                    model.add_eq(LinearExpr::from(extra), LinearExpr::from(*choice_var));
-                    model.add_ge(
+                    let c = model.add_eq(LinearExpr::from(extra), LinearExpr::from(*choice_var));
+                    model.set_constraint_name(c, &format!("select_fma_extra_{}_{}", dep_idx, idx));
+                    let c = model.add_ge(
                         cycle_vars[idx],
                         LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
                     );
+                    model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_opt", idx, dep_idx));
                     select_fma_extra_vars.insert((dep_idx, idx), extra);
                 }
             }
@@ -2832,7 +2861,8 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !valu_intervals.is_empty() {
-            model.add_cumulative(valu_intervals, valu_demands, valu_cap);
+            let c = model.add_cumulative(valu_intervals, valu_demands, valu_cap);
+            model.set_constraint_name(c, "cumul_valu");
         }
     }
 
@@ -2868,7 +2898,8 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !alu_intervals.is_empty() {
-            model.add_cumulative(alu_intervals, alu_demands, alu_cap);
+            let c = model.add_cumulative(alu_intervals, alu_demands, alu_cap);
+            model.set_constraint_name(c, "cumul_alu");
         }
     }
 
@@ -2899,7 +2930,8 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !load_intervals.is_empty() {
-            model.add_cumulative(load_intervals, load_demands, load_cap);
+            let c = model.add_cumulative(load_intervals, load_demands, load_cap);
+            model.set_constraint_name(c, "cumul_load");
         }
     }
 
@@ -2918,7 +2950,8 @@ pub fn schedule_ssa_cpsat(
                 .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
                 .collect();
             let demands: Vec<i64> = vec![1; intervals.len()];
-            model.add_cumulative(intervals, demands, store_cap);
+            let c = model.add_cumulative(intervals, demands, store_cap);
+            model.set_constraint_name(c, "cumul_store");
         }
     }
 
@@ -3000,9 +3033,11 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !flow_intervals.is_empty() {
-            model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
+            let c = model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
+            model.set_constraint_name(c, "cumul_flow");
             // Redundant with cumulative(1): no two Flow intervals overlap when present.
-            model.add_no_overlap(flow_intervals);
+            let c = model.add_no_overlap(flow_intervals);
+            model.set_constraint_name(c, "no_overlap_flow");
         }
     }
 
@@ -3153,8 +3188,9 @@ pub fn schedule_ssa_cpsat(
                 || live_through_vregs.is_some_and(|s| !s.is_empty()))
         {
             let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
-            for cv in &cycle_vars {
-                model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
+            for (cv_idx, cv) in cycle_vars.iter().enumerate() {
+                let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
+                model.set_constraint_name(c, &format!("segment_end_ge_c_{}", cv_idx));
             }
             Some(m)
         } else {
@@ -3237,8 +3273,10 @@ pub fn schedule_ssa_cpsat(
                                     );
                                     let c_fma = model.add_eq(LinearExpr::from(end_var), end_fma.clone());
                                     model.only_enforce_if(c_fma, [choice_var]);
+                                    model.set_constraint_name(c_fma, &format!("scratch_end_fma_{}", last_use_idx));
                                     let c_vselect = model.add_eq(LinearExpr::from(end_var), end_vselect.clone());
                                     model.only_enforce_if(c_vselect, [!choice_var]);
+                                    model.set_constraint_name(c_vselect, &format!("scratch_end_vselect_{}", last_use_idx));
                                     (LinearExpr::from(end_var), LinearExpr::from(end_var))
                                 } else {
                                     // No choice_var (shouldn't happen in Optimize mode)
@@ -3286,8 +3324,9 @@ pub fn schedule_ssa_cpsat(
                         format!("shifted_dest_start_{}", def_idx),
                     );
                     // When shifted: start_var <= each alu_cycle (ensures start_var <= min(alu_cycles))
-                    for &alu_cycle in alu_cycles {
-                        model.add_ge(LinearExpr::from(alu_cycle), LinearExpr::from(start_var));
+                    for (lane_i, &alu_cycle) in alu_cycles.iter().enumerate() {
+                        let c = model.add_ge(LinearExpr::from(alu_cycle), LinearExpr::from(start_var));
+                        model.set_constraint_name(c, &format!("scratch_shifted_start_ge_alu_{}_{}", def_idx, lane_i));
                     }
                     // When not shifted: start_var = cycle_vars[def_idx]
                     let c_not_shifted = model.add_eq(
@@ -3295,6 +3334,7 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(cycle_vars[def_idx]),
                     );
                     model.only_enforce_if(c_not_shifted, [!shift_var]);
+                    model.set_constraint_name(c_not_shifted, &format!("scratch_shifted_start_eq_cycle_{}", def_idx));
                     // Note: We don't explicitly enforce start_var == min(alu_cycles) when shifted,
                     // but the objective (minimize sum of cycles) will naturally push start_var to the minimum.
                     // The constraint start_var <= each alu_cycle ensures correctness (start_var <= actual min).
@@ -3310,7 +3350,8 @@ pub fn schedule_ssa_cpsat(
                     .new_int_var_with_name([(1, horizon + 1)], format!("live_size_{}", vreg.id));
 
                 // Constraint: cycle[def] + size = end
-                model.add_eq(LinearExpr::from(start) + LinearExpr::from(size), end_expr);
+                let c = model.add_eq(LinearExpr::from(start) + LinearExpr::from(size), end_expr);
+                model.set_constraint_name(c, &format!("scratch_live_size_{}", vreg.id));
 
                 let interval = model.new_interval_var(start, size, end_for_interval);
                 scratch_intervals.push(interval);
@@ -3337,10 +3378,11 @@ pub fn schedule_ssa_cpsat(
                                     [(1, horizon + 1)],
                                     format!("live_out_size_{}", vreg.id),
                                 );
-                                model.add_eq(
+                                let c = model.add_eq(
                                     LinearExpr::from(start) + LinearExpr::from(size),
                                     end_expr.clone(),
                                 );
+                                model.set_constraint_name(c, &format!("scratch_live_out_size_{}", vreg.id));
                                 let interval = model.new_interval_var(start, size, end_expr);
                                 scratch_intervals.push(interval);
                                 scratch_demands.push(vreg.size() as i64);
@@ -3362,10 +3404,11 @@ pub fn schedule_ssa_cpsat(
                         [(1, horizon + 1)],
                         format!("init_live_size_{}", vreg.id),
                     );
-                    model.add_eq(
+                    let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
                     );
+                    model.set_constraint_name(c, &format!("scratch_init_live_size_{}", vreg.id));
                     let interval = model.new_interval_var(zero_var, size, end_expr);
                     scratch_intervals.push(interval);
                     scratch_demands.push(vreg.size() as i64);
@@ -3381,10 +3424,11 @@ pub fn schedule_ssa_cpsat(
                         [(1, horizon + 1)],
                         format!("live_through_size_{}", vreg.id),
                     );
-                    model.add_eq(
+                    let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
                     );
+                    model.set_constraint_name(c, &format!("scratch_live_through_size_{}", vreg.id));
                     let interval = model.new_interval_var(zero_var, size, end_expr);
                     scratch_intervals.push(interval);
                     scratch_demands.push(vreg.size() as i64);
@@ -3419,7 +3463,8 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
+            let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
+            model.set_constraint_name(c, "cumul_scratch");
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
@@ -3740,15 +3785,19 @@ pub fn schedule_ssa_cpsat(
         model.new_int_var_with_name([(max_cycle_lb, (horizon - 1) as i64)], "max_cycle".to_string());
     let makespan =
         model.new_int_var_with_name([(capacity_lower_bound, horizon)], "makespan".to_string());
-    model.add_eq(LinearExpr::from(makespan), LinearExpr::from(max_cycle) + 1);
-    for &cv in cycle_vars.iter() {
-        model.add_ge(max_cycle, LinearExpr::from(cv));
+    let c = model.add_eq(LinearExpr::from(makespan), LinearExpr::from(max_cycle) + 1);
+    model.set_constraint_name(c, "makespan_eq_max_cycle");
+    for (cv_idx, &cv) in cycle_vars.iter().enumerate() {
+        let c = model.add_ge(max_cycle, LinearExpr::from(cv));
+        model.set_constraint_name(c, &format!("max_cycle_ge_c_{}", cv_idx));
     }
-    for (_, &completion_var) in completion_cycle_vars.iter() {
-        model.add_ge(max_cycle, LinearExpr::from(completion_var));
+    for (idx, &completion_var) in completion_cycle_vars.iter() {
+        let c = model.add_ge(max_cycle, LinearExpr::from(completion_var));
+        model.set_constraint_name(c, &format!("max_cycle_ge_completion_{}", idx));
     }
-    for (_, &fma_last) in select_choice_fma_last_cycle.iter() {
-        model.add_ge(max_cycle, LinearExpr::from(fma_last));
+    for (idx, &fma_last) in select_choice_fma_last_cycle.iter() {
+        let c = model.add_ge(max_cycle, LinearExpr::from(fma_last));
+        model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
     }
 
     // Redundant linear capacity constraints: only add bounds that are valid for *any* choice.
@@ -3759,11 +3808,13 @@ pub fn schedule_ssa_cpsat(
     // Load and store bounds are valid global mins (min over const_choice for load; store is fixed).
     if load_bound > 0 {
         let load_lb = model.new_int_var([(load_bound, load_bound)]);
-        model.add_ge(makespan, LinearExpr::from(load_lb));
+        let c = model.add_ge(makespan, LinearExpr::from(load_lb));
+        model.set_constraint_name(c, "makespan_ge_load_lb");
     }
     if store_bound > 0 {
         let store_lb = model.new_int_var([(store_bound, store_bound)]);
-        model.add_ge(makespan, LinearExpr::from(store_lb));
+        let c = model.add_ge(makespan, LinearExpr::from(store_lb));
+        model.set_constraint_name(c, "makespan_ge_store_lb");
     }
 
     // Direct capacity constraints: link makespan to choice variables (x = shift, y = ConstChoice AddImm, z = SelectChoice FMA count)
@@ -3806,25 +3857,29 @@ pub fn schedule_ssa_cpsat(
         if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
             let lhs = LinearExpr::from(makespan) * 6 + s.clone() - z.clone() * 2;
             let rhs = model.new_int_var([(valu_count, valu_count)]);
-            model.add_ge(lhs, LinearExpr::from(rhs));
+            let c = model.add_ge(lhs, LinearExpr::from(rhs));
+            model.set_constraint_name(c, "capacity_valu");
         }
         // ALU: 12*makespan >= alu_count + 8*sum(shift)  =>  12*makespan - 8*s >= alu_count
         if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
             let lhs = LinearExpr::from(makespan) * 12 - s.clone() * 8;
             let rhs = model.new_int_var([(alu_count, alu_count)]);
-            model.add_ge(lhs, LinearExpr::from(rhs));
+            let c = model.add_ge(lhs, LinearExpr::from(rhs));
+            model.set_constraint_name(c, "capacity_alu");
         }
         // Flow: makespan >= flow_base + sum(const_add_imm) - sum(select_fma)  =>  makespan + z - y >= flow_base
         if flow_base > 0 || const_choice_count > 0 || select_choice_count > 0 {
             let lhs = LinearExpr::from(makespan) + z.clone() - y.clone();
             let rhs = model.new_int_var([(flow_base, flow_base)]);
-            model.add_ge(lhs, LinearExpr::from(rhs));
+            let c = model.add_ge(lhs, LinearExpr::from(rhs));
+            model.set_constraint_name(c, "capacity_flow");
         }
         // Load: 2*makespan >= load_count - sum(const_add_imm)
         if load_count > 0 && const_choice_count > 0 {
             let lhs = LinearExpr::from(makespan) * 2 + y;
             let rhs = model.new_int_var([(load_count, load_count)]);
-            model.add_ge(lhs, LinearExpr::from(rhs));
+            let c = model.add_ge(lhs, LinearExpr::from(rhs));
+            model.set_constraint_name(c, "capacity_load");
         }
     }
 
@@ -3837,19 +3892,24 @@ pub fn schedule_ssa_cpsat(
             if let Some(&completion_var) = completion_cycle_vars.get(&idx) {
                 let c = model.add_ge(makespan, LinearExpr::from(completion_var) + 1);
                 model.only_enforce_if(c, [shift_var]);
+                model.set_constraint_name(c, &format!("makespan_ge_shifted_{}", idx));
             }
             let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
             model.only_enforce_if(c, [!shift_var]);
+            model.set_constraint_name(c, &format!("makespan_ge_valu_{}", idx));
         } else if select_choice_set.contains(&idx) {
             match select_choice_mode {
                 SelectChoiceMode::ForceVselect => {
-                    model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                    let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                    model.set_constraint_name(c, &format!("makespan_ge_select_vselect_{}", idx));
                 }
                 SelectChoiceMode::ForceFma => {
                     if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
-                        model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
+                        let c = model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
+                        model.set_constraint_name(c, &format!("makespan_ge_select_fma_{}", idx));
                     } else {
-                        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                        model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
                     }
                 }
                 SelectChoiceMode::Optimize => {
@@ -3857,15 +3917,19 @@ pub fn schedule_ssa_cpsat(
                         let choice_var = *select_choice_vars.get(&idx).unwrap();
                         let c = model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
                         model.only_enforce_if(c, [choice_var]);
+                        model.set_constraint_name(c, &format!("makespan_ge_select_fma_{}", idx));
                         let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
                         model.only_enforce_if(c, [!choice_var]);
+                        model.set_constraint_name(c, &format!("makespan_ge_select_vselect_{}", idx));
                     } else {
-                        model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+                        model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
                     }
                 }
             }
         } else {
-            model.add_ge(makespan, LinearExpr::from(cv) + 1);
+            let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
+            model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
         }
     }
 
@@ -3904,9 +3968,11 @@ pub fn schedule_ssa_cpsat(
         if let Some(&cc_var) = completion_cycle_vars.get(&idx) {
             let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cc_var));
             model.only_enforce_if(c, [shift_var]);
+            model.set_constraint_name(c, &format!("chosen_cycle_shifted_{}", idx));
         }
         let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
         model.only_enforce_if(c, [!shift_var]);
+        model.set_constraint_name(c, &format!("chosen_cycle_valu_{}", idx));
         shiftable_chosen_cycle.insert(idx, chosen);
     }
 
@@ -3927,11 +3993,14 @@ pub fn schedule_ssa_cpsat(
                 // Last cycle for the choice made: FMA → fma_last (C+1); vselect → cycle_vars[idx] (C).
                 let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
                 model.only_enforce_if(c, [choice_var]);
+                model.set_constraint_name(c, &format!("chosen_cycle_select_fma_{}", idx));
                 let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
                 model.only_enforce_if(c, [!choice_var]);
+                model.set_constraint_name(c, &format!("chosen_cycle_select_vselect_{}", idx));
             } else {
                 // ForceFma: no choice_var; last cycle is always fma_last.
-                model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
+                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
+                model.set_constraint_name(c, &format!("chosen_cycle_select_fma_{}", idx));
             }
             select_chosen_cycle.insert(idx, chosen);
         } else if let Some(&choice_var) = select_choice_vars.get(&idx) {
@@ -3944,7 +4013,8 @@ pub fn schedule_ssa_cpsat(
                 [(op_asap, op_alap)],
                 format!("select_chosen_cycle_{}", idx),
             );
-            model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
+            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
+            model.set_constraint_name(c, &format!("chosen_cycle_select_{}", idx));
             select_chosen_cycle.insert(idx, chosen);
         }
     }
@@ -4006,7 +4076,8 @@ pub fn schedule_ssa_cpsat(
             acc + LinearExpr::from(v)
         });
         // Explicitly bound tie-breaker below scale so floor(objective/scale) = makespan always.
-        model.add_le(sum_completion.clone(), scale.saturating_sub(1));
+        let c = model.add_le(sum_completion.clone(), scale.saturating_sub(1));
+        model.set_constraint_name(c, "tie_sum_completion");
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
     } else {
