@@ -321,6 +321,7 @@ impl SsaTickTockKernelBuilder {
                 None, // Don't need cycle hints for greedy path
                 None,
                 Some(&mut greedy_const_add_imm_ops),
+                None, // Greedy-only path: no CP-SAT bounds
             )?;
 
         // Elide barriers before address assignment and lowering
@@ -488,6 +489,8 @@ impl SsaTickTockKernelBuilder {
             sections_exceeding_budget, vreg_def_section,
         };
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+        #[cfg(feature = "cpsat")]
+        use crate::cpsat_scheduler::compute_ssa_asap_alap_bounds;
         use crate::types::Opcode;
 
         // Build SSA ops (includes barrier pseudo-ops between rounds)
@@ -534,6 +537,22 @@ impl SsaTickTockKernelBuilder {
 
         let barrier_count = count_barriers(&ssa_ops);
 
+        // Compute ASAP/ALAP bounds (with optional tightening) before greedy so hints stay inside CP-SAT domains.
+        #[cfg(feature = "cpsat")]
+        let (asap_bounds, alap_bounds) = {
+            let bounds_config = SsaCpsatConfig {
+                enable_asap_alap_tightening,
+                enable_scratch_tightening,
+                scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
+                ..Default::default()
+            };
+            compute_ssa_asap_alap_bounds(&ssa_ops, &bounds_config)
+        };
+        #[cfg(feature = "cpsat")]
+        let asap_alap_param = Some((&asap_bounds, &alap_bounds));
+        #[cfg(not(feature = "cpsat"))]
+        let asap_alap_param = None;
+
         // Get greedy hints first (for warm-starting CP-SAT)
         // If shift is enabled, also get shift hints from greedy scheduler
         // Collect SelectChoice and ConstChoice (add_imm) decisions from greedy scheduler
@@ -552,6 +571,7 @@ impl SsaTickTockKernelBuilder {
                 Some(&mut greedy_select_sub_cycles),
                 Some(&mut greedy_select_fma_cycles),
                 Some(&mut greedy_const_add_imm_ops), // Hint ConstChoice as add_imm when greedy used Flow
+                asap_alap_param,
             )?;
 
         if verbose {
@@ -4647,13 +4667,15 @@ mod tests {
     /// - The greedy hints are directly usable (hints_match = true)
     /// - A feasible schedule exists but differs from greedy (hints_match = false)
     /// - No feasible schedule exists within budget (infeasible)
+    /// Uses a smaller config (4 rounds, batch 64) so build + greedy + CP-SAT stay under
+    /// typical runner timeouts (~60s). Full-scale 16r/256b can be run with --ignored.
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_greedy_cpsat_roundtrip_budget_check() {
         use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
 
-        // Build a full-scale kernel
-        let config = KernelConfig::new(10, 2047, 256, 16);
+        // Smaller config to avoid runner wall-clock timeout (4 rounds, batch 64)
+        let config = KernelConfig::new(5, 63, 64, 4);
         let mut builder = SsaTickTockKernelBuilder::new(config);
 
         builder.build_internal();
@@ -4692,7 +4714,7 @@ mod tests {
         let cpsat_result = schedule_ssa_cpsat(
             &ssa_ops,
             SsaCpsatConfig {
-                time_limit_secs: 60.0, // Short timeout
+                time_limit_secs: 30.0, // Keep total test time under runner timeout
                 verbose: true,
                 stop_after_first_solution: true, // Return first feasible solution
                 scratch_budget: 1536,            // Hardware limit
@@ -4711,7 +4733,7 @@ mod tests {
                 live_out_vregs: None,
                 live_through_vregs: None,
             },
-            Some(true), // greedy was within budget in this test
+            Some(!greedy_budget_exceeded),
         );
 
         match cpsat_result {

@@ -1558,9 +1558,6 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
 
 /// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
 /// Uses difference arrays and prefix sums for O(n + horizon) complexity.
-///
-/// For each engine, builds a resource profile of ops that CAN start at each cycle,
-/// then checks if windows have enough capacity. Tightens bounds iteratively until convergence.
 fn tighten_asap_alap_by_slots(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -1729,8 +1726,6 @@ fn tighten_asap_alap_by_slots(
 }
 
 /// Tighten ASAP/ALAP bounds using scratch memory constraints.
-/// Computes min/max scratch usage over choices and tightens bounds to avoid cycles
-/// where even minimum scratch exceeds budget.
 fn tighten_asap_alap_by_scratch(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -1859,6 +1854,97 @@ fn tighten_asap_alap_by_scratch(
     Some((new_asap, new_alap))
 }
 
+/// Build ordering pairs (i, j) for symmetry breaking: cycle[i] <= cycle[j].
+/// Groups ops by ordering_group; within each group sorts by ALAP ascending so that
+/// ASAP[i] <= ALAP[j] holds for consecutive pairs (no need to relax bounds).
+fn build_ordering_pairs_from_bounds(
+    ops: &[SsaOp],
+    _asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+) -> Vec<(usize, usize)> {
+    let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        let Some(ref hint) = op.symmetry_hint else {
+            continue;
+        };
+        if hint.ordering_group.is_empty() {
+            continue;
+        }
+        groups
+            .entry(hint.ordering_group.clone())
+            .or_default()
+            .push(idx);
+    }
+    let mut pairs = Vec::new();
+    for indices in groups.values() {
+        let mut sorted: Vec<usize> = indices.clone();
+        sorted.sort_by_key(|&idx| *alap.get(&ops[idx].id).unwrap_or(&0));
+        for w in sorted.windows(2) {
+            pairs.push((w[0], w[1]));
+        }
+    }
+    pairs
+}
+
+/// Compute ASAP/ALAP bounds (with optional slot/scratch tightening) for use before greedy scheduling.
+/// Call this before the greedy pass so greedy can respect the same domains CP-SAT will use.
+/// Horizon is computed without greedy hints (2 * critical path, or n).
+#[cfg(feature = "cpsat")]
+pub fn compute_ssa_asap_alap_bounds(
+    ops: &[SsaOp],
+    config: &SsaCpsatConfig,
+) -> (HashMap<usize, i32>, HashMap<usize, i32>) {
+    let asap = compute_ssa_asap(ops);
+    let n = ops.len();
+    let critical_path_len = asap.values().max().copied().unwrap_or(0) + 1;
+    let horizon = (critical_path_len * 2).max(n as i32);
+    let alap = compute_ssa_alap(ops, horizon);
+    let mut current_asap = asap;
+    let mut current_alap = alap;
+    let machine = &config.machine;
+    let valu_cap = machine.valu_slots as i64;
+    let alu_cap = machine.alu_slots as i64;
+    let load_cap = machine.load_slots as i64;
+    let store_cap = machine.store_slots as i64;
+    let flow_cap = machine.flow_slots as i64;
+    let scratch_budget = config.scratch_budget as i32;
+    let verbose = false;
+
+    if config.enable_asap_alap_tightening {
+        if let Some((slot_asap, slot_alap)) = tighten_asap_alap_by_slots(
+            ops,
+            &current_asap,
+            &current_alap,
+            horizon,
+            valu_cap,
+            alu_cap,
+            load_cap,
+            store_cap,
+            flow_cap,
+            verbose,
+        ) {
+            current_asap = slot_asap;
+            current_alap = slot_alap;
+        }
+    }
+
+    if config.enable_scratch_tightening {
+        if let Some((scratch_asap, scratch_alap)) = tighten_asap_alap_by_scratch(
+            ops,
+            &current_asap,
+            &current_alap,
+            horizon,
+            scratch_budget,
+            verbose,
+        ) {
+            current_asap = scratch_asap;
+            current_alap = scratch_alap;
+        }
+    }
+
+    (current_asap, current_alap)
+}
+
 /// Schedule SSA operations using CP-SAT solver.
 ///
 /// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
@@ -1957,12 +2043,10 @@ pub fn schedule_ssa_cpsat(
 
     let alap = compute_ssa_alap(ops, horizon as i32);
 
-    // 1b. Tighten ASAP/ALAP bounds if enabled
-    // Can apply slot tightening, scratch tightening, or both independently
+    // 1b. Tighten ASAP/ALAP bounds if enabled. Ordering for symmetry is decided later from final bounds.
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    // Apply slot-aware tightening if enabled
     if enable_asap_alap_tightening {
         let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
             ops,
@@ -1981,7 +2065,6 @@ pub fn schedule_ssa_cpsat(
         current_alap = slot_alap;
     }
 
-    // Apply scratch-aware tightening if enabled (works independently of slot tightening)
     if enable_scratch_tightening {
         let (scratch_asap, scratch_alap) = tighten_asap_alap_by_scratch(
             ops,
@@ -2103,35 +2186,18 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5b. Symmetry breaking (ordering groups): ops with same ordering_group key get cycle[i] <= cycle[j]
-    // for consecutive ops in emission order. Optimizer only groups by key; emission encodes structure.
+    // 5b. Symmetry breaking (ordering groups): ops with same ordering_group get cycle[i] <= cycle[j].
+    // Order within each group is derived from final bounds (sort by ALAP ascending) so ASAP[i] <= ALAP[j] by construction.
     {
-        use std::collections::HashMap;
-        let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
-        for (idx, op) in ops.iter().enumerate() {
-            let Some(ref hint) = op.symmetry_hint else {
-                continue;
-            };
-            if hint.ordering_group.is_empty() {
-                continue;
-            }
-            groups
-                .entry(hint.ordering_group.clone())
-                .or_default()
-                .push(idx);
+        let ordering_pairs = build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap);
+        let n_ordering = ordering_pairs.len();
+        for (i, j) in &ordering_pairs {
+            model.add_le(cycle_vars[*i], cycle_vars[*j]);
         }
-        for (_key, indices) in groups.iter() {
-            for w in indices.windows(2) {
-                let (i, j) = (w[0], w[1]);
-                model.add_le(cycle_vars[i], cycle_vars[j]);
-            }
-        }
-        if verbose && !groups.is_empty() {
-            let total_constraints: usize = groups.values().map(|v| v.len().saturating_sub(1)).sum();
+        if verbose && n_ordering > 0 {
             eprintln!(
-                "  Symmetry breaking (ordering): {} groups, {} constraints",
-                groups.len(),
-                total_constraints
+                "  Symmetry breaking (ordering): {} constraints (order from ALAP)",
+                n_ordering
             );
         }
     }

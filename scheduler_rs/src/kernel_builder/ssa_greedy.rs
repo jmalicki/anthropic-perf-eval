@@ -169,6 +169,7 @@ impl SsaTickTockKernelBuilder {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -192,6 +193,7 @@ impl SsaTickTockKernelBuilder {
         select_sub_cycles: Option<&mut HashMap<usize, i32>>,
         select_fma_cycles: Option<&mut HashMap<usize, i32>>,
         mut const_add_imm_ops: Option<&mut HashSet<usize>>,
+        asap_alap: Option<(&HashMap<usize, i32>, &HashMap<usize, i32>)>,
     ) -> Result<(usize, bool, usize), String> {
         if ops.is_empty() {
             return Ok((0, false, 0));
@@ -371,9 +373,13 @@ impl SsaTickTockKernelBuilder {
         let mut ready_heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
 
         // Initialize with ops that have no dependencies (excluding dead stores)
-        for (idx, _op) in ops.iter().enumerate() {
+        for (idx, op) in ops.iter().enumerate() {
             if remaining_deps[idx] == 0 && !dead_store_indices.contains(&idx) {
-                ready_heap.push(Reverse((0, idx)));
+                let priority = asap_alap
+                    .as_ref()
+                    .and_then(|(a, _)| a.get(&op.id).copied())
+                    .unwrap_or(0);
+                ready_heap.push(Reverse((priority, idx)));
             }
         }
 
@@ -431,7 +437,12 @@ impl SsaTickTockKernelBuilder {
                     ready_this_cycle.push(idx);
                 } else {
                     // Not ready yet - reinsert with updated priority
-                    reinsert.push((priority.max(cycle as i32), idx));
+                    let new_priority = asap_alap
+                        .as_ref()
+                        .and_then(|(a, _)| a.get(&ops[idx].id).copied())
+                        .map(|lb| priority.max(cycle as i32).max(lb))
+                        .unwrap_or_else(|| priority.max(cycle as i32));
+                    reinsert.push((new_priority, idx));
                 }
             }
 
@@ -488,9 +499,26 @@ impl SsaTickTockKernelBuilder {
                     ))
                 });
 
+                // Defer ops that are ready by deps but before their ASAP when bounds are provided
+                let mut deferred_by_bounds: Vec<(i32, usize)> = Vec::new();
+                let mut ready_for_try: Vec<usize> = Vec::new();
+                for idx in ready_this_cycle.drain(..) {
+                    if let Some((asap, _)) = asap_alap {
+                        let lb = *asap.get(&ops[idx].id).unwrap_or(&0);
+                        if (cycle as i32) < lb {
+                            deferred_by_bounds.push((lb, idx));
+                            continue;
+                        }
+                    }
+                    ready_for_try.push(idx);
+                }
+                for (priority, idx) in deferred_by_bounds {
+                    ready_heap.push(Reverse((priority, idx)));
+                }
+
                 // Process ready_this_cycle first, then budget_deferred
-                let ops_to_try: Vec<usize> = ready_this_cycle
-                    .drain(..)
+                let ops_to_try: Vec<usize> = ready_for_try
+                    .into_iter()
                     .chain(budget_deferred.drain(..))
                     .collect();
 
@@ -541,7 +569,12 @@ impl SsaTickTockKernelBuilder {
 
                     if !fits_slots {
                         // Reinsert to heap for next cycle
-                        ready_heap.push(Reverse(((cycle + 1) as i32, idx)));
+                        let next_priority = asap_alap
+                            .as_ref()
+                            .and_then(|(a, _)| a.get(&op_id).copied())
+                            .map(|lb| ((cycle + 1) as i32).max(lb))
+                            .unwrap_or_else(|| (cycle + 1) as i32);
+                        ready_heap.push(Reverse((next_priority, idx)));
                         continue;
                     }
 
@@ -597,7 +630,14 @@ impl SsaTickTockKernelBuilder {
                         _ => {}
                     }
 
-                    ops[idx].cycle = cycle as i32;
+                    let assigned_cycle = if let Some((asap, alap)) = asap_alap {
+                        let lb = *asap.get(&op_id).unwrap_or(&0);
+                        let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
+                        (cycle as i32).clamp(lb, ub)
+                    } else {
+                        cycle as i32
+                    };
+                    ops[idx].cycle = assigned_cycle;
                     scheduled.insert(idx);
                     made_progress = true;
 
@@ -638,7 +678,11 @@ impl SsaTickTockKernelBuilder {
                         remaining_deps[consumer_idx] -= 1;
                         if remaining_deps[consumer_idx] == 0 {
                             // Priority: earliest possible cycle is next cycle (since dep just scheduled)
-                            let priority = (cycle + 1) as i32;
+                            let priority = asap_alap
+                                .as_ref()
+                                .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
+                                .map(|lb| ((cycle + 1) as i32).max(lb))
+                                .unwrap_or_else(|| (cycle + 1) as i32);
                             ready_heap.push(Reverse((priority, consumer_idx)));
                         }
                     }
@@ -725,7 +769,14 @@ impl SsaTickTockKernelBuilder {
                         _ => {}
                     }
 
-                    ops[force_idx].cycle = cycle as i32;
+                    let force_cycle = if let Some((asap, alap)) = asap_alap {
+                        let lb = *asap.get(&op_id).unwrap_or(&0);
+                        let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
+                        (cycle as i32).clamp(lb, ub)
+                    } else {
+                        cycle as i32
+                    };
+                    ops[force_idx].cycle = force_cycle;
                     scheduled.insert(force_idx);
 
                     // Update liveness (same as normal scheduling path)
@@ -733,7 +784,7 @@ impl SsaTickTockKernelBuilder {
                         live_vregs.insert(dest_vreg);
                         live_words += dest_vreg.size();
                         peak_live_words = peak_live_words.max(live_words);
-                        vreg_def_cycle.insert(dest_vreg, cycle as i32);
+                        vreg_def_cycle.insert(dest_vreg, force_cycle);
                     }
 
                     for src in &srcs {
@@ -752,7 +803,12 @@ impl SsaTickTockKernelBuilder {
                     for &consumer_idx in &consumers[force_idx] {
                         remaining_deps[consumer_idx] -= 1;
                         if remaining_deps[consumer_idx] == 0 {
-                            ready_heap.push(Reverse(((cycle + 1) as i32, consumer_idx)));
+                            let priority = asap_alap
+                                .as_ref()
+                                .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
+                                .map(|lb| ((cycle + 1) as i32).max(lb))
+                                .unwrap_or_else(|| (cycle + 1) as i32);
+                            ready_heap.push(Reverse((priority, consumer_idx)));
                         }
                     }
                 }
@@ -760,7 +816,12 @@ impl SsaTickTockKernelBuilder {
 
             // Push remaining budget-deferred ops back to heap for next cycle
             for idx in budget_deferred {
-                ready_heap.push(Reverse(((cycle + 1) as i32, idx)));
+                let priority = asap_alap
+                    .as_ref()
+                    .and_then(|(a, _)| a.get(&ops[idx].id).copied())
+                    .map(|lb| ((cycle + 1) as i32).max(lb))
+                    .unwrap_or_else(|| (cycle + 1) as i32);
+                ready_heap.push(Reverse((priority, idx)));
             }
 
             cycle += 1;
