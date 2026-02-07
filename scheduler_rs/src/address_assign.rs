@@ -95,6 +95,10 @@ pub struct AddressAssignConfig {
     /// When set, VALU ops shifted to ALU (op.id in keys) use min(alu_cycles) as def_cycle for their dest.
     /// The 8 ALU ops write at different cycles; the block is in use from the first write.
     pub shifted_alu_cycles: Option<std::collections::HashMap<usize, Vec<i32>>>,
+    /// When set, ConstChoice ops using ALU-derive: op_id → (left_op_id, right_op_id, opcode).
+    /// The AluDerive op reads the dest VRegs of its left/right producers at its cycle,
+    /// so those producers' live intervals must extend to at least the AluDerive op's cycle.
+    pub const_alu_derive_ops: Option<HashMap<usize, (usize, usize, crate::types::Opcode)>>,
 }
 
 impl Default for AddressAssignConfig {
@@ -106,6 +110,7 @@ impl Default for AddressAssignConfig {
             zero_vreg: None,
             select_fma_ops: None,
             shifted_alu_cycles: None,
+            const_alu_derive_ops: None,
         }
     }
 }
@@ -146,6 +151,7 @@ pub fn compute_live_intervals(
     zero_vreg: Option<VReg>,
     select_fma_ops: Option<&HashSet<usize>>,
     shifted_alu_cycles: Option<&std::collections::HashMap<usize, Vec<i32>>>,
+    const_alu_derive_ops: Option<&HashMap<usize, (usize, usize, crate::types::Opcode)>>,
 ) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
@@ -260,6 +266,59 @@ pub fn compute_live_intervals(
         }
     }
 
+    // AluDerive pass: extend producer VRegs' intervals to cover AluDerive reads.
+    // When a ConstChoice op uses AluDerive (e.g., C = A + B), the lowered instruction
+    // reads from A's and B's addresses at C's cycle. These reads aren't in the SSA graph
+    // (ConstChoice has no VReg srcs), so we must extend A's and B's intervals explicitly.
+    if let Some(alu_derive) = const_alu_derive_ops {
+        // Build op_id → (op_index, dest_vreg) lookup
+        let id_to_info: HashMap<usize, (usize, Option<VReg>)> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (op.id, (i, op.dest)))
+            .collect();
+
+        for (&derive_op_id, &(left_op_id, right_op_id, _opcode)) in alu_derive {
+            let derive_cycle = id_to_info
+                .get(&derive_op_id)
+                .map(|&(i, _)| ops[i].cycle)
+                .unwrap_or(-1);
+            if derive_cycle < 0 {
+                continue;
+            }
+
+            // Extend left producer's dest VReg interval to cover the AluDerive read
+            if let Some(&(_, Some(left_vreg))) = id_to_info.get(&left_op_id) {
+                if let Some(interval) = intervals.get_mut(&left_vreg) {
+                    if derive_cycle > interval.end {
+                        if debug {
+                            eprintln!(
+                                "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
+                                left_vreg, left_op_id, interval.end, derive_cycle, derive_op_id
+                            );
+                        }
+                        interval.end = derive_cycle;
+                    }
+                }
+            }
+
+            // Extend right producer's dest VReg interval to cover the AluDerive read
+            if let Some(&(_, Some(right_vreg))) = id_to_info.get(&right_op_id) {
+                if let Some(interval) = intervals.get_mut(&right_vreg) {
+                    if derive_cycle > interval.end {
+                        if debug {
+                            eprintln!(
+                                "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
+                                right_vreg, right_op_id, interval.end, derive_cycle, derive_op_id
+                            );
+                        }
+                        interval.end = derive_cycle;
+                    }
+                }
+            }
+        }
+    }
+
     // Third pass: extend dead VRegs (start == end) to [start, start+1].
     // This prevents same-cycle write conflicts. See types.rs for explanation.
     for interval in intervals.values_mut() {
@@ -367,6 +426,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         config.zero_vreg,
         config.select_fma_ops.as_ref(),
         config.shifted_alu_cycles.as_ref(),
+        config.const_alu_derive_ops.as_ref(),
     );
 
     // Debug: Collect vstore source VRegs for tracking
@@ -994,7 +1054,7 @@ mod tests {
         emit.ops[0].cycle = 0;
         emit.ops[1].cycle = 1;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -1012,7 +1072,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 5;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
@@ -1063,7 +1123,7 @@ mod tests {
 
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(select_choice_id);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None);
 
         let dest = emit.ops[select_choice_idx]
             .dest
@@ -1145,7 +1205,7 @@ mod tests {
         let result = assign_addresses(&emit.ops, &config);
         assert!(!result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None);
         for (v1, addr1) in &result.vreg_to_addr {
             for (v2, addr2) in &result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1233,7 +1293,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 2;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -1272,6 +1332,7 @@ mod tests {
             zero_vreg: None,
             select_fma_ops: None,
             shifted_alu_cycles: None,
+            const_alu_derive_ops: None,
         };
         let result = assign_addresses(&emit.ops, &config);
 
@@ -1555,7 +1616,7 @@ mod tests {
         emit.ops[5].cycle = 80; // data
         emit.ops[6].cycle = 81; // vstore
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]

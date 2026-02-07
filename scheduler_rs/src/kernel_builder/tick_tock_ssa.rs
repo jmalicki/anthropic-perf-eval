@@ -1207,6 +1207,8 @@ impl SsaTickTockKernelBuilder {
         assign_config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
         // Shifted VALU: 8 ALU ops write at different cycles; def_cycle = min(alu_cycles) for correct allocation
         assign_config.shifted_alu_cycles = Some(cpsat_result.shifted_alu_cycles.clone());
+        // AluDerive: producer VRegs must stay alive until the AluDerive op reads them
+        assign_config.const_alu_derive_ops = Some(cpsat_result.const_alu_derive_ops.clone());
 
         let address_result = assign_addresses(&ssa_ops, &assign_config);
         let budget_exceeded = address_result.budget_exceeded;
@@ -2159,7 +2161,7 @@ mod tests {
         ops[1].cycle = 1;
         ops[2].cycle = 10;
 
-        let intervals = compute_live_intervals(&ops, None, None, None);
+        let intervals = compute_live_intervals(&ops, None, None, None, None);
 
         // CLOSED intervals: [start, end] where end = last_read_cycle
         //
