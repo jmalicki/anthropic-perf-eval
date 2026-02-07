@@ -1,0 +1,157 @@
+================================================================================
+Command: /Users/josephmalicki/src/anthropic-perf-eval/.venv/bin/python3 generate_ssa_kernel.py --rounds 3 --batch-size 64 --cpsat-time-limit 1800.0 --output-json scheduler_output_slot__and__scratch_tightening_enabled.json --comment Slot + scratch tightening enabled --enable-asap-alap-tightening --enable-scratch-tightening
+Start time: 2026-02-06 13:45:42
+================================================================================
+
+Building SSA kernel with CP-SAT (1800s)...
+  forest_height=10, n_nodes=2047
+  batch_size=64, rounds=3
+  enable_valu_shift=True
+  tree_reduce_max_depth=3
+  enable_asap_alap_tightening=True
+  enable_scratch_tightening=True
+
+Building SSA kernel (CP-SAT)...
+SSA Greedy hint: 98 cycles (2 barriers) (37 VALU shifted)
+
+================================================================================
+  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = 1536 words)
+  Sections that exceed budget will get a per-section CP-SAT run (feasibility).
+================================================================================
+
+  Section  0:  peak 409 words  <= 1535  -->  SKIP (within budget)
+  Section  1:  peak 449 words  <= 1535  -->  SKIP (within budget)
+  Section  2:  peak 552 words  <= 1535  -->  SKIP (within budget)
+
+  SUMMARY: All sections within budget; no per-section CP-SAT.
+
+
+================================================================================
+  FULL KERNEL CP-SAT  (optimization — minimize makespan over entire kernel)
+  All rounds merged; solving for minimum cycles. Scratch budget = 1535.
+  Before optimization: 96 cycles, peak 552 words (hint schedule).
+================================================================================
+
+  Slot-aware tightening: 3 iterations, tightened 622 ops
+SSA CP-SAT: 622 ops, critical path 54, horizon 622, scratch_budget=1535
+  VALU ops: 480 total (354 shiftable, 126 non-shiftable: 30 vbroadcast, 96 multiply_add)
+  SelectChoice ops: 32 (can expand to FMA/VALU or vselect/Flow)
+  Model name: full_kernel_optimization
+[Flow model breadcrumbs] regular_flow_ops=0 (indices [], op.ids [])
+[Flow model breadcrumbs] const_choice_ops=22 (optional Flow when choice=true; indices [0, 1, 2, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 32, 60, 62, 68, 77, 82, 87, 92, 97], op.ids [0, 1, 2, 15, 17, 22, 24, 26, 28, 30, 32, 34, 36, 44, 72, 74, 80, 89, 94, 99, 104, 109])
+[Flow model breadcrumbs] select_choice_ops=32 (optional Flow when choice=false; indices [248, 252, 256, 260, 264, 268, 272, 276, 400, 402, 404, 408, 410, 412, 416, 418, 420, 424, 426, 428, 432, 434, 436, 440, 442, 444, 448, 450, 452, 456, 458, 460], op.ids [261, 265, 269, 273, 277, 281, 285, 289, 414, 416, 418, 422, 424, 426, 430, 432, 434, 438, 440, 442, 446, 448, 450, 454, 456, 458, 462, 464, 466, 470, 472, 474])
+[Flow model breadcrumbs] Flow cumulative: total intervals=54, capacity=1
+  Scratch debug: 622 ops total, 606 with dest, 600 with reads, 606 VReg defs, 607 VReg uses
+  Hint verification: peak_live=552 <= budget=1535 OK
+  Scratch constraint: 606 live VRegs, budget=1535
+  Engine capacity verification: OK (VALU<=6, ALU<=12 at all cycles)
+  Capacity bounds (conservative): shiftable=354, const_choice=22; Load=13, Store=8, final_LB=65
+  Hinting 354 shift variables (37 with shift=true, 317 with shift=false)
+
+Starting CP-SAT solver v9.15.9999
+Parameters: max_time_in_seconds: 1800 log_search_progress: true cp_model_presolve: true linearization_level: 2 randomize_search: true cp_model_probing_level: 2 absolute_gap_limit: 333333 num_workers: 8
+
+Initial optimization model 'full_kernel_optimization': (model_fingerprint: 0xeb09c848f1ba567)
+#Variables: 5'709 (#ints: 623 in objective) (4'834 primary variables)
+  - 462 Booleans in [0,1]
+  - 111 different domains in [0,624] with a largest complexity of 1.
+  - 11 constants in {0,1,8,13,32,46,48,480,601} 
+#kCumulative: 6 (#intervals: 4'157, #optional: 3'358, #variable_sizes: 606, #fixed_intervals: 4)
+#kInterval: 4'371 (#enforced: 3'358) (#fixed: 8)
+#kLinear2: 25'493 (#enforced: 12'422)
+#kLinear3: 1'228
+#kLinearN: 22 (#terms: 1'682)
+#kNoOverlap: 1 (#intervals: 54, #optional: 54)
+
+Starting presolve at 0.01s
+The solution hint is incomplete: 5222 out of 5698 non fixed variables hinted.
+  1.10e-03s  0.00e+00d  [DetectDominanceRelations] 
+INFEASIBLE: 'during probing initial propagation'
+  7.31e-02s  9.37e-06d  [PresolveToFixPoint] #num_loops=21 #num_dual_strengthening=1 
+
+Presolve summary:
+  - 478 affine relations were detected.
+  - rule 'TODO dual: add implied bound' was applied 80 times.
+  - rule 'TODO dual: only one blocking constraint?' was applied 73 times.
+  - rule 'TODO dual: only one blocking enforced constraint?' was applied 80 times.
+  - rule 'TODO linear2: contains a boolean' was applied 640 times.
+  - rule 'TODO linear2: convert ax + by != cte to clauses for large domains' was applied 796 times.
+  - rule 'TODO linear2: convert implied ax + by == cte to clauses for large domains' was applied 112 times.
+  - rule 'affine: new relation' was applied 478 times.
+  - rule 'bool_or: always true' was applied 76 times.
+  - rule 'bool_or: implications' was applied 264 times.
+  - rule 'bool_or: only one literal' was applied 22 times.
+  - rule 'bool_or: removed enforcement literal' was applied 8 times.
+  - rule 'cumulative: convert to no_overlap' was applied 1 time.
+  - rule 'cumulative: max profile is always under the min capacity' was applied 2 times.
+  - rule 'cumulative: merged demands of identical interval' was applied 2'887 times.
+  - rule 'cumulative: remove never conflicting intervals' was applied 1 time.
+  - rule 'cumulative: split into disjoint components' was applied 2 times.
+  - rule 'dual: add implication' was applied 1 time.
+  - rule 'dual: make encoding equiv' was applied 16 times.
+  - rule 'enforcement: false literal' was applied 118 times.
+  - rule 'enforcement: true literal' was applied 84 times.
+  - rule 'hint: moved var hint within its domain' was applied 4 times.
+  - rule 'hint: moved var hint within its domain.' was applied 22 times.
+  - rule 'intervals: change duplicate index inside constraint' was applied 2 times.
+  - rule 'intervals: removed unused interval' was applied 227 times.
+  - rule 'linear1: always true' was applied 94 times.
+  - rule 'linear1: x in domain' was applied 44 times.
+  - rule 'linear2: already known enforced relation' was applied 1'920 times.
+  - rule 'linear2: convert ax + by != cte to clauses' was applied 352 times.
+  - rule 'linear: always true' was applied 4'070 times.
+  - rule 'linear: divide by GCD' was applied 1 time.
+  - rule 'linear: empty' was applied 2'530 times.
+  - rule 'linear: fixed or dup variables' was applied 11'943 times.
+  - rule 'linear: negative clause' was applied 11 times.
+  - rule 'linear: never in domain' was applied 2 times.
+  - rule 'linear: positive equal one' was applied 1 time.
+  - rule 'linear: reduced variable domains' was applied 1'546 times.
+  - rule 'linear: remapped using affine relations' was applied 3'947 times.
+  - rule 'linear: trivial 0=0' was applied 3'710 times.
+  - rule 'new_bool: integer encoding' was applied 37 times.
+  - rule 'new_bool: var with 2 values' was applied 73 times.
+  - rule 'no_overlap: split into disjoint components' was applied 1 time.
+  - rule 'objective: variable not used elsewhere' was applied 96 times.
+  - rule 'presolve: iteration' was applied 1 time.
+  - rule 'propagators: changed bounds' was applied 931 times.
+  - rule 'variables with 2 values: create encoding literal' was applied 73 times.
+  - rule 'variables with 2 values: new affine relation' was applied 102 times.
+  - rule 'variables with 2 values: register other encoding' was applied 29 times.
+  - rule 'variables: add encoding constraint' was applied 8 times.
+  - rule 'variables: both boolean and its negation imply same equality' was applied 289 times.
+  - rule 'variables: canonicalize domain' was applied 159 times.
+  - rule 'variables: detect half reified value encoding' was applied 939 times.
+Problem closed by presolve.
+CpSolverResponse summary:
+status: INFEASIBLE
+objective: NA
+best_bound: NA
+integers: 0
+booleans: 0
+conflicts: 0
+branches: 0
+propagations: 0
+integer_propagations: 0
+restarts: 0
+lp_iterations: 0
+walltime: 0.096578
+usertime: 0.096578
+deterministic_time: 9.368e-06
+gap_integral: 0
+
+SSA CP-SAT: no solution found, status Infeasible
+Traceback (most recent call last):
+  File "/Users/josephmalicki/src/anthropic-perf-eval/generate_ssa_kernel.py", line 414, in <module>
+    exit(main())
+         ^^^^^^
+  File "/Users/josephmalicki/src/anthropic-perf-eval/generate_ssa_kernel.py", line 189, in main
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: SSA CP-SAT build failed: CP-SAT scheduling failed
+
+
+================================================================================
+End time: 2026-02-06 13:45:43
+Return code: 1
+================================================================================
