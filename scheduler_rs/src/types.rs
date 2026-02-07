@@ -1533,6 +1533,70 @@ impl SsaOp {
 }
 
 // ============================================================================
+// Precedence Offset Trait
+// ============================================================================
+//
+// Defines per-op precedence delays for ASAP/ALAP computation.
+// Source of truth: docs/ASAP_ALAP_PRECEDENCE_OFFSETS.md
+
+/// Provides per-op precedence offsets for ASAP and ALAP bound computation.
+///
+/// Called on the **predecessor** op to determine how many cycles until its result
+/// is visible to consumers:
+///
+/// - **Normal ops**: offset = 1 (result visible next cycle)
+/// - **SelectChoice FMA ops** (`sub_temp_vreg.is_some()`): offset = 2
+///   (sub emitted at cycle+1, FMA result visible at cycle+2)
+/// - **Shiftable VALU ops**: ASAP offset = 1 (min delay, stays VALU),
+///   ALAP offset = 8 (max delay, shifted to 8 ALU ops that complete later)
+///
+/// See `docs/ASAP_ALAP_PRECEDENCE_OFFSETS.md` for full semantics.
+pub trait PrecedenceOffset {
+    /// Compute the precedence offset from this op (predecessor) to its consumers for ASAP (forward) propagation.
+    ///
+    /// # Arguments
+    /// * `self_is_shiftable` - Whether this op itself is a shiftable VALU op
+    fn precedence_offset_for_asap(&self, self_is_shiftable: bool) -> i32;
+
+    /// Compute the precedence offset from this op (predecessor) to its consumers for ALAP (backward) propagation.
+    ///
+    /// # Arguments
+    /// * `self_is_shiftable` - Whether this op itself is a shiftable VALU op
+    fn precedence_offset_for_alap(&self, self_is_shiftable: bool) -> i32;
+}
+
+impl PrecedenceOffset for SsaOp {
+    fn precedence_offset_for_asap(&self, self_is_shiftable: bool) -> i32 {
+        // SelectChoice with sub_temp_vreg: ASAP uses min delay (vselect path = 1 cycle).
+        // The FMA path (2 cycles) is handled by explicit CP-SAT constraints in section 5d,
+        // just like shiftable ops use min_delay=1 here and let the model handle ALU shift delay.
+        // Using max_delay=2 here would unnecessarily tighten domains and cause chain amplification.
+        if self.opcode == Opcode::SelectChoice && self.sub_temp_vreg.is_some() {
+            return 1;
+        }
+        // This op is shiftable VALU: ASAP uses min delay (1 = stays as VALU)
+        if self_is_shiftable {
+            return 1;
+        }
+        // Default: 1 cycle latency
+        1
+    }
+
+    fn precedence_offset_for_alap(&self, self_is_shiftable: bool) -> i32 {
+        // SelectChoice with sub_temp_vreg: FMA path takes 2 cycles (sub + fma)
+        if self.opcode == Opcode::SelectChoice && self.sub_temp_vreg.is_some() {
+            return 2;
+        }
+        // This op is shiftable VALU: ALAP uses max delay (8 = shifted to 8 ALU ops)
+        if self_is_shiftable {
+            return 8;
+        }
+        // Default: 1 cycle latency
+        1
+    }
+}
+
+// ============================================================================
 // AUTHORITATIVE LIVENESS MODEL DOCUMENTATION
 // ============================================================================
 //
@@ -2370,5 +2434,66 @@ mod tests {
             VReg::vector(1),
             "Second unique VReg should be v1"
         );
+    }
+
+    // ========================================================================
+    // PrecedenceOffset trait tests
+    // ========================================================================
+
+    #[test]
+    fn test_precedence_offset_normal_op() {
+        // A normal ALU op: offset is always 1 (self_is_shiftable=false for ALU)
+        let op = SsaOp::new(
+            0,
+            Engine::Alu,
+            Opcode::Add,
+            Some(VReg::scalar(0)),
+            vec![Operand::scalar(1), Operand::scalar(2)],
+        );
+        assert_eq!(op.precedence_offset_for_asap(false), 1);
+        assert_eq!(op.precedence_offset_for_alap(false), 1);
+        // Even if self_is_shiftable=true (hypothetical), shiftable path applies
+        assert_eq!(op.precedence_offset_for_asap(true), 1);
+        assert_eq!(op.precedence_offset_for_alap(true), 8);
+    }
+
+    #[test]
+    fn test_precedence_offset_select_choice_fma() {
+        // SelectChoice with sub_temp_vreg: ASAP uses min_delay=1 (vselect path),
+        // ALAP uses max_delay=2 (FMA path). Same pattern as shiftable ops.
+        let mut op = SsaOp::new(
+            1,
+            Engine::Flow,
+            Opcode::SelectChoice,
+            Some(VReg::vector(10)),
+            vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+        );
+        op.sub_temp_vreg = Some(VReg::scalar(99));
+
+        // ASAP: min_delay = 1 (vselect path); FMA delay enforced by CP-SAT model constraints
+        assert_eq!(op.precedence_offset_for_asap(false), 1);
+        // ALAP: max_delay = 2 (FMA path: sub + fma)
+        assert_eq!(op.precedence_offset_for_alap(false), 2);
+        // shiftable flag doesn't change SelectChoice offset
+        assert_eq!(op.precedence_offset_for_asap(true), 1);
+        assert_eq!(op.precedence_offset_for_alap(true), 2);
+    }
+
+    #[test]
+    fn test_precedence_offset_shiftable() {
+        // A shiftable VALU op: ASAP=1 (min delay), ALAP=8 (max delay when shifted)
+        let op = SsaOp::new(
+            2,
+            Engine::Valu,
+            Opcode::Add,
+            Some(VReg::vector(5)),
+            vec![Operand::vector(3), Operand::vector(4)],
+        );
+        // When self_is_shiftable=true: ASAP=1, ALAP=8
+        assert_eq!(op.precedence_offset_for_asap(true), 1);
+        assert_eq!(op.precedence_offset_for_alap(true), 8);
+        // When self_is_shiftable=false: default offsets
+        assert_eq!(op.precedence_offset_for_asap(false), 1);
+        assert_eq!(op.precedence_offset_for_alap(false), 1);
     }
 }

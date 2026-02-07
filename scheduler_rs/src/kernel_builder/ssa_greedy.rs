@@ -30,7 +30,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{EmissionPhase, Engine, Opcode, Operand, SsaOp, VReg, VLEN};
+use crate::types::{EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN};
 
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 use super::tick_tock_ssa::SsaTickTockKernelBuilder;
@@ -206,6 +206,17 @@ impl SsaTickTockKernelBuilder {
             .map(|(idx, op)| (op.id, idx))
             .collect();
 
+        // Build shiftable set for PrecedenceOffset computation
+        let shiftable_set: HashSet<usize> = if enable_valu_shift {
+            ops.iter()
+                .enumerate()
+                .filter(|(_, op)| op.engine == Engine::Valu && can_ssa_valu_shift_to_alu(op))
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         // =========================================================================
         // Constant Alternative Detection
         //
@@ -341,6 +352,10 @@ impl SsaTickTockKernelBuilder {
             })
             .collect();
 
+        // Track the earliest cycle each consumer can execute, accounting for
+        // per-predecessor precedence offsets. Updated when each predecessor is scheduled.
+        let mut max_ready_cycle: Vec<i32> = vec![0; ops.len()];
+
         // Track scheduling state
         // =========================================================================
         // Dead Store Elimination
@@ -422,7 +437,8 @@ impl SsaTickTockKernelBuilder {
                     continue; // Already scheduled (shouldn't happen but defensive)
                 }
 
-                // Check if deps are truly satisfied (scheduled in previous cycle)
+                // Check if deps are truly satisfied (predecessor scheduled early enough
+                // that result is visible by this cycle, accounting for precedence offsets).
                 // Dead stores are treated as already satisfied (they're skipped entirely).
                 // Deps not in id_to_idx (external/phantom) are treated as satisfied.
                 let deps_ready = ops[idx].dep_ids.iter().all(|dep_id| {
@@ -430,7 +446,11 @@ impl SsaTickTockKernelBuilder {
                         return true; // external/phantom dep - treat as satisfied
                     };
                     dead_store_indices.contains(&dep_idx)
-                        || (ops[dep_idx].cycle >= 0 && ops[dep_idx].cycle < cycle as i32)
+                        || (ops[dep_idx].cycle >= 0 && {
+                            let offset = ops[dep_idx]
+                                .precedence_offset_for_asap(shiftable_set.contains(&dep_idx));
+                            ops[dep_idx].cycle + offset <= cycle as i32
+                        })
                 });
 
                 if deps_ready {
@@ -675,14 +695,19 @@ impl SsaTickTockKernelBuilder {
 
                     // Add newly-ready consumers to heap (O(log n) per consumer)
                     for &consumer_idx in &consumers[idx] {
+                        // Update max ready cycle from this predecessor's offset
+                        let offset = ops[idx]
+                            .precedence_offset_for_asap(shiftable_set.contains(&idx));
+                        max_ready_cycle[consumer_idx] =
+                            max_ready_cycle[consumer_idx].max((cycle as i32) + offset);
+
                         remaining_deps[consumer_idx] -= 1;
                         if remaining_deps[consumer_idx] == 0 {
-                            // Priority: earliest possible cycle is next cycle (since dep just scheduled)
                             let priority = asap_alap
                                 .as_ref()
                                 .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
-                                .map(|lb| ((cycle + 1) as i32).max(lb))
-                                .unwrap_or_else(|| (cycle + 1) as i32);
+                                .map(|lb| max_ready_cycle[consumer_idx].max(lb))
+                                .unwrap_or(max_ready_cycle[consumer_idx]);
                             ready_heap.push(Reverse((priority, consumer_idx)));
                         }
                     }
@@ -801,13 +826,18 @@ impl SsaTickTockKernelBuilder {
                     }
 
                     for &consumer_idx in &consumers[force_idx] {
+                        let offset = ops[force_idx]
+                            .precedence_offset_for_asap(shiftable_set.contains(&force_idx));
+                        max_ready_cycle[consumer_idx] =
+                            max_ready_cycle[consumer_idx].max((cycle as i32) + offset);
+
                         remaining_deps[consumer_idx] -= 1;
                         if remaining_deps[consumer_idx] == 0 {
                             let priority = asap_alap
                                 .as_ref()
                                 .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
-                                .map(|lb| ((cycle + 1) as i32).max(lb))
-                                .unwrap_or_else(|| (cycle + 1) as i32);
+                                .map(|lb| max_ready_cycle[consumer_idx].max(lb))
+                                .unwrap_or(max_ready_cycle[consumer_idx]);
                             ready_heap.push(Reverse((priority, consumer_idx)));
                         }
                     }
@@ -2949,6 +2979,164 @@ mod tests {
              This indicates the bug: MultiplyAdd with no immediate users (no stores in round 1) \
              is incorrectly marked as dead, even though it's used in round 2 after barrier.",
             emit.ops[8].cycle
+        );
+    }
+
+    // =========================================================================
+    // PrecedenceOffset Tests
+    //
+    // Verify that the greedy scheduler respects PrecedenceOffset (latency > 1)
+    // for SelectChoice FMA ops instead of hardcoding +1 everywhere.
+    // =========================================================================
+
+    /// Test that the greedy scheduler uses PrecedenceOffset for SelectChoice ops.
+    /// ASAP offset for SelectChoice is 1 (vselect path = min_delay), matching the
+    /// shiftable pattern. The FMA delay (2 cycles) is enforced by CP-SAT model constraints.
+    #[test]
+    fn test_greedy_selectchoice_uses_precedence_offset() {
+        use crate::types::PrecedenceOffset;
+
+        // Build: cond, true_val, false_val → SelectChoice (with sub_temp_vreg) → consumer VALU add
+        let mut emit = SsaEmitContext::new();
+
+        // Create scalar constants and broadcast to vectors (SelectChoice needs vectors)
+        let s_cond = emit.emit_const(1); // op 0
+        let s_true = emit.emit_const(2); // op 1
+        let s_false = emit.emit_const(3); // op 2
+        let v_cond = emit.emit_vbroadcast(s_cond); // op 3
+        let v_true = emit.emit_vbroadcast(s_true); // op 4
+        let v_false = emit.emit_vbroadcast(s_false); // op 5
+
+        // SelectChoice with sub_temp_vreg: ASAP offset=1 (vselect min_delay)
+        let v_sel = emit.emit_select_choice(v_cond, v_true, v_false); // op 6
+
+        // Consumer: uses v_sel
+        let v_result = emit.emit_valu(Opcode::Add, v_sel, v_sel); // op 7
+
+        // Sink: store the result to make it live
+        let addr = emit.emit_const(100); // op 8
+        emit.emit_vstore(addr, v_result); // op 9
+
+        // Verify ASAP offset=1 (vselect path), ALAP offset=2 (FMA path)
+        assert_eq!(
+            emit.ops[6].precedence_offset_for_asap(false),
+            1,
+            "SelectChoice ASAP offset should be 1 (vselect min_delay)"
+        );
+        assert_eq!(
+            emit.ops[6].precedence_offset_for_alap(false),
+            2,
+            "SelectChoice ALAP offset should be 2 (FMA max_delay)"
+        );
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+        let mut shifted_ops = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should schedule SelectChoice chain: {:?}",
+            result.err()
+        );
+
+        let sel_cycle = emit.ops[6].cycle;
+        let consumer_cycle = emit.ops[7].cycle;
+        assert!(
+            sel_cycle >= 0,
+            "SelectChoice should be scheduled (cycle={})",
+            sel_cycle
+        );
+        // Consumer at sel_cycle+1 (greedy uses ASAP offset=1 for SelectChoice)
+        assert!(
+            consumer_cycle >= sel_cycle + 1,
+            "Consumer must be at cycle >= {} but was at cycle={}",
+            sel_cycle + 1,
+            consumer_cycle
+        );
+    }
+
+    /// Test diamond DAG: consumer has a SelectChoice predecessor (ASAP offset=1)
+    /// and a normal predecessor (offset=1). Both use min_delay in greedy.
+    #[test]
+    fn test_greedy_mixed_predecessors_diamond() {
+        use crate::types::PrecedenceOffset;
+
+        let mut emit = SsaEmitContext::new();
+
+        // Create vectors for SelectChoice
+        let s_cond = emit.emit_const(1); // op 0
+        let s_true = emit.emit_const(2); // op 1
+        let s_false = emit.emit_const(3); // op 2
+        let v_cond = emit.emit_vbroadcast(s_cond); // op 3
+        let v_true = emit.emit_vbroadcast(s_true); // op 4
+        let v_false = emit.emit_vbroadcast(s_false); // op 5
+
+        // SelectChoice (ASAP offset=1, ALAP offset=2)
+        let v_sel = emit.emit_select_choice(v_cond, v_true, v_false); // op 6
+
+        // Normal VALU op (offset=1): does NOT depend on SelectChoice
+        let v_normal = emit.emit_valu(Opcode::Add, v_true, v_false); // op 7
+
+        // Consumer: depends on BOTH v_sel and v_normal
+        let v_result = emit.emit_valu(Opcode::Add, v_sel, v_normal); // op 8
+
+        // Sink
+        let addr = emit.emit_const(100); // op 9
+        emit.emit_vstore(addr, v_result); // op 10
+
+        // Verify offsets: both ASAP=1
+        assert_eq!(emit.ops[6].precedence_offset_for_asap(false), 1);
+        assert_eq!(emit.ops[7].precedence_offset_for_asap(false), 1);
+        // SelectChoice ALAP=2 (FMA path)
+        assert_eq!(emit.ops[6].precedence_offset_for_alap(false), 2);
+
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+        let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
+        let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
+        let mut shifted_ops = HashSet::new();
+
+        let result = builder.schedule_ssa_greedy_with_shift_budget(
+            &mut emit.ops,
+            false,
+            &mut shifted_ops,
+            1536,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should schedule mixed-predecessor diamond: {:?}",
+            result.err()
+        );
+
+        let sel_cycle = emit.ops[6].cycle;
+        let normal_cycle = emit.ops[7].cycle;
+        let consumer_cycle = emit.ops[8].cycle;
+
+        assert!(sel_cycle >= 0, "SelectChoice should be scheduled");
+        assert!(normal_cycle >= 0, "Normal op should be scheduled");
+
+        // Consumer must respect both predecessors' ASAP offsets (both = 1)
+        assert!(
+            consumer_cycle >= sel_cycle + 1,
+            "Consumer must respect SelectChoice offset=1: consumer={} >= sel+1={}",
+            consumer_cycle,
+            sel_cycle + 1
+        );
+        assert!(
+            consumer_cycle >= normal_cycle + 1,
+            "Consumer must respect normal offset=1: consumer={} >= normal+1={}",
+            consumer_cycle,
+            normal_cycle + 1
         );
     }
 }

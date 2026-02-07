@@ -543,6 +543,7 @@ impl SsaTickTockKernelBuilder {
             let bounds_config = SsaCpsatConfig {
                 enable_asap_alap_tightening,
                 enable_scratch_tightening,
+                enable_valu_shift,
                 scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
                 ..Default::default()
             };
@@ -1048,6 +1049,7 @@ impl SsaTickTockKernelBuilder {
             force_zero_gap,
             enable_asap_alap_tightening,
             enable_scratch_tightening,
+            ..Default::default()
         };
 
         // Pass shift hints if VALU shift is enabled. Exclude ops that were re-scheduled by per-section

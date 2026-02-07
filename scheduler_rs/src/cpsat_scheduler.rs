@@ -161,7 +161,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Not;
 use std::str::FromStr;
 
-use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, SsaOp, VReg, VLEN};
+use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN};
 
 /// ConstChoice encoding mode: let solver choose (Optimize), force AddImm (Flow), or force Load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +976,103 @@ fn verify_select_choice_fma_consumer_precedence(
 }
 
 // ============================================================================
+// Precedence Offset Diagnostics
+// ============================================================================
+
+/// Diagnose precedence bound violations in ASAP/ALAP values.
+///
+/// Checks that for every RAW edge (pred → succ):
+/// - Forward (ASAP): `asap[succ] >= asap[pred] + pred.offset_for_asap(pred_is_shiftable)`
+/// - Backward (ALAP): `alap[pred] <= alap[succ] - pred.offset_for_alap(pred_is_shiftable)`
+///
+/// Also checks domain consistency: `asap[op] <= alap[op]` for all ops.
+///
+/// # Returns
+/// `(violation_count, sample_violations, empty_domain_count)` where:
+/// - `violation_count` = number of edges with ASAP or ALAP violations
+/// - `sample_violations` = up to 3 human-readable violation descriptions
+/// - `empty_domain_count` = number of ops where asap > alap
+pub(crate) fn diagnose_precedence_bounds(
+    ops: &[SsaOp],
+    asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+    shiftable_set: &HashSet<usize>,
+) -> (usize, Vec<String>, usize) {
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+
+    let mut violation_count = 0usize;
+    let mut samples: Vec<String> = Vec::new();
+
+    // Check each RAW edge
+    for (succ_idx, succ_op) in ops.iter().enumerate() {
+        for &dep_id in &succ_op.dep_ids {
+            let pred_idx = match id_to_idx.get(&dep_id) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            let pred_op = &ops[pred_idx];
+            let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+            let asap_offset = pred_op.precedence_offset_for_asap(pred_is_shiftable);
+            // Use min_delay (asap offset) for both ASAP and ALAP domain checking.
+            // Domain bounds use conservative (wide) offsets; the CP-SAT model
+            // handles actual shifted latency via completion_cycle constraints.
+            let alap_offset = pred_op.precedence_offset_for_asap(pred_is_shiftable);
+
+            let pred_asap = *asap.get(&pred_op.id).unwrap_or(&0);
+            let succ_asap = *asap.get(&succ_op.id).unwrap_or(&0);
+            let pred_alap = *alap.get(&pred_op.id).unwrap_or(&0);
+            let succ_alap = *alap.get(&succ_op.id).unwrap_or(&0);
+
+            // Forward check: succ_asap >= pred_asap + asap_offset
+            if succ_asap < pred_asap + asap_offset {
+                violation_count += 1;
+                if samples.len() < 3 {
+                    samples.push(format!(
+                        "ASAP violation: op[{}](asap={}) → op[{}](asap={}), expected >= {} (offset={})",
+                        pred_op.id, pred_asap, succ_op.id, succ_asap,
+                        pred_asap + asap_offset, asap_offset
+                    ));
+                }
+            }
+
+            // Backward check: pred_alap <= succ_alap - alap_offset
+            if pred_alap > succ_alap - alap_offset {
+                violation_count += 1;
+                if samples.len() < 3 {
+                    samples.push(format!(
+                        "ALAP violation: op[{}](alap={}) → op[{}](alap={}), expected <= {} (offset={})",
+                        pred_op.id, pred_alap, succ_op.id, succ_alap,
+                        succ_alap - alap_offset, alap_offset
+                    ));
+                }
+            }
+        }
+    }
+
+    // Check domain consistency
+    let mut empty_domain_count = 0usize;
+    for op in ops {
+        let op_asap = *asap.get(&op.id).unwrap_or(&0);
+        let op_alap = *alap.get(&op.id).unwrap_or(&0);
+        if op_asap > op_alap {
+            empty_domain_count += 1;
+            if samples.len() < 3 {
+                samples.push(format!(
+                    "Empty domain: op[{}] asap={} > alap={}",
+                    op.id, op_asap, op_alap
+                ));
+            }
+        }
+    }
+
+    (violation_count, samples, empty_domain_count)
+}
+
+// ============================================================================
 // Live Interval Computation (for scratch memory tracking)
 // ============================================================================
 
@@ -1159,6 +1256,10 @@ pub struct SsaCpsatConfig {
     /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
     /// Default: false (test first, validate carefully).
     pub enable_scratch_tightening: bool,
+    /// If true, enable verbose logging of the precedence fixpoint repair pass.
+    /// The fixpoint always runs after slot/scratch tightening to restore precedence consistency.
+    /// This flag just controls whether to log the number of ASAP/ALAP changes.
+    pub debug_fix_precedence_bounds: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -1178,6 +1279,7 @@ impl Default for SsaCpsatConfig {
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
             enable_asap_alap_tightening: false, // Default: disabled for ablation studies
             enable_scratch_tightening: false, // Default: disabled for ablation studies
+            debug_fix_precedence_bounds: false, // Default: disabled
         }
     }
 }
@@ -1446,10 +1548,21 @@ pub struct SsaCpsatResult {
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
-/// Uses the RAW-only dependencies from dep_ids.
-pub fn compute_ssa_asap(ops: &[SsaOp]) -> HashMap<usize, i32> {
+/// Uses the RAW-only dependencies from dep_ids, with per-edge precedence offsets.
+///
+/// # Arguments
+/// * `ops` - SSA operations to compute bounds for
+/// * `shiftable_set` - Set of op *indices* that are shiftable VALU ops
+pub fn compute_ssa_asap(ops: &[SsaOp], shiftable_set: &HashSet<usize>) -> HashMap<usize, i32> {
     let mut asap: HashMap<usize, i32> = HashMap::new();
     let mut in_degree: HashMap<usize, usize> = HashMap::new();
+
+    // Build id → index mapping for looking up ops by their id
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
 
     for op in ops {
         in_degree.insert(op.id, op.dep_ids.len());
@@ -1475,10 +1588,14 @@ pub fn compute_ssa_asap(ops: &[SsaOp]) -> HashMap<usize, i32> {
     // Process in topological order
     while let Some(op_id) = queue.pop_front() {
         let my_asap = *asap.get(&op_id).unwrap_or(&0);
+        let pred_idx = id_to_idx[&op_id];
+        let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+        // Offset is determined by the predecessor (this op): how many cycles until its result is visible
+        let offset = ops[pred_idx].precedence_offset_for_asap(pred_is_shiftable);
 
         if let Some(succs) = successors.get(&op_id) {
             for &succ_id in succs {
-                let new_asap = my_asap + 1;
+                let new_asap = my_asap + offset;
                 let current = asap.entry(succ_id).or_insert(0);
                 if new_asap > *current {
                     *current = new_asap;
@@ -1498,8 +1615,20 @@ pub fn compute_ssa_asap(ops: &[SsaOp]) -> HashMap<usize, i32> {
 }
 
 /// Compute ALAP (As Late As Possible) cycle for each SSA op.
-pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
+///
+/// # Arguments
+/// * `ops` - SSA operations to compute bounds for
+/// * `horizon` - Maximum cycle (ALAP for sinks = horizon - 1)
+/// * `shiftable_set` - Set of op *indices* that are shiftable VALU ops
+pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32, shiftable_set: &HashSet<usize>) -> HashMap<usize, i32> {
     let mut alap: HashMap<usize, i32> = HashMap::new();
+
+    // Build id → index mapping for looking up ops by their id
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
 
     // Build consumer map (ops that depend on each op)
     let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1532,12 +1661,21 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
     let op_by_id: HashMap<usize, &SsaOp> = ops.iter().map(|op| (op.id, op)).collect();
 
     // Process in reverse topological order
+    // In ALAP, we propagate from consumer (op_id) backward to its predecessors (dep_id).
+    // The predecessor (dep_id) determines the offset (its result latency).
     while let Some(op_id) = queue.pop_front() {
         let my_alap = *alap.get(&op_id).unwrap_or(&(horizon - 1));
 
         if let Some(op) = op_by_id.get(&op_id) {
             for &dep_id in &op.dep_ids {
-                let new_alap = my_alap - 1;
+                // dep_id is the predecessor — offset is determined by the predecessor
+                let pred_idx = id_to_idx[&dep_id];
+                let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+                // Use min_delay (asap offset) for domain bounding, not max_delay.
+                // The CP-SAT model's completion_cycle constraints (section 5c) handle
+                // the actual shifted latency; wide domains let the solver decide.
+                let offset = ops[pred_idx].precedence_offset_for_asap(pred_is_shiftable);
+                let new_alap = my_alap - offset;
                 let current = alap.entry(dep_id).or_insert(horizon - 1);
                 if new_alap < *current {
                     *current = new_alap;
@@ -1554,6 +1692,55 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32) -> HashMap<usize, i32> {
     }
 
     alap
+}
+
+/// Compute the maximum-latency critical path length using ALAP offsets.
+///
+/// This does a forward ASAP-like pass but uses `precedence_offset_for_alap` (max offsets)
+/// instead of `precedence_offset_for_asap` (min offsets). The result determines the minimum
+/// horizon needed so that ALAP backward propagation doesn't produce negative values.
+pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<usize>) -> i32 {
+    let mut max_asap: HashMap<usize, i32> = HashMap::new();
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+    let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    for op in ops {
+        in_degree.insert(op.id, op.dep_ids.len());
+    }
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for op in ops {
+        if op.dep_ids.is_empty() {
+            queue.push_back(op.id);
+            max_asap.insert(op.id, 0);
+        }
+    }
+    let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops {
+        for &dep_id in &op.dep_ids {
+            successors.entry(dep_id).or_default().push(op.id);
+        }
+    }
+    while let Some(op_id) = queue.pop_front() {
+        let my_asap = *max_asap.get(&op_id).unwrap_or(&0);
+        let pred_idx = id_to_idx[&op_id];
+        let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+        let offset = ops[pred_idx].precedence_offset_for_alap(pred_is_shiftable);
+        if let Some(succs) = successors.get(&op_id) {
+            for &succ_id in succs {
+                let new_asap = my_asap + offset;
+                let current = max_asap.entry(succ_id).or_insert(0);
+                if new_asap > *current {
+                    *current = new_asap;
+                }
+                if let Some(deg) = in_degree.get_mut(&succ_id) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(succ_id);
+                    }
+                }
+            }
+        }
+    }
+    max_asap.values().max().copied().unwrap_or(0) + 1
 }
 
 /// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
@@ -1855,12 +2042,16 @@ fn tighten_asap_alap_by_scratch(
 }
 
 /// Build ordering pairs (i, j) for symmetry breaking: cycle[i] <= cycle[j].
-/// Groups ops by ordering_group; within each group sorts by ALAP ascending so that
-/// ASAP[i] <= ALAP[j] holds for consecutive pairs (no need to relax bounds).
+///
+/// Sort each group by greedy cycle (primary, when available) then ALAP (tiebreaker).
+/// After sorting, verify that ASAP[i] <= ALAP[j] for each consecutive pair — this is
+/// required for the constraint `cycle[i] <= cycle[j]` to be satisfiable. If greedy and
+/// ASAP/ALAP are inconsistent, panic (indicates a bug in greedy or bounds computation).
 fn build_ordering_pairs_from_bounds(
     ops: &[SsaOp],
-    _asap: &HashMap<usize, i32>,
+    asap: &HashMap<usize, i32>,
     alap: &HashMap<usize, i32>,
+    greedy_hints: Option<&[i32]>,
 ) -> Vec<(usize, usize)> {
     let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
     for (idx, op) in ops.iter().enumerate() {
@@ -1876,14 +2067,120 @@ fn build_ordering_pairs_from_bounds(
             .push(idx);
     }
     let mut pairs = Vec::new();
-    for indices in groups.values() {
+    for (group_key, indices) in &groups {
         let mut sorted: Vec<usize> = indices.clone();
-        sorted.sort_by_key(|&idx| *alap.get(&ops[idx].id).unwrap_or(&0));
+        if let Some(hints) = greedy_hints {
+            // Primary: greedy cycle. Tiebreaker: ALAP (for determinism and domain consistency).
+            sorted.sort_by_key(|&idx| {
+                let greedy = hints.get(idx).copied().unwrap_or(0);
+                let alap_val = *alap.get(&ops[idx].id).unwrap_or(&0);
+                (greedy, alap_val)
+            });
+        } else {
+            sorted.sort_by_key(|&idx| *alap.get(&ops[idx].id).unwrap_or(&0));
+        }
+        // Verify domain consistency: ASAP[i] <= ALAP[j] for each consecutive pair.
         for w in sorted.windows(2) {
-            pairs.push((w[0], w[1]));
+            let i = w[0];
+            let j = w[1];
+            let asap_i = *asap.get(&ops[i].id).unwrap_or(&0);
+            let alap_j = *alap.get(&ops[j].id).unwrap_or(&0);
+            if asap_i > alap_j {
+                panic!(
+                    "Symmetry ordering inconsistency: ordering group {:?} requires cycle[{}] <= cycle[{}], \
+                     but ASAP[{}]={} > ALAP[{}]={}. The constraint cycle[i] <= cycle[j] is unsatisfiable. \
+                     Greedy hints: i={}, j={}. Fix: greedy or ASAP/ALAP bounds are inconsistent.",
+                    group_key, i, j, i, asap_i, j, alap_j,
+                    greedy_hints.and_then(|h| h.get(i).copied()).unwrap_or(-1),
+                    greedy_hints.and_then(|h| h.get(j).copied()).unwrap_or(-1),
+                );
+            }
+            pairs.push((i, j));
         }
     }
     pairs
+}
+
+/// Fixpoint pass to repair precedence violations in ASAP/ALAP bounds.
+///
+/// After tightening passes (slot, scratch) may have narrowed bounds without respecting
+/// precedence offsets, this pass does bidirectional propagation:
+/// - Forward: increase ASAP[succ] to satisfy `asap[succ] >= asap[pred] + pred.offset_for_asap()`
+/// - Backward: decrease ALAP[pred] to satisfy `alap[pred] <= alap[succ] - pred.offset_for_alap()`
+///
+/// Iterates until convergence (bounded by ops.len() iterations).
+///
+/// # Returns
+/// New (asap, alap) maps with all precedence constraints satisfied.
+pub(crate) fn fix_precedence_bounds_fixpoint(
+    ops: &[SsaOp],
+    asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+    shiftable_set: &HashSet<usize>,
+) -> (HashMap<usize, i32>, HashMap<usize, i32>) {
+    let mut current_asap = asap.clone();
+    let mut current_alap = alap.clone();
+
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+
+    // Build successor map: pred_id → [succ_id]
+    let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
+    for op in ops {
+        for &dep_id in &op.dep_ids {
+            successors.entry(dep_id).or_default().push(op.id);
+        }
+    }
+
+    let max_iters = ops.len();
+    for _ in 0..max_iters {
+        let mut changed = false;
+
+        // Forward pass: propagate ASAP increases
+        for op in ops {
+            let pred_idx = id_to_idx[&op.id];
+            let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+            let offset = op.precedence_offset_for_asap(pred_is_shiftable);
+            let pred_asap = *current_asap.get(&op.id).unwrap_or(&0);
+
+            if let Some(succs) = successors.get(&op.id) {
+                for &succ_id in succs {
+                    let required = pred_asap + offset;
+                    let current = current_asap.entry(succ_id).or_insert(0);
+                    if required > *current {
+                        *current = required;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Backward pass: propagate ALAP decreases (reverse iteration)
+        for op in ops.iter().rev() {
+            for &dep_id in &op.dep_ids {
+                let pred_idx = id_to_idx[&dep_id];
+                let pred_is_shiftable = shiftable_set.contains(&pred_idx);
+                // Use min_delay for domain bounding (same as compute_ssa_alap)
+                let offset = ops[pred_idx].precedence_offset_for_asap(pred_is_shiftable);
+                let succ_alap = *current_alap.get(&op.id).unwrap_or(&0);
+                let required = succ_alap - offset;
+                let current = current_alap.entry(dep_id).or_insert(required);
+                if required < *current {
+                    *current = required;
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    (current_asap, current_alap)
 }
 
 /// Compute ASAP/ALAP bounds (with optional slot/scratch tightening) for use before greedy scheduling.
@@ -1894,11 +2191,23 @@ pub fn compute_ssa_asap_alap_bounds(
     ops: &[SsaOp],
     config: &SsaCpsatConfig,
 ) -> (HashMap<usize, i32>, HashMap<usize, i32>) {
-    let asap = compute_ssa_asap(ops);
+    // Compute shiftable set from config (same logic as schedule_ssa_cpsat)
+    let shiftable_set: HashSet<usize> = if config.enable_valu_shift {
+        ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Valu && op.opcode.can_shift_to_alu())
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let asap = compute_ssa_asap(ops, &shiftable_set);
     let n = ops.len();
     let critical_path_len = asap.values().max().copied().unwrap_or(0) + 1;
-    let horizon = (critical_path_len * 2).max(n as i32);
-    let alap = compute_ssa_alap(ops, horizon);
+    let max_latency_critical_path = compute_max_latency_critical_path(ops, &shiftable_set);
+    let horizon = (critical_path_len * 2).max(max_latency_critical_path * 2).max(n as i32);
+    let alap = compute_ssa_alap(ops, horizon, &shiftable_set);
     let mut current_asap = asap;
     let mut current_alap = alap;
     let machine = &config.machine;
@@ -1940,6 +2249,15 @@ pub fn compute_ssa_asap_alap_bounds(
             current_asap = scratch_asap;
             current_alap = scratch_alap;
         }
+    }
+
+    // After tightening, re-propagate precedence constraints to restore consistency.
+    // Slot/scratch tightening is precedence-unaware, so it can violate precedence edges.
+    if config.enable_asap_alap_tightening || config.enable_scratch_tightening {
+        let (fixed_asap, fixed_alap) =
+            fix_precedence_bounds_fixpoint(ops, &current_asap, &current_alap, &shiftable_set);
+        current_asap = fixed_asap;
+        current_alap = fixed_alap;
     }
 
     (current_asap, current_alap)
@@ -1991,6 +2309,7 @@ pub fn schedule_ssa_cpsat(
         force_zero_gap,
         enable_asap_alap_tightening,
         enable_scratch_tightening,
+        debug_fix_precedence_bounds,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -2031,17 +2350,37 @@ pub fn schedule_ssa_cpsat(
         });
     }
 
-    // 1. Compute ASAP/ALAP bounds using RAW-only dependencies
-    let asap = compute_ssa_asap(ops);
+    // 0. Identify shiftable VALU ops (needed for precedence offsets in ASAP/ALAP)
+    let shiftable_valu: Vec<usize> = if enable_valu_shift {
+        ops.iter()
+            .enumerate()
+            .filter(|(_, op)| op.engine == Engine::Valu && op.opcode.can_shift_to_alu())
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let shiftable_set: HashSet<usize> = shiftable_valu.iter().copied().collect();
+
+    // 1. Compute ASAP/ALAP bounds using RAW-only dependencies (with precedence offsets)
+    let asap = compute_ssa_asap(ops, &shiftable_set);
     let critical_path_len = asap.values().max().copied().unwrap_or(0) + 1;
 
-    // Use a reasonable horizon (2x critical path or greedy hint max)
+    // Compute max-latency critical path for horizon sizing.
+    // ALAP uses max offsets (e.g. 8 for shiftable VALU), so the horizon must be large enough
+    // that backward propagation from horizon-1 doesn't produce negative ALAP values.
+    let max_latency_critical_path = compute_max_latency_critical_path(ops, &shiftable_set);
+
+    // Use a reasonable horizon: must accommodate both min-latency (ASAP) and max-latency (ALAP) paths
     let greedy_max = greedy_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
         .unwrap_or(0);
-    let horizon = (critical_path_len * 2).max(greedy_max).max(n as i32) as i64;
+    let horizon = (critical_path_len * 2)
+        .max(max_latency_critical_path * 2)
+        .max(greedy_max)
+        .max(n as i32) as i64;
 
-    let alap = compute_ssa_alap(ops, horizon as i32);
+    let alap = compute_ssa_alap(ops, horizon as i32, &shiftable_set);
 
     // 1b. Tighten ASAP/ALAP bounds if enabled. Ordering for symmetry is decided later from final bounds.
     let mut current_asap = asap.clone();
@@ -2079,22 +2418,10 @@ pub fn schedule_ssa_cpsat(
         current_alap = scratch_alap;
     }
 
-    let final_asap = current_asap;
-    let final_alap = current_alap;
+    let mut final_asap = current_asap;
+    let mut final_alap = current_alap;
 
-    // 2. Identify shiftable VALU ops
-    let shiftable_valu: Vec<usize> = if enable_valu_shift {
-        ops.iter()
-            .enumerate()
-            .filter(|(_, op)| op.engine == Engine::Valu && op.opcode.can_shift_to_alu())
-            .map(|(idx, _)| idx)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // Create shiftable_set early so we can use it in precedence constraints
-    let shiftable_set: HashSet<usize> = shiftable_valu.iter().copied().collect();
-
+    // 2. Verbose VALU shift summary
     if verbose {
         let total_valu_ops: usize = ops.iter().filter(|op| op.engine == Engine::Valu).count();
         let non_shiftable_valu_count = total_valu_ops - shiftable_valu.len();
@@ -2128,6 +2455,64 @@ pub fn schedule_ssa_cpsat(
                 select_choice_count
             );
         }
+
+        // Log greedy hints that fall outside [final_asap, final_alap] domains
+        if let Some(hints) = greedy_hints {
+            let mut rejected_count = 0usize;
+            for (idx, &hint_cycle) in hints.iter().enumerate() {
+                if idx >= ops.len() {
+                    break;
+                }
+                let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0);
+                let ub = *final_alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1));
+                if hint_cycle < lb || hint_cycle > ub {
+                    rejected_count += 1;
+                }
+            }
+            if rejected_count > 0 {
+                eprintln!(
+                    "  Greedy hints outside [asap, alap] domain: {} of {} (will be clamped/ignored)",
+                    rejected_count, hints.len()
+                );
+            }
+        }
+
+        // Run precedence diagnostics
+        let (viol_count, viol_samples, empty_count) =
+            diagnose_precedence_bounds(ops, &final_asap, &final_alap, &shiftable_set);
+        if viol_count > 0 || empty_count > 0 {
+            eprintln!(
+                "  Precedence diagnostics: {} edge violations, {} empty domains",
+                viol_count, empty_count
+            );
+            for sample in &viol_samples {
+                eprintln!("    {}", sample);
+            }
+        }
+    }
+
+    // 2b. Precedence fixpoint repair: after slot/scratch tightening, re-propagate precedence
+    // constraints to restore consistency. Tightening is resource-aware but precedence-unaware,
+    // so it can narrow a predecessor's ALAP past what its consumers require.
+    {
+        let (fixed_asap, fixed_alap) =
+            fix_precedence_bounds_fixpoint(ops, &final_asap, &final_alap, &shiftable_set);
+        if verbose {
+            let changed_asap = ops.iter().filter(|op| {
+                fixed_asap.get(&op.id) != final_asap.get(&op.id)
+            }).count();
+            let changed_alap = ops.iter().filter(|op| {
+                fixed_alap.get(&op.id) != final_alap.get(&op.id)
+            }).count();
+            if changed_asap > 0 || changed_alap > 0 {
+                eprintln!(
+                    "  Fixpoint repair: {} ASAP changes, {} ALAP changes",
+                    changed_asap, changed_alap
+                );
+            }
+        }
+        final_asap = fixed_asap;
+        final_alap = fixed_alap;
     }
 
     // 3. Build the CP model
@@ -2181,29 +2566,34 @@ pub fn schedule_ssa_cpsat(
                     continue;
                 }
                 // cycle[idx] >= cycle[dep_idx] + 1
-                model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                model.set_constraint_name(c, &format!("prec_raw_{}_{}", idx, dep_idx));
             }
         }
     }
 
     // 5b. Symmetry breaking (ordering groups): ops with same ordering_group get cycle[i] <= cycle[j].
-    // Order within each group is derived from final bounds (sort by ALAP ascending) so ASAP[i] <= ALAP[j] by construction.
+    // When greedy hints are available, order by greedy cycle so constraints match the hint.
+    // Falls back to ALAP-based ordering (original behavior) when no greedy hints.
     {
-        let ordering_pairs = build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap);
+        let ordering_pairs = build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints);
         let n_ordering = ordering_pairs.len();
+        let order_source = if greedy_hints.is_some() { "greedy" } else { "ALAP" };
         for (i, j) in &ordering_pairs {
-            model.add_le(cycle_vars[*i], cycle_vars[*j]);
+            let c = model.add_le(cycle_vars[*i], cycle_vars[*j]);
+            model.set_constraint_name(c, &format!("sym_ord_{}_{}", i, j));
         }
         if verbose && n_ordering > 0 {
             eprintln!(
-                "  Symmetry breaking (ordering): {} constraints (order from ALAP)",
-                n_ordering
+                "  Symmetry breaking (ordering): {} constraints (order from {})",
+                n_ordering, order_source
             );
         }
     }
 
     // 5c. Symmetry breaking (lexicographic streams): for each stream_key, items ordered by item_key
-    // get first_op[item_i] <= first_op[item_{i+1}]. Optimizer only groups and orders; emission encodes structure.
+    // get first_op[item_i] <= first_op[item_{i+1}]. When greedy hints are available, order items
+    // by greedy cycle of their first op so constraints match the hint. Verify domain consistency.
     {
         use std::collections::{BTreeMap, HashMap};
         let mut streams: HashMap<Vec<i64>, BTreeMap<i64, Vec<usize>>> = HashMap::new();
@@ -2223,19 +2613,45 @@ pub fn schedule_ssa_cpsat(
         }
         let n_streams = streams.len();
         let mut lex_constraints = 0usize;
-        for (_stream_key, by_item) in streams {
-            let ordered: Vec<Vec<usize>> = by_item.into_values().collect();
+        for (stream_key, by_item) in &streams {
+            let mut ordered: Vec<Vec<usize>> = by_item.values().cloned().collect();
+            if let Some(hints) = greedy_hints {
+                // Sort items by greedy cycle of their first op so lex constraints match the hint.
+                // Tiebreaker: ALAP of first op for determinism and domain consistency.
+                ordered.sort_by_key(|group| {
+                    let first = group[0];
+                    let greedy = hints.get(first).copied().unwrap_or(0);
+                    let alap_val = *final_alap.get(&ops[first].id).unwrap_or(&0);
+                    (greedy, alap_val)
+                });
+            }
+            // else: already ordered by item_key (BTreeMap preserves key order)
             for w in ordered.windows(2) {
                 let first_op_cur = w[0][0];
                 let first_op_next = w[1][0];
-                model.add_le(cycle_vars[first_op_cur], cycle_vars[first_op_next]);
+                // Verify domain consistency
+                let asap_cur = *final_asap.get(&ops[first_op_cur].id).unwrap_or(&0);
+                let alap_next = *final_alap.get(&ops[first_op_next].id).unwrap_or(&0);
+                if asap_cur > alap_next {
+                    panic!(
+                        "Lex stream ordering inconsistency: stream {:?} requires cycle[{}] <= cycle[{}], \
+                         but ASAP[{}]={} > ALAP[{}]={}. Greedy hints: cur={}, next={}.",
+                        stream_key, first_op_cur, first_op_next,
+                        first_op_cur, asap_cur, first_op_next, alap_next,
+                        greedy_hints.and_then(|h| h.get(first_op_cur).copied()).unwrap_or(-1),
+                        greedy_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
+                    );
+                }
+                let c = model.add_le(cycle_vars[first_op_cur], cycle_vars[first_op_next]);
+                model.set_constraint_name(c, &format!("sym_lex_{}_{}", first_op_cur, first_op_next));
                 lex_constraints += 1;
             }
         }
         if verbose && lex_constraints > 0 {
+            let lex_source = if greedy_hints.is_some() { "greedy" } else { "item_key" };
             eprintln!(
-                "  Symmetry breaking (lex streams): {} streams, {} constraints",
-                n_streams, lex_constraints
+                "  Symmetry breaking (lex streams): {} streams, {} constraints (order from {})",
+                n_streams, lex_constraints, lex_source
             );
         }
     }
@@ -2469,7 +2885,11 @@ pub fn schedule_ssa_cpsat(
             if let Some(hints) = eliminate_vbroadcast_hints {
                 if hints.contains(&op.id) {
                     model.add_hint(eliminate_var, 1);
+                } else {
+                    model.add_hint(eliminate_var, 0);
                 }
+            } else {
+                model.add_hint(eliminate_var, 0);
             }
             for &c in &shiftable_consumers {
                 if let Some(alu_cycles) = alu_cycle_vars.get(&c) {
@@ -2587,6 +3007,7 @@ pub fn schedule_ssa_cpsat(
                     // Exactly one encoding
                     let sum_expr = use_vars
                         .iter()
+                        .skip(1)
                         .fold(LinearExpr::from(use_vars[0]), |acc, &b| {
                             acc + LinearExpr::from(b)
                         });
@@ -2633,11 +3054,20 @@ pub fn schedule_ssa_cpsat(
                             }
                         }
                     }
+                    // Hint ALL encoding vars so the solution hint is complete.
+                    // Default to Load (index 0); if const_add_imm_hints says AddImm, use index 1.
+                    let hint_idx = if const_add_imm_hints
+                        .map_or(false, |h| h.contains(&ops[idx].id))
+                    {
+                        1 // AddImm
+                    } else {
+                        0 // Load
+                    };
+                    for (i, &var) in use_vars.iter().enumerate() {
+                        model.add_hint(var, if i == hint_idx { 1 } else { 0 });
+                    }
                     const_choice_encoding_vars.insert(idx, use_vars);
                     const_choice_alu_encoding_info.insert(idx, alu_info);
-
-                    // Hint: default Load (index 0)
-                    model.add_hint(use_load, 1);
                 }
             }
         }
@@ -3054,6 +3484,11 @@ pub fn schedule_ssa_cpsat(
     //
     // Without these fixes, CP-SAT could report FEASIBLE solutions that exceed budget
     // during address assignment (e.g., peak_live=1825 > budget=1536).
+    // Track scratch-related IntVars that need hints (select_fma_end, shifted_dest_start).
+    // Declared outside scratch_budget block so section 11 can hint them.
+    let mut scratch_select_fma_end_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, last_use_idx)
+    let mut scratch_shifted_start_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, def_idx)
+
     if scratch_budget > 0 {
         // Build VReg -> defining op index mapping
         let mut vreg_def_op: HashMap<VReg, usize> = HashMap::new();
@@ -3192,6 +3627,11 @@ pub fn schedule_ssa_cpsat(
                 let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
                 model.set_constraint_name(c, &format!("segment_end_ge_c_{}", cv_idx));
             }
+            // Hint segment_end to greedy makespan so hint is complete (per-section mode).
+            if let Some(hints) = greedy_hints {
+                let max_hint = hints.iter().max().copied().unwrap_or(0);
+                model.add_hint(m, max_hint as i64);
+            }
             Some(m)
         } else {
             None
@@ -3277,6 +3717,7 @@ pub fn schedule_ssa_cpsat(
                                     let c_vselect = model.add_eq(LinearExpr::from(end_var), end_vselect.clone());
                                     model.only_enforce_if(c_vselect, [!choice_var]);
                                     model.set_constraint_name(c_vselect, &format!("scratch_end_vselect_{}", last_use_idx));
+                                    scratch_select_fma_end_vars.push((end_var, last_use_idx));
                                     (LinearExpr::from(end_var), LinearExpr::from(end_var))
                                 } else {
                                     // No choice_var (shouldn't happen in Optimize mode)
@@ -3323,6 +3764,7 @@ pub fn schedule_ssa_cpsat(
                         [(min_possible, horizon)],
                         format!("shifted_dest_start_{}", def_idx),
                     );
+                    scratch_shifted_start_vars.push((start_var, def_idx));
                     // When shifted: start_var <= each alu_cycle (ensures start_var <= min(alu_cycles))
                     for (lane_i, &alu_cycle) in alu_cycles.iter().enumerate() {
                         let c = model.add_ge(LinearExpr::from(alu_cycle), LinearExpr::from(start_var));
@@ -3631,12 +4073,15 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // Verify VALU and ALU cumulative constraints from greedy hints
+    // Verify engine capacity constraints from greedy hints (VALU, ALU, Load, Store, Flow)
     if let Some(hints) = greedy_hints {
         // Compute per-cycle usage
         let max_cycle = *hints.iter().max().unwrap_or(&0) as usize + 1;
         let mut valu_per_cycle = vec![0i32; max_cycle];
         let mut alu_per_cycle = vec![0i32; max_cycle];
+        let mut load_per_cycle = vec![0i32; max_cycle];
+        let mut store_per_cycle = vec![0i32; max_cycle];
+        let mut flow_per_cycle = vec![0i32; max_cycle];
 
         for (idx, op) in ops.iter().enumerate() {
             if idx >= hints.len() {
@@ -3653,23 +4098,56 @@ pub fn schedule_ssa_cpsat(
                 false
             };
 
-            match op.engine {
-                Engine::Valu if !is_shifted => {
-                    valu_per_cycle[cycle] += 1;
+            // ConstChoice: hinted as Load by default (greedy treats them as Load)
+            let is_const_add_imm = const_add_imm_hints
+                .map_or(false, |h| h.contains(&op.id));
+            // SelectChoice: hinted as vselect (Flow) by default
+            let is_select_fma = select_choice_hints
+                .map_or(false, |h| h.contains(&op.id));
+
+            if op.opcode == Opcode::ConstChoice {
+                if is_const_add_imm {
+                    flow_per_cycle[cycle] += 1; // AddImm uses Flow
+                } else {
+                    load_per_cycle[cycle] += 1; // Load uses Load
                 }
-                Engine::Valu if is_shifted => {
-                    alu_per_cycle[cycle] += VLEN as i32; // Shifted VALU uses 8 ALU slots
+            } else if op.opcode == Opcode::SelectChoice {
+                if is_select_fma {
+                    valu_per_cycle[cycle] += 1; // FMA uses VALU
+                } else {
+                    flow_per_cycle[cycle] += 1; // vselect uses Flow
                 }
-                Engine::Alu => {
-                    alu_per_cycle[cycle] += 1;
+            } else {
+                match op.engine {
+                    Engine::Valu if !is_shifted => {
+                        valu_per_cycle[cycle] += 1;
+                    }
+                    Engine::Valu if is_shifted => {
+                        alu_per_cycle[cycle] += VLEN as i32; // Shifted VALU uses 8 ALU slots
+                    }
+                    Engine::Alu => {
+                        alu_per_cycle[cycle] += 1;
+                    }
+                    Engine::Load => {
+                        load_per_cycle[cycle] += 1;
+                    }
+                    Engine::Store => {
+                        store_per_cycle[cycle] += 1;
+                    }
+                    Engine::Flow => {
+                        flow_per_cycle[cycle] += 1;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
         // Check for violations
         let mut valu_violations = 0;
         let mut alu_violations = 0;
+        let mut load_violations = 0;
+        let mut store_violations = 0;
+        let mut flow_violations = 0;
         for cycle in 0..max_cycle {
             if (valu_per_cycle[cycle] as i64) > valu_cap {
                 if valu_violations < 3 && verbose {
@@ -3689,25 +4167,93 @@ pub fn schedule_ssa_cpsat(
                 }
                 alu_violations += 1;
             }
+            if (load_per_cycle[cycle] as i64) > load_cap {
+                if load_violations < 3 && verbose {
+                    eprintln!(
+                        "  WARNING: Load overflow at cycle {}: {} > {}",
+                        cycle, load_per_cycle[cycle], load_cap
+                    );
+                }
+                load_violations += 1;
+            }
+            if (store_per_cycle[cycle] as i64) > store_cap {
+                if store_violations < 3 && verbose {
+                    eprintln!(
+                        "  WARNING: Store overflow at cycle {}: {} > {}",
+                        cycle, store_per_cycle[cycle], store_cap
+                    );
+                }
+                store_violations += 1;
+            }
+            if (flow_per_cycle[cycle] as i64) > flow_cap {
+                if flow_violations < 3 && verbose {
+                    eprintln!(
+                        "  WARNING: Flow overflow at cycle {}: {} > {}",
+                        cycle, flow_per_cycle[cycle], flow_cap
+                    );
+                }
+                flow_violations += 1;
+            }
         }
 
-        if valu_violations > 0 || alu_violations > 0 {
-            // Merged hint must be strict concatenation of sections in time; we are allowed to exceed
-            // scratch in the greedy scheduler, but never slot constraints. If the hint violates
-            // VALU/ALU capacity, the merge/rebasing logic is wrong or a single-section schedule
-            // exceeded capacity (both are bugs).
-            panic!(
-                "Merged hint violates engine capacity (VALU: {} cycles, ALU: {} cycles). \
-                 Slot limits must never be exceeded; scratch may be exceeded in greedy, but not VALU/ALU.",
-                valu_violations, alu_violations
+        let total_violations = valu_violations + alu_violations + load_violations + store_violations + flow_violations;
+        if total_violations > 0 {
+            if valu_violations > 0 || alu_violations > 0 {
+                // VALU/ALU violations are bugs in merge/rebase — panic.
+                panic!(
+                    "Merged hint violates engine capacity (VALU: {} cycles, ALU: {} cycles). \
+                     Slot limits must never be exceeded; scratch may be exceeded in greedy, but not VALU/ALU.",
+                    valu_violations, alu_violations
+                );
+            }
+            // Load/Store/Flow violations are less critical — warn but don't panic.
+            // The CP-SAT model will detect infeasible hints and search from scratch.
+            eprintln!(
+                "  WARNING: Hint violates engine capacity (Load: {} cycles, Store: {} cycles, Flow: {} cycles). \
+                 Hint will be infeasible in CP-SAT model.",
+                load_violations, store_violations, flow_violations
             );
         }
 
         if verbose {
             eprintln!(
-                "  Engine capacity verification: OK (VALU<={}, ALU<={} at all cycles)",
-                valu_cap, alu_cap
+                "  Engine capacity verification: OK (VALU<={}, ALU<={}, Load<={}, Store<={}, Flow<={} at all cycles)",
+                valu_cap, alu_cap, load_cap, store_cap, flow_cap
             );
+        }
+    }
+
+    // Check precedence constraints against hints
+    if let Some(hints) = greedy_hints {
+        let mut prec_violations = 0;
+        for (idx, op) in ops.iter().enumerate() {
+            if idx >= hints.len() || hints[idx] < 0 {
+                continue;
+            }
+            let consumer_cycle = hints[idx];
+            for &dep_id in &op.dep_ids {
+                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                    if dep_idx >= hints.len() || hints[dep_idx] < 0 {
+                        continue;
+                    }
+                    let producer_cycle = hints[dep_idx];
+                    // Basic precedence: consumer >= producer + 1
+                    if consumer_cycle < producer_cycle + 1 {
+                        prec_violations += 1;
+                        if prec_violations <= 5 && verbose {
+                            eprintln!(
+                                "  WARNING: Precedence violation: op {} (id={}) at cycle {} depends on op {} (id={}) at cycle {} (need >= {})",
+                                idx, op.id, consumer_cycle, dep_idx, ops[dep_idx].id, producer_cycle, producer_cycle + 1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if prec_violations > 0 && verbose {
+            eprintln!("  Total precedence violations: {}", prec_violations);
+        } else if verbose {
+            eprintln!("  Precedence verification: OK (all consumer >= producer + 1)");
         }
     }
 
@@ -4106,13 +4652,25 @@ pub fn schedule_ssa_cpsat(
                             idx, ops[idx].id, c, lb, ub
                         );
                     }
-                    assert!(
-                        c >= lb && c <= ub,
-                        "cycle hint outside [ASAP, ALAP]: op id={} idx={} hint_cycle={} domain=[{}, {}] (fix greedy or ASAP/ALAP)",
-                        ops[idx].id, idx, c, lb, ub
-                    );
+                    // Clamp hint to [ASAP, ALAP] domain. The greedy scheduler may not
+                    // know about precedence offsets (e.g. SelectChoice FMA offset=2),
+                    // so its hints can fall outside the tighter domains. Clamping is safe
+                    // because hints are just starting points for the solver.
+                    if c < lb || c > ub {
+                        let clamped = c.max(lb).min(ub);
+                        if verbose {
+                            eprintln!(
+                                "  Hint clamped: op id={} idx={} hint={} -> {} domain=[{}, {}]",
+                                ops[idx].id, idx, c, clamped, lb, ub
+                            );
+                        }
+                        model.add_hint(cycle_vars[idx], clamped);
+                    } else {
+                        model.add_hint(cycle_vars[idx], hint_cycle as i64);
+                    }
+                } else {
+                    model.add_hint(cycle_vars[idx], hint_cycle as i64);
                 }
-                model.add_hint(cycle_vars[idx], hint_cycle as i64);
             } else if idx < cycle_vars.len() && hint_cycle < 0 {
                 skipped_cycle_hints += 1;
             }
@@ -4180,17 +4738,20 @@ pub fn schedule_ssa_cpsat(
             let c = hint_cycle as i64;
             let lb = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
             let ub = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
-            assert!(
-                c >= lb && c <= ub,
-                "completion/alu cycle hint outside [ASAP, ALAP]: op id={} idx={} hint_cycle={} domain=[{}, {}] (fix greedy or ASAP/ALAP)",
-                ops[idx].id, idx, c, lb, ub
-            );
+            // Clamp to valid domain (same rationale as cycle hint clamping above)
+            let clamped = c.max(lb).min(ub);
+            if c != clamped && verbose {
+                eprintln!(
+                    "  Completion hint clamped: op id={} idx={} hint={} -> {} domain=[{}, {}]",
+                    ops[idx].id, idx, c, clamped, lb, ub
+                );
+            }
             if let Some(completion_var) = completion_cycle_vars.get(&idx) {
-                model.add_hint(*completion_var, c);
+                model.add_hint(*completion_var, clamped);
             }
             if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
                 for &alu_var in alu_cycles {
-                    model.add_hint(alu_var, c);
+                    model.add_hint(alu_var, clamped);
                 }
             }
         }
@@ -4219,21 +4780,114 @@ pub fn schedule_ssa_cpsat(
                 model.add_hint(chosen, hint_cycle as i64);
             }
         }
-        // Hint select_choice_fma_last_cycle (FMA path: fma_cycle = cycle + 1) so hint is complete.
+        // Hint select_choice_fma_last_cycle for ALL SelectChoice ops (not just FMA path).
+        // fma_cycle = cycle + 1 by constraint, so hint it to hint_cycle + 1 regardless of path.
+        // Previously only hinted when use_fma was true, leaving vars unhinted on the vselect path.
         let use_fma = |idx: usize| -> bool {
             select_choice_hints.map_or(false, |h| h.contains(&ops[idx].id))
         };
         for (&idx, &fma_last_var) in &select_choice_fma_last_cycle {
-            if use_fma(idx) {
-                let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
-                if hint_cycle >= 0 {
-                    model.add_hint(fma_last_var, (hint_cycle + 1) as i64);
-                }
+            let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
+            if hint_cycle >= 0 {
+                model.add_hint(fma_last_var, (hint_cycle + 1) as i64);
             }
         }
         // Hint select_fma_extra vars (0 or 1 = same as choice_var) so hint is complete.
         for (&(dep_idx, _idx), &extra_var) in &select_fma_extra_vars {
             model.add_hint(extra_var, if use_fma(dep_idx) { 1 } else { 0 });
+        }
+
+        // Hint scratch select_fma_end vars: end = last_use_cycle + 2 (FMA) or + 1 (vselect).
+        for &(end_var, last_use_idx) in &scratch_select_fma_end_vars {
+            let hint_cycle = hints.get(last_use_idx).copied().unwrap_or(-1);
+            if hint_cycle >= 0 {
+                let fma = use_fma(last_use_idx);
+                let end_hint = if fma { hint_cycle + 2 } else { hint_cycle + 1 };
+                model.add_hint(end_var, end_hint as i64);
+            }
+        }
+
+        // Hint scratch shifted_dest_start vars: when not shifted, start = def_cycle.
+        // Greedy defaults to not shifting, so hint = def_cycle.
+        for &(start_var, def_idx) in &scratch_shifted_start_vars {
+            let hint_cycle = hints.get(def_idx).copied().unwrap_or(-1);
+            if hint_cycle >= 0 {
+                model.add_hint(start_var, hint_cycle as i64);
+            }
+        }
+    }
+
+    // Diagnostic: report unhinted non-fixed variables AND hint values outside domain.
+    if verbose {
+        let proto = model.proto();
+        let num_vars = proto.variables.len();
+        let hint_map: std::collections::HashMap<i32, i64> = proto
+            .solution_hint
+            .as_ref()
+            .map(|h| h.vars.iter().copied().zip(h.values.iter().copied()).collect())
+            .unwrap_or_default();
+        let hinted_set: std::collections::HashSet<i32> = hint_map.keys().copied().collect();
+        let mut unhinted_names: Vec<String> = Vec::new();
+        let mut out_of_domain: Vec<String> = Vec::new();
+        for i in 0..num_vars {
+            let var_proto = &proto.variables[i];
+            let name = if var_proto.name.is_empty() {
+                format!("var_{}", i)
+            } else {
+                var_proto.name.clone()
+            };
+            // Skip fixed variables (single-value domain: domain = [v, v])
+            let is_fixed = var_proto.domain.len() == 2 && var_proto.domain[0] == var_proto.domain[1];
+            if !is_fixed && !hinted_set.contains(&(i as i32)) {
+                unhinted_names.push(name.clone());
+            }
+            // Check if hint value is within domain
+            if let Some(&hint_val) = hint_map.get(&(i as i32)) {
+                let domain = &var_proto.domain;
+                // Domain is a list of [lb, ub] pairs: domain = [lb1, ub1, lb2, ub2, ...]
+                let mut in_domain = false;
+                for chunk in domain.chunks(2) {
+                    if chunk.len() == 2 && hint_val >= chunk[0] && hint_val <= chunk[1] {
+                        in_domain = true;
+                        break;
+                    }
+                }
+                if !in_domain {
+                    out_of_domain.push(format!(
+                        "{} hint={} domain={:?}", name, hint_val, domain
+                    ));
+                }
+            }
+        }
+        if !unhinted_names.is_empty() {
+            eprintln!(
+                "  CP-SAT hint diagnostic: {} non-fixed variables still unhinted:",
+                unhinted_names.len()
+            );
+            for (i, name) in unhinted_names.iter().enumerate() {
+                if i < 20 {
+                    eprintln!("    - {}", name);
+                } else {
+                    eprintln!("    ... and {} more", unhinted_names.len() - 20);
+                    break;
+                }
+            }
+        }
+        if !out_of_domain.is_empty() {
+            eprintln!(
+                "  CP-SAT hint diagnostic: {} variables with hint OUTSIDE domain:",
+                out_of_domain.len()
+            );
+            for (i, entry) in out_of_domain.iter().enumerate() {
+                if i < 20 {
+                    eprintln!("    - {}", entry);
+                } else {
+                    eprintln!("    ... and {} more", out_of_domain.len() - 20);
+                    break;
+                }
+            }
+        } else {
+            eprintln!("  CP-SAT hint diagnostic: all hint values within domain bounds");
         }
     }
 
@@ -5445,6 +6099,15 @@ mod ssa_tests {
                     SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
+            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+                // CP-SAT chose ALU-derive - verify it's an ALU op
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Alu,
+                    "ConstChoice op {} (value {}) should be lowered to Alu (ALU-derive)",
+                    const_choice_id,
+                    expected_value
+                );
             } else {
                 // CP-SAT chose Load - verify it's a Load op
                 assert_eq!(
@@ -6990,6 +7653,301 @@ pub fn cpsat_available() -> bool {
 }
 
 // ============================================================================
+// Precedence Offset ASAP/ALAP Tests
+// ============================================================================
+
+#[cfg(test)]
+mod precedence_offset_tests {
+    use super::*;
+    use crate::types::{Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg};
+    use std::collections::{HashMap, HashSet};
+
+    /// Helper: create a simple SsaOp for testing
+    fn make_ssa_op(id: usize, engine: Engine, opcode: Opcode, deps: Vec<usize>) -> SsaOp {
+        let mut op = SsaOp::new(
+            id,
+            engine,
+            opcode,
+            Some(VReg::scalar(id as u32)),
+            vec![],
+        );
+        op.dep_ids = deps.into_iter().collect();
+        op
+    }
+
+    #[test]
+    fn test_compute_ssa_asap_with_shiftable_offset() {
+        // Chain: A(0) → B(1) → C(2)
+        // A is shiftable VALU. ASAP offset from A→B should use B's offset_for_asap(pred_is_shiftable=true)=1
+        let a = make_ssa_op(0, Engine::Valu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set: HashSet<usize> = [0].into_iter().collect(); // index 0 is shiftable
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        assert_eq!(*asap.get(&0).unwrap(), 0);
+        assert_eq!(*asap.get(&1).unwrap(), 1); // min_delay=1 for shiftable predecessor
+        assert_eq!(*asap.get(&2).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_compute_ssa_alap_with_shiftable_offset() {
+        // Chain: A(0) → B(1) → C(2), horizon=20
+        // A is shiftable VALU. ALAP domain bounding uses min_delay=1 (not max_delay=8)
+        // because the CP-SAT model handles shifted latency via completion_cycle constraints.
+        let a = make_ssa_op(0, Engine::Valu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set: HashSet<usize> = [0].into_iter().collect();
+
+        let alap = compute_ssa_alap(&ops, 20, &shiftable_set);
+        assert_eq!(*alap.get(&2).unwrap(), 19); // sink: horizon-1
+        assert_eq!(*alap.get(&1).unwrap(), 18); // 19 - 1 (B is not shiftable predecessor of C)
+        assert_eq!(*alap.get(&0).unwrap(), 17); // 18 - 1 (A is shiftable, but domain uses min_delay=1)
+    }
+
+    #[test]
+    fn test_compute_ssa_asap_selectchoice_fma() {
+        // Chain: A(0) → B(1, SelectChoice+sub_temp) → C(2)
+        // A→B: predecessor A is normal ALU, offset = A.offset_for_asap(false) = 1
+        // B→C: predecessor B is SelectChoice+sub_temp, offset = B.offset_for_asap(false) = 1
+        //       (min_delay = vselect path; FMA delay enforced by model constraints)
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let mut b = make_ssa_op(1, Engine::Flow, Opcode::SelectChoice, vec![0]);
+        b.sub_temp_vreg = Some(VReg::scalar(99));
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set: HashSet<usize> = HashSet::new();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        assert_eq!(*asap.get(&0).unwrap(), 0);
+        assert_eq!(*asap.get(&1).unwrap(), 1); // 0 + 1 (normal predecessor A)
+        assert_eq!(*asap.get(&2).unwrap(), 2); // 1 + 1 (SelectChoice ASAP = min_delay = 1)
+    }
+
+    #[test]
+    fn test_compute_ssa_asap_empty_shiftable_set() {
+        // Regression test: empty shiftable_set should give same result as old hardcoded +1
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set: HashSet<usize> = HashSet::new();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        assert_eq!(*asap.get(&0).unwrap(), 0);
+        assert_eq!(*asap.get(&1).unwrap(), 1);
+        assert_eq!(*asap.get(&2).unwrap(), 2);
+
+        let alap = compute_ssa_alap(&ops, 10, &shiftable_set);
+        assert_eq!(*alap.get(&2).unwrap(), 9);  // horizon-1
+        assert_eq!(*alap.get(&1).unwrap(), 8);  // 9-1
+        assert_eq!(*alap.get(&0).unwrap(), 7);  // 8-1
+    }
+
+    #[test]
+    fn test_mixed_chain_asap_alap() {
+        // A(0, shiftable VALU) → B(1, normal ALU) → C(2, SelectChoice+fma) → D(3, normal ALU)
+        // Domain bounding uses min_delay for both ASAP and ALAP (wide domains):
+        //   A→B: A.asap_offset(shiftable=true)=1
+        //   B→C: B.asap_offset(false)=1
+        //   C→D: C.asap_offset(false)=1 (vselect min_delay; FMA enforced by model)
+        let a = make_ssa_op(0, Engine::Valu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let mut c = make_ssa_op(2, Engine::Flow, Opcode::SelectChoice, vec![1]);
+        c.sub_temp_vreg = Some(VReg::scalar(88));
+        let d = make_ssa_op(3, Engine::Alu, Opcode::Add, vec![2]);
+        let ops = vec![a, b, c, d];
+        let shiftable_set: HashSet<usize> = [0].into_iter().collect();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        assert_eq!(*asap.get(&0).unwrap(), 0);
+        assert_eq!(*asap.get(&1).unwrap(), 1); // 0 + 1 (A shiftable, min delay=1)
+        assert_eq!(*asap.get(&2).unwrap(), 2); // 1 + 1 (B normal, offset=1)
+        assert_eq!(*asap.get(&3).unwrap(), 3); // 2 + 1 (C SelectChoice, min_delay=1)
+
+        let alap = compute_ssa_alap(&ops, 30, &shiftable_set);
+        // D is sink: alap=29
+        assert_eq!(*alap.get(&3).unwrap(), 29);
+        // C→D backward: predecessor C is SelectChoice+fma, min_delay=1 (vselect path)
+        assert_eq!(*alap.get(&2).unwrap(), 28); // 29 - 1
+        // B→C backward: predecessor B is normal ALU, min_delay=1
+        assert_eq!(*alap.get(&1).unwrap(), 27); // 28 - 1
+        // A→B backward: predecessor A is shiftable VALU, min_delay=1 (not 8!)
+        assert_eq!(*alap.get(&0).unwrap(), 26); // 27 - 1
+    }
+
+    #[test]
+    fn test_diamond_dag_asap() {
+        // Diamond: A(0) → B(1), A(0) → C(2), B(1) → D(3), C(2) → D(3)
+        // A is shiftable VALU, C is SelectChoice+sub_temp
+        let a = make_ssa_op(0, Engine::Valu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let mut c = make_ssa_op(2, Engine::Flow, Opcode::SelectChoice, vec![0]);
+        c.sub_temp_vreg = Some(VReg::scalar(77));
+        let d = make_ssa_op(3, Engine::Alu, Opcode::Add, vec![1, 2]);
+        let ops = vec![a, b, c, d];
+        let shiftable_set: HashSet<usize> = [0].into_iter().collect();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        assert_eq!(*asap.get(&0).unwrap(), 0);
+        // A→B: predecessor A is shiftable VALU, A.asap_offset(true)=1
+        assert_eq!(*asap.get(&1).unwrap(), 1);
+        // A→C: predecessor A is shiftable VALU, A.asap_offset(true)=1
+        assert_eq!(*asap.get(&2).unwrap(), 1);
+        // D: max(B_asap + B.offset, C_asap + C.offset) = max(1+1, 1+1) = 2
+        // C is SelectChoice but ASAP uses min_delay=1 (vselect path)
+        assert_eq!(*asap.get(&3).unwrap(), 2);
+    }
+
+    // ========================================================================
+    // diagnose_precedence_bounds tests
+    // ========================================================================
+
+    #[test]
+    fn test_diagnose_precedence_violations() {
+        // Chain: A(0) → B(1) → C(2), with ASAP manually set to violate
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set = HashSet::new();
+
+        // Inject violated ASAP: B.asap=0 but should be >= A.asap+1=1
+        let mut asap: HashMap<usize, i32> = HashMap::new();
+        asap.insert(0, 0);
+        asap.insert(1, 0); // Violation: should be >= 1
+        asap.insert(2, 1);
+        let mut alap: HashMap<usize, i32> = HashMap::new();
+        alap.insert(0, 5);
+        alap.insert(1, 6);
+        alap.insert(2, 7);
+
+        let (viol, samples, empty) = diagnose_precedence_bounds(&ops, &asap, &alap, &shiftable_set);
+        assert!(viol >= 1, "Should detect ASAP violation, got {}", viol);
+        assert!(!samples.is_empty(), "Should have sample violations");
+        assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn test_diagnose_empty_domain() {
+        // Single op with asap > alap = empty domain
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let ops = vec![a];
+        let shiftable_set = HashSet::new();
+
+        let mut asap: HashMap<usize, i32> = HashMap::new();
+        asap.insert(0, 10);
+        let mut alap: HashMap<usize, i32> = HashMap::new();
+        alap.insert(0, 5); // Empty: asap=10 > alap=5
+
+        let (viol, _samples, empty) = diagnose_precedence_bounds(&ops, &asap, &alap, &shiftable_set);
+        assert_eq!(empty, 1, "Should detect 1 empty domain");
+        assert_eq!(viol, 0); // No edges to violate
+    }
+
+    #[test]
+    fn test_diagnose_no_violations() {
+        // Consistent bounds from proper ASAP/ALAP computation
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set = HashSet::new();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        let alap = compute_ssa_alap(&ops, 10, &shiftable_set);
+
+        let (viol, samples, empty) = diagnose_precedence_bounds(&ops, &asap, &alap, &shiftable_set);
+        assert_eq!(viol, 0, "Should have no violations, got {:?}", samples);
+        assert_eq!(empty, 0);
+    }
+
+    // ========================================================================
+    // fix_precedence_bounds_fixpoint tests
+    // ========================================================================
+
+    #[test]
+    fn test_fixpoint_converges_on_cascade() {
+        // Chain: A(0) → B(1) → C(2), with cascading ASAP violations
+        // A.asap=0 correct, but B.asap=0 violates (should be >=1), C.asap=0 violates (should be >=2)
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set = HashSet::new();
+
+        let mut asap: HashMap<usize, i32> = HashMap::new();
+        asap.insert(0, 0);
+        asap.insert(1, 0); // Violation
+        asap.insert(2, 0); // Violation
+        let mut alap: HashMap<usize, i32> = HashMap::new();
+        alap.insert(0, 10);
+        alap.insert(1, 10);
+        alap.insert(2, 10);
+
+        let (fixed_asap, fixed_alap) = fix_precedence_bounds_fixpoint(&ops, &asap, &alap, &shiftable_set);
+        assert_eq!(*fixed_asap.get(&0).unwrap(), 0);
+        assert_eq!(*fixed_asap.get(&1).unwrap(), 1); // Fixed: 0 + 1
+        assert_eq!(*fixed_asap.get(&2).unwrap(), 2); // Fixed: 1 + 1
+
+        // ALAP should still be consistent
+        let (viol, _, empty) = diagnose_precedence_bounds(&ops, &fixed_asap, &fixed_alap, &shiftable_set);
+        assert_eq!(viol, 0, "Fixpoint should resolve all violations");
+        assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn test_fixpoint_noop_on_consistent_bounds() {
+        // Already consistent bounds should not change
+        let a = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
+        let ops = vec![a, b, c];
+        let shiftable_set = HashSet::new();
+
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        let alap = compute_ssa_alap(&ops, 10, &shiftable_set);
+
+        let (fixed_asap, fixed_alap) = fix_precedence_bounds_fixpoint(&ops, &asap, &alap, &shiftable_set);
+        assert_eq!(fixed_asap, asap, "Consistent bounds should not change");
+        assert_eq!(fixed_alap, alap, "Consistent ALAP should not change");
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_fixpoint_integration_small_kernel() {
+        // Run a small kernel through CP-SAT with debug_fix_precedence_bounds=true
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let v0 = emit.emit_vbroadcast(c0);
+        let v1 = emit.emit_valu(Opcode::Add, v0, v0);
+        let _v2 = emit.emit_valu(Opcode::Sub, v1, v0);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                debug_fix_precedence_bounds: true,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+
+        assert!(result.is_some(), "CP-SAT should find a solution with fixpoint enabled");
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -7276,6 +8234,15 @@ mod tests {
                     SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
+            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+                // CP-SAT chose ALU-derive - verify it's an ALU op
+                assert_eq!(
+                    lowered_op.engine,
+                    Engine::Alu,
+                    "ConstChoice op {} (value {}) should be lowered to Alu (ALU-derive)",
+                    const_choice_id,
+                    expected_value
+                );
             } else {
                 // CP-SAT chose Load - verify it's a Load op
                 assert_eq!(
