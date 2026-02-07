@@ -3820,6 +3820,15 @@ pub fn schedule_ssa_cpsat(
                                     [(1, horizon + 1)],
                                     format!("live_out_size_{}", vreg.id),
                                 );
+                                // Hint: size = seg_end - def_cycle + 1 (live until segment end)
+                                if let Some(hints) = greedy_hints {
+                                    if def_idx < hints.len() {
+                                        let def_cycle = hints[def_idx];
+                                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
+                                        let size_hint = (seg_end_hint - def_cycle + 1).max(1);
+                                        model.add_hint(size, size_hint as i64);
+                                    }
+                                }
                                 let c = model.add_eq(
                                     LinearExpr::from(start) + LinearExpr::from(size),
                                     end_expr.clone(),
@@ -3846,6 +3855,13 @@ pub fn schedule_ssa_cpsat(
                         [(1, horizon + 1)],
                         format!("init_live_size_{}", vreg.id),
                     );
+                    // Hint: size = last_use_cycle + 1 (start is 0, end is last_use_cycle + 1)
+                    if let Some(hints) = greedy_hints {
+                        if *last_use_idx < hints.len() {
+                            let size_hint = (hints[*last_use_idx] + 1).max(1);
+                            model.add_hint(size, size_hint as i64);
+                        }
+                    }
                     let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
@@ -3866,6 +3882,12 @@ pub fn schedule_ssa_cpsat(
                         [(1, horizon + 1)],
                         format!("live_through_size_{}", vreg.id),
                     );
+                    // Hint: size = seg_end + 1 (start is 0, end is seg_end + 1)
+                    if let Some(hints) = greedy_hints {
+                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
+                        let size_hint = (seg_end_hint + 1).max(1);
+                        model.add_hint(size, size_hint as i64);
+                    }
                     let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
@@ -3911,9 +3933,7 @@ pub fn schedule_ssa_cpsat(
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
                 let max_hint = hints.iter().copied().max().unwrap_or(0);
-                if let Some(seg_end) = segment_end_var {
-                    model.add_hint(seg_end, max_hint as i64);
-                }
+                // segment_end_var is already hinted where it's created (line ~3633); don't duplicate.
                 let mut bad_size_count = 0;
                 for vreg in &live_vregs {
                     let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
