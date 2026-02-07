@@ -8,7 +8,8 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 **Performance Status:**
 - Baseline: 147,734 cycles
-- Current best: 1,764 cycles (83.7x speedup)
+- Current best (4 rounds): 485 cycles (304.6x speedup, CP-SAT 1800s, no VALU shift)
+- Current best (16 rounds): TBD
 - Target: 1,487 cycles (100x speedup)
 
 ## Default Problem Size
@@ -63,7 +64,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 ### Running Tests
 
-**Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). Solver tests in `solver/` and `tests/submission_tests.py` exercise the **Python** kernel builders and pipeline.
+**Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). `tests/submission_tests.py` exercises the end-to-end pipeline.
 
 ```bash
 # Rust: full scheduler_rs test suite (from project root)
@@ -75,9 +76,11 @@ BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --f
 # Python: interface test only (scheduler_rs build → Machine → reference)
 uv run pytest tests/test_scheduler_rs_interface.py -v
 
-# Python: solver / submission tests (Python pipeline, not Rust)
-uv run pytest solver/
+# Python: submission tests (end-to-end pipeline)
 uv run tests/submission_tests.py
+
+# Python: remaining solver utility tests
+uv run pytest solver/test_slot_utilization.py -v
 
 # Manual / CI: optimized kernel with optional --rust-builder
 uv run test_optimized.py
@@ -93,23 +96,26 @@ uv run test_optimized.py
 
 **Recommended: SSA builder with CP-SAT** (best quality):
 ```bash
-# Default: 10 min CP-SAT, VALU shift disabled
+# Default: 1 hour CP-SAT, VALU shift enabled
 # Shows full optimization progress (solver stats, cycle improvements)
 uv run generate_ssa_kernel.py
 
 # With validation against reference kernel
 uv run generate_ssa_kernel.py --validate
 
-# Auto-rebuild scheduler_rs if Rust changed, then run (e.g. long CP-SAT + validate)
-./scripts/run_generate_ssa_kernel.sh --enable-valu-shift --cpsat-time-limit 7200 --validate --rounds 5
+# Quick dev iteration (2 rounds, greedy, ~2 seconds, may exceed budget)
+uv run generate_ssa_kernel.py --rounds 2 --use-greedy
 
-# Quick iteration with greedy scheduler (~2 seconds, may exceed budget)
-uv run generate_ssa_kernel.py --use-greedy
+# 4-round with CP-SAT and validation (30 min, good for development)
+uv run generate_ssa_kernel.py --rounds 4 --cpsat-time-limit 1800 --validate
 
-# Longer optimization (diminishing returns after 10 min)
-uv run generate_ssa_kernel.py --cpsat-time-limit 3600
+# Disable VALU shift to reduce scratch pressure
+uv run generate_ssa_kernel.py --no-valu-shift --validate
 
-# Output schedule JSON for analysis (recommended: scheduler_output.json)
+# Auto-rebuild scheduler_rs if Rust changed, then run
+./scripts/run_generate_ssa_kernel.sh --cpsat-time-limit 7200 --validate --rounds 4
+
+# Output schedule JSON for analysis (default: scheduler_output.json)
 uv run generate_ssa_kernel.py --output-json scheduler_output.json
 ```
 
@@ -122,40 +128,49 @@ uv run generate_ssa_kernel.py --output-json scheduler_output.json
 - Kernel building phase (SSA ops, dead code elimination), solver progress (objective bounds, conflicts, branches), and final statistics (cycles, speedup, scratch usage).
 
 **Options for `generate_ssa_kernel.py`:**
+
+Scheduler options:
 - `--use-greedy` - Use greedy scheduler instead of CP-SAT (fast, ~2s, may exceed budget)
-- `--cpsat-time-limit SECONDS` - CP-SAT time limit (default: 600 = 10 min)
-- `--enable-valu-shift` - Enable VALU→ALU shifting (disabled by default)
-- `--output-json PATH` - Write scheduler output JSON for analysis (e.g. `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
+- `--cpsat-time-limit SECONDS` - CP-SAT time limit (default: 3600 = 1 hour)
+- `--enable-valu-shift` / `--no-valu-shift` - VALU→ALU shifting (enabled by default)
+- `--tree-reduce-max-depth N` - Max tree depth for tree-reduce selection, 2 or 3 (default: 3)
+- `--const-choice MODE` - ConstChoice handling: `optimize` (default), `add_imm`, or `load`
+- `--select-choice MODE` - SelectChoice handling: `optimize` (default), `fma`, or `vselect`
+- `--valu-shift MODE` - VALU shift handling: `optimize` (default), `alu`, or `valu`
+- `--per-section-optimize-secs SECONDS` - Per-section CP-SAT optimization time (0 or omit = feasibility only)
+- `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
+- `--enable-asap-alap-tightening` - Experimental: tighten ASAP/ALAP by slot capacity
+- `--enable-scratch-tightening` - Experimental: scratch-aware domain tightening
+
+Output options:
+- `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
 - `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
-- `--validate-only PATH` - Load kernel from JSON and run validation only (no build). Use after a run with `--validate` to re-check: `uv run generate_ssa_kernel.py --validate-only kernel_to_validate.json`.
+- `--validate-only PATH` - Load kernel from JSON and run validation only (no build).
 - `--save-kernel PATH` - Save kernel to this path (default when `--validate`: `kernel_to_validate.json`).
+- `--liveness-detail LEVEL` - Liveness detail in JSON: `none`, `summary`, or `full` (default)
+- `--comment TEXT` - Comment stored in schedule JSON
+- `--seed N` - Random seed for validation (default: 123)
 - `-q, --quiet` - Suppress verbose Rust scheduler output
 
 **Why SSA builder?**
 - Eliminates false dependencies between operations
 - Enables better scheduling with CP-SAT
-- VALU shift disabled by default to avoid scratch budget issues
+- VALU shift enabled by default for better slot utilization
 
 **Important limitations:**
-- The **greedy scheduler** (`--use-greedy`) does not respect the scratch budget (1536 words) and will produce incorrect results. Use it only for quick iteration, not for correct output.
-- **CP-SAT** (default) is required for correct results with the SSA builder.
-- VALU shift is disabled by default because it increases scratch pressure.
+- The **greedy scheduler** (`--use-greedy`) tries to respect the scratch budget via deferred scheduling, but may exceed it as a last resort (reported via `budget_exceeded` flag). When sections exceed budget, per-section CP-SAT runs automatically fix them.
+- **CP-SAT** (default) is required for guaranteed correct results with the SSA builder.
 
 **Scheduler Selection Guide:**
-- **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), results may exceed budget
-- **SSA + CP-SAT 10 min** (default): Production runs, benchmarking (recommended, correct output)
-- **SSA + CP-SAT 1 hour** (`--cpsat-time-limit 3600`): Final optimization (diminishing returns)
+- **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), may exceed budget
+- **SSA + CP-SAT 1 hour** (default): Production runs, benchmarking (recommended, correct output)
+- **SSA + CP-SAT 30 min** (`--cpsat-time-limit 1800`): Good for 4-round development iteration
 
 **4-round and full-kernel validation:**
-- All full 4-round tests (and 16-round when applicable) **must pass with ALL OPTIONS** including **CP-SAT** and **--enable-valu-shift** when recording results or benchmarking. Do not use `--use-greedy` for recorded results.
+- All full 4-round tests (and 16-round when applicable) **must pass with CP-SAT** when recording results or benchmarking. Do not use `--use-greedy` for recorded results.
 - CP-SAT is required to find a **valid feasible schedule** that respects engine slot limits (ALU 12, VALU 6, Load 2, Store 2, **Flow 1**). The model enforces Flow capacity 1 via cumulative + NoOverlap; after solve we validate per-cycle slot counts. **If slot limits are ever violated in a CP-SAT solution, that indicates a serious bug in the constraints** and must be fixed.
+- **Per-section feasibility**: When greedy exceeds scratch budget for a section, a per-section CP-SAT run automatically finds a feasible schedule within budget. This adds a few cycles but ensures correctness.
 - **Recorded progress** (options run, cycles, peak liveness, before/after treeselect): see **[docs/4-round-phase-results.md](docs/4-round-phase-results.md)**.
-
-### Running Experiments
-```bash
-uv run run_experiment.py           # With W&B logging
-uv run run_experiment.py --offline # Without W&B
-```
 
 ## Architecture Overview
 
@@ -164,6 +179,7 @@ uv run run_experiment.py --offline # Without W&B
 │                    Entry Points                                 │
 │  perf_takehome.py   - Test harness & performance measurement   │
 │  problem.py         - VLIW machine simulator & ISA definition  │
+│  generate_ssa_kernel.py - CLI for kernel generation             │
 └─────────────────────────────────────────────────────────────────┘
                               │
          ┌────────────────────┴────────────────────┐
@@ -172,12 +188,12 @@ uv run run_experiment.py --offline # Without W&B
 │   Kernel Builders             │   │   Rust Module (scheduler_rs/) │
 │                               │   │                               │
 │   scheduler_rs/ (SSA only)    │   │   kernel_builder/             │
-│   └── build_tick_tock_kernel_ssa │   │   └── tick_tock_ssa.rs       │
-│                               │   │   └── emit_ssa.rs             │
-│   solver/kernel_builder/      │   │   scheduler.rs (parallel)     │
-│   └── SSAKernelBuilder (wrapper)│   │   constants.rs (derivation)   │
-│   └── ModularKernelBuilder    │   └───────────────────────────────┘
-└───────────────────────────────┘
+│   └── build_tick_tock_kernel_ssa │   │   └── tick_tock_ssa.rs (main)│
+│                               │   │   └── emit_ssa.rs (SSA emit) │
+│   solver/kernel_builder/      │   │   └── ssa_greedy.rs (greedy)  │
+│   └── SSAKernelBuilder (wrapper)│   │   cpsat_scheduler.rs (CP-SAT)│
+│                               │   │   types.rs (SsaOp, traits)    │
+└───────────────────────────────┘   └───────────────────────────────┘
 ```
 
 ### Rust Kernel Builder (SSA only)
@@ -194,10 +210,10 @@ instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
     n_nodes=2047,
     batch_size=256,
     rounds=16,
-    enable_valu_shift=False,  # Disabled to avoid budget issues
+    enable_valu_shift=True,   # VALU→ALU shifting (default)
     verbose=True,
     use_cpsat=True,
-    cpsat_time_limit=600.0,   # 10 minutes
+    cpsat_time_limit=3600.0,  # 1 hour (default)
     output_json=None
 )
 print(f"Cycles: {stats['cycles']}, Budget exceeded: {stats['budget_exceeded']}")
@@ -254,10 +270,14 @@ Each cycle executes one bundle (dict of engine → list of operations):
 | `perf_takehome.py` | Main test harness for performance measurement |
 | `test_optimized.py` | Test kernel correctness and performance |
 | `generate_ssa_kernel.py` | **Generate kernels with SSA builder + CP-SAT (recommended)** |
-| `scheduler_rs/src/kernel_builder/` | Rust SSA kernel builder (tick_tock_ssa) |
-| `scheduler_rs/src/scheduler.rs` | Rust greedy list scheduler with parallel multipass |
-| `solver/kernel_builder/ssa_wrapper.py` | Python wrapper (KernelBuilder) calling build_tick_tock_kernel_ssa |
+| `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs` | Main SSA kernel builder (orchestration, per-section feasibility) |
+| `scheduler_rs/src/kernel_builder/ssa_greedy.rs` | SSA greedy scheduler (budget-aware, precedence offsets) |
+| `scheduler_rs/src/kernel_builder/emit_ssa.rs` | SSA op emission (ConstChoice, SelectChoice, tree-reduce) |
+| `scheduler_rs/src/cpsat_scheduler.rs` | CP-SAT model (~10K lines, sections 0-14) |
+| `scheduler_rs/src/types.rs` | SsaOp struct, PrecedenceOffset trait, Engine/Opcode enums |
+| `solver/kernel_builder/ssa_wrapper.py` | Python wrapper (SSAKernelBuilder) calling build_tick_tock_kernel_ssa |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
+| `docs/4-round-phase-results.md` | Recorded 4-round optimization progress |
 
 ## Important Constraints
 
@@ -265,7 +285,7 @@ Each cycle executes one bundle (dict of engine → list of operations):
 - **Batch size must be a multiple of 8** - `batch_size` must equal VLEN × n_groups (e.g. 8, 16, 32)
 - **Scratch space = 1536 words** - Limited register/cache space
 - **Write-after-read timing** - Results visible next cycle
-- **Primary bottleneck: Gather operations** - 8 non-contiguous loads per group
+- **Primary bottleneck: VALU saturation** - 98%+ VALU utilization in optimized schedules; gather operations (8 non-contiguous loads per group) are secondary
 
 ## Validation
 
