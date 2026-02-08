@@ -38,6 +38,56 @@ use self::pressure_policy::{GreedyPolicy, PressurePolicy};
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 
 // ============================================================================
+// GreedyBoundsUsage: explicit control over how ASAP/ALAP bounds affect scheduling
+// ============================================================================
+
+/// How the greedy scheduler uses ASAP/ALAP bounds.
+///
+/// Separates two concerns that were previously coupled via `Option`:
+/// - **Policy decisions** (sort_ready, ASAP inflation): improve scheduling quality
+/// - **Core loop mechanics** (heap priority, ASAP deferral, cycle clamping): change
+///   scheduling behavior to keep hints within CP-SAT solver domains
+///
+/// Computing bounds should not implicitly activate deferral behavior. This enum
+/// lets the caller explicitly choose what they want.
+pub enum GreedyBoundsUsage<'a> {
+    /// No bounds data. Pure greedy scheduling (backward-compatible with old `None`).
+    None,
+    /// Bounds available for policy decisions only (sort_ready + inflation).
+    /// Core loop mechanics (priority, deferral, clamping) are unaffected.
+    /// Used in greedy-only mode where we want inflation without deferral.
+    PolicyOnly {
+        asap: &'a HashMap<usize, i32>,
+        alap: &'a HashMap<usize, i32>,
+    },
+    /// Full bounds: core loop uses ASAP for priority, deferral, and clamping.
+    /// Used for CP-SAT warm-start to ensure hints stay within solver domains.
+    Full {
+        asap: &'a HashMap<usize, i32>,
+        alap: &'a HashMap<usize, i32>,
+    },
+}
+
+impl<'a> GreedyBoundsUsage<'a> {
+    /// Bounds for policy decisions (sort_ready, inflation). Available in PolicyOnly + Full.
+    fn policy_bounds(&self) -> Option<(&HashMap<usize, i32>, &HashMap<usize, i32>)> {
+        match self {
+            GreedyBoundsUsage::None => Option::None,
+            GreedyBoundsUsage::PolicyOnly { asap, alap } => Some((asap, alap)),
+            GreedyBoundsUsage::Full { asap, alap } => Some((asap, alap)),
+        }
+    }
+
+    /// Bounds for core loop mechanics (priority, deferral, clamping). Only in Full.
+    fn core_bounds(&self) -> Option<(&HashMap<usize, i32>, &HashMap<usize, i32>)> {
+        match self {
+            GreedyBoundsUsage::Full { asap, alap } => Some((asap, alap)),
+            _ => Option::None,
+        }
+    }
+}
+
+// ============================================================================
 // SlotTracker: single source of truth for per-cycle engine slot accounting
 // ============================================================================
 
@@ -331,7 +381,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &GreedyPolicy,
     )
 }
@@ -355,7 +405,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     select_sub_cycles: Option<&mut HashMap<usize, i32>>,
     select_fma_cycles: Option<&mut HashMap<usize, i32>>,
     mut const_add_imm_ops: Option<&mut HashSet<usize>>,
-    asap_alap: Option<(&HashMap<usize, i32>, &HashMap<usize, i32>)>,
+    bounds_usage: &GreedyBoundsUsage,
     strategy: &dyn PressurePolicy,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
@@ -553,8 +603,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // Initialize with ops that have no dependencies (excluding dead stores)
     for (idx, op) in ops.iter().enumerate() {
         if remaining_deps[idx] == 0 && !dead_store_indices.contains(&idx) {
-            let priority = asap_alap
-                .as_ref()
+            let priority = bounds_usage
+                .core_bounds()
                 .and_then(|(a, _)| a.get(&op.id).copied())
                 .unwrap_or(0);
             ready_heap.push(Reverse((priority, idx)));
@@ -618,8 +668,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 ready_this_cycle.push(idx);
             } else {
                 // Not ready yet - reinsert with updated priority
-                let new_priority = asap_alap
-                    .as_ref()
+                let new_priority = bounds_usage
+                    .core_bounds()
                     .and_then(|(a, _)| a.get(&ops[idx].id).copied())
                     .map(|lb| priority.max(cycle as i32).max(lb))
                     .unwrap_or_else(|| priority.max(cycle as i32));
@@ -683,7 +733,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         }
                     })
                     .sum();
-                let (asap_val, alap_val) = if let Some((asap_map, alap_map)) = asap_alap {
+                let (asap_val, alap_val) = if let Some((asap_map, alap_map)) = bounds_usage.policy_bounds() {
                     (
                         asap_map.get(&ops[idx].id).copied(),
                         alap_map.get(&ops[idx].id).copied(),
@@ -752,16 +802,18 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
             };
 
             for idx in ready_this_cycle.drain(..) {
-                if let Some((asap_map, alap_map)) = asap_alap {
+                // ASAP deferral: only in Full mode (core loop mechanics).
+                // Defers ops whose ASAP cycle hasn't been reached yet.
+                if let Some((asap_map, _alap_map)) = bounds_usage.core_bounds() {
                     let lb = *asap_map.get(&ops[idx].id).unwrap_or(&0);
-                    // Original ASAP check — op not yet ready
                     if (cycle as i32) < lb {
                         deferred_by_bounds.push((lb, idx));
                         continue;
                     }
-                    // ASAP inflation — op is ready but we defer it to reduce pressure.
-                    // Only inflate if: inflation is not disabled by consecutive-empty breaker,
-                    // and we haven't deferred too many this cycle (MIN_PASS_THROUGH safeguard).
+                }
+                // ASAP inflation: available in PolicyOnly + Full mode (policy decisions).
+                // Defers high-slack producers when pressure is high to reduce concurrent liveness.
+                if let Some((asap_map, alap_map)) = bounds_usage.policy_bounds() {
                     let max_inflation_deferrals =
                         ready_this_cycle_len.saturating_sub(MIN_PASS_THROUGH);
                     if !inflation_disabled && inflation_deferred_count < max_inflation_deferrals {
@@ -839,8 +891,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // Check slot availability
                 if !slots.fits(engine, can_shift) {
                     // Reinsert to heap for next cycle
-                    let next_priority = asap_alap
-                        .as_ref()
+                    let next_priority = bounds_usage
+                        .core_bounds()
                         .and_then(|(a, _)| a.get(&op_id).copied())
                         .map(|lb| ((cycle + 1) as i32).max(lb))
                         .unwrap_or_else(|| (cycle + 1) as i32);
@@ -897,8 +949,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     }
                     SlotResult::NoRoom => {
                         // VALU full, shift suppressed by strategy — defer to next cycle
-                        let next_priority = asap_alap
-                            .as_ref()
+                        let next_priority = bounds_usage
+                            .core_bounds()
                             .and_then(|(a, _)| a.get(&op_id).copied())
                             .map(|lb| ((cycle + 1) as i32).max(lb))
                             .unwrap_or_else(|| (cycle + 1) as i32);
@@ -907,7 +959,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     }
                 }
 
-                let assigned_cycle = if let Some((asap, alap)) = asap_alap {
+                let assigned_cycle = if let Some((asap, alap)) = bounds_usage.core_bounds() {
                     let lb = *asap.get(&op_id).unwrap_or(&0);
                     let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
                     (cycle as i32).clamp(lb, ub)
@@ -964,8 +1016,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                     remaining_deps[consumer_idx] -= 1;
                     if remaining_deps[consumer_idx] == 0 {
-                        let priority = asap_alap
-                            .as_ref()
+                        let priority = bounds_usage
+                            .core_bounds()
                             .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
                             .map(|lb| max_ready_cycle[consumer_idx].max(lb))
                             .unwrap_or(max_ready_cycle[consumer_idx]);
@@ -1044,7 +1096,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     }
                 }
 
-                let force_cycle = if let Some((asap, alap)) = asap_alap {
+                let force_cycle = if let Some((asap, alap)) = bounds_usage.core_bounds() {
                     let lb = *asap.get(&op_id).unwrap_or(&0);
                     let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
                     (cycle as i32).clamp(lb, ub)
@@ -1086,8 +1138,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                     remaining_deps[consumer_idx] -= 1;
                     if remaining_deps[consumer_idx] == 0 {
-                        let priority = asap_alap
-                            .as_ref()
+                        let priority = bounds_usage
+                            .core_bounds()
                             .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
                             .map(|lb| max_ready_cycle[consumer_idx].max(lb))
                             .unwrap_or(max_ready_cycle[consumer_idx]);
@@ -1099,8 +1151,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
         // Push remaining budget-deferred ops back to heap for next cycle
         for idx in budget_deferred {
-            let priority = asap_alap
-                .as_ref()
+            let priority = bounds_usage
+                .core_bounds()
                 .and_then(|(a, _)| a.get(&ops[idx].id).copied())
                 .map(|lb| ((cycle + 1) as i32).max(lb))
                 .unwrap_or_else(|| (cycle + 1) as i32);

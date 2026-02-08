@@ -360,7 +360,7 @@ impl SsaTickTockKernelBuilder {
             sections_exceeding_budget, vreg_def_section,
         };
         use super::pipeline::{
-            CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
+            BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
             SchedulingDecisions,
             passes::{ComputeBoundsPass, ComputeDependenciesPass, DcePass,
                      ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass,
@@ -378,6 +378,10 @@ impl SsaTickTockKernelBuilder {
             },
             scratch_budget: SCRATCH_BUDGET_HW,
             verbose,
+            bounds: BoundsConfig {
+                enable_asap_alap_tightening,
+                enable_scratch_tightening,
+            },
             cpsat: Some(CpSatPipelineConfig {
                 time_limit_secs,
                 verbose,

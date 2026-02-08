@@ -31,14 +31,15 @@ use super::ssa_program::SsaProgram;
 use super::tick_tock_ssa::SsaScheduleResult;
 
 use passes::{
-    AssignAddressesPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
+    AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
     FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass,
 };
 #[cfg(feature = "cpsat")]
-use passes::{ComputeBoundsPass, CpSatSchedulePass};
+use passes::CpSatSchedulePass;
 
 pub use context::{
-    PassReport, PipelineConfig, SchedulingBounds, SchedulingDecisions, SchedulingMetrics,
+    BoundsConfig, PassReport, PipelineConfig, SchedulingBounds, SchedulingDecisions,
+    SchedulingMetrics,
 };
 #[cfg(feature = "cpsat")]
 pub use context::CpSatPipelineConfig;
@@ -209,13 +210,19 @@ impl PipelineContext {
 
     /// Run the greedy-only scheduling pipeline.
     ///
-    /// Pipeline: Dependencies → [DCE → Dependencies] → Greedy → Barriers → Filter → Addresses → Lower
+    /// Pipeline: Dependencies → [DCE → Dependencies] → Bounds → Greedy(PolicyOnly) → Barriers → Filter → Addresses → Lower
+    ///
+    /// Bounds are computed so ASAP inflation can work in greedy-only mode.
+    /// The greedy scheduler receives `GreedyBoundsUsage::PolicyOnly`, which enables
+    /// inflation (policy decisions) without activating ASAP deferral or cycle
+    /// clamping (core loop mechanics).
     pub fn run_greedy_pipeline(&mut self, enable_dce: bool) -> Result<(), String> {
         self.run_pass(&ComputeDependenciesPass)?;
         if enable_dce {
             self.run_pass(&DcePass)?;
             self.run_pass(&ComputeDependenciesPass)?;
         }
+        self.run_pass(&ComputeBoundsPass)?;
         self.run_pass(&GreedySchedulePass)?;
 
         // In greedy-only mode, final decisions = greedy decisions

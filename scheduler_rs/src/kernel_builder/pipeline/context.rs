@@ -82,6 +82,19 @@ pub struct SchedulingMetrics {
 // Pipeline Configuration
 // ============================================================================
 
+/// Configuration for ASAP/ALAP bounds computation.
+///
+/// Always available (not feature-gated). Used by both greedy and CP-SAT
+/// pipelines. The greedy pipeline uses bounds for ASAP inflation; the CP-SAT
+/// pipeline uses them as domain hints for cycle variables.
+#[derive(Debug, Clone, Default)]
+pub struct BoundsConfig {
+    /// Enable ASAP/ALAP tightening by slot capacity (energetic reasoning).
+    pub enable_asap_alap_tightening: bool,
+    /// Enable scratch-aware domain tightening.
+    pub enable_scratch_tightening: bool,
+}
+
 /// CP-SAT-specific pipeline configuration.
 #[cfg(feature = "cpsat")]
 #[derive(Debug, Clone)]
@@ -152,20 +165,6 @@ impl CpSatPipelineConfig {
         }
     }
 
-    /// Build an `SsaCpsatConfig` for bounds computation.
-    pub fn to_bounds_config(
-        &self,
-        enable_valu_shift: bool,
-        scratch_budget: usize,
-    ) -> SsaCpsatConfig {
-        SsaCpsatConfig {
-            enable_asap_alap_tightening: self.enable_asap_alap_tightening,
-            enable_scratch_tightening: self.enable_scratch_tightening,
-            enable_valu_shift,
-            scratch_budget,
-            ..Default::default()
-        }
-    }
 }
 
 /// Unified pipeline configuration.
@@ -179,6 +178,8 @@ pub struct PipelineConfig {
     pub scratch_budget: usize,
     /// Whether to print verbose output.
     pub verbose: bool,
+    /// Bounds computation configuration (used by both greedy and CP-SAT).
+    pub bounds: BoundsConfig,
     /// CP-SAT specific configuration (None for greedy-only pipeline).
     #[cfg(feature = "cpsat")]
     pub cpsat: Option<CpSatPipelineConfig>,
@@ -191,6 +192,7 @@ impl Default for PipelineConfig {
             machine: MachineConfig::default(),
             scratch_budget: 1536,
             verbose: true,
+            bounds: BoundsConfig::default(),
             #[cfg(feature = "cpsat")]
             cpsat: None,
         }

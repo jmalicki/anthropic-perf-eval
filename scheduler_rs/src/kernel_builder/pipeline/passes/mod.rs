@@ -11,12 +11,12 @@ pub mod greedy;
 pub mod assign_addrs;
 pub mod lower;
 
-#[cfg(feature = "cpsat")]
 pub mod compute_bounds;
 #[cfg(feature = "cpsat")]
 pub mod cpsat;
 
 pub use compute_deps::ComputeDependenciesPass;
+pub use compute_bounds::ComputeBoundsPass;
 pub use dce::DcePass;
 pub use elide_barriers::ElideBarriersPass;
 pub use filter_dead::FilterDeadStoresPass;
@@ -24,7 +24,5 @@ pub use greedy::GreedySchedulePass;
 pub use assign_addrs::AssignAddressesPass;
 pub use lower::LowerToOpsPass;
 
-#[cfg(feature = "cpsat")]
-pub use compute_bounds::ComputeBoundsPass;
 #[cfg(feature = "cpsat")]
 pub use cpsat::CpSatSchedulePass;

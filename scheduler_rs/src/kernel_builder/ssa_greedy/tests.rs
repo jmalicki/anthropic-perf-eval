@@ -2296,7 +2296,7 @@ fn test_greedy_policy_unchanged_regression() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &GreedyPolicy,
     );
 
@@ -2342,7 +2342,7 @@ fn test_throttled_policy_produces_valid_schedule() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &PressureThrottledPolicy::default(),
     );
 
@@ -2375,7 +2375,7 @@ fn test_gated_policy_produces_valid_schedule() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &PressureGatedPolicy::default(),
     );
 
@@ -2408,7 +2408,7 @@ fn test_adaptive_policy_produces_valid_schedule() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
     );
 
@@ -2515,7 +2515,7 @@ fn test_adaptive_no_cascading_deferral() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
     );
 
@@ -2588,7 +2588,7 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         None,
         None,
         None,
-        None,
+        &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
     );
 
@@ -3094,8 +3094,10 @@ fn test_cascade_inflation_in_scheduler() {
         &HashSet::new(),
     );
 
-    // Run with CascadePolicy (has inflation)
+    // Run with CascadePolicy (has inflation) using PolicyOnly bounds
+    // (inflation test: we want policy decisions but not core loop deferral)
     let mut shifted_ops = HashSet::new();
+    let bounds_policy_only = GreedyBoundsUsage::PolicyOnly { asap: &asap, alap: &alap };
     let result_cascade = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         &mut emit.ops.clone(),
         false,
@@ -3105,7 +3107,7 @@ fn test_cascade_inflation_in_scheduler() {
         None,
         None,
         None,
-        Some((&asap, &alap)),
+        &bounds_policy_only,
         &CascadePolicy::default(),
     );
 
@@ -3122,6 +3124,7 @@ fn test_cascade_inflation_in_scheduler() {
 
     // Run with GreedyPolicy (no inflation) for comparison
     let mut shifted_ops2 = HashSet::new();
+    let bounds_policy_only2 = GreedyBoundsUsage::PolicyOnly { asap: &asap, alap: &alap };
     let result_greedy = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         &mut emit.ops.clone(),
         false,
@@ -3131,7 +3134,7 @@ fn test_cascade_inflation_in_scheduler() {
         None,
         None,
         None,
-        Some((&asap, &alap)),
+        &bounds_policy_only2,
         &GreedyPolicy,
     );
 
