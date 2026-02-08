@@ -64,3 +64,8 @@ optimized_*.json
 schedule_analysis.json
 kernel_*.json
 ssa_*.json
+
+# Analysis artifacts (ablation studies, policy comparisons)
+ablation_*.json
+ablation_*.txt
+greedy_policy_*.json
