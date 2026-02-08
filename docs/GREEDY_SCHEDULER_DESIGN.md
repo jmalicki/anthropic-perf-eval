@@ -11,8 +11,8 @@ improving the greedy scheduler's hint quality for CP-SAT (Feb 2026).
 4. [LLVM GenericScheduler Lessons (Track 1)](#llvm-genericscheduler-lessons-track-1)
 5. [Problem Structure (Track 2)](#problem-structure-track-2)
 6. [Slack & Deferral Analysis (Track 3)](#slack--deferral-analysis-track-3)
-7. [Hint Pipeline Inconsistency (Track 4)](#hint-pipeline-inconsistency-track-4)
-8. [Proposed Architecture (Track 5)](#proposed-architecture-track-5)
+7. [Hint Pipeline Inconsistency (Track 4) — FIXED](#hint-pipeline-inconsistency-track-4--fixed)
+8. [Implemented Architecture (Track 5)](#implemented-architecture-track-5)
 9. [Implementation Roadmap](#implementation-roadmap)
 
 ---
@@ -257,7 +257,11 @@ could serve as:
 
 ---
 
-## Hint Pipeline Inconsistency (Track 4)
+## Hint Pipeline Inconsistency (Track 4) — FIXED
+
+> **Status**: Three hint pipeline inconsistencies have been fixed in
+> `tick_tock_ssa/mod.rs`. The BFS strip (Option C below) for stale downstream
+> hints remains a future improvement. See the fix details at the end of this section.
 
 ### The Problem
 
@@ -312,34 +316,64 @@ Three options were considered:
 This is safe because CP-SAT already handles ops with no hints; we're just
 removing hints that are known to be unreliable.
 
+### Fixes Implemented
+
+Three additional hint pipeline inconsistencies (beyond the stale downstream
+timing issue above) were identified and fixed:
+
+1. **Shift hint over-exclusion** (A1): `rescheduled_by_section_cpsat` collected
+   ALL ops in budget-exceeding sections, but per-section CP-SAT only processed
+   `filtered_global_indices` (AddImm alternatives excluded). Valid shift hints
+   for filtered ops were incorrectly excluded. **Fix**: Track
+   `actually_rescheduled_op_ids` — only ops sent to per-section CP-SAT.
+
+2. **ConstChoice hint loss** (A2): Per-section CP-SAT returns its ConstChoice
+   decisions, but the code removed ALL ConstChoice ops from the section first,
+   then only re-inserted CP-SAT's results. Filtered AddImm ops (never sent to
+   CP-SAT) were permanently lost. **Fix**: Re-insert filtered ops that were in
+   greedy's original `greedy_const_add_imm_ops`.
+
+3. **Post-elision ConstChoice filtering** (A3): SelectChoice hints were filtered
+   against `op_ids_after_elision`, but ConstChoice hints were not — risking
+   stale hints for barrier-elided ops. **Fix**: Apply same filter pattern.
+
+A `debug_assertions` invariant now verifies all hint op IDs exist in the
+post-elision op set (shift, SelectChoice, and ConstChoice).
+
 ---
 
-## Proposed Architecture (Track 5)
+## Implemented Architecture (Track 5)
 
-### SchedulingCandidate Struct
+> **Status**: SchedulingCandidate, SchedulingContext, and CascadePolicy are
+> implemented and tested. The hint pipeline fix (Track 4) is also implemented.
+> See `pressure_policy/mod.rs` for types and `pressure_policy/cascade.rs` for
+> the CascadePolicy. ASAP inflation is not yet implemented (future work).
 
-Replace the raw tuple `(op_index, luc, words_added, words_freed)` with a
-richer struct:
+### SchedulingCandidate Struct (IMPLEMENTED)
+
+Replaced the raw tuple `(op_index, luc, words_added, words_freed)` with a
+richer struct in `pressure_policy/mod.rs`:
 
 ```rust
 pub struct SchedulingCandidate {
     pub op_index: usize,
-    pub luc: usize,           // live-use count (how many live values this op consumes)
-    pub words_added: usize,   // scratch words this op would add
-    pub words_freed: usize,   // scratch words freed by scheduling this op
-    pub engine: Engine,       // ALU, VALU, Load, Store, Flow
-    pub slack: i32,           // ALAP - ASAP (how much this op can move)
-    pub asap: i32,            // earliest feasible cycle
-    pub alap: i32,            // latest feasible cycle
-    pub is_producer: bool,    // true if this op defines a value used later
-    pub successor_count: usize, // fan-out
+    pub luc: usize,                      // last-use count
+    pub words_added: usize,              // scratch words this op would add
+    pub words_freed: usize,              // scratch words freed by scheduling this op
+    pub asap: Option<i32>,               // earliest feasible cycle (None if no bounds)
+    pub alap: Option<i32>,               // latest feasible cycle (None if no bounds)
+    pub engine: Engine,                  // ALU, VALU, Load, Store, Flow
+    pub is_shiftable: bool,              // whether this VALU op can shift to ALU
+    pub unscheduled_consumer_count: usize, // fan-out to unscheduled ops
 }
 ```
 
-### SlotSnapshot + SchedulingContext
+Helper methods: `slack() -> Option<i32>` (ALAP - ASAP), `net_pressure() -> i64`.
+
+### SlotTrackerView + SchedulingContext (IMPLEMENTED)
 
 ```rust
-pub struct SlotSnapshot {
+pub struct SlotTrackerView {
     pub alu_used: usize,
     pub valu_used: usize,
     pub load_used: usize,
@@ -347,40 +381,48 @@ pub struct SlotSnapshot {
     pub flow_used: usize,
 }
 
-pub struct SchedulingContext {
+pub struct SchedulingContext<'a> {
+    pub cycle: usize,
     pub live_words: usize,
     pub scratch_budget: usize,
-    pub current_cycle: usize,
-    pub slots: SlotSnapshot,
+    pub slots: &'a SlotTrackerView,
 }
 ```
 
-### CascadePolicy: 5-Level Strict Priority
+The `PressurePolicy::sort_ready` signature now takes
+`(&self, &mut [SchedulingCandidate], &SchedulingContext)` instead of raw tuples.
+All 5 policies (Greedy, PressureThrottled, PressureGated, Adaptive, Cascade)
+use this interface. The call site in `ssa_greedy/mod.rs` builds candidates with
+ASAP/ALAP from bounds, engine from `ops[idx].engine`, shiftable from the
+`shiftable_set`, and unscheduled consumer count from `consumers[idx]`.
+
+### CascadePolicy: 5-Level Strict Priority (IMPLEMENTED)
+
+Implemented in `pressure_policy/cascade.rs`. Opt-in via
+`--scheduling-pressure-policy cascade` (default remains Adaptive).
 
 ```
-Level 1: Engine Saturation
-  → If VALU is nearly full and candidate is VALU, schedule it NOW
-  → If candidate's engine has 0 remaining slots, skip to next candidate
-  → Ensures bottleneck engine ops aren't displaced by non-critical ops
+Level 1: Engine Saturation (higher saturation = first)
+  → VALU 5/6 → score 3, VALU 4/6 → score 2
+  → Load/Store/Flow at 1/capacity → score 3
+  → ALU 10/12 → score 2
+  → Below those thresholds → 0
 
-Level 2: Slack-Zero (Critical Path)
-  → Ops with slack=0 are on the critical path; delaying them increases makespan
-  → Always prefer slack=0 ops over slack>0 ops at the same level
+Level 2: Slack (lower = first, critical path wins)
+  → Ops without bounds get max slack (deferred)
 
-Level 3: Live-Use Count (LUC)
-  → Higher LUC = more values freed → schedule these first to reduce pressure
-  → This is the current greedy heuristic's primary sort key
+Level 3: LUC (higher = first, frees more scratch)
 
-Level 4: Net Pressure (words_added - words_freed)
-  → When above soft pressure threshold, prefer ops with lower net pressure
-  → Only activates when pressure exceeds configurable threshold
+Level 4: Net Pressure (only above soft threshold 85%)
+  → Lower net pressure = first (prefer ops that reduce pressure)
 
-Level 5: Tiebreak (ASAP, then op_index)
-  → Schedule earlier ASAP ops first (maintains topological order)
-  → op_index breaks remaining ties deterministically
+Level 5: ASAP tiebreak (lower = first), then op_index
 ```
 
-### ASAP Inflation: Strategic Deferral
+`allow_shift`: same graduated zones as AdaptivePolicy.
+`should_defer_for_pressure`: always false.
+
+### ASAP Inflation: Strategic Deferral (NOT YET IMPLEMENTED)
 
 Instead of the current "never defer" approach, inflate ASAP bounds for
 high-slack producers when pressure exceeds a soft threshold:
@@ -396,31 +438,24 @@ This is safe because:
 - The inflation is bounded: at most `slack` cycles of delay
 - Falls back to normal scheduling when pressure drops
 
-### Estimated Code Changes
-
-- ~260 lines new code (SchedulingCandidate, CascadePolicy, ASAP inflation)
-- ~40 lines migration (replace tuple sort_ready signature)
-- No changes to CP-SAT model or hint pipeline
-
 ---
 
 ## Implementation Roadmap
 
-| Priority | Change | Impact | Risk | Effort |
-|----------|--------|--------|------|--------|
-| 1 | LLVM-style priority cascade (CascadePolicy) | High — structured prioritization replaces ad-hoc blending | Low — sort_ready is already the control point | ~150 lines |
-| 2 | ASAP inflation for deferral | High — enables pressure-aware deferral without cascading deadlock | Low — only affects ops with slack, reversible | ~80 lines |
-| 3 | Multi-greedy via rayon | Medium — run multiple policies in parallel, pick best | Low — policies are pure functions, trivially parallelizable | ~50 lines |
-| 4 | Hint pipeline fix (Option C: BFS strip) | Medium — removes stale hints after per-section repair | Low — only removes hints, doesn't add constraints | ~60 lines |
-| 5 | Bidirectional scheduling | High — bottom-up pass for pressure, top-down for ILP | Medium — requires reverse-direction scheduling infrastructure | ~300 lines |
+| Priority | Change | Status | Impact | Risk | Effort |
+|----------|--------|--------|--------|------|--------|
+| 1 | LLVM-style priority cascade (CascadePolicy) | **DONE** | High — structured prioritization replaces ad-hoc blending | Low — sort_ready is already the control point | ~150 lines |
+| 2 | ASAP inflation for deferral | TODO | High — enables pressure-aware deferral without cascading deadlock | Low — only affects ops with slack, reversible | ~80 lines |
+| 3 | Multi-greedy via rayon | TODO | Medium — run multiple policies in parallel, pick best | Low — policies are pure functions, trivially parallelizable | ~50 lines |
+| 4 | Hint pipeline fix (3 inconsistencies) | **DONE** | Medium — fixes shift over-exclusion, ConstChoice loss, post-elision filtering | Low — correctness fix, no behavioral change for correct hints | ~60 lines |
+| 5 | Bidirectional scheduling | TODO | High — bottom-up pass for pressure, top-down for ILP | Medium — requires reverse-direction scheduling infrastructure | ~300 lines |
 
 ### Dependencies
 
-- Priority 1 (CascadePolicy) is a prerequisite for Priority 2 (ASAP inflation)
-  because the cascade provides the structured context for deferral decisions
+- ~~Priority 1 (CascadePolicy) is a prerequisite for Priority 2 (ASAP inflation)~~ **Done** — CascadePolicy provides the structured context
+- Priority 2 (ASAP inflation) can now be built on the CascadePolicy infrastructure
 - Priority 3 (multi-greedy) is independent and can be done at any time
-- Priority 4 (hint fix) is independent and should be done soon to improve
-  CP-SAT convergence
+- ~~Priority 4 (hint fix) is independent and should be done soon~~ **Done** — 3 hint pipeline inconsistencies fixed
 - Priority 5 (bidirectional) depends on Priority 1 for the scheduling
   infrastructure
 

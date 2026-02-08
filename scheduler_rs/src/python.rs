@@ -1047,9 +1047,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         "throttled" => PressurePolicyKind::PressureThrottled,
         "gated" => PressurePolicyKind::PressureGated,
         "adaptive" => PressurePolicyKind::Adaptive,
+        "cascade" => PressurePolicyKind::Cascade,
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid scheduling_pressure_policy '{}': must be 'greedy', 'throttled', 'gated', or 'adaptive'",
+                "Invalid scheduling_pressure_policy '{}': must be 'greedy', 'throttled', 'gated', 'adaptive', or 'cascade'",
                 other
             )));
         }

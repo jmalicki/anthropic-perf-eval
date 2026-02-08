@@ -95,7 +95,7 @@ def main():
                         help="Enable ASAP/ALAP tightening by considering slot capacity (default: enabled). Use --no-enable-asap-alap-tightening to disable.")
     parser.add_argument("--enable-scratch-tightening", action="store_true",
                         help="Enable scratch-aware tightening. Considers scratch constraints when tightening bounds (experimental, for ablation studies). Can be used independently of --enable-asap-alap-tightening.")
-    parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive"], default="adaptive",
+    parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive", "cascade"], default="adaptive",
                         help="Scheduling pressure policy: adaptive (default, transitions automatically), greedy (no pressure awareness), throttled (soft re-sort), gated (hard gate)")
 
     # Output options

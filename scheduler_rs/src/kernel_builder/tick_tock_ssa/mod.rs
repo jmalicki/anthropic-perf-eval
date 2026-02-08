@@ -510,6 +510,7 @@ impl SsaTickTockKernelBuilder {
             vec![None; boundaries.len()];
         let mut current_select_fma: HashSet<usize> = greedy_select_fma_ops.clone();
         let mut current_const_add_imm: HashSet<usize> = greedy_const_add_imm_ops.clone();
+        let mut actually_rescheduled_op_ids: HashSet<usize> = HashSet::new();
 
         for k in 0..boundaries.len() {
             let mut this_section_makespan: Option<i32> = None;
@@ -627,6 +628,12 @@ impl SsaTickTockKernelBuilder {
                     .map(|(_, &g)| g)
                     .collect();
 
+                // Track which ops were actually sent to per-section CP-SAT
+                // (excludes AddImm alternatives that were filtered out).
+                for &gi in &filtered_global_indices {
+                    actually_rescheduled_op_ids.insert(ctx.ops[gi].id);
+                }
+
                 let initial_live = live_in_for_section_filtered(
                     &ctx.ops, &boundaries, k, &vreg_def_sec, &filtered_global_indices,
                 );
@@ -715,15 +722,24 @@ impl SsaTickTockKernelBuilder {
                 for &id in &seg_result.const_add_imm_ops {
                     current_const_add_imm.insert(id);
                 }
+                // Re-insert ConstChoice ops that were filtered out (AddImm alternatives
+                // not sent to per-section CP-SAT) but were in greedy's original set.
+                let filtered_global_set: HashSet<usize> = filtered_global_indices.iter().copied().collect();
+                for &gi in &global_indices {
+                    if !filtered_global_set.contains(&gi) {
+                        let op_id = ctx.ops[gi].id;
+                        if greedy_const_add_imm_ops.contains(&op_id) {
+                            current_const_add_imm.insert(op_id);
+                        }
+                    }
+                }
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
                         ctx.ops[filtered_global_indices[seg_idx]].cycle = section_offset + cycle;
                     }
                 }
-                let filtered_set: HashSet<usize> =
-                    filtered_global_indices.iter().copied().collect();
                 for &i in &global_indices {
-                    if !filtered_set.contains(&i) && ctx.ops[i].cycle >= 0 {
+                    if !filtered_global_set.contains(&i) && ctx.ops[i].cycle >= 0 {
                         ctx.ops[i].cycle =
                             section_offset + (ctx.ops[i].cycle - greedy_min_c);
                     }
@@ -780,11 +796,7 @@ impl SsaTickTockKernelBuilder {
             ));
         }
 
-        let rescheduled_by_section_cpsat: HashSet<usize> = boundaries
-            .iter().enumerate()
-            .filter(|(k, _)| budget_result.section_exceeds_budget[*k])
-            .flat_map(|(_, &(start, end))| ctx.ops[start..end].iter().map(|op| op.id))
-            .collect();
+        let rescheduled_by_section_cpsat = actually_rescheduled_op_ids;
 
         // ====================================================================
         // Phase 3: Elide barriers → Full-kernel CP-SAT → Filter → Assign → Lower
@@ -851,6 +863,37 @@ impl SsaTickTockKernelBuilder {
             .collect();
         let select_choice_hints = if select_choice_hints_set.is_empty() { None } else { Some(&select_choice_hints_set) };
 
+        // ConstChoice hints: filter against post-elision ops (same as SelectChoice above)
+        let const_add_imm_hints_set: HashSet<usize> = current_const_add_imm
+            .iter()
+            .filter(|id| op_ids_after_elision.contains(id))
+            .copied()
+            .collect();
+        let const_add_imm_hints = if const_add_imm_hints_set.is_empty() { None } else { Some(&const_add_imm_hints_set) };
+
+        // Invariant: all hint op IDs must exist in the post-elision op set
+        #[cfg(debug_assertions)]
+        {
+            if let Some(ref hints) = shift_hints {
+                for id in hints.iter() {
+                    debug_assert!(op_ids_after_elision.contains(id),
+                        "Shift hint op {} not in post-elision ops", id);
+                }
+            }
+            if let Some(ref hints) = select_choice_hints {
+                for id in hints.iter() {
+                    debug_assert!(op_ids_after_elision.contains(id),
+                        "SelectChoice hint op {} not in post-elision ops", id);
+                }
+            }
+            if let Some(ref hints) = const_add_imm_hints {
+                for id in hints.iter() {
+                    debug_assert!(op_ids_after_elision.contains(id),
+                        "ConstChoice hint op {} not in post-elision ops", id);
+                }
+            }
+        }
+
         if verbose {
             eprintln!();
             eprintln!(
@@ -887,7 +930,7 @@ impl SsaTickTockKernelBuilder {
                 shift_hints,
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
-                const_add_imm_hints: Some(&current_const_add_imm),
+                const_add_imm_hints,
                 eliminate_vbroadcast_hints: None,
                 initial_live: None,
                 live_out_vregs: None,

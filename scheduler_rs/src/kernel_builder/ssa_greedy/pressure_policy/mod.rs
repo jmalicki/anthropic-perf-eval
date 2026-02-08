@@ -6,7 +6,7 @@
 //! - `RegCritical`: soft priority bias — prefer pressure-reducing ops when
 //!   approaching the critical threshold
 //!
-//! We adapt these concepts into four pressure policies for the scratch-budget–
+//! We adapt these concepts into five pressure policies for the scratch-budget–
 //! constrained greedy scheduler:
 //!
 //! # Policies
@@ -20,6 +20,9 @@
 //!   above critical threshold or when ALU is heavy.
 //! - **Adaptive** (default): Same graduated composite sort as PressureGated,
 //!   with additional shift suppression zones (greedy/throttled/gated).
+//! - **Cascade**: LLVM-style strict 5-level priority cascade (engine saturation
+//!   → slack → LUC → net pressure → ASAP tiebreak). First distinguishing level
+//!   wins — no blending. Opt-in via `--scheduling-pressure-policy cascade`.
 //!
 //! # Design: Sort-Only Pressure Awareness
 //!
@@ -35,11 +38,75 @@ mod greedy;
 mod pressure_throttled;
 mod pressure_gated;
 mod adaptive;
+mod cascade;
 
 pub use greedy::GreedyPolicy;
 pub use pressure_throttled::PressureThrottledPolicy;
 pub use pressure_gated::PressureGatedPolicy;
 pub use adaptive::AdaptivePolicy;
+pub use cascade::CascadePolicy;
+
+use crate::types::Engine;
+
+/// Rich scheduling candidate replacing raw (idx, luc, words_added, words_freed) tuples.
+///
+/// Exposes ASAP/ALAP bounds, engine type, shiftable status, and consumer count
+/// so policies can make fully-informed scheduling decisions.
+#[derive(Debug, Clone)]
+pub struct SchedulingCandidate {
+    /// Index into the ops array
+    pub op_index: usize,
+    /// Last-Use-Count: how many source VRegs have this op as their last reader
+    pub luc: usize,
+    /// Words this op's destination will add to scratch
+    pub words_added: usize,
+    /// Words freed by consuming last-use VRegs
+    pub words_freed: usize,
+    /// ASAP bound (earliest feasible cycle), if bounds are available
+    pub asap: Option<i32>,
+    /// ALAP bound (latest feasible cycle), if bounds are available
+    pub alap: Option<i32>,
+    /// Which engine this op executes on
+    pub engine: Engine,
+    /// Whether this VALU op can be shifted to ALU
+    pub is_shiftable: bool,
+    /// Number of unscheduled consumers of this op's output
+    pub unscheduled_consumer_count: usize,
+}
+
+impl SchedulingCandidate {
+    /// Scheduling slack (ALAP - ASAP). None if bounds unavailable.
+    pub fn slack(&self) -> Option<i32> {
+        match (self.asap, self.alap) {
+            (Some(a), Some(b)) => Some(b - a),
+            _ => None,
+        }
+    }
+
+    /// Net scratch pressure: words_added - words_freed. Positive = increases pressure.
+    pub fn net_pressure(&self) -> i64 {
+        self.words_added as i64 - self.words_freed as i64
+    }
+}
+
+/// Read-only snapshot of current slot usage, for policies that need engine awareness.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotTrackerView {
+    pub alu_used: usize,
+    pub valu_used: usize,
+    pub load_used: usize,
+    pub store_used: usize,
+    pub flow_used: usize,
+}
+
+/// Context for the current scheduling cycle.
+#[derive(Debug)]
+pub struct SchedulingContext<'a> {
+    pub cycle: usize,
+    pub live_words: usize,
+    pub scratch_budget: usize,
+    pub slots: &'a SlotTrackerView,
+}
 
 /// Pressure policy trait for the greedy scheduler.
 ///
@@ -55,13 +122,12 @@ pub trait PressurePolicy: std::fmt::Debug {
     /// Sort the ready-op list for this cycle.
     ///
     /// Called once per cycle after the ready queue is drained.
-    /// `ready_ops` contains `(op_index, luc, words_added, words_freed)` tuples.
+    /// `candidates` contains rich scheduling info (LUC, ASAP/ALAP, engine, etc.).
     /// The implementation should sort in-place; ops are tried in order.
     fn sort_ready(
         &self,
-        ready_ops: &mut [(usize, usize, usize, usize)],
-        live_words: usize,
-        scratch_budget: usize,
+        candidates: &mut [SchedulingCandidate],
+        ctx: &SchedulingContext,
     );
 
     /// Whether to defer this op due to pressure.

@@ -7,7 +7,8 @@ use crate::kernel_builder::config::PressurePolicyKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::ssa_greedy;
 use crate::kernel_builder::ssa_greedy::pressure_policy::{
-    AdaptivePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy, PressureThrottledPolicy,
+    AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy,
+    PressureThrottledPolicy,
 };
 
 /// Runs the greedy scheduler with VALU→ALU shifting and choice tracking.
@@ -32,6 +33,7 @@ impl Pass for GreedySchedulePass {
                 PressurePolicyKind::PressureThrottled => Box::new(PressureThrottledPolicy::default()),
                 PressurePolicyKind::PressureGated => Box::new(PressureGatedPolicy::default()),
                 PressurePolicyKind::Adaptive => Box::new(AdaptivePolicy::default()),
+                PressurePolicyKind::Cascade => Box::new(CascadePolicy::default()),
             };
 
         // Prepare ASAP/ALAP bounds parameter

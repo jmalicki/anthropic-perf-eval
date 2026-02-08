@@ -14,7 +14,7 @@
 //!
 //! See `docs/SCHEDULING_PRESSURE_CASCADING_DEFERRAL.md` for design rationale.
 
-use super::PressurePolicy;
+use super::{PressurePolicy, SchedulingCandidate, SchedulingContext};
 
 /// Adaptive policy: graduated composite score shifts from LUC-dominant to
 /// pressure-dominant as scratch pressure rises.
@@ -42,15 +42,14 @@ impl Default for AdaptivePolicy {
 impl PressurePolicy for AdaptivePolicy {
     fn sort_ready(
         &self,
-        ready_ops: &mut [(usize, usize, usize, usize)],
-        live_words: usize,
-        scratch_budget: usize,
+        candidates: &mut [SchedulingCandidate],
+        ctx: &SchedulingContext,
     ) {
-        let pressure_fraction = live_words as f64 / scratch_budget as f64;
+        let pressure_fraction = ctx.live_words as f64 / ctx.scratch_budget as f64;
 
         if pressure_fraction <= self.soft_threshold_fraction {
             // Greedy zone: pure LUC descending
-            ready_ops.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by(|a, b| b.luc.cmp(&a.luc));
         } else {
             // Pressure-aware zone: graduated composite score
             // Weight shifts from LUC-dominant (0.0) to pressure-dominant (1.0)
@@ -59,14 +58,14 @@ impl PressurePolicy for AdaptivePolicy {
                 / (1.0 - self.soft_threshold_fraction))
                 .clamp(0.0, 1.0);
 
-            ready_ops.sort_by(|a, b| {
-                let net_a = a.2 as f64 - a.3 as f64;
-                let net_b = b.2 as f64 - b.3 as f64;
+            candidates.sort_by(|a, b| {
+                let net_a = a.words_added as f64 - a.words_freed as f64;
+                let net_b = b.words_added as f64 - b.words_freed as f64;
                 // Composite: lower score = better
                 // pressure_weight=0 → pure LUC (higher LUC = lower score = better)
                 // pressure_weight=1 → pure net pressure (lower net = better)
-                let score_a = pressure_weight * net_a - (1.0 - pressure_weight) * a.1 as f64;
-                let score_b = pressure_weight * net_b - (1.0 - pressure_weight) * b.1 as f64;
+                let score_a = pressure_weight * net_a - (1.0 - pressure_weight) * a.luc as f64;
+                let score_b = pressure_weight * net_b - (1.0 - pressure_weight) * b.luc as f64;
                 score_a
                     .partial_cmp(&score_b)
                     .unwrap_or(std::cmp::Ordering::Equal)

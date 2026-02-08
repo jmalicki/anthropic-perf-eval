@@ -133,6 +133,9 @@ impl ProblemSpec {
 /// Modeled after LLVM's `GenericScheduler` register-pressure heuristics
 /// (`RegExcess`/`RegCritical` in `MachineScheduler.cpp`).
 ///
+/// Five policies available: Greedy, PressureThrottled, PressureGated,
+/// Adaptive (default), and Cascade (LLVM-style strict priority).
+///
 /// See `ssa_greedy::pressure_policy` for implementation details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PressurePolicyKind {
@@ -147,6 +150,9 @@ pub enum PressurePolicyKind {
     /// Adaptive (default): transitions Greedy → Throttled → Gated as pressure rises.
     #[default]
     Adaptive,
+    /// Cascade (LLVM-style): strict 5-level priority cascade
+    /// (engine saturation → slack → LUC → net pressure → ASAP tiebreak).
+    Cascade,
 }
 
 /// Compilation concern: how to optimize and schedule.

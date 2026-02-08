@@ -82,6 +82,17 @@ impl SlotTracker {
         }
     }
 
+    /// Create a read-only snapshot for policy inspection.
+    fn view(&self) -> pressure_policy::SlotTrackerView {
+        pressure_policy::SlotTrackerView {
+            alu_used: self.alu_used,
+            valu_used: self.valu_used,
+            load_used: self.load_used,
+            store_used: self.store_used,
+            flow_used: self.flow_used,
+        }
+    }
+
     /// Atomically try to place an op. Updates counters on success, returns
     /// `NoRoom` without side effects on failure.
     ///
@@ -577,8 +588,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 .count()
         }
 
-        // Build (idx, luc, words_added, words_freed) tuples for strategy-driven sort.
-        let mut ready_tuples: Vec<(usize, usize, usize, usize)> = ready_this_cycle
+        // Build SchedulingCandidate structs for strategy-driven sort.
+        let mut ready_candidates: Vec<pressure_policy::SchedulingCandidate> = ready_this_cycle
             .iter()
             .map(|&idx| {
                 let luc = compute_luc(ops, &vreg_remaining_users, idx);
@@ -602,11 +613,39 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         }
                     })
                     .sum();
-                (idx, luc, words_added, words_freed_est)
+                let (asap_val, alap_val) = if let Some((asap_map, alap_map)) = asap_alap {
+                    (
+                        asap_map.get(&ops[idx].id).copied(),
+                        alap_map.get(&ops[idx].id).copied(),
+                    )
+                } else {
+                    (None, None)
+                };
+                let unscheduled_consumers = consumers[idx]
+                    .iter()
+                    .filter(|&&c| !scheduled.contains(&c))
+                    .count();
+                pressure_policy::SchedulingCandidate {
+                    op_index: idx,
+                    luc,
+                    words_added,
+                    words_freed: words_freed_est,
+                    asap: asap_val,
+                    alap: alap_val,
+                    engine: ops[idx].engine,
+                    is_shiftable: shiftable_set.contains(&idx),
+                    unscheduled_consumer_count: unscheduled_consumers,
+                }
             })
             .collect();
-        strategy.sort_ready(&mut ready_tuples, live_words, scratch_budget);
-        ready_this_cycle = ready_tuples.into_iter().map(|(idx, _, _, _)| idx).collect();
+        let sched_ctx = pressure_policy::SchedulingContext {
+            cycle,
+            live_words,
+            scratch_budget,
+            slots: &slots.view(),
+        };
+        strategy.sort_ready(&mut ready_candidates, &sched_ctx);
+        ready_this_cycle = ready_candidates.into_iter().map(|c| c.op_index).collect();
 
         // Keep retrying as long as we make progress (schedule something or free VRegs)
         while made_progress {

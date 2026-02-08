@@ -4,7 +4,7 @@
 //! by net pressure (prefer ops that free scratch) instead of pure LUC.
 //! Suppresses VALU→ALU shift when ALU is heavily loaded (>8/12 slots).
 
-use super::PressurePolicy;
+use super::{PressurePolicy, SchedulingCandidate, SchedulingContext};
 
 /// Soft throttling: re-sort by net pressure above soft threshold, suppress
 /// shift when ALU >8/12 used.
@@ -28,21 +28,20 @@ impl Default for PressureThrottledPolicy {
 impl PressurePolicy for PressureThrottledPolicy {
     fn sort_ready(
         &self,
-        ready_ops: &mut [(usize, usize, usize, usize)],
-        live_words: usize,
-        scratch_budget: usize,
+        candidates: &mut [SchedulingCandidate],
+        ctx: &SchedulingContext,
     ) {
-        let soft_threshold = (scratch_budget as f64 * self.soft_threshold_fraction) as usize;
-        if live_words > soft_threshold {
+        let soft_threshold = (ctx.scratch_budget as f64 * self.soft_threshold_fraction) as usize;
+        if ctx.live_words > soft_threshold {
             // Above soft threshold: sort by net pressure ascending (prefer ops
             // that free the most scratch), with LUC descending as tiebreaker.
-            ready_ops.sort_by(|a, b| {
-                let net_a = a.2 as i64 - a.3 as i64;
-                let net_b = b.2 as i64 - b.3 as i64;
-                net_a.cmp(&net_b).then_with(|| b.1.cmp(&a.1))
+            candidates.sort_by(|a, b| {
+                let net_a = a.net_pressure();
+                let net_b = b.net_pressure();
+                net_a.cmp(&net_b).then_with(|| b.luc.cmp(&a.luc))
             });
         } else {
-            ready_ops.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by(|a, b| b.luc.cmp(&a.luc));
         }
     }
 

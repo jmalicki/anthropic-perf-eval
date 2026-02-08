@@ -1965,20 +1965,89 @@ fn test_greedy_mixed_predecessors_diamond() {
 // =========================================================================
 
 use super::pressure_policy::{
-    AdaptivePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy, PressureThrottledPolicy,
+    AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy,
+    PressureThrottledPolicy, SchedulingCandidate, SchedulingContext, SlotTrackerView,
 };
+
+/// Helper: create a SchedulingCandidate from (op_index, luc, words_added, words_freed).
+/// Other fields default to sensible values for unit tests.
+fn make_candidate(op_index: usize, luc: usize, words_added: usize, words_freed: usize) -> SchedulingCandidate {
+    SchedulingCandidate {
+        op_index,
+        luc,
+        words_added,
+        words_freed,
+        asap: None,
+        alap: None,
+        engine: Engine::Valu,
+        is_shiftable: false,
+        unscheduled_consumer_count: 0,
+    }
+}
+
+/// Helper: create a default SlotTrackerView (all zeros).
+fn empty_slots() -> SlotTrackerView {
+    SlotTrackerView {
+        alu_used: 0,
+        valu_used: 0,
+        load_used: 0,
+        store_used: 0,
+        flow_used: 0,
+    }
+}
+
+/// Helper: create a SchedulingContext with the given live_words and scratch_budget.
+fn make_ctx(live_words: usize, scratch_budget: usize, slots: &SlotTrackerView) -> SchedulingContext<'_> {
+    SchedulingContext {
+        cycle: 0,
+        live_words,
+        scratch_budget,
+        slots,
+    }
+}
+
+/// Helper: create a SchedulingCandidate with full control over all fields.
+/// Used by CascadePolicy tests that need engine, ASAP, and ALAP settings.
+fn make_candidate_full(
+    op_index: usize,
+    luc: usize,
+    words_added: usize,
+    words_freed: usize,
+    asap: Option<i32>,
+    alap: Option<i32>,
+    engine: Engine,
+    is_shiftable: bool,
+    unscheduled_consumer_count: usize,
+) -> SchedulingCandidate {
+    SchedulingCandidate {
+        op_index,
+        luc,
+        words_added,
+        words_freed,
+        asap,
+        alap,
+        engine,
+        is_shiftable,
+        unscheduled_consumer_count,
+    }
+}
 
 /// Test GreedyPolicy sort: pure LUC descending.
 #[test]
 fn test_greedy_policy_sort_by_luc() {
     let policy = GreedyPolicy;
-    // (idx, luc, words_added, words_freed)
-    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops, 500, 1536);
+    let mut ops = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let slots = empty_slots();
+    let ctx = make_ctx(500, 1536, &slots);
+    policy.sort_ready(&mut ops, &ctx);
     // Should sort by LUC descending: 5, 3, 1
-    assert_eq!(ops[0].0, 2, "LUC=5 should be first");
-    assert_eq!(ops[1].0, 0, "LUC=3 should be second");
-    assert_eq!(ops[2].0, 1, "LUC=1 should be third");
+    assert_eq!(ops[0].op_index, 2, "LUC=5 should be first");
+    assert_eq!(ops[1].op_index, 0, "LUC=3 should be second");
+    assert_eq!(ops[2].op_index, 1, "LUC=1 should be third");
 }
 
 /// Test GreedyPolicy never defers and always allows shift.
@@ -1995,19 +2064,30 @@ fn test_greedy_policy_no_deferral_always_shift() {
 #[test]
 fn test_throttled_policy_sort_changes_above_threshold() {
     let policy = PressureThrottledPolicy::default(); // soft_threshold = 85%
+    let slots = empty_slots();
 
     // Below threshold (85% of 1536 = 1305): sort by LUC descending
-    let mut ops_below = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops_below, 1000, 1536);
-    assert_eq!(ops_below[0].0, 2, "Below threshold: LUC=5 first");
+    let mut ops_below = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let ctx = make_ctx(1000, 1536, &slots);
+    policy.sort_ready(&mut ops_below, &ctx);
+    assert_eq!(ops_below[0].op_index, 2, "Below threshold: LUC=5 first");
 
     // Above threshold: sort by net pressure ascending (prefer freeing ops)
     // op0: net = 8-0 = 8, op1: net = 8-8 = 0, op2: net = 1-0 = 1
-    let mut ops_above = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops_above, 1400, 1536);
-    assert_eq!(ops_above[0].0, 1, "Above threshold: net=0 first (most freeing)");
-    assert_eq!(ops_above[1].0, 2, "Above threshold: net=1 second");
-    assert_eq!(ops_above[2].0, 0, "Above threshold: net=8 last (most adding)");
+    let mut ops_above = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let ctx = make_ctx(1400, 1536, &slots);
+    policy.sort_ready(&mut ops_above, &ctx);
+    assert_eq!(ops_above[0].op_index, 1, "Above threshold: net=0 first (most freeing)");
+    assert_eq!(ops_above[1].op_index, 2, "Above threshold: net=1 second");
+    assert_eq!(ops_above[2].op_index, 0, "Above threshold: net=8 last (most adding)");
 }
 
 /// Test PressureThrottledPolicy suppresses shift when ALU is heavily loaded.
@@ -2053,20 +2133,31 @@ fn test_gated_policy_no_deferral() {
 #[test]
 fn test_gated_policy_graduated_sort() {
     let policy = PressureGatedPolicy::default(); // soft=85%, critical=95%
+    let slots = empty_slots();
 
     // Below soft threshold (85% of 1536 = 1305): pure LUC sort
-    let mut ops_below = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops_below, 1000, 1536);
-    assert_eq!(ops_below[0].0, 2, "Below soft: LUC=5 first");
+    let mut ops_below = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let ctx = make_ctx(1000, 1536, &slots);
+    policy.sort_ready(&mut ops_below, &ctx);
+    assert_eq!(ops_below[0].op_index, 2, "Below soft: LUC=5 first");
 
     // At ~100% pressure: nearly pure net-pressure sort
     // op0: net=8, op1: net=0, op2: net=1
-    let mut ops_high = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops_high, 1530, 1536);
-    assert_eq!(ops_high[0].0, 1, "Near 100%: net=0 first (most freeing)");
+    let mut ops_high = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(1530, 1536, &slots);
+    policy.sort_ready(&mut ops_high, &ctx);
+    assert_eq!(ops_high[0].op_index, 1, "Near 100%: net=0 first (most freeing)");
     // op2 (net=1) should come before op0 (net=8) at high pressure
-    assert_eq!(ops_high[1].0, 2, "Near 100%: net=1 second");
-    assert_eq!(ops_high[2].0, 0, "Near 100%: net=8 last");
+    assert_eq!(ops_high[1].op_index, 2, "Near 100%: net=1 second");
+    assert_eq!(ops_high[2].op_index, 0, "Near 100%: net=8 last");
 }
 
 /// Test PressureGatedPolicy suppresses shift above critical threshold.
@@ -2090,15 +2181,21 @@ fn test_gated_policy_shift_suppression() {
     );
 }
 
-/// Test AdaptivePolicy transitions: below soft → Greedy behavior.
+/// Test AdaptivePolicy transitions: below soft -> Greedy behavior.
 #[test]
 fn test_adaptive_policy_greedy_below_soft() {
     let policy = AdaptivePolicy::default(); // soft=85%, critical=95%
+    let slots = empty_slots();
 
     // Below 85%: LUC sort (same as GreedyPolicy)
-    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops, 1000, 1536);
-    assert_eq!(ops[0].0, 2, "Below soft: LUC=5 should be first");
+    let mut ops = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let ctx = make_ctx(1000, 1536, &slots);
+    policy.sort_ready(&mut ops, &ctx);
+    assert_eq!(ops[0].op_index, 2, "Below soft: LUC=5 should be first");
 
     // Below 85%: no deferral
     assert!(!policy.should_defer_for_pressure(1000, 8, 0, 1536));
@@ -2107,26 +2204,32 @@ fn test_adaptive_policy_greedy_below_soft() {
     assert!(policy.allow_shift(1000, 10, 1536));
 }
 
-/// Test AdaptivePolicy transitions: between soft and critical → graduated blend.
+/// Test AdaptivePolicy transitions: between soft and critical -> graduated blend.
 ///
-/// At ~91% pressure (1400/1536), pressure_weight ≈ 0.41. This is a blend where
+/// At ~91% pressure (1400/1536), pressure_weight ~ 0.41. This is a blend where
 /// both LUC and net pressure matter. The composite score is:
 ///   score = 0.41 * net_pressure - 0.59 * LUC
 ///
 /// ops: (0, LUC=3, net=8), (1, LUC=1, net=0), (2, LUC=5, net=1)
-/// scores: op0=1.51, op1=-0.59, op2=-2.54 → sort: op2, op1, op0
+/// scores: op0=1.51, op1=-0.59, op2=-2.54 -> sort: op2, op1, op0
 /// Op2 wins because its high LUC (5) outweighs its small net pressure (1) at this blend.
 #[test]
 fn test_adaptive_policy_throttled_between_thresholds() {
     let policy = AdaptivePolicy::default(); // soft=85% (1305), critical=95% (1459)
+    let slots = empty_slots();
 
-    // At 1400 (~91%): graduated composite score — LUC still has significant weight
-    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
-    policy.sort_ready(&mut ops, 1400, 1536);
+    // At 1400 (~91%): graduated composite score -- LUC still has significant weight
+    let mut ops = vec![
+        make_candidate(0, 3, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 5, 1, 0),
+    ];
+    let ctx = make_ctx(1400, 1536, &slots);
+    policy.sort_ready(&mut ops, &ctx);
     // Op2 (LUC=5, net=1) has best composite score at this blend level
-    assert_eq!(ops[0].0, 2, "Throttled zone: op2 (high LUC, low net) first at ~91%");
-    // Op0 (LUC=3, net=8) should be last — high net pressure penalty
-    assert_eq!(ops[2].0, 0, "Throttled zone: op0 (high net=8) last");
+    assert_eq!(ops[0].op_index, 2, "Throttled zone: op2 (high LUC, low net) first at ~91%");
+    // Op0 (LUC=3, net=8) should be last -- high net pressure penalty
+    assert_eq!(ops[2].op_index, 0, "Throttled zone: op0 (high net=8) last");
 
     // No deferral
     assert!(!policy.should_defer_for_pressure(1400, 8, 0, 1536));
@@ -2136,12 +2239,13 @@ fn test_adaptive_policy_throttled_between_thresholds() {
     assert!(!policy.allow_shift(1400, 9, 1536));
 }
 
-/// Test AdaptivePolicy transitions: above critical → graduated sort, no deferral.
+/// Test AdaptivePolicy transitions: above critical -> graduated sort, no deferral.
 #[test]
 fn test_adaptive_policy_gated_above_critical() {
     let policy = AdaptivePolicy::default(); // critical=95% (1459)
+    let slots = empty_slots();
 
-    // Never defers — pressure awareness handled by sort_ready()
+    // Never defers -- pressure awareness handled by sort_ready()
     assert!(
         !policy.should_defer_for_pressure(1500, 8, 0, 1536),
         "Above critical: should NOT defer (cascading deferral fix)"
@@ -2156,9 +2260,14 @@ fn test_adaptive_policy_gated_above_critical() {
 
     // Graduated sort at high pressure: pressure-dominant
     // op0: LUC=5, net=8; op1: LUC=1, net=0; op2: LUC=3, net=1
-    let mut ops = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops, 1500, 1536);
-    assert_eq!(ops[0].0, 1, "Above critical: net=0 first (pressure-dominant sort)");
+    let mut ops = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(1500, 1536, &slots);
+    policy.sort_ready(&mut ops, &ctx);
+    assert_eq!(ops[0].op_index, 1, "Above critical: net=0 first (pressure-dominant sort)");
 }
 
 /// Test that GreedyPolicy produces the same schedule as before (regression guard).
@@ -2313,35 +2422,56 @@ fn test_adaptive_policy_produces_valid_schedule() {
 #[test]
 fn test_adaptive_graduated_sort_weight() {
     let policy = AdaptivePolicy::default(); // soft=85%
+    let slots = empty_slots();
 
     // Create ops with conflicting LUC vs pressure signals:
-    // op0: high LUC (5), high net pressure (8 added, 0 freed) — good for ILP, bad for pressure
-    // op1: low LUC (1), zero net pressure (8 added, 8 freed) — neutral ILP, great for pressure
-    // op2: medium LUC (3), low net pressure (1 added, 0 freed) — medium both
+    // op0: high LUC (5), high net pressure (8 added, 0 freed) -- good for ILP, bad for pressure
+    // op1: low LUC (1), zero net pressure (8 added, 8 freed) -- neutral ILP, great for pressure
+    // op2: medium LUC (3), low net pressure (1 added, 0 freed) -- medium both
 
     // At exactly soft threshold (85%): pure LUC sort
     let at_soft = (1536.0 * 0.85) as usize; // 1305
-    let mut ops_soft = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops_soft, at_soft, 1536);
-    assert_eq!(ops_soft[0].0, 0, "At soft threshold: LUC=5 first (pure LUC)");
+    let mut ops_soft = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(at_soft, 1536, &slots);
+    policy.sort_ready(&mut ops_soft, &ctx);
+    assert_eq!(ops_soft[0].op_index, 0, "At soft threshold: LUC=5 first (pure LUC)");
 
     // Just above soft threshold (~87%): LUC still dominates but pressure has some influence
-    let mut ops_87 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops_87, 1340, 1536); // ~87.2%
+    let mut ops_87 = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(1340, 1536, &slots);
+    policy.sort_ready(&mut ops_87, &ctx); // ~87.2%
     // At low pressure_weight, LUC=5 (op0) likely still wins despite net=8
     // But op1 (net=0) should be preferred over op2 (net=1) when LUC difference is small
 
-    // At ~93% pressure: pressure weight ~0.53 — roughly balanced
-    let mut ops_93 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops_93, 1428, 1536); // ~93%
+    // At ~93% pressure: pressure weight ~0.53 -- roughly balanced
+    let mut ops_93 = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(1428, 1536, &slots);
+    policy.sort_ready(&mut ops_93, &ctx); // ~93%
     // Pressure is now significant enough that net=0 (op1) can beat net=8 (op0)
 
-    // At ~100% pressure: pressure weight → 1.0, nearly pure pressure sort
-    let mut ops_100 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
-    policy.sort_ready(&mut ops_100, 1530, 1536);
-    assert_eq!(ops_100[0].0, 1, "Near 100%: net=0 first (pressure-dominant)");
-    assert_eq!(ops_100[1].0, 2, "Near 100%: net=1 second");
-    assert_eq!(ops_100[2].0, 0, "Near 100%: net=8 last");
+    // At ~100% pressure: pressure weight -> 1.0, nearly pure pressure sort
+    let mut ops_100 = vec![
+        make_candidate(0, 5, 8, 0),
+        make_candidate(1, 1, 8, 8),
+        make_candidate(2, 3, 1, 0),
+    ];
+    let ctx = make_ctx(1530, 1536, &slots);
+    policy.sort_ready(&mut ops_100, &ctx);
+    assert_eq!(ops_100[0].op_index, 1, "Near 100%: net=0 first (pressure-dominant)");
+    assert_eq!(ops_100[1].op_index, 2, "Near 100%: net=1 second");
+    assert_eq!(ops_100[2].op_index, 0, "Near 100%: net=8 last");
 }
 
 /// Test that AdaptivePolicy does NOT cause cascading deferral when all ready ops
@@ -2479,6 +2609,131 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
             cycle, valu_at_cycle
         );
     }
+}
+
+// =========================================================================
+// CascadePolicy Tests
+//
+// Verify the 5-level strict priority cascade:
+// 1. Engine saturation, 2. Slack, 3. LUC, 4. Net pressure (above soft), 5. ASAP tiebreak
+// =========================================================================
+
+/// Test CascadePolicy Level 1: engine saturation dominates.
+/// VALU op at 5/6 capacity sorts before ALU op at 2/12 capacity.
+#[test]
+fn test_cascade_engine_saturation_dominates() {
+    let policy = CascadePolicy::default();
+    let mut candidates = vec![
+        make_candidate_full(0, 5, 8, 0, Some(0), Some(10), Engine::Alu, false, 0),
+        make_candidate_full(1, 3, 8, 0, Some(0), Some(10), Engine::Valu, false, 0),
+    ];
+    let slots = SlotTrackerView {
+        valu_used: 5,  // 5/6 = critical for VALU
+        alu_used: 2,   // 2/12 = not saturated for ALU
+        ..empty_slots()
+    };
+    let ctx = SchedulingContext {
+        cycle: 10,
+        live_words: 500,
+        scratch_budget: 1536,
+        slots: &slots,
+    };
+    policy.sort_ready(&mut candidates, &ctx);
+    assert_eq!(candidates[0].op_index, 1, "VALU op (5/6 saturated) should sort first");
+}
+
+/// Test CascadePolicy Level 2: slack dominates when engine saturation is equal.
+/// Critical-path op (slack=2) sorts before high-slack op (slack=20).
+#[test]
+fn test_cascade_slack_dominates_over_luc() {
+    let policy = CascadePolicy::default();
+    let mut candidates = vec![
+        make_candidate_full(0, 10, 8, 0, Some(5), Some(25), Engine::Alu, false, 0), // slack=20, high LUC
+        make_candidate_full(1, 1, 8, 0, Some(5), Some(7), Engine::Alu, false, 0),   // slack=2, low LUC
+    ];
+    let slots = empty_slots();
+    let ctx = make_ctx(500, 1536, &slots);
+    policy.sort_ready(&mut candidates, &ctx);
+    assert_eq!(candidates[0].op_index, 1, "Slack=2 (critical path) should sort before slack=20");
+}
+
+/// Test CascadePolicy Level 3: LUC tiebreak when engine and slack are equal.
+#[test]
+fn test_cascade_luc_tiebreak() {
+    let policy = CascadePolicy::default();
+    let mut candidates = vec![
+        make_candidate_full(0, 2, 8, 0, Some(5), Some(15), Engine::Alu, false, 0), // slack=10, LUC=2
+        make_candidate_full(1, 5, 8, 0, Some(5), Some(15), Engine::Alu, false, 0), // slack=10, LUC=5
+    ];
+    let slots = empty_slots();
+    let ctx = make_ctx(500, 1536, &slots);
+    policy.sort_ready(&mut candidates, &ctx);
+    assert_eq!(candidates[0].op_index, 1, "Higher LUC (5) should win when slack is equal");
+}
+
+/// Test CascadePolicy Level 4: net pressure only activates above soft threshold.
+#[test]
+fn test_cascade_net_pressure_only_above_threshold() {
+    let policy = CascadePolicy::default();
+
+    // Below soft threshold (85% of 1536 = 1305): net pressure should NOT distinguish
+    let slots = empty_slots();
+    let mut candidates_below = vec![
+        make_candidate_full(0, 3, 8, 0, Some(5), Some(15), Engine::Alu, false, 0), // net=8
+        make_candidate_full(1, 3, 1, 8, Some(5), Some(15), Engine::Alu, false, 0), // net=-7
+    ];
+    let ctx_below = make_ctx(1000, 1536, &slots);
+    policy.sort_ready(&mut candidates_below, &ctx_below);
+    // With equal saturation, slack, and LUC, net pressure is NOT active below threshold
+    // So tiebreak goes to ASAP (both same) then op_index (0 before 1)
+    assert_eq!(candidates_below[0].op_index, 0, "Below threshold: net pressure inactive, op_index tiebreak");
+
+    // Above soft threshold: net pressure SHOULD distinguish
+    let mut candidates_above = vec![
+        make_candidate_full(0, 3, 8, 0, Some(5), Some(15), Engine::Alu, false, 0), // net=8
+        make_candidate_full(1, 3, 1, 8, Some(5), Some(15), Engine::Alu, false, 0), // net=-7
+    ];
+    let ctx_above = make_ctx(1400, 1536, &slots);
+    policy.sort_ready(&mut candidates_above, &ctx_above);
+    assert_eq!(candidates_above[0].op_index, 1, "Above threshold: net=-7 (freeing) should sort first");
+}
+
+/// Test CascadePolicy allow_shift: same graduated zones as Adaptive.
+#[test]
+fn test_cascade_allow_shift_graduated() {
+    let policy = CascadePolicy::default(); // soft=85% (1305), critical=95% (1459)
+
+    // Below soft: always allow
+    assert!(policy.allow_shift(1000, 10, 1536));
+
+    // Between soft and critical: suppress when ALU > 8
+    assert!(policy.allow_shift(1400, 4, 1536));
+    assert!(!policy.allow_shift(1400, 9, 1536));
+
+    // Above critical: suppress all
+    assert!(!policy.allow_shift(1500, 4, 1536));
+}
+
+/// Test CascadePolicy never defers.
+#[test]
+fn test_cascade_no_deferral() {
+    let policy = CascadePolicy::default();
+    assert!(!policy.should_defer_for_pressure(1500, 8, 0, 1536));
+    assert!(!policy.should_defer_for_pressure(1536, 8, 0, 1536));
+}
+
+/// Test CascadePolicy Level 5: ASAP tiebreak when all other levels are equal.
+#[test]
+fn test_cascade_asap_tiebreak() {
+    let policy = CascadePolicy::default();
+    let mut candidates = vec![
+        make_candidate_full(0, 3, 4, 0, Some(10), Some(20), Engine::Alu, false, 0), // ASAP=10, slack=10
+        make_candidate_full(1, 3, 4, 0, Some(5), Some(15), Engine::Alu, false, 0),  // ASAP=5, slack=10
+    ];
+    let slots = empty_slots();
+    let ctx = make_ctx(500, 1536, &slots);
+    policy.sort_ready(&mut candidates, &ctx);
+    assert_eq!(candidates[0].op_index, 1, "Lower ASAP (5) should win as tiebreak");
 }
 
 // =========================================================================
