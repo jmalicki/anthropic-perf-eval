@@ -9,7 +9,11 @@
 //! - `config` - Kernel configuration (forest height, batch size, etc.)
 //! - `context_ssa` - SSA scratch context with VRegs (no pre-allocated addresses)
 //! - `emit_ssa` - SSA-based op emission using virtual registers
-//! - `tick_tock_ssa` - SSA-based kernel builder (eliminates false dependencies)
+//! - `ssa_emit` - High-level SSA emission (hash, branch, tree selection)
+//! - `ssa_greedy/` - Greedy scheduler (budget-aware, precedence offsets)
+//! - `ssa_lower` - SSA→concrete lowering (address assignment, VALU→ALU expansion)
+//! - `tick_tock_ssa/` - SSA-based kernel builder (orchestration, scheduling)
+//! - `round_budget` - Per-section scratch budget analysis
 
 pub mod barrier_elision;
 pub mod config;

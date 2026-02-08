@@ -68,7 +68,7 @@ The script prints:
 
 ## Follow-Up: Which constraints are binding
 
-When bulk-move **blocks**, the blocking constraint is one of the **binding** (tight) constraints at the CP-SAT solution. The CP-SAT path can log binding schedule constraints (precedence, ordering, domain) when building the schedule; search for "Binding schedule constraints" or "bulk-move" in `scheduler_rs/src/cpsat_scheduler.rs`. Comparing the violation’s constraint type and op indices to that list confirms which binding constraint is limiting compaction.
+When bulk-move **blocks**, the blocking constraint is one of the **binding** (tight) constraints at the CP-SAT solution. The CP-SAT path can log binding schedule constraints (precedence, ordering, domain) when building the schedule; search for "Binding schedule constraints" or "bulk-move" in `scheduler_rs/src/cpsat_scheduler/`. Comparing the violation’s constraint type and op indices to that list confirms which binding constraint is limiting compaction.
 
 ## Complementary Script
 
@@ -84,7 +84,7 @@ Use it to get a higher-level view of why ops sit at C+1; use bulk-move to get th
 - **Constraint definitions and bulk-move logic:** `scheduler_rs/src/schedule_constraints.rs`  
   - `ScheduleConstraint`: Precedence, Ordering, Domain  
   - `run_bulk_move_simulator`, `check_schedule_constraints`, `binding_schedule_constraints`
-- **How constraints are built (CP-SAT):** `scheduler_rs/src/cpsat_scheduler.rs` (search for `build_ssa_schedule_constraints`, "bulk-move", "Binding schedule constraints")
+- **How constraints are built (CP-SAT):** `scheduler_rs/src/cpsat_scheduler/` (search for `build_ssa_schedule_constraints`, "bulk-move", "Binding schedule constraints")
 - **Python wrapper:** `scripts/simulate_bulk_move.py`; Rust API: `scheduler_rs.run_bulk_move_simulator_from_json(path, verbose=...)`
 
 ## Capacity lower bound sanity check
@@ -95,7 +95,7 @@ When **greedy is within scratch budget**, CP-SAT requires `greedy_makespan >= ca
 greedy makespan X < capacity_lower_bound Y (greedy schedule would violate capacity; ...)
 ```
 
-then either (1) **capacity_lower_bound** is wrong (e.g. in `compute_capacity_lower_bound_global`, `cpsat_scheduler.rs`), or (2) the **greedy scheduler** produced an invalid schedule (too few cycles for the chosen shift/ConstChoice/SelectChoice). The check is skipped when greedy exceeded scratch (`greedy_within_scratch_budget: Some(false)` or `None`), because infeasible greedy can legally use fewer cycles.
+then either (1) **capacity_lower_bound** is wrong (e.g. in `compute_capacity_lower_bound_global`, `cpsat_scheduler/`), or (2) the **greedy scheduler** produced an invalid schedule (too few cycles for the chosen shift/ConstChoice/SelectChoice). The check is skipped when greedy exceeded scratch (`greedy_within_scratch_budget: Some(false)` or `None`), because infeasible greedy can legally use fewer cycles.
 
 ## Limitation
 

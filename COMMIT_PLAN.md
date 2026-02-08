@@ -16,11 +16,11 @@ Execute in this order. Do **not** commit the kernel JSON files (`kernel_*.json`,
    - `scheduler_rs/src/lib.rs` (pub mod schedule_constraints)
 
 4. **feat(scheduler_rs): CP-SAT capacity validation, bulk-move, full hints, makespan diagnostics**
-   - `scheduler_rs/src/cpsat_scheduler.rs`
+   - `scheduler_rs/src/cpsat_scheduler/`
    - Includes: try_validate_ssa_slot_limits, capacity check before bulk-move, remove wrong redundant makespan bounds, makespan active set, full hints (chosen_cycle, select_fma_extra, fma_last), bulk-move integration and compaction, Unknown hint message, module docs.
 
 5. **fix(scheduler_rs): concatenate section schedules; per-section ConstChoice hints; bulk-move result fields**
-   - `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs`
+   - `scheduler_rs/src/kernel_builder/tick_tock_ssa/`
    - Rebase sections that skip per-section CP-SAT; segment const_add_imm hints; SsaScheduleResult fields and population for bulk-move JSON.
 
 6. **feat(scheduler_rs): expose bulk-move from JSON, SSA schedule in JSON, empty-cycle logging**
@@ -32,5 +32,5 @@ Execute in this order. Do **not** commit the kernel JSON files (`kernel_*.json`,
    - `scripts/analyze_empty_cycles.py`
 
 8. **fix(scheduler_rs): greedy ConstChoice as add_imm when Flow slot free**
-   - `scheduler_rs/src/kernel_builder/ssa_greedy.rs`
+   - `scheduler_rs/src/kernel_builder/ssa_greedy/`
    - Record const_add_imm_ops when scheduling ConstChoice as Flow; prefer add_imm when no other Flow op ready.

@@ -15,7 +15,8 @@
 //! - `constants` - Constant analysis and derivation planning
 //! - `scheduler` - Core scheduling algorithms
 //! - `address_assign` - SSA address assignment via linear scan allocation
-//! - `kernel_builder` - Native Rust kernel generation
+//! - `cpsat_scheduler/` - CP-SAT model (config, bounds, validation, model, legacy)
+//! - `kernel_builder/` - Native Rust kernel generation (tick_tock_ssa, ssa_greedy, emit)
 //! - `python` - PyO3 bindings and Python interface
 
 use pyo3::prelude::*;

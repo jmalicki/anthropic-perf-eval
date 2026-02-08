@@ -188,10 +188,10 @@ Output options:
 │   Kernel Builders             │   │   Rust Module (scheduler_rs/) │
 │                               │   │                               │
 │   scheduler_rs/ (SSA only)    │   │   kernel_builder/             │
-│   └── build_tick_tock_kernel_ssa │   │   └── tick_tock_ssa.rs (main)│
+│   └── build_tick_tock_kernel_ssa │   │   └── tick_tock_ssa/ (main)  │
 │                               │   │   └── emit_ssa.rs (SSA emit) │
-│   solver/kernel_builder/      │   │   └── ssa_greedy.rs (greedy)  │
-│   └── SSAKernelBuilder (wrapper)│   │   cpsat_scheduler.rs (CP-SAT)│
+│   solver/kernel_builder/      │   │   └── ssa_greedy/ (greedy)   │
+│   └── SSAKernelBuilder (wrapper)│   │   cpsat_scheduler/ (CP-SAT)  │
 │                               │   │   types.rs (SsaOp, traits)    │
 └───────────────────────────────┘   └───────────────────────────────┘
 ```
@@ -270,10 +270,10 @@ Each cycle executes one bundle (dict of engine → list of operations):
 | `perf_takehome.py` | Main test harness for performance measurement |
 | `test_optimized.py` | Test kernel correctness and performance |
 | `generate_ssa_kernel.py` | **Generate kernels with SSA builder + CP-SAT (recommended)** |
-| `scheduler_rs/src/kernel_builder/tick_tock_ssa.rs` | Main SSA kernel builder (orchestration, per-section feasibility) |
-| `scheduler_rs/src/kernel_builder/ssa_greedy.rs` | SSA greedy scheduler (budget-aware, precedence offsets) |
+| `scheduler_rs/src/kernel_builder/tick_tock_ssa/` | Main SSA kernel builder (orchestration, per-section feasibility) |
+| `scheduler_rs/src/kernel_builder/ssa_greedy/` | SSA greedy scheduler (budget-aware, precedence offsets) |
 | `scheduler_rs/src/kernel_builder/emit_ssa.rs` | SSA op emission (ConstChoice, SelectChoice, tree-reduce) |
-| `scheduler_rs/src/cpsat_scheduler.rs` | CP-SAT model (~10K lines, sections 0-14) |
+| `scheduler_rs/src/cpsat_scheduler/` | CP-SAT model (config, bounds, validation, model, legacy) |
 | `scheduler_rs/src/types.rs` | SsaOp struct, PrecedenceOffset trait, Engine/Opcode enums |
 | `solver/kernel_builder/ssa_wrapper.py` | Python wrapper (SSAKernelBuilder) calling build_tick_tock_kernel_ssa |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |

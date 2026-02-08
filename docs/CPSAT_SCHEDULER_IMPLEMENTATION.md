@@ -136,7 +136,9 @@ match response.status() {
 
 ## Implementation Structure
 
-### File: `scheduler_rs/src/cpsat_scheduler.rs`
+### Directory: `scheduler_rs/src/cpsat_scheduler/`
+
+The module is split into: `config.rs` (enums), `bounds.rs` (ASAP/ALAP, capacity bounds), `validation.rs` (slot limit checks), `model.rs` (main solver), `legacy.rs` (Op-based ASAP/ALAP), `tests.rs`.
 
 ```rust
 //! CP-SAT based scheduler using Google OR-Tools.
@@ -446,7 +448,7 @@ if scheduler_rs.cpsat_available():
 
 ## Testing Plan
 
-### Unit Tests (`scheduler_rs/src/cpsat_scheduler.rs`)
+### Unit Tests (`scheduler_rs/src/cpsat_scheduler/tests.rs`)
 
 ```rust
 #[cfg(test)]
@@ -570,7 +572,7 @@ In addition to using capacity (and profile/suffix/sparse) bounds to set the **do
 
 - For each engine: **makespan ≥ ceil(num_ops_engine / capacity)**.
 
-These are redundant with the cumulative constraints and the makespan domain, but as linear inequalities they can be used more effectively in the LP relaxation and cut generation, improving `best_objective_bound` and convergence. Implemented in both `schedule_cpsat` (non-SSA) and `schedule_ssa_cpsat` (SSA) in `scheduler_rs/src/cpsat_scheduler.rs`. In `schedule_ssa_cpsat`, the capacity used is taken from `config.machine` (MachineConfig).
+These are redundant with the cumulative constraints and the makespan domain, but as linear inequalities they can be used more effectively in the LP relaxation and cut generation, improving `best_objective_bound` and convergence. Implemented in both `schedule_cpsat` (non-SSA) and `schedule_ssa_cpsat` (SSA) in `scheduler_rs/src/cpsat_scheduler/model.rs`. In `schedule_ssa_cpsat`, the capacity used is taken from `config.machine` (MachineConfig).
 
 ### Impact
 
