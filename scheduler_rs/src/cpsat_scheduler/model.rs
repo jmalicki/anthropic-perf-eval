@@ -130,16 +130,59 @@ pub fn schedule_ssa_cpsat(
     // that backward propagation from horizon-1 doesn't produce negative ALAP values.
     let max_latency_critical_path = compute_max_latency_critical_path(ops, &shiftable_set);
 
-    // Use a reasonable horizon: must accommodate both min-latency (ASAP) and max-latency (ALAP) paths
+    // Use a reasonable horizon: when greedy hints exist, greedy_max is a proven upper bound
+    // on makespan, so we only need a small buffer beyond it. Without greedy, use conservative 2x.
     let greedy_max = greedy_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
         .unwrap_or(0);
-    let horizon = (critical_path_len * 2)
-        .max(max_latency_critical_path * 2)
-        .max(greedy_max)
-        .max(n as i32) as i64;
+    let horizon = if greedy_max > 0 {
+        // Greedy makespan is a proven upper bound — optimal is at most greedy_max.
+        // Add small buffer (+20) for solver flexibility, but keep max_latency_critical_path
+        // guard so ALAP backward propagation has enough room.
+        (greedy_max as i64 + 20)
+            .max(max_latency_critical_path as i64)
+            .max(n as i64)
+    } else {
+        // No greedy hints: keep conservative formula
+        (critical_path_len * 2)
+            .max(max_latency_critical_path * 2)
+            .max(n as i32) as i64
+    };
 
     let alap = compute_ssa_alap(ops, horizon as i32, &shiftable_set);
+
+    // 1a. Warm-start ALAP from greedy schedule: intersect each op's ALAP with greedy_cycle + slack.
+    // The greedy schedule is a proven feasible solution, so greedy_cycle[op] + slack is a valid
+    // upper bound. This tightens domains before energetic reasoning for compounding benefit.
+    let alap = if let Some(hints) = greedy_hints {
+        let slack = 15i32; // conservative slack to avoid excluding optimal
+        let mut tighter_alap = alap;
+        let mut tightened_count = 0usize;
+        for (idx, &hint_cycle) in hints.iter().enumerate() {
+            if idx >= ops.len() || hint_cycle < 0 {
+                continue;
+            }
+            let op_id = ops[idx].id;
+            let op_asap = *asap.get(&op_id).unwrap_or(&0);
+            if let Some(current) = tighter_alap.get_mut(&op_id) {
+                let new_alap = (hint_cycle + slack).min(*current);
+                // Never tighten below ASAP
+                if new_alap >= op_asap && new_alap < *current {
+                    *current = new_alap;
+                    tightened_count += 1;
+                }
+            }
+        }
+        if verbose && tightened_count > 0 {
+            eprintln!(
+                "  Greedy-based ALAP tightening: {} ops tightened (slack={})",
+                tightened_count, slack
+            );
+        }
+        tighter_alap
+    } else {
+        alap
+    };
 
     // 1b. Tighten ASAP/ALAP bounds if enabled. Ordering for symmetry is decided later from final bounds.
     let mut current_asap = asap.clone();
@@ -964,18 +1007,9 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 7. Create regular intervals for non-shiftable, non-ConstChoice, non-SelectChoice ops
+    // 7. Sets for distinguishing choice/shift ops from regular ops
     let const_choice_set: HashSet<usize> = const_choice_ops.iter().copied().collect();
     let select_choice_set: HashSet<usize> = select_choice_ops.iter().copied().collect();
-    let mut regular_intervals: Vec<IntervalVar> = Vec::new();
-    for (idx, _) in ops.iter().enumerate() {
-        if !shiftable_set.contains(&idx)
-            && !const_choice_set.contains(&idx)
-            && !select_choice_set.contains(&idx)
-        {
-            regular_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
-        }
-    }
 
     // 8. Build cumulative constraints with optional intervals
 
@@ -2719,9 +2753,84 @@ pub fn schedule_ssa_cpsat(
     params.cp_model_presolve = Some(true);
     params.cp_model_probing_level = Some(2);
     params.randomize_search = Some(true);
+    // interleave_search: interleaves LNS neighborhoods and core search deterministically.
+    // For scheduling-heavy models, this improves convergence by giving LNS (which finds
+    // most improvements) more regular opportunities to fire.
+    params.interleave_search = Some(true);
 
     if stop_after_first_solution {
         params.stop_after_first_solution = Some(true);
+    }
+
+    // 13b. Decision strategy: branch on structural choices first, then bottleneck engines.
+    // This decomposes search into "pick a configuration, then schedule within it."
+    // Decision strategies are advisory — CP-SAT can override them, so this cannot make things worse.
+    {
+        use cp_sat::proto::DecisionStrategyProto;
+        use cp_sat::proto::decision_strategy_proto::{
+            VariableSelectionStrategy, DomainReductionStrategy,
+        };
+
+        // Phase 1: Structural decisions (shift? FMA? Load?) — branch on these first
+        let mut choice_var_indices: Vec<i32> = Vec::new();
+        for (_, &bv) in &shift_vars {
+            choice_var_indices.push(bv.index());
+        }
+        for (_, &bv) in &const_choice_vars {
+            choice_var_indices.push(bv.index());
+        }
+        for (_, &bv) in &select_choice_vars {
+            choice_var_indices.push(bv.index());
+        }
+        if !choice_var_indices.is_empty() {
+            model.proto_mut().search_strategy.push(DecisionStrategyProto {
+                variables: choice_var_indices.clone(),
+                exprs: vec![],
+                variable_selection_strategy: VariableSelectionStrategy::ChooseFirst as i32,
+                domain_reduction_strategy: DomainReductionStrategy::SelectMinValue as i32,
+            });
+        }
+
+        // Phase 2: Bottleneck engine scheduling (VALU and Flow — tightest capacity)
+        let mut bottleneck_var_indices: Vec<i32> = Vec::new();
+        for (idx, op) in ops.iter().enumerate() {
+            if op.engine == Engine::Valu || op.engine == Engine::Flow {
+                bottleneck_var_indices.push(cycle_vars[idx].index());
+            }
+        }
+        if !bottleneck_var_indices.is_empty() {
+            model.proto_mut().search_strategy.push(DecisionStrategyProto {
+                variables: bottleneck_var_indices,
+                exprs: vec![],
+                variable_selection_strategy: VariableSelectionStrategy::ChooseLowestMin as i32,
+                domain_reduction_strategy: DomainReductionStrategy::SelectMinValue as i32,
+            });
+        }
+
+        // Phase 3: Remaining engines (ALU, Load, Store — more capacity headroom)
+        let mut remaining_var_indices: Vec<i32> = Vec::new();
+        for (idx, op) in ops.iter().enumerate() {
+            if op.engine != Engine::Valu && op.engine != Engine::Flow {
+                remaining_var_indices.push(cycle_vars[idx].index());
+            }
+        }
+        if !remaining_var_indices.is_empty() {
+            model.proto_mut().search_strategy.push(DecisionStrategyProto {
+                variables: remaining_var_indices,
+                exprs: vec![],
+                variable_selection_strategy: VariableSelectionStrategy::ChooseLowestMin as i32,
+                domain_reduction_strategy: DomainReductionStrategy::SelectMinValue as i32,
+            });
+        }
+
+        if verbose {
+            let n_strategies = model.proto().search_strategy.len();
+            let n_choice = choice_var_indices.len();
+            eprintln!(
+                "  Decision strategy: {} phases ({} choice vars first, then VALU/Flow, then rest)",
+                n_strategies, n_choice
+            );
+        }
     }
 
     // 14. Solve

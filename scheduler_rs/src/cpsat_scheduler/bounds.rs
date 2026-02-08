@@ -306,7 +306,7 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
-            enable_asap_alap_tightening: false, // Default: disabled for ablation studies
+            enable_asap_alap_tightening: false, // Disabled by default: can create empty domains on toy configs. Enable via CLI for production.
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
         }

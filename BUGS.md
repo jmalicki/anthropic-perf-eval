@@ -10,6 +10,8 @@
 
 - [x] **CP-SAT loose makespan** – Makespan domain was forced to `[capacity_lower_bound, horizon]` with `capacity_lower_bound` inflated by `critical_path_len` (max ASAP + 1). That overestimates because the model uses variable-length steps (completion_cycle for shifted, +2 for SelectChoice FMA). Solver found 609 with 416 empty cycles; compaction reduced to 192. **Fix:** Pass 0 for the dependency floor when calling `compute_capacity_lower_bound_global` in the SSA path so `capacity_lower_bound` is the actual capacity-derived lower bound (min over x,y,z only). Precedence constraints in the model enforce any dependency lower bound. `scheduler_rs/src/cpsat_scheduler.rs`.
 
+- [x] **Force-schedule VALU slot overflow (7 > 6)** – In the greedy scheduler's emergency force-schedule path (`ssa_greedy/mod.rs:836-845`), when VALU was full (6 ops) and the op was shiftable, `fits_slots` passed (shift possible), but `strategy.allow_shift()` returned false (pressure policy blocked shift). The `else` branch blindly did `valu_used += 1`, exceeding the 6-slot limit. This caused the CP-SAT per-section hint verification to panic: `"Merged hint violates engine capacity (VALU: 1 cycles)"`. Triggered in 4-round depth-3 section 3 where high liveness pressure activated the AdaptivePolicy's shift suppression during force-scheduling. **Fix:** Added intermediate guards — if VALU is full and strategy blocks the shift but ALU has room, force the shift anyway (force-schedule already ignores budget). Regression test: `test_force_schedule_never_exceeds_valu_capacity`.
+
 ## Fixed (historical)
 
 - [x] **Greedy / merged hint violates engine capacity (VALU, ALU)** – Fix: rebase all sections in `tick_tock_ssa/` so merged hint is strict concatenation. See below for details.

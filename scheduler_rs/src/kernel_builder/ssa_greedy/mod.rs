@@ -37,6 +37,90 @@ use crate::types::{EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, Ssa
 use self::pressure_policy::{GreedyPolicy, PressurePolicy};
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 
+// ============================================================================
+// SlotTracker: single source of truth for per-cycle engine slot accounting
+// ============================================================================
+
+/// Result of attempting to place an op on an engine slot this cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotResult {
+    /// Op placed on its natural engine (VALU as VALU, ALU as ALU, etc.)
+    Placed,
+    /// VALU op shifted to ALU (occupies VLEN=8 ALU slots)
+    Shifted,
+    /// No room on this cycle — caller should defer or skip
+    NoRoom,
+}
+
+/// Tracks per-cycle engine slot usage. Enforces capacity invariants in one place
+/// so all scheduling paths (normal, force-schedule, simple) share the same logic.
+///
+/// Capacity limits: ALU=12, VALU=6, Load=2, Store=2, Flow=1.
+#[derive(Debug, Default)]
+struct SlotTracker {
+    load_used: usize,
+    store_used: usize,
+    alu_used: usize,
+    valu_used: usize,
+    flow_used: usize,
+}
+
+impl SlotTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check whether an op with the given engine could fit (read-only, no mutation).
+    fn fits(&self, engine: Engine, can_shift: bool) -> bool {
+        match engine {
+            Engine::Load => self.load_used < 2,
+            Engine::Store => self.store_used < 2,
+            Engine::Alu => self.alu_used < 12,
+            Engine::Valu => self.valu_used < 6 || (can_shift && self.alu_used + VLEN <= 12),
+            Engine::Flow => self.flow_used < 1,
+            _ => true,
+        }
+    }
+
+    /// Atomically try to place an op. Updates counters on success, returns
+    /// `NoRoom` without side effects on failure.
+    ///
+    /// `allow_shift`: whether the caller permits VALU→ALU shifting (strategy
+    /// may block it). When `false` and VALU is full, returns `NoRoom` even if
+    /// ALU has room — the caller can retry with `allow_shift=true` to force it.
+    fn try_place(&mut self, engine: Engine, can_shift: bool, allow_shift: bool) -> SlotResult {
+        match engine {
+            Engine::Load if self.load_used < 2 => {
+                self.load_used += 1;
+                SlotResult::Placed
+            }
+            Engine::Store if self.store_used < 2 => {
+                self.store_used += 1;
+                SlotResult::Placed
+            }
+            Engine::Alu if self.alu_used < 12 => {
+                self.alu_used += 1;
+                SlotResult::Placed
+            }
+            Engine::Valu if self.valu_used < 6 => {
+                self.valu_used += 1;
+                SlotResult::Placed
+            }
+            Engine::Valu if can_shift && allow_shift && self.alu_used + VLEN <= 12 => {
+                self.alu_used += VLEN;
+                SlotResult::Shifted
+            }
+            Engine::Flow if self.flow_used < 1 => {
+                self.flow_used += 1;
+                SlotResult::Placed
+            }
+            // Barrier and other non-slot engines always fit (no slot consumed)
+            Engine::Barrier => SlotResult::Placed,
+            _ => SlotResult::NoRoom,
+        }
+    }
+}
+
 /// Dump usage breakdown for currently live VRegs when budget is exceeded.
 ///
 /// This helps diagnose which rounds/var_types are consuming the most scratch
@@ -421,11 +505,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
             }
         }
 
-        let mut load_used = 0;
-        let mut store_used = 0;
-        let mut alu_used = 0;
-        let mut valu_used = 0;
-        let mut flow_used = 0;
+        let mut slots = SlotTracker::new();
 
         // Collect ready ops from heap
         // Ops in the heap may need to be deferred if their deps aren't truly ready
@@ -583,7 +663,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // ConstChoice: use add_imm (Flow) only if there is a free Flow slot and no
                 // other schedulable Flow op (vselect, jump, etc.); otherwise use Load.
                 let engine = if ops[idx].opcode == Opcode::ConstChoice {
-                    if flow_used < 1 && flow_other_ready == 0 {
+                    if slots.flow_used < 1 && flow_other_ready == 0 {
                         Engine::Flow
                     } else {
                         Engine::Load
@@ -600,16 +680,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     && can_ssa_valu_shift_to_alu(&ops[idx]);
 
                 // Check slot availability
-                let fits_slots = match engine {
-                    Engine::Load => load_used < 2,
-                    Engine::Store => store_used < 2,
-                    Engine::Alu => alu_used < 12,
-                    Engine::Valu => valu_used < 6 || (can_shift && alu_used + VLEN <= 12),
-                    Engine::Flow => flow_used < 1,
-                    _ => true,
-                };
-
-                if !fits_slots {
+                if !slots.fits(engine, can_shift) {
                     // Reinsert to heap for next cycle
                     let next_priority = asap_alap
                         .as_ref()
@@ -652,48 +723,31 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     continue;
                 }
 
-                // Schedule the op
-                //
-                // Design choice: we do NOT prefer VALU→ALU shifting in greedy. We only shift when
-                // VALU is full (valu_used >= 6). Shift decisions are left to CP-SAT, which can
-                // optimize them globally; greedy just provides cycle hints and shifts only when
-                // necessary to make progress.
-                //
-                // Strategy can suppress shifting via allow_shift() when pressure is high.
-                match engine {
-                    Engine::Load => load_used += 1,
-                    Engine::Store => store_used += 1,
-                    Engine::Alu => alu_used += 1,
-                    Engine::Valu => {
-                        if can_shift
-                            && valu_used >= 6
-                            && strategy.allow_shift(live_words, alu_used, scratch_budget)
-                        {
-                            alu_used += VLEN;
-                            shifted_ops.insert(op_id);
-                        } else if valu_used < 6 {
-                            valu_used += 1;
-                        } else {
-                            // VALU full, shift suppressed by strategy — defer to next cycle
-                            let next_priority = asap_alap
-                                .as_ref()
-                                .and_then(|(a, _)| a.get(&op_id).copied())
-                                .map(|lb| ((cycle + 1) as i32).max(lb))
-                                .unwrap_or_else(|| (cycle + 1) as i32);
-                            ready_heap.push(Reverse((next_priority, idx)));
-                            continue;
-                        }
-                    }
-                    Engine::Flow => {
-                        flow_used += 1;
+                // Schedule the op via SlotTracker.
+                // Strategy can suppress shifting; if suppressed and VALU full, defer.
+                let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
+                match slots.try_place(engine, can_shift, allow_shift) {
+                    SlotResult::Placed => {
                         // Record ConstChoice scheduled as add_imm for lowering
-                        if ops[idx].opcode == Opcode::ConstChoice {
+                        if engine == Engine::Flow && ops[idx].opcode == Opcode::ConstChoice {
                             if let Some(ref mut set) = const_add_imm_ops {
                                 set.insert(op_id);
                             }
                         }
                     }
-                    _ => {}
+                    SlotResult::Shifted => {
+                        shifted_ops.insert(op_id);
+                    }
+                    SlotResult::NoRoom => {
+                        // VALU full, shift suppressed by strategy — defer to next cycle
+                        let next_priority = asap_alap
+                            .as_ref()
+                            .and_then(|(a, _)| a.get(&op_id).copied())
+                            .map(|lb| ((cycle + 1) as i32).max(lb))
+                            .unwrap_or_else(|| (cycle + 1) as i32);
+                        ready_heap.push(Reverse((next_priority, idx)));
+                        continue;
+                    }
                 }
 
                 let assigned_cycle = if let Some((asap, alap)) = asap_alap {
@@ -798,16 +852,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 && engine == Engine::Valu
                 && can_ssa_valu_shift_to_alu(&ops[force_idx]);
 
-            let fits_slots = match engine {
-                Engine::Load => load_used < 2,
-                Engine::Store => store_used < 2,
-                Engine::Alu => alu_used < 12,
-                Engine::Valu => valu_used < 6 || (can_shift && alu_used + VLEN <= 12),
-                Engine::Flow => flow_used < 1,
-                _ => true,
-            };
-
-            if fits_slots {
+            if slots.fits(engine, can_shift) {
                 // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
                 // This is intentional behavior - DO NOT REMOVE unless explicitly instructed.
                 // The force-schedule allows progress when retry loops fail to free enough
@@ -825,27 +870,20 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     last_budget_dump_cycle = Some(cycle);
                 }
                 budget_exceeded = true;
+                // Try with strategy first; if NoRoom (strategy blocked shift), force
+                // with allow_shift=true to maintain slot capacity invariants.
+                let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
                 #[allow(unused_assignments)]
-                // Same design as normal path: shift only when VALU full, not by preference.
-                // Force-schedule still respects strategy's allow_shift to avoid
-                // displacement cascade that further inflates liveness.
-                match engine {
-                    Engine::Load => load_used += 1,
-                    Engine::Store => store_used += 1,
-                    Engine::Alu => alu_used += 1,
-                    Engine::Valu => {
-                        if can_shift
-                            && valu_used >= 6
-                            && strategy.allow_shift(live_words, alu_used, scratch_budget)
-                        {
-                            alu_used += VLEN;
-                            shifted_ops.insert(op_id);
-                        } else {
-                            valu_used += 1;
+                match slots.try_place(engine, can_shift, allow_shift) {
+                    SlotResult::Placed => {}
+                    SlotResult::Shifted => { shifted_ops.insert(op_id); }
+                    SlotResult::NoRoom => {
+                        // Strategy blocked shift but VALU is full — force the shift.
+                        match slots.try_place(engine, can_shift, true) {
+                            SlotResult::Shifted => { shifted_ops.insert(op_id); }
+                            _ => {} // Truly no room — shouldn't happen since fits() passed
                         }
                     }
-                    Engine::Flow => flow_used += 1,
-                    _ => {}
                 }
 
                 let force_cycle = if let Some((asap, alap)) = asap_alap {
@@ -1078,11 +1116,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_impl(
 
     while scheduled.len() < ops.len() && cycle < max_cycles {
         // Slot usage this cycle
-        let mut load_used = 0;
-        let mut store_used = 0;
-        let mut alu_used = 0;
-        let mut valu_used = 0;
-        let mut flow_used = 0;
+        let mut slots = SlotTracker::new();
 
         // Find ready ops (all deps scheduled at earlier cycles)
         let ready: Vec<usize> = ops
@@ -1112,56 +1146,13 @@ pub(super) fn schedule_ssa_greedy_with_shift_impl(
             let can_shift =
                 enable_valu_shift && engine == Engine::Valu && can_ssa_valu_shift_to_alu(op);
 
-            let fits = match engine {
-                Engine::Load => {
-                    if load_used < 2 {
-                        load_used += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Engine::Store => {
-                    if store_used < 2 {
-                        store_used += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Engine::Alu => {
-                    if alu_used < 12 {
-                        alu_used += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Engine::Valu => {
-                    if valu_used < 6 {
-                        valu_used += 1;
-                        true
-                    } else if can_shift && alu_used + VLEN <= 12 {
-                        // Design choice: shift only when VALU full; we do not prefer shifting in greedy (CP-SAT decides).
-                        alu_used += VLEN;
-                        shifted_ops.insert(op.id);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Engine::Flow => {
-                    if flow_used < 1 {
-                        flow_used += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => true,
-            };
+            // No strategy in this simple path — always allow shifting.
+            let result = slots.try_place(engine, can_shift, true);
+            if result == SlotResult::Shifted {
+                shifted_ops.insert(op.id);
+            }
 
-            if fits {
+            if result != SlotResult::NoRoom {
                 ops[idx].cycle = cycle as i32;
                 scheduled.insert(idx);
             }

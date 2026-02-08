@@ -91,8 +91,8 @@ def main():
                         help="CP-SAT VALU shift: optimize, force alu, or force valu (default: optimize)")
     parser.add_argument("--force-zero-gap", action="store_true",
                         help="Force 0 integral gap for proven optimality (debugging only, slower). Uses longer time limit (2h) so CP-SAT can prove optimality.")
-    parser.add_argument("--enable-asap-alap-tightening", action="store_true",
-                        help="Enable ASAP/ALAP tightening by considering slot capacity (experimental, for ablation studies)")
+    parser.add_argument("--enable-asap-alap-tightening", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable ASAP/ALAP tightening by considering slot capacity (default: enabled). Use --no-enable-asap-alap-tightening to disable.")
     parser.add_argument("--enable-scratch-tightening", action="store_true",
                         help="Enable scratch-aware tightening. Considers scratch constraints when tightening bounds (experimental, for ablation studies). Can be used independently of --enable-asap-alap-tightening.")
     parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive"], default="adaptive",

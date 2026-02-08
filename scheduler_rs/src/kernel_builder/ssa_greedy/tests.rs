@@ -2397,3 +2397,228 @@ fn test_adaptive_no_cascading_deferral() {
         _peak_live
     );
 }
+
+/// Regression test: force-schedule path must never exceed VALU capacity (6 ops/cycle).
+///
+/// Before the fix, when a shiftable VALU op entered the force-schedule path with
+/// VALU full (6 ops), if `strategy.allow_shift()` returned false, the code fell
+/// through to `valu_used += 1`, creating a 7-VALU-per-cycle violation. This caused
+/// panics in the CP-SAT hint verification ("VALU overflow at cycle N: 7 > 6").
+///
+/// The fix adds an intermediate branch: if VALU is full and strategy blocks the shift
+/// but ALU has room, force the shift anyway (since we're already in the emergency
+/// force-schedule path that ignores budget constraints).
+#[test]
+fn test_force_schedule_never_exceeds_valu_capacity() {
+    // Create a kernel with many VALU ops and very tight budget to trigger
+    // force-scheduling. After scheduling, verify no cycle has > 6 non-shifted VALU ops.
+    let mut emit = SsaEmitContext::new();
+
+    // Create 8 scalar constants (Load slots, 1 word each)
+    let mut scalars = vec![];
+    for i in 0..8 {
+        scalars.push(emit.emit_const(i as i64));
+    }
+
+    // Create 8 vbroadcasts (each 8 words) — non-shiftable VALU ops
+    let mut vecs = vec![];
+    for &s in &scalars {
+        vecs.push(emit.emit_vbroadcast(s));
+    }
+
+    // Create 12 shiftable VALU ops (Add), each consuming 2 vectors.
+    // With tight budget, some will be force-scheduled.
+    let mut results = vec![];
+    for i in 0..12 {
+        let a = vecs[i % 8];
+        let b = vecs[(i + 1) % 8];
+        results.push(emit.emit_valu(Opcode::Add, a, b));
+    }
+
+    // Create sinks (stores) to consume results
+    let addr = emit.emit_const(200);
+    for &r in &results {
+        emit.emit_vstore(addr, r);
+    }
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+
+    // Use AdaptivePolicy (production default) with a tight budget.
+    // The tight budget forces the force-schedule path, and AdaptivePolicy
+    // blocks shifting when live pressure is above critical threshold.
+    let budget = 80; // Very tight: 8 vbroadcasts * 8 words = 64 baseline
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        true, // enable_valu_shift
+        &mut shifted_ops,
+        budget,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AdaptivePolicy::default(),
+    );
+
+    assert!(result.is_ok(), "Scheduler should complete: {:?}", result.err());
+
+    // Verify the VALU <= 6 invariant on every cycle
+    let max_cycle = emit.ops.iter().map(|op| op.cycle).max().unwrap_or(0);
+    for cycle in 0..=max_cycle {
+        let valu_at_cycle: usize = emit.ops.iter()
+            .filter(|op| op.cycle == cycle
+                && op.engine == Engine::Valu
+                && !shifted_ops.contains(&op.id))
+            .count();
+        assert!(
+            valu_at_cycle <= 6,
+            "VALU overflow at cycle {}: {} > 6 (regression: force-schedule must shift \
+             when strategy blocks but VALU is full)",
+            cycle, valu_at_cycle
+        );
+    }
+}
+
+// =========================================================================
+// SlotTracker unit tests — shared slot-capacity invariants
+//
+// These tests verify the SlotTracker abstraction in isolation, ensuring that:
+// - Each engine respects its capacity limit
+// - fits() and try_place() are consistent (fits=true implies try_place succeeds)
+// - VALU→ALU shifting consumes exactly VLEN ALU slots
+// - allow_shift=false prevents shifting even when ALU has room
+// - Non-slot engines (Barrier, Debug, etc.) are always placeable
+// =========================================================================
+
+#[test]
+fn test_slot_tracker_alu_capacity() {
+    let mut slots = SlotTracker::new();
+    // Fill all 12 ALU slots
+    for i in 0..12 {
+        assert!(slots.fits(Engine::Alu, false), "ALU should fit at count {}", i);
+        assert_eq!(slots.try_place(Engine::Alu, false, false), SlotResult::Placed);
+    }
+    // 13th should fail
+    assert!(!slots.fits(Engine::Alu, false));
+    assert_eq!(slots.try_place(Engine::Alu, false, false), SlotResult::NoRoom);
+}
+
+#[test]
+fn test_slot_tracker_valu_capacity() {
+    let mut slots = SlotTracker::new();
+    // Fill all 6 VALU slots
+    for i in 0..6 {
+        assert!(slots.fits(Engine::Valu, false), "VALU should fit at count {}", i);
+        assert_eq!(slots.try_place(Engine::Valu, false, false), SlotResult::Placed);
+    }
+    // 7th should fail (not shiftable)
+    assert!(!slots.fits(Engine::Valu, false));
+    assert_eq!(slots.try_place(Engine::Valu, false, false), SlotResult::NoRoom);
+}
+
+#[test]
+fn test_slot_tracker_valu_shift_to_alu() {
+    let mut slots = SlotTracker::new();
+    // Fill VALU
+    for _ in 0..6 {
+        slots.try_place(Engine::Valu, false, false);
+    }
+    // VALU full, but shiftable op can go to ALU
+    assert!(slots.fits(Engine::Valu, true)); // can_shift=true
+    let result = slots.try_place(Engine::Valu, true, true);
+    assert_eq!(result, SlotResult::Shifted);
+    // Shifting consumed VLEN=8 ALU slots
+    assert_eq!(slots.alu_used, VLEN);
+}
+
+#[test]
+fn test_slot_tracker_shift_blocked_by_allow_shift_false() {
+    let mut slots = SlotTracker::new();
+    // Fill VALU
+    for _ in 0..6 {
+        slots.try_place(Engine::Valu, false, false);
+    }
+    // can_shift=true but allow_shift=false (strategy blocks) → NoRoom
+    assert_eq!(slots.try_place(Engine::Valu, true, false), SlotResult::NoRoom);
+    // ALU unchanged
+    assert_eq!(slots.alu_used, 0);
+}
+
+#[test]
+fn test_slot_tracker_shift_blocked_by_alu_full() {
+    let mut slots = SlotTracker::new();
+    // Fill VALU
+    for _ in 0..6 {
+        slots.try_place(Engine::Valu, false, false);
+    }
+    // Fill ALU to 5 — only 7 remaining < VLEN=8, so shift won't fit
+    for _ in 0..5 {
+        slots.try_place(Engine::Alu, false, false);
+    }
+    assert!(!slots.fits(Engine::Valu, true)); // no room even with shift
+    assert_eq!(slots.try_place(Engine::Valu, true, true), SlotResult::NoRoom);
+}
+
+#[test]
+fn test_slot_tracker_load_store_flow_capacity() {
+    let mut slots = SlotTracker::new();
+    // Load: 2 slots
+    assert_eq!(slots.try_place(Engine::Load, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Load, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Load, false, false), SlotResult::NoRoom);
+
+    // Store: 2 slots
+    assert_eq!(slots.try_place(Engine::Store, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Store, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Store, false, false), SlotResult::NoRoom);
+
+    // Flow: 1 slot
+    assert_eq!(slots.try_place(Engine::Flow, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Flow, false, false), SlotResult::NoRoom);
+}
+
+#[test]
+fn test_slot_tracker_barrier_always_fits() {
+    let mut slots = SlotTracker::new();
+    // Barrier ops don't consume any engine slot
+    assert!(slots.fits(Engine::Barrier, false));
+    assert_eq!(slots.try_place(Engine::Barrier, false, false), SlotResult::Placed);
+    // Multiple barriers in same cycle
+    assert_eq!(slots.try_place(Engine::Barrier, false, false), SlotResult::Placed);
+    assert_eq!(slots.try_place(Engine::Barrier, false, false), SlotResult::Placed);
+}
+
+#[test]
+fn test_slot_tracker_fits_and_try_place_consistent() {
+    // For every engine, fits()==true must imply try_place() succeeds
+    let engines = [
+        (Engine::Load, false),
+        (Engine::Store, false),
+        (Engine::Alu, false),
+        (Engine::Valu, false),
+        (Engine::Valu, true), // with can_shift
+        (Engine::Flow, false),
+        (Engine::Barrier, false),
+    ];
+    for &(engine, can_shift) in &engines {
+        let mut slots = SlotTracker::new();
+        // Keep placing until fits() says no
+        let mut placed = 0;
+        while slots.fits(engine, can_shift) {
+            let result = slots.try_place(engine, can_shift, true);
+            assert_ne!(
+                result,
+                SlotResult::NoRoom,
+                "fits() returned true but try_place() returned NoRoom for {:?} (can_shift={})",
+                engine, can_shift,
+            );
+            placed += 1;
+            // Safety: avoid infinite loop for Barrier (always fits)
+            if placed > 20 {
+                break;
+            }
+        }
+    }
+}

@@ -54,7 +54,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cp_sat"
 version = "0.3.3"
-source = "git+https://github.com/jmalicki/cp_sat.git?branch=main#1bde90374437760d1f73496227ec192e0a80a92f"
+source = "git+https://github.com/jmalicki/cp_sat.git?branch=main#165da6f2626c7baa7c1ee054cf6e892328877796"
 dependencies = [
  "bytes",
  "cc",
