@@ -18,8 +18,8 @@ use super::tick_tock_ssa::{
 impl SsaTickTockKernelBuilder {
     /// Internal build logic.
     pub(super) fn build_internal(&mut self) {
-        let n_groups = self.config.n_groups();
-        let n_iters = self.config.n_iters();
+        let n_groups = self.config.spec.n_groups();
+        let n_iters = self.config.spec.n_iters();
 
         // Emit initialization (phase already set to Init by default)
         self.emit.set_phase(EmissionPhase::Init);
@@ -34,10 +34,10 @@ impl SsaTickTockKernelBuilder {
         self.emit_load_data(n_groups);
 
         // Main loop
-        let tree_height = self.config.tree_height();
+        let tree_height = self.config.spec.tree_height();
         let mut tree_depth = 0;
-        for rnd in 0..self.config.rounds {
-            let is_last_round = rnd == self.config.rounds - 1;
+        for rnd in 0..self.config.spec.rounds {
+            let is_last_round = rnd == self.config.spec.rounds - 1;
             self.emit.set_round_context(rnd, tree_depth);
             self.emit_round(rnd, tree_depth, n_groups, n_iters, is_last_round);
 
@@ -133,7 +133,7 @@ impl SsaTickTockKernelBuilder {
         // Note: partition_idx_offset not needed in SSA version (offset is 0, implicit)
         self.emit.set_next_var_type(VarType::Constant);
         self.ctx.partition_val_offset =
-            Some(self.emit.emit_const_choice(self.config.batch_size as i64));
+            Some(self.emit.emit_const_choice(self.config.spec.batch_size as i64));
 
         // Load hash constants and create broadcasts.
         // Only emit constants/broadcasts that are actually used:
@@ -907,7 +907,7 @@ impl SsaTickTockKernelBuilder {
         tree_depth: usize,
         is_last_round: bool,
     ) {
-        let is_wrap_round = tree_depth == self.config.forest_height;
+        let is_wrap_round = tree_depth == self.config.spec.forest_height;
         let v_1 = self.ctx.v_1.unwrap();
         let v_2 = self.ctx.v_2.unwrap();
         let zero = self.zero_vreg.unwrap();
@@ -957,7 +957,7 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Partition stores (tick-tock) - only if enabled
-        if self.config.enable_partition_stores {
+        if self.config.spec.enable_partition_stores {
             if TICK_STORE_DEPTHS.contains(&tree_depth) {
                 if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
                     eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);

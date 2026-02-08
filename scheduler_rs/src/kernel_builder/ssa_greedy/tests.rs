@@ -32,11 +32,9 @@ fn test_greedy_fallback_sets_budget_exceeded() {
 
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
     let mut shifted_ops = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -119,11 +117,9 @@ fn test_barrier_with_dead_store_in_section() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false, // no VALU shift
         &mut shifted_ops,
@@ -197,11 +193,9 @@ fn test_multiple_dead_stores_before_barrier() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -288,11 +282,9 @@ fn test_barrier_chain_with_dead_stores() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -350,11 +342,9 @@ fn test_dead_store_in_dependency_chain() {
 
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -406,11 +396,9 @@ fn test_dead_store_detection_is_transitive() {
 
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -464,11 +452,9 @@ fn test_immediate_dead_store() {
     // Verify all 3 ops were created
     assert_eq!(emit.ops.len(), 3, "Should have 3 ops");
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -566,11 +552,9 @@ fn test_store_source_vregs_not_dead() {
     );
 
     // Schedule and verify FMA is NOT a dead store
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -657,11 +641,9 @@ fn test_store_address_vreg_liveness() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -759,11 +741,9 @@ fn test_dce_cannot_eliminate_op_with_user() {
     );
 
     // Now schedule and verify none of these are marked as dead
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -841,11 +821,9 @@ fn test_transitive_users_prevent_elimination() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -917,11 +895,9 @@ fn test_store_sources_count_as_users() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -989,11 +965,9 @@ fn test_dce_detects_genuinely_dead_store() {
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1065,11 +1039,9 @@ fn test_dead_store_detection_counts_store_users() {
     );
 
     // Schedule and verify v1 is scheduled
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1106,13 +1078,8 @@ fn test_greedy_constchoice_treated_as_load() {
     // Use the constant in an ALU op
     let _result = emit.emit_alu(Opcode::Add, c1, zero);
 
-    let mut builder = SsaTickTockKernelBuilder::new(super::super::config::KernelConfig::new(
-        10, 2047, 256, 16,
-    ));
-    builder.zero_vreg = Some(zero);
-
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1239,11 +1206,9 @@ fn test_context_variable_multiplyadd_not_dead() {
     );
 
     // Schedule and verify FMA is NOT a dead store
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1355,11 +1320,9 @@ fn test_context_variable_multiplyadd_across_barrier() {
     );
 
     // Schedule and verify FMA is NOT a dead store
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1485,11 +1448,9 @@ fn test_multi_round_conditional_stores_hypothesis1() {
         idx_round1_users);
 
     // Schedule and verify Round 1 FMA is NOT a dead store
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1556,11 +1517,9 @@ fn test_last_round_edge_case_hypothesis2() {
     compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1642,11 +1601,9 @@ fn test_complex_barrier_pattern_hypothesis3() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1724,11 +1681,9 @@ fn test_vreg_replacement_pattern_hypothesis4() {
     );
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1820,11 +1775,9 @@ fn test_real_kernel_conditional_stores_pattern() {
         idx_new_users);
 
     // Schedule
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_ops = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1898,11 +1851,9 @@ fn test_greedy_selectchoice_uses_precedence_offset() {
 
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
     let mut shifted_ops = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,
@@ -1968,11 +1919,9 @@ fn test_greedy_mixed_predecessors_diamond() {
 
     compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
 
-    let config = crate::kernel_builder::config::KernelConfig::new(10, 2047, 256, 16);
-    let builder = crate::kernel_builder::tick_tock_ssa::SsaTickTockKernelBuilder::new(config);
     let mut shifted_ops = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = schedule_ssa_greedy_with_shift_budget(
         &mut emit.ops,
         false,
         &mut shifted_ops,

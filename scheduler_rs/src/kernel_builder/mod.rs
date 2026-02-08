@@ -12,6 +12,7 @@
 //! - `ssa_emit` - High-level SSA emission (hash, branch, tree selection)
 //! - `ssa_greedy/` - Greedy scheduler (budget-aware, precedence offsets)
 //! - `ssa_lower` - SSA→concrete lowering (address assignment, VALU→ALU expansion)
+//! - `ssa_program` - SsaProgram IR type (emission output / compilation input)
 //! - `tick_tock_ssa/` - SSA-based kernel builder (orchestration, scheduling)
 //! - `round_budget` - Per-section scratch budget analysis
 
@@ -23,11 +24,13 @@ pub mod round_budget;
 pub mod ssa_emit;
 pub mod ssa_greedy;
 pub mod ssa_lower;
+pub mod ssa_program;
 pub mod tick_tock_ssa;
 
 pub use config::KernelConfig;
 pub use context_ssa::SsaScratchContext;
 pub use emit_ssa::SsaEmitContext;
+pub use ssa_program::SsaProgram;
 pub use tick_tock_ssa::{SsaScheduleResult, SsaTickTockKernelBuilder};
 
 // #[cfg(test)]

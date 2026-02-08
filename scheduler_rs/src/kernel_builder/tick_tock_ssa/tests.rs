@@ -22,10 +22,10 @@ fn test_ssa_builder_creates_ops() {
     // Use fewer rounds (4) to test faster and stay within budget
     let config = KernelConfig::new(10, 2047, 256, 4);
     let mut builder = SsaTickTockKernelBuilder::new(config);
-    let ops = builder.build();
+    let program = builder.build();
 
-    assert!(!ops.is_empty(), "Should generate ops");
-    println!("Generated {} SSA ops", ops.len());
+    assert!(!program.ops.is_empty(), "Should generate ops");
+    println!("Generated {} SSA ops", program.ops.len());
 }
 
 #[test]
@@ -149,11 +149,11 @@ fn test_greedy_scratch_budget_delays_ops() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // With budget=16, should succeed (peak is 16)
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops.clone(),
         false,
         &mut shifted,
@@ -168,7 +168,7 @@ fn test_greedy_scratch_budget_delays_ops() {
     // With budget=8, the scheduler will still succeed due to emergency force-scheduling.
     // The scheduler prefers to exceed budget temporarily rather than fail completely.
     let mut shifted2 = HashSet::new();
-    let result2 = builder.schedule_ssa_greedy_with_shift_budget(
+    let result2 = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops.clone(),
         false,
         &mut shifted2,
@@ -319,13 +319,14 @@ fn test_greedy_scratch_budget_generous_allows_parallel() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Schedule with generous budget (1000 words)
-    let (cycles, _, _) = builder
-        .schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000)
-        .expect("Should find feasible schedule");
+    let (cycles, _, _) = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
+        &mut ops, false, &mut shifted, 1000,
+    )
+    .expect("Should find feasible schedule");
 
     // With generous budget and 6 VALU slots, all 6 producers can run at cycle 0
     let producers_at_cycle_0 = ops[0..6].iter().filter(|op| op.cycle == 0).count();
@@ -467,26 +468,24 @@ fn test_greedy_scratch_budget_tight_increases_makespan() {
     let mut ops_tight = make_ops();
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
 
     let mut shifted_generous = HashSet::new();
-    let (cycles_generous, _, _) = builder
-        .schedule_ssa_greedy_with_shift_budget(
-            &mut ops_generous,
-            false,
-            &mut shifted_generous,
-            1000,
-        )
-        .expect("Should find feasible schedule with generous budget");
+    let (cycles_generous, _, _) = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
+        &mut ops_generous,
+        false,
+        &mut shifted_generous,
+        1000,
+    )
+    .expect("Should find feasible schedule with generous budget");
 
     let mut shifted_tight = HashSet::new();
-    let (cycles_tight, _, _) = builder
-        .schedule_ssa_greedy_with_shift_budget(
-            &mut ops_tight,
-            false,
-            &mut shifted_tight,
-            24, // Only 3 vectors
-        )
+    let (cycles_tight, _, _) = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
+        &mut ops_tight,
+        false,
+        &mut shifted_tight,
+        24, // Only 3 vectors
+    )
         .expect("Should find feasible schedule with tight budget");
 
     // Both should schedule successfully. The tight budget may or may not take longer
@@ -565,11 +564,11 @@ fn test_greedy_liveness_matches_verification() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
 
     // With budget=16, should succeed (peak is 16 at cycle 1)
     let mut shifted = HashSet::new();
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops.clone(),
         false,
         &mut shifted,
@@ -580,7 +579,7 @@ fn test_greedy_liveness_matches_verification() {
     // With budget=8, the scheduler will still succeed due to emergency force-scheduling.
     // The scheduler prefers to exceed budget temporarily rather than fail completely.
     let mut shifted2 = HashSet::new();
-    let result2 = builder.schedule_ssa_greedy_with_shift_budget(
+    let result2 = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops.clone(),
         false,
         &mut shifted2,
@@ -658,7 +657,7 @@ fn test_greedy_scratch_budget_vreg_death() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // With budget=24 (3 vectors) and same-cycle reuse:
@@ -668,9 +667,10 @@ fn test_greedy_scratch_budget_vreg_death() {
     // - Cycle 2: op4 -> v2, v3 die, v4 born
     //
     // Without same-cycle reuse, op3 would be delayed to cycle 2.
-    let (cycles, _, _) = builder
-        .schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 24)
-        .expect("Should find feasible schedule");
+    let (cycles, _, _) = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
+        &mut ops, false, &mut shifted, 24,
+    )
+    .expect("Should find feasible schedule");
 
     println!("VReg death tracking schedule: {} cycles", cycles);
     for op in &ops {
@@ -1037,11 +1037,11 @@ fn test_greedy_handles_external_deps() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(result.is_ok(), "Should schedule chain: {:?}", result.err());
 
@@ -1104,11 +1104,11 @@ fn test_greedy_long_chain_all_scheduled() {
     ));
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(
         result.is_ok(),
@@ -1212,11 +1212,11 @@ fn test_greedy_diamond_deps_all_scheduled() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(
         result.is_ok(),
@@ -1297,11 +1297,11 @@ fn test_greedy_parallel_chains_all_scheduled() {
     }
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(
         result.is_ok(),
@@ -1355,11 +1355,11 @@ fn test_greedy_slot_overflow_all_scheduled() {
     }
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(
         result.is_ok(),
@@ -1463,11 +1463,11 @@ fn test_greedy_budget_overflow_all_scheduled() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Use a moderate budget that requires careful scheduling
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -1548,10 +1548,10 @@ fn test_greedy_large_scale_all_scheduled() {
     );
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -1637,11 +1637,11 @@ fn test_greedy_cross_chain_deps_all_scheduled() {
     assert_eq!(ops.len(), 51, "Should have 51 ops (50 chain ops + 1 sink)");
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 1000);
 
     assert!(
         result.is_ok(),
@@ -1702,7 +1702,7 @@ fn test_greedy_real_kernel_small() {
 
     let mut shifted = HashSet::new();
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
 
     assert!(
         result.is_ok(),
@@ -1748,7 +1748,7 @@ fn test_greedy_real_kernel_medium() {
 
     compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg);
 
-    if builder.config.enable_ssa_dce {
+    if builder.config.compiler.enable_ssa_dce {
         let (new_ops, new_vreg_def, _new_const_alternatives) = eliminate_ssa_dead_code(
             ops,
             &mut vreg_def,
@@ -1764,7 +1764,7 @@ fn test_greedy_real_kernel_medium() {
 
     let mut shifted = HashSet::new();
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
 
     assert!(
         result.is_ok(),
@@ -1834,7 +1834,7 @@ fn test_greedy_real_kernel_full_scale() {
 
     let mut shifted = HashSet::new();
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 1536);
 
     assert!(
         result.is_ok(),
@@ -1959,11 +1959,11 @@ fn test_luc_tiebreaker_prefers_high_luc() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 100);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 100);
     assert!(
         result.is_ok(),
         "Should schedule successfully: {:?}",
@@ -2072,13 +2072,13 @@ fn test_luc_deferred_ops_prioritizes_freeing() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // With budget = 32, ops 0,1,2 take 24 words. Op3 or op4 can fit (adds 8, frees some).
     // LUC should help choose the better one.
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 32);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 32);
     assert!(
         result.is_ok(),
         "Should schedule with budget=32: {:?}",
@@ -2150,13 +2150,13 @@ fn test_luc_emergency_fallback_breaks_deadlock() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // With same-cycle reuse, op2 should work: projected = 16 + 8 - 16 = 8
     // But if that doesn't work, emergency fallback should kick in.
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
     assert!(
         result.is_ok(),
         "Emergency fallback should break deadlock: {:?}",
@@ -2237,11 +2237,11 @@ fn test_duplicate_operand_luc_calculation() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Schedule with a budget that requires accurate liveness tracking
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2323,11 +2323,11 @@ fn test_duplicate_operand_remaining_users_not_double_decremented() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Schedule with a tight budget that requires accurate liveness
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2424,13 +2424,13 @@ fn test_duplicate_operand_words_freed_not_over_estimated() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Use a budget of exactly 16 words - this should work with correct calculation
     // Peak liveness: v0 + v1 after cycle 0, or v1 + v2 after cycle 1 = 16 words
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 16);
     assert!(
         result.is_ok(),
         "Should schedule with accurate words_freed: {:?}",
@@ -2489,10 +2489,10 @@ fn test_duplicate_operand_scalar() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2559,10 +2559,10 @@ fn test_duplicate_operand_multiply_add() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2644,12 +2644,12 @@ fn test_vreg_width_affects_liveness_words() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Budget of 9 words should be enough (s0=1 + v0=8)
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 9);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 9);
     assert!(
         result.is_ok(),
         "Budget=9 should fit scalar(1)+vector(8): {:?}",
@@ -2699,11 +2699,11 @@ fn test_valu_requires_vector_sources() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 24);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 24);
     assert!(
         result.is_ok(),
         "VALU with vector sources should work: {:?}",
@@ -2764,12 +2764,12 @@ fn test_alu_uses_scalar_vregs() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Budget of 3 words should be enough for 3 scalars
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 3);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 3);
     assert!(
         result.is_ok(),
         "ALU with scalar sources should work: {:?}",
@@ -2842,10 +2842,10 @@ fn test_broadcast_scalar_to_vector_conversion() {
     );
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2920,10 +2920,10 @@ fn test_vload_vstore_vector_width() {
     }
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
-    let result = builder.schedule_ssa_greedy_with_shift_budget(
+    let result = ssa_greedy::schedule_ssa_greedy_with_shift_budget(
         &mut ops,
         false,
         &mut shifted,
@@ -2983,12 +2983,12 @@ fn test_valu_to_alu_shift_preserves_semantics() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Enable VALU shift
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 24);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, true, &mut shifted, 24);
     assert!(
         result.is_ok(),
         "VALU→ALU shift should work: {:?}",
@@ -3215,13 +3215,13 @@ fn test_mixed_width_pipeline() {
     ];
 
     let config = KernelConfig::new(10, 2047, 256, 1);
-    let builder = SsaTickTockKernelBuilder::new(config);
+    let _builder = SsaTickTockKernelBuilder::new(config);
     let mut shifted = HashSet::new();
 
     // Peak: s0(1) + s1(1) + v2(8) + v3(8) + v4(8) = 26 words
     // But scalars die early, so actual peak is less
     let result =
-        builder.schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 26);
+        ssa_greedy::schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted, 26);
     assert!(
         result.is_ok(),
         "Mixed width pipeline should schedule: {:?}",
@@ -3300,8 +3300,8 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
 
     // Run greedy scheduler to get hints
     let mut greedy_shifted = HashSet::new();
-    let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = builder
-        .schedule_ssa_greedy_with_shift(
+    let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) =
+        ssa_greedy::schedule_ssa_greedy_with_shift(
             &mut ssa_ops,
             false, // no VALU shift
             &mut greedy_shifted,

@@ -1040,28 +1040,33 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     }
     use crate::kernel_builder::config::MAX_TREE_REDUCE_DEPTH;
     let tree_reduce_max_depth = tree_reduce_max_depth.clamp(2, MAX_TREE_REDUCE_DEPTH);
+    use crate::kernel_builder::config::{ProblemSpec, CompilerConfig};
     let config = KernelConfig {
-        forest_height,
-        n_nodes,
-        batch_size,
-        rounds,
-        enable_valu_shift,
-        enable_debug: false,
-        enable_lazy_partition: false,
-        partition_frequency: 3,
-        enable_partition_stores: false,
-        enable_pseudo_consts: false,
-        enable_add_imm: true,
-        enable_const_load: true,
-        enable_const_alu: true,
-        max_alu_depth: None,
-        tree_reduce_max_depth,
-        enable_ssa_dce: true, // Remove dead code before scheduling (saves cycles, optimizer time, scratch)
+        spec: ProblemSpec {
+            forest_height,
+            n_nodes,
+            batch_size,
+            rounds,
+            enable_debug: false,
+            enable_lazy_partition: false,
+            partition_frequency: 3,
+            enable_partition_stores: false,
+            enable_pseudo_consts: false,
+            enable_add_imm: true,
+            enable_const_load: true,
+            enable_const_alu: true,
+            max_alu_depth: None,
+            tree_reduce_max_depth,
+        },
+        compiler: CompilerConfig {
+            enable_valu_shift,
+            enable_ssa_dce: true, // Remove dead code before scheduling (saves cycles, optimizer time, scratch)
+        },
     };
 
     let mut builder = SsaTickTockKernelBuilder::new(config);
 
-    if use_cpsat && !builder.config.enable_ssa_dce {
+    if use_cpsat && !builder.config.compiler.enable_ssa_dce {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "CP-SAT requires DCE; enable_ssa_dce must be true when use_cpsat is true.",
         ));

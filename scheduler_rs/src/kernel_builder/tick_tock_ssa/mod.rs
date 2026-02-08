@@ -26,7 +26,9 @@ use super::emit_ssa::{
     compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code,
     SsaEmitContext,
 };
+use super::ssa_greedy;
 use super::ssa_lower::lower_ssa_ops_with_shift;
+use super::ssa_program::SsaProgram;
 
 /// Unroll factor - process 8 groups per iteration
 pub(crate) const UNROLL: usize = 8;
@@ -210,8 +212,8 @@ impl SsaTickTockKernelBuilder {
     pub fn new(config: KernelConfig) -> Self {
         let n_groups = config.n_groups();
         let n_iters = config.n_iters();
-        let tree_height = config.forest_height;
-        let uses_depth3 = (0..config.rounds).any(|r| {
+        let tree_height = config.spec.forest_height;
+        let uses_depth3 = (0..config.spec.rounds).any(|r| {
             let tree_depth = r % tree_height;
             tree_depth == 3
         });
@@ -235,10 +237,21 @@ impl SsaTickTockKernelBuilder {
         }
     }
 
-    /// Build the kernel, returning unscheduled SSA ops.
-    pub fn build(&mut self) -> Vec<SsaOp> {
+    /// Build the kernel, returning an `SsaProgram` with all emission artifacts.
+    pub fn build(&mut self) -> SsaProgram {
         self.build_internal();
-        self.emit.take_ops()
+        SsaProgram {
+            vreg_def: std::mem::take(&mut self.emit.vreg_def),
+            const_alternatives: self.emit.take_const_alternatives(),
+            vreg_count: self.emit.next_vreg_id,
+            ops: self.emit.take_ops(),
+            zero_vreg: self.zero_vreg,
+        }
+    }
+
+    /// Build the kernel, returning just the ops (convenience for tests).
+    pub fn build_ops(&mut self) -> Vec<SsaOp> {
+        self.build().ops
     }
 
     /// Build and schedule the kernel, returning the full result.
@@ -252,7 +265,7 @@ impl SsaTickTockKernelBuilder {
     ///
     /// Returns `Err` if scratch budget was exceeded (peak_live > budget); the caller must not use the kernel in that case.
     pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, String> {
-        self.build_and_schedule_with_options(self.config.enable_valu_shift, None)
+        self.build_and_schedule_with_options(self.config.compiler.enable_valu_shift, None)
     }
 
     /// Build and schedule with explicit VALU shift option.
@@ -269,31 +282,25 @@ impl SsaTickTockKernelBuilder {
     ) -> Result<SsaScheduleResult, String> {
         println!("[DEBUG] build_and_schedule_with_options ENTRY");
         std::io::Write::flush(&mut std::io::stdout()).ok();
-        // Build SSA ops
-        self.build_internal();
-
-        // Get ops and dependency info
-        // IMPORTANT: Take vreg_def and const_alternatives BEFORE take_ops() since take_ops() clears them
-        let mut vreg_def = std::mem::take(&mut self.emit.vreg_def);
-        let mut const_alternatives = self.emit.take_const_alternatives();
-        let vreg_count = self.emit.next_vreg_id;
-        let mut ssa_ops = self.emit.take_ops();
+        // Build SSA program (emission output)
+        let program = self.build();
+        let SsaProgram { ops: mut ssa_ops, mut vreg_def, vreg_count, mut const_alternatives, zero_vreg } = program;
 
         // Use barrier-aware dependencies for greedy scheduler
-        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, zero_vreg);
 
         // Optional SSA DCE: remove ops whose result has no users (saves cycles, optimizer time, scratch)
-        if self.config.enable_ssa_dce {
+        if self.config.compiler.enable_ssa_dce {
             let (new_ops, new_vreg_def, new_const_alternatives) = eliminate_ssa_dead_code(
                 ssa_ops,
                 &mut vreg_def,
                 &mut const_alternatives,
-                self.zero_vreg,
+                zero_vreg,
             );
             ssa_ops = new_ops;
             vreg_def = new_vreg_def;
             const_alternatives = new_const_alternatives;
-            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, zero_vreg);
         }
 
         // Build set of AddImm alternative op indices for the greedy scheduler to skip
@@ -311,8 +318,8 @@ impl SsaTickTockKernelBuilder {
         let mut shifted_ops: HashSet<usize> = HashSet::new();
         let mut greedy_select_fma_ops = HashSet::new();
         let mut greedy_const_add_imm_ops = HashSet::new();
-        let (cycles, sched_budget_exceeded, _sched_peak_live) = self
-            .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        let (cycles, sched_budget_exceeded, _sched_peak_live) =
+            ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
                 enable_valu_shift,
                 &mut shifted_ops,
@@ -342,7 +349,7 @@ impl SsaTickTockKernelBuilder {
         assign_config.budget = SCRATCH_BUDGET_HW;
 
         // Reserve address 0 and include zero in peak_live so scheduler budget 1536 matches assignable+zero
-        if let Some(zero) = self.zero_vreg {
+        if let Some(zero) = zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
             assign_config.zero_vreg = Some(zero);
         }
@@ -493,38 +500,32 @@ impl SsaTickTockKernelBuilder {
         use crate::cpsat_scheduler::compute_ssa_asap_alap_bounds;
         use crate::types::Opcode;
 
-        // Build SSA ops (includes barrier pseudo-ops between rounds)
-        self.build_internal();
-
-        // Get ops and dependency info
-        // IMPORTANT: Take vreg_def and const_alternatives BEFORE take_ops() since take_ops() clears them
-        let mut vreg_def = std::mem::take(&mut self.emit.vreg_def);
-        let mut const_alternatives = self.emit.take_const_alternatives();
-        let vreg_count = self.emit.next_vreg_id;
-        let mut ssa_ops = self.emit.take_ops();
+        // Build SSA program (emission output)
+        let program = self.build();
+        let SsaProgram { ops: mut ssa_ops, mut vreg_def, vreg_count, mut const_alternatives, zero_vreg } = program;
 
         // Use barrier-aware dependencies for greedy hints
-        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, zero_vreg);
 
         // Optional SSA DCE: remove ops whose result has no users (saves cycles, optimizer time, scratch)
-        if self.config.enable_ssa_dce {
+        if self.config.compiler.enable_ssa_dce {
             let (new_ops, new_vreg_def, new_const_alternatives) = eliminate_ssa_dead_code(
                 ssa_ops,
                 &mut vreg_def,
                 &mut const_alternatives,
-                self.zero_vreg,
+                zero_vreg,
             );
             ssa_ops = new_ops;
             vreg_def = new_vreg_def;
             const_alternatives = new_const_alternatives;
-            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, self.zero_vreg);
+            compute_ssa_dependencies_with_barriers(&mut ssa_ops, &vreg_def, zero_vreg);
         }
         let _ = &const_alternatives; // used in greedy path; CP-SAT discovers alternatives from ops
 
         // CP-SAT scratch liveness only models VRegs with at least one use. When DCE ran,
         // every op.dest must have a reader in the SSA op list. (sub_temp_vreg is not
         // included: it is only read by the FMA that appears after lowering, not by any SsaOp.)
-        if self.config.enable_ssa_dce {
+        if self.config.compiler.enable_ssa_dce {
             let defined: HashSet<_> = ssa_ops.iter().filter_map(|op| op.dest).collect();
             let used: HashSet<_> = ssa_ops.iter().flat_map(|op| op.reads()).collect();
             let dead: Vec<_> = defined.difference(&used).copied().collect();
@@ -544,7 +545,7 @@ impl SsaTickTockKernelBuilder {
                 enable_asap_alap_tightening,
                 enable_scratch_tightening,
                 enable_valu_shift,
-                scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
+                scratch_budget: effective_scratch_budget(zero_vreg.is_some()),
                 ..Default::default()
             };
             compute_ssa_asap_alap_bounds(&ssa_ops, &bounds_config)
@@ -562,8 +563,8 @@ impl SsaTickTockKernelBuilder {
         let mut greedy_select_sub_cycles = HashMap::new();
         let mut greedy_select_fma_cycles = HashMap::new();
         let mut greedy_const_add_imm_ops = HashSet::new();
-        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) = self
-            .schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        let (greedy_cycles, greedy_budget_exceeded, greedy_peak_live) =
+            ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ssa_ops,
                 enable_valu_shift, // Match CP-SAT shift setting for hints
                 &mut greedy_shifted,
@@ -595,7 +596,7 @@ impl SsaTickTockKernelBuilder {
 
         // Phase 1: Per-section feasibility (only when a section exceeds scratch budget)
         let boundaries = section_boundaries(&ssa_ops);
-        let effective_budget = effective_scratch_budget(self.zero_vreg.is_some());
+        let effective_budget = effective_scratch_budget(zero_vreg.is_some());
         let budget_result =
             sections_exceeding_budget(
                 &ssa_ops,
@@ -931,7 +932,7 @@ impl SsaTickTockKernelBuilder {
                 if verbose {
                     let after_budget = sections_exceeding_budget(
                         &ssa_ops,
-                        effective_scratch_budget(self.zero_vreg.is_some()),
+                        effective_scratch_budget(zero_vreg.is_some()),
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
                     );
@@ -1006,7 +1007,7 @@ impl SsaTickTockKernelBuilder {
             .max()
             .map(|c| c + 1)
             .unwrap_or(0);
-        let effective_budget_hint = effective_scratch_budget(self.zero_vreg.is_some());
+        let effective_budget_hint = effective_scratch_budget(zero_vreg.is_some());
         // After elision there is one section; use current choice hints (greedy + per-section updates).
         let hint_peak = sections_exceeding_budget(
             &ssa_ops,
@@ -1040,7 +1041,7 @@ impl SsaTickTockKernelBuilder {
             stop_after_first_solution: false,
             enable_valu_shift,
             enable_vbroadcast_elimination,
-            scratch_budget: effective_scratch_budget(self.zero_vreg.is_some()),
+            scratch_budget: effective_scratch_budget(zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
             machine: MachineConfig::default(),
             const_choice_mode,
@@ -1199,7 +1200,7 @@ impl SsaTickTockKernelBuilder {
         let mut assign_config = AddressAssignConfig::default();
         assign_config.budget = SCRATCH_BUDGET_HW;
 
-        if let Some(zero) = self.zero_vreg {
+        if let Some(zero) = zero_vreg {
             assign_config.fixed_vregs.insert(zero, 0);
             assign_config.zero_vreg = Some(zero);
         }

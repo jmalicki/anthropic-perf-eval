@@ -1,6 +1,9 @@
 //! Kernel configuration types.
 //!
-//! Defines the configuration parameters for kernel generation.
+//! Defines the configuration parameters for kernel generation, split into:
+//! - `ProblemSpec` — emission concern: what program to generate
+//! - `CompilerConfig` — compilation concern: how to optimize/schedule
+//! - `KernelConfig` — combined wrapper for backward compatibility
 
 use crate::types::ConstEncodingFlags;
 
@@ -28,9 +31,12 @@ pub const SCRATCH_SIZE: usize = 1536;
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
 pub const MAX_TREE_REDUCE_DEPTH: u32 = 3;
 
-/// Kernel configuration parameters
+/// Emission concern: what program to generate.
+///
+/// Controls problem dimensions and emission behavior — which ops are
+/// emitted, what constant-encoding alternatives are generated, etc.
 #[derive(Debug, Clone)]
-pub struct KernelConfig {
+pub struct ProblemSpec {
     /// Height of the forest (tree depth - 1)
     pub forest_height: usize,
     /// Number of nodes in the tree
@@ -39,91 +45,52 @@ pub struct KernelConfig {
     pub batch_size: usize,
     /// Number of rounds to execute
     pub rounds: usize,
-    /// Enable VALU→ALU shifting during scheduling
-    pub enable_valu_shift: bool,
+    /// Maximum tree depth (0..=N) for which tree-reduce selection is used.
+    /// Default 3 (8-way at depth 3). Minimum allowed is 2. Cannot exceed MAX_TREE_REDUCE_DEPTH (3).
+    pub tree_reduce_max_depth: u32,
     /// Enable debug operations
     pub enable_debug: bool,
     /// Enable lazy partition for sorted vload tree access (depths 4-8)
-    /// When enabled, items are sorted by tree index via stable partition every k rounds,
-    /// enabling sequential vloads instead of scattered loads.
     pub enable_lazy_partition: bool,
     /// Partition frequency: partition every k rounds (default: 1)
-    /// k=1 means partition every round -> 2-way selection (trivial)
-    /// k=2 means partition every 2 rounds -> 4-way selection
-    /// k=3 means partition every 3 rounds -> 8-way selection
-    /// k=1 is optimal because 2-way select is cheap and partition stores are FREE
     pub partition_frequency: usize,
     /// Enable tick-tock partition stores during rounds.
-    /// When disabled (default), only final stores are emitted.
-    /// This simplifies debugging but may increase register pressure.
     pub enable_partition_stores: bool,
     /// Enable pseudo-const mode for flexible constant generation.
-    /// When enabled, constants are declared via need_const() and the scheduler
-    /// dynamically chooses between Load, Add, Mul, etc. based on resource availability.
-    /// This can reduce early cycle inefficiency by avoiding long derivation chains.
     pub enable_pseudo_consts: bool,
-
     // === Pseudo-const encoding flags ===
     /// Enable AddImm encoding via flow slot (add_imm dest, s0, value)
-    /// Note: s0 (address 0) is always initialized to 0 at startup, so no precedence constraint needed
     pub enable_add_imm: bool,
     /// Enable Load encoding via load slot (const dest, value)
     pub enable_const_load: bool,
     /// Enable ALU-based derivation (Add, Sub, Mul, Shift)
     pub enable_const_alu: bool,
     /// Maximum derivation depth for ALU-based constant generation.
-    /// Values requiring deeper derivation chains will use Load/AddImm instead.
-    /// None means unlimited (default). Recommended: 4-6 to prevent long critical paths.
     pub max_alu_depth: Option<usize>,
-
-    /// Maximum tree depth (0..=N) for which tree-reduce selection is used.
-    /// Default 3 (8-way at depth 3). Minimum allowed is 2. Cannot exceed MAX_TREE_REDUCE_DEPTH (3).
-    pub tree_reduce_max_depth: u32,
-
-    /// Enable SSA dead code elimination before scheduling.
-    /// When enabled (default), ops whose result has no users are removed,
-    /// reducing cycles, optimizer time, and scratch pressure.
-    pub enable_ssa_dce: bool,
 }
 
-impl Default for KernelConfig {
+impl Default for ProblemSpec {
     fn default() -> Self {
-        KernelConfig {
+        ProblemSpec {
             forest_height: 10,
             n_nodes: 2047,
             batch_size: 256,
             rounds: 16,
-            enable_valu_shift: true,
+            tree_reduce_max_depth: 3,
             enable_debug: false,
             enable_lazy_partition: false,
             partition_frequency: 1,
             enable_partition_stores: false,
             enable_pseudo_consts: false,
-            // All encoding methods enabled by default
             enable_add_imm: true,
             enable_const_load: true,
             enable_const_alu: true,
-            max_alu_depth: None, // No limit by default
-            // Tree-reduce up to depth 3 by default (8-way at depth 3; min allowed is 2)
-            tree_reduce_max_depth: 3,
-            // SSA DCE on by default (removes dead code before scheduling)
-            enable_ssa_dce: true,
+            max_alu_depth: None,
         }
     }
 }
 
-impl KernelConfig {
-    /// Create a new kernel configuration
-    pub fn new(forest_height: usize, n_nodes: usize, batch_size: usize, rounds: usize) -> Self {
-        KernelConfig {
-            forest_height,
-            n_nodes,
-            batch_size,
-            rounds,
-            ..Default::default()
-        }
-    }
-
+impl ProblemSpec {
     /// Number of groups (batch_size / VLEN)
     pub fn n_groups(&self) -> usize {
         self.batch_size / VLEN
@@ -155,10 +122,94 @@ impl KernelConfig {
     }
 
     /// True if tree-reduce selection should be used at the given tree depth.
-    /// Only depths 0..=MAX_TREE_REDUCE_DEPTH have tree-reduce emission; higher depths use fallback.
-    /// tree_reduce_max_depth is clamped to 2..=MAX_TREE_REDUCE_DEPTH at the API boundary.
     pub fn use_tree_reduce_at_depth(&self, depth: usize) -> bool {
         depth <= self.tree_reduce_max_depth.min(MAX_TREE_REDUCE_DEPTH) as usize
+    }
+}
+
+/// Compilation concern: how to optimize and schedule.
+///
+/// Controls scheduling and optimization passes — these don't affect
+/// what ops are emitted, only how they're scheduled/optimized.
+#[derive(Debug, Clone)]
+pub struct CompilerConfig {
+    /// Enable VALU→ALU shifting during scheduling
+    pub enable_valu_shift: bool,
+    /// Enable SSA dead code elimination before scheduling.
+    pub enable_ssa_dce: bool,
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        CompilerConfig {
+            enable_valu_shift: true,
+            enable_ssa_dce: true,
+        }
+    }
+}
+
+/// Kernel configuration parameters.
+///
+/// Thin wrapper combining `ProblemSpec` (what to emit) and `CompilerConfig`
+/// (how to optimize). Delegation methods on `KernelConfig` forward to `spec`
+/// so that callers using `config.n_groups()` etc. continue to work.
+#[derive(Debug, Clone)]
+pub struct KernelConfig {
+    /// Emission concern: problem dimensions and what to emit.
+    pub spec: ProblemSpec,
+    /// Compilation concern: scheduling and optimization options.
+    pub compiler: CompilerConfig,
+}
+
+impl Default for KernelConfig {
+    fn default() -> Self {
+        KernelConfig {
+            spec: ProblemSpec::default(),
+            compiler: CompilerConfig::default(),
+        }
+    }
+}
+
+impl KernelConfig {
+    /// Create a new kernel configuration
+    pub fn new(forest_height: usize, n_nodes: usize, batch_size: usize, rounds: usize) -> Self {
+        KernelConfig {
+            spec: ProblemSpec {
+                forest_height,
+                n_nodes,
+                batch_size,
+                rounds,
+                ..Default::default()
+            },
+            compiler: CompilerConfig::default(),
+        }
+    }
+
+    // --- Delegation to ProblemSpec ---
+
+    /// Number of groups (batch_size / VLEN)
+    pub fn n_groups(&self) -> usize {
+        self.spec.n_groups()
+    }
+
+    /// Number of iterations (ceil(n_groups / 8) so that 1..7 groups still get one iter)
+    pub fn n_iters(&self) -> usize {
+        self.spec.n_iters()
+    }
+
+    /// Tree height (forest_height + 1)
+    pub fn tree_height(&self) -> usize {
+        self.spec.tree_height()
+    }
+
+    /// Get encoding flags for pseudo-consts
+    pub fn encoding_flags(&self) -> ConstEncodingFlags {
+        self.spec.encoding_flags()
+    }
+
+    /// True if tree-reduce selection should be used at the given tree depth.
+    pub fn use_tree_reduce_at_depth(&self, depth: usize) -> bool {
+        self.spec.use_tree_reduce_at_depth(depth)
     }
 }
 
@@ -187,10 +238,13 @@ mod tests {
     #[test]
     fn test_n_iters_ceiling_small_groups() {
         let cfg = KernelConfig {
-            forest_height: 5,
-            n_nodes: 31,
-            batch_size: 8, // n_groups = 1
-            rounds: 1,
+            spec: ProblemSpec {
+                forest_height: 5,
+                n_nodes: 31,
+                batch_size: 8, // n_groups = 1
+                rounds: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cfg.n_groups(), 1, "batch 8 -> 1 group");
@@ -200,10 +254,13 @@ mod tests {
     #[test]
     fn test_n_iters_ceiling_two_groups() {
         let cfg = KernelConfig {
-            forest_height: 5,
-            n_nodes: 31,
-            batch_size: 16, // n_groups = 2
-            rounds: 2,
+            spec: ProblemSpec {
+                forest_height: 5,
+                n_nodes: 31,
+                batch_size: 16, // n_groups = 2
+                rounds: 2,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cfg.n_groups(), 2);
@@ -213,10 +270,13 @@ mod tests {
     #[test]
     fn test_n_iters_eight_groups() {
         let cfg = KernelConfig {
-            forest_height: 5,
-            n_nodes: 31,
-            batch_size: 64, // n_groups = 8
-            rounds: 4,
+            spec: ProblemSpec {
+                forest_height: 5,
+                n_nodes: 31,
+                batch_size: 64, // n_groups = 8
+                rounds: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cfg.n_groups(), 8);
@@ -226,10 +286,13 @@ mod tests {
     #[test]
     fn test_n_iters_nine_groups() {
         let cfg = KernelConfig {
-            forest_height: 5,
-            n_nodes: 31,
-            batch_size: 72, // n_groups = 9
-            rounds: 4,
+            spec: ProblemSpec {
+                forest_height: 5,
+                n_nodes: 31,
+                batch_size: 72, // n_groups = 9
+                rounds: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cfg.n_groups(), 9);
