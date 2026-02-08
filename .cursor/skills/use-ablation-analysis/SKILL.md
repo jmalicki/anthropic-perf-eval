@@ -1,20 +1,99 @@
 ---
 name: use-ablation-analysis
-description: Run ablation studies comparing ASAP/ALAP tightening configurations (baseline, slot-aware, scratch-aware, both) and analyze results. Use when measuring the impact of domain tightening on CP-SAT solve time, makespan, and solver statistics.
+description: Run ablation studies comparing any generate_ssa_kernel.py options (tree-reduce depth, const-choice, select-choice, VALU shift, tightening, etc.) and analyze results. Also supports the legacy 4-arm ASAP/ALAP tightening study.
 ---
 
 # Using the Ablation Analysis Tools
 
-Two scripts work together for ASAP/ALAP tightening ablation studies:
+Two sets of scripts are available:
 
-1. **run_asap_alap_ablation.py** — Run a **4-arm ablation study** (baseline, slot-only, scratch-only, slot+scratch).
-2. **analyze_ablation_results.py** — **Analyze** saved results: makespan, solve time, solver stats, liveness, VALU shift, slot usage.
+**General-purpose** (recommended for new studies):
+1. **run_ablation.py** — Compare **any** `generate_ssa_kernel.py` options via `--arm "name:options"`.
+2. **analyze_ablation.py** — Analyze results: summary table, per-arm detail, pairwise comparison.
 
-Run both from **project root**. Ensure **scheduler_rs** is built (`./scripts/build_scheduler_rs.sh`).
+**ASAP/ALAP-specific** (legacy, still works):
+1. **run_asap_alap_ablation.py** — Hardcoded 4-arm study (baseline, slot-only, scratch-only, slot+scratch).
+2. **analyze_ablation_results.py** — Analyze saved ASAP/ALAP results.
+
+Run all from **project root**. Ensure **scheduler_rs** is built (`./scripts/build_scheduler_rs.sh`).
 
 ---
 
-## 1. Run an ablation study
+## General-Purpose Ablation
+
+### Run an ablation study
+
+**Script:** `scripts/run_ablation.py`
+
+Specify **shared options** (rounds, batch size, time limit) and **per-arm differences** via `--arm "name:options"`. The first arm is treated as the baseline for comparison.
+
+#### Usage
+
+```bash
+# Tree-reduce depth 3 vs 4
+uv run python scripts/run_ablation.py \
+  --rounds 5 --time-limit 600 \
+  --arm "depth-3:--tree-reduce-max-depth 3" \
+  --arm "depth-4:--tree-reduce-max-depth 4"
+
+# Const choice comparison (3 arms)
+uv run python scripts/run_ablation.py \
+  --rounds 4 --time-limit 600 \
+  --arm "optimize:--const-choice optimize" \
+  --arm "add_imm:--const-choice add_imm" \
+  --arm "load:--const-choice load"
+
+# VALU shift on vs off
+uv run python scripts/run_ablation.py \
+  --rounds 4 --time-limit 600 \
+  --arm "valu-shift:--enable-valu-shift" \
+  --arm "no-valu-shift:--no-valu-shift"
+
+# With shared args applied to all arms
+uv run python scripts/run_ablation.py \
+  --rounds 4 --time-limit 600 \
+  --shared-args "--no-valu-shift" \
+  --arm "optimize:--const-choice optimize" \
+  --arm "load:--const-choice load"
+```
+
+#### Options
+
+- `--rounds N` — Number of rounds (default: 4).
+- `--batch-size N` — Batch size, must be multiple of 8 (default: 256).
+- `--time-limit SECS` — CP-SAT time limit per arm (default: 600).
+- `--arm "name:options"` — Arm specification. Repeat for each arm. Required (at least 2).
+- `--shared-args "..."` — Extra args applied to ALL arms.
+- `--output PATH` — Output JSON file (default: `ablation_general_results.json`).
+
+#### Output files
+
+- **`ablation_general_results.json`** — All arms with makespan, timing, solver stats, embedded scheduler JSON.
+- **`scheduler_output_{arm_name}.json`** — Per-arm scheduler output JSON.
+- **`ablation_log_{arm_name}.txt`** — Full solver logs per arm.
+
+### Analyze general ablation results
+
+**Script:** `scripts/analyze_ablation.py`
+
+```bash
+# Analyze default results file
+uv run python scripts/analyze_ablation.py
+
+# Analyze a specific results file
+uv run python scripts/analyze_ablation.py my_ablation.json
+```
+
+Reports:
+- **Summary table** — Compact comparison of all arms (cycles, status, solve time, peak liveness, VALU shift, vs baseline).
+- **Per-arm detail** — Full metrics including liveness curve, usage accounting, VALU shift breakdown, solver stats, slot usage.
+- **Pairwise comparison** — Each arm vs baseline: makespan, elapsed time, solve time, peak liveness, VALU shifted, branches, conflicts, slot utilization changes.
+
+---
+
+## ASAP/ALAP Tightening Ablation (Legacy)
+
+### 1. Run an ablation study
 
 **Script:** `scripts/run_asap_alap_ablation.py`
 
@@ -143,9 +222,11 @@ Previous ablation studies are documented in:
 
 | Goal | Script | Typical use |
 |------|--------|-------------|
-| Run full 4-arm ablation study | run_asap_alap_ablation.py | Compare baseline vs slot vs scratch vs both |
-| Analyze saved results | analyze_ablation_results.py | After a run completes; compare arms |
-| Quick dev check | run_asap_alap_ablation.py --rounds 2 --time-limit 120 | Fast iteration on tightening changes |
-| Production ablation | run_asap_alap_ablation.py --rounds 4 --time-limit 1800 | Thorough study for documentation |
+| **Compare any options** | run_ablation.py | `--arm "a:opts" --arm "b:opts"` for any generate_ssa_kernel.py flags |
+| **Analyze general results** | analyze_ablation.py | Summary table + per-arm detail + pairwise comparison |
+| Run 4-arm tightening study | run_asap_alap_ablation.py | Compare baseline vs slot vs scratch vs both |
+| Analyze tightening results | analyze_ablation_results.py | After a tightening ablation run |
+| Quick dev check | run_ablation.py --rounds 2 --time-limit 120 | Fast iteration on any option comparison |
+| Production ablation | run_ablation.py --rounds 4 --time-limit 1800 | Thorough study for documentation |
 
 After running an ablation, use the per-arm `scheduler_output_*.json` files with other analysis tools (slot decile, bulk-move, what-if shift) for deeper investigation.
