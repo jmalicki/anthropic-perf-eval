@@ -35,6 +35,7 @@ When working in this repo, read and follow these project-specific skills when th
 - **Bug tracking** — Read [.cursor/skills/use-bugs-md/SKILL.md](.cursor/skills/use-bugs-md/SKILL.md). Use BUGS.md at the repo root: read before fixing, update when fixing or reporting, keep entries short.
 - **Bisecting validation failures / minimal repros** — Read [.cursor/skills/use-bisection-tools/SKILL.md](.cursor/skills/use-bisection-tools/SKILL.md). Use `scripts/bisect_cpsat_validation.py` to find which choice options (ConstChoice, SelectChoice, valu shift) correlate with failure, and `scripts/bisect_minimal_fma.py` for smallest rounds/batch/height that reproduces.
 - **Hypothesis quantification (schedule optimization ideas)** — Read [.cursor/skills/use-schedule-hypotheses/SKILL.md](.cursor/skills/use-schedule-hypotheses/SKILL.md). Use `scripts/quantify_schedule_hypotheses.py` on scheduler output JSON to estimate impact of vbroadcast elimination, element-wise chaining, and ConstChoice; use A/B runs and bulk-move/what-if for VALU shift and precedence.
+- **Ablation analysis (ASAP/ALAP tightening)** — Read [.cursor/skills/use-ablation-analysis/SKILL.md](.cursor/skills/use-ablation-analysis/SKILL.md). Run 4-arm ablation study (baseline, slot-aware, scratch-aware, both) with `scripts/run_asap_alap_ablation.py`; analyze results with `scripts/analyze_ablation_results.py`.
 
 ## Build & Development Commands
 
