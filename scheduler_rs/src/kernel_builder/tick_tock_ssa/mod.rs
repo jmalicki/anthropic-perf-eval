@@ -281,7 +281,8 @@ impl SsaTickTockKernelBuilder {
                 enable_valu_shift,
                 ..self.config.compiler.clone()
             },
-            scratch_budget: scratch_budget_override.unwrap_or(SCRATCH_BUDGET_HW),
+            scratch_budget: scratch_budget_override
+                .unwrap_or_else(|| effective_scratch_budget(program.zero_vreg.is_some())),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             ..Default::default()
         };
@@ -289,7 +290,9 @@ impl SsaTickTockKernelBuilder {
         let mut ctx = PipelineContext::new(program, config);
         ctx.run_greedy_pipeline(self.config.compiler.enable_ssa_dce)?;
 
-        // Check budget: greedy path fails if scheduling or address assignment exceeded budget
+        // Check budget: address assignment is the ground truth for peak liveness
+        // (it accounts for sub_temp_vregs, shifted VALU multi-cycle writes, and
+        // zero_vreg permanent reservation that the greedy scheduler doesn't track).
         let sched_exceeded = ctx.greedy_metrics.budget_exceeded;
         let addr_exceeded = ctx
             .address_result

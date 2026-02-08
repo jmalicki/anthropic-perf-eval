@@ -662,7 +662,6 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
                         live_vregs.insert(d);
                         live_words += d.size();
-                        peak_live_words = peak_live_words.max(live_words);
                     }
                     // Track when this VReg was defined
                     vreg_def_cycle.insert(d, cycle as i32);
@@ -688,6 +687,10 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         }
                     }
                 }
+
+                // Record peak after both adds and frees, matching the same-cycle
+                // reuse model used by address assignment's interval-based liveness.
+                peak_live_words = peak_live_words.max(live_words);
 
                 // Add newly-ready consumers to heap (O(log n) per consumer)
                 for &consumer_idx in &consumers[idx] {
@@ -804,7 +807,6 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 if let Some(dest_vreg) = dest {
                     live_vregs.insert(dest_vreg);
                     live_words += dest_vreg.size();
-                    peak_live_words = peak_live_words.max(live_words);
                     vreg_def_cycle.insert(dest_vreg, force_cycle);
                 }
 
@@ -820,6 +822,9 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         }
                     }
                 }
+
+                // Record peak after both adds and frees
+                peak_live_words = peak_live_words.max(live_words);
 
                 for &consumer_idx in &consumers[force_idx] {
                     let offset = ops[force_idx]

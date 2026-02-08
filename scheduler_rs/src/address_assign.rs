@@ -187,11 +187,15 @@ pub fn compute_live_intervals(
             intervals.insert(dest, LiveInterval::new(def_cycle, end_cycle));
         }
 
-        // Handle sub_temp_vreg for SelectChoice ops without delta
-        // The sub_temp is defined at the SelectChoice's cycle and read at cycle + 1 (by FMA)
+        // Handle sub_temp_vreg for SelectChoice ops that chose the FMA path.
+        // The sub_temp is defined at the SelectChoice's cycle and read at cycle + 1 (by FMA).
+        // Only create the interval when FMA is actually chosen; if vselect is used,
+        // sub_temp_vreg is never written/read and should not count toward liveness.
         if let Some(sub_temp) = op.sub_temp_vreg {
-            // Interval: [cycle, cycle+1] - defined at cycle, read at cycle+1
-            intervals.insert(sub_temp, LiveInterval::new(op.cycle, op.cycle + 1));
+            if select_fma_ops.map_or(false, |s| s.contains(&op.id)) {
+                // Interval: [cycle, cycle+1] - defined at cycle, read at cycle+1
+                intervals.insert(sub_temp, LiveInterval::new(op.cycle, op.cycle + 1));
+            }
         }
     }
 
