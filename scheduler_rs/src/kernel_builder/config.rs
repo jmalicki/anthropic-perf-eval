@@ -27,9 +27,9 @@ pub const VLEN: usize = 8;
 /// Maximum scratch space available
 pub const SCRATCH_SIZE: usize = 1536;
 
-/// Maximum tree depth for which we have tree-reduce emission (depth 3 = 8-way).
+/// Maximum tree depth for which we have tree-reduce emission (depth 4 = 16-way).
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
-pub const MAX_TREE_REDUCE_DEPTH: u32 = 3;
+pub const MAX_TREE_REDUCE_DEPTH: u32 = 4;
 
 /// Emission concern: what program to generate.
 ///
@@ -46,7 +46,7 @@ pub struct ProblemSpec {
     /// Number of rounds to execute
     pub rounds: usize,
     /// Maximum tree depth (0..=N) for which tree-reduce selection is used.
-    /// Default 3 (8-way at depth 3). Minimum allowed is 2. Cannot exceed MAX_TREE_REDUCE_DEPTH (3).
+    /// Default 3 (8-way at depth 3). Minimum allowed is 2. Cannot exceed MAX_TREE_REDUCE_DEPTH (4).
     pub tree_reduce_max_depth: u32,
     /// Enable debug operations
     pub enable_debug: bool,

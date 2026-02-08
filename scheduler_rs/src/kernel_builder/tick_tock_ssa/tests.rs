@@ -3444,3 +3444,166 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         SCRATCH_BUDGET_HW
     );
 }
+
+// =========================================================================
+// Depth 4 Tree-Reduce Tests
+// =========================================================================
+
+/// Verify that tree_reduce_max_depth=4 emits depth 4 ops.
+/// With forest_height=5 (tree_height=6) and rounds=5, round 4 hits depth 4.
+#[test]
+fn test_depth4_emits_ops() {
+    use crate::kernel_builder::config::ProblemSpec;
+    let config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8,
+            rounds: 5,
+            tree_reduce_max_depth: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    assert!(builder.uses_depth4, "uses_depth4 should be true");
+    let program = builder.build();
+
+    // Should have FMA ops from depth 4 (MultiplyAdd opcode)
+    let fma_count = program.ops.iter()
+        .filter(|op| op.opcode == Opcode::MultiplyAdd)
+        .count();
+    assert!(
+        fma_count > 0,
+        "Depth 4 tree-reduce should emit FMA (MultiplyAdd) ops, got {}",
+        fma_count
+    );
+    println!("Depth 4 emitted {} FMA ops out of {} total ops", fma_count, program.ops.len());
+}
+
+/// Verify that default config (tree_reduce_max_depth=3) does NOT emit depth 4 ops.
+#[test]
+fn test_depth4_default_unchanged() {
+    use crate::kernel_builder::config::ProblemSpec;
+    // Same config but tree_reduce_max_depth=3 (default)
+    let config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8,
+            rounds: 5,
+            tree_reduce_max_depth: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    assert!(!builder.uses_depth4, "uses_depth4 should be false with default depth");
+
+    // Build with depth 4 enabled vs disabled, ops should differ
+    let program_d3 = builder.build();
+
+    let config_d4 = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8,
+            rounds: 5,
+            tree_reduce_max_depth: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder_d4 = SsaTickTockKernelBuilder::new(config_d4);
+    let program_d4 = builder_d4.build();
+
+    // Depth 4 should have more ops (additional tree loads, constants, FMAs)
+    assert!(
+        program_d4.ops.len() > program_d3.ops.len(),
+        "Depth 4 enabled should emit more ops: d3={} vs d4={}",
+        program_d3.ops.len(),
+        program_d4.ops.len()
+    );
+}
+
+/// Verify that depth 4 builds and schedules with greedy scheduler.
+#[test]
+fn test_depth4_greedy_schedules() {
+    use crate::kernel_builder::config::ProblemSpec;
+    let config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8,
+            rounds: 5,
+            tree_reduce_max_depth: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    let result = builder.build_and_schedule();
+
+    assert!(
+        result.is_ok(),
+        "Greedy scheduling with depth 4 should succeed: {:?}",
+        result.err()
+    );
+    let result = result.unwrap();
+    println!(
+        "Depth 4 greedy: {} cycles, {} ops, peak_live={}",
+        result.cycles,
+        result.ops.len(),
+        result.address_result.peak_live
+    );
+    assert!(result.cycles > 0, "Should have positive cycle count");
+}
+
+/// Verify depth 4 with CP-SAT finds a feasible schedule.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_depth4_cpsat() {
+    use crate::kernel_builder::config::ProblemSpec;
+    use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+
+    let config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 31,
+            batch_size: 8,
+            rounds: 5,
+            tree_reduce_max_depth: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    let result = builder.build_and_schedule_cpsat(
+        120.0, // time limit
+        false, // verbose
+        false, // enable_valu_shift (simpler for small test)
+        false, // enable_vbroadcast_elimination
+        None,  // per_section_optimize_secs
+        None,  // forced_shifts
+        ConstChoiceMode::Optimize,
+        SelectChoiceMode::Optimize,
+        ValuShiftMode::Optimize,
+        false, // force_zero_gap
+        false, // enable_asap_alap_tightening
+        false, // enable_scratch_tightening
+    );
+    assert!(
+        result.is_ok(),
+        "CP-SAT with depth 4 should find feasible schedule: {:?}",
+        result.err()
+    );
+    let result = result.unwrap();
+    println!(
+        "Depth 4 CP-SAT: {} cycles, peak_live={}",
+        result.cycles, result.address_result.peak_live
+    );
+    assert!(
+        !result.budget_exceeded,
+        "Depth 4 CP-SAT should not exceed budget"
+    );
+}

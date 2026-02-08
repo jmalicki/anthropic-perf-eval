@@ -53,6 +53,20 @@ pub struct SsaScratchContext {
     pub c_r3: [Option<VReg>; 8],  // Constants 7-14
 
     // =========================================================================
+    // Depth 4 Cache (tree[15..30])
+    // =========================================================================
+    pub tc_r4: [Option<VReg>; 16],       // tree[15..30] scalar values
+    pub tc_r4_addr: [Option<VReg>; 16],  // address registers (short-lived)
+    pub c_r4: [Option<VReg>; 16],        // constants 15-30
+
+    // Depth 4 Tree-Reduce Deltas (8 pairs)
+    pub td_r4: [Option<VReg>; 8], // td_r4[i] = tc_r4[2i+1] - tc_r4[2i]
+
+    // Depth 4 vector broadcasts (lazy init)
+    pub v_tc_r4_even: [Option<VReg>; 8], // broadcasts of tc_r4[0,2,4,...,14] (even-indexed bases)
+    pub v_td_r4: [Option<VReg>; 8],      // broadcasts of td_r4[0..8] (deltas)
+
+    // =========================================================================
     // Stage 5 XOR Optimization
     // =========================================================================
     pub stage5_xor_s: Option<VReg>, // 0xB55A4F09 scalar

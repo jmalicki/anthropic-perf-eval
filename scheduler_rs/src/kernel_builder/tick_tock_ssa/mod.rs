@@ -105,6 +105,10 @@ pub struct SsaTickTockKernelBuilder {
     pub(crate) depth3_broadcasts_initialized: bool,
     /// Whether any round will use depth 3
     pub(crate) uses_depth3: bool,
+    /// Whether depth 4 broadcasts have been initialized
+    pub(crate) depth4_broadcasts_initialized: bool,
+    /// Whether any round will use depth 4
+    pub(crate) uses_depth4: bool,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
 }
@@ -209,6 +213,11 @@ impl SsaTickTockKernelBuilder {
             let tree_depth = r % tree_height;
             tree_depth == 3
         });
+        let uses_depth4 = config.spec.use_tree_reduce_at_depth(4)
+            && (0..config.spec.rounds).any(|r| {
+                let tree_depth = r % tree_height;
+                tree_depth == 4
+            });
 
         // Pre-compute FMA multipliers in config-compatible format
         let mut hash_fma_mult = [None; 6];
@@ -225,6 +234,8 @@ impl SsaTickTockKernelBuilder {
             emit: SsaEmitContext::new(),
             depth3_broadcasts_initialized: false,
             uses_depth3,
+            depth4_broadcasts_initialized: false,
+            uses_depth4,
             zero_vreg: None,
         }
     }

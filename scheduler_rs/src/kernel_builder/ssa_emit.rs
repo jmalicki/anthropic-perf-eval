@@ -115,8 +115,10 @@ impl SsaTickTockKernelBuilder {
         let c7 = self.ctx.c[7].unwrap();
 
         self.ctx.c[14] = Some(self.emit.emit_alu(Opcode::Add, c7, c7));
-        // TODO: c[15] is unused - restructure constant generation to only emit what's needed
-        // self.ctx.c[15] = Some(self.emit.emit_alu(Opcode::Add, c8, c7));
+        // c[15] needed for depth 4 tree-reduce (and as base for constants 16-30)
+        if self.uses_depth4 {
+            self.ctx.c[15] = Some(self.emit.emit_alu(Opcode::Add, c8, c7));
+        }
 
         // Load pointers from memory (addresses 4, 5, 6, 7)
         // Note: n_nodes_s not needed in SSA version (was only for v_nn which is unused)
@@ -284,6 +286,60 @@ impl SsaTickTockKernelBuilder {
             self.ctx.td_r3_45 = Some(self.emit.emit_alu(Opcode::Sub, tc_r3_5, tc_r3_4));
             self.ctx.td_r3_67 = Some(self.emit.emit_alu(Opcode::Sub, tc_r3_7, tc_r3_6));
         }
+
+        // Depth 4 initialization: constants 15-30, load tree[15..30], compute deltas
+        if self.uses_depth4 {
+            let c8 = self.ctx.c[8].unwrap();
+            let c15 = self.ctx.c[15].unwrap();
+            let c1 = self.ctx.c[1].unwrap();
+            let c2 = self.ctx.c[2].unwrap();
+            let c3 = self.ctx.c[3].unwrap();
+            let c4 = self.ctx.c[4].unwrap();
+            let c5 = self.ctx.c[5].unwrap();
+            let c6 = self.ctx.c[6].unwrap();
+            let c7 = self.ctx.c[7].unwrap();
+
+            // c_r4[0] = c[15] (alias for constant 15)
+            self.ctx.c_r4[0] = Some(c15);
+            // Derive constants 16-30 via ALU
+            let c16 = self.emit.emit_alu(Opcode::Add, c8, c8);
+            self.ctx.c_r4[1] = Some(c16);
+            self.ctx.c_r4[2] = Some(self.emit.emit_alu(Opcode::Add, c16, c1));
+            self.ctx.c_r4[3] = Some(self.emit.emit_alu(Opcode::Add, c16, c2));
+            self.ctx.c_r4[4] = Some(self.emit.emit_alu(Opcode::Add, c16, c3));
+            self.ctx.c_r4[5] = Some(self.emit.emit_alu(Opcode::Add, c16, c4));
+            self.ctx.c_r4[6] = Some(self.emit.emit_alu(Opcode::Add, c16, c5));
+            self.ctx.c_r4[7] = Some(self.emit.emit_alu(Opcode::Add, c16, c6));
+            self.ctx.c_r4[8] = Some(self.emit.emit_alu(Opcode::Add, c16, c7));
+            let c24 = self.emit.emit_alu(Opcode::Add, c16, c8);
+            self.ctx.c_r4[9] = Some(c24);
+            self.ctx.c_r4[10] = Some(self.emit.emit_alu(Opcode::Add, c24, c1));
+            self.ctx.c_r4[11] = Some(self.emit.emit_alu(Opcode::Add, c24, c2));
+            self.ctx.c_r4[12] = Some(self.emit.emit_alu(Opcode::Add, c24, c3));
+            self.ctx.c_r4[13] = Some(self.emit.emit_alu(Opcode::Add, c24, c4));
+            self.ctx.c_r4[14] = Some(self.emit.emit_alu(Opcode::Add, c24, c5));
+            self.ctx.c_r4[15] = Some(self.emit.emit_alu(Opcode::Add, c24, c6));
+
+            // Load tree[15..30] via forest_p + c_r4[i]
+            let forest_p = self.ctx.forest_p.unwrap();
+            for i in 0..16 {
+                self.emit.set_next_var_type(VarType::Address);
+                let addr = self.emit.emit_alu(Opcode::Add, forest_p, self.ctx.c_r4[i].unwrap());
+                self.ctx.tc_r4_addr[i] = Some(addr);
+                self.emit.set_next_var_type(VarType::TreeCache);
+                self.ctx.tc_r4[i] = Some(self.emit.emit_load(addr));
+            }
+
+            // Compute 8 pair deltas: td_r4[i] = tc_r4[2i+1] - tc_r4[2i]
+            for i in 0..8 {
+                self.emit.set_next_var_type(VarType::TreeCache);
+                self.ctx.td_r4[i] = Some(self.emit.emit_alu(
+                    Opcode::Sub,
+                    self.ctx.tc_r4[2 * i + 1].unwrap(),
+                    self.ctx.tc_r4[2 * i].unwrap(),
+                ));
+            }
+        }
     }
 
     /// Ensure depth 3 broadcasts are initialized (lazy init).
@@ -306,6 +362,28 @@ impl SsaTickTockKernelBuilder {
             self.ctx.v_td_r3_23 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_23.unwrap()));
             self.ctx.v_td_r3_45 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_45.unwrap()));
             self.ctx.v_td_r3_67 = Some(self.emit.emit_vbroadcast(self.ctx.td_r3_67.unwrap()));
+        }
+    }
+
+    /// Ensure depth 4 broadcasts are initialized (lazy init).
+    pub(super) fn ensure_depth4_broadcasts(&mut self) {
+        if self.depth4_broadcasts_initialized {
+            return;
+        }
+        self.depth4_broadcasts_initialized = true;
+
+        // Broadcast 8 even-indexed bases: tc_r4[0], tc_r4[2], ..., tc_r4[14]
+        for i in 0..8 {
+            self.emit.set_next_var_type(VarType::TreeCache);
+            self.ctx.v_tc_r4_even[i] =
+                Some(self.emit.emit_vbroadcast(self.ctx.tc_r4[2 * i].unwrap()));
+        }
+
+        // Broadcast 8 deltas: td_r4[0..8]
+        for i in 0..8 {
+            self.emit.set_next_var_type(VarType::TreeCache);
+            self.ctx.v_td_r4[i] =
+                Some(self.emit.emit_vbroadcast(self.ctx.td_r4[i].unwrap()));
         }
     }
 
@@ -406,6 +484,9 @@ impl SsaTickTockKernelBuilder {
             1 => self.emit_depth1_access(n_iters, n_groups),
             2 => self.emit_depth2_access(n_iters, n_groups),
             3 => self.emit_depth3_access(n_iters, n_groups),
+            4 if self.config.use_tree_reduce_at_depth(4) => {
+                self.emit_depth4_access(n_iters, n_groups)
+            }
             _ => self.emit_scattered_access(n_iters, n_groups),
         }
 
@@ -688,8 +769,16 @@ impl SsaTickTockKernelBuilder {
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
         if self.config.use_tree_reduce_at_depth(3) {
-            // Tree-reduce: 3 levels of 2-way by bits (same shape as select_8way_bit_tree), but using direct FMA for lower op count.
-            // For a SelectChoice-based 8-way use select_8way_bit_tree(idx, 7, &[v_tc_r3[0], ..., v_tc_r3[7]]).
+            // Tree-reduce: direct FMA at level 0 (with precomputed deltas) +
+            // SelectChoice at levels 1-2.
+            //
+            // Level 0 uses direct FMA because FMA with precomputed delta is strictly
+            // better than vselect: multiply_add(bit, delta, base) = 1 VALU op, whereas
+            // vselect needs add(base, delta) + vselect = 1 VALU + 1 Flow = more ops + latency.
+            //
+            // Levels 1-2 use SelectChoice(bit, high, low) — solver picks vselect (1 Flow)
+            // or FMA (sub+fma, 2 VALU). Here vselect IS beneficial: it saves 2 VALU ops
+            // at the cost of 1 Flow op, helping when VALU is saturated.
             let v_const_7 = self.ctx.v_const[7].unwrap();
             let v_1 = self.ctx.v_1.unwrap();
             let v_td_r3_01 = self.ctx.v_td_r3_01.unwrap();
@@ -707,33 +796,41 @@ impl SsaTickTockKernelBuilder {
                     if base_g + i >= n_groups {
                         continue;
                     }
+                    self.emit.set_iter_group(it, base_g + i);
                     let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                     // Bit extraction
+                    self.emit.set_next_var_type(VarType::Temporary);
                     let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_const_7);
                     let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
                     let idx_adj_shr = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
                     let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
                     let bit2 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr, v_1);
 
-                    // Level 0: 4 FMAs (symmetry hint: leaves in order)
+                    // Level 0: 4 direct FMA with precomputed deltas (8→4)
+                    // multiply_add(bit0, delta, base) = bit0 * delta + base
                     self.emit.set_symmetry_hint(0);
+                    self.emit.set_next_var_type(VarType::Temporary);
                     let p01 = self.emit.emit_fma(bit0, v_td_r3_01, v_tc_r3_0);
+                    self.emit.set_next_var_type(VarType::Temporary);
                     let p23 = self.emit.emit_fma(bit0, v_td_r3_23, v_tc_r3_2);
+                    self.emit.set_next_var_type(VarType::Temporary);
                     let p45 = self.emit.emit_fma(bit0, v_td_r3_45, v_tc_r3_4);
+                    self.emit.set_next_var_type(VarType::Temporary);
                     let p67 = self.emit.emit_fma(bit0, v_td_r3_67, v_tc_r3_6);
 
-                    // Level 1: Combine pairs
+                    // Level 1: 2 SelectChoice (4→2)
+                    // vselect saves 2 VALU ops vs FMA (sub+fma) at cost of 1 Flow op
                     self.emit.set_symmetry_hint(1);
-                    let dp03 = self.emit.emit_valu(Opcode::Sub, p23, p01);
-                    let q03 = self.emit.emit_fma(bit1, dp03, p01);
-                    let dp47 = self.emit.emit_valu(Opcode::Sub, p67, p45);
-                    let q47 = self.emit.emit_fma(bit1, dp47, p45);
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    let q03 = self.select_2way(bit1, p23, p01);
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    let q47 = self.select_2way(bit1, p67, p45);
 
-                    // Level 2: Final result
+                    // Level 2: 1 SelectChoice (2→1)
                     self.emit.set_symmetry_hint(2);
-                    let d_final = self.emit.emit_valu(Opcode::Sub, q47, q03);
-                    let result = self.emit.emit_fma(bit2, d_final, q03);
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    let result = self.select_2way(bit2, q47, q03);
                     self.emit.clear_symmetry_hint();
 
                     self.ctx.v_nv[it][i] =
@@ -773,6 +870,107 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         }
+    }
+
+    pub(super) fn emit_depth4_access(&mut self, n_iters: usize, n_groups: usize) {
+        // Ensure depth 4 broadcasts are initialized
+        self.ensure_depth4_broadcasts();
+
+        let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
+
+        // 4-level tree for 16-way selection (tree indices 15-30).
+        // Uses precomputed broadcasts: v_tc_r4_even[0..8] (even bases) and v_td_r4[0..8] (deltas).
+        //
+        // Level 0: 8 direct FMA with precomputed deltas (16→8)
+        //   FMA is strictly better than vselect here: multiply_add(bit, delta, base) = 1 VALU op,
+        //   vs vselect needing add(base, delta) + vselect = 1 VALU + 1 Flow + extra VReg.
+        // Levels 1-3: SelectChoice(bit, high, low) → solver picks vselect (1 Flow) or FMA (sub+fma, 2 VALU)
+        //   Here vselect IS beneficial: saves 2 VALU ops at cost of 1 Flow op.
+
+        // Broadcast of constant 15 for idx adjustment
+        let c15 = self.ctx.c[15].unwrap();
+        let v_c15 = self.emit.emit_vbroadcast(c15);
+        let v_1 = self.ctx.v_1.unwrap();
+
+        // Cache broadcast references
+        let v_td_r4: [crate::types::VReg; 8] = std::array::from_fn(|i| {
+            self.ctx.v_td_r4[i].unwrap()
+        });
+        let v_tc_r4_even: [crate::types::VReg; 8] = std::array::from_fn(|i| {
+            self.ctx.v_tc_r4_even[i].unwrap()
+        });
+
+        for it in 0..n_iters {
+            let base_g = it * UNROLL;
+            for i in 0..UNROLL {
+                if base_g + i >= n_groups {
+                    continue;
+                }
+                self.emit.set_iter_group(it, base_g + i);
+                let idx = self.ctx.all_idx[base_g + i].unwrap();
+
+                // Bit extraction: idx_adj = idx - 15, then extract bits 0-3
+                self.emit.set_next_var_type(VarType::Temporary);
+                let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_c15);
+                let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
+                let idx_adj_shr1 = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
+                let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr1, v_1);
+                let idx_adj_shr2 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr1, v_1);
+                let bit2 = self.emit.emit_valu(Opcode::And, idx_adj_shr2, v_1);
+                let bit3 = self.emit.emit_valu(Opcode::Shr, idx_adj_shr2, v_1);
+
+                // Level 0: 8 direct FMA with precomputed deltas (16→8)
+                // multiply_add(bit0, delta, base) = bit0 * delta + base
+                self.emit.set_symmetry_hint(0);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p0 = self.emit.emit_fma(bit0, v_td_r4[0], v_tc_r4_even[0]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p1 = self.emit.emit_fma(bit0, v_td_r4[1], v_tc_r4_even[1]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p2 = self.emit.emit_fma(bit0, v_td_r4[2], v_tc_r4_even[2]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p3 = self.emit.emit_fma(bit0, v_td_r4[3], v_tc_r4_even[3]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p4 = self.emit.emit_fma(bit0, v_td_r4[4], v_tc_r4_even[4]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p5 = self.emit.emit_fma(bit0, v_td_r4[5], v_tc_r4_even[5]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p6 = self.emit.emit_fma(bit0, v_td_r4[6], v_tc_r4_even[6]);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let p7 = self.emit.emit_fma(bit0, v_td_r4[7], v_tc_r4_even[7]);
+
+                // Level 1: 4 SelectChoice (8→4)
+                // vselect path: vselect(bit1, p_high, p_low) (1 Flow)
+                // FMA path: sub + fma (2 VALU) — sub managed by SelectChoice internally
+                self.emit.set_symmetry_hint(1);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let q0 = self.select_2way(bit1, p1, p0);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let q1 = self.select_2way(bit1, p3, p2);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let q2 = self.select_2way(bit1, p5, p4);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let q3 = self.select_2way(bit1, p7, p6);
+
+                // Level 2: 2 SelectChoice (4→2)
+                self.emit.set_symmetry_hint(2);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let r0 = self.select_2way(bit2, q1, q0);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let r1 = self.select_2way(bit2, q3, q2);
+
+                // Level 3: 1 SelectChoice (2→1)
+                self.emit.set_symmetry_hint(3);
+                self.emit.set_next_var_type(VarType::Temporary);
+                let result = self.select_2way(bit3, r1, r0);
+                self.emit.clear_symmetry_hint();
+
+                self.emit.set_next_var_type(VarType::RoundState);
+                self.ctx.v_nv[it][i] =
+                    Some(self.emit.emit_valu(Opcode::Xor, result, v_stage5_xor));
+            }
+        }
+        self.emit.clear_iter_group();
     }
 
     pub(super) fn emit_scattered_access(&mut self, n_iters: usize, n_groups: usize) {

@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
                         help="Disable VALU->ALU shifting (e.g. if hitting scratch budget)")
     parser.add_argument("--tree-reduce-max-depth", type=int, default=3, metavar="N",
-                        help="Max tree depth for tree-reduce selection (2..3). Default 3; use 2 to disable depth-3 8-way (saves scratch).")
+                        help="Max tree depth for tree-reduce selection (2..4). Default 3; use 4 for 16-way at depth 4 (more VALU ops).")
     parser.add_argument("--const-choice", choices=["optimize", "add_imm", "load"], default="optimize",
                         help="CP-SAT ConstChoice: optimize, force add_imm, or force load (default: optimize)")
     parser.add_argument("--select-choice", choices=["optimize", "fma", "vselect"], default="optimize",
@@ -129,8 +129,8 @@ def main():
 
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
-    # Clamp to allowed range (min 2, max 3)
-    tree_reduce_max_depth = max(2, min(3, args.tree_reduce_max_depth))
+    # Clamp to allowed range (min 2, max 4)
+    tree_reduce_max_depth = max(2, min(4, args.tree_reduce_max_depth))
     if tree_reduce_max_depth != args.tree_reduce_max_depth and verbose:
         print(f"  tree_reduce_max_depth clamped to {tree_reduce_max_depth} (allowed 2..3)")
     per_section_optimize = (
