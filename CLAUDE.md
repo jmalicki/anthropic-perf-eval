@@ -160,7 +160,7 @@ Output options:
 - **CP-SAT** (default) is required for guaranteed correct results with the SSA builder.
 
 **Scheduler Selection Guide:**
-- **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), may exceed budget
+- **SSA + Greedy** (`--use-greedy`): Quick iteration only (~2s), may exceed budget. The greedy scheduler always runs as Phase 1 even with CP-SAT; `--use-greedy` skips Phases 2-3. **Never use `--use-greedy` for recorded results or benchmarking.**
 - **SSA + CP-SAT 1 hour** (default): Production runs, benchmarking (recommended, correct output)
 - **SSA + CP-SAT 30 min** (`--cpsat-time-limit 1800`): Good for 4-round development iteration
 
@@ -193,6 +193,16 @@ Output options:
 │                               │   │   types.rs (SsaOp, traits)    │
 └───────────────────────────────┘   └───────────────────────────────┘
 ```
+
+### Three-Phase Hint-Based Scheduling
+
+The scheduling pipeline has three phases:
+
+1. **Greedy scheduler** (~100ms): Produces per-op cycle hints, VALU shift decisions, and SelectChoice/ConstChoice. May exceed scratch budget in some sections — this is expected, not a bug.
+2. **Per-section feasibility CP-SAT** (seconds–minutes): Re-schedules only sections that exceed scratch budget. Merges results back, potentially changing SelectChoice decisions.
+3. **Full-kernel CP-SAT** (minutes–hours): Uses greedy+repair hints as warm start. Optimizes across all sections simultaneously for minimum cycles.
+
+Better greedy hints → faster CP-SAT convergence. Hint quality is measured by cycles, peak liveness, and budget headroom. See [docs/GREEDY_SCHEDULER_DESIGN.md](docs/GREEDY_SCHEDULER_DESIGN.md) for detailed analysis of pressure policies and improvement roadmap.
 
 ### Rust Kernel Builder (SSA only)
 
