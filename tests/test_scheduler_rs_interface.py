@@ -72,6 +72,7 @@ def test_4_round_submission_correctness():
 
     Submission-style correctness: forest_height=10, n_nodes=2047, batch_size=256, rounds=4.
     Build via scheduler_rs, run on Machine, assert output == reference_kernel2.
+    Uses default Adaptive pressure policy (graduated sort, no cascading deferral).
     """
     import scheduler_rs
 
@@ -144,6 +145,57 @@ def test_ssa_2_rounds_batch_16_correctness():
     )
     assert not stats.get("budget_exceeded", False), "2r16b should stay within budget"
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
+def test_scheduling_pressure_policy_throttled():
+    """PyO3: scheduling_pressure_policy='throttled' kwarg is accepted and produces correct output."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+        scheduling_pressure_policy="throttled",
+    )
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+
+
+def test_scheduling_pressure_policy_gated():
+    """PyO3: scheduling_pressure_policy='gated' kwarg is accepted and produces correct output."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+        scheduling_pressure_policy="gated",
+    )
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+
+
+def test_scheduling_pressure_policy_greedy():
+    """PyO3: scheduling_pressure_policy='greedy' kwarg is accepted and produces correct output."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+        scheduling_pressure_policy="greedy",
+    )
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
 
 
 def test_depth4_validates():

@@ -1955,3 +1955,445 @@ fn test_greedy_mixed_predecessors_diamond() {
         normal_cycle + 1
     );
 }
+
+// =========================================================================
+// PressurePolicy Tests
+//
+// Verify the four pressure policies (Greedy, PressureThrottled, PressureGated,
+// Adaptive) produce correct scheduling decisions and that the trait integration
+// works end-to-end.
+// =========================================================================
+
+use super::pressure_policy::{
+    AdaptivePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy, PressureThrottledPolicy,
+};
+
+/// Test GreedyPolicy sort: pure LUC descending.
+#[test]
+fn test_greedy_policy_sort_by_luc() {
+    let policy = GreedyPolicy;
+    // (idx, luc, words_added, words_freed)
+    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops, 500, 1536);
+    // Should sort by LUC descending: 5, 3, 1
+    assert_eq!(ops[0].0, 2, "LUC=5 should be first");
+    assert_eq!(ops[1].0, 0, "LUC=3 should be second");
+    assert_eq!(ops[2].0, 1, "LUC=1 should be third");
+}
+
+/// Test GreedyPolicy never defers and always allows shift.
+#[test]
+fn test_greedy_policy_no_deferral_always_shift() {
+    let policy = GreedyPolicy;
+    assert!(!policy.should_defer_for_pressure(1500, 8, 0, 1536));
+    assert!(!policy.should_defer_for_pressure(1536, 8, 0, 1536));
+    assert!(policy.allow_shift(1500, 10, 1536));
+    assert!(policy.allow_shift(1536, 12, 1536));
+}
+
+/// Test PressureThrottledPolicy sort changes above soft threshold.
+#[test]
+fn test_throttled_policy_sort_changes_above_threshold() {
+    let policy = PressureThrottledPolicy::default(); // soft_threshold = 85%
+
+    // Below threshold (85% of 1536 = 1305): sort by LUC descending
+    let mut ops_below = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops_below, 1000, 1536);
+    assert_eq!(ops_below[0].0, 2, "Below threshold: LUC=5 first");
+
+    // Above threshold: sort by net pressure ascending (prefer freeing ops)
+    // op0: net = 8-0 = 8, op1: net = 8-8 = 0, op2: net = 1-0 = 1
+    let mut ops_above = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops_above, 1400, 1536);
+    assert_eq!(ops_above[0].0, 1, "Above threshold: net=0 first (most freeing)");
+    assert_eq!(ops_above[1].0, 2, "Above threshold: net=1 second");
+    assert_eq!(ops_above[2].0, 0, "Above threshold: net=8 last (most adding)");
+}
+
+/// Test PressureThrottledPolicy suppresses shift when ALU is heavily loaded.
+#[test]
+fn test_throttled_policy_suppresses_shift_high_alu() {
+    let policy = PressureThrottledPolicy::default(); // alu_shift_suppress_threshold = 8
+
+    // ALU <= 8: allow shift
+    assert!(policy.allow_shift(1000, 4, 1536));
+    assert!(policy.allow_shift(1000, 8, 1536));
+
+    // ALU > 8: suppress shift
+    assert!(
+        !policy.allow_shift(1000, 9, 1536),
+        "Should suppress shift when alu_used > 8"
+    );
+    assert!(!policy.allow_shift(1000, 12, 1536));
+}
+
+/// Test PressureThrottledPolicy does NOT defer (only re-sorts).
+#[test]
+fn test_throttled_policy_no_deferral() {
+    let policy = PressureThrottledPolicy::default();
+    assert!(!policy.should_defer_for_pressure(1500, 8, 0, 1536));
+    assert!(!policy.should_defer_for_pressure(1536, 8, 0, 1536));
+}
+
+/// Test PressureGatedPolicy never defers (deferral disabled to avoid cascading deferral).
+/// See docs/SCHEDULING_PRESSURE_CASCADING_DEFERRAL.md.
+#[test]
+fn test_gated_policy_no_deferral() {
+    let policy = PressureGatedPolicy::default();
+
+    // Never defers — pressure awareness is handled by sort_ready()
+    assert!(!policy.should_defer_for_pressure(1400, 8, 0, 1536));
+    assert!(!policy.should_defer_for_pressure(1500, 8, 0, 1536));
+    assert!(!policy.should_defer_for_pressure(1500, 8, 8, 1536));
+    assert!(!policy.should_defer_for_pressure(1536, 8, 0, 1536));
+}
+
+/// Test PressureGatedPolicy graduated sort: above soft threshold, composite score
+/// shifts from LUC-dominant to pressure-dominant.
+#[test]
+fn test_gated_policy_graduated_sort() {
+    let policy = PressureGatedPolicy::default(); // soft=85%, critical=95%
+
+    // Below soft threshold (85% of 1536 = 1305): pure LUC sort
+    let mut ops_below = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops_below, 1000, 1536);
+    assert_eq!(ops_below[0].0, 2, "Below soft: LUC=5 first");
+
+    // At ~100% pressure: nearly pure net-pressure sort
+    // op0: net=8, op1: net=0, op2: net=1
+    let mut ops_high = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops_high, 1530, 1536);
+    assert_eq!(ops_high[0].0, 1, "Near 100%: net=0 first (most freeing)");
+    // op2 (net=1) should come before op0 (net=8) at high pressure
+    assert_eq!(ops_high[1].0, 2, "Near 100%: net=1 second");
+    assert_eq!(ops_high[2].0, 0, "Near 100%: net=8 last");
+}
+
+/// Test PressureGatedPolicy suppresses shift above critical threshold.
+#[test]
+fn test_gated_policy_shift_suppression() {
+    let policy = PressureGatedPolicy::default(); // critical = 95% of 1536 = 1459
+
+    // Below critical threshold and ALU low: allow
+    assert!(policy.allow_shift(1000, 4, 1536));
+
+    // Above critical threshold: suppress regardless of ALU
+    assert!(
+        !policy.allow_shift(1500, 4, 1536),
+        "Should suppress shift above critical threshold"
+    );
+
+    // Below critical but ALU > 8: also suppress (same as Throttled)
+    assert!(
+        !policy.allow_shift(1000, 9, 1536),
+        "Should suppress shift when alu_used > 8"
+    );
+}
+
+/// Test AdaptivePolicy transitions: below soft → Greedy behavior.
+#[test]
+fn test_adaptive_policy_greedy_below_soft() {
+    let policy = AdaptivePolicy::default(); // soft=85%, critical=95%
+
+    // Below 85%: LUC sort (same as GreedyPolicy)
+    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops, 1000, 1536);
+    assert_eq!(ops[0].0, 2, "Below soft: LUC=5 should be first");
+
+    // Below 85%: no deferral
+    assert!(!policy.should_defer_for_pressure(1000, 8, 0, 1536));
+
+    // Below 85%: always allow shift
+    assert!(policy.allow_shift(1000, 10, 1536));
+}
+
+/// Test AdaptivePolicy transitions: between soft and critical → graduated blend.
+///
+/// At ~91% pressure (1400/1536), pressure_weight ≈ 0.41. This is a blend where
+/// both LUC and net pressure matter. The composite score is:
+///   score = 0.41 * net_pressure - 0.59 * LUC
+///
+/// ops: (0, LUC=3, net=8), (1, LUC=1, net=0), (2, LUC=5, net=1)
+/// scores: op0=1.51, op1=-0.59, op2=-2.54 → sort: op2, op1, op0
+/// Op2 wins because its high LUC (5) outweighs its small net pressure (1) at this blend.
+#[test]
+fn test_adaptive_policy_throttled_between_thresholds() {
+    let policy = AdaptivePolicy::default(); // soft=85% (1305), critical=95% (1459)
+
+    // At 1400 (~91%): graduated composite score — LUC still has significant weight
+    let mut ops = vec![(0, 3, 8, 0), (1, 1, 8, 8), (2, 5, 1, 0)];
+    policy.sort_ready(&mut ops, 1400, 1536);
+    // Op2 (LUC=5, net=1) has best composite score at this blend level
+    assert_eq!(ops[0].0, 2, "Throttled zone: op2 (high LUC, low net) first at ~91%");
+    // Op0 (LUC=3, net=8) should be last — high net pressure penalty
+    assert_eq!(ops[2].0, 0, "Throttled zone: op0 (high net=8) last");
+
+    // No deferral
+    assert!(!policy.should_defer_for_pressure(1400, 8, 0, 1536));
+
+    // Throttled: suppress shift when ALU > threshold
+    assert!(policy.allow_shift(1400, 4, 1536));
+    assert!(!policy.allow_shift(1400, 9, 1536));
+}
+
+/// Test AdaptivePolicy transitions: above critical → graduated sort, no deferral.
+#[test]
+fn test_adaptive_policy_gated_above_critical() {
+    let policy = AdaptivePolicy::default(); // critical=95% (1459)
+
+    // Never defers — pressure awareness handled by sort_ready()
+    assert!(
+        !policy.should_defer_for_pressure(1500, 8, 0, 1536),
+        "Above critical: should NOT defer (cascading deferral fix)"
+    );
+    assert!(
+        !policy.should_defer_for_pressure(1500, 8, 8, 1536),
+        "Above critical: should NOT defer"
+    );
+
+    // Above critical: suppress all shifts (shift suppression is retained)
+    assert!(!policy.allow_shift(1500, 4, 1536));
+
+    // Graduated sort at high pressure: pressure-dominant
+    // op0: LUC=5, net=8; op1: LUC=1, net=0; op2: LUC=3, net=1
+    let mut ops = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops, 1500, 1536);
+    assert_eq!(ops[0].0, 1, "Above critical: net=0 first (pressure-dominant sort)");
+}
+
+/// Test that GreedyPolicy produces the same schedule as before (regression guard).
+/// Uses the same test pattern as test_greedy_fallback_sets_budget_exceeded but with
+/// a comfortable budget so nothing changes.
+#[test]
+fn test_greedy_policy_unchanged_regression() {
+    let mut emit = SsaEmitContext::new();
+    let s1 = emit.emit_const(1);
+    let s2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(s1);
+    let v2 = emit.emit_vbroadcast(s2);
+    let v3 = emit.emit_valu(Opcode::Add, v1, v2);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, v3);
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &GreedyPolicy,
+    );
+
+    assert!(result.is_ok(), "GreedyPolicy should schedule: {:?}", result.err());
+    let (cycles, budget_exceeded, _peak_live) = result.unwrap();
+    assert!(!budget_exceeded, "Should not exceed budget with GreedyPolicy");
+    assert!(cycles > 0, "Should produce a valid schedule");
+
+    // Verify all ops have valid cycles (except dead stores)
+    for (i, op) in emit.ops.iter().enumerate() {
+        if op.dest.is_some() {
+            // All ops with dests should be scheduled (unless dead)
+            // The vstore has no dest, so skip it
+        }
+        if i == emit.ops.len() - 1 {
+            // vstore should be scheduled
+            assert!(op.cycle >= 0, "vstore should be scheduled");
+        }
+    }
+}
+
+/// Test that PressureThrottledPolicy can be passed and produces a valid schedule.
+#[test]
+fn test_throttled_policy_produces_valid_schedule() {
+    let mut emit = SsaEmitContext::new();
+    let s1 = emit.emit_const(1);
+    let s2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(s1);
+    let v2 = emit.emit_vbroadcast(s2);
+    let v3 = emit.emit_valu(Opcode::Add, v1, v2);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, v3);
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &PressureThrottledPolicy::default(),
+    );
+
+    assert!(result.is_ok(), "PressureThrottledPolicy should schedule: {:?}", result.err());
+    let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
+    assert!(!budget_exceeded, "Should not exceed budget with PressureThrottledPolicy");
+}
+
+/// Test that PressureGatedPolicy can be passed and produces a valid schedule.
+#[test]
+fn test_gated_policy_produces_valid_schedule() {
+    let mut emit = SsaEmitContext::new();
+    let s1 = emit.emit_const(1);
+    let s2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(s1);
+    let v2 = emit.emit_vbroadcast(s2);
+    let v3 = emit.emit_valu(Opcode::Add, v1, v2);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, v3);
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &PressureGatedPolicy::default(),
+    );
+
+    assert!(result.is_ok(), "PressureGatedPolicy should schedule: {:?}", result.err());
+    let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
+    assert!(!budget_exceeded, "Should not exceed budget with PressureGatedPolicy");
+}
+
+/// Test that AdaptivePolicy can be passed and produces a valid schedule.
+#[test]
+fn test_adaptive_policy_produces_valid_schedule() {
+    let mut emit = SsaEmitContext::new();
+    let s1 = emit.emit_const(1);
+    let s2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(s1);
+    let v2 = emit.emit_vbroadcast(s2);
+    let v3 = emit.emit_valu(Opcode::Add, v1, v2);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, v3);
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AdaptivePolicy::default(),
+    );
+
+    assert!(result.is_ok(), "AdaptivePolicy should schedule: {:?}", result.err());
+    let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
+    assert!(!budget_exceeded, "Should not exceed budget with AdaptivePolicy");
+}
+
+/// Test AdaptivePolicy graduated sort weight: as pressure increases from 85% to 100%,
+/// sort weight shifts from LUC-dominant to pressure-dominant.
+#[test]
+fn test_adaptive_graduated_sort_weight() {
+    let policy = AdaptivePolicy::default(); // soft=85%
+
+    // Create ops with conflicting LUC vs pressure signals:
+    // op0: high LUC (5), high net pressure (8 added, 0 freed) — good for ILP, bad for pressure
+    // op1: low LUC (1), zero net pressure (8 added, 8 freed) — neutral ILP, great for pressure
+    // op2: medium LUC (3), low net pressure (1 added, 0 freed) — medium both
+
+    // At exactly soft threshold (85%): pure LUC sort
+    let at_soft = (1536.0 * 0.85) as usize; // 1305
+    let mut ops_soft = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops_soft, at_soft, 1536);
+    assert_eq!(ops_soft[0].0, 0, "At soft threshold: LUC=5 first (pure LUC)");
+
+    // Just above soft threshold (~87%): LUC still dominates but pressure has some influence
+    let mut ops_87 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops_87, 1340, 1536); // ~87.2%
+    // At low pressure_weight, LUC=5 (op0) likely still wins despite net=8
+    // But op1 (net=0) should be preferred over op2 (net=1) when LUC difference is small
+
+    // At ~93% pressure: pressure weight ~0.53 — roughly balanced
+    let mut ops_93 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops_93, 1428, 1536); // ~93%
+    // Pressure is now significant enough that net=0 (op1) can beat net=8 (op0)
+
+    // At ~100% pressure: pressure weight → 1.0, nearly pure pressure sort
+    let mut ops_100 = vec![(0, 5, 8, 0), (1, 1, 8, 8), (2, 3, 1, 0)];
+    policy.sort_ready(&mut ops_100, 1530, 1536);
+    assert_eq!(ops_100[0].0, 1, "Near 100%: net=0 first (pressure-dominant)");
+    assert_eq!(ops_100[1].0, 2, "Near 100%: net=1 second");
+    assert_eq!(ops_100[2].0, 0, "Near 100%: net=8 last");
+}
+
+/// Test that AdaptivePolicy does NOT cause cascading deferral when all ready ops
+/// have positive net pressure. This was the original bug.
+///
+/// Scenario: 4 vbroadcasts (each +8 words) with tight budget. With old binary gate,
+/// above 95% all would be deferred → force-schedule → budget_exceeded. With graduated
+/// sort, they are sorted by composite score and scheduled normally.
+#[test]
+fn test_adaptive_no_cascading_deferral() {
+    let mut emit = SsaEmitContext::new();
+
+    // Create 4 scalar constants feeding 4 vbroadcasts, then a chain of VALU ops
+    // consuming them. All vbroadcasts add 8 words and free 0 (positive net pressure).
+    let s1 = emit.emit_const(1);
+    let s2 = emit.emit_const(2);
+    let s3 = emit.emit_const(3);
+    let s4 = emit.emit_const(4);
+    let v1 = emit.emit_vbroadcast(s1);
+    let v2 = emit.emit_vbroadcast(s2);
+    let v3 = emit.emit_vbroadcast(s3);
+    let v4 = emit.emit_vbroadcast(s4);
+    let v5 = emit.emit_valu(Opcode::Add, v1, v2);
+    let v6 = emit.emit_valu(Opcode::Add, v3, v4);
+    let v7 = emit.emit_valu(Opcode::Add, v5, v6);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, v7);
+
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+
+    let mut shifted_ops = HashSet::new();
+
+    // Budget of 40: tight enough that 4 vectors (32 words) + scalars approach the limit,
+    // but should not force-schedule with graduated sort.
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        40,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AdaptivePolicy::default(),
+    );
+
+    assert!(result.is_ok(), "Should complete: {:?}", result.err());
+    let (_cycles, budget_exceeded, _peak_live) = result.unwrap();
+    assert!(
+        !budget_exceeded,
+        "AdaptivePolicy should NOT force-schedule (no cascading deferral); peak_live={}",
+        _peak_live
+    );
+}

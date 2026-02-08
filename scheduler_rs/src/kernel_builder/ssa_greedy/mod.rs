@@ -27,11 +27,14 @@
 //! The CP-SAT scheduler (`cpsat_scheduler.rs`) also honors dead stores by
 //! checking for negative cycle hints (-1) from the greedy scheduler.
 
+pub mod pressure_policy;
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::types::{EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN};
 
+use self::pressure_policy::{GreedyPolicy, PressurePolicy};
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
 
 /// Dump usage breakdown for currently live VRegs when budget is exceeded.
@@ -167,6 +170,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         None,
         None,
         None,
+        &GreedyPolicy,
     )
 }
 
@@ -190,6 +194,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     select_fma_cycles: Option<&mut HashMap<usize, i32>>,
     mut const_add_imm_ops: Option<&mut HashSet<usize>>,
     asap_alap: Option<(&HashMap<usize, i32>, &HashMap<usize, i32>)>,
+    strategy: &dyn PressurePolicy,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -492,15 +497,36 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 .count()
         }
 
-        // Sort ready_this_cycle by LUC (descending) as tie-breaker for ASAP.
-        // Since heap already sorted by ASAP, stable sort preserves that ordering.
-        ready_this_cycle.sort_by(|&a, &b| {
-            compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
-                ops,
-                &vreg_remaining_users,
-                a,
-            ))
-        });
+        // Build (idx, luc, words_added, words_freed) tuples for strategy-driven sort.
+        let mut ready_tuples: Vec<(usize, usize, usize, usize)> = ready_this_cycle
+            .iter()
+            .map(|&idx| {
+                let luc = compute_luc(ops, &vreg_remaining_users, idx);
+                let words_added = ops[idx].dest.map_or(0, |d| d.size());
+                let words_freed_est = ops[idx]
+                    .srcs
+                    .iter()
+                    .filter(|src| {
+                        if let Operand::VReg(vreg) = src {
+                            vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
+                                && live_vregs.contains(vreg)
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|src| {
+                        if let Operand::VReg(vreg) = src {
+                            vreg.size()
+                        } else {
+                            0
+                        }
+                    })
+                    .sum();
+                (idx, luc, words_added, words_freed_est)
+            })
+            .collect();
+        strategy.sort_ready(&mut ready_tuples, live_words, scratch_budget);
+        ready_this_cycle = ready_tuples.into_iter().map(|(idx, _, _, _)| idx).collect();
 
         // Keep retrying as long as we make progress (schedule something or free VRegs)
         while made_progress {
@@ -615,6 +641,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     budget_deferred.push(idx);
                     continue;
                 }
+                // Strategy-driven soft deferral (pressure awareness)
+                if strategy.should_defer_for_pressure(
+                    live_words,
+                    words_added,
+                    words_freed,
+                    scratch_budget,
+                ) {
+                    budget_deferred.push(idx);
+                    continue;
+                }
 
                 // Schedule the op
                 //
@@ -622,16 +658,30 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // VALU is full (valu_used >= 6). Shift decisions are left to CP-SAT, which can
                 // optimize them globally; greedy just provides cycle hints and shifts only when
                 // necessary to make progress.
+                //
+                // Strategy can suppress shifting via allow_shift() when pressure is high.
                 match engine {
                     Engine::Load => load_used += 1,
                     Engine::Store => store_used += 1,
                     Engine::Alu => alu_used += 1,
                     Engine::Valu => {
-                        if can_shift && valu_used >= 6 {
+                        if can_shift
+                            && valu_used >= 6
+                            && strategy.allow_shift(live_words, alu_used, scratch_budget)
+                        {
                             alu_used += VLEN;
                             shifted_ops.insert(op_id);
-                        } else {
+                        } else if valu_used < 6 {
                             valu_used += 1;
+                        } else {
+                            // VALU full, shift suppressed by strategy — defer to next cycle
+                            let next_priority = asap_alap
+                                .as_ref()
+                                .and_then(|(a, _)| a.get(&op_id).copied())
+                                .map(|lb| ((cycle + 1) as i32).max(lb))
+                                .unwrap_or_else(|| (cycle + 1) as i32);
+                            ready_heap.push(Reverse((next_priority, idx)));
+                            continue;
                         }
                     }
                     Engine::Flow => {
@@ -776,13 +826,18 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 }
                 budget_exceeded = true;
                 #[allow(unused_assignments)]
-                // Same design as normal path: shift only when VALU full, not by preference
+                // Same design as normal path: shift only when VALU full, not by preference.
+                // Force-schedule still respects strategy's allow_shift to avoid
+                // displacement cascade that further inflates liveness.
                 match engine {
                     Engine::Load => load_used += 1,
                     Engine::Store => store_used += 1,
                     Engine::Alu => alu_used += 1,
                     Engine::Valu => {
-                        if can_shift && valu_used >= 6 {
+                        if can_shift
+                            && valu_used >= 6
+                            && strategy.allow_shift(live_words, alu_used, scratch_budget)
+                        {
                             alu_used += VLEN;
                             shifted_ops.insert(op_id);
                         } else {

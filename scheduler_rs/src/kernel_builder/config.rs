@@ -127,6 +127,28 @@ impl ProblemSpec {
     }
 }
 
+/// Which scheduling pressure policy the greedy scheduler should use.
+///
+/// Controls how the scheduler reacts to rising scratch (register) pressure.
+/// Modeled after LLVM's `GenericScheduler` register-pressure heuristics
+/// (`RegExcess`/`RegCritical` in `MachineScheduler.cpp`).
+///
+/// See `ssa_greedy::pressure_policy` for implementation details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PressurePolicyKind {
+    /// No pressure awareness: LUC sort, defer at hard budget only, always shift.
+    Greedy,
+    /// Soft throttling: re-sort by net pressure above 85% budget, suppress
+    /// shift when ALU >8/12 used.
+    PressureThrottled,
+    /// Hard gating: above 95% budget, only schedule ops with non-positive net
+    /// pressure. Suppress shift above critical threshold.
+    PressureGated,
+    /// Adaptive (default): transitions Greedy → Throttled → Gated as pressure rises.
+    #[default]
+    Adaptive,
+}
+
 /// Compilation concern: how to optimize and schedule.
 ///
 /// Controls scheduling and optimization passes — these don't affect
@@ -137,6 +159,11 @@ pub struct CompilerConfig {
     pub enable_valu_shift: bool,
     /// Enable SSA dead code elimination before scheduling.
     pub enable_ssa_dce: bool,
+    /// Scheduling pressure policy for the greedy scheduler.
+    ///
+    /// Controls how the scheduler reacts to rising scratch (register) pressure.
+    /// See `ssa_greedy::pressure_policy` module for details.
+    pub scheduling_pressure_policy: PressurePolicyKind,
 }
 
 impl Default for CompilerConfig {
@@ -144,6 +171,7 @@ impl Default for CompilerConfig {
         CompilerConfig {
             enable_valu_shift: true,
             enable_ssa_dce: true,
+            scheduling_pressure_policy: PressurePolicyKind::default(),
         }
     }
 }

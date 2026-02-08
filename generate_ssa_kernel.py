@@ -95,6 +95,8 @@ def main():
                         help="Enable ASAP/ALAP tightening by considering slot capacity (experimental, for ablation studies)")
     parser.add_argument("--enable-scratch-tightening", action="store_true",
                         help="Enable scratch-aware tightening. Considers scratch constraints when tightening bounds (experimental, for ablation studies). Can be used independently of --enable-asap-alap-tightening.")
+    parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive"], default="adaptive",
+                        help="Scheduling pressure policy: adaptive (default, transitions automatically), greedy (no pressure awareness), throttled (soft re-sort), gated (hard gate)")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -161,6 +163,8 @@ def main():
         print(f"  enable_asap_alap_tightening=True")
     if args.enable_scratch_tightening:
         print(f"  enable_scratch_tightening=True")
+    if args.scheduling_pressure_policy != "adaptive":
+        print(f"  scheduling_pressure_policy={args.scheduling_pressure_policy}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -182,6 +186,7 @@ def main():
         "force_zero_gap": args.force_zero_gap and use_cpsat,
         "enable_asap_alap_tightening": args.enable_asap_alap_tightening and use_cpsat,
         "enable_scratch_tightening": args.enable_scratch_tightening and use_cpsat,
+        "scheduling_pressure_policy": args.scheduling_pressure_policy,
     }
     git_sha = get_git_sha()
 
@@ -207,6 +212,7 @@ def main():
         run_options_json=json.dumps(run_options),
         git_sha=git_sha,
         comment=args.comment,
+        scheduling_pressure_policy=args.scheduling_pressure_policy,
     )
     build_time = time.time() - start_time
 
