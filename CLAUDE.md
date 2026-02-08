@@ -109,9 +109,6 @@ uv run generate_ssa_kernel.py --rounds 2 --use-greedy
 # 4-round with CP-SAT and validation (30 min, good for development)
 uv run generate_ssa_kernel.py --rounds 4 --cpsat-time-limit 1800 --validate
 
-# Disable VALU shift to reduce scratch pressure
-uv run generate_ssa_kernel.py --no-valu-shift --validate
-
 # Auto-rebuild scheduler_rs if Rust changed, then run
 ./scripts/run_generate_ssa_kernel.sh --cpsat-time-limit 7200 --validate --rounds 4
 

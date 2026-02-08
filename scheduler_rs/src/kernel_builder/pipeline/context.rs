@@ -1,0 +1,213 @@
+//! Pipeline context sub-types.
+//!
+//! Defines the structured data types that flow through the pipeline:
+//! - `SchedulingBounds` — ASAP/ALAP bounds for CP-SAT domains
+//! - `SchedulingDecisions` — choice/shift decisions from scheduling passes
+//! - `SchedulingMetrics` — cycle count, peak liveness, budget status
+//! - `PipelineConfig` — unified configuration for the pipeline
+//! - `PassReport` — timing and diagnostics for each pass
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use crate::types::{MachineConfig, Opcode};
+
+use super::super::config::CompilerConfig;
+
+#[cfg(feature = "cpsat")]
+use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, SsaCpsatConfig, ValuShiftMode};
+
+// ============================================================================
+// Scheduling Bounds (CP-SAT domain hints)
+// ============================================================================
+
+/// ASAP/ALAP bounds computed from the dependency graph.
+///
+/// These are domain hints for the CP-SAT solver, not correctness guarantees.
+/// Uses min_delay (best-case) for widest valid domains.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulingBounds {
+    /// ASAP (as-soon-as-possible) cycle for each op, keyed by op index.
+    pub asap: HashMap<usize, i32>,
+    /// ALAP (as-late-as-possible) cycle for each op, keyed by op index.
+    pub alap: HashMap<usize, i32>,
+}
+
+// ============================================================================
+// Scheduling Decisions
+// ============================================================================
+
+/// Decisions made by a scheduling pass (greedy or CP-SAT).
+///
+/// These track which ops were shifted, which encoding was chosen for
+/// ConstChoice/SelectChoice, and other scheduling decisions.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulingDecisions {
+    /// VALU ops shifted to ALU (by op ID).
+    pub shifted_ops: HashSet<usize>,
+    /// SelectChoice ops using FMA path (by op ID).
+    pub select_fma_ops: HashSet<usize>,
+    /// ConstChoice ops using AddImm encoding (by op ID).
+    pub const_add_imm_ops: HashSet<usize>,
+    /// ConstChoice ops using ALU-derived encoding: op_id → (left_op_id, right_op_id, opcode).
+    pub const_alu_derive_ops: HashMap<usize, (usize, usize, Opcode)>,
+    /// Individual ALU cycle assignments for shifted VALU ops: op_id → [c0..c7].
+    pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
+    /// Op IDs of vbroadcasts eliminated (not emitted; consumers use scalar producer).
+    pub eliminated_vbroadcast_ops: HashSet<usize>,
+    /// Eliminated vbroadcast op_id → scalar producer op_id mapping.
+    pub eliminated_vb_to_scalar_producer: HashMap<usize, usize>,
+    /// SelectChoice sub cycles from greedy: op_id → cycle for the sub instruction.
+    pub select_sub_cycles: HashMap<usize, i32>,
+    /// SelectChoice FMA cycles from greedy: op_id → cycle for the FMA instruction.
+    pub select_fma_cycles: HashMap<usize, i32>,
+}
+
+// ============================================================================
+// Scheduling Metrics
+// ============================================================================
+
+/// Metrics from a scheduling pass.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulingMetrics {
+    /// Number of cycles in the schedule.
+    pub cycles: usize,
+    /// Peak simultaneously-live words.
+    pub peak_live: usize,
+    /// Whether the scratch budget was exceeded.
+    pub budget_exceeded: bool,
+}
+
+// ============================================================================
+// Pipeline Configuration
+// ============================================================================
+
+/// CP-SAT-specific pipeline configuration.
+#[cfg(feature = "cpsat")]
+#[derive(Debug, Clone)]
+pub struct CpSatPipelineConfig {
+    /// Time limit for the full-kernel CP-SAT solve.
+    pub time_limit_secs: f64,
+    /// Whether to print verbose solver output.
+    pub verbose: bool,
+    /// Enable vbroadcast elimination optimization.
+    pub enable_vbroadcast_elimination: bool,
+    /// Per-section optimization time (None or Some(0) = feasibility only).
+    pub per_section_optimize_secs: Option<f64>,
+    /// Forced shift set (ops that must be shifted to ALU).
+    pub forced_shifts: Option<HashSet<usize>>,
+    /// ConstChoice handling mode.
+    pub const_choice_mode: ConstChoiceMode,
+    /// SelectChoice handling mode.
+    pub select_choice_mode: SelectChoiceMode,
+    /// VALU shift handling mode.
+    pub valu_shift_mode: ValuShiftMode,
+    /// Force zero optimality gap (proven optimal).
+    pub force_zero_gap: bool,
+    /// Enable ASAP/ALAP tightening by slot capacity.
+    pub enable_asap_alap_tightening: bool,
+    /// Enable scratch-aware domain tightening.
+    pub enable_scratch_tightening: bool,
+}
+
+#[cfg(feature = "cpsat")]
+impl Default for CpSatPipelineConfig {
+    fn default() -> Self {
+        CpSatPipelineConfig {
+            time_limit_secs: 3600.0,
+            verbose: true,
+            enable_vbroadcast_elimination: false,
+            per_section_optimize_secs: None,
+            forced_shifts: None,
+            const_choice_mode: ConstChoiceMode::Optimize,
+            select_choice_mode: SelectChoiceMode::Optimize,
+            valu_shift_mode: ValuShiftMode::Optimize,
+            force_zero_gap: false,
+            enable_asap_alap_tightening: false,
+            enable_scratch_tightening: false,
+        }
+    }
+}
+
+#[cfg(feature = "cpsat")]
+impl CpSatPipelineConfig {
+    /// Build an `SsaCpsatConfig` for the full-kernel CP-SAT solve.
+    pub fn to_full_kernel_config(&self, scratch_budget: usize) -> SsaCpsatConfig {
+        SsaCpsatConfig {
+            time_limit_secs: self.time_limit_secs,
+            verbose: self.verbose,
+            stop_after_first_solution: false,
+            enable_valu_shift: false, // set by caller from pipeline config
+            enable_vbroadcast_elimination: self.enable_vbroadcast_elimination,
+            scratch_budget,
+            model_name: Some("full_kernel_optimization".to_string()),
+            machine: MachineConfig::default(),
+            const_choice_mode: self.const_choice_mode,
+            select_choice_mode: self.select_choice_mode,
+            valu_shift_mode: self.valu_shift_mode,
+            force_zero_gap: self.force_zero_gap,
+            enable_asap_alap_tightening: self.enable_asap_alap_tightening,
+            enable_scratch_tightening: self.enable_scratch_tightening,
+            ..Default::default()
+        }
+    }
+
+    /// Build an `SsaCpsatConfig` for bounds computation.
+    pub fn to_bounds_config(
+        &self,
+        enable_valu_shift: bool,
+        scratch_budget: usize,
+    ) -> SsaCpsatConfig {
+        SsaCpsatConfig {
+            enable_asap_alap_tightening: self.enable_asap_alap_tightening,
+            enable_scratch_tightening: self.enable_scratch_tightening,
+            enable_valu_shift,
+            scratch_budget,
+            ..Default::default()
+        }
+    }
+}
+
+/// Unified pipeline configuration.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Compilation config (DCE, VALU shift, etc.).
+    pub compiler: CompilerConfig,
+    /// Machine slot limits.
+    pub machine: MachineConfig,
+    /// Hardware scratch budget in words.
+    pub scratch_budget: usize,
+    /// Whether to print verbose output.
+    pub verbose: bool,
+    /// CP-SAT specific configuration (None for greedy-only pipeline).
+    #[cfg(feature = "cpsat")]
+    pub cpsat: Option<CpSatPipelineConfig>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        PipelineConfig {
+            compiler: CompilerConfig::default(),
+            machine: MachineConfig::default(),
+            scratch_budget: 1536,
+            verbose: true,
+            #[cfg(feature = "cpsat")]
+            cpsat: None,
+        }
+    }
+}
+
+// ============================================================================
+// Pass Report
+// ============================================================================
+
+/// Report from a single pass execution.
+#[derive(Debug, Clone)]
+pub struct PassReport {
+    /// Pass name.
+    pub name: &'static str,
+    /// How long the pass took.
+    pub duration: Duration,
+    /// Optional detail string (e.g. "213 cycles, peak 1530 words").
+    pub detail: String,
+}

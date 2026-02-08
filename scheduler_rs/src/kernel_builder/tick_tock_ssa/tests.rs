@@ -1,4 +1,6 @@
 use super::*;
+use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code};
+use crate::kernel_builder::ssa_greedy;
 use crate::kernel_builder::ssa_lower::expand_ssa_valu_to_alu;
 use crate::types::{Engine, Opcode, Operand};
 use std::collections::HashMap;
