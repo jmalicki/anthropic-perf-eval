@@ -24,6 +24,13 @@ pub struct CascadePolicy {
     pub critical_threshold_fraction: f64,
     /// Maximum ALU slots used before suppressing VALU→ALU shift.
     pub alu_shift_suppress_threshold: usize,
+    /// Fraction of scratch budget above which ASAP inflation activates.
+    pub inflation_threshold_fraction: f64,
+    /// Minimum slack (ALAP - ASAP) required before an op can be inflated.
+    /// Ops on the critical path (slack 0-2) are never inflated.
+    pub min_inflation_slack: i32,
+    /// Maximum number of cycles to inflate ASAP by.
+    pub max_inflation_cycles: i32,
 }
 
 impl Default for CascadePolicy {
@@ -32,6 +39,9 @@ impl Default for CascadePolicy {
             soft_threshold_fraction: 0.85,
             critical_threshold_fraction: 0.95,
             alu_shift_suppress_threshold: 8,
+            inflation_threshold_fraction: 0.80,
+            min_inflation_slack: 3,
+            max_inflation_cycles: 10,
         }
     }
 }
@@ -132,6 +142,43 @@ impl PressurePolicy for CascadePolicy {
             } else {
                 true
             }
+        }
+    }
+
+    fn compute_asap_inflation(
+        &self,
+        candidate: &SchedulingCandidate,
+        ctx: &SchedulingContext,
+    ) -> Option<i32> {
+        let threshold = (ctx.scratch_budget as f64 * self.inflation_threshold_fraction) as usize;
+        if ctx.live_words <= threshold {
+            return None; // Pressure is fine, no inflation needed
+        }
+
+        let slack = candidate.slack().unwrap_or(0);
+        if slack < self.min_inflation_slack {
+            return None; // Critical-path op, never inflate
+        }
+
+        // Graduated inflation: more pressure → more inflation
+        // pressure_ratio goes from 0.0 (at threshold) to 1.0 (at budget)
+        let budget_range = ctx.scratch_budget as f64 - threshold as f64;
+        if budget_range <= 0.0 {
+            return None;
+        }
+        let pressure_ratio =
+            ((ctx.live_words as f64 - threshold as f64) / budget_range).clamp(0.0, 1.0);
+
+        // Inflation scales with both pressure and available slack
+        // slack_fraction saturates toward 1.0 as slack grows (diminishing returns)
+        let slack_fraction = (slack as f64 / (slack as f64 + 5.0)).min(1.0);
+        let inflation =
+            (pressure_ratio * slack_fraction * self.max_inflation_cycles as f64).ceil() as i32;
+
+        if inflation > 0 {
+            Some(inflation.min(self.max_inflation_cycles))
+        } else {
+            None
         }
     }
 }

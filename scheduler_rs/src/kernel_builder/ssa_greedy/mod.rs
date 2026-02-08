@@ -235,6 +235,73 @@ pub(super) fn dump_live_usage_breakdown(
     eprintln!("=== End Budget Exceeded Dump ===\n");
 }
 
+/// Build a lightweight `SchedulingCandidate` for the ASAP inflation check.
+///
+/// Computes the same fields as the sort-ready candidate builder (LUC, words_freed,
+/// ASAP/ALAP, etc.) for a single op. Used in the inflation loop where we need
+/// per-op candidates without building the full sorted list.
+fn build_inflation_candidate(
+    ops: &[SsaOp],
+    vreg_remaining_users: &HashMap<VReg, usize>,
+    live_vregs: &HashSet<VReg>,
+    consumers: &[Vec<usize>],
+    scheduled: &HashSet<usize>,
+    shiftable_set: &HashSet<usize>,
+    asap_map: &HashMap<usize, i32>,
+    alap_map: &HashMap<usize, i32>,
+    idx: usize,
+) -> pressure_policy::SchedulingCandidate {
+    let luc = ops[idx]
+        .srcs
+        .iter()
+        .filter(|src| {
+            if let Operand::VReg(vreg) = src {
+                vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
+            } else {
+                false
+            }
+        })
+        .count();
+
+    let words_added = ops[idx].dest.map_or(0, |d| d.size());
+    let words_freed: usize = ops[idx]
+        .srcs
+        .iter()
+        .filter(|src| {
+            if let Operand::VReg(vreg) = src {
+                vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
+                    && live_vregs.contains(vreg)
+            } else {
+                false
+            }
+        })
+        .map(|src| {
+            if let Operand::VReg(vreg) = src {
+                vreg.size()
+            } else {
+                0
+            }
+        })
+        .sum();
+
+    let unscheduled_consumers = consumers[idx]
+        .iter()
+        .filter(|&&c| !scheduled.contains(&c))
+        .count();
+
+    pressure_policy::SchedulingCandidate {
+        op_index: idx,
+        luc,
+        words_added,
+        words_freed,
+        asap: asap_map.get(&ops[idx].id).copied(),
+        alap: alap_map.get(&ops[idx].id).copied(),
+        engine: ops[idx].engine,
+        is_shiftable: shiftable_set.contains(&idx),
+        unscheduled_consumer_count: unscheduled_consumers,
+    }
+}
+
 /// Schedule SSA ops using a greedy list scheduler with VALU→ALU shifting
 /// and scratch budget constraint.
 ///
@@ -500,6 +567,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
     let mut cycle = 0;
     let max_cycles = 50000;
+    // Track consecutive cycles with no ops scheduled (for ASAP inflation breaker)
+    let mut consecutive_empty: usize = 0;
 
     while scheduled.len() < ops.len() && cycle < max_cycles {
         // Note: scheduled includes dead stores (pre-marked), so we check against ops.len()
@@ -567,6 +636,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         // When an op frees VRegs, previously budget-failed ops may now fit.
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
+        let mut scheduled_this_cycle: usize = 0;
 
         // Helper: compute LUC (Last-Use-Count) for an op - count of source VRegs
         // where this op is their last reader. Higher LUC = frees more scratch space.
@@ -660,15 +730,63 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 ))
             });
 
-            // Defer ops that are ready by deps but before their ASAP when bounds are provided
+            // Defer ops that are ready by deps but before their ASAP when bounds are provided.
+            // ASAP inflation: when pressure is high, defer high-slack producers by inflating
+            // their effective ASAP, creating breathing room for consumers to free VRegs.
             let mut deferred_by_bounds: Vec<(i32, usize)> = Vec::new();
             let mut ready_for_try: Vec<usize> = Vec::new();
+
+            // ASAP inflation safeguards
+            let inflation_disabled = consecutive_empty >= 3;
+            let ready_this_cycle_len = ready_this_cycle.len();
+            let mut inflation_deferred_count: usize = 0;
+            // At least MIN_PASS_THROUGH ops must pass without inflation per cycle
+            const MIN_PASS_THROUGH: usize = 3;
+
+            // Build context for inflation decisions
+            let inflation_ctx = pressure_policy::SchedulingContext {
+                cycle,
+                live_words,
+                scratch_budget,
+                slots: &slots.view(),
+            };
+
             for idx in ready_this_cycle.drain(..) {
-                if let Some((asap, _)) = asap_alap {
-                    let lb = *asap.get(&ops[idx].id).unwrap_or(&0);
+                if let Some((asap_map, alap_map)) = asap_alap {
+                    let lb = *asap_map.get(&ops[idx].id).unwrap_or(&0);
+                    // Original ASAP check — op not yet ready
                     if (cycle as i32) < lb {
                         deferred_by_bounds.push((lb, idx));
                         continue;
+                    }
+                    // ASAP inflation — op is ready but we defer it to reduce pressure.
+                    // Only inflate if: inflation is not disabled by consecutive-empty breaker,
+                    // and we haven't deferred too many this cycle (MIN_PASS_THROUGH safeguard).
+                    let max_inflation_deferrals =
+                        ready_this_cycle_len.saturating_sub(MIN_PASS_THROUGH);
+                    if !inflation_disabled && inflation_deferred_count < max_inflation_deferrals {
+                        let ub = *alap_map.get(&ops[idx].id).unwrap_or(&i32::MAX);
+                        let candidate = build_inflation_candidate(
+                            ops,
+                            &vreg_remaining_users,
+                            &live_vregs,
+                            &consumers,
+                            &scheduled,
+                            &shiftable_set,
+                            asap_map,
+                            alap_map,
+                            idx,
+                        );
+                        if let Some(inflation) =
+                            strategy.compute_asap_inflation(&candidate, &inflation_ctx)
+                        {
+                            let inflated = ((cycle as i32) + inflation).min(ub);
+                            if inflated > cycle as i32 {
+                                deferred_by_bounds.push((inflated, idx));
+                                inflation_deferred_count += 1;
+                                continue;
+                            }
+                        }
                     }
                 }
                 ready_for_try.push(idx);
@@ -799,6 +917,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 ops[idx].cycle = assigned_cycle;
                 scheduled.insert(idx);
                 made_progress = true;
+                scheduled_this_cycle += 1;
 
                 // Update live tracking for destination VReg
                 if let Some(d) = dest {
@@ -934,6 +1053,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 };
                 ops[force_idx].cycle = force_cycle;
                 scheduled.insert(force_idx);
+                scheduled_this_cycle += 1;
 
                 // Update liveness (same as normal scheduling path)
                 if let Some(dest_vreg) = dest {
@@ -985,6 +1105,13 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 .map(|lb| ((cycle + 1) as i32).max(lb))
                 .unwrap_or_else(|| (cycle + 1) as i32);
             ready_heap.push(Reverse((priority, idx)));
+        }
+
+        // Track consecutive empty cycles for ASAP inflation breaker
+        if scheduled_this_cycle == 0 {
+            consecutive_empty += 1;
+        } else {
+            consecutive_empty = 0;
         }
 
         cycle += 1;

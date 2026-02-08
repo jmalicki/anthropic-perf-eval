@@ -24,13 +24,19 @@
 //!   → slack → LUC → net pressure → ASAP tiebreak). First distinguishing level
 //!   wins — no blending. Opt-in via `--scheduling-pressure-policy cascade`.
 //!
-//! # Design: Sort-Only Pressure Awareness
+//! # Design: Sort + ASAP Inflation
 //!
 //! All policies use **sort-based** pressure awareness rather than binary deferral.
 //! The `should_defer_for_pressure()` method exists on the trait for extensibility
 //! but returns `false` for all built-in policies. This avoids **cascading deferral**
 //! — a deadlock where all ready ops are deferred because they all have positive net
 //! pressure (common on unrolled VLIW kernels with vbroadcasts and intermediates).
+//!
+//! **ASAP inflation** complements sort-based awareness: when pressure exceeds 80%,
+//! high-slack producers have their effective ASAP inflated, deferring them to later
+//! cycles. This is NOT binary deferral — it targets only ops with sufficient slack
+//! and is limited by `MIN_PASS_THROUGH` (at least 3 ops always pass through).
+//! See `compute_asap_inflation()` on the trait.
 //!
 //! See `docs/SCHEDULING_PRESSURE_CASCADING_DEFERRAL.md` for full design rationale.
 
@@ -153,4 +159,29 @@ pub trait PressurePolicy: std::fmt::Debug {
     /// Returns `false` to suppress the shift (the op will be deferred to
     /// the next cycle instead of consuming 8 ALU slots).
     fn allow_shift(&self, live_words: usize, alu_used: usize, scratch_budget: usize) -> bool;
+
+    /// Compute ASAP inflation for a candidate when pressure is high.
+    ///
+    /// Called during the ASAP-check loop for each ready op. Returns `Some(n)`
+    /// to inflate the op's ASAP by `n` cycles (delaying it), or `None` to
+    /// schedule normally. The caller clamps the inflated ASAP to the op's
+    /// ALAP to prevent infeasibility.
+    ///
+    /// # Design
+    ///
+    /// ASAP inflation defers high-slack producers when scratch pressure is
+    /// high, creating empty cycles that allow consumers to run and free
+    /// registers. This is a greedy-only heuristic — CP-SAT uses original
+    /// ASAP/ALAP bounds.
+    ///
+    /// See: Touati & Eisenbeis (2004), "Register Saturation in ILP" —
+    /// when DAG parallelism exceeds register capacity, some ops must be
+    /// delayed; inflation implements this proactively rather than reactively.
+    fn compute_asap_inflation(
+        &self,
+        _candidate: &SchedulingCandidate,
+        _ctx: &SchedulingContext,
+    ) -> Option<i32> {
+        None // Default: no inflation (backward-compatible)
+    }
 }

@@ -344,10 +344,10 @@ post-elision op set (shift, SelectChoice, and ConstChoice).
 
 ## Implemented Architecture (Track 5)
 
-> **Status**: SchedulingCandidate, SchedulingContext, and CascadePolicy are
-> implemented and tested. The hint pipeline fix (Track 4) is also implemented.
-> See `pressure_policy/mod.rs` for types and `pressure_policy/cascade.rs` for
-> the CascadePolicy. ASAP inflation is not yet implemented (future work).
+> **Status**: SchedulingCandidate, SchedulingContext, CascadePolicy, and ASAP
+> inflation are implemented and tested. The hint pipeline fix (Track 4) is also
+> implemented. See `pressure_policy/mod.rs` for types, `pressure_policy/cascade.rs`
+> for CascadePolicy, and the `compute_asap_inflation()` trait method for inflation.
 
 ### SchedulingCandidate Struct (IMPLEMENTED)
 
@@ -438,6 +438,40 @@ This is safe because:
 - The inflation is bounded: at most `slack` cycles of delay
 - Falls back to normal scheduling when pressure drops
 
+### ASAP Inflation (IMPLEMENTED)
+
+When scratch pressure exceeds 80% of budget, the greedy scheduler inflates ASAP bounds
+for high-slack producers, deferring them to later cycles. This creates breathing room
+for consumers to execute and free registers.
+
+**Key parameters** (configurable per policy via struct fields):
+- `inflation_threshold_fraction` (0.80): pressure level that activates inflation
+- `min_inflation_slack` (3): minimum slack required for inflation (critical-path exempt)
+- `max_inflation_cycles` (10): maximum deferral amount
+
+**Graduated response**: Inflation scales with both pressure ratio (0→1 from threshold
+to budget) and slack fraction (saturates via `slack/(slack+5)`). At 85% pressure with
+slack=20, inflation ≈ 3 cycles; at 100% pressure with slack=50, inflation = 10 cycles.
+
+**Safeguards**:
+- `MIN_PASS_THROUGH` (3): at least 3 ops per cycle skip inflation, preventing deadlock
+  where all ready ops are deferred
+- Consecutive-empty breaker: after 3 empty cycles (0 ops scheduled), inflation is
+  disabled for 1 cycle, breaking potential oscillation
+- ALAP clamping: inflated ASAP never exceeds ALAP (`inflated = (cycle + n).min(alap)`)
+
+**Greedy-only**: CP-SAT uses original ASAP/ALAP bounds. Inflation is a scheduling
+heuristic, not a domain constraint. The three-phase pipeline handles this naturally:
+1. Greedy (with inflation) → budget-compliant hints, possibly more cycles
+2. Per-section CP-SAT → uses original bounds, may compress the greedy schedule
+3. Full-kernel CP-SAT → uses original bounds, optimizes globally
+
+**Implementation**: The `compute_asap_inflation()` trait method on `PressurePolicy`
+returns `Option<i32>` (None = don't inflate, Some(n) = inflate by n cycles). Implemented
+in `CascadePolicy` and `AdaptivePolicy`; `GreedyPolicy` uses the default (None).
+The inflation check runs in the ASAP-check loop of `ssa_greedy/mod.rs`, using a
+lightweight `build_inflation_candidate()` helper to construct per-op candidates.
+
 ---
 
 ## Implementation Roadmap
@@ -445,7 +479,7 @@ This is safe because:
 | Priority | Change | Status | Impact | Risk | Effort |
 |----------|--------|--------|--------|------|--------|
 | 1 | LLVM-style priority cascade (CascadePolicy) | **DONE** | High — structured prioritization replaces ad-hoc blending | Low — sort_ready is already the control point | ~150 lines |
-| 2 | ASAP inflation for deferral | TODO | High — enables pressure-aware deferral without cascading deadlock | Low — only affects ops with slack, reversible | ~80 lines |
+| 2 | ASAP inflation for deferral | **DONE** | High — enables pressure-aware deferral without cascading deadlock | Low — only affects ops with slack, reversible | ~150 lines |
 | 3 | Multi-greedy via rayon | TODO | Medium — run multiple policies in parallel, pick best | Low — policies are pure functions, trivially parallelizable | ~50 lines |
 | 4 | Hint pipeline fix (3 inconsistencies) | **DONE** | Medium — fixes shift over-exclusion, ConstChoice loss, post-elision filtering | Low — correctness fix, no behavioral change for correct hints | ~60 lines |
 | 5 | Bidirectional scheduling | TODO | High — bottom-up pass for pressure, top-down for ILP | Medium — requires reverse-direction scheduling infrastructure | ~300 lines |
@@ -453,7 +487,7 @@ This is safe because:
 ### Dependencies
 
 - ~~Priority 1 (CascadePolicy) is a prerequisite for Priority 2 (ASAP inflation)~~ **Done** — CascadePolicy provides the structured context
-- Priority 2 (ASAP inflation) can now be built on the CascadePolicy infrastructure
+- ~~Priority 2 (ASAP inflation) can now be built on the CascadePolicy infrastructure~~ **Done** — implemented in CascadePolicy and AdaptivePolicy via `compute_asap_inflation()` trait method
 - Priority 3 (multi-greedy) is independent and can be done at any time
 - ~~Priority 4 (hint fix) is independent and should be done soon~~ **Done** — 3 hint pipeline inconsistencies fixed
 - Priority 5 (bidirectional) depends on Priority 1 for the scheduling
