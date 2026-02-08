@@ -69,3 +69,6 @@ ssa_*.json
 ablation_*.json
 ablation_*.txt
 greedy_policy_*.json
+
+# Catch-all for JSON artifacts not covered above
+*.json

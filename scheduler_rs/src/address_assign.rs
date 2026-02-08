@@ -99,6 +99,9 @@ pub struct AddressAssignConfig {
     /// The AluDerive op reads the dest VRegs of its left/right producers at its cycle,
     /// so those producers' live intervals must extend to at least the AluDerive op's cycle.
     pub const_alu_derive_ops: Option<HashMap<usize, (usize, usize, crate::types::Opcode)>>,
+    /// When set, maps vector group alias VRegs to their 8 scalar lane VRegs (for scatter loads).
+    /// The group is allocated as an 8-word block; lane VRegs derive addresses as base+i.
+    pub vector_group_lanes: Option<HashMap<VReg, Vec<VReg>>>,
 }
 
 impl Default for AddressAssignConfig {
@@ -111,6 +114,7 @@ impl Default for AddressAssignConfig {
             select_fma_ops: None,
             shifted_alu_cycles: None,
             const_alu_derive_ops: None,
+            vector_group_lanes: None,
         }
     }
 }
@@ -152,6 +156,7 @@ pub fn compute_live_intervals(
     select_fma_ops: Option<&HashSet<usize>>,
     shifted_alu_cycles: Option<&std::collections::HashMap<usize, Vec<i32>>>,
     const_alu_derive_ops: Option<&HashMap<usize, (usize, usize, crate::types::Opcode)>>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
@@ -333,6 +338,91 @@ pub fn compute_live_intervals(
         }
     }
 
+    // Vector group pass: synthesize group interval from lane writes and consumer reads.
+    // The group alias VReg occupies 8 contiguous words; lanes share this allocation.
+    // After this pass, lane VRegs are removed from intervals (they get addresses derived
+    // as base+i from the group's allocation in assign_addresses).
+    //
+    // Two kinds of groups:
+    //   Write group (fresh_vector_group): lanes ARE op destinations (have intervals),
+    //     group key is NOT an op destination (no existing interval).
+    //   Read group (decompose_vector): lanes are NOT op destinations (no intervals),
+    //     group key IS an op destination (has existing interval from its definer).
+    //
+    // For read groups, we must preserve the existing interval and extend it to cover
+    // all ops that read lane VRegs. Lane VRegs lack intervals so we scan ops directly.
+    if let Some(groups) = vector_group_lanes {
+        for (group_vreg, lane_vregs) in groups {
+            // Existing interval for the group key (present for read groups / decomposition)
+            let existing_start = intervals.get(group_vreg).map(|i| i.start);
+            let existing_end = intervals.get(group_vreg).map(|i| i.end);
+
+            // Lane intervals (present for write groups, absent for read groups)
+            let lane_start = lane_vregs
+                .iter()
+                .filter_map(|lv| intervals.get(lv).map(|i| i.start))
+                .min();
+            let lane_end = lane_vregs
+                .iter()
+                .filter_map(|lv| intervals.get(lv).map(|i| i.end))
+                .max();
+
+            // Consumer reads of the group alias VReg (ops that use the vector group)
+            let consumer_end = ops
+                .iter()
+                .filter(|op| {
+                    op.srcs
+                        .iter()
+                        .any(|s| matches!(s, Operand::VReg(v) if *v == *group_vreg))
+                })
+                .map(|op| op.cycle)
+                .max();
+
+            // Lane VReg uses: ops that read any lane VReg directly.
+            // Critical for read groups where lane VRegs have no intervals.
+            let lane_vreg_set: HashSet<VReg> = lane_vregs.iter().copied().collect();
+            let lane_use_end = ops
+                .iter()
+                .filter(|op| {
+                    op.srcs
+                        .iter()
+                        .any(|s| matches!(s, Operand::VReg(v) if lane_vreg_set.contains(v)))
+                })
+                .map(|op| op.cycle)
+                .max();
+
+            // Combine all sources for start and end
+            let start = [lane_start, existing_start]
+                .iter()
+                .flatten()
+                .copied()
+                .min()
+                .unwrap_or(0);
+
+            let end = [lane_end, consumer_end, lane_use_end, existing_end]
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .unwrap_or(start)
+                .max(start + 1);
+
+            intervals.insert(*group_vreg, LiveInterval::new(start, end));
+
+            // Remove lane VRegs — they share the group's 8-word allocation
+            for lv in lane_vregs {
+                intervals.remove(lv);
+            }
+
+            if debug {
+                eprintln!(
+                    "[DEBUG compute_live_intervals] Vector group {:?}: [{}, {}] (8 lanes, existing=[{:?}, {:?}])",
+                    group_vreg, start, end, existing_start, existing_end
+                );
+            }
+        }
+    }
+
     // Include zero_vreg so peak_live counts the reserved slot (total capacity = budget including zero)
     if let Some(zero) = zero_vreg {
         let max_cycle = ops
@@ -431,6 +521,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         config.select_fma_ops.as_ref(),
         config.shifted_alu_cycles.as_ref(),
         config.const_alu_derive_ops.as_ref(),
+        config.vector_group_lanes.as_ref(),
     );
 
     // Debug: Collect vstore source VRegs for tracking
@@ -600,6 +691,26 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
                 "[DEBUG assign_addresses] CYCLE3: VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
                 vreg, new_addr, size, interval.start, interval.end, active_ranges
             );
+        }
+    }
+
+    // Post-allocation: derive lane addresses from vector group base addresses.
+    // Each lane VReg gets address = group_base + lane_index.
+    if let Some(ref groups) = config.vector_group_lanes {
+        for (group_vreg, lane_vregs) in groups {
+            if let Some(&base_addr) = vreg_to_addr.get(group_vreg) {
+                for (i, lane_vreg) in lane_vregs.iter().enumerate() {
+                    vreg_to_addr.insert(*lane_vreg, base_addr + i as i64);
+                }
+                if debug {
+                    eprintln!(
+                        "[DEBUG assign_addresses] Vector group {:?} base={}, lanes: {:?}",
+                        group_vreg,
+                        base_addr,
+                        lane_vregs.iter().enumerate().map(|(i, lv)| format!("{:?}={}", lv, base_addr + i as i64)).collect::<Vec<_>>()
+                    );
+                }
+            }
         }
     }
 
@@ -1058,7 +1169,7 @@ mod tests {
         emit.ops[0].cycle = 0;
         emit.ops[1].cycle = 1;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -1076,7 +1187,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 5;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
@@ -1127,7 +1238,7 @@ mod tests {
 
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(select_choice_id);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None);
 
         let dest = emit.ops[select_choice_idx]
             .dest
@@ -1209,7 +1320,7 @@ mod tests {
         let result = assign_addresses(&emit.ops, &config);
         assert!(!result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None);
         for (v1, addr1) in &result.vreg_to_addr {
             for (v2, addr2) in &result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1297,7 +1408,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 2;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -1337,6 +1448,7 @@ mod tests {
             select_fma_ops: None,
             shifted_alu_cycles: None,
             const_alu_derive_ops: None,
+            vector_group_lanes: None,
         };
         let result = assign_addresses(&emit.ops, &config);
 
@@ -1620,7 +1732,7 @@ mod tests {
         emit.ops[5].cycle = 80; // data
         emit.ops[6].cycle = 81; // vstore
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]

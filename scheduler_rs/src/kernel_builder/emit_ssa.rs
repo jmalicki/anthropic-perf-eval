@@ -89,6 +89,20 @@ pub struct SsaEmitContext {
     /// This VReg has no associated SSA op - scratch[0] is always 0 by hardware initialization.
     /// Used by AddImm encoding of other constants.
     pub zero_vreg: Option<VReg>,
+
+    // =========================================================================
+    // Vector Group Tracking (for scatter loads)
+    // =========================================================================
+    /// Maps a vector group alias VReg to its 8 scalar lane VRegs.
+    ///
+    /// A vector group decomposes a vector VReg into 8 independently-writable
+    /// scalar lane VRegs. Each lane is written by a scalar `load` op; downstream
+    /// vector ops consume the group alias, which creates dependencies on all 8
+    /// lane producers.
+    ///
+    /// At address assignment time, the group is allocated as an 8-word block
+    /// and lane VRegs derive their addresses as base+i.
+    pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
 }
 
 impl Default for SsaEmitContext {
@@ -118,6 +132,8 @@ impl SsaEmitContext {
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
+            // Vector group tracking
+            vector_group_lanes: HashMap::new(),
         }
     }
 
@@ -197,6 +213,8 @@ impl SsaEmitContext {
         // Reset const alternative tracking
         self.const_alternatives.clear();
         self.zero_vreg = None;
+        // Reset vector group tracking
+        self.vector_group_lanes.clear();
         std::mem::take(&mut self.ops)
     }
 
@@ -928,6 +946,90 @@ impl SsaEmitContext {
     // Barrier Operations (Scheduling-only)
     // ========================================================================
 
+    // ========================================================================
+    // Vector Group Operations (for scatter loads)
+    // ========================================================================
+
+    /// Create a fresh vector group: a vector alias VReg + 8 scalar lane VRegs.
+    ///
+    /// The returned vector VReg is the "alias" that downstream vector ops consume.
+    /// The 8 scalar VRegs are written by individual scalar load ops.
+    /// The alias is NOT defined by any op — it exists only in `vector_group_lanes`
+    /// and is resolved during dependency computation and address assignment.
+    ///
+    /// # Returns
+    /// `(group_vreg, lane_vregs)` where `group_vreg` is the vector alias and
+    /// `lane_vregs[i]` is the scalar VReg for lane `i`.
+    pub fn fresh_vector_group(&mut self) -> (VReg, Vec<VReg>) {
+        let group = self.fresh_vector();
+        let lanes: Vec<VReg> = (0..crate::types::VLEN)
+            .map(|_| self.fresh_scalar())
+            .collect();
+        self.vector_group_lanes.insert(group, lanes.clone());
+        (group, lanes)
+    }
+
+    /// Decompose a vector VReg into 8 scalar element VRegs.
+    ///
+    /// Creates 8 scalar VRegs that alias the individual elements of the source
+    /// vector. At address assignment, element i gets address `vector_base + i`.
+    /// No instruction is emitted — this is purely SSA-level bookkeeping.
+    ///
+    /// The element VRegs inherit the source vector's definer in vreg_def,
+    /// so dependency resolution works automatically.
+    ///
+    /// # Arguments
+    /// * `v` - A vector VReg that was defined by some prior op (e.g. FMA, vload)
+    ///
+    /// # Returns
+    /// A Vec of 8 scalar VRegs, one per SIMD lane.
+    pub fn decompose_vector(&mut self, v: VReg) -> Vec<VReg> {
+        assert!(v.is_vector(), "decompose_vector requires a vector VReg");
+        let elements: Vec<VReg> = (0..crate::types::VLEN)
+            .map(|_| self.fresh_scalar())
+            .collect();
+        self.vector_group_lanes.insert(v, elements.clone());
+        // Add elements to vreg_def with same definer as source vector
+        if let Some(&def_id) = self.vreg_def.get(&v) {
+            for e in &elements {
+                self.vreg_def.insert(*e, def_id);
+            }
+        }
+        elements
+    }
+
+    /// Emit a scalar load into a pre-specified destination VReg.
+    ///
+    /// Used with vector groups: the dest VReg is an element of a group,
+    /// so the load writes to a known position within the group's contiguous block.
+    ///
+    /// # Arguments
+    /// * `addr` - Scalar VReg holding the memory address to load from
+    /// * `dest` - Scalar VReg to write the loaded value into
+    #[track_caller]
+    pub fn emit_load_into(&mut self, addr: VReg, dest: VReg) {
+        assert!(addr.is_scalar(), "load addr must be scalar");
+        assert!(dest.is_scalar(), "load dest must be scalar");
+
+        let op = SsaOp::new(
+            0, // set by emit()
+            Engine::Load,
+            Opcode::Load,
+            Some(dest),
+            vec![Operand::VReg(addr)],
+        );
+        self.emit(op);
+    }
+
+    /// Take vector_group_lanes (for passing to dependency computation, address assignment, etc.)
+    pub fn take_vector_group_lanes(&mut self) -> HashMap<VReg, Vec<VReg>> {
+        std::mem::take(&mut self.vector_group_lanes)
+    }
+
+    // ========================================================================
+    // Barrier Operations (Scheduling-only)
+    // ========================================================================
+
     /// Emit a barrier pseudo-op for round boundaries.
     ///
     /// The barrier:
@@ -958,11 +1060,38 @@ impl SsaEmitContext {
 ///
 /// `zero_vreg`: Optional reserved zero VReg. Reads from this VReg have no dependency
 /// because scratch[0] is always 0 by hardware initialization (no defining op).
+///
+/// `vector_group_lanes`: Optional map from vector group alias VRegs to their 8 lane VRegs.
+/// When an op reads a group alias, it depends on all 8 lane producers instead of
+/// looking for a single definer in vreg_def.
 pub fn compute_ssa_dependencies(
     ops: &mut [SsaOp],
     vreg_def: &HashMap<VReg, usize>,
     zero_vreg: Option<VReg>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) {
+    // For decomposed vectors: element VRegs inherit the source vector's definer.
+    // This lets normal dependency resolution handle decomposed elements automatically.
+    // A "read group" is identified by the vector key being present in vreg_def
+    // (meaning some op defined that vector).
+    let mut extended_vreg_def;
+    let effective_vreg_def = if let Some(groups) = vector_group_lanes {
+        extended_vreg_def = vreg_def.clone();
+        for (vec_vreg, elements) in groups {
+            if let Some(&def_id) = vreg_def.get(vec_vreg) {
+                // Read group (decomposition): vector is defined by an op
+                for e in elements {
+                    if !extended_vreg_def.contains_key(e) {
+                        extended_vreg_def.insert(*e, def_id);
+                    }
+                }
+            }
+        }
+        &extended_vreg_def
+    } else {
+        vreg_def
+    };
+
     for op in ops.iter_mut() {
         op.dep_ids.clear();
 
@@ -973,14 +1102,26 @@ pub fn compute_ssa_dependencies(
                 if Some(*vreg) == zero_vreg {
                     continue;
                 }
-                let def_id = *vreg_def.get(vreg).unwrap_or_else(|| {
-                    panic!(
-                        "BUG: op id={} reads {:?} but no definition found in vreg_def. \
-                         Source: {:?}",
-                        op.id, vreg, op.source
-                    )
-                });
-                op.dep_ids.insert(def_id);
+
+                // Check if this is a vector group alias
+                if let Some(lanes) = vector_group_lanes.and_then(|m| m.get(vreg)) {
+                    // Group alias: depend on all 8 lane producers
+                    for lane_vreg in lanes {
+                        if let Some(&def_id) = effective_vreg_def.get(lane_vreg) {
+                            op.dep_ids.insert(def_id);
+                        }
+                    }
+                } else {
+                    // Normal VReg: single producer dependency
+                    let def_id = *effective_vreg_def.get(vreg).unwrap_or_else(|| {
+                        panic!(
+                            "BUG: op id={} reads {:?} but no definition found in vreg_def. \
+                             Source: {:?}",
+                            op.id, vreg, op.source
+                        )
+                    });
+                    op.dep_ids.insert(def_id);
+                }
             }
         }
     }
@@ -1001,13 +1142,15 @@ pub fn compute_ssa_dependencies(
 /// ops after barrier N can start. But the dependency graph is O(n) instead of O(n²).
 ///
 /// `zero_vreg`: Optional reserved zero VReg. Reads from this VReg have no dependency.
+/// `vector_group_lanes`: Optional map from vector group alias VRegs to their lane VRegs.
 pub fn compute_ssa_dependencies_with_barriers(
     ops: &mut [SsaOp],
     vreg_def: &HashMap<VReg, usize>,
     zero_vreg: Option<VReg>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) {
     // First compute normal RAW deps
-    compute_ssa_dependencies(ops, vreg_def, zero_vreg);
+    compute_ssa_dependencies(ops, vreg_def, zero_vreg, vector_group_lanes);
 
     // Find barrier ops
     let barrier_indices: Vec<usize> = ops
@@ -1075,6 +1218,7 @@ pub fn eliminate_ssa_dead_code(
     vreg_def: &mut HashMap<VReg, usize>,
     const_alternatives: &mut Vec<ConstAlternative>,
     zero_vreg: Option<VReg>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) -> (Vec<SsaOp>, HashMap<VReg, usize>, Vec<ConstAlternative>) {
     if ops.is_empty() {
         return (
@@ -1146,6 +1290,26 @@ pub fn eliminate_ssa_dead_code(
         }
     }
 
+    // Add decomposed element VRegs to vreg_def so their uses mark
+    // the source vector's definer as live.
+    // A "read group" (decomposition) has its vector key in vreg_def (defined by an op).
+    let mut extended_vreg_def;
+    let effective_vreg_def = if let Some(groups) = vector_group_lanes {
+        extended_vreg_def = vreg_def.clone();
+        for (vec_vreg, elements) in groups {
+            if let Some(&def_id) = vreg_def.get(vec_vreg) {
+                for e in elements {
+                    if !extended_vreg_def.contains_key(e) {
+                        extended_vreg_def.insert(*e, def_id);
+                    }
+                }
+            }
+        }
+        &extended_vreg_def
+    } else {
+        vreg_def
+    };
+
     // Propagate: definers of operands of live ops are live.
     // ConstChoice and SelectChoice are atomic: we keep/remove encodings as a unit (ConstChoice pair
     // via const_choice_partner; SelectChoice is a single op so no extra handling).
@@ -1154,7 +1318,24 @@ pub fn eliminate_ssa_dead_code(
             if Some(vreg) == zero_vreg {
                 continue;
             }
-            let def_id = match vreg_def.get(&vreg) {
+
+            // Check if this is a vector group alias — if so, mark all lane definers as live
+            if let Some(lanes) = vector_group_lanes.and_then(|m| m.get(&vreg)) {
+                for lane_vreg in lanes {
+                    let def_id = match effective_vreg_def.get(lane_vreg) {
+                        Some(&id) => id,
+                        None => continue,
+                    };
+                    let def_idx = match id_to_idx.get(&def_id) {
+                        Some(&i) => i,
+                        None => continue,
+                    };
+                    mark_live_atomic(def_idx, &mut live, &mut worklist, &const_choice_partner);
+                }
+                continue;
+            }
+
+            let def_id = match effective_vreg_def.get(&vreg) {
                 Some(&id) => id,
                 None => continue,
             };
@@ -1301,7 +1482,7 @@ mod tests {
         let ops = emit.take_ops();
         let n_before = ops.len();
         let (new_ops, _new_vreg_def, _new_alts) =
-            eliminate_ssa_dead_code(ops, &mut vreg_def, &mut const_alternatives, emit.zero_vreg);
+            eliminate_ssa_dead_code(ops, &mut vreg_def, &mut const_alternatives, emit.zero_vreg, None);
         assert!(
             new_ops.len() < n_before,
             "DCE should remove at least the dead const(99) op"
@@ -1384,7 +1565,7 @@ mod tests {
         let v1 = emit.emit_const(5);
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
         // op1 (v2 = v1 + v1) depends on op0 (v1 = const 5)
         assert!(emit.ops[1].dep_ids.contains(&0));
@@ -1398,7 +1579,7 @@ mod tests {
         let _v1 = emit.emit_const(5);
         let _v2 = emit.emit_const(6);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
         // op1 should have no dependencies
         assert!(emit.ops[1].dep_ids.is_empty());
@@ -1414,7 +1595,7 @@ mod tests {
         let _v2 = emit.emit_alu(Opcode::Add, v1, v1);
         let _v3 = emit.emit_const(7);
 
-        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
         // op2 (v3) should have no dependencies
         assert!(emit.ops[2].dep_ids.is_empty());
@@ -1570,7 +1751,7 @@ mod tests {
         let v4 = emit.emit_const(7); // op 4
         let _v5 = emit.emit_alu(Opcode::Mul, v4, v1); // op 5 (uses v1 from round 1)
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
         // Barrier (op 3) should depend on ops 0, 1, 2
         assert!(
@@ -1618,7 +1799,7 @@ mod tests {
         emit.emit_barrier(); // op 3
         let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 4
 
-        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
         // First barrier depends on op 0 (its section)
         assert!(

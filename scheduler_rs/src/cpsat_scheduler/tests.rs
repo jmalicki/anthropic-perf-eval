@@ -28,7 +28,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -74,7 +74,7 @@ mod ssa_tests {
         let c2 = emit.emit_const_choice(2);
         let _sum = emit.emit_alu(Opcode::Add, c1, c2);
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let result = schedule_ssa_cpsat(
             &emit.ops,
@@ -124,7 +124,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -286,7 +286,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT with longer time limit to allow optimization
         let result = schedule_ssa_cpsat(
@@ -419,7 +419,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -481,7 +481,7 @@ mod ssa_tests {
         }
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Toy machine: 1 VALU, 8 ALU so one shifted VALU fits in ALU.
         let toy_machine = MachineConfig {
@@ -557,7 +557,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT - use verbose to see breadcrumbs
         let result = schedule_ssa_cpsat(
@@ -657,7 +657,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Count AddImm ops
         let addimm_count = emit
@@ -835,7 +835,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Verify we have ConstChoice ops
         let constchoice_count = emit
@@ -924,7 +924,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Count ops
         let addimm_count = emit
@@ -1027,7 +1027,7 @@ mod ssa_tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -1169,7 +1169,7 @@ mod ssa_tests {
         let _use = emit.emit_valu(Opcode::Add, sel, sel);
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let select_choice_idx = emit
             .ops
@@ -1283,7 +1283,7 @@ mod ssa_tests {
         let consumer = emit.emit_valu(Opcode::Sub, shiftable, v0); // Consumer must run later
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let shift_idx = emit
             .ops
@@ -1339,7 +1339,7 @@ mod ssa_tests {
         let id3 = emit.ops.last().unwrap().id;
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let toy_machine = MachineConfig {
             valu_slots: 1,
@@ -1409,7 +1409,7 @@ mod ssa_tests {
         let add_id = emit.ops.last().unwrap().id;
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let toy_machine = MachineConfig {
             valu_slots: 1,
@@ -1470,7 +1470,7 @@ mod ssa_tests {
         let _use = emit.emit_valu(Opcode::Add, sel, sel);
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let select_choice_idx = emit
             .ops
@@ -1524,7 +1524,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops));
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1603,7 +1603,7 @@ mod ssa_tests {
         let _u2 = emit.emit_valu(Opcode::Add, sel2, sel2);
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let idx1 = emit
             .ops
@@ -1675,7 +1675,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops));
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1719,7 +1719,7 @@ mod ssa_tests {
         let _use = emit.emit_valu(Opcode::Add, sel, sel);
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let result = schedule_ssa_cpsat(
             &emit.ops,
@@ -1746,7 +1746,7 @@ mod ssa_tests {
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
         let assign_result = assign_addresses(&emit.ops, &config);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops));
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -2052,7 +2052,7 @@ mod precedence_offset_tests {
         let _v2 = emit.emit_valu(Opcode::Sub, v1, v0);
 
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         let result = schedule_ssa_cpsat(
             &emit.ops,
@@ -2194,7 +2194,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -2255,7 +2255,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT
         let result = schedule_ssa_cpsat(
@@ -2422,7 +2422,7 @@ mod tests {
 
         // Compute dependencies
         let vreg_def = std::mem::take(&mut emit.vreg_def);
-        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
         // Schedule with CP-SAT with longer time limit to allow optimization
         let result = schedule_ssa_cpsat(
@@ -4778,6 +4778,7 @@ mod tests {
             Some(&r.select_fma_ops),
             None,
             Some(&r.const_alu_derive_ops),
+            None,
         );
         let select_cycle = scheduled_ops[3].cycle;
         let cond_interval = intervals.get(&VReg::scalar(0)).unwrap();

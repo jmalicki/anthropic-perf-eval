@@ -65,6 +65,11 @@ impl Pass for GreedySchedulePass {
             None => GreedyBoundsUsage::None,
         };
 
+        let vgl = if ctx.vector_group_lanes.is_empty() {
+            None
+        } else {
+            Some(&ctx.vector_group_lanes)
+        };
         let (cycles, budget_exceeded, peak_live) =
             ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ctx.ops,
@@ -77,6 +82,7 @@ impl Pass for GreedySchedulePass {
                 Some(&mut ctx.greedy_decisions.const_add_imm_ops),
                 &bounds_usage,
                 &*strategy,
+                vgl,
             )?;
 
         ctx.greedy_metrics = super::super::SchedulingMetrics {

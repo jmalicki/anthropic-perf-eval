@@ -483,7 +483,9 @@ impl SsaTickTockKernelBuilder {
             0 => self.emit_depth0_access(n_iters, n_groups),
             1 => self.emit_depth1_access(n_iters, n_groups),
             2 => self.emit_depth2_access(n_iters, n_groups),
-            3 => self.emit_depth3_access(n_iters, n_groups),
+            3 if self.config.use_tree_reduce_at_depth(3) => {
+                self.emit_depth3_access(n_iters, n_groups)
+            }
             4 if self.config.use_tree_reduce_at_depth(4) => {
                 self.emit_depth4_access(n_iters, n_groups)
             }
@@ -974,21 +976,21 @@ impl SsaTickTockKernelBuilder {
     }
 
     pub(super) fn emit_scattered_access(&mut self, n_iters: usize, n_groups: usize) {
-        // Scattered/gathered loads for depths 4+
+        // Scatter load via vector address computation + scalar decomposition.
         //
-        // The ISA doesn't support gathered vload, so we need to compute addresses
-        // for each lane. For depths 4+, tree indices vary per lane.
+        // Each of the 8 batch items in a group has its own tree node index
+        // (stored per-element in the vector VReg `all_idx[g]`). We:
+        //   1. Compute all 8 addresses in one VALU add: vadd(v_idx, v_forest_p)
+        //   2. Decompose the address vector into 8 scalar elements
+        //   3. Load each tree node value via scalar load
+        //   4. Assemble the 8 scalar results into a vector for downstream ops
         //
-        // Proper implementation would use one of:
-        // 1. 8 scalar loads per group (expensive)
-        // 2. Lazy partition to make accesses sequential
-        // 3. load_offset with chunked gather
-        //
-        // For now, use the FMA approach similar to depth 3:
-        // Compute v_nv using delta selection for the applicable tree indices.
-        // This works because at depth d, indices are in range [2^d - 1, 2^(d+1) - 2].
+        // The vbroadcast of forest_p is CSE'd (broadcast_cache), so it's shared
+        // across all groups and rounds. Each group costs 1 vadd (shiftable) +
+        // 8 loads instead of 8 ALU adds + 8 loads.
 
         let forest_p = self.ctx.forest_p.unwrap();
+        let v_forest_p = self.emit.emit_vbroadcast(forest_p);
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
         for it in 0..n_iters {
@@ -997,19 +999,33 @@ impl SsaTickTockKernelBuilder {
                 if base_g + i >= n_groups {
                     continue;
                 }
+                self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
 
-                // For gathered access, we need 8 separate loads (or load_offset).
-                // This is a simplification that just uses a contiguous vload from
-                // the forest pointer. Won't produce correct results for depths 4+
-                // but exercises the SSA pipeline.
-                let _ = idx; // Mark idx as used (consumed by conceptual gather)
-                let v_nv = self.emit.emit_vload(forest_p);
+                // Vector address computation: forest_p + idx[item] for all 8 items
+                self.emit.set_next_var_type(VarType::Address);
+                let v_addr = self.emit.emit_valu(Opcode::Add, idx, v_forest_p);
+
+                // Decompose address vector into 8 scalar addresses
+                let addr_elements = self.emit.decompose_vector(v_addr);
+
+                // Result vector group: 8 scalar load results assembled into a vector
+                self.emit.set_next_var_type(VarType::Temporary);
+                let (v_nv, result_elements) = self.emit.fresh_vector_group();
+
+                // Scalar loads from each computed address
+                for elem in 0..VLEN {
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    self.emit.emit_load_into(addr_elements[elem], result_elements[elem]);
+                }
 
                 // XOR with stage5 constant
-                self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
+                self.emit.set_next_var_type(VarType::RoundState);
+                self.ctx.v_nv[it][i] =
+                    Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
         }
+        self.emit.clear_iter_group();
     }
 
     // =========================================================================

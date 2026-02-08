@@ -107,6 +107,8 @@ pub struct PipelineContext {
     pub const_alternatives: Vec<ConstAlternative>,
     /// VReg representing constant 0 (address 0), if reserved.
     pub zero_vreg: Option<VReg>,
+    /// Maps vector group alias VRegs to their 8 scalar lane VRegs (for scatter loads).
+    pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
 
     // --- Scheduling state ---
     /// ASAP/ALAP bounds (populated by ComputeBoundsPass, consumed by greedy + CP-SAT).
@@ -151,6 +153,7 @@ impl PipelineContext {
             vreg_count,
             const_alternatives,
             zero_vreg,
+            vector_group_lanes,
         } = program;
 
         PipelineContext {
@@ -159,6 +162,7 @@ impl PipelineContext {
             vreg_count,
             const_alternatives,
             zero_vreg,
+            vector_group_lanes,
             bounds: None,
             greedy_decisions: SchedulingDecisions::default(),
             final_decisions: SchedulingDecisions::default(),

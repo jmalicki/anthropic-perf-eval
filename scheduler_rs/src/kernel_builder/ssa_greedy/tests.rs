@@ -30,7 +30,7 @@ fn test_greedy_fallback_sets_budget_exceeded() {
     let addr = emit.emit_const(100); // op 5
     emit.emit_vstore(addr, v3); // op 6 - sink
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
 
@@ -108,7 +108,7 @@ fn test_barrier_with_dead_store_in_section() {
     let addr = emit.emit_const(100); // op 5
     emit.emit_store(addr, v4); // op 6 - makes v4 live
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify barrier depends on the dead store
     assert!(
@@ -176,7 +176,7 @@ fn test_multiple_dead_stores_before_barrier() {
     let addr = emit.emit_const(100); // op 6
     emit.emit_store(addr, v5); // op 7
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify barrier depends on all dead stores
     assert!(
@@ -263,7 +263,7 @@ fn test_barrier_chain_with_dead_stores() {
     let addr = emit.emit_const(100); // op 7
     emit.emit_store(addr, v5); // op 8
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify barrier1 depends on dead store op1
     assert!(
@@ -340,7 +340,7 @@ fn test_dead_store_in_dependency_chain() {
     let addr = emit.emit_const(100); // op 4
     emit.emit_store(addr, v4); // op 5 - makes v4 live
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
 
     let mut shifted_ops = HashSet::new();
@@ -394,7 +394,7 @@ fn test_dead_store_detection_is_transitive() {
     let addr = emit.emit_const(100); // op 4
     emit.emit_store(addr, v4); // op 5
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
 
     let mut shifted_ops = HashSet::new();
@@ -447,7 +447,7 @@ fn test_immediate_dead_store() {
     let v2 = emit.emit_const_force(6); // op 1 - has reader (op2), not dead
     let _v3 = emit.emit_alu(Opcode::Add, v1, v2); // op 2 - DEAD (no readers)
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify all 3 ops were created
     assert_eq!(emit.ops.len(), 3, "Should have 3 ops");
@@ -530,7 +530,7 @@ fn test_store_source_vregs_not_dead() {
     let addr = emit.emit_const(200); // op 7
     emit.emit_vstore(addr, fma_result); // op 8
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify: vstore (op8) reads fma_result (v6)
     // Build vreg_users map as the scheduler does
@@ -612,7 +612,7 @@ fn test_store_address_vreg_liveness() {
     let data = emit.emit_const(42); // op 3
     emit.emit_store(addr, data); // op 4
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Build vreg_users map
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -699,7 +699,7 @@ fn test_dce_cannot_eliminate_op_with_user() {
     let addr = emit.emit_const(100); // op 3 - has user (op4)
     emit.emit_vstore(addr, v2); // op 4 - sink (no dest)
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Build vreg_users map as the scheduler does
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -790,7 +790,7 @@ fn test_transitive_users_prevent_elimination() {
     let addr = emit.emit_const(100); // op 4
     emit.emit_vstore(addr, v3); // op 5
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Build vreg_users map
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -874,7 +874,7 @@ fn test_store_sources_count_as_users() {
     let addr = emit.emit_const(100); // op 7
     emit.emit_vstore(addr, fma_result); // op 8
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Build vreg_users map
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -962,7 +962,7 @@ fn test_dce_detects_genuinely_dead_store() {
     let addr = emit.emit_const(100); // op 3
     emit.emit_store(addr, v3); // op 4
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Schedule
 
@@ -1010,7 +1010,7 @@ fn test_dead_store_detection_counts_store_users() {
     let addr = emit.emit_const(100); // op 3
     emit.emit_vstore(addr, v1); // op 4 - uses v1
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Build vreg_users map as the scheduler does
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1184,7 +1184,7 @@ fn test_context_variable_multiplyadd_not_dead() {
     emit.emit_vstore(addr, idx_new); // op 8
 
     // Use barrier-aware dependencies to match real kernel behavior
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify: vstore (op8) reads idx_new (the FMA result)
     // Build vreg_users map as the scheduler does
@@ -1298,7 +1298,7 @@ fn test_context_variable_multiplyadd_across_barrier() {
     emit.emit_vstore(addr, idx_new); // op 9
 
     // Use barrier-aware dependencies to match real kernel behavior
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify: vstore (op9) reads idx_new (the FMA result)
     // Build vreg_users map as the scheduler does
@@ -1428,7 +1428,7 @@ fn test_multi_round_conditional_stores_hypothesis1() {
     emit.emit_vstore(addr, idx_round2_use); // op 10
 
     // Use barrier-aware dependencies to match real kernel behavior
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify: idx_round2_use (op8) reads idx_round1 (the FMA result from round 1)
     // Build vreg_users map as the scheduler does
@@ -1514,7 +1514,7 @@ fn test_last_round_edge_case_hypothesis2() {
     let addr = emit.emit_const(200); // op 3
     emit.emit_vstore(addr, use_idx); // op 4
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Schedule
 
@@ -1581,7 +1581,7 @@ fn test_complex_barrier_pattern_hypothesis3() {
     let addr = emit.emit_const(200);
     emit.emit_vstore(addr, idx_round3_use); // op 12
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify dependency chain: Round 1 FMA -> Round 2 use -> Round 3 use -> Store
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1661,7 +1661,7 @@ fn test_vreg_replacement_pattern_hypothesis4() {
     let addr = emit.emit_const(200);
     emit.emit_vstore(addr, new_idx_vec); // op 8
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify: vstore uses new_idx_vec, which depends on MultiplyAdd
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1756,7 +1756,7 @@ fn test_real_kernel_conditional_stores_pattern() {
     let addr = emit.emit_const(200);
     emit.emit_vstore(addr, result_vec); // op 13
 
-    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Verify dependency chain
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
@@ -1849,7 +1849,7 @@ fn test_greedy_selectchoice_uses_precedence_offset() {
         "SelectChoice ALAP offset should be 2 (FMA max_delay)"
     );
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
 
@@ -1917,7 +1917,7 @@ fn test_greedy_mixed_predecessors_diamond() {
     // SelectChoice ALAP=2 (FMA path)
     assert_eq!(emit.ops[6].precedence_offset_for_alap(false), 2);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
 
@@ -2284,7 +2284,7 @@ fn test_greedy_policy_unchanged_regression() {
     let addr = emit.emit_const(100);
     emit.emit_vstore(addr, v3);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
     let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
@@ -2298,6 +2298,7 @@ fn test_greedy_policy_unchanged_regression() {
         None,
         &GreedyBoundsUsage::None,
         &GreedyPolicy,
+        None,
     );
 
     assert!(result.is_ok(), "GreedyPolicy should schedule: {:?}", result.err());
@@ -2330,7 +2331,7 @@ fn test_throttled_policy_produces_valid_schedule() {
     let addr = emit.emit_const(100);
     emit.emit_vstore(addr, v3);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
     let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
@@ -2344,6 +2345,7 @@ fn test_throttled_policy_produces_valid_schedule() {
         None,
         &GreedyBoundsUsage::None,
         &PressureThrottledPolicy::default(),
+        None,
     );
 
     assert!(result.is_ok(), "PressureThrottledPolicy should schedule: {:?}", result.err());
@@ -2363,7 +2365,7 @@ fn test_gated_policy_produces_valid_schedule() {
     let addr = emit.emit_const(100);
     emit.emit_vstore(addr, v3);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
     let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
@@ -2377,6 +2379,7 @@ fn test_gated_policy_produces_valid_schedule() {
         None,
         &GreedyBoundsUsage::None,
         &PressureGatedPolicy::default(),
+        None,
     );
 
     assert!(result.is_ok(), "PressureGatedPolicy should schedule: {:?}", result.err());
@@ -2396,7 +2399,7 @@ fn test_adaptive_policy_produces_valid_schedule() {
     let addr = emit.emit_const(100);
     emit.emit_vstore(addr, v3);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
     let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
@@ -2410,6 +2413,7 @@ fn test_adaptive_policy_produces_valid_schedule() {
         None,
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
+        None,
     );
 
     assert!(result.is_ok(), "AdaptivePolicy should schedule: {:?}", result.err());
@@ -2500,7 +2504,7 @@ fn test_adaptive_no_cascading_deferral() {
     let addr = emit.emit_const(100);
     emit.emit_vstore(addr, v7);
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
 
@@ -2517,6 +2521,7 @@ fn test_adaptive_no_cascading_deferral() {
         None,
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
+        None,
     );
 
     assert!(result.is_ok(), "Should complete: {:?}", result.err());
@@ -2571,7 +2576,7 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         emit.emit_vstore(addr, r);
     }
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     let mut shifted_ops = HashSet::new();
 
@@ -2590,6 +2595,7 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         None,
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
+        None,
     );
 
     assert!(result.is_ok(), "Scheduler should complete: {:?}", result.err());
@@ -3080,7 +3086,7 @@ fn test_cascade_inflation_in_scheduler() {
         emit.emit_vstore(addr, val);
     }
 
-    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
 
     // Compute ASAP/ALAP bounds for inflation to work
     let asap = crate::cpsat_scheduler::bounds::compute_ssa_asap(
@@ -3109,6 +3115,7 @@ fn test_cascade_inflation_in_scheduler() {
         None,
         &bounds_policy_only,
         &CascadePolicy::default(),
+        None,
     );
 
     assert!(
@@ -3136,6 +3143,7 @@ fn test_cascade_inflation_in_scheduler() {
         None,
         &bounds_policy_only2,
         &GreedyPolicy,
+        None,
     );
 
     assert!(result_greedy.is_ok());

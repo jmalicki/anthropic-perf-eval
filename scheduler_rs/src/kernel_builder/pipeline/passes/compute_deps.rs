@@ -17,7 +17,12 @@ impl Pass for ComputeDependenciesPass {
     }
 
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
-        compute_ssa_dependencies_with_barriers(&mut ctx.ops, &ctx.vreg_def, ctx.zero_vreg);
+        let vgl = if ctx.vector_group_lanes.is_empty() {
+            None
+        } else {
+            Some(&ctx.vector_group_lanes)
+        };
+        compute_ssa_dependencies_with_barriers(&mut ctx.ops, &ctx.vreg_def, ctx.zero_vreg, vgl);
         Ok(format!("{} ops", ctx.ops.len()))
     }
 }

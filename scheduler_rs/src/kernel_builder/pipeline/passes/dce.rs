@@ -19,11 +19,17 @@ impl Pass for DcePass {
 
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
         let before = ctx.ops.len();
+        let vgl = if ctx.vector_group_lanes.is_empty() {
+            None
+        } else {
+            Some(&ctx.vector_group_lanes)
+        };
         let (new_ops, new_vreg_def, new_const_alternatives) = eliminate_ssa_dead_code(
             std::mem::take(&mut ctx.ops),
             &mut ctx.vreg_def,
             &mut ctx.const_alternatives,
             ctx.zero_vreg,
+            vgl,
         );
         ctx.ops = new_ops;
         ctx.vreg_def = new_vreg_def;

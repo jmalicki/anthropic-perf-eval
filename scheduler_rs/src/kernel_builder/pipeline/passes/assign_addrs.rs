@@ -44,6 +44,9 @@ impl Pass for AssignAddressesPass {
             assign_config.const_alu_derive_ops =
                 Some(ctx.final_decisions.const_alu_derive_ops.clone());
         }
+        if !ctx.vector_group_lanes.is_empty() {
+            assign_config.vector_group_lanes = Some(ctx.vector_group_lanes.clone());
+        }
 
         let address_result = assign_addresses(&ctx.ops, &assign_config);
 

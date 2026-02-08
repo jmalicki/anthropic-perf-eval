@@ -26,4 +26,6 @@ pub struct SsaProgram {
     pub const_alternatives: Vec<ConstAlternative>,
     /// VReg representing constant 0 (address 0), if reserved.
     pub zero_vreg: Option<VReg>,
+    /// Maps vector group alias VRegs to their 8 scalar lane VRegs (for scatter loads).
+    pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
 }

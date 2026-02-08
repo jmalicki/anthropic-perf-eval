@@ -405,6 +405,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         None,
         &GreedyBoundsUsage::None,
         &GreedyPolicy,
+        None,
     )
 }
 
@@ -429,6 +430,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     mut const_add_imm_ops: Option<&mut HashSet<usize>>,
     bounds_usage: &GreedyBoundsUsage,
     strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -500,6 +502,34 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         for src in &op.srcs {
             if let Operand::VReg(vreg) = src {
                 vreg_users.entry(*vreg).or_default().insert(idx);
+            }
+        }
+    }
+
+    // Vector group awareness: bidirectional user propagation between group aliases
+    // and their lane VRegs. This prevents dead store detection from incorrectly
+    // eliminating ops that produce values consumed through vector group indirection.
+    //
+    // Write groups (fresh_vector_group): alias → lanes.
+    //   If the group alias has users, all lane VRegs are implicitly used.
+    // Read groups (decompose_vector): lanes → group key.
+    //   If any lane VReg has users, the group key's definer is implicitly used.
+    if let Some(groups) = vector_group_lanes {
+        for (group_vreg, lanes) in groups {
+            // Write group direction: alias users → lane VRegs
+            if let Some(group_users) = vreg_users.get(group_vreg).cloned() {
+                for lane_vreg in lanes {
+                    vreg_users.entry(*lane_vreg).or_default().extend(&group_users);
+                }
+            }
+            // Read group direction: lane users → group key
+            let lane_users: HashSet<usize> = lanes
+                .iter()
+                .filter_map(|lv| vreg_users.get(lv))
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            if !lane_users.is_empty() {
+                vreg_users.entry(*group_vreg).or_default().extend(&lane_users);
             }
         }
     }

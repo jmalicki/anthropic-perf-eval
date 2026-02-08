@@ -772,7 +772,7 @@ fn test_vreg_liveness_intervals() {
     ops[1].cycle = 1;
     ops[2].cycle = 10;
 
-    let intervals = compute_live_intervals(&ops, None, None, None, None);
+    let intervals = compute_live_intervals(&ops, None, None, None, None, None);
 
     // CLOSED intervals: [start, end] where end = last_read_cycle
     //
@@ -1677,6 +1677,7 @@ fn test_greedy_real_kernel_small() {
         &mut ops,
         &vreg_def,
         builder.zero_vreg,
+        None,
     );
 
     println!("Generated {} ops", ops.len());
@@ -1748,7 +1749,7 @@ fn test_greedy_real_kernel_medium() {
     let mut const_alternatives = builder.emit.take_const_alternatives();
     let mut ops = builder.emit.take_ops();
 
-    compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg);
+    compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg, None);
 
     if builder.config.compiler.enable_ssa_dce {
         let (new_ops, new_vreg_def, _new_const_alternatives) = eliminate_ssa_dead_code(
@@ -1756,10 +1757,11 @@ fn test_greedy_real_kernel_medium() {
             &mut vreg_def,
             &mut const_alternatives,
             builder.zero_vreg,
+            None,
         );
         ops = new_ops;
         vreg_def = new_vreg_def;
-        compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg);
+        compute_ssa_dependencies_with_barriers(&mut ops, &vreg_def, builder.zero_vreg, None);
     }
 
     println!("Generated {} ops (after DCE)", ops.len());
@@ -1823,13 +1825,20 @@ fn test_greedy_real_kernel_full_scale() {
     // Build SSA ops
     builder.build_internal();
     let vreg_def = std::mem::take(&mut builder.emit.vreg_def);
+    let vector_group_lanes = builder.emit.take_vector_group_lanes();
     let mut ops = builder.emit.take_ops();
 
     // Compute dependencies (pass zero_vreg so reads of reserved zero are skipped)
+    let vgl = if vector_group_lanes.is_empty() {
+        None
+    } else {
+        Some(&vector_group_lanes)
+    };
     crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
         &mut ops,
         &vreg_def,
         builder.zero_vreg,
+        vgl,
     );
 
     println!("Generated {} ops for full-scale kernel", ops.len());
@@ -3298,6 +3307,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
         &mut ssa_ops,
         &vreg_def,
         builder.zero_vreg,
+        None,
     );
 
     // Run greedy scheduler to get hints

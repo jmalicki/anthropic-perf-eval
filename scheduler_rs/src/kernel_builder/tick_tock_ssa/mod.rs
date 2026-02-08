@@ -247,6 +247,7 @@ impl SsaTickTockKernelBuilder {
             vreg_def: std::mem::take(&mut self.emit.vreg_def),
             const_alternatives: self.emit.take_const_alternatives(),
             vreg_count: self.emit.next_vreg_id,
+            vector_group_lanes: self.emit.take_vector_group_lanes(),
             ops: self.emit.take_ops(),
             zero_vreg: self.zero_vreg,
         }
@@ -409,7 +410,20 @@ impl SsaTickTockKernelBuilder {
         // DCE assertion: every defined VReg must have a use
         if self.config.compiler.enable_ssa_dce {
             let defined: HashSet<_> = ctx.ops.iter().filter_map(|op| op.dest).collect();
-            let used: HashSet<_> = ctx.ops.iter().flat_map(|op| op.reads()).collect();
+            let mut used: HashSet<_> = ctx.ops.iter().flat_map(|op| op.reads()).collect();
+            // Vector group members are implicitly used through their group alias.
+            // Bidirectional: write groups (alias used → lanes used) and
+            // read groups / decompositions (any lane used → group key used).
+            for (group_vreg, lanes) in &ctx.vector_group_lanes {
+                if used.contains(group_vreg) {
+                    for lane in lanes {
+                        used.insert(*lane);
+                    }
+                }
+                if lanes.iter().any(|lane| used.contains(lane)) {
+                    used.insert(*group_vreg);
+                }
+            }
             let dead: Vec<_> = defined.difference(&used).copied().collect();
             assert!(
                 dead.is_empty(),
