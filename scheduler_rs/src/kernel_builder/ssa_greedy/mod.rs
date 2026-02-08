@@ -88,6 +88,28 @@ impl<'a> GreedyBoundsUsage<'a> {
 }
 
 // ============================================================================
+// InflationStats: lightweight counters for ASAP inflation diagnostics
+// ============================================================================
+
+/// Tracks ASAP inflation activity during a greedy scheduling run.
+/// Printed as a summary after scheduling completes (via eprintln).
+#[derive(Default)]
+struct InflationStats {
+    /// Ops deferred by inflation
+    total_deferred: usize,
+    /// Sum of all inflation amounts (cycles)
+    total_inflation_cycles: i64,
+    /// Largest single inflation applied
+    max_inflation: i32,
+    /// Times MIN_PASS_THROUGH prevented inflation (capacity limit)
+    pass_through_blocks: usize,
+    /// Times consecutive_empty breaker disabled inflation
+    breaker_activations: usize,
+    /// Times the net-liveness guard blocked inflation (words_freed >= words_added)
+    net_liveness_blocks: usize,
+}
+
+// ============================================================================
 // SlotTracker: single source of truth for per-cycle engine slot accounting
 // ============================================================================
 
@@ -620,6 +642,9 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // Track consecutive cycles with no ops scheduled (for ASAP inflation breaker)
     let mut consecutive_empty: usize = 0;
 
+    // ASAP inflation diagnostics
+    let mut inflation_stats = InflationStats::default();
+
     while scheduled.len() < ops.len() && cycle < max_cycles {
         // Note: scheduled includes dead stores (pre-marked), so we check against ops.len()
         // Free expired VRegs (O(log n) per VReg)
@@ -816,6 +841,11 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 if let Some((asap_map, alap_map)) = bounds_usage.policy_bounds() {
                     let max_inflation_deferrals =
                         ready_this_cycle_len.saturating_sub(MIN_PASS_THROUGH);
+                    if inflation_disabled {
+                        inflation_stats.breaker_activations += 1;
+                    } else if inflation_deferred_count >= max_inflation_deferrals {
+                        inflation_stats.pass_through_blocks += 1;
+                    }
                     if !inflation_disabled && inflation_deferred_count < max_inflation_deferrals {
                         let ub = *alap_map.get(&ops[idx].id).unwrap_or(&i32::MAX);
                         let candidate = build_inflation_candidate(
@@ -832,10 +862,27 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         if let Some(inflation) =
                             strategy.compute_asap_inflation(&candidate, &inflation_ctx)
                         {
+                            // Net-liveness guard: only defer if benefit > cost.
+                            // Benefit: P's output (words_added) won't be produced for k
+                            // more cycles. Cost: P's input VRegs that are last-used by P
+                            // stay live k additional cycles (can't be freed until P runs).
+                            // When words_freed >= words_added, deferring extends more live
+                            // data than it saves — causes the "deferred avalanche" blowup.
+                            if candidate.words_freed >= candidate.words_added {
+                                inflation_stats.net_liveness_blocks += 1;
+                                ready_for_try.push(idx);
+                                continue;
+                            }
+
                             let inflated = ((cycle as i32) + inflation).min(ub);
                             if inflated > cycle as i32 {
                                 deferred_by_bounds.push((inflated, idx));
                                 inflation_deferred_count += 1;
+                                inflation_stats.total_deferred += 1;
+                                inflation_stats.total_inflation_cycles += inflation as i64;
+                                if inflation > inflation_stats.max_inflation {
+                                    inflation_stats.max_inflation = inflation;
+                                }
                                 continue;
                             }
                         }
@@ -1283,6 +1330,23 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 }
             }
         }
+    }
+
+    // Print inflation stats if any inflation activity occurred
+    if inflation_stats.total_deferred > 0
+        || inflation_stats.net_liveness_blocks > 0
+        || inflation_stats.breaker_activations > 0
+    {
+        eprintln!(
+            "ASAP inflation: deferred={}, total_cycles={}, max={}, net_liveness_blocks={}, \
+             pass_through_blocks={}, breaker_activations={}",
+            inflation_stats.total_deferred,
+            inflation_stats.total_inflation_cycles,
+            inflation_stats.max_inflation,
+            inflation_stats.net_liveness_blocks,
+            inflation_stats.pass_through_blocks,
+            inflation_stats.breaker_activations,
+        );
     }
 
     if budget_exceeded {
