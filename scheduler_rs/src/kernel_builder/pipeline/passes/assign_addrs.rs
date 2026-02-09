@@ -2,7 +2,7 @@
 //!
 //! Assigns concrete scratch addresses to VRegs via linear scan allocation.
 
-use crate::address_assign::{assign_addresses, AddressAssignConfig};
+use crate::address_assign::{assign_addresses, verify_no_address_conflicts, AddressAssignConfig};
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::tick_tock_ssa::SCRATCH_BUDGET_HW;
 
@@ -47,8 +47,36 @@ impl Pass for AssignAddressesPass {
         if !ctx.vector_group_lanes.is_empty() {
             assign_config.vector_group_lanes = Some(ctx.vector_group_lanes.clone());
         }
+        assign_config.vreg_def = Some(ctx.vreg_def.clone());
 
         let address_result = assign_addresses(&ctx.ops, &assign_config);
+
+        // Verify no address conflicts between simultaneously-live VRegs.
+        // This catches bugs in live interval computation or address allocation.
+        let conflicts = verify_no_address_conflicts(
+            &address_result.live_intervals,
+            &address_result.vreg_to_addr,
+        );
+        if !conflicts.is_empty() {
+            eprintln!(
+                "ADDRESS CONFLICT DETECTED: {} conflicts found!",
+                conflicts.len()
+            );
+            for (i, c) in conflicts.iter().enumerate().take(20) {
+                eprintln!(
+                    "  conflict {}: {:?} (addr={}, size={}, interval=[{},{}]) vs {:?} (addr={}, size={}, interval=[{},{}])",
+                    i, c.vreg1, c.addr1, c.vreg1.size(), c.interval1.start, c.interval1.end,
+                    c.vreg2, c.addr2, c.vreg2.size(), c.interval2.start, c.interval2.end,
+                );
+            }
+            if conflicts.len() > 20 {
+                eprintln!("  ... and {} more", conflicts.len() - 20);
+            }
+            return Err(format!(
+                "Address assignment produced {} conflicts between simultaneously-live VRegs",
+                conflicts.len()
+            ));
+        }
 
         let peak_live = address_result.peak_live;
         let budget_exceeded = address_result.budget_exceeded;

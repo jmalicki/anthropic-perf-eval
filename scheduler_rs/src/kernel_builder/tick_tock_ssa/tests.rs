@@ -772,7 +772,7 @@ fn test_vreg_liveness_intervals() {
     ops[1].cycle = 1;
     ops[2].cycle = 10;
 
-    let intervals = compute_live_intervals(&ops, None, None, None, None, None);
+    let intervals = compute_live_intervals(&ops, None, None, None, None, None, None);
 
     // CLOSED intervals: [start, end] where end = last_read_cycle
     //
@@ -3435,6 +3435,7 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         false, // force_zero_gap
         false, // enable_asap_alap_tightening
         false, // enable_scratch_tightening
+        None,  // disable_optional_constraint_groups
     );
     assert!(
         result.is_ok(),
@@ -3601,6 +3602,7 @@ fn test_depth4_cpsat() {
         false, // force_zero_gap
         false, // enable_asap_alap_tightening
         false, // enable_scratch_tightening
+        None,  // disable_optional_constraint_groups
     );
     assert!(
         result.is_ok(),

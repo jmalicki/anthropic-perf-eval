@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::AddressAssignmentResult;
 use crate::cpsat_scheduler::OptionalConstraintGroup;
-use crate::types::{Engine, MachineConfig, Op, SsaOp, UsageAccounting, VReg, VarType};
+use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, SsaOp, UsageAccounting, VReg, VarType};
 use crate::types::SlotVal;
 
 use super::config::{fma_multiplier, KernelConfig};
@@ -976,6 +976,28 @@ impl SsaTickTockKernelBuilder {
         for (idx, op) in ctx.ops.iter_mut().enumerate() {
             if idx < cpsat_result.cycle_assignments.len() {
                 op.cycle = cpsat_result.cycle_assignments[idx];
+            }
+        }
+
+        // Post-solve check: every vstore must be scheduled after its value's producer (cycle[vstore] >= cycle[producer] + 1).
+        // If this fires, the solver returned an invalid solution or the precedence constraint was missing.
+        let op_id_to_idx: HashMap<usize, usize> = ctx.ops.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
+        for (vstore_idx, op) in ctx.ops.iter().enumerate() {
+            if op.opcode == Opcode::Vstore && op.srcs.len() >= 2 {
+                if let Operand::VReg(value_vreg) = &op.srcs[1] {
+                    if let Some(&producer_id) = ctx.vreg_def.get(value_vreg) {
+                        if let Some(&producer_idx) = op_id_to_idx.get(&producer_id) {
+                            let vstore_cycle = op.cycle;
+                            let producer_cycle = ctx.ops[producer_idx].cycle;
+                            assert!(
+                                vstore_cycle >= producer_cycle + 1,
+                                "BUG: Vstore precedence violation: vstore op id={} at cycle {} reads value from producer op id={} at cycle {}. \
+                                 Need cycle[vstore] >= cycle[producer] + 1. Fix scheduler (dep_ids or CP-SAT model).",
+                                op.id, vstore_cycle, producer_id, producer_cycle
+                            );
+                        }
+                    }
+                }
             }
         }
 

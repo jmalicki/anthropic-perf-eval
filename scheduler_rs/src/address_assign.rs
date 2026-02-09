@@ -102,6 +102,8 @@ pub struct AddressAssignConfig {
     /// When set, maps vector group alias VRegs to their 8 scalar lane VRegs (for scatter loads).
     /// The group is allocated as an 8-word block; lane VRegs derive addresses as base+i.
     pub vector_group_lanes: Option<HashMap<VReg, Vec<VReg>>>,
+    /// When set, used when detecting precedence violations (interval end < start) to log producer op id.
+    pub vreg_def: Option<HashMap<VReg, usize>>,
 }
 
 impl Default for AddressAssignConfig {
@@ -115,6 +117,7 @@ impl Default for AddressAssignConfig {
             shifted_alu_cycles: None,
             const_alu_derive_ops: None,
             vector_group_lanes: None,
+            vreg_def: None,
         }
     }
 }
@@ -157,6 +160,7 @@ pub fn compute_live_intervals(
     shifted_alu_cycles: Option<&std::collections::HashMap<usize, Vec<i32>>>,
     const_alu_derive_ops: Option<&HashMap<usize, (usize, usize, crate::types::Opcode)>>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    vreg_def: Option<&HashMap<VReg, usize>>,
 ) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
@@ -223,6 +227,22 @@ pub fn compute_live_intervals(
                     if op.cycle > interval.end {
                         interval.end = op.cycle;
                     }
+                    // Precedence violation: consumer (e.g. vstore) scheduled before producer.
+                    // interval.start = producer cycle, interval.end = this op's cycle; end < start is invalid.
+                    if interval.end < interval.start {
+                        let producer_op_id = vreg_def.and_then(|def| def.get(vreg).copied());
+                        eprintln!(
+                            "PRECEDENCE VIOLATION (interval end < start): op id={} opcode={:?} cycle={} \
+                             reads value VReg {:?} whose interval is [{}, {}] (start=producer cycle). \
+                             Producer op id: {:?}. Schedule has consumer before producer.",
+                            op.id, op.opcode, op.cycle, vreg, interval.start, interval.end, producer_op_id
+                        );
+                        panic!(
+                            "BUG: Schedule has op {} (consumer, cycle {}) before producer of {:?} (interval start {}). \
+                             Fix the scheduler so cycle[consumer] >= cycle[producer] + 1.",
+                            op.id, op.cycle, vreg, interval.start
+                        );
+                    }
                     // Debug: log interval extension for vstore sources
                     if debug && op.opcode == Opcode::Vstore && interval.end > old_end {
                         eprintln!(
@@ -269,6 +289,25 @@ pub fn compute_live_intervals(
                 if let Some(interval) = intervals.get_mut(&delta_vreg) {
                     if read_at_cycle_plus_one > interval.end {
                         interval.end = read_at_cycle_plus_one;
+                    }
+                }
+            }
+        }
+    }
+
+    // Vstore value pass: ensure the stored value VReg is live through the vstore's cycle.
+    // This prevents the allocator from reusing that address for another VReg (e.g. offset used
+    // by multiply_add next cycle) when the schedule would have the vstore and producer in
+    // the wrong order. Extend value (srcs[1]) to vstore cycle and clamp so end >= start.
+    for op in ops {
+        if op.opcode == Opcode::Vstore && op.srcs.len() >= 2 {
+            if let Operand::VReg(value_vreg) = &op.srcs[1] {
+                if let Some(interval) = intervals.get_mut(value_vreg) {
+                    if op.cycle > interval.end {
+                        interval.end = op.cycle;
+                    }
+                    if interval.end < interval.start {
+                        interval.end = interval.start;
                     }
                 }
             }
@@ -522,6 +561,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         config.shifted_alu_cycles.as_ref(),
         config.const_alu_derive_ops.as_ref(),
         config.vector_group_lanes.as_ref(),
+        config.vreg_def.as_ref(),
     );
 
     // Debug: Collect vstore source VRegs for tracking
@@ -734,6 +774,66 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         budget: config.budget,
         live_intervals,
     }
+}
+
+/// An address conflict between two simultaneously-live VRegs.
+#[derive(Debug, Clone)]
+pub struct AddressConflict {
+    pub vreg1: VReg,
+    pub vreg2: VReg,
+    pub addr1: i64,
+    pub addr2: i64,
+    pub interval1: LiveInterval,
+    pub interval2: LiveInterval,
+}
+
+/// Verify that no two simultaneously-live VRegs have overlapping address ranges.
+///
+/// This is an O(n²) post-assignment check that catches bugs in live interval
+/// computation or address allocation. If the allocator is correct, this should
+/// always return an empty Vec.
+///
+/// # Arguments
+/// * `intervals` - Live intervals for all VRegs (from compute_live_intervals)
+/// * `vreg_to_addr` - Assigned addresses (from assign_addresses)
+///
+/// # Returns
+/// Vec of conflicts found. Empty means no conflicts.
+pub fn verify_no_address_conflicts(
+    intervals: &HashMap<VReg, LiveInterval>,
+    vreg_to_addr: &HashMap<VReg, i64>,
+) -> Vec<AddressConflict> {
+    let mut conflicts = Vec::new();
+
+    // Build entries: (VReg, LiveInterval, address) for all VRegs in both maps
+    let entries: Vec<(VReg, &LiveInterval, i64)> = intervals
+        .iter()
+        .filter_map(|(v, iv)| vreg_to_addr.get(v).map(|&a| (*v, iv, a)))
+        .collect();
+
+    for i in 0..entries.len() {
+        let (v1, iv1, a1) = entries[i];
+        let end1 = a1 + v1.size() as i64;
+        for j in (i + 1)..entries.len() {
+            let (v2, iv2, a2) = entries[j];
+            let end2 = a2 + v2.size() as i64;
+            // Address ranges overlap?
+            if a1 < end2 && a2 < end1 {
+                // Live intervals overlap? (using the same semantics as LiveInterval::overlaps)
+                if iv1.overlaps(iv2) {
+                    conflicts.push(AddressConflict {
+                        vreg1: v1,
+                        vreg2: v2,
+                        addr1: a1,
+                        addr2: a2,
+                        interval1: iv1.clone(),
+                        interval2: iv2.clone(),
+                    });
+                }
+            }
+        }
+    }
+    conflicts
 }
 
 /// Check if an address range overlaps with any fixed VReg
@@ -1169,7 +1269,7 @@ mod tests {
         emit.ops[0].cycle = 0;
         emit.ops[1].cycle = 1;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None, None);
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -1187,7 +1287,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 5;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None, None);
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
@@ -1238,7 +1338,7 @@ mod tests {
 
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(select_choice_id);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None, None);
 
         let dest = emit.ops[select_choice_idx]
             .dest
@@ -1320,7 +1420,7 @@ mod tests {
         let result = assign_addresses(&emit.ops, &config);
         assert!(!result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&select_fma_ops), None, None, None, None);
         for (v1, addr1) in &result.vreg_to_addr {
             for (v2, addr2) in &result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1408,7 +1508,7 @@ mod tests {
         emit.ops[1].cycle = 1;
         emit.ops[2].cycle = 2;
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None, None);
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -1449,6 +1549,7 @@ mod tests {
             shifted_alu_cycles: None,
             const_alu_derive_ops: None,
             vector_group_lanes: None,
+            vreg_def: None,
         };
         let result = assign_addresses(&emit.ops, &config);
 
@@ -1732,7 +1833,7 @@ mod tests {
         emit.ops[5].cycle = 80; // data
         emit.ops[6].cycle = 81; // vstore
 
-        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None);
+        let intervals = compute_live_intervals(&emit.ops, None, None, None, None, None, None);
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]

@@ -1524,7 +1524,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1675,7 +1675,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1746,7 +1746,7 @@ mod ssa_tests {
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
         let assign_result = assign_addresses(&emit.ops, &config);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None);
+        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -4778,6 +4778,7 @@ mod tests {
             Some(&r.select_fma_ops),
             None,
             Some(&r.const_alu_derive_ops),
+            None,
             None,
         );
         let select_cycle = scheduled_ops[3].cycle;
