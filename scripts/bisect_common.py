@@ -5,9 +5,40 @@ Used by bisect.py, bisect_cpsat_validation.py, and bisect_minimal_fma.py so
 CLI construction and subprocess invocation live in one place.
 """
 
+import re
 import subprocess
 import sys
 from typing import Optional
+
+
+def parse_solver_status(stdout: str, stderr: str) -> Optional[str]:
+    """Parse CP-SAT / Rust solver status from combined output.
+
+    Returns one of: 'OPTIMAL', 'FEASIBLE', 'INFEASIBLE', 'UNKNOWN', or None if not found.
+    Rust prints to stderr: "SSA CP-SAT result: ... status Optimal" or
+    "SSA CP-SAT: no solution found, status Infeasible". CP-SAT may print "status: FEASIBLE" etc.
+    """
+    text = (stdout or "") + "\n" + (stderr or "")
+    line_lower = text.lower()
+    # Prefer Rust-style "status Infeasible" / "status Optimal" (Debug format)
+    rust_status = re.search(
+        r"status\s+(optimal|feasible|infeasible|unknown)",
+        line_lower,
+        re.IGNORECASE,
+    )
+    if rust_status:
+        return rust_status.group(1).upper()
+    # CP-SAT / log style "status: FEASIBLE"
+    if "status:" in line_lower:
+        if "optimal" in line_lower:
+            return "OPTIMAL"
+        if "feasible" in line_lower:
+            return "FEASIBLE"
+        if "infeasible" in line_lower:
+            return "INFEASIBLE"
+        if "unknown" in line_lower:
+            return "UNKNOWN"
+    return None
 
 
 def n_nodes(forest_height: int) -> int:
@@ -33,8 +64,12 @@ def run_one(
     validate: bool = True,
     quiet: bool = True,
     timeout_sec: Optional[float] = None,
-) -> tuple[bool, str]:
-    """Run generate_ssa_kernel.py with given params. Returns (success, stderr_snippet).
+    return_full_output: bool = False,
+):
+    """Run generate_ssa_kernel.py with given params.
+
+    Returns (success, stderr_snippet) by default. If return_full_output=True,
+    returns (success, stderr_snippet, stdout, stderr) so callers can parse solver status.
 
     disable_constraints: None (no disable), or list of group names (e.g. ["capacity_valu"]),
     or comma-separated string (parsed and passed as --disable-cpsat-constraints).
@@ -81,4 +116,6 @@ def run_one(
     if result.stderr:
         lines = result.stderr.strip().splitlines()
         snippet = "\n".join(lines[-8:]) if len(lines) > 8 else result.stderr.strip()
+    if return_full_output:
+        return result.returncode == 0, snippet, result.stdout or "", result.stderr or ""
     return result.returncode == 0, snippet

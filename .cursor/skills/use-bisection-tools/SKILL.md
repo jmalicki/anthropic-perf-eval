@@ -34,13 +34,15 @@ uv run python scripts/bisect.py --sweep-choice --const-choice optimize load add_
 uv run python scripts/bisect.py --sweep-choice --rounds 2 --batch-size 256 --cpsat-time-limit 90
 ```
 
-### Sweep constraint groups (which disabled group correlates with failure?)
+### Sweep constraint groups (which disabled group correlates with failure? or infeasibility?)
+
+Use this to find which optional constraint group makes the model **infeasible**: run with `single` (baseline + one run per group disabled). The script reports **solver status** (INFEASIBLE, FEASIBLE, OPTIMAL, UNKNOWN) for each run and, when the baseline is infeasible, which disabled groups made the model feasible.
 
 ```bash
 # Single run with no disabled groups (baseline)
 uv run python scripts/bisect.py --sweep-constraints none
 
-# None + one run per group with that group disabled (1 + 5 = 6 runs)
+# None + one run per group with that group disabled (1 + 5 = 6 runs); reports solver status for infeasibility debugging
 uv run python scripts/bisect.py --sweep-constraints single
 
 # One run with all five groups disabled

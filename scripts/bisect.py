@@ -33,7 +33,7 @@ import sys
 
 # Allow importing bisect_common when run as uv run python scripts/bisect.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bisect_common import run_one
+from bisect_common import run_one, parse_solver_status
 
 
 def _constraint_group_names():
@@ -308,6 +308,8 @@ def main():
             return 1
         print()
 
+    # When sweeping constraint groups, capture solver status to diagnose infeasibility
+    sweep_constraints = len(constraint_axis) > 1
     results = []
     for (clbl, ckw) in choice_axis:
         for (conlbl, condisable) in constraint_axis:
@@ -323,22 +325,48 @@ def main():
                     "seed": args.seed,
                     "validate": True,
                     "quiet": True,
+                    "return_full_output": sweep_constraints,
                 }
                 print(f"  {label}...", end=" ", flush=True)
-                ok, _ = run_one(project_root, script, **kwargs)
-                status = "PASS" if ok else "FAIL"
-                results.append((label, status))
-                print(status)
+                if sweep_constraints:
+                    ok, _, stdout, stderr = run_one(project_root, script, **kwargs)
+                    solver_status = parse_solver_status(stdout, stderr)
+                    status = "PASS" if ok else "FAIL"
+                    if status == "PASS":
+                        print(f"{status}")
+                    else:
+                        print(f"{status} (solver {solver_status or '?'})")
+                    results.append((label, status, solver_status))
+                else:
+                    ok, _ = run_one(project_root, script, **kwargs)
+                    status = "PASS" if ok else "FAIL"
+                    results.append((label, status, None))
+                    print(status)
 
     # Summary
     print()
-    passed = sum(1 for _, s in results if s == "PASS")
-    failed_list = [lbl for lbl, s in results if s == "FAIL"]
+    passed = sum(1 for r in results if r[1] == "PASS")
+    failed_list = [r[0] for r in results if r[1] == "FAIL"]
     print(f"Summary: {passed}/{len(results)} passed.")
     if failed_list:
         print("Failing configs:")
-        for lbl in failed_list:
-            print(f"  {lbl}")
+        for r in results:
+            if r[1] == "FAIL":
+                extra = f" (solver {r[2]})" if r[2] else ""
+                print(f"  {r[0]}{extra}")
+    # When sweeping constraints only (one choice, one size): highlight which disabled group(s) made the model feasible
+    if sweep_constraints and len(constraint_axis) > 1 and len(choice_axis) == 1 and len(size_axis) == 1:
+        none_label = constraint_axis[0][0]  # "none"
+        baseline_ok = any(r[1] == "PASS" and (r[0] == none_label or r[0].endswith(" | " + none_label)) for r in results)
+        if not baseline_ok:
+            feasible_when_disabled = [
+                r[0] for r in results
+                if r[1] == "PASS" and "disable_" in r[0]
+            ]
+            if feasible_when_disabled:
+                print("Infeasibility vs constraint groups: baseline (no groups disabled) infeasible; became feasible when disabling:")
+                for lbl in feasible_when_disabled:
+                    print(f"  {lbl}")
     return 0 if not failed_list else 1
 
 
