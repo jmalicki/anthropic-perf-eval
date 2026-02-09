@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::AddressAssignmentResult;
+use crate::cpsat_scheduler::OptionalConstraintGroup;
 use crate::types::{Engine, MachineConfig, Op, SsaOp, UsageAccounting, VReg, VarType};
 use crate::types::SlotVal;
 
@@ -354,6 +355,7 @@ impl SsaTickTockKernelBuilder {
         force_zero_gap: bool,
         enable_asap_alap_tightening: bool,
         enable_scratch_tightening: bool,
+        disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
     ) -> Result<SsaScheduleResult, String> {
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
@@ -367,8 +369,13 @@ impl SsaTickTockKernelBuilder {
                      ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass,
                      LowerToOpsPass},
         };
-        use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+        use crate::cpsat_scheduler::{
+            schedule_ssa_cpsat, OptionalConstraintGroup, SsaCpsatConfig, SsaCpsatHints,
+        };
         use crate::types::Opcode;
+
+        let disable_optional_constraint_groups: std::collections::HashSet<OptionalConstraintGroup> =
+            disable_optional_constraint_groups.unwrap_or_default();
 
         // Build SSA program and create pipeline context
         let program = self.build();
@@ -395,6 +402,7 @@ impl SsaTickTockKernelBuilder {
                 force_zero_gap,
                 enable_asap_alap_tightening,
                 enable_scratch_tightening,
+                disable_optional_constraint_groups,
             }),
             ..Default::default()
         };
@@ -858,6 +866,12 @@ impl SsaTickTockKernelBuilder {
             force_zero_gap,
             enable_asap_alap_tightening,
             enable_scratch_tightening,
+            disable_optional_constraint_groups: ctx
+                .config
+                .cpsat
+                .as_ref()
+                .map(|c| c.disable_optional_constraint_groups.clone())
+                .unwrap_or_else(std::collections::HashSet::new),
             ..Default::default()
         };
 

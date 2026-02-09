@@ -27,6 +27,7 @@ Example usage:
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -97,6 +98,9 @@ def main():
                         help="Enable scratch-aware tightening. Considers scratch constraints when tightening bounds (experimental, for ablation studies). Can be used independently of --enable-asap-alap-tightening.")
     parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive", "cascade"], default="adaptive",
                         help="Scheduling pressure policy: adaptive (default, transitions automatically), greedy (no pressure awareness), throttled (soft re-sort), gated (hard gate)")
+    _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
+    parser.add_argument("--disable-cpsat-constraints", type=str, default=None, metavar="GROUP1,GROUP2,...",
+                        help=f"Disable optional CP-SAT constraint groups (for debugging). Valid: {_constraint_names}. Also from env CPSAT_DISABLE_OPTIONAL_CONSTRAINTS.")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -131,6 +135,19 @@ def main():
 
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
+
+    # Optional constraint groups to disable (debugging): CLI or env CPSAT_DISABLE_OPTIONAL_CONSTRAINTS
+    # Parse comma-separated names into enum values (single source of truth in Rust)
+    disable_constraints_raw = args.disable_cpsat_constraints or os.environ.get("CPSAT_DISABLE_OPTIONAL_CONSTRAINTS")
+    optional_constraint_groups_to_disable = None
+    if disable_constraints_raw:
+        optional_constraint_groups_to_disable = []
+        for s in disable_constraints_raw.split(","):
+            t = s.strip()
+            if t:
+                optional_constraint_groups_to_disable.append(
+                    scheduler_rs.OptionalConstraintGroup.from_str(t)
+                )
     # Clamp to allowed range (min 2, max 4)
     tree_reduce_max_depth = max(2, min(4, args.tree_reduce_max_depth))
     if tree_reduce_max_depth != args.tree_reduce_max_depth and verbose:
@@ -157,6 +174,9 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
+    if optional_constraint_groups_to_disable:
+        names = [g.name for g in optional_constraint_groups_to_disable]
+        print(f"  disable_optional_constraint_groups={names}")
     if args.force_zero_gap:
         print(f"  force_zero_gap=True")
     if args.enable_asap_alap_tightening:
@@ -213,6 +233,7 @@ def main():
         git_sha=git_sha,
         comment=args.comment,
         scheduling_pressure_policy=args.scheduling_pressure_policy,
+        optional_constraint_groups_to_disable=optional_constraint_groups_to_disable,
     )
     build_time = time.time() - start_time
 

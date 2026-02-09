@@ -52,6 +52,21 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::cpsat_available, m)?)?;
     // SSA kernel building functions
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ssa, m)?)?;
+    m.add_function(wrap_pyfunction!(python::optional_constraint_group_names, m)?)?;
+    m.add_class::<python::OptionalConstraintGroupPy>()?;
+    // Expose each variant as a class attribute for Python (e.g. OptionalConstraintGroup.redundant_linear_bounds).
+    let py = m.py();
+    let cls = m.getattr("OptionalConstraintGroup")?;
+    use crate::cpsat_scheduler::OptionalConstraintGroup;
+    let set_attr = |name: &str, inner: OptionalConstraintGroup| -> PyResult<()> {
+        let val = python::OptionalConstraintGroupPy { inner };
+        cls.setattr(name, Py::new(py, val)?)
+    };
+    set_attr("redundant_linear_bounds", OptionalConstraintGroup::RedundantLinearBounds)?;
+    set_attr("capacity_valu", OptionalConstraintGroup::CapacityValu)?;
+    set_attr("capacity_alu", OptionalConstraintGroup::CapacityAlu)?;
+    set_attr("capacity_flow", OptionalConstraintGroup::CapacityFlow)?;
+    set_attr("capacity_load", OptionalConstraintGroup::CapacityLoad)?;
     Ok(())
 }
 
