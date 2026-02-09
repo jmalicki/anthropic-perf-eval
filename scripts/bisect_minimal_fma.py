@@ -8,6 +8,8 @@ Runs generate_ssa_kernel.py with --validate -q and --select-choice fma:
 Machine config (VALU/ALU slot counts) is NOT exposed via the CLI; the scheduler uses
 MachineConfig::default() (6 VALU, 12 ALU, etc.). So we only sweep problem size here.
 
+For full axis options (choice + constraints + size), see scripts/bisect.py.
+
 Usage (from project root):
     # Default: sweep rounds in [1,2], batch in [8,16,32], forest_height in [8,9,10]
     uv run python scripts/bisect_minimal_fma.py
@@ -24,55 +26,11 @@ Usage (from project root):
 
 import argparse
 import os
-import subprocess
 import sys
 
-
-def n_nodes(forest_height: int) -> int:
-    return (1 << forest_height) - 1
-
-
-def run_one(
-    project_root: str,
-    script: str,
-    rounds: int,
-    batch_size: int,
-    forest_height: int,
-    use_greedy: bool,
-    cpsat_time_limit: float,
-    seed: int = 123,
-) -> tuple[bool, str]:
-    """Run generate_ssa_kernel.py with given params. Returns (success, stderr_snippet)."""
-    cmd = [
-        sys.executable,
-        script,
-        "--rounds",
-        str(rounds),
-        "--batch-size",
-        str(batch_size),
-        "--forest-height",
-        str(forest_height),
-        "--n-nodes",
-        str(n_nodes(forest_height)),
-        "--seed",
-        str(seed),
-        "--validate",
-        "-q",
-        "--select-choice",
-        "fma",
-        "--valu-shift",
-        "valu",
-    ]
-    if use_greedy:
-        cmd.append("--use-greedy")
-    else:
-        cmd.extend(["--cpsat-time-limit", str(cpsat_time_limit)])
-    result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True, timeout=cpsat_time_limit + 30)
-    snippet = ""
-    if result.stderr:
-        lines = result.stderr.strip().splitlines()
-        snippet = "\n".join(lines[-8:]) if len(lines) > 8 else result.stderr.strip()
-    return result.returncode == 0, snippet
+# Allow importing bisect_common when run as uv run python scripts/bisect_minimal_fma.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bisect_common import run_one
 
 
 def main():
@@ -109,33 +67,54 @@ def main():
         print(f"Error: generate_ssa_kernel.py not found at {script}", file=sys.stderr)
         return 1
 
+    for b in args.batch_size:
+        if b % 8 != 0:
+            print(f"Error: batch_size must be a multiple of 8 (VLEN). Got {b}.", file=sys.stderr)
+            return 1
+
+    def run(rounds, batch_size, forest_height, use_greedy):
+        return run_one(
+            project_root,
+            script,
+            rounds=rounds,
+            batch_size=batch_size,
+            forest_height=forest_height,
+            use_greedy=use_greedy,
+            cpsat_time_limit=args.cpsat_time_limit,
+            seed=args.seed,
+            const_choice="optimize",
+            select_choice="fma",
+            valu_shift="valu",
+            validate=True,
+            quiet=True,
+        )
+
     if args.shrink:
-        # Start from known failing config (2, 16, 10); try smaller configs and report pass/fail
         r0, b0, h0 = 2, 16, 10
         print("Shrink mode: try smaller configs to find minimal failing (rounds, batch_size, forest_height)")
         print(f"  Reference: rounds={r0}, batch_size={b0}, forest_height={h0}")
         print()
 
-        # Greedy baseline at reference
-        ok, _ = run_one(project_root, script, r0, b0, h0, True, args.cpsat_time_limit, args.seed)
+        ok, _ = run(r0, b0, h0, True)
         if not ok:
             print("  Greedy + fma failed at reference; cannot use as baseline.", file=sys.stderr)
             return 1
 
-        # Try each dimension smaller; record pass/fail
         print("  Varying batch_size (rounds=2, forest_height=10):")
         for batch in [16, 8, 4, 2]:
-            ok, _ = run_one(project_root, script, r0, batch, h0, False, args.cpsat_time_limit, args.seed)
+            if batch % 8 != 0:
+                continue
+            ok, _ = run(r0, batch, h0, False)
             print(f"    batch_size={batch}: CP-SAT+fma {'PASS' if ok else 'FAIL'}")
 
         print("  Varying rounds (batch_size=16, forest_height=10):")
         for rounds in [2, 1]:
-            ok, _ = run_one(project_root, script, rounds, b0, h0, False, args.cpsat_time_limit, args.seed)
+            ok, _ = run(rounds, b0, h0, False)
             print(f"    rounds={rounds}: CP-SAT+fma {'PASS' if ok else 'FAIL'}")
 
         print("  Varying forest_height (rounds=2, batch_size=16):")
         for height in [10, 9, 8, 7]:
-            ok, _ = run_one(project_root, script, r0, b0, height, False, args.cpsat_time_limit, args.seed)
+            ok, _ = run(r0, b0, height, False)
             print(f"    forest_height={height}: CP-SAT+fma {'PASS' if ok else 'FAIL'}")
 
         print()
@@ -143,7 +122,6 @@ def main():
         print("  uv run python scripts/minimal_fma_repro.py --rounds 2 --batch-size 16")
         return 0
 
-    # Grid sweep
     rounds_list = sorted(set(args.rounds))
     batch_list = sorted(set(args.batch_size))
     height_list = sorted(set(args.forest_height))
@@ -154,10 +132,9 @@ def main():
     print("  Machine config: not exposed (using default 6 VALU, 12 ALU, etc.)")
     print()
 
-    # Greedy baseline at one config
     r0, b0, h0 = rounds_list[-1], batch_list[-1], height_list[-1]
     print(f"Greedy baseline (rounds={r0}, batch={b0}, forest_height={h0})...", flush=True)
-    ok, _ = run_one(project_root, script, r0, b0, h0, True, args.cpsat_time_limit, args.seed)
+    ok, _ = run(r0, b0, h0, True)
     print(f"  {'PASS' if ok else 'FAIL'}")
     if not ok:
         print("  Greedy failed; fix baseline before bisecting.", file=sys.stderr)
@@ -168,12 +145,9 @@ def main():
     for rounds in rounds_list:
         for batch in batch_list:
             for height in height_list:
-                key = (rounds, batch, height)
-                ok, snippet = run_one(
-                    project_root, script, rounds, batch, height, False, args.cpsat_time_limit, args.seed
-                )
-                results.append((*key, "PASS" if ok else "FAIL", snippet))
+                ok, snippet = run(rounds, batch, height, False)
                 status = "PASS" if ok else "FAIL"
+                results.append((rounds, batch, height, status, snippet))
                 print(f"  rounds={rounds} batch={batch} forest_height={height}  CP-SAT+fma: {status}")
 
     print()
@@ -185,7 +159,6 @@ def main():
         print("  Failing configs (rounds, batch_size, forest_height):")
         for (r, b, h) in sorted(failed):
             print(f"    ({r}, {b}, {h})")
-        # Smallest failing by (rounds, batch, height) lex order
         r, b, h = min(failed, key=lambda t: (t[0], t[1], t[2]))
         print(f"  Smallest failing (lex): rounds={r}, batch_size={b}, forest_height={h}")
     return 0
