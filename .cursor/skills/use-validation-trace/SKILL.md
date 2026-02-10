@@ -147,7 +147,7 @@ Use these when you know the **cycle and address** from the trace (e.g. “vstore
 
 **Script:** `scripts/compare_depth3_tree_value.py`
 
-For **depth-3** configs (e.g. 4r/8b) where the kernel produces a wrong value, compares the wrong value to reference **node_val**, **val_after_xor**, and **hashed_val** for the depth-3 round. Tells you whether the bug is likely (A) wrong tree selection (got value matches another lane's node_val), (B) wrong XOR, or (C) wrong hash/branch.
+For **depth-3** configs (e.g. 4r/8b) where the kernel produces a wrong value, compares the wrong value to reference **node_val**, **val_after_xor**, and **hashed_val** for the depth-3 round. Tells you whether the bug is likely (A) wrong tree selection (got value matches another lane's node_val), (B) wrong XOR, or (C) wrong hash/branch. **Tip:** Generate the kernel with `--no-cse-groups` to simplify debugging (fewer moving parts); see BUGS.md for the minimal repro.
 
 ### Usage
 

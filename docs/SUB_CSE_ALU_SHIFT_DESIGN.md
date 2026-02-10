@@ -157,6 +157,8 @@ The shared SUB has no SsaOp; it is a synthetic op. To model ALU-shift we treat i
 
 If true_val or false_val has multiple producers (e.g. phi), the model is more complex; for tree-select they are single-def.
 
+**Phase 1 validation (CSE build/validation pass):** When building CseGroup instances (e.g. in `build_cse_groups`), detect when `producer_true_idx` or `producer_false_idx` is None (operands have multiple producers or no single def — multi-def/phi). Then either (a) reject the group with a clear error/warning that operands have multiple producers, or (b) tag the group as **complex_phi** and fall back to conservative dependency handling. The implementation uses (b): set `complex_phi: true` and emit a diagnostic (e.g. stderr) that the group is downgraded. Dependency builder and per-lane dependency logic (Section 5.4) must check this tag and never unwrap None; when `complex_phi` is true, use conservative handling (e.g. sub_asap = 0, no per-lane precedence from those operands).
+
 ### 5.4 Per-Lane Dependencies for SUB
 
 For lane i: `sub_temp[i] = true_val[i] - false_val[i]`. Lane i depends on:
@@ -169,6 +171,8 @@ So:
 Where `ready_true[i]` = `alu_cycle[producer_true][i] + 1` (if producer shifted) or `cycle_vars[producer_true] + 1` (if not). Same for false.
 
 **Element dep map:** Default same-lane (i -> i). Tree-select operands are full vectors from one op, so lane i of SUB depends on lane i of each producer.
+
+**Complex-phi fallback:** When `CseGroup.complex_phi` is true, do **not** use `producer_true_idx` or `producer_false_idx` for per-lane dependency construction (they may be None). Use conservative handling: do not add per-lane precedence from those operands; use sub_asap = 0 (or a safe lower bound) for the shared SUB. All usage sites (dependency builder, per-lane dependency logic) must check `complex_phi` or the Option and avoid unwrapping None; emit diagnostics when groups are rejected or downgraded.
 
 ### 5.5 Precedence to Consumers (FMAs)
 

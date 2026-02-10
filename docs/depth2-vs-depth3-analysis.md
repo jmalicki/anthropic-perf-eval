@@ -255,12 +255,12 @@ So: **we do have lots of free ALU during depth-3 select, and shifting the SUB to
 
 **Question:** Does the CP-SAT model correctly account for SelectChoice FMA path as 2 VALU ops (SUB + FMA)?
 
-**Answer:** Yes. The scheduler correctly models a SelectChoice on the FMA path as **2 VALU ops**, not 1:
+**Answer:** Yes — except when `false_val == 0`. The scheduler models a SelectChoice on the FMA path as **2 VALU ops** in the normal case:
 
-1. **VALU cumulative** (`cpsat_scheduler/model.rs`): For each SelectChoice FMA, it adds two intervals (sub at cycle C, fma at cycle C+1), each with demand 1.
-2. **Capacity constraint:** `6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)` — explicitly adds 2 VALU ops per SelectChoice that chooses FMA.
+1. **VALU cumulative** (`cpsat_scheduler/model.rs`): For each SelectChoice FMA it adds two intervals (sub at cycle C, fma at cycle C+1), each with demand 1 — see the branch where `delta_vreg` is `None` (and not CSE consumer), which builds `sub_interval` and `fma_interval` (e.g. around lines 975–989 and 1034–1048).
+2. **Capacity constraint:** `6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)` (model.rs, capacity_valu) — explicitly counts 2 VALU ops per SelectChoice that chooses FMA.
 
-One caveat: when `false_val == 0`, emission sets `needs_subtraction = false` and emits only 1 FMA (no SUB). The model does not distinguish this; it assumes 2 VALU ops whenever `delta_vreg` is None. That could slightly overcount VALU for those rare cases, but as noted above, needs_subtraction is effectively always true for depth-3 tree-select (see analysis below on **SUB with constant 0** and `needs_subtraction` for the depth-3 kernel).
+The caveat: at **emission** time, when `false_val == 0`, we set `needs_subtraction = false` and emit only one FMA (no SUB). The model does not distinguish that case: it assumes 2 VALU ops whenever the op has `delta_vreg == None`, so in those rare cases the model can **overcount** VALU by one per such SelectChoice. The rest of this section still applies (two intervals and the capacity formula are how the model encodes FMA path); for depth-3 tree-select, `needs_subtraction` is effectively always true (see **SUB with constant 0** below), so the overcount does not arise in practice for that kernel.
 
 ---
 

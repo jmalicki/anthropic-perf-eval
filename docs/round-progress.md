@@ -50,6 +50,13 @@ Data sources: scheduler output JSON files (`scheduler_output*.json`) and manual 
 
 See [4-round-phase-results.md](4-round-phase-results.md) for detailed 4-round tracking.
 
+**Ablation (2026-02-10):**
+- **Experiment:** Method tree-reduce; depths compared 2 vs 3; 4 rounds, batch 256; 1800s CP-SAT; `--validate`.
+- **depth-2:** 435 cycles, OPTIMAL, validation PASSED.
+- **depth-3:** 443 cycles, OPTIMAL, validation FAILED.
+- **Artifacts:** Results in `ablation_4r_depth2_vs_depth3.json`.
+- **Analyzer:** `uv run python scripts/analyze_ablation.py ablation_4r_depth2_vs_depth3.json`.
+
 Quick summary:
 - **2a32f71** (Phase 1): 514 cycles, 1489 peak (greedy, batch 256)
 - **68b1602** (tree-reduce depth3): 460 cycles, 1522 peak (greedy, valu-shift, batch 256)
@@ -59,6 +66,8 @@ Quick summary:
 
 | Date | SHA | Batch | Cycles | Peak live | Status | Validation | Notes | Source |
 |------|-----|-------|--------|-----------|--------|------------|-------|--------|
+| 2026-02-10 | 614354c1 | 256 | 435 | 1267 | OPTIMAL | PASSED | ablation: tree-reduce depth 2 (run_ablation.py 4r 1800s) | scheduler_output_depth-2.json |
+| 2026-02-10 | 614354c1 | 256 | 443 | 1266 | OPTIMAL | FAILED | ablation: tree-reduce depth 3 (validation failed; resolved in 29ad610b) | scheduler_output_depth-3.json |
 | 2026-02-10 | 29ad610b | 256 | 435 | 1267 | OPTIMAL | PASSED | depth-2 tree-reduce (validated) | scheduler_output_4r_256b_depth2.json |
 | 2026-02-10 | 29ad610b | 256 | 443 | 1266 | OPTIMAL | PASSED | depth-3 tree-reduce (validated) | scheduler_output_4r_256b_depth3.json |
 | 2026-02-09 | 16d5766a | 256 | 435 | N/A | OPTIMAL | N/A | depth-2 tree-reduce | scheduler_output_depth2.json |
@@ -67,6 +76,8 @@ Quick summary:
 | 2026-02-08 | 1a4a1817 | 256 | 443 | N/A | OPTIMAL | N/A | treeselect | scheduler_output_treeselect.json |
 | 2026-02-07 | d6461724 | 256 | 499 | N/A | OPTIMAL | N/A | depth-3, no valu-shift | scheduler_output_depth3_novs.json |
 | 2026-02-07 | d6461724 | 256 | 506 | N/A | OPTIMAL | N/A | depth-2, no valu-shift | scheduler_output_depth2_novs.json |
+
+**Depth-3 validation note:** The validation failure for tree-reduce depth 3 at 614354c1 was later resolved in 29ad610b—the same configuration (4r, 256, depth 3) passed validation there. So identical configs show different outcomes because of fixes in between (e.g. scheduler/address-assign or validation; see BUGS.md for related scratch/liveness issues).
 
 ---
 
