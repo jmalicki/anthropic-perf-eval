@@ -31,11 +31,14 @@
 //!
 //! See `types.rs` "AUTHORITATIVE LIVENESS MODEL DOCUMENTATION" for full explanation.
 //!
-//! ## The Single Expiration Rule: `end <= start`
+//! ## The Expiration Rule
 //!
-//! When allocating VReg B at cycle S, expire VReg A where `A.end <= S`:
-//! - Same-cycle reuse: A=[0,5], B=[5,...] → 5<=5 ✓ → A expires (correct)
-//! - Write conflict: A=[5,6] (dead), B=[5,...] → 6<=5 ✗ → no reuse (correct)
+//! When allocating VReg B at cycle S, expire VReg A when:
+//! - `A.end < S`, or
+//! - `A.end == S` and B is not a "point" interval [S, S], or
+//! - `A.end == S` and A was not a point interval (so A was read then B can write; same-cycle reuse).
+//! Point intervals [C, C] (defined and read at C) are never expired when allocating another VReg
+//! that starts at C, so two VRegs both read at cycle C get different addresses.
 //!
 //! ## Algorithm: Linear Scan Allocation
 //!
@@ -154,17 +157,7 @@ impl AddressAssignConfig {
     /// zero_vreg, select_fma_ops, shifted_alu_cycles, const_alu_derive_ops, vector_group_lanes,
     /// vreg_def, cse_consumer_op_ids, and cse_shared_sub_temp_intervals.
     pub fn compute_live_intervals(&self, ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
-        compute_live_intervals(
-            ops,
-            self.zero_vreg,
-            &self.select_fma_ops,
-            &self.shifted_alu_cycles,
-            &self.const_alu_derive_ops,
-            &self.vector_group_lanes,
-            &self.vreg_def,
-            &self.cse_consumer_op_ids,
-            &self.cse_shared_sub_temp_intervals,
-        )
+        compute_live_intervals(self, ops)
     }
 }
 
@@ -309,24 +302,17 @@ impl LivenessUse for OpLiveness<'_> {
 /// as def_cycle for their dest. The 8 ALU ops write at different cycles; the vector block is
 /// in use from the first write.
 pub fn compute_live_intervals(
+    config: &AddressAssignConfig,
     ops: &[SsaOp],
-    zero_vreg: Option<VReg>,
-    select_fma_ops: &HashSet<usize>,
-    shifted_alu_cycles: &std::collections::HashMap<usize, Vec<i32>>,
-    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
-    vector_group_lanes: &HashMap<VReg, Vec<VReg>>,
-    vreg_def: &HashMap<VReg, usize>,
-    cse_consumer_op_ids: &HashSet<usize>,
-    cse_shared_sub_temp_intervals: &[(VReg, i32, i32)],
 ) -> HashMap<VReg, LiveInterval> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
     let ctx = LivenessContext {
-        select_fma_ops,
-        shifted_alu_cycles,
-        const_alu_derive_ops,
-        cse_consumer_op_ids,
+        select_fma_ops: &config.select_fma_ops,
+        shifted_alu_cycles: &config.shifted_alu_cycles,
+        const_alu_derive_ops: &config.const_alu_derive_ops,
+        cse_consumer_op_ids: &config.cse_consumer_op_ids,
         ops,
     };
 
@@ -360,7 +346,7 @@ pub fn compute_live_intervals(
                     interval.end = read_cycle;
                 }
                 if interval.end < interval.start {
-                    let producer_op_id = vreg_def.get(&vreg).copied();
+                    let producer_op_id = config.vreg_def.get(&vreg).copied();
                     eprintln!(
                         "PRECEDENCE VIOLATION (interval end < start): op id={} opcode={:?} cycle={} \
                          reads value VReg {:?} whose interval is [{}, {}] (start=producer cycle). \
@@ -398,7 +384,7 @@ pub fn compute_live_intervals(
         .map(|(i, op)| (op.id, (i, op.dest)))
         .collect();
 
-    for (&derive_op_id, info) in const_alu_derive_ops {
+    for (&derive_op_id, info) in &config.const_alu_derive_ops {
         let left_op_id = info.left_op_id;
         let right_op_id = info.right_op_id;
         let derive_cycle = id_to_info
@@ -440,10 +426,17 @@ pub fn compute_live_intervals(
         }
     }
 
-    // Third pass: extend dead VRegs (start == end) to [start, start+1].
+    // Third pass: extend dead VRegs (start == end, never read) to [start, start+1].
     // This prevents same-cycle write conflicts. See types.rs for explanation.
-    for interval in intervals.values_mut() {
-        if interval.start == interval.end {
+    // Only extend when the VReg is never read: if it is read at the same cycle as def ([C, C]),
+    // we must not extend, so that two such VRegs (e.g. two vstore value sources at cycle C)
+    // remain distinct for allocation and get different addresses.
+    let used_vregs: HashSet<VReg> = ops
+        .iter()
+        .flat_map(|op| op.srcs.iter().filter_map(|s| s.as_vreg()))
+        .collect();
+    for (vreg, interval) in intervals.iter_mut() {
+        if interval.start == interval.end && !used_vregs.contains(vreg) {
             // Dead VReg: written but never read. Extend by 1 to prevent
             // same-cycle write conflicts with other VRegs.
             interval.end = interval.start + 1;
@@ -451,7 +444,7 @@ pub fn compute_live_intervals(
     }
 
     // CSE shared sub_temp intervals: add synthetic intervals for shared SUBs.
-    for &(vreg, start, end) in cse_shared_sub_temp_intervals {
+    for &(vreg, start, end) in &config.cse_shared_sub_temp_intervals {
         intervals.insert(vreg, LiveInterval::new(start, end));
     }
 
@@ -468,7 +461,7 @@ pub fn compute_live_intervals(
     //
     // For read groups, we must preserve the existing interval and extend it to cover
     // all ops that read lane VRegs. Lane VRegs lack intervals so we scan ops directly.
-    for (group_vreg, lane_vregs) in vector_group_lanes {
+    for (group_vreg, lane_vregs) in &config.vector_group_lanes {
         // Existing interval for the group key (present for read groups / decomposition)
         let existing_start = intervals.get(group_vreg).map(|i| i.start);
         let existing_end = intervals.get(group_vreg).map(|i| i.end);
@@ -539,7 +532,7 @@ pub fn compute_live_intervals(
     }
 
     // Include zero_vreg so peak_live counts the reserved slot (total capacity = budget including zero)
-    if let Some(zero) = zero_vreg {
+    if let Some(zero) = config.zero_vreg {
         let max_cycle = ops
             .iter()
             .filter(|op| op.cycle >= 0)
@@ -673,8 +666,11 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         used_ranges.push((*addr, end));
     }
 
-    // Active intervals: (end_cycle, allocated_base_addr, size)
-    let mut active: BinaryHeap<Reverse<(i32, i64, usize)>> = BinaryHeap::new();
+    // Active intervals: (end_cycle, allocated_base_addr, size, was_point_interval)
+    // was_point_interval: true if the allocated VReg had interval [C, C]. We need this to avoid
+    // expiring a point interval when allocating a non-point [C, C+1] that starts at the same cycle
+    // (otherwise we'd assign the same address to both).
+    let mut active: BinaryHeap<Reverse<(i32, i64, usize, bool)>> = BinaryHeap::new();
 
     // Free ranges: list of (base_addr, size) available for reuse
     // Use BinaryHeap with Reverse to prefer lower addresses
@@ -695,7 +691,8 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         if config.fixed_vregs.contains_key(vreg) {
             // Still need to track as active for correct expiry
             let addr = config.fixed_vregs[vreg];
-            active.push(Reverse((interval.end, addr, vreg.size())));
+            let point = interval.start == interval.end;
+            active.push(Reverse((interval.end, addr, vreg.size(), point)));
             continue;
         }
 
@@ -705,8 +702,18 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         // VLIW semantics: reads happen before writes within a cycle.
         // So if A ends at cycle 11 (last read at 11) and B starts at cycle 11 (written at 11),
         // A is read first, then B is written - they can safely share the same address.
-        while let Some(&Reverse((end_cycle, freed_addr, freed_size))) = active.peek() {
-            if end_cycle <= interval.start {
+        // Exception: when THIS interval is a "point" [C, C], only expire if freed ended before C.
+        // When the FREED allocation was a point interval ending at C, do NOT expire when
+        // allocating a non-point [C, C+k] — otherwise we'd give the new VReg the same address
+        // as the point (both live at cycle C).
+        while let Some(&Reverse((end_cycle, freed_addr, freed_size, freed_was_point))) = active.peek() {
+            let expire = if interval.start == interval.end {
+                end_cycle < interval.start
+            } else {
+                end_cycle < interval.start
+                    || (end_cycle == interval.start && !freed_was_point)
+            };
+            if expire {
                 active.pop();
                 // Return freed range to pool (don't free fixed ranges)
                 if !is_in_fixed_range(freed_addr, freed_size, &config.fixed_vregs) {
@@ -720,7 +727,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         // Snapshot active (addr, size) so we can check overlap reliably.
         let active_ranges: Vec<(i64, usize)> = active
             .iter()
-            .map(|Reverse((_, a, s))| (*a, *s))
+            .map(|Reverse((_, a, s, _))| (*a, *s))
             .collect();
 
         let overlaps_any = |addr: i64, len: usize| {
@@ -776,7 +783,8 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         }
 
         vreg_to_addr.insert(*vreg, new_addr);
-        active.push(Reverse((interval.end, new_addr, size)));
+        let point = interval.start == interval.end;
+        active.push(Reverse((interval.end, new_addr, size, point)));
 
         // Debug: log assignment for vstore-related VRegs
         if debug && vstore_vregs.contains(vreg) {
@@ -1997,6 +2005,165 @@ mod tests {
         assert_ne!(
             result.vreg_to_addr[&partition_addr], result.vreg_to_addr[&computation],
             "BUG: Overlapping VRegs got the same address"
+        );
+    }
+
+    // ========================================================================
+    // Multi-group / last-round store speculations (3r/64, group 4 bug)
+    //
+    // When multiple groups' final values are vstored, value VRegs can have
+    // identical or adjacent intervals. The allocator must never assign the
+    // same address to two VRegs that are both read in the same cycle (two
+    // vstore value sources at cycle C), even if one interval "ends" at C and
+    // the next "starts" at C (end <= start would expire and reuse).
+    // ========================================================================
+
+    /// Two VRegs with identical closed interval [C, C] (both defined and
+    /// last-used at cycle C) must get different addresses.
+    ///
+    /// Scenario: two vstore value sources at the same cycle (e.g. two groups'
+    /// hash outputs stored at cycle 85). If the scheduler incorrectly places
+    /// the producer at the same cycle as the vstore, we get interval [C, C].
+    /// The allocator sorts by (start, end); when allocating the second [C, C]
+    /// VReg it would expire the first (end <= start) and reuse the same address,
+    /// causing one vstore to read the wrong value. Defensive: require distinct
+    /// addresses whenever two intervals both include the same cycle.
+    #[test]
+    fn test_two_vregs_same_interval_both_read_at_same_cycle_distinct_addresses() {
+        use crate::types::Operand;
+        let a_vreg = VReg::vector(10);
+        let b_vreg = VReg::vector(11);
+        let c1 = VReg::scalar(1);
+        let c2 = VReg::scalar(2);
+        let addr1 = VReg::scalar(3);
+        let addr2 = VReg::scalar(4);
+
+        let mut ops: Vec<SsaOp> = vec![
+            SsaOp::new(0, Engine::Load, Opcode::Const, Some(c1), vec![]),
+            SsaOp::new(1, Engine::Load, Opcode::Const, Some(c2), vec![]),
+            SsaOp::new(2, Engine::Load, Opcode::Const, Some(addr1), vec![]),
+            SsaOp::new(3, Engine::Load, Opcode::Const, Some(addr2), vec![]),
+        ];
+        for op in &mut ops {
+            op.cycle = 0;
+        }
+        // Producers at cycle 11 (so A and B get def at 11)
+        ops.push(SsaOp::new(
+            4,
+            Engine::Valu,
+            Opcode::Xor,
+            Some(a_vreg),
+            vec![Operand::VReg(c1), Operand::VReg(c2)],
+        ));
+        ops.last_mut().unwrap().cycle = 11;
+        ops.push(SsaOp::new(
+            5,
+            Engine::Valu,
+            Opcode::Xor,
+            Some(b_vreg),
+            vec![Operand::VReg(c1), Operand::VReg(c2)],
+        ));
+        ops.last_mut().unwrap().cycle = 11;
+        // Vstores at cycle 11 (so A and B get last use at 11) → intervals [11, 11]
+        ops.push(SsaOp::new(
+            6,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::VReg(addr1), Operand::VReg(a_vreg)],
+        ));
+        ops.last_mut().unwrap().cycle = 11;
+        ops.push(SsaOp::new(
+            7,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::VReg(addr2), Operand::VReg(b_vreg)],
+        ));
+        ops.last_mut().unwrap().cycle = 11;
+
+        let config = AddressAssignConfig::default();
+        let intervals = config.compute_live_intervals(&ops);
+        assert_eq!(intervals[&a_vreg], LiveInterval::new(11, 11));
+        assert_eq!(intervals[&b_vreg], LiveInterval::new(11, 11));
+
+        let result = assign_addresses(&ops, &config);
+        assert_ne!(
+            result.vreg_to_addr[&a_vreg],
+            result.vreg_to_addr[&b_vreg],
+            "Two VRegs with interval [C,C] (both read at same cycle) must get different addresses \
+             so two vstores at the same cycle do not read the same scratch"
+        );
+    }
+
+    /// Multiple (e.g. 8) value VRegs all last-used at the same cycle by vstores
+    /// must get distinct addresses when their intervals overlap.
+    ///
+    /// Simulates last-round emit_store_data: 8 groups, each with a final hash
+    /// value consumed by a vstore. If all 8 vstores are scheduled at cycle 85
+    /// and all 8 values are produced by cycle 84, we have 8 intervals [84, 85].
+    /// They must get 8 distinct addresses.
+    #[test]
+    fn test_multiple_vstore_value_vregs_same_last_use_cycle_distinct_addresses() {
+        use crate::types::Operand;
+        const N: usize = 8;
+        let cycle_produce = 84;
+        let cycle_vstore = 85;
+
+        let mut ops: Vec<SsaOp> = vec![];
+        let c1 = VReg::scalar(100);
+        let c2 = VReg::scalar(101);
+        ops.push(SsaOp::new(0, Engine::Load, Opcode::Const, Some(c1), vec![]));
+        ops.push(SsaOp::new(1, Engine::Load, Opcode::Const, Some(c2), vec![]));
+        ops[0].cycle = 0;
+        ops[1].cycle = 0;
+
+        let value_vregs: Vec<VReg> = (0..N).map(|i| VReg::vector(200 + i as u32)).collect();
+        let addr_vregs: Vec<VReg> = (0..N).map(|i| VReg::scalar(300 + i as u32)).collect();
+
+        for i in 0..N {
+            ops.push(SsaOp::new(
+                10 + i * 2,
+                Engine::Load,
+                Opcode::Const,
+                Some(addr_vregs[i]),
+                vec![],
+            ));
+            ops.last_mut().unwrap().cycle = 0;
+            ops.push(SsaOp::new(
+                10 + i * 2 + 1,
+                Engine::Valu,
+                Opcode::Xor,
+                Some(value_vregs[i]),
+                vec![Operand::VReg(c1), Operand::VReg(c2)],
+            ));
+            ops.last_mut().unwrap().cycle = cycle_produce;
+        }
+        for i in 0..N {
+            ops.push(SsaOp::new(
+                100 + i,
+                Engine::Store,
+                Opcode::Vstore,
+                None,
+                vec![
+                    Operand::VReg(addr_vregs[i]),
+                    Operand::VReg(value_vregs[i]),
+                ],
+            ));
+            ops.last_mut().unwrap().cycle = cycle_vstore;
+        }
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&ops, &config);
+
+        let addrs: std::collections::HashSet<i64> =
+            value_vregs.iter().map(|v| result.vreg_to_addr[v]).collect();
+        assert_eq!(
+            addrs.len(),
+            N,
+            "{} vstore value VRegs (last use at same cycle) must get {} distinct addresses",
+            N,
+            N
         );
     }
 }
