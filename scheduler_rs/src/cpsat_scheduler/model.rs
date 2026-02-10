@@ -1081,6 +1081,33 @@ pub fn schedule_ssa_cpsat(
             );
             cse_sub_cycle_vars.push(sub_cycle_var);
 
+            // Producer precedence: when sub is active, sub_cycle >= producer result visible cycle.
+            // Uses completion_cycle for shiftable VALU producers (result at completion+1), else cycle+1.
+            if let Some(pt) = group.producer_true_idx {
+                let producer_cycle = completion_cycle_vars
+                    .get(&pt)
+                    .copied()
+                    .unwrap_or(cycle_vars[pt]);
+                let c = model.add_ge(
+                    LinearExpr::from(sub_cycle_var),
+                    LinearExpr::from(producer_cycle) + 1,
+                );
+                model.set_constraint_name(c, &format!("cse_sub_after_producer_true_g{}", g));
+                model.only_enforce_if(c, [sub_active_var]);
+            }
+            if let Some(pf) = group.producer_false_idx {
+                let producer_cycle = completion_cycle_vars
+                    .get(&pf)
+                    .copied()
+                    .unwrap_or(cycle_vars[pf]);
+                let c = model.add_ge(
+                    LinearExpr::from(sub_cycle_var),
+                    LinearExpr::from(producer_cycle) + 1,
+                );
+                model.set_constraint_name(c, &format!("cse_sub_after_producer_false_g{}", g));
+                model.only_enforce_if(c, [sub_active_var]);
+            }
+
             // Activity: sub_active <=> (sum choice[c] >= 1)
             match select_choice_mode {
                 SelectChoiceMode::ForceVselect => {
@@ -2859,6 +2886,37 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // Hint CSE shared SUB vars so the solution hint is complete (cse_sub_active_vars,
+    // cse_sub_cycle_vars; cse_shared_sub_valu_intervals are fully determined by these).
+    if let Some(groups) = cse_groups {
+        for (g, group) in groups.iter().enumerate() {
+            // sub_active = 1 if any consumer in the group has select_choice hint indicating FMA
+            let sub_active = select_choice_hints.map_or(false, |h| {
+                group
+                    .consumer_indices
+                    .iter()
+                    .any(|&c| h.contains(&ops[c].id))
+            });
+            model.add_hint(cse_sub_active_vars[g], if sub_active { 1 } else { 0 });
+        }
+        let horizon_i64 = horizon as i64;
+        for (g, group) in groups.iter().enumerate() {
+            // sub_cycle hint: minimum hinted consumer cycle in this group, or 0 if no greedy hints
+            let sub_cycle_hint = greedy_hints
+                .and_then(|hints| {
+                    group
+                        .consumer_indices
+                        .iter()
+                        .filter_map(|&c| hints.get(c).copied())
+                        .filter(|&t| t >= 0)
+                        .min()
+                })
+                .unwrap_or(0);
+            let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
+            model.add_hint(cse_sub_cycle_vars[g], clamped);
+        }
+    }
+
     // Diagnostic: report unhinted non-fixed variables AND hint values outside domain.
     if verbose {
         let proto = model.proto();
@@ -3388,7 +3446,11 @@ pub fn schedule_ssa_cpsat(
                         binding_ops.len()
                     );
                     for (idx, op_id, reason) in binding_ops.iter().take(15) {
-                        eprintln!("      idx={} op.id={} {}", idx, op_id, *reason);
+                        let cse_info = op_idx_to_cse_group
+                            .get(idx)
+                            .map(|g| format!(" CSE_group={}", g))
+                            .unwrap_or_default();
+                        eprintln!("      idx={} op.id={} {}{}", idx, op_id, *reason, cse_info);
                     }
                     if binding_ops.len() > 15 {
                         eprintln!("      ... and {} more", binding_ops.len() - 15);
