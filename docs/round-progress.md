@@ -59,6 +59,8 @@ Quick summary:
 
 | Date | SHA | Batch | Cycles | Peak live | Status | Validation | Notes | Source |
 |------|-----|-------|--------|-----------|--------|------------|-------|--------|
+| 2026-02-10 | 29ad610b | 256 | 435 | 1267 | OPTIMAL | PASSED | depth-2 tree-reduce (validated) | scheduler_output_4r_256b_depth2.json |
+| 2026-02-10 | 29ad610b | 256 | 443 | 1266 | OPTIMAL | PASSED | depth-3 tree-reduce (validated) | scheduler_output_4r_256b_depth3.json |
 | 2026-02-09 | 16d5766a | 256 | 435 | N/A | OPTIMAL | N/A | depth-2 tree-reduce | scheduler_output_depth2.json |
 | 2026-02-09 | 16d5766a | 256 | 443 | N/A | OPTIMAL | N/A | depth-3 tree-reduce | scheduler_output_depth3.json |
 | 2026-02-08 | 1a4a1817 | 256 | 435 | N/A | OPTIMAL | N/A | scatter load | scheduler_output_scatter.json |
