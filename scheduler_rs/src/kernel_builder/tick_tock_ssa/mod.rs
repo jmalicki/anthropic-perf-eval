@@ -1006,6 +1006,29 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
+        // Post-solve check: every multiply_add must be scheduled after all its dependencies
+        // (e.g. offset producer). Results are visible next cycle; if FMA and producer were in the
+        // same cycle, the FMA would read before the producer wrote. The CP-SAT model enforces
+        // consumer >= producer + 1 (or completion_cycle + 1 for shifted deps) in section 5/5c.
+        for (fma_idx, op) in ctx.ops.iter().enumerate() {
+            if op.engine != Engine::Valu || op.opcode != Opcode::MultiplyAdd {
+                continue;
+            }
+            let fma_cycle = op.cycle;
+            for &dep_id in &op.dep_ids {
+                let Some(&producer_idx) = op_id_to_idx.get(&dep_id) else {
+                    continue;
+                };
+                let producer_cycle = ctx.ops[producer_idx].cycle;
+                assert!(
+                    fma_cycle >= producer_cycle + 1,
+                    "BUG: MultiplyAdd precedence violation: FMA op id={} at cycle {} reads from producer op id={} at cycle {}. \
+                     FMA must run after producer (result visible next cycle). Fix scheduler precedence constraints.",
+                    op.id, fma_cycle, dep_id, producer_cycle
+                );
+            }
+        }
+
         let cycles = cpsat_result.makespan;
 
         if std::env::var("SCHEDULER_DEBUG_DECISIONS").is_ok() {

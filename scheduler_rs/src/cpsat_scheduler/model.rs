@@ -390,9 +390,12 @@ pub fn schedule_ssa_cpsat(
         .map(|(i, _)| i)
         .collect();
 
-    // 5. Add precedence constraints from RAW dependencies
-    // Note: For consumers of shifted VALU ops, we'll update these constraints after
-    // creating completion_cycle_vars (see below)
+    // 5. Add precedence constraints from RAW dependencies.
+    // These ensure every consumer (including multiply_add) is scheduled at least one cycle after
+    // its producers (e.g. offset producer). Results are visible next cycle; without this, an FMA
+    // could run in the same cycle as its offset producer and read before the producer writes.
+    // Note: For consumers of shifted VALU ops, we'll add constraints after creating
+    // completion_cycle_vars (see 5c below).
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
