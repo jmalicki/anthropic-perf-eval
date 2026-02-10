@@ -73,43 +73,31 @@ For each CSE group G:
 
 ### 4.4 Constraints
 
-**Activity:**
+**Activity:** `sub_active` is true iff at least one consumer in G chooses FMA:
 ```
-sub_active == (sum(choice[c] for c in G) >= 1)
+sub_active ⟺ (sum(choice[c] for c in G) >= 1)
 ```
-Use `add_ge` on sum; or `sub_active == max_eq(1, choice[c])` if available. Need one auxiliary bool that is 1 iff any choice[c] is 1.
+The concrete encoding (auxiliary boolean and bidirectional `only_enforce_if` constraints) is given in **Section 7.3**.
 
-**Precedence (for each consumer c in G):**
-```
-If choice[c] == 1:  sub_cycle <= fma_cycle[c] - 1
-```
-Use `only_enforce_if(choice[c])` so we only enforce when c chose FMA.
-
-**SUB placement:**
-- When sub_active and sub_shift=0: SUB uses 1 VALU slot at sub_cycle
-- When sub_active and sub_shift=1: SUB uses 8 ALU slots at sub_cycle (element-wise)
-
-Same pattern as existing shiftable VALU ops: optional VALU interval, optional ALU interval, exactly one when active.
-
-**FMA cycles:**
-- Each consumer c has `fma_cycle[c]` (already modeled when choice[c]=1). FMA is at `sub_cycle + 1` for the "canonical" consumer, but in fact each FMA has its own cycle. The only constraint is `sub_cycle <= fma_cycle[c] - 1` for each FMA consumer. So the shared SUB can run as late as `min(fma_cycle[c]) - 1` over active consumers. The solver picks sub_cycle anywhere in [ASAP, min(fma_cycle)-1].
+**SUB scheduling (conditional, placement, and precedence):** All constraints on SUB scheduling are conditional using `only_enforce_if(choice[c])` for FMA consumers. Placement: when `sub_active`, `sub_shift=0` → 1 VALU slot at `sub_cycle`; `sub_shift=1` → 8 ALU slots at `sub_cycle`. For each FMA consumer c, the single constraint is `sub_cycle <= fma_cycle[c] - 1`. The solver picks `sub_cycle` in the interval [ASAP, min(fma_cycle[c]) - 1] over active consumers.
 
 ### 4.5 Capacity constraints
 
-**VALU:** Count 1 for shared SUB when sub_active and sub_shift=0. Count 2 for each consumer FMA (SUB+FMA in the current per-op model). But wait — with shared SUB we have:
-- 1 SUB (when sub_active, not shifted)
-- N FMAs (one per consumer with choice=1)
+**Current model:** `valu_count += 2 * num_select_fma` — each SelectChoice FMA is counted as SUB + FMA (two VALU slots).
 
-So VALU count = (1 if sub_active and not sub_shift else 0) + 2 * (number of consumers with choice=1). Need to adjust the global VALU capacity formula to account for shared SUBs vs per-op SUBs.
+This overcounts when using shared SUBs: multiple SelectChoice FMAs in a CSE group share a single SUB when `sub_active` and `sub_shift == 0`, so counting 2 per FMA counts the SUB once per consumer instead of once per group.
 
-**Current model:** Each SelectChoice FMA contributes 2 VALU (sub + fma). So `valu_count += 2 * num_select_fma`.
+**New (group-aware) formula:** For each CSE group G, add to VALU count:
+- 1 SUB when the group’s shared SUB is active and not shifted: `(1 if sub_active and not sub_shift else 0)`
+- one slot per FMA consumer in that group: `len(FMA_consumers_G)`
 
-**With shared SUBs:** For each CSE group G, we have:
-- 1 SUB if sub_active and not shifted
-- len(FMA consumers) FMAs
-- Total VALU from this group = (1 if sub_active and not sub_shift else 0) + len(FMA consumers)
+So the contribution for group G is `(1 if sub_active and not sub_shift else 0) + len(FMA_consumers_G)`. Replace the per-FMA term with the sum over CSE groups.
 
-And we must not double-count: the current model adds 2 per SelectChoice FMA. With CSE we add 1 per group (SUB) + 1 per FMA consumer. So we need to change how we count: instead of 2 per SelectChoice FMA, we use the shared-SUB-aware formula.
+**Comparison:**
+
+| Old (per-FMA) | New (per-group) |
+|---------------|-----------------|
+| `2 * num_select_fma` | `sum_G [(1 if sub_active and not sub_shift else 0) + len(FMA_consumers_G)]` |
 
 ### 4.6 Scratch / liveness
 
@@ -290,11 +278,8 @@ The lowering logic must map shared SUB result to the correct sub_temp VReg and p
 ### 7.3 Constraint Representation
 
 **Activity (`sub_active <=> at least one consumer chose FMA`):**
-- Sum: `sum_g = sum over c in group g of choice_var[c]`. CP-SAT: `LinearExpr::sum(choice_vars)`.
-- `sub_active[g] <=> (sum_g >= 1)`: 
-  - `sum_g >= 1 => sub_active[g]`: add_ge(sum_g, 1).only_enforce_if(sub_active[g]). No — that enforces sum>=1 when sub_active. We need the reverse: when sum>=1, sub_active must be true.
-  - Standard encoding: `sub_active[g] = 1` iff `sum_g >= 1`. Use `model.add_ge(LinearExpr::from(sum_g), 1)` and `model.add_eq(sub_active[g], max_eq(1, sum_g))` — but max_eq may not exist. Alternative: `sub_active[g] >= sum_g / M` (big-M) or use auxiliary vars. Simpler: `add_ge(sum_g, 1)` only when sub_active; `add_eq(sum_g, 0)` only when !sub_active. That forces the equivalence.
-  - Concretely: (a) `model.only_enforce_if(add_ge(sum_g, 1), [sub_active[g]])` — when sub_active, sum>=1. (b) `model.only_enforce_if(add_eq(sum_g, 0), [sub_active[g].not()])` — when !sub_active, sum=0. That gives the bidirectional link.
+- Define `sum_g = sum(choice_var[c])` over consumers `c` in group `g` (e.g. `LinearExpr::sum(choice_vars)`).
+- Bidirectional encoding: enforce `model.add_ge(sum_g, 1)` only when `sub_active[g]` is true, and `model.add_eq(sum_g, 0)` only when `sub_active[g]` is false — i.e. use `only_enforce_if` with `sub_active[g]` and `sub_active[g].not()` respectively.
 
 **Precedence (`sub_cycle <= fma_cycle[c] - 1` when consumer c chose FMA):**
 - For each consumer `c` in group `g`: `sub_cycle[g] + 1 <= fma_cycle[c]`, i.e. `fma_cycle[c] >= sub_cycle[g] + 1`.
@@ -367,8 +352,7 @@ When `cse_groups` is empty (no shared operands), behavior must match the current
 1. **CP-SAT expressiveness:** Can we cleanly express `sub_active = (sum >= 1)` and conditional precedence? OR-Tools supports `only_enforce_if` and `add_ge`; need to verify the pattern.
 2. **Solve time:** More variables and constraints per CSE group. Does it blow up for 37 groups?
 3. **Delta-path SelectChoices:** Excluded from CSE (no SUB). Confirm they stay unchanged.
-4. **Hints:** Greedy doesn't optimize, but add simple hints: sub_cycle = ASAP for the group; sub_shift = 0 (VALU) by default, or a cheap heuristic (e.g. prefer ALU when VALU pressure estimate is high). Keeps solve time reasonable without extending greedy.
-5. **ALU cumulative demand:** Does OR-Tools `add_cumulative` support demand > 1 per interval for atomic ALU SUB? Or do we need 8 intervals at the same start?
+4. **ALU cumulative demand:** Does OR-Tools `add_cumulative` support demand > 1 per interval for atomic ALU SUB? Or do we need 8 intervals at the same start?
 
 ---
 

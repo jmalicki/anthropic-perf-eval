@@ -185,7 +185,7 @@ In **depth-2**, level-0 selects use shared tree-cache broadcasts:
 - `select_2way(bit0, values[3], values[2])` — same for `(values[3], values[2])`.
 - Result: ~32 identical SUBs per pattern, 31 of which can be CSE'd away.
 
-In **depth-3**, level-1 and level-2 operands (`p01`, `p23`, `q03`, etc.) come from per-group FMAs and selects, so they differ per group. The 120 redundant SUBs in the depth-3 kernel likely come from depth-2 rounds (rounds 1–2) where level-0 selects use shared tree-cache values.
+In **depth-3**, level-1 and level-2 operands (`p01`, `p23`, `q03`, etc.) come from per-group FMAs and selects, so they differ per group. The 120 redundant SUBs are in the **depth-3 kernel** (the schedule from the depth-3 run, i.e. `scheduler_output_4r_256b_depth3.json`). They are caused by **level-0 selects** within the depth-3 tree structure: at the leaves of the tree, those level-0 selects use the same **shared tree-cache values** for all 32 groups (as in the depth-2 kernel). So the redundancy comes from **reused level-0 selects across groups** — many groups share the same `(true_val, false_val)` at level-0 — not from the depth-3 tree shape itself, which only makes level-1 and level-2 operands per-group.
 
 ### Where CSE Must Happen
 
@@ -260,7 +260,7 @@ So: **we do have lots of free ALU during depth-3 select, and shifting the SUB to
 1. **VALU cumulative** (`cpsat_scheduler/model.rs`): For each SelectChoice FMA, it adds two intervals (sub at cycle C, fma at cycle C+1), each with demand 1.
 2. **Capacity constraint:** `6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)` — explicitly adds 2 VALU ops per SelectChoice that chooses FMA.
 
-One caveat: when `false_val == 0`, emission sets `needs_subtraction = false` and emits only 1 FMA (no SUB). The model does not distinguish this; it assumes 2 VALU ops whenever `delta_vreg` is None. That could slightly overcount VALU for those rare cases, but as noted above, needs_subtraction is effectively always true for depth-3 tree-select.
+One caveat: when `false_val == 0`, emission sets `needs_subtraction = false` and emits only 1 FMA (no SUB). The model does not distinguish this; it assumes 2 VALU ops whenever `delta_vreg` is None. That could slightly overcount VALU for those rare cases, but as noted above, needs_subtraction is effectively always true for depth-3 tree-select (see analysis below on **SUB with constant 0** and `needs_subtraction` for the depth-3 kernel).
 
 ---
 
