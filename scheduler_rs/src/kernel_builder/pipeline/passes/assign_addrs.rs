@@ -82,6 +82,7 @@ impl Pass for AssignAddressesPass {
         if !ctx.vector_group_lanes.is_empty() {
             assign_config.vector_group_lanes = ctx.vector_group_lanes.clone();
         }
+        // vreg_def is required by address assignment and may be empty by design; always copy.
         assign_config.vreg_def = ctx.vreg_def.clone();
 
         let address_result = assign_addresses(&ctx.ops, &assign_config);

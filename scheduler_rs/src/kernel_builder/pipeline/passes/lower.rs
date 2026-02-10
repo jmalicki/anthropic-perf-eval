@@ -5,7 +5,7 @@
 //! encoding decisions.
 
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
-use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
 
 /// Lowers SSA ops to concrete `Op` instructions.
 ///
@@ -31,33 +31,27 @@ impl Pass for LowerToOpsPass {
 
         let decisions = &ctx.final_decisions;
 
-        let ops = lower_ssa_ops_with_shift(
-            &ctx.ops,
-            &address_result.vreg_to_addr,
-            &decisions.shifted_ops,
-            &decisions.const_add_imm_ops,
-            &decisions.const_alu_derive_ops,
-            &decisions.select_fma_ops,
-            &decisions.shifted_alu_cycles,
-            &decisions.eliminated_vbroadcast_ops,
-            &decisions.eliminated_vb_to_scalar_producer,
+        let ctx_lowering = LoweringContext {
+            ssa_ops: &ctx.ops,
+            vreg_to_addr: &address_result.vreg_to_addr,
+            shifted_ops: &decisions.shifted_ops,
+            const_add_imm_ops: &decisions.const_add_imm_ops,
+            const_alu_derive_ops: &decisions.const_alu_derive_ops,
+            select_fma_ops: &decisions.select_fma_ops,
+            shifted_alu_cycles: &decisions.shifted_alu_cycles,
+            eliminated_vbroadcast_ops: &decisions.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &decisions.eliminated_vb_to_scalar_producer,
             #[cfg(feature = "cpsat")]
-            (if decisions.cse_groups.is_empty() {
-                None
-            } else {
-                Some(decisions.cse_groups.as_slice())
-            }),
+            cse_groups: (!decisions.cse_groups.is_empty()).then(|| decisions.cse_groups.as_slice()),
             #[cfg(not(feature = "cpsat"))]
-            None,
+            cse_groups: None,
             #[cfg(feature = "cpsat")]
-            (if decisions.cse_group_results.is_empty() {
-                None
-            } else {
-                Some(decisions.cse_group_results.as_slice())
-            }),
+            cse_group_results: (!decisions.cse_group_results.is_empty())
+                .then(|| decisions.cse_group_results.as_slice()),
             #[cfg(not(feature = "cpsat"))]
-            None,
-        );
+            cse_group_results: None,
+        };
+        let ops = lower_ssa_ops_with_shift(&ctx_lowering);
 
         let n_ops = ops.len();
         ctx.lowered_ops = Some(ops);

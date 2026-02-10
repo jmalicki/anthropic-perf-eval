@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::types::{MachineConfig, Opcode};
+use crate::types::{AluDeriveInfo, MachineConfig, Opcode};
 
 use super::super::config::CompilerConfig;
 
@@ -53,7 +53,7 @@ pub struct SchedulingDecisions {
     /// ConstChoice ops using AddImm encoding (by op ID).
     pub const_add_imm_ops: HashSet<usize>,
     /// ConstChoice ops using ALU-derived encoding: op_id → AluDeriveInfo.
-    pub const_alu_derive_ops: HashMap<usize, crate::types::AluDeriveInfo>,
+    pub const_alu_derive_ops: HashMap<usize, AluDeriveInfo>,
     /// Individual ALU cycle assignments for shifted VALU ops: op_id → [c0..c7].
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
     /// Op IDs of vbroadcasts eliminated (not emitted; consumers use scalar producer).

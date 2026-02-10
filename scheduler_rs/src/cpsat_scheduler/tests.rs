@@ -6,7 +6,7 @@ use super::*;
 mod ssa_tests {
     use super::*;
     use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
-    use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+    use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
     use crate::types::{Engine, Opcode, SlotVal};
     use std::collections::{HashMap, HashSet};
 
@@ -183,19 +183,19 @@ mod ssa_tests {
         // Ensure zero is at address 0
         vreg_to_addr.insert(zero, 0);
 
-        let lowered_ops = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &vreg_to_addr,
-            &HashSet::new(),                 // No shifted ops
-            &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered_ops = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &HashSet::new(), // No shifted ops
+            const_add_imm_ops: &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
@@ -334,19 +334,19 @@ mod ssa_tests {
         }
         vreg_to_addr.insert(zero, 0);
 
-        let lowered_ops = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &vreg_to_addr,
-            &HashSet::new(),
-            &cpsat_result.const_add_imm_ops,
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered_ops = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &HashSet::new(),
+            const_add_imm_ops: &cpsat_result.const_add_imm_ops,
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
@@ -1076,19 +1076,19 @@ mod ssa_tests {
             }
         }
 
-        let lowered_ops = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &vreg_to_addr,
-            &HashSet::new(),                  // No shifted ops
-            &HashSet::new(),                  // No ConstChoice AddImm ops
-            &HashMap::new(),                  // No ConstChoice ALU-derived
-            &cpsat_result.select_fma_ops,     // Use CP-SAT decisions
-            &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered_ops = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &HashSet::new(), // No shifted ops
+            const_add_imm_ops: &HashSet::new(), // No ConstChoice AddImm ops
+            const_alu_derive_ops: &HashMap::new(), // No ConstChoice ALU-derived
+            select_fma_ops: &cpsat_result.select_fma_ops, // Use CP-SAT decisions
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
         for select_choice_id in &select_choice_ids {
@@ -1238,19 +1238,19 @@ mod ssa_tests {
         assert!(!assign_result.budget_exceeded);
 
         // With 1 VALU slot, sub and fma must be in consecutive cycles
-        let lowered = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &assign_result.vreg_to_addr,
-            &HashSet::new(),
-            &HashSet::new(),
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles,
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &assign_result.vreg_to_addr,
+            shifted_ops: &HashSet::new(),
+            const_add_imm_ops: &HashSet::new(),
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
                 && o.engine == Engine::Valu
@@ -1461,7 +1461,7 @@ mod ssa_tests {
             assign_addresses, compute_live_intervals, AddressAssignConfig,
         };
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
-        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
         use std::collections::HashSet;
 
         let mut emit = SsaEmitContext::new();
@@ -1560,19 +1560,19 @@ mod ssa_tests {
             }
         }
 
-        let lowered = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &assign_result.vreg_to_addr,
-            &HashSet::new(),
-            &HashSet::new(),
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles,
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &assign_result.vreg_to_addr,
+            shifted_ops: &HashSet::new(),
+            const_add_imm_ops: &HashSet::new(),
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
                 && o.engine == Engine::Valu
@@ -1732,7 +1732,7 @@ mod ssa_tests {
             assign_addresses, compute_live_intervals, AddressAssignConfig,
         };
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
-        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
         use std::collections::HashSet;
 
         let mut emit = SsaEmitContext::new();
@@ -1800,19 +1800,19 @@ mod ssa_tests {
                 }
             }
         }
-        let _lowered = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &assign_result.vreg_to_addr,
-            &HashSet::new(),
-            &HashSet::new(),
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles,
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let _lowered = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &assign_result.vreg_to_addr,
+            shifted_ops: &HashSet::new(),
+            const_add_imm_ops: &HashSet::new(),
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
     }
 }
 
@@ -2276,7 +2276,7 @@ mod tests {
     #[test]
     fn test_ssa_cpsat_constchoice_roundtrip() {
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
-        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
         use crate::types::{Engine, Opcode, SlotVal};
         use std::collections::HashMap;
 
@@ -2356,19 +2356,19 @@ mod tests {
         // Ensure zero is at address 0
         vreg_to_addr.insert(zero, 0);
 
-        let lowered_ops = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &vreg_to_addr,
-            &HashSet::new(),                 // No shifted ops
-            &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered_ops = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &HashSet::new(), // No shifted ops
+            const_add_imm_ops: &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
@@ -2442,7 +2442,7 @@ mod tests {
     #[test]
     fn test_ssa_cpsat_constchoice_prefers_addimm_when_load_slots_full() {
         use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
-        use crate::kernel_builder::ssa_lower::lower_ssa_ops_with_shift;
+        use crate::kernel_builder::ssa_lower::{lower_ssa_ops_with_shift, LoweringContext};
         use crate::types::{Engine, Opcode, SlotVal};
         use std::collections::HashMap;
 
@@ -2512,19 +2512,19 @@ mod tests {
         }
         vreg_to_addr.insert(zero, 0);
 
-        let lowered_ops = lower_ssa_ops_with_shift(
-            &emit.ops,
-            &vreg_to_addr,
-            &HashSet::new(),
-            &cpsat_result.const_add_imm_ops,
-            &cpsat_result.const_alu_derive_ops,
-            &cpsat_result.select_fma_ops,
-            &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
-            &cpsat_result.eliminated_vbroadcast_ops,
-            &cpsat_result.eliminated_vb_to_scalar_producer,
-            None,
-            None,
-        );
+        let lowered_ops = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &emit.ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &HashSet::new(),
+            const_add_imm_ops: &cpsat_result.const_add_imm_ops,
+            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
+            select_fma_ops: &cpsat_result.select_fma_ops,
+            shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
+            eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
+            eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
