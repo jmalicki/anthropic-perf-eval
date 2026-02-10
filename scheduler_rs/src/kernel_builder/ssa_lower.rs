@@ -7,6 +7,10 @@ use std::collections::{HashMap, HashSet};
 
 use arrayvec::ArrayVec;
 
+/// Prefix for op ids of CSE shared SUB ops (one per active CSE group).
+/// Ops use ids CSE_SHARED_SUB_PREFIX + g for group index g.
+const CSE_SHARED_SUB_PREFIX: usize = 0xC5E0_0000;
+
 use crate::address_assign::lower_ssa_op;
 use crate::types::{Engine, Op, SlotVal, SsaOp, VReg, VLEN};
 
@@ -32,6 +36,26 @@ pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Ve
         .collect()
 }
 
+/// Context for SSA lowering with VALU shift, ConstChoice, SelectChoice, and optional CSE.
+///
+/// Groups all inputs to `lower_ssa_ops_with_shift` in one struct to reduce parameter count.
+#[derive(Debug)]
+pub struct LoweringContext<'a> {
+    pub ssa_ops: &'a [SsaOp],
+    pub vreg_to_addr: &'a HashMap<VReg, i64>,
+    pub shifted_ops: &'a HashSet<usize>,
+    pub const_add_imm_ops: &'a HashSet<usize>,
+    pub const_alu_derive_ops: &'a HashMap<usize, crate::types::AluDeriveInfo>,
+    pub select_fma_ops: &'a HashSet<usize>,
+    /// op_id -> [cycle0, ..., cycle7]
+    pub shifted_alu_cycles: &'a HashMap<usize, Vec<i32>>,
+    pub eliminated_vbroadcast_ops: &'a HashSet<usize>,
+    /// vb op_id -> scalar producer op_id
+    pub eliminated_vb_to_scalar_producer: &'a HashMap<usize, usize>,
+    pub cse_groups: Option<&'a [crate::cpsat_scheduler::CseGroup]>,
+    pub cse_group_results: Option<&'a [crate::cpsat_scheduler::CseGroupResult]>,
+}
+
 /// Lower SSA ops to concrete ops, expanding shifted VALU ops to ALU.
 ///
 /// Shifted VALU ops are expanded to 8 scalar ALU ops, one per lane.
@@ -51,19 +75,7 @@ pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Ve
 ///
 /// When `cse_groups` and `cse_group_results` are provided and non-empty, SelectChoice FMA
 /// consumers in CSE groups use a shared SUB: one SUB per active group, multiple FMAs per group.
-pub fn lower_ssa_ops_with_shift(
-    ssa_ops: &[SsaOp],
-    vreg_to_addr: &HashMap<VReg, i64>,
-    shifted_ops: &HashSet<usize>,
-    const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
-    select_fma_ops: &HashSet<usize>,
-    shifted_alu_cycles: &HashMap<usize, Vec<i32>>, // op_id -> [cycle0, ..., cycle7]
-    eliminated_vbroadcast_ops: &HashSet<usize>,
-    eliminated_vb_to_scalar_producer: &HashMap<usize, usize>, // vb op_id -> scalar producer op_id
-    cse_groups: Option<&[crate::cpsat_scheduler::CseGroup]>,
-    cse_group_results: Option<&[crate::cpsat_scheduler::CseGroupResult]>,
-) -> Vec<Op> {
+pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
     use crate::types::{Opcode, SlotVal};
     use arrayvec::ArrayVec;
 
@@ -72,39 +84,49 @@ pub fn lower_ssa_ops_with_shift(
     // Build op_id -> shared sub_temp_addr for CSE group FMA consumers
     let cse_op_to_sub_temp_addr: HashMap<usize, i64> = {
         let mut m = HashMap::new();
-        if let (Some(groups), Some(results)) = (cse_groups, cse_group_results) {
+        if let (Some(groups), Some(results)) = (ctx.cse_groups, ctx.cse_group_results) {
             if groups.len() == results.len() {
                 for (group, res) in groups.iter().zip(results.iter()) {
                     if !res.sub_active {
                         continue;
                     }
-                    let Some(&sub_temp_addr) = vreg_to_addr.get(&group.sub_temp_vreg) else {
+                    let Some(&sub_temp_addr) = ctx.vreg_to_addr.get(&group.sub_temp_vreg) else {
                         continue;
                     };
                     for &idx in &group.consumer_indices {
-                        if idx < ssa_ops.len() && select_fma_ops.contains(&ssa_ops[idx].id) {
-                            m.insert(ssa_ops[idx].id, sub_temp_addr);
+                        if idx < ctx.ssa_ops.len() && ctx.select_fma_ops.contains(&ctx.ssa_ops[idx].id) {
+                            m.insert(ctx.ssa_ops[idx].id, sub_temp_addr);
                         }
                     }
                 }
+            } else {
+                eprintln!(
+                    "[ssa_lower] CSE groups/results length mismatch: cse_groups.len()={} cse_group_results.len()={}; skipping CSE mapping in lower_ssa_ops_with_shift (caller bug?)",
+                    groups.len(),
+                    results.len()
+                );
             }
         }
         m
     };
 
     // Emit shared SUBs first (one per active CSE group)
-    if let (Some(groups), Some(results)) = (cse_groups, cse_group_results) {
+    if let (Some(groups), Some(results)) = (ctx.cse_groups, ctx.cse_group_results) {
         if groups.len() == results.len() {
             for (g, (group, res)) in groups.iter().zip(results.iter()).enumerate() {
                 if !res.sub_active {
                     continue;
                 }
-                let sub_temp_addr = match vreg_to_addr.get(&group.sub_temp_vreg) {
+                let sub_temp_addr = match ctx.vreg_to_addr.get(&group.sub_temp_vreg) {
                     Some(&a) => a,
                     None => continue,
                 };
-                let true_val_addr = *vreg_to_addr.get(&group.true_val).unwrap_or(&0);
-                let false_val_addr = *vreg_to_addr.get(&group.false_val).unwrap_or(&0);
+                let true_val_addr = *ctx.vreg_to_addr
+                    .get(&group.true_val)
+                    .expect("CSE group true_val VReg not in mapping");
+                let false_val_addr = *ctx.vreg_to_addr
+                    .get(&group.false_val)
+                    .expect("CSE group false_val VReg not in mapping");
 
                 let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                 sub_slot.push(SlotVal::Str("-".to_string()));
@@ -123,7 +145,7 @@ pub fn lower_ssa_ops_with_shift(
                 }
 
                 result.push(Op {
-                    id: 0xC5E0_0000 + g, // CSE shared SUB prefix
+                    id: CSE_SHARED_SUB_PREFIX + g,
                     engine: crate::types::Engine::Valu,
                     slot: sub_slot,
                     cycle: res.sub_cycle,
@@ -140,20 +162,20 @@ pub fn lower_ssa_ops_with_shift(
     // Build map: eliminated vb dest VReg -> scalar producer address (for shifted consumers reading from vb)
     let eliminated_vb_vreg_to_scalar_addr: HashMap<VReg, i64> = {
         let mut m = HashMap::new();
-        for (&vb_id, &scalar_id) in eliminated_vb_to_scalar_producer {
-            if !eliminated_vbroadcast_ops.contains(&vb_id) {
+        for (&vb_id, &scalar_id) in ctx.eliminated_vb_to_scalar_producer {
+            if !ctx.eliminated_vbroadcast_ops.contains(&vb_id) {
                 continue;
             }
-            let vb_dest = ssa_ops
+            let vb_dest = ctx.ssa_ops
                 .iter()
                 .find(|o| o.id == vb_id)
                 .and_then(|o| o.dest);
-            let scalar_dest = ssa_ops
+            let scalar_dest = ctx.ssa_ops
                 .iter()
                 .find(|o| o.id == scalar_id)
                 .and_then(|o| o.dest);
             if let (Some(vreg), Some(svreg)) = (vb_dest, scalar_dest) {
-                if let Some(&addr) = vreg_to_addr.get(&svreg) {
+                if let Some(&addr) = ctx.vreg_to_addr.get(&svreg) {
                     m.insert(vreg, addr);
                 }
             }
@@ -161,17 +183,17 @@ pub fn lower_ssa_ops_with_shift(
         m
     };
 
-    for ssa_op in ssa_ops {
-        if eliminated_vbroadcast_ops.contains(&ssa_op.id) {
+    for ssa_op in ctx.ssa_ops {
+        if ctx.eliminated_vbroadcast_ops.contains(&ssa_op.id) {
             continue;
         }
-        if shifted_ops.contains(&ssa_op.id) {
+        if ctx.shifted_ops.contains(&ssa_op.id) {
             // Expand shifted VALU op to 8 ALU ops
             // Use individual cycles if available (from CP-SAT), otherwise use completion_cycle
-            let alu_cycles = shifted_alu_cycles.get(&ssa_op.id);
+            let alu_cycles = ctx.shifted_alu_cycles.get(&ssa_op.id);
             let expanded = expand_ssa_valu_to_alu(
                 ssa_op,
-                vreg_to_addr,
+                ctx.vreg_to_addr,
                 alu_cycles.map(|v| v.as_slice()),
                 if eliminated_vb_vreg_to_scalar_addr.is_empty() {
                     None
@@ -183,29 +205,29 @@ pub fn lower_ssa_ops_with_shift(
         } else if ssa_op.opcode == Opcode::ConstChoice {
             // Handle ConstChoice based on scheduler decision
             let dest = ssa_op.dest.expect("ConstChoice op must have dest");
-            let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
+            let dest_addr = *ctx.vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
             let value = ssa_op
                 .produces_constant
                 .expect("ConstChoice op must have produces_constant");
 
-            if let Some(info) = const_alu_derive_ops.get(&ssa_op.id) {
+            if let Some(info) = ctx.const_alu_derive_ops.get(&ssa_op.id) {
                 let left_op_id = info.left_op_id;
                 let right_op_id = info.right_op_id;
                 let opcode = info.opcode;
                 // ALU-derived: dest = left opcode right (e.g. add, mul)
-                let left_dest = ssa_ops
+                let left_dest = ctx.ssa_ops
                     .iter()
                     .find(|o| o.id == left_op_id)
                     .and_then(|o| o.dest)
                     .expect("ALU derive left producer must exist");
-                let right_dest = ssa_ops
+                let right_dest = ctx.ssa_ops
                     .iter()
                     .find(|o| o.id == right_op_id)
                     .and_then(|o| o.dest)
                     .expect("ALU derive right producer must exist");
-                let left_addr = *vreg_to_addr.get(&left_dest).expect("left producer VReg in mapping");
+                let left_addr = *ctx.vreg_to_addr.get(&left_dest).expect("left producer VReg in mapping");
                 let right_addr =
-                    *vreg_to_addr.get(&right_dest).expect("right producer VReg in mapping");
+                    *ctx.vreg_to_addr.get(&right_dest).expect("right producer VReg in mapping");
 
                 let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                 slot.push(SlotVal::Str(opcode.as_str().to_string()));
@@ -230,7 +252,7 @@ pub fn lower_ssa_ops_with_shift(
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
                 });
-            } else if const_add_imm_ops.contains(&ssa_op.id) {
+            } else if ctx.const_add_imm_ops.contains(&ssa_op.id) {
                 // AddImm: dest = scratch[0] + value
                 // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
                 // is guaranteed by hardware initialization. add_imm reads from address 0, but we don't
@@ -283,11 +305,11 @@ pub fn lower_ssa_ops_with_shift(
         } else if ssa_op.opcode == Opcode::SelectChoice {
             // Handle SelectChoice based on scheduler decision
             let dest = ssa_op.dest.expect("SelectChoice op must have dest");
-            let dest_addr = *vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
+            let dest_addr = *ctx.vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
             if std::env::var("SCHEDULER_DEBUG").is_ok() {
                 eprintln!(
                     "[DEBUG lower_ssa_ops_with_shift] SelectChoice op.id={} cycle={} select_fma_ops.contains={} sub_temp_vreg={:?}",
-                    ssa_op.id, ssa_op.cycle, select_fma_ops.contains(&ssa_op.id), ssa_op.sub_temp_vreg
+                    ssa_op.id, ssa_op.cycle, ctx.select_fma_ops.contains(&ssa_op.id), ssa_op.sub_temp_vreg
                 );
             }
 
@@ -307,17 +329,17 @@ pub fn lower_ssa_ops_with_shift(
                 .as_vreg()
                 .expect("SelectChoice false_val must be VReg");
 
-            let cond_addr = *vreg_to_addr
+            let cond_addr = *ctx.vreg_to_addr
                 .get(&cond_vreg)
                 .expect("cond VReg not in mapping");
-            let true_val_addr = *vreg_to_addr
+            let true_val_addr = *ctx.vreg_to_addr
                 .get(&true_val_vreg)
                 .expect("true_val VReg not in mapping");
-            let false_val_addr = *vreg_to_addr
+            let false_val_addr = *ctx.vreg_to_addr
                 .get(&false_val_vreg)
                 .expect("false_val VReg not in mapping");
 
-            if select_fma_ops.contains(&ssa_op.id) {
+            if ctx.select_fma_ops.contains(&ssa_op.id) {
                 // FMA path: check if we have a precomputed delta
                 if std::env::var("SCHEDULER_DEBUG").is_ok() {
                     eprintln!(
@@ -328,7 +350,7 @@ pub fn lower_ssa_ops_with_shift(
                 if let Some(delta_vreg) = ssa_op.delta_vreg {
                     // Precomputed delta available: emit single FMA op
                     // fma = cond * delta + base (where base = false_val)
-                    let delta_addr = *vreg_to_addr
+                    let delta_addr = *ctx.vreg_to_addr
                         .get(&delta_vreg)
                         .expect("delta VReg not in mapping");
                     if std::env::var("SCHEDULER_DEBUG").is_ok() {
@@ -385,7 +407,7 @@ pub fn lower_ssa_ops_with_shift(
                         let sub_temp_vreg = ssa_op.sub_temp_vreg.expect(
                             "SelectChoice without delta must have sub_temp_vreg allocated during emission"
                         );
-                        *vreg_to_addr.get(&sub_temp_vreg).expect(
+                        *ctx.vreg_to_addr.get(&sub_temp_vreg).expect(
                             "sub_temp_vreg not in address mapping - was it included in address assignment?"
                         )
                     };
@@ -514,7 +536,7 @@ pub fn lower_ssa_ops_with_shift(
             }
         } else {
             // Normal lowering
-            result.push(lower_ssa_op(ssa_op, vreg_to_addr));
+            result.push(lower_ssa_op(ssa_op, ctx.vreg_to_addr));
         }
     }
 
@@ -649,19 +671,19 @@ mod tests {
         let shifted_ops = HashSet::new();
         let const_add_imm_ops = HashSet::new(); // Use Load
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &HashSet::new(),
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -719,19 +741,19 @@ mod tests {
             },
         ); // op 3 = op1 + op2
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &const_alu_derive_ops,
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &const_alu_derive_ops,
+            select_fma_ops: &HashSet::new(),
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 3); // 3 ConstChoice ops -> 3 lowered ops
         let alu_op = result
@@ -762,19 +784,19 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(99); // Use AddImm
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &HashSet::new(),
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -806,19 +828,19 @@ mod tests {
         let mut const_add_imm_ops = HashSet::new();
         const_add_imm_ops.insert(1); // op1 uses AddImm, op2 uses Load
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &HashSet::new(),
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 2);
 
@@ -881,19 +903,19 @@ mod tests {
         let const_add_imm_ops = HashSet::new();
         let select_fma_ops = HashSet::new(); // vselect path
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &select_fma_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
         let op = &result[0];
@@ -937,19 +959,19 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &select_fma_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
         let op = &result[0];
@@ -996,19 +1018,19 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &select_fma_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // FMA without delta should produce 2 ops: sub + fma
         assert_eq!(
@@ -1081,19 +1103,19 @@ mod tests {
         let mut select_fma_ops = HashSet::new();
         select_fma_ops.insert(42); // FMA path WITHOUT delta
 
-        let result = lower_ssa_ops_with_shift(
-            &ssa_ops,
-            &vreg_to_addr,
-            &shifted_ops,
-            &const_add_imm_ops,
-            &HashMap::new(),
-            &select_fma_ops,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
 
         // Check slot values for invalid addresses
         for op in &result {
