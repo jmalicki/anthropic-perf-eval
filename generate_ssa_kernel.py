@@ -101,6 +101,8 @@ def main():
     _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
     parser.add_argument("--disable-cpsat-constraints", type=str, default=None, metavar="GROUP1,GROUP2,...",
                         help=f"Disable optional CP-SAT constraint groups (for debugging). Valid: {_constraint_names}. Also from env CPSAT_DISABLE_OPTIONAL_CONSTRAINTS.")
+    parser.add_argument("--no-cse-groups", action="store_true",
+                        help="Disable CSE groups for SelectChoice shared SUB (debugging depth-3 / validation failures).")
 
     # Output options
     parser.add_argument("--output-json", type=str, default=None,
@@ -207,6 +209,7 @@ def main():
         "enable_asap_alap_tightening": args.enable_asap_alap_tightening and use_cpsat,
         "enable_scratch_tightening": args.enable_scratch_tightening and use_cpsat,
         "scheduling_pressure_policy": args.scheduling_pressure_policy,
+        "enable_cse_groups": not args.no_cse_groups,
     }
     git_sha = get_git_sha()
 
@@ -234,6 +237,7 @@ def main():
         comment=args.comment,
         scheduling_pressure_policy=args.scheduling_pressure_policy,
         optional_constraint_groups_to_disable=optional_constraint_groups_to_disable,
+        enable_cse_groups=None if args.no_cse_groups is False else False,
     )
     build_time = time.time() - start_time
 

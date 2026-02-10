@@ -132,6 +132,8 @@ pub struct CpSatPipelineConfig {
     pub enable_scratch_tightening: bool,
     /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
     pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
+    /// When true (default), build CSE groups for shared SelectChoice SUB. When false, disable for debugging.
+    pub enable_cse_groups: bool,
 }
 
 #[cfg(feature = "cpsat")]
@@ -150,6 +152,7 @@ impl Default for CpSatPipelineConfig {
             enable_asap_alap_tightening: false,
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
+            enable_cse_groups: true,
         }
     }
 }

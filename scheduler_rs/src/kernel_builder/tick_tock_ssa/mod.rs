@@ -356,6 +356,7 @@ impl SsaTickTockKernelBuilder {
         enable_asap_alap_tightening: bool,
         enable_scratch_tightening: bool,
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
+        enable_cse_groups: bool,
     ) -> Result<SsaScheduleResult, String> {
         #[cfg(not(feature = "cpsat"))]
         return Err("CP-SAT not available: compile with --features cpsat".to_string());
@@ -408,6 +409,7 @@ impl SsaTickTockKernelBuilder {
                 enable_asap_alap_tightening,
                 enable_scratch_tightening,
                 disable_optional_constraint_groups,
+                enable_cse_groups,
             }),
             ..Default::default()
         };
@@ -960,7 +962,17 @@ impl SsaTickTockKernelBuilder {
         }
 
         let forced_shifts_ref = forced_shifts.as_ref();
-        let cse_groups = crate::cpsat_scheduler::build_cse_groups(&ctx.ops);
+        let enable_cse = ctx
+            .config
+            .cpsat
+            .as_ref()
+            .map(|c| c.enable_cse_groups)
+            .unwrap_or(true);
+        let cse_groups = if enable_cse {
+            crate::cpsat_scheduler::build_cse_groups(&ctx.ops)
+        } else {
+            vec![]
+        };
         let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
         let cpsat_result = schedule_ssa_cpsat(
             &ctx.ops,

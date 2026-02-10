@@ -71,7 +71,12 @@ impl Pass for CpSatSchedulePass {
             op.cycle = -1;
         }
 
-        let cse_groups = build_cse_groups(&ctx.ops);
+        let enable_cse = cpsat_pipeline_config.enable_cse_groups;
+        let cse_groups = if enable_cse {
+            build_cse_groups(&ctx.ops)
+        } else {
+            vec![]
+        };
         let cse_groups_ref = if cse_groups.is_empty() {
             None
         } else {

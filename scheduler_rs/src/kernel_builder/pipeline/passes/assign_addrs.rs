@@ -41,6 +41,14 @@ impl Pass for AssignAddressesPass {
             let groups = &ctx.final_decisions.cse_groups;
             let results = &ctx.final_decisions.cse_group_results;
             let select_fma = &ctx.final_decisions.select_fma_ops;
+            if !groups.is_empty() && results.len() != groups.len() {
+                eprintln!(
+                    "AssignAddresses: CSE block skipped — groups.len() ({}) != results.len() ({}); \
+                     skipping CSE shared-sub-temp intervals to avoid data corruption",
+                    groups.len(),
+                    results.len(),
+                );
+            }
             if !groups.is_empty() && results.len() == groups.len() {
                 let mut cse_consumer_op_ids = std::collections::HashSet::new();
                 let mut cse_shared = Vec::new();

@@ -773,17 +773,7 @@ fn test_vreg_liveness_intervals() {
     ops[2].cycle = 10;
 
     let config = AddressAssignConfig::default();
-    let intervals = compute_live_intervals(
-        &ops,
-        config.zero_vreg,
-        &config.select_fma_ops,
-        &config.shifted_alu_cycles,
-        &config.const_alu_derive_ops,
-        &config.vector_group_lanes,
-        &config.vreg_def,
-        &config.cse_consumer_op_ids,
-        &config.cse_shared_sub_temp_intervals,
-    );
+    let intervals = compute_live_intervals(&config, &ops);
 
     // CLOSED intervals: [start, end] where end = last_read_cycle
     //
@@ -3448,6 +3438,7 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         false, // enable_asap_alap_tightening
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
+        true,  // enable_cse_groups
     );
     assert!(
         result.is_ok(),
@@ -3615,6 +3606,7 @@ fn test_depth4_cpsat() {
         false, // enable_asap_alap_tightening
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
+        true,  // enable_cse_groups
     );
     assert!(
         result.is_ok(),

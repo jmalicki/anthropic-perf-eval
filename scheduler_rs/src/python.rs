@@ -1052,10 +1052,13 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// cpsat_time_limit sets the maximum time for CP-SAT solver (default: 600 seconds / 10 minutes).
 /// per_section_optimize_secs: when use_cpsat is true and > 0, each per-section CP-SAT run uses this time limit
 /// and optimizes for cycles (no VALU shift in per-section). When 0 or None, per-section runs in feasibility-only mode.
+/// enable_cse_groups: when use_cpsat is true, enable CSE (common subexpression) groups so SelectChoice ops sharing
+/// the same (true_val, false_val) use one shared SUB per group instead of one SUB per FMA, reducing VALU pressure.
+/// Defaults to true when not provided. Has no effect when use_cpsat is false.
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, enable_asap_alap_tightening=None, enable_scratch_tightening=None, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, enable_asap_alap_tightening=None, enable_scratch_tightening=None, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1083,6 +1086,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     enable_scratch_tightening: Option<bool>,
     scheduling_pressure_policy: &str,
     optional_constraint_groups_to_disable: Option<Vec<OptionalConstraintGroupPy>>,
+    enable_cse_groups: Option<bool>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1158,6 +1162,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let enable_vbroadcast_elimination = enable_vbroadcast_elimination.unwrap_or(enable_valu_shift);
     let enable_asap_alap_tightening = enable_asap_alap_tightening.unwrap_or(false);
     let enable_scratch_tightening = enable_scratch_tightening.unwrap_or(false);
+    let enable_cse_groups = enable_cse_groups.unwrap_or(true);
     let disable_optional_set: Option<HashSet<OptionalConstraintGroup>> =
         optional_constraint_groups_to_disable.map(|v| v.into_iter().map(|p| p.inner).collect());
     let result = if use_cpsat {
@@ -1176,6 +1181,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 enable_asap_alap_tightening,
                 enable_scratch_tightening,
                 disable_optional_set,
+                enable_cse_groups,
             )
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
