@@ -48,21 +48,94 @@ pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Ve
 /// SelectChoice ops are lowered based on the scheduler's decision:
 /// - If in `select_fma_ops`: emit sub + fma ops (both VALU, sequential)
 /// - Otherwise: emit vselect op (Flow engine)
+///
+/// When `cse_groups` and `cse_group_results` are provided and non-empty, SelectChoice FMA
+/// consumers in CSE groups use a shared SUB: one SUB per active group, multiple FMAs per group.
 pub fn lower_ssa_ops_with_shift(
     ssa_ops: &[SsaOp],
     vreg_to_addr: &HashMap<VReg, i64>,
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, (usize, usize, crate::types::Opcode)>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
     select_fma_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>, // op_id -> [cycle0, ..., cycle7]
     eliminated_vbroadcast_ops: &HashSet<usize>,
     eliminated_vb_to_scalar_producer: &HashMap<usize, usize>, // vb op_id -> scalar producer op_id
+    cse_groups: Option<&[crate::cpsat_scheduler::CseGroup]>,
+    cse_group_results: Option<&[crate::cpsat_scheduler::CseGroupResult]>,
 ) -> Vec<Op> {
     use crate::types::{Opcode, SlotVal};
     use arrayvec::ArrayVec;
 
     let mut result = Vec::new();
+
+    // Build op_id -> shared sub_temp_addr for CSE group FMA consumers
+    let cse_op_to_sub_temp_addr: HashMap<usize, i64> = {
+        let mut m = HashMap::new();
+        if let (Some(groups), Some(results)) = (cse_groups, cse_group_results) {
+            if groups.len() == results.len() {
+                for (group, res) in groups.iter().zip(results.iter()) {
+                    if !res.sub_active {
+                        continue;
+                    }
+                    let Some(&sub_temp_addr) = vreg_to_addr.get(&group.sub_temp_vreg) else {
+                        continue;
+                    };
+                    for &idx in &group.consumer_indices {
+                        if idx < ssa_ops.len() && select_fma_ops.contains(&ssa_ops[idx].id) {
+                            m.insert(ssa_ops[idx].id, sub_temp_addr);
+                        }
+                    }
+                }
+            }
+        }
+        m
+    };
+
+    // Emit shared SUBs first (one per active CSE group)
+    if let (Some(groups), Some(results)) = (cse_groups, cse_group_results) {
+        if groups.len() == results.len() {
+            for (g, (group, res)) in groups.iter().zip(results.iter()).enumerate() {
+                if !res.sub_active {
+                    continue;
+                }
+                let sub_temp_addr = match vreg_to_addr.get(&group.sub_temp_vreg) {
+                    Some(&a) => a,
+                    None => continue,
+                };
+                let true_val_addr = *vreg_to_addr.get(&group.true_val).unwrap_or(&0);
+                let false_val_addr = *vreg_to_addr.get(&group.false_val).unwrap_or(&0);
+
+                let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                sub_slot.push(SlotVal::Str("-".to_string()));
+                sub_slot.push(SlotVal::Int(sub_temp_addr));
+                sub_slot.push(SlotVal::Int(true_val_addr));
+                sub_slot.push(SlotVal::Int(false_val_addr));
+
+                let mut sub_reads = HashSet::new();
+                for i in 0..VLEN as i64 {
+                    sub_reads.insert(true_val_addr + i);
+                    sub_reads.insert(false_val_addr + i);
+                }
+                let mut sub_writes = HashSet::new();
+                for i in 0..VLEN as i64 {
+                    sub_writes.insert(sub_temp_addr + i);
+                }
+
+                result.push(Op {
+                    id: 0xC5E0_0000 + g, // CSE shared SUB prefix
+                    engine: crate::types::Engine::Valu,
+                    slot: sub_slot,
+                    cycle: res.sub_cycle,
+                    dep_ids: HashSet::new(),
+                    reads: sub_reads,
+                    writes: sub_writes,
+                    last_use_reads: HashSet::new(),
+                    produces_constant: None,
+                });
+            }
+        }
+    }
 
     // Build map: eliminated vb dest VReg -> scalar producer address (for shifted consumers reading from vb)
     let eliminated_vb_vreg_to_scalar_addr: HashMap<VReg, i64> = {
@@ -115,7 +188,10 @@ pub fn lower_ssa_ops_with_shift(
                 .produces_constant
                 .expect("ConstChoice op must have produces_constant");
 
-            if let Some(&(left_op_id, right_op_id, opcode)) = const_alu_derive_ops.get(&ssa_op.id) {
+            if let Some(info) = const_alu_derive_ops.get(&ssa_op.id) {
+                let left_op_id = info.left_op_id;
+                let right_op_id = info.right_op_id;
+                let opcode = info.opcode;
                 // ALU-derived: dest = left opcode right (e.g. add, mul)
                 let left_dest = ssa_ops
                     .iter()
@@ -301,19 +377,27 @@ pub fn lower_ssa_ops_with_shift(
                     // No precomputed delta: emit sub + fma ops (both VALU, sequential)
                     // sub = true_val - false_val
                     // fma = cond * sub + false_val
-
-                    // Get the sub_temp VReg that was allocated during emission
-                    let sub_temp_vreg = ssa_op.sub_temp_vreg.expect(
-                        "SelectChoice without delta must have sub_temp_vreg allocated during emission"
-                    );
-                    let sub_temp_addr = *vreg_to_addr.get(&sub_temp_vreg).expect(
-                        "sub_temp_vreg not in address mapping - was it included in address assignment?"
-                    );
+                    // When in CSE group: shared SUB already emitted; use shared sub_temp_addr, emit only FMA
+                    let use_shared_sub = cse_op_to_sub_temp_addr.contains_key(&ssa_op.id);
+                    let sub_temp_addr = if use_shared_sub {
+                        *cse_op_to_sub_temp_addr.get(&ssa_op.id).unwrap()
+                    } else {
+                        let sub_temp_vreg = ssa_op.sub_temp_vreg.expect(
+                            "SelectChoice without delta must have sub_temp_vreg allocated during emission"
+                        );
+                        *vreg_to_addr.get(&sub_temp_vreg).expect(
+                            "sub_temp_vreg not in address mapping - was it included in address assignment?"
+                        )
+                    };
                     if std::env::var("SCHEDULER_DEBUG").is_ok() {
+                        let sub_src = if use_shared_sub {
+                            format!("shared->{}", sub_temp_addr)
+                        } else {
+                            format!("vreg{:?}->{}", ssa_op.sub_temp_vreg, sub_temp_addr)
+                        };
                         eprintln!(
-                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA (op.id={} cycle={}): sub_temp_vreg={:?} -> addr {}, dest={:?} -> addr {}, cond={:?} -> addr {}, true_val={:?} -> addr {}, false_val={:?} -> addr {}",
-                            ssa_op.id, ssa_op.cycle,
-                            sub_temp_vreg, sub_temp_addr,
+                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA (op.id={} cycle={}): sub_temp {} dest={:?}->{} cond={:?}->{} true_val={:?}->{} false_val={:?}->{}",
+                            ssa_op.id, ssa_op.cycle, sub_src,
                             ssa_op.dest.unwrap(), dest_addr,
                             cond_vreg, cond_addr,
                             true_val_vreg, true_val_addr,
@@ -321,44 +405,36 @@ pub fn lower_ssa_ops_with_shift(
                         );
                     }
 
-                    // Sub op: sub_temp = true_val - false_val
-                    let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
-                    sub_slot.push(SlotVal::Str("-".to_string()));
-                    sub_slot.push(SlotVal::Int(sub_temp_addr));
-                    sub_slot.push(SlotVal::Int(true_val_addr));
-                    sub_slot.push(SlotVal::Int(false_val_addr));
+                    // Sub op: only when NOT using shared SUB (CSE group)
+                    if !use_shared_sub {
+                        let mut sub_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+                        sub_slot.push(SlotVal::Str("-".to_string()));
+                        sub_slot.push(SlotVal::Int(sub_temp_addr));
+                        sub_slot.push(SlotVal::Int(true_val_addr));
+                        sub_slot.push(SlotVal::Int(false_val_addr));
 
-                    let mut sub_reads = HashSet::new();
-                    // Expand vector addresses: all SelectChoice operands are vectors
-                    for i in 0..VLEN as i64 {
-                        sub_reads.insert(true_val_addr + i);
-                        sub_reads.insert(false_val_addr + i);
-                    }
+                        let mut sub_reads = HashSet::new();
+                        for i in 0..VLEN as i64 {
+                            sub_reads.insert(true_val_addr + i);
+                            sub_reads.insert(false_val_addr + i);
+                        }
+                        let mut sub_writes = HashSet::new();
+                        for i in 0..VLEN as i64 {
+                            sub_writes.insert(sub_temp_addr + i);
+                        }
 
-                    let mut sub_writes = HashSet::new();
-                    // sub_temp is a vector VReg
-                    for i in 0..VLEN as i64 {
-                        sub_writes.insert(sub_temp_addr + i);
+                        result.push(Op {
+                            id: ssa_op.id,
+                            engine: crate::types::Engine::Valu,
+                            slot: sub_slot,
+                            cycle: ssa_op.cycle,
+                            dep_ids: ssa_op.dep_ids.clone(),
+                            reads: sub_reads,
+                            writes: sub_writes,
+                            last_use_reads: HashSet::new(),
+                            produces_constant: None,
+                        });
                     }
-
-                    let sub_op = Op {
-                        id: ssa_op.id, // Use same ID for sub (will be different for fma)
-                        engine: crate::types::Engine::Valu,
-                        slot: sub_slot,
-                        cycle: ssa_op.cycle, // Sub is at the same cycle as SelectChoice
-                        dep_ids: ssa_op.dep_ids.clone(),
-                        reads: sub_reads,
-                        writes: sub_writes,
-                        last_use_reads: HashSet::new(),
-                        produces_constant: None,
-                    };
-                    if std::env::var("SCHEDULER_DEBUG").is_ok() {
-                        eprintln!(
-                            "[DEBUG lower_ssa_ops_with_shift] SelectChoice FMA sub: op.id={} cycle={} writes={:?} reads={:?}",
-                            sub_op.id, sub_op.cycle, sub_op.writes, sub_op.reads
-                        );
-                    }
-                    result.push(sub_op);
 
                     // FMA op: dest = cond * sub_temp + false_val
                     let mut fma_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
@@ -583,6 +659,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -632,7 +710,14 @@ mod tests {
         let shifted_ops = HashSet::new();
         let const_add_imm_ops = HashSet::new();
         let mut const_alu_derive_ops = HashMap::new();
-        const_alu_derive_ops.insert(3, (1, 2, Opcode::Add)); // op 3 = op1 + op2
+        const_alu_derive_ops.insert(
+            3,
+            crate::types::AluDeriveInfo {
+                left_op_id: 1,
+                right_op_id: 2,
+                opcode: Opcode::Add,
+            },
+        ); // op 3 = op1 + op2
 
         let result = lower_ssa_ops_with_shift(
             &ssa_ops,
@@ -644,6 +729,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 3); // 3 ConstChoice ops -> 3 lowered ops
@@ -685,6 +772,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -727,6 +816,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 2);
@@ -800,6 +891,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
@@ -854,6 +947,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
@@ -911,6 +1006,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         // FMA without delta should produce 2 ops: sub + fma
@@ -994,6 +1091,8 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            None,
+            None,
         );
 
         // Check slot values for invalid addresses

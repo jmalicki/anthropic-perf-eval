@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatHints};
+use crate::cpsat_scheduler::{build_cse_groups, schedule_ssa_cpsat, SsaCpsatHints};
 use crate::kernel_builder::pipeline::context::SchedulingDecisions;
 use crate::kernel_builder::pipeline::{CpSatExtra, Pass, PipelineContext, SchedulingMetrics};
 use crate::types::Opcode;
@@ -71,6 +71,12 @@ impl Pass for CpSatSchedulePass {
             op.cycle = -1;
         }
 
+        let cse_groups = build_cse_groups(&ctx.ops);
+        let cse_groups_ref = if cse_groups.is_empty() {
+            None
+        } else {
+            Some(cse_groups.as_slice())
+        };
         let cpsat_result = schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
@@ -84,6 +90,7 @@ impl Pass for CpSatSchedulePass {
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
+                cse_groups: cse_groups_ref,
             },
             Some(!greedy_budget_exceeded),
         )
@@ -111,6 +118,9 @@ impl Pass for CpSatSchedulePass {
                 .clone(),
             select_sub_cycles: Default::default(),
             select_fma_cycles: Default::default(),
+            cse_groups,
+            cse_group_results: cpsat_result.cse_group_results.clone(),
+            ..Default::default()
         };
 
         ctx.final_metrics = SchedulingMetrics {

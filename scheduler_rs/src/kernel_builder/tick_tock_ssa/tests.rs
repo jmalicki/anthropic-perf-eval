@@ -731,7 +731,7 @@ fn test_ssa_kernel_builds_successfully() {
 /// The liveness interval for a VReg uses CLOSED convention [start, end].
 #[test]
 fn test_vreg_liveness_intervals() {
-    use crate::address_assign::compute_live_intervals;
+    use crate::address_assign::{compute_live_intervals, AddressAssignConfig};
 
     // Create a simple test case:
     // op0: const -> s0 (def at cycle 0)
@@ -772,7 +772,18 @@ fn test_vreg_liveness_intervals() {
     ops[1].cycle = 1;
     ops[2].cycle = 10;
 
-    let intervals = compute_live_intervals(&ops, None, None, None, None, None, None);
+    let config = AddressAssignConfig::default();
+    let intervals = compute_live_intervals(
+        &ops,
+        config.zero_vreg,
+        &config.select_fma_ops,
+        &config.shifted_alu_cycles,
+        &config.const_alu_derive_ops,
+        &config.vector_group_lanes,
+        &config.vreg_def,
+        &config.cse_consumer_op_ids,
+        &config.cse_shared_sub_temp_intervals,
+    );
 
     // CLOSED intervals: [start, end] where end = last_read_cycle
     //
@@ -3355,6 +3366,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
             initial_live: None,
             live_out_vregs: None,
             live_through_vregs: None,
+            cse_groups: None,
         },
         Some(!greedy_budget_exceeded),
     );

@@ -34,20 +34,55 @@ impl Pass for AssignAddressesPass {
 
         // Pass scheduling decisions to address assignment
         if !ctx.final_decisions.select_fma_ops.is_empty() {
-            assign_config.select_fma_ops = Some(ctx.final_decisions.select_fma_ops.clone());
+            assign_config.select_fma_ops = ctx.final_decisions.select_fma_ops.clone();
+        }
+        #[cfg(feature = "cpsat")]
+        {
+            let groups = &ctx.final_decisions.cse_groups;
+            let results = &ctx.final_decisions.cse_group_results;
+            let select_fma = &ctx.final_decisions.select_fma_ops;
+            if !groups.is_empty() && results.len() == groups.len() {
+                let mut cse_consumer_op_ids = std::collections::HashSet::new();
+                let mut cse_shared = Vec::new();
+                for (g, group) in groups.iter().enumerate() {
+                    let res = &results[g];
+                    if !res.sub_active {
+                        continue;
+                    }
+                    for &idx in &group.consumer_indices {
+                        if idx < ctx.ops.len() {
+                            cse_consumer_op_ids.insert(ctx.ops[idx].id);
+                        }
+                    }
+                    let max_fma = group
+                        .consumer_indices
+                        .iter()
+                        .filter(|&&idx| idx < ctx.ops.len() && select_fma.contains(&ctx.ops[idx].id))
+                        .map(|&idx| ctx.ops[idx].cycle + 1)
+                        .max()
+                        .unwrap_or(res.sub_cycle + 1);
+                    cse_shared.push((group.sub_temp_vreg, res.sub_cycle, max_fma + 1));
+                }
+                if !cse_consumer_op_ids.is_empty() {
+                    assign_config.cse_consumer_op_ids = cse_consumer_op_ids;
+                }
+                if !cse_shared.is_empty() {
+                    assign_config.cse_shared_sub_temp_intervals = cse_shared;
+                }
+            }
         }
         if !ctx.final_decisions.shifted_alu_cycles.is_empty() {
             assign_config.shifted_alu_cycles =
-                Some(ctx.final_decisions.shifted_alu_cycles.clone());
+                ctx.final_decisions.shifted_alu_cycles.clone();
         }
         if !ctx.final_decisions.const_alu_derive_ops.is_empty() {
             assign_config.const_alu_derive_ops =
-                Some(ctx.final_decisions.const_alu_derive_ops.clone());
+                ctx.final_decisions.const_alu_derive_ops.clone();
         }
         if !ctx.vector_group_lanes.is_empty() {
-            assign_config.vector_group_lanes = Some(ctx.vector_group_lanes.clone());
+            assign_config.vector_group_lanes = ctx.vector_group_lanes.clone();
         }
-        assign_config.vreg_def = Some(ctx.vreg_def.clone());
+        assign_config.vreg_def = ctx.vreg_def.clone();
 
         let address_result = assign_addresses(&ctx.ops, &assign_config);
 

@@ -193,6 +193,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -342,6 +344,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
 
         // Verify ConstChoice ops were lowered correctly
@@ -1082,6 +1086,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
 
         // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
@@ -1227,7 +1233,7 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
@@ -1242,6 +1248,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
@@ -1520,11 +1528,21 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
+        let intervals = compute_live_intervals(
+            &emit.ops,
+            config.zero_vreg,
+            &config.select_fma_ops,
+            &config.shifted_alu_cycles,
+            &config.const_alu_derive_ops,
+            &config.vector_group_lanes,
+            &config.vreg_def,
+            &config.cse_consumer_op_ids,
+            &config.cse_shared_sub_temp_intervals,
+        );
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1552,6 +1570,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
@@ -1671,11 +1691,21 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
+        let intervals = compute_live_intervals(
+            &emit.ops,
+            config.zero_vreg,
+            &config.select_fma_ops,
+            &config.shifted_alu_cycles,
+            &config.const_alu_derive_ops,
+            &config.vector_group_lanes,
+            &config.vreg_def,
+            &config.cse_consumer_op_ids,
+            &config.cse_shared_sub_temp_intervals,
+        );
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1744,9 +1774,19 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = Some(cpsat_result.select_fma_ops.clone());
+        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
         let assign_result = assign_addresses(&emit.ops, &config);
-        let intervals = compute_live_intervals(&emit.ops, None, Some(&cpsat_result.select_fma_ops), Some(&cpsat_result.shifted_alu_cycles), Some(&cpsat_result.const_alu_derive_ops), None, None);
+        let intervals = compute_live_intervals(
+            &emit.ops,
+            config.zero_vreg,
+            &config.select_fma_ops,
+            &config.shifted_alu_cycles,
+            &config.const_alu_derive_ops,
+            &config.vector_group_lanes,
+            &config.vreg_def,
+            &config.cse_consumer_op_ids,
+            &config.cse_shared_sub_temp_intervals,
+        );
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1770,6 +1810,8 @@ mod ssa_tests {
             &cpsat_result.shifted_alu_cycles,
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
     }
 }
@@ -2324,6 +2366,8 @@ mod tests {
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
@@ -2478,6 +2522,8 @@ mod tests {
             &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             &cpsat_result.eliminated_vbroadcast_ops,
             &cpsat_result.eliminated_vb_to_scalar_producer,
+            None,
+            None,
         );
 
         // Verify ConstChoice ops were lowered correctly
@@ -2854,6 +2900,7 @@ mod tests {
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
+                cse_groups: None,
             },
             Some(true), // valid hints, within scratch
         );
@@ -4283,7 +4330,7 @@ mod tests {
         let config = AddressAssignConfig {
             budget: 16,
             start_addr: 1,
-            shifted_alu_cycles: Some(r.shifted_alu_cycles.clone()),
+            shifted_alu_cycles: r.shifted_alu_cycles.clone(),
             ..Default::default()
         };
         let assign_result = assign_addresses(&scheduled_ops, &config);
@@ -4766,7 +4813,8 @@ mod tests {
         let config = AddressAssignConfig {
             budget: 4,
             start_addr: 1,
-            select_fma_ops: Some(r.select_fma_ops.clone()),
+            select_fma_ops: r.select_fma_ops.clone(),
+            const_alu_derive_ops: r.const_alu_derive_ops.clone(),
             ..Default::default()
         };
         let assign_result = assign_addresses(&scheduled_ops, &config);
@@ -4774,12 +4822,14 @@ mod tests {
         // Verify live intervals: cond and false_val should extend to cycle+1 (where FMA reads them)
         let intervals = compute_live_intervals(
             &scheduled_ops,
-            None,
-            Some(&r.select_fma_ops),
-            None,
-            Some(&r.const_alu_derive_ops),
-            None,
-            None,
+            config.zero_vreg,
+            &config.select_fma_ops,
+            &config.shifted_alu_cycles,
+            &config.const_alu_derive_ops,
+            &config.vector_group_lanes,
+            &config.vreg_def,
+            &config.cse_consumer_op_ids,
+            &config.cse_shared_sub_temp_intervals,
         );
         let select_cycle = scheduled_ops[3].cycle;
         let cond_interval = intervals.get(&VReg::scalar(0)).unwrap();

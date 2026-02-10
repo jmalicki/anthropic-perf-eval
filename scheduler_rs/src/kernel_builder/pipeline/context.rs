@@ -16,7 +16,8 @@ use super::super::config::CompilerConfig;
 
 #[cfg(feature = "cpsat")]
 use crate::cpsat_scheduler::{
-    ConstChoiceMode, OptionalConstraintGroup, SelectChoiceMode, SsaCpsatConfig, ValuShiftMode,
+    CseGroup, CseGroupResult, ConstChoiceMode, OptionalConstraintGroup,
+    SelectChoiceMode, SsaCpsatConfig, ValuShiftMode,
 };
 
 // ============================================================================
@@ -51,8 +52,8 @@ pub struct SchedulingDecisions {
     pub select_fma_ops: HashSet<usize>,
     /// ConstChoice ops using AddImm encoding (by op ID).
     pub const_add_imm_ops: HashSet<usize>,
-    /// ConstChoice ops using ALU-derived encoding: op_id → (left_op_id, right_op_id, opcode).
-    pub const_alu_derive_ops: HashMap<usize, (usize, usize, Opcode)>,
+    /// ConstChoice ops using ALU-derived encoding: op_id → AluDeriveInfo.
+    pub const_alu_derive_ops: HashMap<usize, crate::types::AluDeriveInfo>,
     /// Individual ALU cycle assignments for shifted VALU ops: op_id → [c0..c7].
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
     /// Op IDs of vbroadcasts eliminated (not emitted; consumers use scalar producer).
@@ -63,6 +64,12 @@ pub struct SchedulingDecisions {
     pub select_sub_cycles: HashMap<usize, i32>,
     /// SelectChoice FMA cycles from greedy: op_id → cycle for the FMA instruction.
     pub select_fma_cycles: HashMap<usize, i32>,
+    /// CSE groups for shared SUB (from build_cse_groups). Empty when not used.
+    #[cfg(feature = "cpsat")]
+    pub cse_groups: Vec<CseGroup>,
+    /// CSE group results from CP-SAT (sub_active, sub_cycle per group). Indexed by group.
+    #[cfg(feature = "cpsat")]
+    pub cse_group_results: Vec<CseGroupResult>,
 }
 
 // ============================================================================

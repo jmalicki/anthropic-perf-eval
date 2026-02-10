@@ -41,6 +41,22 @@ impl Pass for LowerToOpsPass {
             &decisions.shifted_alu_cycles,
             &decisions.eliminated_vbroadcast_ops,
             &decisions.eliminated_vb_to_scalar_producer,
+            #[cfg(feature = "cpsat")]
+            (if decisions.cse_groups.is_empty() {
+                None
+            } else {
+                Some(decisions.cse_groups.as_slice())
+            }),
+            #[cfg(not(feature = "cpsat"))]
+            None,
+            #[cfg(feature = "cpsat")]
+            (if decisions.cse_group_results.is_empty() {
+                None
+            } else {
+                Some(decisions.cse_group_results.as_slice())
+            }),
+            #[cfg(not(feature = "cpsat"))]
+            None,
         );
 
         let n_ops = ops.len();

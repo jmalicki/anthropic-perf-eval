@@ -726,6 +726,7 @@ impl SsaTickTockKernelBuilder {
                         initial_live: Some(&initial_live),
                         live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
                         live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
+                        cse_groups: None, // Per-section: no CSE (feasibility only)
                     },
                     Some(false),
                 ) {
@@ -959,6 +960,8 @@ impl SsaTickTockKernelBuilder {
         }
 
         let forced_shifts_ref = forced_shifts.as_ref();
+        let cse_groups = crate::cpsat_scheduler::build_cse_groups(&ctx.ops);
+        let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
         let cpsat_result = schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
@@ -972,6 +975,7 @@ impl SsaTickTockKernelBuilder {
                 initial_live: None,
                 live_out_vregs: None,
                 live_through_vregs: None,
+                cse_groups: cse_groups_ref,
             },
             Some(!greedy_budget_exceeded),
         )
@@ -1078,6 +1082,8 @@ impl SsaTickTockKernelBuilder {
             shifted_alu_cycles: cpsat_result.shifted_alu_cycles.clone(),
             eliminated_vbroadcast_ops: cpsat_result.eliminated_vbroadcast_ops.clone(),
             eliminated_vb_to_scalar_producer: cpsat_result.eliminated_vb_to_scalar_producer.clone(),
+            cse_groups,
+            cse_group_results: cpsat_result.cse_group_results.clone(),
             ..Default::default()
         };
         ctx.final_metrics.cycles = cycles;

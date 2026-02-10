@@ -89,6 +89,7 @@ pub fn schedule_ssa_cpsat(
     let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
+    let cse_groups = hints.cse_groups;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -109,6 +110,7 @@ pub fn schedule_ssa_cpsat(
             lb_cycles: Some(0),
             eliminated_vbroadcast_ops: HashSet::new(),
             eliminated_vb_to_scalar_producer: HashMap::new(),
+            cse_group_results: vec![],
             schedule_constraints: vec![],
         });
     }
@@ -923,6 +925,22 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, _)| idx)
         .collect();
 
+    // CSE groups: op index -> group index for SelectChoice ops in CSE groups (no delta, has sub_temp)
+    let (cse_consumer_set, op_idx_to_cse_group): (HashSet<usize>, HashMap<usize, usize>) =
+        if let Some(groups) = cse_groups {
+            let mut set = HashSet::new();
+            let mut map = HashMap::new();
+            for (g, group) in groups.iter().enumerate() {
+                for &idx in &group.consumer_indices {
+                    set.insert(idx);
+                    map.insert(idx, g);
+                }
+            }
+            (set, map)
+        } else {
+            (HashSet::new(), HashMap::new())
+        };
+
     let mut select_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
     let mut select_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
@@ -938,6 +956,22 @@ pub fn schedule_ssa_cpsat(
             SelectChoiceMode::ForceFma => {
                 let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
                     vec![model.new_fixed_size_interval_var(cycle_vars[idx], 1)]
+                } else if cse_consumer_set.contains(&idx) {
+                    // In CSE group: only FMA interval; shared SUB added per group
+                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+                    let fma_cycle_var = model.new_int_var_with_name(
+                        [(fma_asap as i64, fma_alap as i64)],
+                        format!("fma_cycle_{}", idx),
+                    );
+                    let c = model.add_eq(
+                        LinearExpr::from(fma_cycle_var),
+                        LinearExpr::from(cycle_vars[idx]) + 1,
+                    );
+                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
+                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                    let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
+                    vec![fma_interval]
                 } else {
                     let sub_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
                     let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
@@ -980,6 +1014,23 @@ pub fn schedule_ssa_cpsat(
 
                 let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
                     vec![model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var)]
+                } else if cse_consumer_set.contains(&idx) {
+                    // In CSE group: only FMA interval; shared SUB added per group
+                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
+                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
+                    let fma_cycle_var = model.new_int_var_with_name(
+                        [(fma_asap as i64, fma_alap as i64)],
+                        format!("fma_cycle_{}", idx),
+                    );
+                    let c = model.add_eq(
+                        LinearExpr::from(fma_cycle_var),
+                        LinearExpr::from(cycle_vars[idx]) + 1,
+                    );
+                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
+                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                    let fma_interval =
+                        model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
+                    vec![fma_interval]
                 } else {
                     let sub_interval =
                         model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
@@ -1001,6 +1052,88 @@ pub fn schedule_ssa_cpsat(
                 };
                 select_valu_intervals.insert(idx, valu_intervals);
             }
+        }
+    }
+
+    // 6c-bis. CSE shared SUB: variables and constraints per group (Phase A: SUB on VALU only)
+    let mut cse_sub_active_vars: Vec<BoolVar> = Vec::new();
+    let mut cse_sub_cycle_vars: Vec<IntVar> = Vec::new();
+    let mut cse_shared_sub_valu_intervals: Vec<IntervalVar> = Vec::new();
+    if let Some(groups) = cse_groups {
+        for (g, group) in groups.iter().enumerate() {
+            let sub_active_var = model.new_bool_var_with_name(format!("cse_sub_active_{}", g));
+            cse_sub_active_vars.push(sub_active_var);
+
+            // sub_asap = max(asap[producer_true], asap[producer_false]) + 1
+            let sub_asap = if let (Some(pt), Some(pf)) =
+                (group.producer_true_idx, group.producer_false_idx)
+            {
+                let at = *asap.get(&ops[pt].id).unwrap_or(&0);
+                let af = *asap.get(&ops[pf].id).unwrap_or(&0);
+                at.max(af) + 1
+            } else {
+                0
+            };
+            let sub_alap = horizon as i32 - 1;
+            let sub_cycle_var = model.new_int_var_with_name(
+                [(sub_asap as i64, sub_alap as i64)],
+                format!("cse_sub_cycle_{}", g),
+            );
+            cse_sub_cycle_vars.push(sub_cycle_var);
+
+            // Activity: sub_active <=> (sum choice[c] >= 1)
+            match select_choice_mode {
+                SelectChoiceMode::ForceVselect => {
+                    model.add_eq(sub_active_var, 0);
+                }
+                SelectChoiceMode::ForceFma => {
+                    model.add_eq(sub_active_var, 1);
+                }
+                SelectChoiceMode::Optimize => {
+                    let choice_vars: Vec<BoolVar> = group
+                        .consumer_indices
+                        .iter()
+                        .filter_map(|&idx| select_choice_vars.get(&idx).copied())
+                        .collect();
+                    if !choice_vars.is_empty() {
+                        let sum_choice = choice_vars
+                            .iter()
+                            .skip(1)
+                            .fold(LinearExpr::from(choice_vars[0]), |acc, &b| {
+                                acc + LinearExpr::from(b)
+                            });
+                        let c1 = model.add_ge(sum_choice.clone(), 1);
+                        model.only_enforce_if(c1, [sub_active_var]);
+                        let c2 = model.add_eq(sum_choice, 0);
+                        model.only_enforce_if(c2, [sub_active_var.not()]);
+                    }
+                }
+            }
+
+            // Precedence: for each consumer c: sub_cycle + 1 <= fma_cycle[c] (when FMA path)
+            for &idx in &group.consumer_indices {
+                if select_choice_mode == SelectChoiceMode::ForceVselect {
+                    continue; // No FMA path, no precedence needed
+                }
+                let Some(&fma_cycle_var) = select_choice_fma_last_cycle.get(&idx) else {
+                    continue;
+                };
+                let c = model.add_ge(
+                    LinearExpr::from(fma_cycle_var),
+                    LinearExpr::from(sub_cycle_var) + 1,
+                );
+                model.set_constraint_name(c, &format!("cse_prec_g{}_c{}", g, idx));
+                if select_choice_mode == SelectChoiceMode::Optimize {
+                    if let Some(&choice_var) = select_choice_vars.get(&idx) {
+                        model.only_enforce_if(c, [choice_var]);
+                    }
+                }
+            }
+
+            // Optional VALU interval for shared SUB at sub_cycle when sub_active
+            let sub_interval =
+                model.new_optional_fixed_size_interval_var(sub_cycle_var, 1, sub_active_var);
+            cse_shared_sub_valu_intervals.push(sub_interval);
         }
     }
 
@@ -1121,6 +1254,12 @@ pub fn schedule_ssa_cpsat(
                     valu_demands.push(1); // Each VALU op (sub or fma) uses 1 slot
                 }
             }
+        }
+
+        // Add shared SUB intervals from CSE groups (Phase A: one per group when sub_active)
+        for iv in &cse_shared_sub_valu_intervals {
+            valu_intervals.push(*iv);
+            valu_demands.push(1);
         }
 
         if !valu_intervals.is_empty() {
@@ -3088,7 +3227,7 @@ pub fn schedule_ssa_cpsat(
 
             // Extract ConstChoice: ForceAddImm => all; ForceLoad => none; Optimize => from solver
             // Also extract ALU-derived choices (op_id -> (left_id, right_id, opcode))
-            let (const_add_imm_ops, const_alu_derive_ops): (HashSet<usize>, HashMap<usize, (usize, usize, Opcode)>) =
+            let (const_add_imm_ops, const_alu_derive_ops): (HashSet<usize>, HashMap<usize, crate::types::AluDeriveInfo>) =
                 match const_choice_mode {
                     ConstChoiceMode::ForceAddImm => (
                         const_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
@@ -3113,7 +3252,11 @@ pub fn schedule_ssa_cpsat(
                                                 let (li, ri, opcode) = info[i];
                                                 alu_derive.insert(
                                                     ops[idx].id,
-                                                    (ops[li].id, ops[ri].id, opcode),
+                                                    crate::types::AluDeriveInfo {
+                                                        left_op_id: ops[li].id,
+                                                        right_op_id: ops[ri].id,
+                                                        opcode,
+                                                    },
                                                 );
                                             }
                                         }
@@ -3147,6 +3290,17 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
             };
+
+            // Extract CSE group results (sub_active, sub_cycle per group)
+            let cse_group_results: Vec<super::cse_groups::CseGroupResult> =
+                cse_sub_active_vars
+                    .iter()
+                    .zip(cse_sub_cycle_vars.iter())
+                    .map(|(&sub_active_var, &sub_cycle_var)| super::cse_groups::CseGroupResult {
+                        sub_active: sub_active_var.solution_value(&response),
+                        sub_cycle: sub_cycle_var.solution_value(&response) as i32,
+                    })
+                    .collect();
 
             // Extract eliminated vbroadcasts and vb -> scalar producer map
             let (eliminated_vbroadcast_ops, eliminated_vb_to_scalar_producer) = {
@@ -3824,6 +3978,7 @@ pub fn schedule_ssa_cpsat(
                 lb_cycles,
                 eliminated_vbroadcast_ops,
                 eliminated_vb_to_scalar_producer,
+                cse_group_results,
                 schedule_constraints,
             })
         }

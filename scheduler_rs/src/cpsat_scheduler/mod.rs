@@ -164,6 +164,7 @@ pub use std::str::FromStr;
 pub use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN};
 
 pub mod config;
+pub mod cse_groups;
 pub mod legacy;
 pub mod validation;
 pub mod bounds;
@@ -177,6 +178,7 @@ pub use config::{
     ValuShiftMode,
 };
 pub use legacy::{compute_asap, compute_alap};
+pub use cse_groups::{build_cse_groups, CseGroup, CseGroupResult};
 pub use bounds::{
     CapacityLowerBoundResult, CpsatConfig, CpsatResultWithShift, LiveInterval,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,

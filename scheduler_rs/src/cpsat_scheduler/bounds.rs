@@ -470,6 +470,8 @@ pub struct SsaCpsatHints<'a> {
     pub live_through_vregs: Option<&'a HashSet<VReg>>,
     /// Op IDs of vbroadcasts to hint for elimination (try eliminate_vb = true).
     pub eliminate_vbroadcast_hints: Option<&'a HashSet<usize>>,
+    /// CSE groups for shared SUB. When set and non-empty, CP-SAT uses shared-SUB model for those groups.
+    pub cse_groups: Option<&'a [super::cse_groups::CseGroup]>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
@@ -493,8 +495,8 @@ pub struct SsaCpsatResult {
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
     /// Set of ConstChoice op IDs that should use AddImm (Flow) instead of Load
     pub const_add_imm_ops: HashSet<usize>,
-    /// ConstChoice ops that chose ALU-derived encoding: op_id -> (left_producer_op_id, right_producer_op_id, opcode)
-    pub const_alu_derive_ops: HashMap<usize, (usize, usize, Opcode)>,
+    /// ConstChoice ops that chose ALU-derived encoding: op_id -> AluDeriveInfo
+    pub const_alu_derive_ops: HashMap<usize, crate::types::AluDeriveInfo>,
     /// Set of SelectChoice op IDs that should use FMA path (VALU) instead of vselect (Flow)
     pub select_fma_ops: HashSet<usize>,
     /// Number of empty cycles (makespan minus max cycle used). 0 when schedule has no gaps.
@@ -507,6 +509,8 @@ pub struct SsaCpsatResult {
     pub eliminated_vbroadcast_ops: HashSet<usize>,
     /// For each eliminated vb op ID, the op ID of its scalar producer (for lowering).
     pub eliminated_vb_to_scalar_producer: HashMap<usize, usize>,
+    /// CSE group results (Phase A: sub_active, sub_cycle). Indexed by group index. Empty when no CSE groups.
+    pub cse_group_results: Vec<super::cse_groups::CseGroupResult>,
     /// Same constraints as the CP-SAT model (for bulk-move simulator and validation).
     pub schedule_constraints: Vec<crate::schedule_constraints::ScheduleConstraint>,
 }

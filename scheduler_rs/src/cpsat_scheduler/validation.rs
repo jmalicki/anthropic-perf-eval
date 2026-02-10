@@ -156,7 +156,7 @@ pub(crate) fn summarise_ssa_solution_engines_and_choices(
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
     const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
     select_fma_ops: &HashSet<usize>,
 ) -> SsaSolutionSummary {
     let mut alu_total = 0usize;
@@ -264,7 +264,7 @@ pub(crate) fn validate_ssa_slot_limits(
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
     select_fma_ops: &HashSet<usize>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
@@ -423,7 +423,7 @@ pub(crate) fn try_validate_ssa_slot_limits(
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, (usize, usize, Opcode)>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
     select_fma_ops: &HashSet<usize>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,

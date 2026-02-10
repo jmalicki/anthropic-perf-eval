@@ -2,6 +2,8 @@
 
 **Analysis log:** Depth-2 vs depth-3 comparison, per-decile utilization, hypothesis quantification, CSE review, and SUB-in-FMA redundant-SUB findings (with cycle estimate). Data from `scheduler_output_4r_256b_depth2.json` and `scheduler_output_4r_256b_depth3.json` (4 rounds, batch 256).
 
+**Update (2025-02):** Added scheduler model verification (SelectChoice FMA = 2 VALU ops), needs_subtraction usage, and CSE operand-sharing analysis.
+
 ## Summary
 
 **Question:** Are there inefficiencies holding depth-3 back that, if fixed, could make depth-3 faster than scatter load?
@@ -169,6 +171,22 @@ Many SelectChoice ops share the same `(true_val, false_val)` but each allocates 
 
 **Example:** `SUB with reads (27, 28, …, 34, 86, 87, …, 93)` appears **13 times** (13 different result VRegs). All 13 could use a single CSE'd SUB.
 
+### Where Does SUB Sharing Come From?
+
+CSE targets SUBs with identical `(true_val, false_val)` across **different** SelectChoice ops — not "two arms of the same select" (each SelectChoice has one operand pair and at most one SUB). Sharing occurs when **different batch items (groups)** use the same operand pair because those operands are **shared across groups**:
+
+| Operand source | Shared across groups? | CSE opportunity |
+|----------------|-----------------------|-----------------|
+| Tree-cache broadcasts (e.g. `values[0..4]` in depth-2) | Yes | Large — same SUB repeated for all 32 groups |
+| Per-group intermediates (`p01`, `p23`, etc. from level-0 FMA) | No | None across groups |
+
+In **depth-2**, level-0 selects use shared tree-cache broadcasts:
+- `select_2way(bit0, values[1], values[0])` — `(values[1], values[0])` is identical for all 32 groups.
+- `select_2way(bit0, values[3], values[2])` — same for `(values[3], values[2])`.
+- Result: ~32 identical SUBs per pattern, 31 of which can be CSE'd away.
+
+In **depth-3**, level-1 and level-2 operands (`p01`, `p23`, `q03`, etc.) come from per-group FMAs and selects, so they differ per group. The 120 redundant SUBs in the depth-3 kernel likely come from depth-2 rounds (rounds 1–2) where level-0 selects use shared tree-cache values.
+
 ### Where CSE Must Happen
 
 **CSE has to be done at emission (before scheduling), not at lowering.**  
@@ -233,6 +251,19 @@ So: **we do have lots of free ALU during depth-3 select, and shifting the SUB to
 
 ---
 
+## Scheduler Model: SelectChoice FMA = 2 VALU Ops
+
+**Question:** Does the CP-SAT model correctly account for SelectChoice FMA path as 2 VALU ops (SUB + FMA)?
+
+**Answer:** Yes. The scheduler correctly models a SelectChoice on the FMA path as **2 VALU ops**, not 1:
+
+1. **VALU cumulative** (`cpsat_scheduler/model.rs`): For each SelectChoice FMA, it adds two intervals (sub at cycle C, fma at cycle C+1), each with demand 1.
+2. **Capacity constraint:** `6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)` — explicitly adds 2 VALU ops per SelectChoice that chooses FMA.
+
+One caveat: when `false_val == 0`, emission sets `needs_subtraction = false` and emits only 1 FMA (no SUB). The model does not distinguish this; it assumes 2 VALU ops whenever `delta_vreg` is None. That could slightly overcount VALU for those rare cases, but as noted above, needs_subtraction is effectively always true for depth-3 tree-select.
+
+---
+
 ## SUB with constant 0 (zero operand)
 
 **Question:** Do the SUBs from the SelectChoice FMA path ever use 0 as a constant argument? If so, that could be special-cased (e.g. skip SUB when `false_val == 0` → use `true_val` as `sub_temp`).
@@ -250,3 +281,9 @@ So: **we do have lots of free ALU during depth-3 select, and shifting the SUB to
 1. Any SelectChoice with **false_val == 0** is already optimized at emission (no SUB), so such cases do not appear as SUBs in the schedule.
 2. **true_val == 0** would give `sub_temp = 0 - false_val` (negation). The emitter does not special-case that; we’d still emit a SUB. In the depth-3 tree-select, operands are tree-cache values or earlier select results, so true_val is not constant 0 in practice.
 3. **Conclusion:** For this kernel there is no additional zero-operand SUB case to special-case. The only useful special case (false_val == 0) is already implemented.
+
+**Fraction with needs_subtraction = false:** Effectively **0%** for the depth-3 tree-select kernel. Operands are always tree-cache values or earlier select results, never constant 0. The special case exists but is defensive; removing it is not recommended without evidence it's dead across all configs.
+
+---
+
+**Design doc:** See [docs/SUB_CSE_ALU_SHIFT_DESIGN.md](SUB_CSE_ALU_SHIFT_DESIGN.md) for a structured breakdown of the unified CP-SAT model (SUB CSE + SUB ALU-shift + vselect/FMA choice), tensions, constraints, edge cases, and implementation phases.

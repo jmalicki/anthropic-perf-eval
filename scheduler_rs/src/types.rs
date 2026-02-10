@@ -333,6 +333,22 @@ impl Opcode {
 }
 
 // ============================================================================
+// AluDeriveInfo
+// ============================================================================
+
+/// Info for a ConstChoice op that chose ALU-derived encoding: `dest = left opcode right`.
+/// Used in `const_alu_derive_ops: HashMap<op_id, AluDeriveInfo>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AluDeriveInfo {
+    /// Op ID of the left producer (defines a value read by the derived op).
+    pub left_op_id: usize,
+    /// Op ID of the right producer (defines a value read by the derived op).
+    pub right_op_id: usize,
+    /// The ALU opcode to use (e.g. Add, Mul).
+    pub opcode: Opcode,
+}
+
+// ============================================================================
 // Legacy compatibility (slot limits by string)
 // ============================================================================
 
