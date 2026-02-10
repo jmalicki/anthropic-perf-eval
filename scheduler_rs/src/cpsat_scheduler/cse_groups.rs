@@ -6,10 +6,53 @@
 
 use std::collections::HashMap;
 
-use crate::types::{Opcode, SsaOp, VReg, VRegWidth};
+use crate::types::{Opcode, Operand, SsaOp, VReg, VRegWidth};
 
-/// Base ID for CSE group sub_temp VRegs. Chosen to avoid collision with normal emission IDs.
-const CSE_SUB_TEMP_BASE_ID: u32 = 0x1000000;
+/// Maximum VReg ID that can be produced by normal emission (SsaEmitContext::next_vreg_id).
+/// CSE sub_temp IDs are allocated above this via [cse_sub_temp_base], so this constant
+/// documents the upper bound of the "normal" ID space for clarity; the allocator
+/// guarantees no collision without relying on this limit.
+pub const EMIT_VREG_ID_MAX: u32 = 0x1000000 - 1;
+
+/// Returns the maximum VReg id that appears in any op (dest, srcs, delta_vreg, sub_temp_vreg).
+/// Used to allocate CSE sub_temp IDs above all emission IDs.
+fn max_vreg_id_in_ops(ops: &[SsaOp]) -> u32 {
+    let mut max = 0u32;
+    for op in ops {
+        if let Some(d) = op.dest {
+            max = max.max(d.id);
+        }
+        for src in &op.srcs {
+            if let Operand::VReg(v) = src {
+                max = max.max(v.id);
+            }
+        }
+        if let Some(v) = op.delta_vreg {
+            max = max.max(v.id);
+        }
+        if let Some(v) = op.sub_temp_vreg {
+            max = max.max(v.id);
+        }
+    }
+    max
+}
+
+/// Allocates a base ID for CSE group sub_temp VRegs so they do not collide with normal
+/// emission VReg IDs. Returns `max_vreg_id_in_ops(ops) + 1`. Panics if the range
+/// `[base, base + num_groups)` would overflow u32.
+fn cse_sub_temp_base(ops: &[SsaOp], num_groups: usize) -> u32 {
+    let max_emit = max_vreg_id_in_ops(ops);
+    let base = max_emit.saturating_add(1);
+    // Ensure last allocated id (base + num_groups - 1) fits in u32
+    let num_groups_u = num_groups as u32;
+    assert!(
+        num_groups_u == 0 || base <= u32::MAX - (num_groups_u - 1),
+        "CSE sub_temp ID range would overflow: base={} num_groups={}",
+        base,
+        num_groups
+    );
+    base
+}
 
 /// One CSE group: SelectChoice ops sharing the same (true_val, false_val).
 #[derive(Debug, Clone)]
@@ -79,13 +122,17 @@ pub fn build_cse_groups(ops: &[SsaOp]) -> Vec<CseGroup> {
             .push(idx);
     }
 
+    // Allocate CSE sub_temp IDs above all emission VReg IDs to avoid collision
+    let num_groups = key_to_indices.len();
+    let base = cse_sub_temp_base(ops, num_groups);
+
     // Convert to Vec<CseGroup> with allocated sub_temp_vreg per group
-    let mut groups = Vec::with_capacity(key_to_indices.len());
+    let mut groups = Vec::with_capacity(num_groups);
     for (g, ((true_val, false_val), consumer_indices)) in key_to_indices.into_iter().enumerate() {
         let producer_true_idx = vreg_def.get(&true_val).copied();
         let producer_false_idx = vreg_def.get(&false_val).copied();
         let sub_temp_vreg = VReg {
-            id: CSE_SUB_TEMP_BASE_ID + g as u32,
+            id: base + g as u32,
             width: VRegWidth::Vector,
         };
         groups.push(CseGroup {
@@ -97,5 +144,6 @@ pub fn build_cse_groups(ops: &[SsaOp]) -> Vec<CseGroup> {
             sub_temp_vreg,
         });
     }
+    groups.sort_by_key(|g| (g.true_val, g.false_val));
     groups
 }
