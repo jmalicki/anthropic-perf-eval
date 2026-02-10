@@ -198,6 +198,35 @@ def test_scheduling_pressure_policy_greedy():
     _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
 
 
+def test_depth3_validates():
+    """Depth 3 tree-reduce: kernel with tree_reduce_max_depth=3 must match reference.
+
+    Uses forest_height=5 (tree_height=6), rounds=4, batch_size=8 so round 3 hits depth 3
+    (8-way selection). Greedy scheduler (fast) — correctness is the goal.
+    """
+    import scheduler_rs
+
+    forest_height = 5
+    n_nodes = 31
+    batch_size = 8
+    rounds = 4
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        enable_valu_shift=False,
+        verbose=False,
+        use_cpsat=False,
+        tree_reduce_max_depth=3,
+    )
+    assert not stats.get("budget_exceeded", False), "depth3 small config should stay within budget"
+    _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
 def test_depth4_validates():
     """Depth 4 tree-reduce: kernel with tree_reduce_max_depth=4 must match reference.
 

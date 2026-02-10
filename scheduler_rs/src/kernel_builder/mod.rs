@@ -20,6 +20,7 @@ pub mod barrier_elision;
 pub mod config;
 pub mod context_ssa;
 pub mod emit_ssa;
+pub mod tree_select;
 pub mod pipeline;
 pub mod round_budget;
 pub mod ssa_emit;
