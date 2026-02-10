@@ -43,8 +43,11 @@ fn max_vreg_id_in_ops(ops: &[SsaOp]) -> u32 {
 fn cse_sub_temp_base(ops: &[SsaOp], num_groups: usize) -> u32 {
     let max_emit = max_vreg_id_in_ops(ops);
     let base = max_emit.saturating_add(1);
+    // Avoid silent truncation: num_groups must fit in u32
+    let num_groups_u: u32 = num_groups.try_into().unwrap_or_else(|_| {
+        panic!("num_groups exceeds u32::MAX: num_groups={}", num_groups)
+    });
     // Ensure last allocated id (base + num_groups - 1) fits in u32
-    let num_groups_u = num_groups as u32;
     assert!(
         num_groups_u == 0 || base <= u32::MAX - (num_groups_u - 1),
         "CSE sub_temp ID range would overflow: base={} num_groups={}",
@@ -67,6 +70,10 @@ pub struct CseGroup {
     pub producer_true_idx: Option<usize>,
     /// Op index that defines false_val, if unique
     pub producer_false_idx: Option<usize>,
+    /// True when true_val or false_val has no single producer (multi-def/phi).
+    /// Per-lane dependency construction (Section 5.4) must use conservative
+    /// handling when this is true; do not unwrap producer_true_idx/producer_false_idx.
+    pub complex_phi: bool,
     /// Allocated VReg for the shared sub_temp (sub_temp = true_val - false_val)
     pub sub_temp_vreg: VReg,
 }
@@ -126,11 +133,21 @@ pub fn build_cse_groups(ops: &[SsaOp]) -> Vec<CseGroup> {
     let num_groups = key_to_indices.len();
     let base = cse_sub_temp_base(ops, num_groups);
 
-    // Convert to Vec<CseGroup> with allocated sub_temp_vreg per group
+    // Convert to Vec<CseGroup> with allocated sub_temp_vreg per group.
+    // Phase 1 validation: detect None for producer_true_idx/producer_false_idx (multi-def/phi)
+    // and tag the group as complex_phi; use conservative dependency handling in the model.
     let mut groups = Vec::with_capacity(num_groups);
     for (g, ((true_val, false_val), consumer_indices)) in key_to_indices.into_iter().enumerate() {
         let producer_true_idx = vreg_def.get(&true_val).copied();
         let producer_false_idx = vreg_def.get(&false_val).copied();
+        let complex_phi = producer_true_idx.is_none() || producer_false_idx.is_none();
+        if complex_phi {
+            eprintln!(
+                "CSE group (true_val={:?}, false_val={:?}): operands have multiple producers or no single def (multi-def/phi); \
+                 tagging as complex-phi, using conservative dependency handling",
+                true_val, false_val
+            );
+        }
         let sub_temp_vreg = VReg {
             id: base + g as u32,
             width: VRegWidth::Vector,
@@ -141,6 +158,7 @@ pub fn build_cse_groups(ops: &[SsaOp]) -> Vec<CseGroup> {
             consumer_indices,
             producer_true_idx,
             producer_false_idx,
+            complex_phi,
             sub_temp_vreg,
         });
     }

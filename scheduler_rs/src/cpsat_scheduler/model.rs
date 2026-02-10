@@ -1064,8 +1064,18 @@ pub fn schedule_ssa_cpsat(
             let sub_active_var = model.new_bool_var_with_name(format!("cse_sub_active_{}", g));
             cse_sub_active_vars.push(sub_active_var);
 
-            // sub_asap = max(asap[producer_true], asap[producer_false]) + 1
-            let sub_asap = if let (Some(pt), Some(pf)) =
+            // sub_asap = max(asap[producer_true], asap[producer_false]) + 1 when both producers
+            // are unique. For complex_phi (multi-def/phi), use conservative bound 0; do not
+            // unwrap producer_true_idx/producer_false_idx.
+            let sub_asap = if group.complex_phi {
+                if verbose {
+                    eprintln!(
+                        "  CSE group {}: complex-phi (operands have multiple producers); using conservative sub_asap=0",
+                        g
+                    );
+                }
+                0
+            } else if let (Some(pt), Some(pf)) =
                 (group.producer_true_idx, group.producer_false_idx)
             {
                 let at = *asap.get(&ops[pt].id).unwrap_or(&0);
@@ -1083,6 +1093,7 @@ pub fn schedule_ssa_cpsat(
 
             // Producer precedence: when sub is active, sub_cycle >= producer result visible cycle.
             // Uses completion_cycle for shiftable VALU producers (result at completion+1), else cycle+1.
+            // For complex_phi, one or both producers are None; we only add precedence for present producers.
             if let Some(pt) = group.producer_true_idx {
                 let producer_cycle = completion_cycle_vars
                     .get(&pt)
@@ -1133,6 +1144,10 @@ pub fn schedule_ssa_cpsat(
                         model.only_enforce_if(c1, [sub_active_var]);
                         let c2 = model.add_eq(sum_choice, 0);
                         model.only_enforce_if(c2, [sub_active_var.not()]);
+                        // (sum_choice >= 1) => sub_active_var: any selected choice forces sub active
+                        for &choice in &choice_vars {
+                            model.add_implication(choice, sub_active_var);
+                        }
                     }
                 }
             }
@@ -2901,17 +2916,19 @@ pub fn schedule_ssa_cpsat(
         }
         let horizon_i64 = horizon as i64;
         for (g, group) in groups.iter().enumerate() {
-            // sub_cycle hint: minimum hinted consumer cycle in this group, or 0 if no greedy hints
-            let sub_cycle_hint = greedy_hints
-                .and_then(|hints| {
-                    group
-                        .consumer_indices
-                        .iter()
-                        .filter_map(|&c| hints.get(c).copied())
-                        .filter(|&t| t >= 0)
-                        .min()
-                })
-                .unwrap_or(0);
+            // sub_cycle hint: first cycle after both producers complete (max producer cycle + 1).
+            // Do not unwrap producer_true_idx/producer_false_idx; for complex_phi groups we use
+            // only present producer hints and fall back to 0 when none exist.
+            let sub_cycle_hint = greedy_hints.map_or(0, |hints| {
+                let producer_cycles = [group.producer_true_idx, group.producer_false_idx]
+                    .into_iter()
+                    .filter_map(|opt_idx| opt_idx.and_then(|idx| hints.get(idx).copied()))
+                    .filter(|&t| t >= 0);
+                producer_cycles
+                    .max()
+                    .map(|max_c| max_c + 1)
+                    .unwrap_or(0)
+            });
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
             model.add_hint(cse_sub_cycle_vars[g], clamped);
         }
