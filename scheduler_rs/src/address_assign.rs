@@ -296,15 +296,17 @@ pub fn compute_live_intervals(
     }
 
     // Vstore value pass: ensure the stored value VReg is live through the vstore's cycle.
-    // This prevents the allocator from reusing that address for another VReg (e.g. offset used
-    // by multiply_add next cycle) when the schedule would have the vstore and producer in
-    // the wrong order. Extend value (srcs[1]) to vstore cycle and clamp so end >= start.
+    // The linear scan expires when end_cycle <= interval.start; so if we set end = op.cycle,
+    // the value is expired when we allocate the next interval (start = op.cycle) and the
+    // vstore would read a reused address. Extend value (srcs[1]) to op.cycle + 1 so the
+    // value is still reserved when the vstore reads at op.cycle.
     for op in ops {
         if op.opcode == Opcode::Vstore && op.srcs.len() >= 2 {
             if let Operand::VReg(value_vreg) = &op.srcs[1] {
                 if let Some(interval) = intervals.get_mut(value_vreg) {
-                    if op.cycle > interval.end {
-                        interval.end = op.cycle;
+                    let read_through = op.cycle + 1;
+                    if read_through > interval.end {
+                        interval.end = read_through;
                     }
                     if interval.end < interval.start {
                         interval.end = interval.start;
