@@ -1259,7 +1259,7 @@ pub fn compute_liveness_summary(
 mod tests {
     use super::*;
     use crate::kernel_builder::emit_ssa::SsaEmitContext;
-    use crate::types::{Engine, Opcode};
+    use crate::types::{Engine, Operand, Opcode};
 
     #[test]
     fn test_compute_live_intervals_simple() {
@@ -1478,6 +1478,84 @@ mod tests {
         // v1 and v2 must have different addresses
         assert_ne!(result.vreg_to_addr[&v1], result.vreg_to_addr[&v2]);
         assert!(!result.budget_exceeded);
+    }
+
+    /// Hash-as-offset scenario: value VReg (consumed by vstore at T+1) and offset VReg
+    /// (consumed by multiply_add at T+2) must get different addresses. Value is extended
+    /// to op.cycle+1 by the vstore value pass; both intervals overlap so allocator must
+    /// assign distinct addresses.
+    #[test]
+    fn test_value_and_offset_vregs_different_addresses() {
+        use crate::types::Operand;
+        let value_vreg = VReg::vector(100);
+        let offset_vreg = VReg::vector(101);
+        let addr_vreg = VReg::scalar(0);
+        let idx_vreg = VReg::vector(1);
+        let x_vreg = VReg::vector(2);
+        let a_vreg = VReg::vector(3);
+        let b_vreg = VReg::vector(4);
+
+        let mut op_value = SsaOp::new(
+            0,
+            Engine::Valu,
+            Opcode::Xor,
+            Some(value_vreg),
+            vec![Operand::VReg(a_vreg), Operand::VReg(b_vreg)],
+        );
+        op_value.cycle = 10;
+
+        let mut op_offset = SsaOp::new(
+            1,
+            Engine::Valu,
+            Opcode::Sub,
+            Some(offset_vreg),
+            vec![Operand::VReg(a_vreg), Operand::VReg(b_vreg)],
+        );
+        op_offset.cycle = 9;
+
+        let mut op_vstore = SsaOp::new(
+            2,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::VReg(addr_vreg), Operand::VReg(value_vreg)],
+        );
+        op_vstore.cycle = 11;
+
+        let mut op_fma = SsaOp::new(
+            3,
+            Engine::Valu,
+            Opcode::MultiplyAdd,
+            Some(VReg::vector(102)),
+            vec![Operand::VReg(idx_vreg), Operand::VReg(x_vreg), Operand::VReg(offset_vreg)],
+        );
+        op_fma.cycle = 12;
+
+        // Defs for addr, idx, x, a, b at cycle 0 so they don't overlap with value/offset
+        let mut ops = vec![
+            SsaOp::new(10, Engine::Load, Opcode::Const, Some(addr_vreg), vec![]),
+            SsaOp::new(11, Engine::Valu, Opcode::Xor, Some(idx_vreg), vec![]),
+            SsaOp::new(12, Engine::Valu, Opcode::Xor, Some(x_vreg), vec![]),
+            SsaOp::new(13, Engine::Load, Opcode::Const, Some(a_vreg), vec![]),
+            SsaOp::new(14, Engine::Load, Opcode::Const, Some(b_vreg), vec![]),
+        ];
+        for op in &mut ops {
+            op.cycle = 0;
+        }
+        ops.push(op_offset);
+        ops.push(op_value);
+        ops.push(op_vstore);
+        ops.push(op_fma);
+
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&ops, &config);
+
+        assert!(!result.budget_exceeded);
+        assert_ne!(
+            result.vreg_to_addr[&value_vreg],
+            result.vreg_to_addr[&offset_vreg],
+            "value (vstore at T+1) and offset (multiply_add at T+2) must get different addresses"
+        );
     }
 
     #[test]

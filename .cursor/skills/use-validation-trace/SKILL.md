@@ -132,7 +132,37 @@ uv run python scripts/inspect_cycle_addr.py sched_4r8b_d3.json --cycle 785 --add
 uv run python scripts/inspect_vreg_at_addr.py scheduler_output.json --addr 10 --vregs
 ```
 
+**Script:** `scripts/inspect_vreg_definer.py` — Given a VReg id, prints the **defining op** (the op that writes to that VReg’s scratch address) and, if present, interval/metadata from the `vregs` array. Use to confirm the value at an address comes from the expected SSA op (e.g. depth-3 tree-select).
+
+```bash
+uv run python scripts/inspect_vreg_definer.py sched_4r8b_d3.json --vreg 213
+uv run python scripts/inspect_vreg_definer.py scheduler_output.json --vreg 213 --width vector
+```
+
 Use these when you know the **cycle and address** from the trace (e.g. “vstore at 786 from scratch 19”) and want to see which SSA op reads that address and which VRegs share it with their intervals.
+
+---
+
+## 6. Depth-3 wrong value: tree selection vs hash vs branch
+
+**Script:** `scripts/compare_depth3_tree_value.py`
+
+For **depth-3** configs (e.g. 4r/8b) where the kernel produces a wrong value, compares the wrong value to reference **node_val**, **val_after_xor**, and **hashed_val** for the depth-3 round. Tells you whether the bug is likely (A) wrong tree selection (got value matches another lane's node_val), (B) wrong XOR, or (C) wrong hash/branch.
+
+### Usage
+
+```bash
+uv run python scripts/compare_depth3_tree_value.py --kernel kernel_to_validate.json --rounds 4 --batch-size 8
+uv run python scripts/compare_depth3_tree_value.py --rounds 4 --batch-size 8 --group 0
+```
+
+### Output
+
+- **Reference** for the depth-3 round (round 3 for 4 rounds): node_val, val_after_xor, hashed_val per batch index (optionally for one group only with `--group`).
+- **Final got vs ref** and list of mismatching batch indices.
+- **Wrong value analysis**: for each wrong value store, whether got matches ref node_val (same or other lane), val_after_xor, or hashed_val — to distinguish tree selection mix-up vs hash/branch bug.
+
+Use when debugging the "depth-3 (4r/8b): all 8 lanes wrong" failure to isolate tree-reduce selection vs hash vs branch.
 
 ---
 
@@ -142,8 +172,10 @@ Use these when you know the **cycle and address** from the trace (e.g. “vstore
 |------|--------|-------------|
 | Which batch indices / groups are wrong? | debug_validation_trace.py | After validation fails; use same rounds/batch-size as build. |
 | Which cycle and instruction wrote a wrong value? | trace_group20.py | After debug_validation_trace; pick an affected group with `--group`. |
+| Depth-3: tree selection vs hash vs branch? | compare_depth3_tree_value.py | 4r/8b wrong value; compare got to ref node_val/val_after_xor/hashed_val. |
 | How does a scratch address change over time? | trace_scratch_addresses.py | When debugging scratch/register usage. |
 | What instructions run at cycle C? | dump_cycle_instrs.py | After trace_group20 gives you a cycle number. |
 | Ops at cycle C reading addr A / VRegs at addr? | inspect_cycle_addr.py, inspect_vreg_at_addr.py | Schedule JSON; debugging scratch reuse / vstore value interval. |
+| Which SSA op defines VReg X? | inspect_vreg_definer.py | Schedule JSON; confirm producer of value at an address (e.g. VReg 213). |
 
 **No kernel to trace?** If the failing config makes CP-SAT **infeasible**, no kernel file is produced. Use `scripts/bisect_cpsat_validation.py` or `scripts/bisect_minimal_fma.py` (see use-bisection-tools skill) to find which options or minimal config fail; trace scripts need a **saved kernel that runs but produces wrong output**.
