@@ -52,6 +52,27 @@
 //!
 //! Vector VRegs occupy 8 contiguous words (VLEN=8). Unlike some architectures,
 //! vectors do NOT require alignment - they can start at any address.
+//!
+//! ## Liveness special cases (effective write/read cycles)
+//!
+//! The general rule is: **interval = [first_write_cycle, last_read_cycle]** where write/read
+//! cycles are the actual machine cycles. Some ops have effective writes or reads at cycles
+//! that differ from `op.cycle` or from `op.srcs`; those are handled explicitly below. Each
+//! special case is justified by "effective write/read at cycle X" that isn't obvious from
+//! the SSA graph alone.
+//!
+//! | Scenario | Where | Effective behavior | Reason |
+//! |----------|-------|--------------------|--------|
+//! | **SelectChoice FMA** | First pass | Dest: `def_cycle = op.cycle + 1`; sub_temp: `[op.cycle, op.cycle+1]` | FMA writes at cycle+1; sub is read by FMA at cycle+1. Not in srcs as a normal consumer. |
+//! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles)` | One SSA op expands to 8 ALU ops at (possibly) 8 cycles; block in use from first to last write. |
+//! | **SelectChoice FMA reads** | Second pass | Extend cond, false_val, delta to `op.cycle + 1` | FMA reads these at cycle+1; those reads are not in srcs with cycle+1. |
+//! | **AluDerive** | Separate pass | Extend left/right producer's interval to derive op's cycle | ConstChoice AluDerive has no VReg srcs; the actual reads are implicit at the derive op's cycle. |
+//! | **Dead VRegs** | Third pass | Extend `[def, def]` to `[def, def+1]` | Prevents same-cycle write conflict (see types.rs). |
+//! | **Vector group** | Separate pass | Synthesize group interval from lane intervals and consumer reads; remove lane VRegs | Structural: lanes share one block; not a single "op" in the usual sense. |
+//!
+//! Vstore value: The value (srcs[1]) is read at the vstore's cycle C. So "last read" = C is
+//! correct; no extra extension is applied. Offset–FMA ordering is enforced by the scheduler
+//! (multiply_add must run after its offset producer), not by extending the value's interval.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -122,6 +143,110 @@ impl Default for AddressAssignConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Liveness traits: effective write/read cycles per op (see plan "Generalize address-assign liveness")
+// ---------------------------------------------------------------------------
+
+/// Context passed to liveness behavior; used to resolve effective def/use cycles.
+pub struct LivenessContext<'a> {
+    pub select_fma_ops: Option<&'a HashSet<usize>>,
+    pub shifted_alu_cycles: Option<&'a std::collections::HashMap<usize, Vec<i32>>>,
+    pub const_alu_derive_ops: Option<&'a HashMap<usize, (usize, usize, Opcode)>>,
+    pub ops: &'a [SsaOp],
+}
+
+/// When does this op write its dest (and any aux VRegs like sub_temp)?
+pub trait LivenessDef {
+    /// (first_write_cycle, last_write_cycle) for the op's dest, if any.
+    fn dest_write_interval(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Option<(i32, i32)>;
+    /// Auxiliary defs (e.g. sub_temp for SelectChoice FMA): (VReg, start, end).
+    fn aux_defs(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32, i32)>;
+}
+
+/// At which cycles does this op read each VReg (including implicit reads)?
+pub trait LivenessUse {
+    /// (VReg, read_cycle) for each use.
+    fn use_cycles(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32)>;
+}
+
+/// Dispatcher: implements LivenessDef and LivenessUse by branching on opcode and context.
+pub struct OpLiveness<'a> {
+    pub op: &'a SsaOp,
+    pub ctx: &'a LivenessContext<'a>,
+}
+
+impl LivenessDef for OpLiveness<'_> {
+    fn dest_write_interval(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Option<(i32, i32)> {
+        op.dest?; // only called when dest is some; return type allows None for consistency
+        // SelectChoice FMA (no delta): FMA writes at cycle+1
+        let (first, last) = if op.opcode == Opcode::SelectChoice
+            && ctx.select_fma_ops.map_or(false, |s| s.contains(&op.id))
+            && op.sub_temp_vreg.is_some()
+        {
+            (op.cycle + 1, op.cycle + 1)
+        } else if let Some(cycles) = ctx
+            .shifted_alu_cycles
+            .and_then(|m| m.get(&op.id))
+            .filter(|c| c.len() == VLEN)
+        {
+            let min_c = *cycles.iter().min().unwrap_or(&op.cycle);
+            let max_c = *cycles.iter().max().unwrap_or(&op.cycle);
+            (min_c, max_c)
+        } else {
+            (op.cycle, op.cycle)
+        };
+        Some((first, last))
+    }
+
+    fn aux_defs(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32, i32)> {
+        let mut out = Vec::new();
+        if let Some(sub_temp) = op.sub_temp_vreg {
+            if op.opcode == Opcode::SelectChoice
+                && ctx.select_fma_ops.map_or(false, |s| s.contains(&op.id))
+            {
+                out.push((sub_temp, op.cycle, op.cycle + 1));
+            }
+        }
+        out
+    }
+}
+
+impl LivenessUse for OpLiveness<'_> {
+    fn use_cycles(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32)> {
+        let mut out = Vec::new();
+        // SelectChoice FMA: cond, false_val, delta (and sub_temp) read at cycle+1; skip true_val (index 1)
+        if op.opcode == Opcode::SelectChoice
+            && ctx.select_fma_ops.map_or(false, |s| s.contains(&op.id))
+            && op.srcs.len() >= 3
+        {
+            let read_at = op.cycle + 1;
+            for (i, src) in op.srcs.iter().enumerate() {
+                if i != 1 {
+                    if let Operand::VReg(v) = src {
+                        out.push((*v, read_at));
+                    }
+                }
+            }
+            if let Some(delta_vreg) = op.delta_vreg {
+                out.push((delta_vreg, read_at));
+            }
+            if let Some(sub_temp) = op.sub_temp_vreg {
+                out.push((sub_temp, read_at));
+            }
+            return out;
+        }
+        // Default: each src VReg read at op.cycle
+        for src in &op.srcs {
+            if let Operand::VReg(v) = src {
+                out.push((*v, op.cycle));
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Compute live intervals for all VRegs based on scheduled cycles.
 ///
 /// Uses **CLOSED intervals** [start, end] as documented in `types.rs`.
@@ -165,53 +290,28 @@ pub fn compute_live_intervals(
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
-    // First pass: record definition cycles.
-    // Initialize with [def, def] — will be extended if read.
-    for op in ops {
-        if let Some(dest) = op.dest {
-            // SelectChoice FMA (no delta): FMA writes at cycle+1 → reserve dest address from cycle+1
-            let def_cycle = if op.opcode == Opcode::SelectChoice
-                && select_fma_ops.map_or(false, |s| s.contains(&op.id))
-                && op.sub_temp_vreg.is_some()
-            {
-                op.cycle + 1
-            } else if let Some(cycles) =
-                shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
-            {
-                // Shifted VALU: 8 ALU ops write at different cycles; block in use from first to last write
-                // We must not free the address until after the last lane write, or another op could
-                // be assigned the same range and we get same-cycle scratch write conflict.
-                *cycles.iter().min().unwrap_or(&op.cycle)
-            } else {
-                op.cycle
-            };
-            // For shifted VALU dest, end must be at least max(alu_cycles) so we don't reuse before last write
-            let end_cycle = if let Some(cycles) =
-                shifted_alu_cycles.and_then(|m| m.get(&op.id)).filter(|c| c.len() == VLEN)
-            {
-                *cycles.iter().max().unwrap_or(&def_cycle)
-            } else {
-                def_cycle
-            };
-            intervals.insert(dest, LiveInterval::new(def_cycle, end_cycle));
-        }
+    let ctx = LivenessContext {
+        select_fma_ops,
+        shifted_alu_cycles,
+        const_alu_derive_ops,
+        ops,
+    };
 
-        // Handle sub_temp_vreg for SelectChoice ops that chose the FMA path.
-        // The sub_temp is defined at the SelectChoice's cycle and read at cycle + 1 (by FMA).
-        // Only create the interval when FMA is actually chosen; if vselect is used,
-        // sub_temp_vreg is never written/read and should not count toward liveness.
-        if let Some(sub_temp) = op.sub_temp_vreg {
-            if select_fma_ops.map_or(false, |s| s.contains(&op.id)) {
-                // Interval: [cycle, cycle+1] - defined at cycle, read at cycle+1
-                intervals.insert(sub_temp, LiveInterval::new(op.cycle, op.cycle + 1));
+    // First pass: record definition cycles (LivenessDef).
+    for op in ops {
+        let op_liv = OpLiveness { op, ctx: &ctx };
+        if let Some(dest) = op.dest {
+            if let Some((first, last)) = op_liv.dest_write_interval(op, &ctx) {
+                intervals.insert(dest, LiveInterval::new(first, last));
             }
+        }
+        for (vreg, s, e) in op_liv.aux_defs(op, &ctx) {
+            intervals.insert(vreg, LiveInterval::new(s, e));
         }
     }
 
-    // Second pass: extend end to last READ cycle.
-    // CLOSED interval: end = last_read_cycle (not last_read + 1).
+    // Second pass: extend end to last READ cycle (LivenessUse).
     for op in ops {
-        // Debug: log vstore reads
         if debug && op.opcode == Opcode::Vstore {
             eprintln!(
                 "[DEBUG compute_live_intervals] vstore op id={} cycle={} srcs={:?}",
@@ -219,78 +319,38 @@ pub fn compute_live_intervals(
             );
         }
 
-        for src in &op.srcs {
-            if let Operand::VReg(vreg) = src {
-                if let Some(interval) = intervals.get_mut(vreg) {
-                    let old_end = interval.end;
-                    // Closed interval: end is the read cycle itself
-                    if op.cycle > interval.end {
-                        interval.end = op.cycle;
-                    }
-                    // Precedence violation: consumer (e.g. vstore) scheduled before producer.
-                    // interval.start = producer cycle, interval.end = this op's cycle; end < start is invalid.
-                    if interval.end < interval.start {
-                        let producer_op_id = vreg_def.and_then(|def| def.get(vreg).copied());
-                        eprintln!(
-                            "PRECEDENCE VIOLATION (interval end < start): op id={} opcode={:?} cycle={} \
-                             reads value VReg {:?} whose interval is [{}, {}] (start=producer cycle). \
-                             Producer op id: {:?}. Schedule has consumer before producer.",
-                            op.id, op.opcode, op.cycle, vreg, interval.start, interval.end, producer_op_id
-                        );
-                        panic!(
-                            "BUG: Schedule has op {} (consumer, cycle {}) before producer of {:?} (interval start {}). \
-                             Fix the scheduler so cycle[consumer] >= cycle[producer] + 1.",
-                            op.id, op.cycle, vreg, interval.start
-                        );
-                    }
-                    // Debug: log interval extension for vstore sources
-                    if debug && op.opcode == Opcode::Vstore && interval.end > old_end {
-                        eprintln!(
-                            "  Extended {:?} interval from [{}, {}] to [{}, {}] (read by vstore)",
-                            vreg, interval.start, old_end, interval.start, interval.end
-                        );
-                    }
-                } else if debug && op.opcode == Opcode::Vstore {
-                    // VReg not in intervals - this is a bug!
+        let op_liv = OpLiveness { op, ctx: &ctx };
+        for (vreg, read_cycle) in op_liv.use_cycles(op, &ctx) {
+            if let Some(interval) = intervals.get_mut(&vreg) {
+                let old_end = interval.end;
+                if read_cycle > interval.end {
+                    interval.end = read_cycle;
+                }
+                if interval.end < interval.start {
+                    let producer_op_id = vreg_def.and_then(|def| def.get(&vreg).copied());
                     eprintln!(
-                        "  WARNING: VReg {:?} read by vstore but not in intervals!",
-                        vreg
+                        "PRECEDENCE VIOLATION (interval end < start): op id={} opcode={:?} cycle={} \
+                         reads value VReg {:?} whose interval is [{}, {}] (start=producer cycle). \
+                         Producer op id: {:?}. Schedule has consumer before producer.",
+                        op.id, op.opcode, op.cycle, vreg, interval.start, interval.end, producer_op_id
+                    );
+                    panic!(
+                        "BUG: Schedule has op {} (consumer, cycle {}) before producer of {:?} (interval start {}). \
+                         Fix the scheduler so cycle[consumer] >= cycle[producer] + 1.",
+                        op.id, op.cycle, vreg, interval.start
                     );
                 }
-            }
-        }
-
-        // SelectChoice FMA (both delta and sub+fma paths): FMA reads cond, delta (if delta path), and false_val at cycle+1.
-        // For delta path: single FMA at cycle+1 reads cond, delta, false_val.
-        // For sub+fma path: sub at cycle, FMA at cycle+1 reads cond, sub_temp, false_val.
-        // In both cases, cond and false_val are read at cycle+1, so their intervals must extend
-        // to cycle+1 or the allocator may reuse those addresses and corrupt the FMA result.
-        // For delta path, delta is also read at cycle+1, so its interval must extend to cycle+1.
-        if op.opcode == Opcode::SelectChoice
-            && select_fma_ops.map_or(false, |s| s.contains(&op.id))
-            && op.srcs.len() >= 3
-        {
-            let read_at_cycle_plus_one = op.cycle + 1;
-            for (i, src) in op.srcs.iter().enumerate() {
-                // cond = srcs[0], false_val = srcs[2] are read again by FMA at cycle+1
-                // (true_val = srcs[1] is only used by sub in sub+fma path, not by FMA)
-                if i != 1 {
-                    if let Operand::VReg(vreg) = src {
-                        if let Some(interval) = intervals.get_mut(vreg) {
-                            if read_at_cycle_plus_one > interval.end {
-                                interval.end = read_at_cycle_plus_one;
-                            }
-                        }
-                    }
+                if debug && op.opcode == Opcode::Vstore && interval.end > old_end {
+                    eprintln!(
+                        "  Extended {:?} interval from [{}, {}] to [{}, {}] (read by vstore)",
+                        vreg, interval.start, old_end, interval.start, interval.end
+                    );
                 }
-            }
-            // For delta path: delta_vreg is also read by FMA at cycle+1
-            if let Some(delta_vreg) = op.delta_vreg {
-                if let Some(interval) = intervals.get_mut(&delta_vreg) {
-                    if read_at_cycle_plus_one > interval.end {
-                        interval.end = read_at_cycle_plus_one;
-                    }
-                }
+            } else if debug && op.opcode == Opcode::Vstore {
+                eprintln!(
+                    "  WARNING: VReg {:?} read by vstore but not in intervals!",
+                    vreg
+                );
             }
         }
     }
