@@ -1532,17 +1532,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(
-            &emit.ops,
-            config.zero_vreg,
-            &config.select_fma_ops,
-            &config.shifted_alu_cycles,
-            &config.const_alu_derive_ops,
-            &config.vector_group_lanes,
-            &config.vreg_def,
-            &config.cse_consumer_op_ids,
-            &config.cse_shared_sub_temp_intervals,
-        );
+        let intervals = compute_live_intervals(&config, &emit.ops);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1695,17 +1685,7 @@ mod ssa_tests {
         let assign_result = assign_addresses(&emit.ops, &config);
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(
-            &emit.ops,
-            config.zero_vreg,
-            &config.select_fma_ops,
-            &config.shifted_alu_cycles,
-            &config.const_alu_derive_ops,
-            &config.vector_group_lanes,
-            &config.vreg_def,
-            &config.cse_consumer_op_ids,
-            &config.cse_shared_sub_temp_intervals,
-        );
+        let intervals = compute_live_intervals(&config, &emit.ops);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1776,17 +1756,7 @@ mod ssa_tests {
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = cpsat_result.select_fma_ops.clone();
         let assign_result = assign_addresses(&emit.ops, &config);
-        let intervals = compute_live_intervals(
-            &emit.ops,
-            config.zero_vreg,
-            &config.select_fma_ops,
-            &config.shifted_alu_cycles,
-            &config.const_alu_derive_ops,
-            &config.vector_group_lanes,
-            &config.vreg_def,
-            &config.cse_consumer_op_ids,
-            &config.cse_shared_sub_temp_intervals,
-        );
+        let intervals = compute_live_intervals(&config, &emit.ops);
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -4766,8 +4736,8 @@ mod tests {
             ),
         ];
 
-        // Set sub_temp_vreg for SelectChoice (no-delta path, uses FMA)
-        ops[3].sub_temp_vreg = Some(VReg::scalar(99));
+        // Set sub_temp_vreg for SelectChoice (no-delta path, uses FMA). Vector = 8 words (matches real FMA sub_temp).
+        ops[3].sub_temp_vreg = Some(VReg::vector(99));
 
         // Schedule with CP-SAT, forcing FMA path, with tight budget
         // Budget must accommodate: cond (1), false_val (1), true_val (1), result (1), sub_temp (8) = 12 words peak
@@ -4811,7 +4781,7 @@ mod tests {
         }
 
         let config = AddressAssignConfig {
-            budget: 4,
+            budget: 12, // Match CP-SAT scratch_budget: sub_temp (8) + cond + false_val + true_val + result
             start_addr: 1,
             select_fma_ops: r.select_fma_ops.clone(),
             const_alu_derive_ops: r.const_alu_derive_ops.clone(),
@@ -4820,17 +4790,7 @@ mod tests {
         let assign_result = assign_addresses(&scheduled_ops, &config);
 
         // Verify live intervals: cond and false_val should extend to cycle+1 (where FMA reads them)
-        let intervals = compute_live_intervals(
-            &scheduled_ops,
-            config.zero_vreg,
-            &config.select_fma_ops,
-            &config.shifted_alu_cycles,
-            &config.const_alu_derive_ops,
-            &config.vector_group_lanes,
-            &config.vreg_def,
-            &config.cse_consumer_op_ids,
-            &config.cse_shared_sub_temp_intervals,
-        );
+        let intervals = compute_live_intervals(&config, &scheduled_ops);
         let select_cycle = scheduled_ops[3].cycle;
         let cond_interval = intervals.get(&VReg::scalar(0)).unwrap();
         let false_val_interval = intervals.get(&VReg::scalar(2)).unwrap();
@@ -4847,8 +4807,8 @@ mod tests {
 
         // Address assignment should fit within budget (CP-SAT constraint should match)
         assert!(
-            assign_result.peak_live <= 4,
-            "Address assignment peak_live={} should fit in budget=4 (CP-SAT constraint should match)",
+            assign_result.peak_live <= 12,
+            "Address assignment peak_live={} should fit in budget=12 (CP-SAT constraint should match)",
             assign_result.peak_live
         );
     }
