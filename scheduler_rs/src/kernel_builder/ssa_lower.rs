@@ -117,10 +117,9 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                 if !res.sub_active {
                     continue;
                 }
-                let sub_temp_addr = match ctx.vreg_to_addr.get(&group.sub_temp_vreg) {
-                    Some(&a) => a,
-                    None => continue,
-                };
+                let sub_temp_addr = *ctx.vreg_to_addr
+                    .get(&group.sub_temp_vreg)
+                    .expect("CSE group sub_temp_vreg VReg not in mapping");
                 let true_val_addr = *ctx.vreg_to_addr
                     .get(&group.true_val)
                     .expect("CSE group true_val VReg not in mapping");
@@ -640,6 +639,7 @@ pub fn expand_ssa_valu_to_alu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpsat_scheduler::{CseGroup, CseGroupResult};
     use crate::types::{Opcode, Operand};
 
     fn make_const_choice_op(id: usize, value: i64, dest: VReg, cycle: i32) -> SsaOp {
@@ -708,8 +708,8 @@ mod tests {
         vreg_to_addr.insert(v2, 20);
         vreg_to_addr.insert(v3, 30);
 
-        let mut op1 = make_const_choice_op(1, 1, v1, 0);
-        let mut op2 = make_const_choice_op(2, 2, v2, 0);
+        let op1 = make_const_choice_op(1, 1, v1, 0);
+        let op2 = make_const_choice_op(2, 2, v2, 0);
         let mut op3 = SsaOp::new(
             3,
             Engine::Load,
@@ -1135,5 +1135,230 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // SelectChoice CSE group lowering tests
+    // -------------------------------------------------------------------------
+
+    /// With non-None cse_groups and cse_group_results, shared SUBs are emitted for
+    /// active CSE groups (one SUB per active group), and FMA consumers in that group
+    /// do not emit their own SUB.
+    #[test]
+    fn test_lower_selectchoice_cse_shared_sub_emitted() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest = VReg::vector(100);
+        let sub_temp_cse = VReg::vector(201); // CSE group's shared sub_temp
+
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest, 400);
+        vreg_to_addr.insert(sub_temp_cse, 500);
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op.dest = Some(dest);
+        op.sub_temp_vreg = Some(VReg::vector(101)); // per-op temp (ignored when CSE active)
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42);
+
+        let cse_groups: Vec<CseGroup> = vec![CseGroup {
+            true_val,
+            false_val,
+            consumer_indices: vec![0],
+            producer_true_idx: None,
+            producer_false_idx: None,
+            complex_phi: true,
+            sub_temp_vreg: sub_temp_cse,
+        }];
+        let cse_group_results: Vec<CseGroupResult> = vec![CseGroupResult {
+            sub_active: true,
+            sub_cycle: 5,
+        }];
+
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: Some(&cse_groups),
+            cse_group_results: Some(&cse_group_results),
+        });
+
+        // One shared SUB + one FMA (no per-op SUB)
+        assert_eq!(result.len(), 2, "CSE path: 1 shared SUB + 1 FMA");
+        let sub_op = &result[0];
+        let fma_op = &result[1];
+        assert_eq!(sub_op.slot[0], SlotVal::Str("-".to_string()));
+        assert_eq!(sub_op.engine, Engine::Valu);
+        assert_eq!(sub_op.slot[1], SlotVal::Int(500)); // sub_temp_cse addr
+        assert_eq!(fma_op.slot[0], SlotVal::Str("multiply_add".to_string()));
+    }
+
+    /// FMA consumer in a CSE group must use the shared SUB address in its reads
+    /// (sub_temp), not a per-op temp.
+    #[test]
+    fn test_lower_selectchoice_cse_fma_uses_shared_sub_address() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest = VReg::vector(100);
+        let shared_sub_addr = 500i64;
+        let sub_temp_cse = VReg::vector(201);
+
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest, 400);
+        vreg_to_addr.insert(sub_temp_cse, shared_sub_addr);
+
+        let mut op = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op.dest = Some(dest);
+        op.sub_temp_vreg = Some(VReg::vector(101));
+
+        let ssa_ops = vec![op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42);
+
+        let cse_groups: Vec<CseGroup> = vec![CseGroup {
+            true_val,
+            false_val,
+            consumer_indices: vec![0],
+            producer_true_idx: None,
+            producer_false_idx: None,
+            complex_phi: true,
+            sub_temp_vreg: sub_temp_cse,
+        }];
+        let cse_group_results: Vec<CseGroupResult> = vec![CseGroupResult {
+            sub_active: true,
+            sub_cycle: 5,
+        }];
+
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: Some(&cse_groups),
+            cse_group_results: Some(&cse_group_results),
+        });
+
+        let fma_op = &result[1];
+        // FMA reads: cond, sub_temp, false_val (vector lanes)
+        assert!(
+            fma_op.reads.contains(&shared_sub_addr),
+            "FMA must read from shared SUB address {}",
+            shared_sub_addr
+        );
+        // Slot operands: multiply_add, dest, cond, sub_temp, false_val
+        assert_eq!(fma_op.slot[3], SlotVal::Int(shared_sub_addr));
+    }
+
+    /// Mismatched cse_groups vs cse_group_results lengths: lowering skips CSE mapping,
+    /// logs a diagnostic, and each FMA consumer gets its own SUB (no shared SUBs).
+    #[test]
+    fn test_lower_selectchoice_cse_mismatched_lengths_fallback() {
+        let mut vreg_to_addr = HashMap::new();
+        let cond = VReg::vector(1);
+        let true_val = VReg::vector(2);
+        let false_val = VReg::vector(3);
+        let dest1 = VReg::vector(100);
+        let dest2 = VReg::vector(101);
+        let sub_temp1 = VReg::vector(102);
+        let sub_temp2 = VReg::vector(103);
+
+        vreg_to_addr.insert(cond, 100);
+        vreg_to_addr.insert(true_val, 200);
+        vreg_to_addr.insert(false_val, 300);
+        vreg_to_addr.insert(dest1, 400);
+        vreg_to_addr.insert(dest2, 401);
+        vreg_to_addr.insert(sub_temp1, 500);
+        vreg_to_addr.insert(sub_temp2, 501);
+
+        let mut op1 = make_select_choice_op(42, cond, true_val, false_val, None, 10);
+        op1.dest = Some(dest1);
+        op1.sub_temp_vreg = Some(sub_temp1);
+        let mut op2 = make_select_choice_op(43, cond, true_val, false_val, None, 10);
+        op2.dest = Some(dest2);
+        op2.sub_temp_vreg = Some(sub_temp2);
+
+        let ssa_ops = vec![op1, op2];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
+        select_fma_ops.insert(42);
+        select_fma_ops.insert(43);
+
+        // Mismatch: one group, two results
+        let cse_groups: Vec<CseGroup> = vec![CseGroup {
+            true_val,
+            false_val,
+            consumer_indices: vec![0, 1],
+            producer_true_idx: None,
+            producer_false_idx: None,
+            complex_phi: true,
+            sub_temp_vreg: VReg::vector(200),
+        }];
+        let cse_group_results: Vec<CseGroupResult> = vec![
+            CseGroupResult {
+                sub_active: true,
+                sub_cycle: 5,
+            },
+            CseGroupResult {
+                sub_active: true,
+                sub_cycle: 6,
+            },
+        ];
+
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &select_fma_ops,
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: Some(&cse_groups),
+            cse_group_results: Some(&cse_group_results),
+        });
+
+        // CSE mapping skipped -> each consumer emits SUB + FMA -> 4 ops
+        assert_eq!(
+            result.len(),
+            4,
+            "Mismatched lengths: CSE skipped, expect 2 SUBs + 2 FMAs"
+        );
+        let sub_count = result
+            .iter()
+            .filter(|o| o.slot.get(0) == Some(&SlotVal::Str("-".to_string())))
+            .count();
+        let fma_count = result
+            .iter()
+            .filter(|o| o.slot.get(0) == Some(&SlotVal::Str("multiply_add".to_string())))
+            .count();
+        assert_eq!(sub_count, 2, "Each FMA consumer gets its own SUB when CSE skipped");
+        assert_eq!(fma_count, 2);
     }
 }
