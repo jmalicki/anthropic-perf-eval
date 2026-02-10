@@ -15,7 +15,9 @@ use crate::types::{MachineConfig, Opcode};
 use super::super::config::CompilerConfig;
 
 #[cfg(feature = "cpsat")]
-use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, SsaCpsatConfig, ValuShiftMode};
+use crate::cpsat_scheduler::{
+    ConstChoiceMode, OptionalConstraintGroup, SelectChoiceMode, SsaCpsatConfig, ValuShiftMode,
+};
 
 // ============================================================================
 // Scheduling Bounds (CP-SAT domain hints)
@@ -121,6 +123,8 @@ pub struct CpSatPipelineConfig {
     pub enable_asap_alap_tightening: bool,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
+    /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
+    pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
 }
 
 #[cfg(feature = "cpsat")]
@@ -138,6 +142,7 @@ impl Default for CpSatPipelineConfig {
             force_zero_gap: false,
             enable_asap_alap_tightening: false,
             enable_scratch_tightening: false,
+            disable_optional_constraint_groups: HashSet::new(),
         }
     }
 }
@@ -161,6 +166,7 @@ impl CpSatPipelineConfig {
             force_zero_gap: self.force_zero_gap,
             enable_asap_alap_tightening: self.enable_asap_alap_tightening,
             enable_scratch_tightening: self.enable_scratch_tightening,
+            disable_optional_constraint_groups: self.disable_optional_constraint_groups.clone(),
             ..Default::default()
         }
     }

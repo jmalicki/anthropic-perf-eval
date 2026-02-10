@@ -72,6 +72,7 @@ pub fn schedule_ssa_cpsat(
         enable_asap_alap_tightening,
         enable_scratch_tightening,
         debug_fix_precedence_bounds,
+        ref disable_optional_constraint_groups,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -318,6 +319,39 @@ pub fn schedule_ssa_cpsat(
         }
         final_asap = fixed_asap;
         final_alap = fixed_alap;
+    }
+
+    // 2c. Guarantee greedy hint feasibility: widen final domains to include greedy values.
+    // The greedy schedule is a proven feasible solution (satisfies precedence, slot capacity,
+    // scratch budget). If domain tightening excluded any greedy values, the tightening was
+    // overly conservative. Widening ensures the hint is always within domain, so CP-SAT
+    // gets a feasible warm start instead of searching from scratch.
+    if let Some(hints) = greedy_hints {
+        let mut widened_count = 0usize;
+        for (idx, &hint_cycle) in hints.iter().enumerate() {
+            if idx >= ops.len() || hint_cycle < 0 {
+                continue;
+            }
+            let op_id = ops[idx].id;
+            if let Some(a) = final_asap.get_mut(&op_id) {
+                if hint_cycle < *a {
+                    *a = hint_cycle;
+                    widened_count += 1;
+                }
+            }
+            if let Some(a) = final_alap.get_mut(&op_id) {
+                if hint_cycle > *a {
+                    *a = hint_cycle;
+                    widened_count += 1;
+                }
+            }
+        }
+        if verbose && widened_count > 0 {
+            eprintln!(
+                "  Greedy hint domain widening: {} bound(s) widened to include greedy values",
+                widened_count
+            );
+        }
     }
 
     // 3. Build the CP model
@@ -2168,15 +2202,18 @@ pub fn schedule_ssa_cpsat(
     // bounds for one extreme (all shift / no shift) and would over-constrain when the solver picks a different choice
     // (e.g. shift 163 only → ALU need 121 cycles, but "all shift" bound would force makespan >= 609).
     // Load and store bounds are valid global mins (min over const_choice for load; store is fixed).
-    if load_bound > 0 {
-        let load_lb = model.new_int_var([(load_bound, load_bound)]);
-        let c = model.add_ge(makespan, LinearExpr::from(load_lb));
-        model.set_constraint_name(c, "makespan_ge_load_lb");
-    }
-    if store_bound > 0 {
-        let store_lb = model.new_int_var([(store_bound, store_bound)]);
-        let c = model.add_ge(makespan, LinearExpr::from(store_lb));
-        model.set_constraint_name(c, "makespan_ge_store_lb");
+    // Optional group RedundantLinearBounds: helps propagation but not required (cumulatives + domain suffice).
+    if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::RedundantLinearBounds) {
+        if load_bound > 0 {
+            let load_lb = model.new_int_var([(load_bound, load_bound)]);
+            let c = model.add_ge(makespan, LinearExpr::from(load_lb));
+            model.set_constraint_name(c, "makespan_ge_load_lb");
+        }
+        if store_bound > 0 {
+            let store_lb = model.new_int_var([(store_bound, store_bound)]);
+            let c = model.add_ge(makespan, LinearExpr::from(store_lb));
+            model.set_constraint_name(c, "makespan_ge_store_lb");
+        }
     }
 
     // Direct capacity constraints: link makespan to choice variables (x = shift, y = ConstChoice AddImm, z = SelectChoice FMA count)
@@ -2215,29 +2252,41 @@ pub fn schedule_ssa_cpsat(
         let z = sum_select_fma.unwrap_or_else(|| LinearExpr::from(zero_var));
         let y = sum_const_add_imm.unwrap_or_else(|| LinearExpr::from(zero_var));
 
+        // Direct capacity linear constraints: optional groups per engine (help propagation; cumulatives enforce the real limits).
         // VALU: each SelectChoice FMA = 2 VALU ops (sub + fma). So 6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)
-        if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
+        if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityValu)
+            && enable_valu_shift
+            && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0)
+        {
             let lhs = LinearExpr::from(makespan) * 6 + s.clone() - z.clone() * 2;
             let rhs = model.new_int_var([(valu_count, valu_count)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_valu");
         }
         // ALU: 12*makespan >= alu_count + 8*sum(shift)  =>  12*makespan - 8*s >= alu_count
-        if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
+        if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityAlu)
+            && enable_valu_shift
+            && (alu_count > 0 || shiftable_count > 0)
+        {
             let lhs = LinearExpr::from(makespan) * 12 - s.clone() * 8;
             let rhs = model.new_int_var([(alu_count, alu_count)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_alu");
         }
         // Flow: makespan >= flow_base + sum(const_add_imm) - sum(select_fma)  =>  makespan + z - y >= flow_base
-        if flow_base > 0 || const_choice_count > 0 || select_choice_count > 0 {
+        if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityFlow)
+            && (flow_base > 0 || const_choice_count > 0 || select_choice_count > 0)
+        {
             let lhs = LinearExpr::from(makespan) + z.clone() - y.clone();
             let rhs = model.new_int_var([(flow_base, flow_base)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_flow");
         }
         // Load: 2*makespan >= load_count - sum(const_add_imm)
-        if load_count > 0 && const_choice_count > 0 {
+        if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityLoad)
+            && load_count > 0
+            && const_choice_count > 0
+        {
             let lhs = LinearExpr::from(makespan) * 2 + y;
             let rhs = model.new_int_var([(load_count, load_count)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
@@ -2456,11 +2505,25 @@ pub fn schedule_ssa_cpsat(
     let hint_debug_ssa = std::env::var("CPSAT_HINT_DEBUG").is_ok();
     if let Some(hints) = greedy_hints {
         let mut skipped_cycle_hints = 0usize;
+        // When ForceLoad, greedy scheduled ConstChoice as add_imm; hinting those cycles would pack
+        // too many Load ops at the same cycle (Load capacity 2). Skip cycle hints for ConstChoice ops.
+        let skip_const_cycle_hints =
+            matches!(const_choice_mode, ConstChoiceMode::ForceLoad);
+        if skip_const_cycle_hints && verbose {
+            eprintln!(
+                "  Skipping cycle hints for {} ConstChoice ops (ForceLoad: greedy hint would violate Load capacity)",
+                const_choice_ops.len()
+            );
+        }
         for (idx, &hint_cycle) in hints.iter().enumerate() {
             if idx < cycle_vars.len() && hint_cycle >= 0 {
+                if skip_const_cycle_hints && const_choice_set.contains(&idx) {
+                    skipped_cycle_hints += 1;
+                    continue;
+                }
                 if idx < ops.len() {
-                    let lb = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-                    let ub = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) as i64;
+                    let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                    let ub = *final_alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) as i64;
                     let c = hint_cycle as i64;
                     if hint_debug_ssa {
                         eprintln!(
@@ -2468,10 +2531,9 @@ pub fn schedule_ssa_cpsat(
                             idx, ops[idx].id, c, lb, ub
                         );
                     }
-                    // Clamp hint to [ASAP, ALAP] domain. The greedy scheduler may not
-                    // know about precedence offsets (e.g. SelectChoice FMA offset=2),
-                    // so its hints can fall outside the tighter domains. Clamping is safe
-                    // because hints are just starting points for the solver.
+                    // Clamp hint to [final_asap, final_alap] domain. After domain widening (step 2c),
+                    // greedy hints should always be within domain. This clamping is defensive for any
+                    // future hint sources that might not come from greedy.
                     if c < lb || c > ub {
                         let clamped = c.max(lb).min(ub);
                         if verbose {
@@ -2544,16 +2606,25 @@ pub fn schedule_ssa_cpsat(
     // Hint completion_cycle and alu_cycle for shiftable ops so CP-SAT gets a full solution hint.
     // Greedy gives one cycle per op; we use that for completion_cycle and all 8 alu_cycles
     // (valid when shifted: all 8 ALU ops at same cycle -> completion_cycle = that cycle).
-    // By construction greedy never schedules before ASAP; if this fires, fix greedy or ASAP/ALAP.
+    // When ForceAlu, greedy scheduled these as VALU (one slot each); hinting all 8 ALU ops at
+    // the same cycle per op would exceed ALU capacity (12/cycle). Skip these hints so the solver
+    // can find a feasible assignment.
     if let Some(hints) = greedy_hints {
+        let skip_shifted_hints = matches!(valu_shift_mode, ValuShiftMode::ForceAlu);
+        if skip_shifted_hints && verbose {
+            eprintln!("  Skipping completion/alu_cycle hints for shiftable ops (ForceAlu: greedy hint would violate ALU capacity)");
+        }
         for &idx in &shiftable_valu {
+            if skip_shifted_hints {
+                continue;
+            }
             let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
             if hint_cycle < 0 {
                 continue;
             }
             let c = hint_cycle as i64;
-            let lb = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-            let ub = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+            let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+            let ub = *final_alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
             // Clamp to valid domain (same rationale as cycle hint clamping above)
             let clamped = c.max(lb).min(ub);
             if c != clamped && verbose {
@@ -2576,14 +2647,23 @@ pub fn schedule_ssa_cpsat(
     // Hint shiftable_chosen_cycle and select_chosen_cycle so "solution hint is complete" (no unhinted vars).
     // These tie-breaker vars are equal to the effective cycle (completion_cycle when shifted, cycle when not;
     // fma_last when FMA, cycle when vselect). Greedy gives one cycle per op -> use that for chosen.
+    // When ForceAlu, skip shiftable_chosen_cycle hints (same reason as completion/alu_cycle above).
     if let Some(hints) = greedy_hints {
+        let skip_shifted_chosen = matches!(valu_shift_mode, ValuShiftMode::ForceAlu);
         for &idx in &shiftable_valu {
+            if skip_shifted_chosen {
+                continue;
+            }
             let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
             if hint_cycle < 0 {
                 continue;
             }
             if let Some(&chosen) = shiftable_chosen_cycle.get(&idx) {
-                model.add_hint(chosen, hint_cycle as i64);
+                // Clamp to domain (defensive: after domain widening, greedy values should be in domain)
+                let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                let ub = *final_alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+                let clamped = (hint_cycle as i64).max(lb).min(ub);
+                model.add_hint(chosen, clamped);
             }
         }
         for &idx in &select_choice_ops {
@@ -2593,7 +2673,11 @@ pub fn schedule_ssa_cpsat(
             }
             if let Some(&chosen) = select_chosen_cycle.get(&idx) {
                 // vselect path: chosen = cycle; FMA path: chosen = fma_last (often cycle+1). Use hint_cycle as hint.
-                model.add_hint(chosen, hint_cycle as i64);
+                // Clamp to domain (defensive: after domain widening, greedy values should be in domain)
+                let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+                let ub = *final_alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
+                let clamped = (hint_cycle as i64).max(lb).min(ub);
+                model.add_hint(chosen, clamped);
             }
         }
         // Hint select_choice_fma_last_cycle for ALL SelectChoice ops (not just FMA path).

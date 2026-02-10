@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::types::{Engine, MachineConfig, Op, Opcode, PrecedenceOffset, SsaOp, VReg};
 
-use super::config::{ConstChoiceMode, CpsatResult, CpsatStatus, SelectChoiceMode, ValuShiftMode};
+use super::config::{
+    ConstChoiceMode, CpsatResult, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode,
+    ValuShiftMode,
+};
 
 // ============================================================================
 // Precedence Offset Diagnostics
@@ -289,6 +292,10 @@ pub struct SsaCpsatConfig {
     /// The fixpoint always runs after slot/scratch tightening to restore precedence consistency.
     /// This flag just controls whether to log the number of ASAP/ALAP changes.
     pub debug_fix_precedence_bounds: bool,
+    /// Optional constraint groups to disable for debugging. When a group is in this set, the
+    /// corresponding constraints are not added (they are redundant/helper constraints that help
+    /// propagation but are not required for correctness). Empty by default (all optional groups on).
+    pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
 }
 
 impl Default for SsaCpsatConfig {
@@ -309,6 +316,7 @@ impl Default for SsaCpsatConfig {
             enable_asap_alap_tightening: false, // Disabled by default: can create empty domains on toy configs. Enable via CLI for production.
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
+            disable_optional_constraint_groups: HashSet::new(),
         }
     }
 }

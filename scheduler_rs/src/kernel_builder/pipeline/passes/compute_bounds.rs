@@ -109,6 +109,14 @@ impl Pass for ComputeBoundsPass {
                 );
             current_asap = fixed_asap;
             current_alap = fixed_alap;
+            // Enforce non-empty domains: for each op, alap >= asap (avoids clamp(lb, ub) panic in greedy)
+            for op in &ctx.ops {
+                let a = *current_asap.get(&op.id).unwrap_or(&0);
+                let b = *current_alap.get(&op.id).unwrap_or(&i32::MAX);
+                if a > b {
+                    current_alap.insert(op.id, a);
+                }
+            }
         }
 
         let final_horizon = current_alap.values().copied().max().unwrap_or(0);

@@ -1036,13 +1036,11 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     }
                 }
 
-                let assigned_cycle = if let Some((asap, alap)) = bounds_usage.core_bounds() {
-                    let lb = *asap.get(&op_id).unwrap_or(&0);
-                    let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
-                    (cycle as i32).clamp(lb, ub)
-                } else {
-                    cycle as i32
-                };
+                // Record the cycle we actually placed in so slot counts match the hint.
+                // Clamping to [asap, alap] would record a different cycle and cause
+                // "Merged hint violates engine capacity" when multiple ops get clamped
+                // into the same cycle.
+                let assigned_cycle = cycle as i32;
                 ops[idx].cycle = assigned_cycle;
                 scheduled.insert(idx);
                 made_progress = true;
@@ -1173,13 +1171,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     }
                 }
 
-                let force_cycle = if let Some((asap, alap)) = bounds_usage.core_bounds() {
-                    let lb = *asap.get(&op_id).unwrap_or(&0);
-                    let ub = *alap.get(&op_id).unwrap_or(&i32::MAX);
-                    (cycle as i32).clamp(lb, ub)
-                } else {
-                    cycle as i32
-                };
+                // Record the cycle we actually placed in (same as normal path).
+                let force_cycle = cycle as i32;
                 ops[force_idx].cycle = force_cycle;
                 scheduled.insert(force_idx);
                 scheduled_this_cycle += 1;

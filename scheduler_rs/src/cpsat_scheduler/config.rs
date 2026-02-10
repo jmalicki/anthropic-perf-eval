@@ -90,6 +90,52 @@ impl FromStr for ValuShiftMode {
     }
 }
 
+/// Optional constraint group: redundant/helper constraints that can be disabled for debugging.
+/// Each variant corresponds to a named group in the CP-SAT model (see model.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionalConstraintGroup {
+    /// makespan_ge_load_lb, makespan_ge_store_lb (redundant with domain + cumulatives).
+    RedundantLinearBounds,
+    /// Linear constraint: 6*makespan >= valu_count - shift + 2*select_fma.
+    CapacityValu,
+    /// Linear constraint: 12*makespan - 8*shift >= alu_count.
+    CapacityAlu,
+    /// Linear constraint: makespan + z - y >= flow_base.
+    CapacityFlow,
+    /// Linear constraint: 2*makespan + y >= load_count.
+    CapacityLoad,
+}
+
+impl FromStr for OptionalConstraintGroup {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "redundant_linear_bounds" => Ok(Self::RedundantLinearBounds),
+            "capacity_valu" => Ok(Self::CapacityValu),
+            "capacity_alu" => Ok(Self::CapacityAlu),
+            "capacity_flow" => Ok(Self::CapacityFlow),
+            "capacity_load" => Ok(Self::CapacityLoad),
+            _ => Err(format!(
+                "invalid optional constraint group '{}', expected: redundant_linear_bounds, capacity_valu, capacity_alu, capacity_flow, capacity_load",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for OptionalConstraintGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::RedundantLinearBounds => "redundant_linear_bounds",
+            Self::CapacityValu => "capacity_valu",
+            Self::CapacityAlu => "capacity_alu",
+            Self::CapacityFlow => "capacity_flow",
+            Self::CapacityLoad => "capacity_load",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
 pub struct CpsatResult {
