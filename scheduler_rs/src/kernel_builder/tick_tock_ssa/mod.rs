@@ -357,6 +357,11 @@ impl SsaTickTockKernelBuilder {
         enable_scratch_tightening: bool,
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
     ) -> Result<SsaScheduleResult, String> {
+        #[cfg(not(feature = "cpsat"))]
+        return Err("CP-SAT not available: compile with --features cpsat".to_string());
+
+        #[cfg(feature = "cpsat")]
+        {
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
             live_in_for_section_filtered, live_out_from_section, live_through_for_section,
@@ -1106,6 +1111,7 @@ impl SsaTickTockKernelBuilder {
         }
 
         ctx.into_result()
+        }
     }
 
     // Note: Greedy scheduling methods are implemented in ssa_greedy.rs

@@ -172,20 +172,25 @@ pub mod model;
 mod tests;
 
 // Re-exports: all public items from sub-modules
-pub use config::{ConstChoiceMode, CpsatResult, CpsatStatus, SelectChoiceMode, ValuShiftMode};
+pub use config::{
+    ConstChoiceMode, CpsatResult, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode,
+    ValuShiftMode,
+};
 pub use legacy::{compute_asap, compute_alap};
 pub use bounds::{
     CapacityLowerBoundResult, CpsatConfig, CpsatResultWithShift, LiveInterval,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
     compute_capacity_lower_bound_global, compute_live_intervals, compute_max_latency_critical_path,
-    compute_ssa_alap, compute_ssa_asap, compute_ssa_asap_alap_bounds,
+    compute_ssa_alap, compute_ssa_asap,
 };
+#[cfg(feature = "cpsat")]
+pub use bounds::compute_ssa_asap_alap_bounds;
 pub use model::schedule_ssa_cpsat;
 
 // Re-exports needed by tests (via `use super::*;` in test modules)
 #[cfg(test)]
 pub(crate) use bounds::{diagnose_precedence_bounds, fix_precedence_bounds_fixpoint};
-#[cfg(test)]
+#[cfg(all(test, feature = "cpsat"))]
 pub(crate) use validation::validate_ssa_slot_limits;
 
 /// Check if CP-SAT feature is available

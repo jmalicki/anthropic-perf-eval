@@ -15,7 +15,10 @@ use super::bounds::{
     build_ordering_pairs_from_bounds,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
 };
-use super::config::{ConstChoiceMode, CpsatStatus, SelectChoiceMode, ValuShiftMode};
+use super::config::{
+    ConstChoiceMode, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
+};
+#[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
     try_validate_ssa_slot_limits, validate_ssa_slot_limits,
