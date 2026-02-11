@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::types::{Engine, MachineConfig, Op, Opcode, PrecedenceOffset, SsaOp, VReg};
 
+use super::cse_groups::CseGroup;
+
 use super::config::{
     ConstChoiceMode, CpsatResult, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode,
     ValuShiftMode,
@@ -330,12 +332,32 @@ pub struct CapacityLowerBoundResult {
     pub store_bound: i64,
 }
 
+/// Minimum VALU ops from SelectChoice when `z` consumers choose FMA and CSE groups exist:
+/// one SUB per group that has at least one FMA + z FMAs. Minimized by concentrating z in as few groups as possible.
+fn min_valu_from_select_cse(z: i64, group_sizes: &[usize]) -> i64 {
+    if z <= 0 {
+        return 0;
+    }
+    let z = z as usize;
+    let mut sizes: Vec<usize> = group_sizes.to_vec();
+    sizes.sort_by(|a, b| b.cmp(a));
+    let mut sum = 0usize;
+    for (k, &s) in sizes.iter().enumerate() {
+        sum += s;
+        if sum >= z {
+            return (k + 1) as i64 + z as i64;
+        }
+    }
+    (sizes.len() + z) as i64
+}
+
 /// Compute capacity-based lower bound on makespan by minimizing over choice variables (x, y, z).
 /// No CP-SAT needed: pure triple loop over small integer ranges.
 ///
 /// - x = number of shiftable VALU that stay on VALU (0..=shiftable_count)
 /// - y = number of ConstChoice that choose add_imm/Flow (0..=const_choice_count)
-/// - z = number of SelectChoice that choose FMA/VALU (0..=select_choice_count); each adds 2 VALU ops (sub + fma)
+/// - z = number of SelectChoice that choose FMA/VALU (0..=select_choice_count).
+///   Without CSE: each FMA adds 2 VALU ops (sub + fma). With CSE: (1 SUB per active group) + z FMAs.
 ///
 /// For each (x,y,z), computes max(ceil(VALU/6), ceil(ALU/12), ceil(Load/2), Flow, ceil(Store/2))
 /// then returns the minimum over all (x,y,z), capped below by critical_path_len.
@@ -356,6 +378,7 @@ pub fn compute_capacity_lower_bound_global(
     store_cap: i64,
     _flow_cap: i64,
     critical_path_len: i64,
+    cse_groups: Option<&[CseGroup]>,
 ) -> CapacityLowerBoundResult {
     let mut capacity_lower_bound = critical_path_len;
     if !enable_valu_shift && valu_count > 0 && valu_cap > 0 {
@@ -367,6 +390,7 @@ pub fn compute_capacity_lower_bound_global(
     } else {
         0
     };
+    let cse_group_sizes: Option<Vec<usize>> = cse_groups.map(|g| g.iter().map(|grp| grp.consumer_indices.len()).collect());
     let mut global_min = i64::MAX;
     for x in 0..=shiftable_count {
         let valu_ops = if enable_valu_shift {
@@ -382,8 +406,11 @@ pub fn compute_capacity_lower_bound_global(
         for y in 0..=const_choice_count {
             let load_ops = (load_count - y).max(0);
             for z in 0..=select_choice_count {
-                // Each SelectChoice FMA adds 2 VALU ops (sub + fma).
-                let valu_with_select = valu_ops + 2 * z;
+                let valu_select = match &cse_group_sizes {
+                    Some(sizes) if !sizes.is_empty() => min_valu_from_select_cse(z, sizes),
+                    _ => 2 * z,
+                };
+                let valu_with_select = valu_ops + valu_select;
                 // flow_base already counts all Flow ops (including SelectChoice). When z choose FMA they use VALU;
                 // (select_choice_count - z) use vselect (1 Flow each). So total Flow = flow_base + y - z.
                 let flow_ops = flow_base + y - z;

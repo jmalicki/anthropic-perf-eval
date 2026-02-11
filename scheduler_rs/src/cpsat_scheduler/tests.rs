@@ -2111,6 +2111,7 @@ mod tests {
             writes: [id as i64 * 10].into_iter().collect(),
             last_use_reads: HashSet::new(),
             produces_constant: None,
+            trace_id: None,
         }
     }
 
@@ -4826,7 +4827,7 @@ mod capacity_lb_tests {
     fn test_capacity_lb_no_choices() {
         let (vc, ac, lc, sc, fc) = default_caps();
         let r = compute_capacity_lower_bound_global(
-            18, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 1,
+            18, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 1, None,
         );
         assert_eq!(r.capacity_lower_bound, 3, "18 VALU / 6 = 3 cycles");
         assert_eq!(r.store_bound, 0);
@@ -4836,7 +4837,7 @@ mod capacity_lb_tests {
     fn test_capacity_lb_critical_path_dominates() {
         let (vc, ac, lc, sc, fc) = default_caps();
         let r = compute_capacity_lower_bound_global(
-            6, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 10,
+            6, 0, 0, 0, 0, 0, 0, 0, false, vc, ac, lc, sc, fc, 10, None,
         );
         assert_eq!(r.capacity_lower_bound, 10, "critical_path 10 dominates 6/6=1");
     }
@@ -4846,10 +4847,10 @@ mod capacity_lb_tests {
         let (vc, ac, lc, sc, fc) = default_caps();
         // 6 VALU, 3 shiftable. x=0 (all shift): VALU=3, ALU=24 => max(1,2)=2. x=3 (none shift): VALU=6, ALU=0 => max(1,0)=1. Global min = 1.
         let r_no_shift = compute_capacity_lower_bound_global(
-            6, 0, 0, 0, 0, 3, 0, 0, false, vc, ac, lc, sc, fc, 1,
+            6, 0, 0, 0, 0, 3, 0, 0, false, vc, ac, lc, sc, fc, 1, None,
         );
         let r_shift = compute_capacity_lower_bound_global(
-            6, 0, 0, 0, 0, 3, 0, 0, true, vc, ac, lc, sc, fc, 1,
+            6, 0, 0, 0, 0, 3, 0, 0, true, vc, ac, lc, sc, fc, 1, None,
         );
         assert_eq!(r_no_shift.capacity_lower_bound, 1);
         assert_eq!(r_shift.capacity_lower_bound, 1, "min over x: best is x=3 => 1 cycle");
@@ -4860,7 +4861,7 @@ mod capacity_lb_tests {
         let (vc, ac, lc, sc, fc) = default_caps();
         // 4 Load ops, 2 ConstChoice. If both add_imm: 2 Load => 1 cycle. If both load: 4 Load => 2 cycles.
         let r = compute_capacity_lower_bound_global(
-            0, 0, 4, 0, 0, 0, 2, 0, false, vc, ac, lc, sc, fc, 1,
+            0, 0, 4, 0, 0, 0, 2, 0, false, vc, ac, lc, sc, fc, 1, None,
         );
         assert!(r.capacity_lower_bound >= 1 && r.capacity_lower_bound <= 2);
         assert_eq!(r.load_bound, 1, "min Load = 2 ops => ceil(2/2)=1");
@@ -4871,7 +4872,7 @@ mod capacity_lb_tests {
         let (vc, ac, lc, sc, fc) = default_caps();
         // 5 Flow ops (flow_base=5), no others. Makespan must be >= 5.
         let r = compute_capacity_lower_bound_global(
-            0, 0, 0, 0, 5, 0, 0, 0, false, vc, ac, lc, sc, fc, 1,
+            0, 0, 0, 0, 5, 0, 0, 0, false, vc, ac, lc, sc, fc, 1, None,
         );
         assert_eq!(r.capacity_lower_bound, 5);
     }
@@ -4881,7 +4882,7 @@ mod capacity_lb_tests {
         let (vc, ac, lc, sc, fc) = default_caps();
         // Small mix: some VALU (shiftable), some ConstChoice, some SelectChoice. Just check it runs and returns >= critical_path.
         let r = compute_capacity_lower_bound_global(
-            6, 12, 2, 0, 1, 3, 1, 1, true, vc, ac, lc, sc, fc, 5,
+            6, 12, 2, 0, 1, 3, 1, 1, true, vc, ac, lc, sc, fc, 5, None,
         );
         assert!(r.capacity_lower_bound >= 5);
         assert!(r.capacity_lower_bound >= r.store_bound);
