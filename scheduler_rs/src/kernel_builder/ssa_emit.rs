@@ -1058,6 +1058,9 @@ impl SsaTickTockKernelBuilder {
     // =========================================================================
 
     pub(super) fn emit_hash(&mut self, n_groups: usize, n_iters: usize) {
+        let rnd = self.emit.current_round.unwrap_or(0);
+        let enable_trace = self.config.spec.enable_trace_ids;
+
         for hi in 0..6 {
             let (op1, _, op2, op3, _) = HASH_STAGES[hi];
 
@@ -1072,13 +1075,21 @@ impl SsaTickTockKernelBuilder {
 
                     if self.ctx.hash_fma_mult[hi].is_some() {
                         // FMA optimization
+                        if enable_trace && hi == 5 {
+                            self.emit
+                                .set_next_trace_id(format!("r{}_g{}_hashed_val", rnd, g));
+                        }
                         let v_mult = *self.ctx.v_hash_mult.get(&hi).unwrap();
                         let v_hc = self.ctx.v_hc[hi].unwrap();
                         self.ctx.all_val[g] = Some(self.emit.emit_fma(val, v_mult, v_hc));
                     } else if hi == 5 {
-                        // Stage 5 special handling
+                        // Stage 5 special handling (Shr + Xor; Xor produces hashed_val)
                         let v_hs = self.ctx.v_hs[hi].unwrap();
                         let t = self.emit.emit_valu(Opcode::Shr, val, v_hs);
+                        if enable_trace {
+                            self.emit
+                                .set_next_trace_id(format!("r{}_g{}_hashed_val", rnd, g));
+                        }
                         self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, t));
                     } else {
                         // General case
@@ -1103,6 +1114,10 @@ impl SsaTickTockKernelBuilder {
 
                         let t = self.emit.emit_valu(op1_code, val, v_hc);
                         let shifted = self.emit.emit_valu(op3_code, val, v_hs);
+                        if enable_trace && hi == 5 {
+                            self.emit
+                                .set_next_trace_id(format!("r{}_g{}_hashed_val", rnd, g));
+                        }
                         self.ctx.all_val[g] = Some(self.emit.emit_valu(op2_code, t, shifted));
                     }
                 }

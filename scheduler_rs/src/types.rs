@@ -408,6 +408,10 @@ pub struct Op {
     /// For example, a Load("const", dest, 4) might be replaced with
     /// ALU("+", dest, 2, 2) if ALU slots are available but Load slots are scarce.
     pub produces_constant: Option<i64>,
+
+    /// Optional trace ID for debug ops (trace_input/trace_output).
+    /// Set when this Op is a debug op; propagated from SsaOp for traced logical ops.
+    pub trace_id: Option<String>,
 }
 
 // ============================================================================
@@ -933,6 +937,7 @@ pub fn expand_valu_to_alu_smart(
             writes: [dest + i_offset].into_iter().collect(),
             last_use_reads: HashSet::new(), // Computed later by compute_last_uses
             produces_constant: None,
+            trace_id: None,
         };
         new_ops.push(new_op);
     }
@@ -1060,6 +1065,7 @@ pub fn resolve_pseudo_const(
         writes,
         last_use_reads: HashSet::new(),
         produces_constant: Some(pc.value),
+        trace_id: None,
     })
 }
 
@@ -1422,6 +1428,10 @@ pub struct SsaOp {
     /// This VReg is allocated during emission and assigned an address during address assignment.
     /// None when delta_vreg is set (no sub needed) or for non-SelectChoice ops.
     pub sub_temp_vreg: Option<VReg>,
+
+    /// Optional trace ID for semantic debugging (trace_input/trace_output).
+    /// When set, lowering emits debug ops at first/last cycle. Format: "r{round}_g{group}_{phase}".
+    pub trace_id: Option<String>,
 }
 
 impl SsaOp {
@@ -1451,6 +1461,7 @@ impl SsaOp {
             delta_vreg: None,        // Default: no precomputed delta
             select_choice_parent: None, // Default: not part of SelectChoice expansion
             sub_temp_vreg: None, // Default: no sub temp needed (set for SelectChoice without delta)
+            trace_id: None,
         }
     }
 

@@ -50,6 +50,8 @@ pub struct ProblemSpec {
     pub tree_reduce_max_depth: u32,
     /// Enable debug operations
     pub enable_debug: bool,
+    /// Enable trace IDs for semantic debugging (trace_input/trace_output)
+    pub enable_trace_ids: bool,
     /// Enable lazy partition for sorted vload tree access (depths 4-8)
     pub enable_lazy_partition: bool,
     /// Partition frequency: partition every k rounds (default: 1)
@@ -78,6 +80,7 @@ impl Default for ProblemSpec {
             rounds: 16,
             tree_reduce_max_depth: 3,
             enable_debug: false,
+            enable_trace_ids: false,
             enable_lazy_partition: false,
             partition_frequency: 1,
             enable_partition_stores: false,

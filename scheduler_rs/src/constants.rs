@@ -463,6 +463,7 @@ pub fn emit_constant_generation_ops(
             last_use_reads: HashSet::new(),
             dep_ids: HashSet::new(),
             produces_constant: Some(value),
+            trace_id: None,
         });
 
         op_id += 1;

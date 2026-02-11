@@ -78,6 +78,8 @@ pub struct SsaEmitContext {
     pub current_symmetry_hint: Option<SymmetryHint>,
     /// VarType to use for the next emitted op (if set)
     pub next_var_type: Option<VarType>,
+    /// Trace ID for the next emitted op (if set, for trace_input/trace_output)
+    pub next_trace_id: Option<String>,
 
     // =========================================================================
     // Constant Alternative Tracking (for CP-SAT optimization)
@@ -129,6 +131,7 @@ impl SsaEmitContext {
             current_phase: EmissionPhase::Init,
             current_symmetry_hint: None,
             next_var_type: None,
+            next_trace_id: None,
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
@@ -210,6 +213,7 @@ impl SsaEmitContext {
         self.current_group = None;
         self.current_phase = EmissionPhase::Init;
         self.next_var_type = None;
+        self.next_trace_id = None;
         // Reset const alternative tracking
         self.const_alternatives.clear();
         self.zero_vreg = None;
@@ -290,6 +294,11 @@ impl SsaEmitContext {
         self.current_symmetry_hint = None;
     }
 
+    /// Set trace ID for the next emitted op (for trace_input/trace_output debugging).
+    pub fn set_next_trace_id(&mut self, trace_id: String) {
+        self.next_trace_id = Some(trace_id);
+    }
+
     /// Record that a VReg is defined by a specific op.
     ///
     /// Panics if the VReg is already defined - this indicates an SSA violation.
@@ -333,6 +342,9 @@ impl SsaEmitContext {
         op.symmetry_hint = self.current_symmetry_hint.clone();
         if let Some(var_type) = self.next_var_type.take() {
             op.var_type = Some(var_type);
+        }
+        if let Some(trace_id) = self.next_trace_id.take() {
+            op.trace_id = Some(trace_id);
         }
 
         self.next_op_id += 1;

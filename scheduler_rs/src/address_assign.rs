@@ -118,6 +118,7 @@ pub struct AddressAssignConfig {
     pub select_fma_ops: HashSet<usize>,
     /// VALU ops shifted to ALU (op.id in keys) use min(alu_cycles) as def_cycle for their dest.
     /// The 8 ALU ops write at different cycles; the block is in use from the first write.
+    /// Presence in map = shifted; require len==VLEN or panic. Absence = not shifted.
     pub shifted_alu_cycles: std::collections::HashMap<usize, Vec<i32>>,
     /// ConstChoice ops using ALU-derive: op_id → AluDeriveInfo (left_op_id, right_op_id, opcode).
     /// The AluDerive op reads the dest VRegs of its left/right producers at its cycle,
@@ -204,11 +205,14 @@ impl LivenessDef for OpLiveness<'_> {
             && op.sub_temp_vreg.is_some()
         {
             (op.cycle + 1, op.cycle + 1)
-        } else if let Some(cycles) = ctx
-            .shifted_alu_cycles
-            .get(&op.id)
-            .filter(|c| c.len() == VLEN)
-        {
+        } else if let Some(cycles) = ctx.shifted_alu_cycles.get(&op.id) {
+            // Presence = shifted; require valid data or panic
+            if cycles.len() != VLEN {
+                panic!(
+                    "BUG: shifted VALU op {} has shifted_alu_cycles len {} (expected {})",
+                    op.id, cycles.len(), VLEN
+                );
+            }
             let min_c = *cycles.iter().min().unwrap_or(&op.cycle);
             let max_c = *cycles.iter().max().unwrap_or(&op.cycle);
             (min_c, max_c)
@@ -808,6 +812,13 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
                 vreg, new_addr, size, interval.start, interval.end, active_ranges
             );
         }
+        // Debug: log assignments at cycle 18 for scratch conflict diagnosis
+        if debug && interval.start == 18 {
+            eprintln!(
+                "[DEBUG assign_addresses] CYCLE18: VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
+                vreg, new_addr, size, interval.start, interval.end, active_ranges
+            );
+        }
     }
 
     // Post-allocation: derive lane addresses from vector group base addresses.
@@ -1034,6 +1045,7 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         reads,
         writes,
         last_use_reads: HashSet::new(), // Will be computed by scheduler
+        trace_id: ssa_op.trace_id.clone(),
         produces_constant: ssa_op.produces_constant,
     }
 }

@@ -200,6 +200,7 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                     reads,
                     writes,
                     last_use_reads: HashSet::new(),
+                    trace_id: None,
                     produces_constant: None,
                 });
                 op_id += 1;
@@ -1058,7 +1059,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, enable_asap_alap_tightening=None, enable_scratch_tightening=None, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, enable_asap_alap_tightening=None, enable_scratch_tightening=None, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1087,6 +1088,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     scheduling_pressure_policy: &str,
     optional_constraint_groups_to_disable: Option<Vec<OptionalConstraintGroupPy>>,
     enable_cse_groups: Option<bool>,
+    enable_trace_ids: Option<bool>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1117,6 +1119,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             batch_size,
             rounds,
             enable_debug: false,
+            enable_trace_ids: enable_trace_ids.unwrap_or(false),
             enable_lazy_partition: false,
             partition_frequency: 3,
             enable_partition_stores: false,

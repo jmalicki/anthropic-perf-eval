@@ -11,6 +11,9 @@ use arrayvec::ArrayVec;
 /// Ops use ids CSE_SHARED_SUB_PREFIX + g for group index g.
 const CSE_SHARED_SUB_PREFIX: usize = 0xC5E0_0000;
 
+/// Prefix for trace debug op ids (trace_input/trace_output).
+const TRACE_DEBUG_OP_PREFIX: usize = 0xD3B0_0000;
+
 use crate::address_assign::lower_ssa_op;
 use crate::types::{Engine, Op, SlotVal, SsaOp, VReg, VLEN};
 
@@ -153,6 +156,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     writes: sub_writes,
                     last_use_reads: HashSet::new(),
                     produces_constant: None,
+                    trace_id: None,
                 });
             }
         }
@@ -250,6 +254,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     writes,
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
+                    trace_id: ssa_op.trace_id.clone(),
                 });
             } else if ctx.const_add_imm_ops.contains(&ssa_op.id) {
                 // AddImm: dest = scratch[0] + value
@@ -278,6 +283,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     writes,
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
+                    trace_id: ssa_op.trace_id.clone(),
                 });
             } else {
                 // Load: dest = const value
@@ -299,6 +305,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     writes,
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
+                    trace_id: ssa_op.trace_id.clone(),
                 });
             }
         } else if ssa_op.opcode == Opcode::SelectChoice {
@@ -392,6 +399,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                         reads: fma_reads,
                         writes: fma_writes,
                         last_use_reads: HashSet::new(),
+                        trace_id: ssa_op.trace_id.clone(),
                         produces_constant: None,
                     });
                 } else {
@@ -454,6 +462,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                             writes: sub_writes,
                             last_use_reads: HashSet::new(),
                             produces_constant: None,
+                            trace_id: ssa_op.trace_id.clone(),
                         });
                     }
 
@@ -493,6 +502,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                         writes: fma_writes,
                         last_use_reads: HashSet::new(),
                         produces_constant: None,
+                        trace_id: ssa_op.trace_id.clone(),
                     };
                     if std::env::var("SCHEDULER_DEBUG").is_ok() {
                         eprintln!(
@@ -531,6 +541,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     writes,
                     last_use_reads: HashSet::new(),
                     produces_constant: None,
+                    trace_id: ssa_op.trace_id.clone(),
                 });
             }
         } else {
@@ -539,7 +550,99 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
         }
     }
 
+    // Post-pass: emit trace_input/trace_output debug ops for ops with trace_id
+    emit_trace_debug_ops(&mut result, ctx);
+
     result
+}
+
+/// Emit trace_input and trace_output debug ops for ops that have trace_id.
+/// Groups ops by trace_id, computes first/last cycle, and creates debug ops.
+fn emit_trace_debug_ops(result: &mut Vec<Op>, ctx: &LoweringContext<'_>) {
+    use crate::types::Operand;
+    use std::collections::HashMap;
+
+    // Build trace_id -> (first_cycle, last_cycle, ssa_op)
+    let mut trace_info: HashMap<String, (i32, i32, &SsaOp)> = HashMap::new();
+    for op in result.iter() {
+        if let Some(ref tid) = op.trace_id {
+            match trace_info.get_mut(tid) {
+                Some((first, last, _)) => {
+                    *first = (*first).min(op.cycle);
+                    *last = (*last).max(op.cycle);
+                }
+                None => {
+                    let ssa_op = ctx
+                        .ssa_ops
+                        .iter()
+                        .find(|s| s.trace_id.as_deref() == Some(tid.as_str()))
+                        .expect("trace_id on op but not found in ssa_ops");
+                    trace_info.insert(tid.clone(), (op.cycle, op.cycle, ssa_op));
+                }
+            }
+        }
+    }
+
+    let mut debug_op_id = TRACE_DEBUG_OP_PREFIX;
+    for (trace_id, (first_cycle, last_cycle, ssa_op)) in trace_info {
+        let input_addrs: Vec<i64> = ssa_op
+            .srcs
+            .iter()
+            .filter_map(|o| o.as_vreg())
+            .filter_map(|v| ctx.vreg_to_addr.get(&v).copied())
+            .collect();
+        let dest_addr = ssa_op
+            .dest
+            .and_then(|d| ctx.vreg_to_addr.get(&d).copied());
+        let n_elems = ssa_op
+            .dest
+            .map(|d| if d.is_vector() { VLEN as i64 } else { 1 })
+            .unwrap_or(1);
+
+        // trace_input at first_cycle
+        let mut trace_input_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+        trace_input_slot.push(SlotVal::Str("trace_input".to_string()));
+        trace_input_slot.push(SlotVal::Str(trace_id.clone()));
+        trace_input_slot.push(SlotVal::Int(n_elems));
+        for &a in input_addrs.iter().take(3) {
+            trace_input_slot.push(SlotVal::Int(a));
+        }
+        result.push(Op {
+            id: debug_op_id,
+            engine: Engine::Debug,
+            slot: trace_input_slot,
+            cycle: first_cycle,
+            dep_ids: HashSet::new(),
+            reads: HashSet::new(),
+            writes: HashSet::new(),
+            last_use_reads: HashSet::new(),
+            produces_constant: None,
+            trace_id: Some(trace_id.clone()),
+        });
+        debug_op_id += 1;
+
+        // trace_output at last_cycle (only if we have a dest)
+        if let Some(dest) = dest_addr {
+            let mut trace_output_slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
+            trace_output_slot.push(SlotVal::Str("trace_output".to_string()));
+            trace_output_slot.push(SlotVal::Str(trace_id));
+            trace_output_slot.push(SlotVal::Int(n_elems));
+            trace_output_slot.push(SlotVal::Int(dest));
+            result.push(Op {
+                id: debug_op_id,
+                engine: Engine::Debug,
+                slot: trace_output_slot,
+                cycle: last_cycle,
+                dep_ids: HashSet::new(),
+                reads: HashSet::new(),
+                writes: HashSet::new(),
+                last_use_reads: HashSet::new(),
+                produces_constant: None,
+                trace_id: None, // Don't nest
+            });
+            debug_op_id += 1;
+        }
+    }
 }
 
 /// Expand a shifted SSA VALU op into 8 scalar ALU ops.
@@ -630,6 +733,7 @@ pub fn expand_ssa_valu_to_alu(
             writes,
             last_use_reads: HashSet::new(),
             produces_constant: None,
+            trace_id: ssa_op.trace_id.clone(),
         });
     }
 
@@ -695,6 +799,49 @@ mod tests {
         assert_eq!(op.slot[2], SlotVal::Int(5)); // value
         assert_eq!(op.produces_constant, Some(5));
         assert!(op.reads.is_empty()); // Const doesn't read anything
+    }
+
+    #[test]
+    fn test_lower_emits_trace_debug_ops_when_trace_id_set() {
+        let mut vreg_to_addr = HashMap::new();
+        let dest_vreg = VReg::scalar(1);
+        vreg_to_addr.insert(dest_vreg, 100);
+
+        let mut ssa_op = make_const_choice_op(42, 5, dest_vreg, 10);
+        ssa_op.trace_id = Some("r0_g0_hashed_val".to_string());
+
+        let ssa_ops = vec![ssa_op];
+        let shifted_ops = HashSet::new();
+        let const_add_imm_ops = HashSet::new(); // Use Load
+
+        let result = lower_ssa_ops_with_shift(&LoweringContext {
+            ssa_ops: &ssa_ops,
+            vreg_to_addr: &vreg_to_addr,
+            shifted_ops: &shifted_ops,
+            const_add_imm_ops: &const_add_imm_ops,
+            const_alu_derive_ops: &HashMap::new(),
+            select_fma_ops: &HashSet::new(),
+            shifted_alu_cycles: &HashMap::new(),
+            eliminated_vbroadcast_ops: &HashSet::new(),
+            eliminated_vb_to_scalar_producer: &HashMap::new(),
+            cse_groups: None,
+            cse_group_results: None,
+        });
+
+        let debug_ops: Vec<_> = result.iter().filter(|o| o.engine == Engine::Debug).collect();
+        assert!(
+            debug_ops.len() >= 2,
+            "Expected at least 2 debug ops (trace_input + trace_output), got {}",
+            debug_ops.len()
+        );
+        let trace_input = debug_ops
+            .iter()
+            .find(|o| matches!(&o.slot[0], SlotVal::Str(s) if s == "trace_input"));
+        let trace_output = debug_ops
+            .iter()
+            .find(|o| matches!(&o.slot[0], SlotVal::Str(s) if s == "trace_output"));
+        assert!(trace_input.is_some(), "Expected trace_input debug op");
+        assert!(trace_output.is_some(), "Expected trace_output debug op");
     }
 
     #[test]

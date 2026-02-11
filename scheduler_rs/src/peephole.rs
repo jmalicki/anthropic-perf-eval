@@ -599,6 +599,7 @@ mod tests {
             writes: [dest].into_iter().collect(),
             last_use_reads: HashSet::new(),
             produces_constant: None,
+            trace_id: None,
         }
     }
 
@@ -627,6 +628,7 @@ mod tests {
             writes,
             last_use_reads: HashSet::new(),
             produces_constant: None,
+            trace_id: None,
         }
     }
 
