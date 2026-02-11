@@ -168,12 +168,14 @@ Use when debugging the "depth-3 (4r/8b): all 8 lanes wrong" failure to isolate t
 
 ## 7. Targeted debug tools (low-token, data-focused)
 
+Scripts like `scripts/scratch_vs_ref.py`, `scripts/who_wrote_addr.py`, and `scripts/addr_conflict_report.py` are best used when you already know the specific cycle or address (or suspect a particular location) and want concise raw data instead of higher-level analysis.
+
 Use these when you need **specific data** without speculation:
 
 **Script:** `scripts/scratch_vs_ref.py` — Scratch values at key cycles vs reference.
 
 ```bash
-uv run python -m scripts.scratch_vs_ref kernel.json --rounds 4 --batch-size 8 --addr 21 --cycles 71 72 --group 0
+uv run python scripts/scratch_vs_ref.py --kernel kernel.json --rounds 4 --batch-size 8 --addr 21 --cycles 71 72 --group 0
 ```
 
 Output: at each cycle, `s[addr..addr+7]` GOT vs REF (round N hashed_val), lane-by-lane MISMATCH/OK. Pinpoints exactly when values diverge.
@@ -181,7 +183,7 @@ Output: at each cycle, `s[addr..addr+7]` GOT vs REF (round N hashed_val), lane-b
 **Script:** `scripts/who_wrote_addr.py` — Last instruction that wrote to an address before a cycle.
 
 ```bash
-uv run python -m scripts.who_wrote_addr kernel.json --addr 13 --before-cycle 72
+uv run python scripts/who_wrote_addr.py --kernel kernel.json --addr 13 --before-cycle 72
 ```
 
 Output: the cycle and full instruction that last wrote to that address. Answers: "what produced the value we're reading?"
@@ -189,10 +191,23 @@ Output: the cycle and full instruction that last wrote to that address. Answers:
 **Script:** `scripts/addr_conflict_report.py` — Detect problematic VReg interval overlaps at same address.
 
 ```bash
-uv run python -m scripts.addr_conflict_report scheduler_output.json --addr 13
+uv run python scripts/addr_conflict_report.py scheduler_output.json --addr 13
 ```
 
 Output: CONFLICT lines when B writes before A's last read (same address). No conflicts = allocator intervals are consistent; conflicts = allocation bug.
+
+**Script:** `scripts/diff_kernels.py` — Compare two kernel JSONs (e.g. passing vs failing) to see instruction differences.
+
+```bash
+uv run python scripts/diff_kernels.py kernel_to_validate.json kernel_pass.json
+uv run python scripts/diff_kernels.py kernel_fail.json kernel_pass.json --brief
+```
+
+**Script:** `scripts/check_broadcast_overwrites.py` — Analyze kernel for vbroadcast/vector overwrites that could cause wrong values. See BUGS.md for when to use.
+
+```bash
+uv run python scripts/check_broadcast_overwrites.py
+```
 
 ---
 
@@ -210,5 +225,7 @@ Output: CONFLICT lines when B writes before A's last read (same address). No con
 | Scratch at cycle C vs reference? | scratch_vs_ref.py | Got vs expected; lane-level mismatch. |
 | Who wrote addr before cycle C? | who_wrote_addr.py | Last instruction writing to that address. |
 | Allocation conflicts at addr? | addr_conflict_report.py | Overlapping VReg intervals at same address. |
+| Compare passing vs failing kernel | diff_kernels.py | Instruction-level diff between two kernel JSONs. |
+| Broadcast overwrite analysis | check_broadcast_overwrites.py | vbroadcast/vector overwrites; see BUGS.md. |
 
 **No kernel to trace?** If the failing config makes CP-SAT **infeasible**, no kernel file is produced. Use `scripts/bisect_cpsat_validation.py` or `scripts/bisect_minimal_fma.py` (see use-bisection-tools skill) to find which options or minimal config fail; trace scripts need a **saved kernel that runs but produces wrong output**.
