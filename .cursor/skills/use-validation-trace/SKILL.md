@@ -61,7 +61,7 @@ uv run python scripts/trace_group20.py --kernel kernel_fail.json --rounds 4 --ba
 uv run python scripts/trace_group20.py --kernel kernel_to_validate.json --rounds 4 --batch-size 256 --group 20
 ```
 
-**Note:** `--group N` implies batch indices `N*8` to `N*8+7`. Ensure `(N+1)*8 <= batch_size`.
+**Note:** `--group N` implies batch indices `N*8` to `N*8+7`. Ensure `(N+1)*8 <= batch_size`. The script supports any `--rounds` (e.g. `--rounds 3 --group 4` for 3-round kernels).
 
 ### Output
 
@@ -166,6 +166,36 @@ Use when debugging the "depth-3 (4r/8b): all 8 lanes wrong" failure to isolate t
 
 ---
 
+## 7. Targeted debug tools (low-token, data-focused)
+
+Use these when you need **specific data** without speculation:
+
+**Script:** `scripts/scratch_vs_ref.py` — Scratch values at key cycles vs reference.
+
+```bash
+uv run python -m scripts.scratch_vs_ref kernel.json --rounds 4 --batch-size 8 --addr 21 --cycles 71 72 --group 0
+```
+
+Output: at each cycle, `s[addr..addr+7]` GOT vs REF (round N hashed_val), lane-by-lane MISMATCH/OK. Pinpoints exactly when values diverge.
+
+**Script:** `scripts/who_wrote_addr.py` — Last instruction that wrote to an address before a cycle.
+
+```bash
+uv run python -m scripts.who_wrote_addr kernel.json --addr 13 --before-cycle 72
+```
+
+Output: the cycle and full instruction that last wrote to that address. Answers: "what produced the value we're reading?"
+
+**Script:** `scripts/addr_conflict_report.py` — Detect problematic VReg interval overlaps at same address.
+
+```bash
+uv run python -m scripts.addr_conflict_report scheduler_output.json --addr 13
+```
+
+Output: CONFLICT lines when B writes before A's last read (same address). No conflicts = allocator intervals are consistent; conflicts = allocation bug.
+
+---
+
 ## Workflow summary
 
 | Goal | Script | Typical use |
@@ -177,5 +207,8 @@ Use when debugging the "depth-3 (4r/8b): all 8 lanes wrong" failure to isolate t
 | What instructions run at cycle C? | dump_cycle_instrs.py | After trace_group20 gives you a cycle number. |
 | Ops at cycle C reading addr A / VRegs at addr? | inspect_cycle_addr.py, inspect_vreg_at_addr.py | Schedule JSON; debugging scratch reuse / vstore value interval. |
 | Which SSA op defines VReg X? | inspect_vreg_definer.py | Schedule JSON; confirm producer of value at an address (e.g. VReg 213). |
+| Scratch at cycle C vs reference? | scratch_vs_ref.py | Got vs expected; lane-level mismatch. |
+| Who wrote addr before cycle C? | who_wrote_addr.py | Last instruction writing to that address. |
+| Allocation conflicts at addr? | addr_conflict_report.py | Overlapping VReg intervals at same address. |
 
 **No kernel to trace?** If the failing config makes CP-SAT **infeasible**, no kernel file is produced. Use `scripts/bisect_cpsat_validation.py` or `scripts/bisect_minimal_fma.py` (see use-bisection-tools skill) to find which options or minimal config fail; trace scripts need a **saved kernel that runs but produces wrong output**.
