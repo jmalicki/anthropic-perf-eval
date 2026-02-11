@@ -29,89 +29,26 @@ import argparse
 import json
 import os
 import random
-import subprocess
 import sys
 import time
 
-import scheduler_rs
-
-DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
+from kernel_build_args import (
+    DEFAULT_SCHEDULER_JSON,
+    add_kernel_build_args,
+    args_to_build_kwargs,
+    build_kernel_with_args,
+)
 
 BASELINE = 147734
-
-
-def get_git_sha():
-    """Return git HEAD SHA (short) or None if not a repo or git unavailable."""
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if out.returncode == 0 and out.stdout:
-            return out.stdout.strip()[:12]  # short SHA
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return None
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Generate optimized kernel using SSA builder with CP-SAT"
     )
+    add_kernel_build_args(parser)
 
-    # Problem parameters
-    parser.add_argument("--forest-height", type=int, default=10,
-                        help="Tree depth (default: 10, gives 2047 nodes)")
-    parser.add_argument("--n-nodes", type=int, default=2047,
-                        help="Number of tree nodes (default: 2047 = 2^10 - 1)")
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help="Number of parallel traversals; must be a multiple of 8 (VLEN) (default: 256)")
-    parser.add_argument("--rounds", type=int, default=16,
-                        help="Hash rounds per traversal (default: 16)")
-
-    # Scheduler options
-    parser.add_argument("--cpsat-time-limit", type=float, default=3600.0,
-                        help="CP-SAT time limit in seconds (default: 3600 = 1 hour)")
-    parser.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
-                        help="If set, run each per-section CP-SAT for SECS seconds to optimize cycles (no VALU shift in per-section). 0 or omit = feasibility only.")
-    parser.add_argument("--use-greedy", action="store_true",
-                        help="Use greedy scheduler instead of CP-SAT (fast, ~2s)")
-    parser.add_argument("--enable-valu-shift", action="store_true", default=True,
-                        help="Enable VALU->ALU shifting (default: True)")
-    parser.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
-                        help="Disable VALU->ALU shifting (e.g. if hitting scratch budget)")
-    parser.add_argument("--tree-reduce-max-depth", type=int, default=3, metavar="N",
-                        help="Max tree depth for tree-reduce selection (2..4). Default 3; use 4 for 16-way at depth 4 (more VALU ops).")
-    parser.add_argument("--const-choice", choices=["optimize", "add_imm", "load"], default="optimize",
-                        help="CP-SAT ConstChoice: optimize, force add_imm, or force load (default: optimize)")
-    parser.add_argument("--select-choice", choices=["optimize", "fma", "vselect"], default="optimize",
-                        help="CP-SAT SelectChoice: optimize, force fma, or force vselect (default: optimize)")
-    parser.add_argument("--valu-shift", choices=["optimize", "alu", "valu"], default="optimize",
-                        help="CP-SAT VALU shift: optimize, force alu, or force valu (default: optimize)")
-    parser.add_argument("--force-zero-gap", action="store_true",
-                        help="Force 0 integral gap for proven optimality (debugging only, slower). Uses longer time limit (2h) so CP-SAT can prove optimality.")
-    parser.add_argument("--enable-asap-alap-tightening", action=argparse.BooleanOptionalAction, default=True,
-                        help="Enable ASAP/ALAP tightening by considering slot capacity (default: enabled). Use --no-enable-asap-alap-tightening to disable.")
-    parser.add_argument("--enable-scratch-tightening", action="store_true",
-                        help="Enable scratch-aware tightening. Considers scratch constraints when tightening bounds (experimental, for ablation studies). Can be used independently of --enable-asap-alap-tightening.")
-    parser.add_argument("--scheduling-pressure-policy", choices=["greedy", "throttled", "gated", "adaptive", "cascade"], default="adaptive",
-                        help="Scheduling pressure policy: adaptive (default, transitions automatically), greedy (no pressure awareness), throttled (soft re-sort), gated (hard gate)")
-    _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
-    parser.add_argument("--disable-cpsat-constraints", type=str, default=None, metavar="GROUP1,GROUP2,...",
-                        help=f"Disable optional CP-SAT constraint groups (for debugging). Valid: {_constraint_names}. Also from env CPSAT_DISABLE_OPTIONAL_CONSTRAINTS.")
-    parser.add_argument("--no-cse-groups", action="store_true",
-                        help="Disable CSE groups for SelectChoice shared SUB (debugging depth-3 / validation failures).")
-
-    # Output options
-    parser.add_argument("--output-json", type=str, default=None,
-                        help=f"Output schedule JSON path (default: {DEFAULT_SCHEDULER_JSON})")
-    parser.add_argument("--comment", type=str, default=None,
-                        help="Comment stored in the schedule JSON to describe the run")
-    parser.add_argument("--liveness-detail", type=str, default=None,
-                        choices=["none", "summary", "full"],
-                        help="Liveness detail level in JSON: none, summary, or full (default: full)")
+    # Script-specific options (not passed to Rust)
     parser.add_argument("--validate", action="store_true",
                         help="Validate against reference kernel (kernel is always saved before validation for debugging)")
     parser.add_argument("--validate-only", type=str, metavar="PATH", default=None,
@@ -138,37 +75,26 @@ def main():
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
 
-    # Optional constraint groups to disable (debugging): CLI or env CPSAT_DISABLE_OPTIONAL_CONSTRAINTS
-    # Parse comma-separated names into enum values (single source of truth in Rust)
-    disable_constraints_raw = args.disable_cpsat_constraints or os.environ.get("CPSAT_DISABLE_OPTIONAL_CONSTRAINTS")
-    optional_constraint_groups_to_disable = None
-    if disable_constraints_raw:
-        optional_constraint_groups_to_disable = []
-        for s in disable_constraints_raw.split(","):
-            t = s.strip()
-            if t:
-                optional_constraint_groups_to_disable.append(
-                    scheduler_rs.OptionalConstraintGroup.from_str(t)
-                )
-    # Clamp to allowed range (min 2, max 4)
+    # Derive n_nodes if not set
+    n_nodes_val = getattr(args, "n_nodes", None)
+    if n_nodes_val is None:
+        n_nodes_val = (1 << args.forest_height) - 1
     tree_reduce_max_depth = max(2, min(4, args.tree_reduce_max_depth))
     if tree_reduce_max_depth != args.tree_reduce_max_depth and verbose:
-        print(f"  tree_reduce_max_depth clamped to {tree_reduce_max_depth} (allowed 2..3)")
+        print(f"  tree_reduce_max_depth clamped to {tree_reduce_max_depth} (allowed 2..4)")
     per_section_optimize = (
         None if args.per_section_optimize_secs is None or args.per_section_optimize_secs <= 0
         else args.per_section_optimize_secs
     )
-
-    # With --force-zero-gap, CP-SAT must prove optimality; use longer time limit if needed
     cpsat_time_limit = args.cpsat_time_limit
     if args.force_zero_gap and cpsat_time_limit < 7200:
-        cpsat_time_limit = 7200  # 2 hours so solver has time to prove optimality
+        cpsat_time_limit = 7200
         if verbose:
             print(f"  (force_zero_gap: using cpsat_time_limit={cpsat_time_limit:.0f}s to allow proving optimality)")
 
     scheduler_name = "greedy" if args.use_greedy else f"CP-SAT ({cpsat_time_limit:.0f}s)"
     print(f"Building SSA kernel with {scheduler_name}...")
-    print(f"  forest_height={args.forest_height}, n_nodes={args.n_nodes}")
+    print(f"  forest_height={args.forest_height}, n_nodes={n_nodes_val}")
     print(f"  batch_size={args.batch_size}, rounds={args.rounds}")
     print(f"  enable_valu_shift={args.enable_valu_shift}")
     print(f"  tree_reduce_max_depth={tree_reduce_max_depth}")
@@ -176,8 +102,9 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
-    if optional_constraint_groups_to_disable:
-        names = [g.name for g in optional_constraint_groups_to_disable]
+    build_kwargs = args_to_build_kwargs(args)
+    if build_kwargs.get("optional_constraint_groups_to_disable"):
+        names = [g.name for g in build_kwargs["optional_constraint_groups_to_disable"]]
         print(f"  disable_optional_constraint_groups={names}")
     if args.force_zero_gap:
         print(f"  force_zero_gap=True")
@@ -190,54 +117,12 @@ def main():
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
-    # Always write schedule JSON (default path or user-specified); include run metadata
     output_json_path = args.output_json if args.output_json is not None else DEFAULT_SCHEDULER_JSON
-    run_options = {
-        "forest_height": args.forest_height,
-        "n_nodes": args.n_nodes,
-        "batch_size": args.batch_size,
-        "rounds": args.rounds,
-        "use_cpsat": use_cpsat,
-        "cpsat_time_limit": cpsat_time_limit,
-        "per_section_optimize_secs": per_section_optimize,
-        "enable_valu_shift": args.enable_valu_shift,
-        "tree_reduce_max_depth": tree_reduce_max_depth,
-        "const_choice": args.const_choice,
-        "select_choice": args.select_choice,
-        "valu_shift": args.valu_shift,
-        "force_zero_gap": args.force_zero_gap and use_cpsat,
-        "enable_asap_alap_tightening": args.enable_asap_alap_tightening and use_cpsat,
-        "enable_scratch_tightening": args.enable_scratch_tightening and use_cpsat,
-        "scheduling_pressure_policy": args.scheduling_pressure_policy,
-        "enable_cse_groups": not args.no_cse_groups,
-    }
-    git_sha = get_git_sha()
-
     start_time = time.time()
-    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
-        forest_height=args.forest_height,
-        n_nodes=args.n_nodes,
-        batch_size=args.batch_size,
-        rounds=args.rounds,
-        enable_valu_shift=args.enable_valu_shift,
+    instrs, stats = build_kernel_with_args(
+        args,
         verbose=verbose,
-        use_cpsat=use_cpsat,
-        cpsat_time_limit=cpsat_time_limit,
-        per_section_optimize_secs=per_section_optimize,
         output_json=output_json_path,
-        tree_reduce_max_depth=tree_reduce_max_depth,
-        const_choice=args.const_choice,
-        select_choice=args.select_choice,
-        valu_shift=args.valu_shift,
-        force_zero_gap=args.force_zero_gap if use_cpsat else None,
-        enable_asap_alap_tightening=args.enable_asap_alap_tightening if use_cpsat else None,
-        enable_scratch_tightening=args.enable_scratch_tightening if use_cpsat else None,
-        run_options_json=json.dumps(run_options),
-        git_sha=git_sha,
-        comment=args.comment,
-        scheduling_pressure_policy=args.scheduling_pressure_policy,
-        optional_constraint_groups_to_disable=optional_constraint_groups_to_disable,
-        enable_cse_groups=None if args.no_cse_groups is False else False,
     )
     build_time = time.time() - start_time
 

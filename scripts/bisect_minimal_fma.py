@@ -28,9 +28,14 @@ import argparse
 import os
 import sys
 
-# Allow importing bisect_common when run as uv run python scripts/bisect_minimal_fma.py
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bisect_common import run_one
+# Ensure project root is first so stdlib "bisect" is not shadowed by scripts/bisect.py
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _root)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir in sys.path:
+    sys.path.remove(_script_dir)
+
+from scripts.bisect_common import run_one
 
 
 def main():

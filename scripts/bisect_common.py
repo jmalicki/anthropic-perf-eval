@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Shared helper for bisection scripts: build generate_ssa_kernel.py argv and run.
+"""Shared helper for bisection scripts: run kernel build and validation.
 
-Used by bisect.py, bisect_cpsat_validation.py, and bisect_minimal_fma.py so
-CLI construction and subprocess invocation live in one place.
+Used by bisect.py, bisect_cpsat_validation.py, and bisect_minimal_fma.py.
+Calls scheduler_rs in-process via kernel_build_args.build_kernel_with_args.
 """
 
+import os
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Optional
+
+# Import from project root (scripts/ is a subdir)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from kernel_build_args import build_kernel_with_args
 
 
 def parse_solver_status(stdout: str, stderr: str) -> Optional[str]:
@@ -65,57 +74,63 @@ def run_one(
     quiet: bool = True,
     timeout_sec: Optional[float] = None,
     return_full_output: bool = False,
+    tree_reduce_max_depth: Optional[int] = None,
+    no_cse_groups: bool = False,
 ):
-    """Run generate_ssa_kernel.py with given params.
+    """Build kernel and optionally validate. Calls Rust in-process via kernel_build_args.
 
     Returns (success, stderr_snippet) by default. If return_full_output=True,
-    returns (success, stderr_snippet, stdout, stderr) so callers can parse solver status.
+    returns (success, stderr_snippet, stdout, stderr) - stdout/stderr are empty for in-process.
 
-    disable_constraints: None (no disable), or list of group names (e.g. ["capacity_valu"]),
-    or comma-separated string (parsed and passed as --disable-cpsat-constraints).
+    script_path: unused (kept for backward compat); build is in-process.
+    disable_constraints: None, or list of group names, or comma-separated string.
     """
+    import random
+
     nn = n_nodes_val if n_nodes_val is not None else n_nodes(forest_height)
-    cmd = [
-        sys.executable,
-        script_path,
-        "--rounds",
-        str(rounds),
-        "--batch-size",
-        str(batch_size),
-        "--forest-height",
-        str(forest_height),
-        "--n-nodes",
-        str(nn),
-        "--seed",
-        str(seed),
-        "--const-choice",
-        const_choice,
-        "--select-choice",
-        select_choice,
-        "--valu-shift",
-        valu_shift,
-    ]
-    if validate:
-        cmd.append("--validate")
-    if quiet:
-        cmd.append("-q")
+    disable_str = None
     if disable_constraints is not None:
         if isinstance(disable_constraints, str):
-            groups = [s.strip() for s in disable_constraints.split(",") if s.strip()]
+            disable_str = disable_constraints
         else:
-            groups = list(disable_constraints)
-        if groups:
-            cmd.extend(["--disable-cpsat-constraints", ",".join(groups)])
-    if use_greedy:
-        cmd.append("--use-greedy")
-    else:
-        cmd.extend(["--cpsat-time-limit", str(cpsat_time_limit)])
-    timeout = timeout_sec if timeout_sec is not None else (cpsat_time_limit + 30 if not use_greedy else 60)
-    result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True, timeout=timeout)
-    snippet = ""
-    if result.stderr:
-        lines = result.stderr.strip().splitlines()
-        snippet = "\n".join(lines[-8:]) if len(lines) > 8 else result.stderr.strip()
+            disable_str = ",".join(disable_constraints)
+
+    try:
+        instrs, stats = build_kernel_with_args(
+            args=None,
+            verbose=not quiet,
+            output_json=None,
+            use_git_sha=False,
+            forest_height=forest_height,
+            n_nodes=nn,
+            batch_size=batch_size,
+            rounds=rounds,
+            use_greedy=use_greedy,
+            cpsat_time_limit=cpsat_time_limit,
+            const_choice=const_choice,
+            select_choice=select_choice,
+            valu_shift=valu_shift,
+            disable_cpsat_constraints=disable_str,
+            tree_reduce_max_depth=tree_reduce_max_depth,
+            no_cse_groups=no_cse_groups,
+        )
+    except Exception as e:
+        snippet = str(e)
+        if return_full_output:
+            return False, snippet, "", snippet
+        return False, snippet
+
+    if not validate:
+        if return_full_output:
+            return True, "", "", ""
+        return True, ""
+
+    # Validate
+    from generate_ssa_kernel import validate_kernel
+
+    random.seed(seed)
+    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed)
+    snippet = "Validation failed" if not correct else ""
     if return_full_output:
-        return result.returncode == 0, snippet, result.stdout or "", result.stderr or ""
-    return result.returncode == 0, snippet
+        return correct, snippet, "", ""
+    return correct, snippet

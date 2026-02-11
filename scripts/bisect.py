@@ -22,6 +22,9 @@ Usage (from project root):
   # Shrink to find minimal failing config
   uv run python scripts/bisect.py --shrink --select-choice fma --valu-shift valu
 
+  # Find smallest depth-3 validation failure (tree-reduce depth 3, no CSE)
+  uv run python scripts/bisect.py --shrink-depth3
+
   # Fixed config only (single run)
   uv run python scripts/bisect.py --rounds 2 --batch-size 16
 """
@@ -31,9 +34,14 @@ import itertools
 import os
 import sys
 
-# Allow importing bisect_common when run as uv run python scripts/bisect.py
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bisect_common import run_one, parse_solver_status
+# Ensure project root is first so stdlib "bisect" is not shadowed by this script
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _root)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir in sys.path:
+    sys.path.remove(_script_dir)
+
+from scripts.bisect_common import run_one, parse_solver_status
 
 
 def _constraint_group_names():
@@ -130,6 +138,23 @@ def main():
         action="store_true",
         help="Shrink from reference (2,16,10): vary one dimension at a time, report pass/fail",
     )
+    parser.add_argument(
+        "--shrink-depth3",
+        action="store_true",
+        help="Find smallest depth-3 validation failure: sweep (r,b) with tree-reduce-max-depth 3, no-cse-groups",
+    )
+    parser.add_argument(
+        "--tree-reduce-max-depth",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Pass --tree-reduce-max-depth N to generate_ssa_kernel (e.g. 3 for depth-3)",
+    )
+    parser.add_argument(
+        "--no-cse-groups",
+        action="store_true",
+        help="Pass --no-cse-groups to generate_ssa_kernel (simplify debugging)",
+    )
 
     args = parser.parse_args()
 
@@ -144,6 +169,13 @@ def main():
         if b % 8 != 0:
             print(f"Error: batch_size must be a multiple of 8 (VLEN). Got {b}.", file=sys.stderr)
             return 1
+
+    # Extra kwargs for depth-3 / CSE debugging
+    extra_kw = {}
+    if args.tree_reduce_max_depth is not None:
+        extra_kw["tree_reduce_max_depth"] = args.tree_reduce_max_depth
+    if args.no_cse_groups:
+        extra_kw["no_cse_groups"] = True
 
     # Resolve single-value vs sweep for choice
     if args.sweep_choice:
@@ -214,6 +246,56 @@ def main():
         r, b, h = args.rounds[0], args.batch_size[0], args.forest_height[0]
         size_axis = [("", {"rounds": r, "batch_size": b, "forest_height": h})]
 
+    # ---- Shrink depth-3 mode (smallest repro for depth-3 validation bug) ----
+    if args.shrink_depth3:
+        depth3_kw = {
+            "tree_reduce_max_depth": 3,
+            "no_cse_groups": True,
+            "const_choice": "optimize",
+            "select_choice": "optimize",
+            "valu_shift": "optimize",
+            "cpsat_time_limit": min(args.cpsat_time_limit, 90.0),
+            "seed": args.seed,
+            "validate": True,
+            "quiet": True,
+        }
+        print("Shrink depth-3: find smallest (rounds, batch_size) that fails validation")
+        print("  tree_reduce_max_depth=3, no_cse_groups, forest_height=10")
+        print("  (Use --use-greedy for faster iteration; CP-SAT for accuracy)")
+        print()
+
+        # Grid: rounds 2,3,4 × batch 8,16,32,40,48,56,64 (from BUGS.md: 4r/8 fails, 3r/40-64 fail)
+        configs = [
+            (2, 8), (2, 16), (2, 32),
+            (3, 8), (3, 16), (3, 32), (3, 40), (3, 48), (3, 56), (3, 64),
+            (4, 8), (4, 16), (4, 32),
+        ]
+        use_greedy = args.use_greedy
+        failed = []
+        for rounds, batch in configs:
+            ok, _ = run_one(
+                project_root,
+                script,
+                rounds=rounds,
+                batch_size=batch,
+                forest_height=10,
+                use_greedy=use_greedy,
+                **depth3_kw,
+            )
+            status = "FAIL" if not ok else "PASS"
+            print(f"  rounds={rounds} batch={batch}: {status}")
+            if not ok:
+                failed.append((rounds, batch))
+
+        print()
+        if failed:
+            r, b = min(failed, key=lambda t: (t[0], t[1]))
+            print(f"Smallest failing: rounds={r}, batch_size={b}")
+            print(f"  uv run generate_ssa_kernel.py --rounds {r} --batch-size {b} --tree-reduce-max-depth 3 --no-cse-groups --validate --save-kernel kernel_{r}r_{b}b_d3.json")
+        else:
+            print("No failures in grid. Try larger batch (e.g. 4r/256) or different choice options.")
+        return 0 if not failed else 1
+
     # ---- Shrink mode ----
     if args.shrink:
         r0, b0, h0 = 2, 16, 10
@@ -242,6 +324,7 @@ def main():
             "disable_constraints": fixed_disable,
             "validate": True,
             "quiet": True,
+            **extra_kw,
         }
 
         ok, _ = run_one(project_root, script, use_greedy=True, **{**base_kw, "use_greedy": True})
@@ -278,7 +361,7 @@ def main():
         (conlbl, condisable) = constraint_axis[0]
         (slbl, skw) = size_axis[0]
         label = " ".join(filter(None, [clbl, conlbl, slbl])).strip() or "greedy"
-        kwargs = {**ckw, **skw, "disable_constraints": condisable, "use_greedy": True, "cpsat_time_limit": args.cpsat_time_limit, "seed": args.seed, "validate": True, "quiet": True}
+        kwargs = {**ckw, **skw, "disable_constraints": condisable, "use_greedy": True, "cpsat_time_limit": args.cpsat_time_limit, "seed": args.seed, "validate": True, "quiet": True, **extra_kw}
         print(f"Greedy (baseline): {label}...", flush=True)
         ok, _ = run_one(project_root, script, **kwargs)
         print(f"  {'PASS' if ok else 'FAIL'}")
@@ -301,6 +384,7 @@ def main():
             seed=args.seed,
             validate=True,
             quiet=True,
+            **extra_kw,
         )
         print(f"  Greedy (baseline): {'PASS' if ok else 'FAIL'}")
         if not ok:
@@ -326,6 +410,7 @@ def main():
                     "validate": True,
                     "quiet": True,
                     "return_full_output": sweep_constraints,
+                    **extra_kw,
                 }
                 print(f"  {label}...", end=" ", flush=True)
                 if sweep_constraints:
