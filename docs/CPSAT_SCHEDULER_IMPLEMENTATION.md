@@ -109,10 +109,12 @@ model.add_no_overlap(intervals);
 // Provide warm-start hint
 model.add_hint(var, value);
 
-// Set objective
+// Set objective (simplified; see below for SSA implementation)
 model.minimize(makespan);
 model.maximize(expr);
 ```
+
+**SSA implementation:** The objective is not makespan alone; see the **canonical description** in `scheduler_rs/src/cpsat_scheduler/model.rs` (search for "CANONICAL DESCRIPTION" or "Objective = scale * makespan"). That block defines the composite objective and tie-breaker; update it there when the tie-breaker changes.
 
 ### Solving
 ```rust

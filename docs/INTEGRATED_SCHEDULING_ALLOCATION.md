@@ -499,6 +499,8 @@ model.minimize(makespan);
 // model.minimize(makespan * 1000 + num_spills * 100);
 ```
 
+**Note (SSA CP-SAT):** The real implementation uses a composite objective (makespan + tie-breaker). See the canonical description in `scheduler_rs/src/cpsat_scheduler/model.rs` (search for "CANONICAL DESCRIPTION").
+
 ### 4.10 Implied Constraints (Strengthen Propagation)
 
 ```rust

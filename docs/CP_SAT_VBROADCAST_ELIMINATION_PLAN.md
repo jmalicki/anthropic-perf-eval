@@ -118,7 +118,7 @@ Make the **combined** transform (shift consumers of a vbroadcast to ALU + elimin
 
 ## Tiebreaker objective
 
-The CP-SAT model currently minimizes **makespan** with a **tie-breaker** so that when makespan is equal, the solver prefers schedules that pack ops earlier: `objective = scale * makespan + sum(tie_breaker_vars)` where `tie_breaker_vars` are effective cycles (completion_cycle for shifted, cycle for ConstChoice/SelectChoice/others) and `scale` is chosen so `scale > max_sum` so that `floor(objective/scale) = makespan` ([cpsat_scheduler.rs](scheduler_rs/src/cpsat_scheduler.rs) around 3518–3635). The tie-breaker thus rewards earlier placement of shiftable VALU, ConstChoice, and SelectChoice ops.
+The CP-SAT model minimizes **makespan** with a **tie-breaker**; see the **canonical description** in `scheduler_rs/src/cpsat_scheduler/model.rs` (search for "CANONICAL DESCRIPTION" or "Objective = scale * makespan"). That block defines the formula and semantics; the tie-breaker rewards earlier placement and fills earlier slots even when that does not reduce makespan.
 
 ### No separate elimination term needed
 

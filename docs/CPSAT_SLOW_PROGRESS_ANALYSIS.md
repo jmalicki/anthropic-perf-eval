@@ -4,7 +4,7 @@ This document explains why the full-kernel CP-SAT run advances "one cycle at a t
 
 ## Why "One Cycle at a Time"?
 
-**This is expected, not a bug.** The objective is **minimize makespan** (total cycles). Makespan is an integer: the number of cycles. So:
+**This is expected, not a bug.** The objective is **minimize makespan** (total cycles) plus a tie-breaker that rewards earlier completion (canonical description: `scheduler_rs/src/cpsat_scheduler/model.rs`, search for "CANONICAL DESCRIPTION"). Makespan is an integer: the number of cycles. So:
 
 - When the solver has a feasible solution with makespan **460**, the only strictly better values are **459, 458, …**
 - Each improvement is therefore **one cycle** (460 → 456 → 455 → … → 429).
