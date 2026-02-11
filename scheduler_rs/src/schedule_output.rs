@@ -351,6 +351,8 @@ struct SsaScheduleOutput {
     ssa_cycle_assignments: Option<Vec<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssa_ops_bulk_move: Option<Vec<SsaOpBulkMoveOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssa_ops: Option<Vec<SsaOpDebugOut>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     eliminated_vbroadcast_ops: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +370,34 @@ struct SsaScheduleOutput {
 struct SsaOpBulkMoveOut {
     id: usize,
     dep_ids: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct SsaOpDebugOut {
+    id: usize,
+    engine: String,
+    opcode: String,
+    dest: Option<String>, // VReg as string
+    srcs: Vec<SsaOperandOut>,
+    dep_ids: Vec<usize>,
+    cycle: i32,
+    var_type: Option<String>,
+    source_info: Option<SsaSourceInfoOut>,
+}
+
+#[derive(Serialize)]
+enum SsaOperandOut {
+    VReg { id: u32, width: String }, // "scalar" or "vector"
+    Imm(i64),
+}
+
+#[derive(Serialize)]
+struct SsaSourceInfoOut {
+    round: Option<usize>,
+    phase: Option<String>,
+    group: Option<usize>,
+    tree_depth: Option<usize>,
+    iter: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +529,60 @@ pub fn write_ssa_schedule_json(
         }
     };
 
+    use crate::types::{Operand, VRegWidth};
+
+    // Convert SSA ops to debug format
+    let ssa_ops_debug: Option<Vec<SsaOpDebugOut>> = result.ssa_ops.as_ref().map(|ssa_ops| {
+        ssa_ops
+            .iter()
+            .map(|op| {
+                let srcs: Vec<SsaOperandOut> = op
+                    .srcs
+                    .iter()
+                    .map(|src| match src {
+                        Operand::VReg(vreg) => SsaOperandOut::VReg {
+                            id: vreg.id,
+                            width: match vreg.width {
+                                VRegWidth::Scalar => "scalar".to_string(),
+                                VRegWidth::Vector => "vector".to_string(),
+                            },
+                        },
+                        Operand::Imm(val) => SsaOperandOut::Imm(*val),
+                    })
+                    .collect();
+
+                let source_info = op.source_info.as_ref().map(|info| SsaSourceInfoOut {
+                    round: info.round,
+                    phase: Some(info.phase.as_str().to_string()),
+                    group: info.group,
+                    tree_depth: info.tree_depth,
+                    iter: info.iter,
+                });
+
+                SsaOpDebugOut {
+                    id: op.id,
+                    engine: op.engine.as_str().to_string(),
+                    opcode: op.opcode.as_str().to_string(),
+                    dest: op.dest.as_ref().map(|v| {
+                        format!(
+                            "v{}_{}",
+                            v.id,
+                            match v.width {
+                                VRegWidth::Scalar => "s",
+                                VRegWidth::Vector => "v",
+                            }
+                        )
+                    }),
+                    srcs,
+                    dep_ids: op.dep_ids.iter().copied().collect(),
+                    cycle: op.cycle,
+                    var_type: op.var_type.as_ref().map(|vt| vt.as_str().to_string()),
+                    source_info,
+                }
+            })
+            .collect()
+    });
+
     let valu_shift_debug = if !result.shifted_alu_cycles.is_empty() {
         let mut spread_count = 0;
         let mut clustered_count = 0;
@@ -571,6 +655,7 @@ pub fn write_ssa_schedule_json(
                 })
                 .collect()
         }),
+        ssa_ops: ssa_ops_debug,
         eliminated_vbroadcast_ops: result.eliminated_vbroadcast_ops.clone(),
         run_options,
         git_sha,

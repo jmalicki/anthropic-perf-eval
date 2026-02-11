@@ -83,6 +83,8 @@ pub struct SsaScheduleResult {
     pub ssa_cycle_assignments: Option<Vec<i32>>,
     /// SSA-level (id, dep_ids) per op in same order. For bulk-move from JSON.
     pub ssa_ops_bulk_move: Option<Vec<(usize, Vec<usize>)>>,
+    /// Full SSA ops (for debugging/inspection). None if not needed.
+    pub ssa_ops: Option<Vec<SsaOp>>,
     /// Op IDs of vbroadcasts eliminated by CP-SAT (not emitted; consumers use scalar producer). Empty for greedy.
     pub eliminated_vbroadcast_ops: Vec<usize>,
     /// Proven lower bound on cycles (CP-SAT only). When Optimal, equals cycles; when Feasible, solver best_bound in cycles.

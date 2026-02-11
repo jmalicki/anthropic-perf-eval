@@ -348,6 +348,7 @@ impl PipelineContext {
                 .cpsat_extra
                 .as_ref()
                 .map(|e| e.ssa_ops_bulk_move.clone()),
+            ssa_ops: Some(self.ops.clone()), // Include SSA ops for debugging/inspection
             eliminated_vbroadcast_ops: self
                 .final_decisions
                 .eliminated_vbroadcast_ops

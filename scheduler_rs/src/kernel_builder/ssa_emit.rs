@@ -1060,6 +1060,7 @@ impl SsaTickTockKernelBuilder {
     pub(super) fn emit_hash(&mut self, n_groups: usize, n_iters: usize) {
         let rnd = self.emit.current_round.unwrap_or(0);
         let enable_trace = self.config.spec.enable_trace_ids;
+        let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
 
         for hi in 0..6 {
             let (op1, _, op2, op3, _) = HASH_STAGES[hi];
@@ -1072,6 +1073,14 @@ impl SsaTickTockKernelBuilder {
                         continue;
                     }
                     let val = self.ctx.all_val[g].unwrap();
+                    
+                    // Debug: log Round N hash reading Round N-1 hash (or initial value)
+                    if debug && hi == 0 && it == 0 && i == 0 {
+                        eprintln!(
+                            "[EMISSION DEBUG] Round {} hash phase: reading all_val[{}] = VReg {:?} (Round {} hash output)",
+                            rnd, g, val, if rnd > 0 { rnd - 1 } else { 0 }
+                        );
+                    }
 
                     if self.ctx.hash_fma_mult[hi].is_some() {
                         // FMA optimization
@@ -1081,7 +1090,15 @@ impl SsaTickTockKernelBuilder {
                         }
                         let v_mult = *self.ctx.v_hash_mult.get(&hi).unwrap();
                         let v_hc = self.ctx.v_hc[hi].unwrap();
-                        self.ctx.all_val[g] = Some(self.emit.emit_fma(val, v_mult, v_hc));
+                        let new_val = self.emit.emit_fma(val, v_mult, v_hc);
+                        // Debug: log Round N hash updating all_val[g]
+                        if debug && hi == 5 && it == 0 && i == 0 {
+                            eprintln!(
+                                "[EMISSION DEBUG] Round {} hash phase (stage 5 FMA): updating all_val[{}] = VReg {:?} -> {:?}",
+                                rnd, g, val, new_val
+                            );
+                        }
+                        self.ctx.all_val[g] = Some(new_val);
                     } else if hi == 5 {
                         // Stage 5 special handling (Shr + Xor; Xor produces hashed_val)
                         let v_hs = self.ctx.v_hs[hi].unwrap();
@@ -1090,7 +1107,15 @@ impl SsaTickTockKernelBuilder {
                             self.emit
                                 .set_next_trace_id(format!("r{}_g{}_hashed_val", rnd, g));
                         }
-                        self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, t));
+                        let new_val = self.emit.emit_valu(Opcode::Xor, val, t);
+                        // Debug: log Round N hash updating all_val[g]
+                        if debug && it == 0 && i == 0 {
+                            eprintln!(
+                                "[EMISSION DEBUG] Round {} hash phase (stage 5): updating all_val[{}] = VReg {:?} -> {:?}",
+                                rnd, g, val, new_val
+                            );
+                        }
+                        self.ctx.all_val[g] = Some(new_val);
                     } else {
                         // General case
                         let v_hc = self.ctx.v_hc[hi].unwrap();
@@ -1160,6 +1185,16 @@ impl SsaTickTockKernelBuilder {
 
                 let val = self.ctx.all_val[g].unwrap();
                 let idx = self.ctx.all_idx[g].unwrap();
+                
+                // Debug: log what VReg all_val[g] contains when branch runs
+                let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
+                if debug {
+                    let rnd = self.emit.current_round.unwrap_or(0);
+                    eprintln!(
+                        "[EMISSION DEBUG] Round {} branch phase: reading all_val[{}] = VReg {:?} (group {})",
+                        rnd, g, val, g
+                    );
+                }
 
                 if is_wrap_round {
                     // Wrap to index 0
