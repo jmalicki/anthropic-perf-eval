@@ -72,3 +72,6 @@ greedy_policy_*.json
 
 # Catch-all for JSON artifacts not covered above
 *.json
+
+# Debug artifacts
+*.pb
