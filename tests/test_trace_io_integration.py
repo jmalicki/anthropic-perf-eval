@@ -43,6 +43,8 @@ def test_trace_io_integration_disabled():
         use_greedy=True,
         verbose=False,
     )
+    assert instrs is not None
+    assert len(instrs) > 0
 
     random.seed(123)
     forest = Tree.generate(10)

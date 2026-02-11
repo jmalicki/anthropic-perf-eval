@@ -117,12 +117,17 @@ def main():
             model = cp_model.CpModel()
             model.Proto().CopyFrom(proto)
             if hasattr(model, "Validate"):
-                model.Validate()
-                print("\nValidation: OK")
+                validation_result = model.Validate()
+                if validation_result:
+                    print(f"\nValidation error: {validation_result}")
+                    return 1
+                else:
+                    print("\nValidation: OK")
             else:
                 print("\nValidation: (Validate not available in this ortools version)")
         except Exception as e:
             print(f"\nValidation error: {e}")
+            return 1
 
     return 0
 
