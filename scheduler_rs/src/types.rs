@@ -1950,6 +1950,78 @@ impl UsageAccounting {
 }
 
 // ============================================================================
+// SSA ID Encoding/Decoding
+// ============================================================================
+
+/// Wrapper for SSA operation IDs with encoding/decoding support.
+///
+/// When VALU ops are expanded to multiple ALU ops (e.g., 8 lanes), the expanded
+/// ops use encoded IDs: `ssa_id * 1000 + sub_index` where sub_index is 0-7.
+/// This struct provides methods to encode and decode these IDs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct SsaId(pub usize);
+
+impl SsaId {
+    /// Create a new SsaId from a raw usize.
+    pub fn new(id: usize) -> Self {
+        SsaId(id)
+    }
+
+    /// Get the raw usize value.
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+
+    /// Encode an SSA ID with a sub-index (for expanded ops).
+    ///
+    /// When a VALU op is expanded to multiple ALU ops, each gets a unique ID:
+    /// `ssa_id * 1000 + sub_index` where sub_index is typically 0-7.
+    pub fn encode_with_sub_index(ssa_id: usize, sub_index: usize) -> Self {
+        SsaId(ssa_id * 1000 + sub_index)
+    }
+
+    /// Decode an ID to get the original SSA ID.
+    ///
+    /// If the ID is encoded (>= 1000), extracts the SSA ID via division.
+    /// Otherwise, returns the ID as-is.
+    pub fn decode_ssa_id(self) -> usize {
+        if self.0 >= 1000 {
+            self.0 / 1000
+        } else {
+            self.0
+        }
+    }
+
+    /// Check if this ID is encoded (has a sub-index).
+    pub fn is_encoded(self) -> bool {
+        self.0 >= 1000
+    }
+
+    /// Extract the sub-index from an encoded ID.
+    ///
+    /// Returns None if the ID is not encoded.
+    pub fn sub_index(self) -> Option<usize> {
+        if self.0 >= 1000 {
+            Some(self.0 % 1000)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<usize> for SsaId {
+    fn from(id: usize) -> Self {
+        SsaId(id)
+    }
+}
+
+impl From<SsaId> for usize {
+    fn from(id: SsaId) -> Self {
+        id.0
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2522,5 +2594,33 @@ mod tests {
         // When self_is_shiftable=false: default offsets
         assert_eq!(op.precedence_offset_for_asap(false), 1);
         assert_eq!(op.precedence_offset_for_alap(false), 1);
+    }
+
+    #[test]
+    fn test_ssa_id_encoding_decoding() {
+        // Test basic ID (not encoded)
+        let id = SsaId::new(42);
+        assert_eq!(id.decode_ssa_id(), 42);
+        assert!(!id.is_encoded());
+        assert_eq!(id.sub_index(), None);
+
+        // Test encoded ID
+        let encoded = SsaId::encode_with_sub_index(42, 5);
+        assert_eq!(encoded.as_usize(), 42005);
+        assert_eq!(encoded.decode_ssa_id(), 42);
+        assert!(encoded.is_encoded());
+        assert_eq!(encoded.sub_index(), Some(5));
+
+        // Test boundary case (id = 1000)
+        let boundary = SsaId::new(1000);
+        assert_eq!(boundary.decode_ssa_id(), 1);
+        assert!(boundary.is_encoded());
+        assert_eq!(boundary.sub_index(), Some(0));
+
+        // Test From/Into conversions
+        let id_from_usize: SsaId = 123.into();
+        assert_eq!(id_from_usize.as_usize(), 123);
+        let usize_from_id: usize = id_from_usize.into();
+        assert_eq!(usize_from_id, 123);
     }
 }

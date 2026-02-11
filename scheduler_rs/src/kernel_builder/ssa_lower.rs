@@ -15,7 +15,7 @@ const CSE_SHARED_SUB_PREFIX: usize = 0xC5E0_0000;
 const TRACE_DEBUG_OP_PREFIX: usize = 0xD3B0_0000;
 
 use crate::address_assign::lower_ssa_op;
-use crate::types::{Engine, Op, SlotVal, SsaOp, VReg, VLEN};
+use crate::types::{Engine, Op, SlotVal, SsaId, SsaOp, VReg, VLEN};
 
 /// Check if an SSA VALU op can be shifted to ALU.
 ///
@@ -724,7 +724,7 @@ pub fn expand_ssa_valu_to_alu(
         };
 
         ops.push(Op {
-            id: ssa_op.id * 1000 + i, // Unique ID for expanded op
+            id: SsaId::encode_with_sub_index(ssa_op.id, i).as_usize(), // Unique ID for expanded op
             engine: Engine::Alu,
             slot,
             cycle,

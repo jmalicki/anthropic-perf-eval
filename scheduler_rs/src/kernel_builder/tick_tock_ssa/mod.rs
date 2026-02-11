@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::address_assign::AddressAssignmentResult;
 use crate::cpsat_scheduler::OptionalConstraintGroup;
-use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, SsaOp, UsageAccounting, VReg, VarType};
+use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, SsaId, SsaOp, UsageAccounting, VReg, VarType};
 use crate::types::SlotVal;
 
 use super::config::{fma_multiplier, KernelConfig};
@@ -159,7 +159,7 @@ fn contiguous_ranges_from_addresses(addrs: &HashSet<i64>) -> Vec<(i64, usize)> {
 pub struct ScratchConflictDebugContext<'a> {
     pub address_result: &'a AddressAssignmentResult,
     pub ssa_ops: &'a [SsaOp],
-    pub shifted_alu_cycles: &'a std::collections::HashMap<usize, Vec<i32>>,
+    pub shifted_alu_cycles: HashMap<SsaId, Vec<i32>>,
 }
 
 /// Panics if two distinct ops in the same cycle write overlapping scratch ranges.
@@ -203,26 +203,26 @@ fn verify_no_same_cycle_scratch_write_conflict(
 
                     // Emit debug info when available (VReg intervals, addresses, shifted_alu_cycles)
                     if let Some(ctx) = debug_ctx {
-                        let ssa_id1 = if id1 >= 1000 { id1 / 1000 } else { id1 };
-                        let ssa_id2 = if id2 >= 1000 { id2 / 1000 } else { id2 };
+                        let ssa_id1 = SsaId::from(id1);
+                        let ssa_id2 = SsaId::from(id2);
                         eprintln!(
-                            "[DEBUG scratch conflict] cycle {}: op id={} (ssa {}) vs op id={} (ssa {})",
+                            "[DEBUG scratch conflict] cycle {}: op id={} (ssa {:?}) vs op id={} (ssa {:?})",
                             _cycle, id1, ssa_id1, id2, ssa_id2
                         );
                         for (op_id, ssa_id) in [(id1, ssa_id1), (id2, ssa_id2)] {
-                            if let Some(ssa_op) = ctx.ssa_ops.iter().find(|o| o.id == ssa_id) {
+                            if let Some(ssa_op) = ctx.ssa_ops.iter().find(|o| SsaId::from(o.id) == ssa_id) {
                                 if let Some(dest) = ssa_op.dest {
                                     if let Some(interval) = ctx.address_result.live_intervals.get(&dest) {
                                         let addr = ctx.address_result.vreg_to_addr.get(&dest);
                                         eprintln!(
-                                            "  ssa op {} dest {:?}: interval [{}, {}], addr {:?}",
+                                            "  ssa op {:?} dest {:?}: interval [{}, {}], addr {:?}",
                                             ssa_id, dest, interval.start, interval.end,
                                             addr
                                         );
                                     }
                                     if let Some(alu_cycles) = ctx.shifted_alu_cycles.get(&ssa_id) {
                                         eprintln!(
-                                            "  ssa op {} shifted_alu_cycles: {:?}",
+                                            "  ssa op {:?} shifted_alu_cycles: {:?}",
                                             ssa_id, alu_cycles
                                         );
                                     }
@@ -1188,10 +1188,19 @@ impl SsaTickTockKernelBuilder {
         // Debug: assert no two ops in the same cycle write overlapping scratch addresses
         if cfg!(debug_assertions) {
             if let Some(ref ops) = ctx.lowered_ops {
-                let debug_ctx = ctx.address_result.as_ref().map(|ar| ScratchConflictDebugContext {
-                    address_result: ar,
-                    ssa_ops: &ctx.ops,
-                    shifted_alu_cycles: &ctx.final_decisions.shifted_alu_cycles,
+                let debug_ctx = ctx.address_result.as_ref().map(|ar| {
+                    // Convert HashMap<usize, Vec<i32>> to HashMap<SsaId, Vec<i32>> for type-safe lookups
+                    let shifted_alu_cycles: HashMap<SsaId, Vec<i32>> = ctx
+                        .final_decisions
+                        .shifted_alu_cycles
+                        .iter()
+                        .map(|(&k, v)| (SsaId::from(k), v.clone()))
+                        .collect();
+                    ScratchConflictDebugContext {
+                        address_result: ar,
+                        ssa_ops: &ctx.ops,
+                        shifted_alu_cycles,
+                    }
                 });
                 verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx);
             }
