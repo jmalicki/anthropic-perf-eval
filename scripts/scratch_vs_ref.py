@@ -10,15 +10,9 @@ Usage:
     --addr 21 --cycles 71 72 --group 0
 """
 
-import sys
-import os
-
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _root)
-if os.path.dirname(os.path.abspath(__file__)) in sys.path:
-    sys.path.remove(os.path.dirname(os.path.abspath(__file__)))
-
+import argparse
 import json
+import sys
 import random
 import argparse
 
@@ -42,11 +36,18 @@ def main():
     ap.add_argument("--addr", type=int, nargs="+", default=[21], help="Vector base address(s) to dump")
     ap.add_argument("--cycles", type=int, nargs="+", default=[70, 71, 72, 73, 74])
     ap.add_argument("--group", type=int, default=0, help="Group for ref trace (batch group*8..group*8+7)")
+    ap.add_argument("--ref-key", default="hashed_val", choices=["val", "node_val", "val_after_xor", "hashed_val"],
+                    help="Trace key to compare (default: hashed_val)")
+    ap.add_argument("--ref-round", type=int, default=None, help="Round for ref (default: rounds-1)")
     ap.add_argument("--seed", type=int, default=123)
     args = ap.parse_args()
 
-    with open(args.kernel) as f:
-        data = json.load(f)
+    try:
+        with open(args.kernel) as f:
+            data = json.load(f)
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError) as e:
+        print(f"Error reading kernel file '{args.kernel}': {e}", file=sys.stderr)
+        sys.exit(1)
     instrs = data.get("instrs", data) if isinstance(data, dict) else data
 
     random.seed(args.seed)
@@ -56,7 +57,7 @@ def main():
 
     # Run reference for trace
     trace_ref = {}
-    ref_results = list(reference_kernel2(copy(mem), trace_ref))
+    list(reference_kernel2(copy(mem), trace_ref))
 
     addrs = args.addr if isinstance(args.addr, list) else [args.addr]
     group = args.group
@@ -77,6 +78,18 @@ def main():
     machine2.prints = False
     core = machine2.cores[0]
 
+    # Validate target_cycles vs instruction length; extend with NOPs if needed
+    max_target = max(target_cycles, default=-1)
+    if max_target >= len(instrs):
+        n_missing = max_target - len(instrs) + 1
+        nop_bundle = {}
+        instrs = list(instrs) + [nop_bundle] * n_missing
+        print(
+            f"Warning: target_cycles up to {max_target} but kernel has only {len(instrs) - n_missing} cycles; "
+            f"appending {n_missing} NOP step(s) so those cycles are captured.",
+            file=sys.stderr,
+        )
+
     captures = {}  # cycle -> {addr: [vals]}
     for cycle_idx in range(len(instrs)):
         if cycle_idx in target_cycles:
@@ -88,9 +101,9 @@ def main():
         core.pc += 1
         machine2.step(instr, core)
 
-    # trace_ref keys: (round, batch_i, "hashed_val") or (round, batch_i, "val"), etc.
     n_rounds = args.rounds
-    round_idx = n_rounds - 1
+    round_idx = args.ref_round if args.ref_round is not None else n_rounds - 1
+    ref_key = args.ref_key
 
     print(f"Scratch at cycles {args.cycles} (group {group}, batch {batch_start}..{batch_start+7})")
     print()
@@ -102,16 +115,16 @@ def main():
         ref_vals = []
         for lane in range(8):
             bi = batch_start + lane
-            key = (round_idx, bi, "hashed_val")
+            key = (round_idx, bi, ref_key)
             ref_vals.append(trace_ref.get(key))
         if any(x is not None for x in ref_vals) and addrs:
             base = addrs[0]
             got = captures[c][base]
-            print(f"        REF (round {round_idx} hashed_val): {[hex(x) if x is not None else '?' for x in ref_vals]}")
+            print(f"        REF (round {round_idx} {ref_key}): {[hex(x) if x is not None else '?' for x in ref_vals]}")
             for lane in range(8):
                 g, r = got[lane], ref_vals[lane]
                 match = "OK" if r is not None and g == r else "MISMATCH"
-                print(f"        lane {lane}: got={hex(g)} ref={hex(r) if r else '?'} [{match}]")
+                print(f"        lane {lane}: got={hex(g)} ref={hex(r) if r is not None else '?'} [{match}]")
         print()
 
     return 0

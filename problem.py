@@ -118,6 +118,7 @@ class Machine:
         self.cycle = 0
         self.enable_pause = True
         self.enable_debug = True
+        self.trace_io_log: list = []
         if trace:
             self.setup_trace()
         else:
@@ -365,29 +366,57 @@ class Machine:
         }
         self.scratch_write = {}
         self.mem_write = {}
+        # First pass: run non-debug engines (populates scratch_write)
         for name, slots in instr.items():
             if name == "debug":
-                if not self.enable_debug:
-                    continue
-                for slot in slots:
-                    if slot[0] == "compare":
-                        loc, key = slot[1], slot[2]
-                        ref = self.value_trace[key]
-                        res = core.scratch[loc]
-                        assert res == ref, f"{res} != {ref} for {key} at pc={core.pc}"
-                    elif slot[0] == "vcompare":
-                        loc, keys = slot[1], slot[2]
-                        ref = [self.value_trace[key] for key in keys]
-                        res = core.scratch[loc : loc + VLEN]
-                        assert res == ref, (
-                            f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
-                        )
                 continue
             assert len(slots) <= SLOT_LIMITS[name]
             for i, slot in enumerate(slots):
                 if self.trace is not None:
                     self.trace_slot(core, slot, name, i)
                 ENGINE_FNS[name](core, *slot)
+        # Second pass: run debug ops (can read scratch_write for trace_output)
+        if self.enable_debug and "debug" in instr:
+            for slot in instr["debug"]:
+                if slot[0] == "compare":
+                    loc, key = slot[1], slot[2]
+                    ref = self.value_trace[key]
+                    res = core.scratch[loc]
+                    assert res == ref, f"{res} != {ref} for {key} at pc={core.pc}"
+                elif slot[0] == "vcompare":
+                    loc, keys = slot[1], slot[2]
+                    ref = [self.value_trace[key] for key in keys]
+                    res = core.scratch[loc : loc + VLEN]
+                    assert res == ref, (
+                        f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
+                    )
+                elif slot[0] == "trace_input":
+                    # ("trace_input", trace_id, n_elems, *input_addrs)
+                    # Read from core.scratch (inputs exist before this cycle)
+                    trace_id = slot[1]
+                    n_elems = slot[2]
+                    input_addrs = slot[3:]
+                    values = []
+                    for base in input_addrs:
+                        for i in range(n_elems):
+                            addr = base + i
+                            values.append(core.scratch[addr])
+                    self.trace_io_log.append(
+                        (self.cycle, "input", trace_id, tuple(values))
+                    )
+                elif slot[0] == "trace_output":
+                    # ("trace_output", trace_id, n_elems, dest_addr)
+                    trace_id = slot[1]
+                    n_elems = slot[2]
+                    dest_addr = slot[3]
+                    values = []
+                    for i in range(n_elems):
+                        addr = dest_addr + i
+                        val = self.scratch_write.get(addr, core.scratch[addr])
+                        values.append(val)
+                    self.trace_io_log.append(
+                        (self.cycle, "output", trace_id, tuple(values))
+                    )
         for addr, val in self.scratch_write.items():
             core.scratch[addr] = val
         for addr, val in self.mem_write.items():

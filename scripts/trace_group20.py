@@ -314,7 +314,7 @@ def main():
 
     # The tree values at the relevant indices
     print("\nTree values at traversal indices:")
-    for h in range(4):
+    for h in range(args.rounds):
         for i in range(group_start, group_end):
             idx = trace.get((h, i, "idx"), 0)
             tree_val = mem[forest_values_p + idx] if idx < n_nodes else "OOB"
@@ -751,7 +751,7 @@ def main():
 
     # Let's search for the tree values that should be loaded
     print("\nExpected tree values per round:")
-    for h in range(4):
+    for h in range(args.rounds):
         print(f"  Round {h}:")
         for i in range(group_start, group_end):
             idx = trace[(h, i, "idx")]
@@ -807,7 +807,7 @@ def main():
     # scratch addresses at some point.
 
     # Let's search for the expected hashed values for each round
-    for h in range(4):
+    for h in range(args.rounds):
         print(f"\nRound {h}: expected hashed values for group 20:")
         expected_hash = []
         for i in range(group_start, group_end):
@@ -832,7 +832,7 @@ def main():
             print(f"    NOT FOUND anywhere in scratch!")
 
     # Now let's look at the expected idx values after each round
-    for h in range(4):
+    for h in range(args.rounds):
         print(f"\nRound {h}: expected wrapped_idx for group 20:")
         expected_idx = []
         for i in range(group_start, group_end):
@@ -882,7 +882,7 @@ def main():
 
     # Expected memory addresses for tree node loads:
     print("\nExpected tree load addresses for group 20:")
-    for h in range(4):
+    for h in range(args.rounds):
         print(f"  Round {h}:")
         for i in range(group_start, group_end):
             idx = trace[(h, i, "idx")]

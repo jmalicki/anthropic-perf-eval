@@ -73,10 +73,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--force-zero-gap", action="store_true",
                        help="Force 0 integral gap for proven optimality")
     group.add_argument("--enable-asap-alap-tightening", action=argparse.BooleanOptionalAction,
-                       default=True,
-                       help="Enable ASAP/ALAP tightening (default: enabled)")
+                       default=False,
+                       help="Enable ASAP/ALAP slot tightening (default: disabled; non-default debugging option)")
     group.add_argument("--enable-scratch-tightening", action="store_true",
-                       help="Enable scratch-aware tightening (experimental)")
+                       help="Enable scratch-aware tightening (default: disabled; non-default debugging option)")
     group.add_argument("--scheduling-pressure-policy",
                        choices=["greedy", "throttled", "gated", "adaptive", "cascade"],
                        default="adaptive",
@@ -90,6 +90,8 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help=f"Disable CP-SAT constraint groups. Valid: {_constraint_names}")
     group.add_argument("--no-cse-groups", action="store_true",
                        help="Disable CSE groups (debugging depth-3)")
+    group.add_argument("--enable-trace-ids", action="store_true",
+                       help="Enable trace IDs for semantic debugging (trace_input/trace_output)")
 
     # Output (passed to Rust)
     group.add_argument("--output-json", type=str, default=None,
@@ -169,10 +171,11 @@ def args_to_build_kwargs(
         "select_choice": get("select_choice", "optimize"),
         "valu_shift": get("valu_shift", "optimize"),
         "force_zero_gap": get("force_zero_gap", False) and use_cpsat,
-        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", True) and use_cpsat,
+        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", False) and use_cpsat,
         "enable_scratch_tightening": get("enable_scratch_tightening", False) and use_cpsat,
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "enable_cse_groups": not get("no_cse_groups", False),
+        "enable_trace_ids": get("enable_trace_ids", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -193,7 +196,7 @@ def args_to_build_kwargs(
         "select_choice": get("select_choice", "optimize"),
         "valu_shift": get("valu_shift", "optimize"),
         "force_zero_gap": get("force_zero_gap", False) if use_cpsat else None,
-        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", True) if use_cpsat else None,
+        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", False) if use_cpsat else None,
         "enable_scratch_tightening": get("enable_scratch_tightening", False) if use_cpsat else None,
         "run_options_json": json.dumps(run_options),
         "git_sha": git_sha,
@@ -202,6 +205,7 @@ def args_to_build_kwargs(
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "optional_constraint_groups_to_disable": optional_constraint_groups_to_disable,
         "enable_cse_groups": enable_cse,
+        "enable_trace_ids": get("enable_trace_ids", False),
     }
 
 

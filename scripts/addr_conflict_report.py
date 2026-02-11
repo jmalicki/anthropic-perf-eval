@@ -23,8 +23,20 @@ import argparse
 
 
 def intervals_conflict(a_start, a_end, b_start, b_end):
-    """True if B writes before A's last read (problematic reuse).
-    Same-cycle reuse (b_start == a_end) is OK: read then write within cycle."""
+    """Return True if the two intervals conflict (B writes before A's last read).
+
+    Precondition: callers must pass intervals with a_start <= b_start. This is
+    enforced by the sorted loop in main (items sorted by (start, end)); when
+    comparing pairs, the first interval is always the earlier one. Checking
+    this in intervals_conflict allows future maintainers to rely on the
+    preconditions without inspecting call sites.
+
+    Bounds: start and end are inclusive cycle indices (value is live from cycle
+    start through cycle end).
+
+    Same-cycle reuse: when b_start == a_end, intervals_conflict returns False.
+    Read of A and write of B may occur in the same cycle, which is allowed.
+    """
     return a_start <= b_end and b_start < a_end
 
 
@@ -34,8 +46,15 @@ def main():
     ap.add_argument("--addr", type=int, default=None, help="Only check this address")
     args = ap.parse_args()
 
-    with open(args.json_path) as f:
-        data = json.load(f)
+    try:
+        with open(args.json_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"File not found: {args.json_path}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON: {e}")
+        return 1
 
     vregs = data.get("vregs")
     if not vregs:

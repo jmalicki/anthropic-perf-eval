@@ -18,6 +18,12 @@ if os.path.dirname(os.path.abspath(__file__)) in sys.path:
 
 import json
 import argparse
+import logging
+
+# Ops that write 8 words (vector width); multiply_add has no "v" prefix.
+VECTOR_OPS = ("vload", "vbroadcast", "vselect", "multiply_add")
+
+logger = logging.getLogger(__name__)
 
 
 def get_writes(instr):
@@ -33,15 +39,20 @@ def get_writes(instr):
             if op == "vstore":
                 continue  # writes to mem
             dest = slot[1]
-            if not isinstance(dest, (int, float)):
+            if isinstance(dest, int):
+                pass
+            elif isinstance(dest, float):
+                logger.warning("dest %s is float, converting to int", dest)
+                dest = int(dest)
+            else:
                 continue
-            dest = int(dest)
-            size = 8 if (engine == "valu" or op in ("vload", "vbroadcast", "vselect", "multiply_add")) else 1
+            size = 8 if (engine == "valu" or op in VECTOR_OPS) else 1
             writes.append((dest, size))
     return writes
 
 
 def main():
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     ap = argparse.ArgumentParser(description="Last write to addr before cycle")
     ap.add_argument("kernel", help="Kernel JSON")
     ap.add_argument("--addr", type=int, required=True)
@@ -55,6 +66,11 @@ def main():
     addr = args.addr
     before = args.before_cycle
     addr_end = addr + 8  # vector span
+
+    if not 0 <= before <= len(instrs):
+        raise ValueError(
+            f"before_cycle {before} out of range, must be between 0 and {len(instrs)} (number of instructions)"
+        )
 
     for c in range(before - 1, -1, -1):
         instr = instrs[c]
