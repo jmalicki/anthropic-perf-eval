@@ -460,6 +460,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "cp_sat",
+ "prost",
  "pyo3",
  "rayon",
  "serde",

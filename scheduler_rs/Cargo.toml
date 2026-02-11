@@ -17,10 +17,11 @@ rayon = "1.11"
 # CP-SAT solver bindings (fork with interval/cumulative support)
 # Build requires: ORTOOLS_PREFIX=$(brew --prefix or-tools) RUSTFLAGS='-Clink-arg=-lprotobuf'
 cp_sat = { git = "https://github.com/jmalicki/cp_sat.git", branch = "main", optional = true }
+prost = { version = "0.8", optional = true }
 
 [features]
 default = []
-cpsat = ["cp_sat"]
+cpsat = ["cp_sat", "prost"]
 # Optional: slow/optional tests (proptest, minimal failing config, etc.). CI should use --features "cpsat ci-tests".
 ci-tests = []
 
