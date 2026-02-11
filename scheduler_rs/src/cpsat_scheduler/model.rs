@@ -1305,6 +1305,13 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !valu_intervals.is_empty() {
+            let max_demand = *valu_demands.iter().max().unwrap_or(&0);
+            debug_assert!(
+                max_demand <= valu_cap,
+                "cumul_valu: max demand {} > capacity {}",
+                max_demand,
+                valu_cap
+            );
             let c = model.add_cumulative(valu_intervals, valu_demands, valu_cap);
             model.set_constraint_name(c, "cumul_valu");
         }
@@ -1342,6 +1349,13 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !alu_intervals.is_empty() {
+            let max_demand = *alu_demands.iter().max().unwrap_or(&0);
+            debug_assert!(
+                max_demand <= alu_cap,
+                "cumul_alu: max demand {} > capacity {}",
+                max_demand,
+                alu_cap
+            );
             let c = model.add_cumulative(alu_intervals, alu_demands, alu_cap);
             model.set_constraint_name(c, "cumul_alu");
         }
@@ -1374,6 +1388,13 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !load_intervals.is_empty() {
+            let max_demand = *load_demands.iter().max().unwrap_or(&0);
+            debug_assert!(
+                max_demand <= load_cap,
+                "cumul_load: max demand {} > capacity {}",
+                max_demand,
+                load_cap
+            );
             let c = model.add_cumulative(load_intervals, load_demands, load_cap);
             model.set_constraint_name(c, "cumul_load");
         }
@@ -1394,6 +1415,13 @@ pub fn schedule_ssa_cpsat(
                 .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
                 .collect();
             let demands: Vec<i64> = vec![1; intervals.len()];
+            let max_demand = *demands.iter().max().unwrap_or(&0);
+            debug_assert!(
+                max_demand <= store_cap,
+                "cumul_store: max demand {} > capacity {}",
+                max_demand,
+                store_cap
+            );
             let c = model.add_cumulative(intervals, demands, store_cap);
             model.set_constraint_name(c, "cumul_store");
         }
@@ -1477,6 +1505,13 @@ pub fn schedule_ssa_cpsat(
         }
 
         if !flow_intervals.is_empty() {
+            let max_demand = *flow_demands.iter().max().unwrap_or(&0);
+            debug_assert!(
+                max_demand <= flow_cap,
+                "cumul_flow: max demand {} > capacity {}",
+                max_demand,
+                flow_cap
+            );
             let c = model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
             model.set_constraint_name(c, "cumul_flow");
             // Redundant with cumulative(1): no two Flow intervals overlap when present.
@@ -1941,6 +1976,13 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
+            let max_demand = scratch_demands.iter().copied().max().unwrap_or(0);
+            debug_assert!(
+                max_demand <= scratch_budget as i64,
+                "cumul_scratch: max demand {} > budget {}",
+                max_demand,
+                scratch_budget
+            );
             let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
             model.set_constraint_name(c, "cumul_scratch");
 
@@ -2322,6 +2364,7 @@ pub fn schedule_ssa_cpsat(
         store_cap,
         flow_cap,
         0i64, // dependency floor: don't inflate capacity_lower_bound with ASAP-based critical path
+        cse_groups,
     );
     let capacity_lower_bound = cap_result.capacity_lower_bound;
     let mut valu_alu_global_min = cap_result.valu_alu_global_min;
@@ -2402,7 +2445,7 @@ pub fn schedule_ssa_cpsat(
 
     // Direct capacity constraints: link makespan to choice variables (x = shift, y = ConstChoice AddImm, z = SelectChoice FMA count)
     // so CP-SAT can optimize over (x,y,z) during search instead of relying only on the pre-computed capacity_lower_bound.
-    // Uses same formulas as compute_capacity_lower_bound_global: VALU_ops = valu_count - sum(shift) + 2*sum(select_fma), etc.
+    // VALU uses CSE-aware formula when cse_groups present; else 2*sum(select_fma). Flow/Load/ALU unchanged.
     {
         let zero_var = model.new_int_var([(0, 0)]);
         let sum_shift: Option<LinearExpr> = shiftable_valu
@@ -2437,12 +2480,38 @@ pub fn schedule_ssa_cpsat(
         let y = sum_const_add_imm.unwrap_or_else(|| LinearExpr::from(zero_var));
 
         // Direct capacity linear constraints: optional groups per engine (help propagation; cumulatives enforce the real limits).
-        // VALU: each SelectChoice FMA = 2 VALU ops (sub + fma). So 6*makespan >= valu_count - sum(shift) + 2*sum(select_fma)
+        // VALU: with CSE groups, SelectChoice FMA contributes (1 SUB per active group) + (1 FMA per consumer); without CSE, 2 per FMA.
+        // So 6*makespan >= valu_count - sum(shift) + select_valu_contrib.
         if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityValu)
             && enable_valu_shift
             && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0)
         {
-            let lhs = LinearExpr::from(makespan) * 6 + s.clone() - z.clone() * 2;
+            let select_valu_contrib: LinearExpr = if let Some(groups) = cse_groups {
+                if groups.is_empty() {
+                    z.clone() * 2
+                } else {
+                    let mut c = LinearExpr::from(zero_var);
+                    for (g, group) in groups.iter().enumerate() {
+                        c = c + LinearExpr::from(cse_sub_active_vars[g]);
+                        for &idx in &group.consumer_indices {
+                            if let Some(&cv) = select_choice_vars.get(&idx) {
+                                c = c + LinearExpr::from(cv);
+                            }
+                        }
+                    }
+                    for &idx in &select_choice_ops {
+                        if !cse_consumer_set.contains(&idx) {
+                            if let Some(&cv) = select_choice_vars.get(&idx) {
+                                c = c + LinearExpr::from(cv) * 2;
+                            }
+                        }
+                    }
+                    c
+                }
+            } else {
+                z.clone() * 2
+            };
+            let lhs = LinearExpr::from(makespan) * 6 + s.clone() - select_valu_contrib;
             let rhs = model.new_int_var([(valu_count, valu_count)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_valu");
@@ -2531,9 +2600,11 @@ pub fn schedule_ssa_cpsat(
     // makespan = max_cycle + 1 and max_cycle >= every cycle var already force all work into [0, max_cycle];
     // no need for explicit cycle <= makespan-1.
 
+    // CANONICAL DESCRIPTION (docs should reference this block, not duplicate the formula):
     // Minimize makespan; when equal, minimize sum of effective completion cycles (tie-breaker).
     // Philosophy: "early completion of computation is better"—a smoother objective that steers
     // search toward packings that can lead to cycle reduction, not only for breaking ties.
+    // The solver thus fills earlier slots even when that does not reduce makespan.
     //
     // Design: every op contributes exactly one "effective completion cycle"; for choice vars we
     // use the chosen path's completion so the objective fully accounts for the choice.
@@ -3502,11 +3573,17 @@ pub fn schedule_ssa_cpsat(
                 if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
                     let s = shifted_ops.len() as i64;
                     let z = select_fma_ops.len() as i64;
-                    let lhs_valu = 6 * (actual_makespan as i64) + s - 2 * z;
+                    let select_valu_contrib_solution: i64 = if !cse_group_results.is_empty() {
+                        let num_active = cse_group_results.iter().filter(|r| r.sub_active).count() as i64;
+                        num_active + z
+                    } else {
+                        2 * z
+                    };
+                    let lhs_valu = 6 * (actual_makespan as i64) + s - select_valu_contrib_solution;
                     let binding_valu = lhs_valu == valu_count;
                     if binding_valu {
                         eprintln!(
-                            "    Direct VALU (6*makespan + shift - 2*select_fma >= valu_count): binding (LHS={})",
+                            "    Direct VALU (6*makespan + shift - select_valu_contrib >= valu_count): binding (LHS={})",
                             lhs_valu
                         );
                     }
@@ -4068,6 +4145,18 @@ pub fn schedule_ssa_cpsat(
                     eprintln!(
                         "  (Unknown usually means time limit or incomplete hint; ensure cycle, ConstChoice, SelectChoice, and segment vars are hinted.)"
                     );
+                }
+            }
+            // Export model on INFEASIBLE for debugging (CPSAT_EXPORT_INFEASIBLE=1)
+            if status == CpsatStatus::Infeasible {
+                if std::env::var("CPSAT_EXPORT_INFEASIBLE").is_ok() {
+                    let path = std::env::var("CPSAT_EXPORT_INFEASIBLE_PATH")
+                        .unwrap_or_else(|_| "cpsat_infeasible_model.pb".to_string());
+                    let proto = model.proto();
+                    let bytes = prost::Message::encode_to_vec(proto);
+                    if std::fs::write(&path, &bytes).is_ok() {
+                        eprintln!("  [INFEASIBLE] Model exported to {}", path);
+                    }
                 }
             }
             None
