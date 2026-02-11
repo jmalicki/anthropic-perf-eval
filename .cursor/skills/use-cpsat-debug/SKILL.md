@@ -29,7 +29,7 @@ When CP-SAT reports INFEASIBLE, the same constraint bugs may cause wrong output 
 Binding constraints are those that hold with equality at the CP-SAT solution—they limit the schedule.
 
 - **During generation:** Run `generate_ssa_kernel.py` without `-q`; stderr prints `[Makespan active set]` and binding schedule constraints (precedence, ordering, domain).
-- **From saved JSON:** Use `scripts/inspect_binding_constraints.py` on scheduler output (CP-SAT run with `--output-json`):
+- **From saved JSON:** Use `python -m scripts.inspect_binding_constraints` on scheduler output (CP-SAT run with `--output-json`):
   ```bash
   uv run python -m scripts.inspect_binding_constraints scheduler_output.json
   ```

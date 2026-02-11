@@ -68,7 +68,20 @@ The script prints:
 
 ## Follow-Up: Which constraints are binding
 
-When bulk-move **blocks**, the blocking constraint is one of the **binding** (tight) constraints at the CP-SAT solution. The CP-SAT path can log binding schedule constraints (precedence, ordering, domain) when building the schedule; search for "Binding schedule constraints" or "bulk-move" in `scheduler_rs/src/cpsat_scheduler/`. Comparing the violation’s constraint type and op indices to that list confirms which binding constraint is limiting compaction.
+When bulk-move **blocks**, the blocking constraint is one of the **binding** (tight) constraints at the CP-SAT solution. To identify it:
+
+1. **From a fresh run** — Run without `-q` and with `--output-json` so CP-SAT writes `scheduler_output.json` and logs binding constraints to stderr:
+   ```bash
+   uv run generate_ssa_kernel.py --rounds 2 --output-json scheduler_output.json
+   ```
+   Search stderr for "Binding schedule constraints" or "Makespan active set".
+
+2. **From existing JSON** — Compute binding constraints from scheduler output (no re-run):
+   ```bash
+   uv run python -m scripts.inspect_binding_constraints scheduler_output.json
+   ```
+
+3. **Match the violation** — Compare the bulk-move violation’s constraint type and op indices to the binding-constraints output to identify the limiting constraint.
 
 ## Complementary Script
 
