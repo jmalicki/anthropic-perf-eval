@@ -95,6 +95,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--no-verify-scratch-conflict", action="store_false", dest="verify_same_cycle_scratch",
                        default=True,
                        help="Disable same-cycle scratch write conflict check (default: enabled)")
+    group.add_argument("--no-bulk-move", action="store_false", dest="enable_bulk_move",
+                       default=True,
+                       help="Disable bulk-move compaction after CP-SAT (keep raw schedule; for debugging)")
 
     # Output (passed to Rust)
     group.add_argument("--output-json", type=str, default=None,
@@ -179,6 +182,7 @@ def args_to_build_kwargs(
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "enable_cse_groups": not get("no_cse_groups", False),
         "enable_trace_ids": get("enable_trace_ids", False),
+        "enable_bulk_move": get("enable_bulk_move", True),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -210,6 +214,7 @@ def args_to_build_kwargs(
         "enable_cse_groups": enable_cse,
         "enable_trace_ids": get("enable_trace_ids", False),
         "verify_same_cycle_scratch": get("verify_same_cycle_scratch", True),
+        "enable_bulk_move": get("enable_bulk_move", True),
     }
 
 

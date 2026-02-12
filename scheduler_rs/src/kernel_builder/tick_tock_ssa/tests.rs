@@ -3439,6 +3439,7 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
+        true,  // enable_bulk_move
     );
     assert!(
         result.is_ok(),
@@ -3607,6 +3608,7 @@ fn test_depth4_cpsat() {
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
+        true,  // enable_bulk_move
     );
     assert!(
         result.is_ok(),

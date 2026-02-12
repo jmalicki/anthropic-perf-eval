@@ -14,6 +14,8 @@ pub mod lower;
 pub mod compute_bounds;
 #[cfg(feature = "cpsat")]
 pub mod cpsat;
+#[cfg(feature = "cpsat")]
+pub mod bulk_move;
 
 pub use compute_deps::ComputeDependenciesPass;
 pub use compute_bounds::ComputeBoundsPass;
@@ -24,5 +26,7 @@ pub use greedy::GreedySchedulePass;
 pub use assign_addrs::AssignAddressesPass;
 pub use lower::LowerToOpsPass;
 
+#[cfg(feature = "cpsat")]
+pub use bulk_move::BulkMoveCompactionPass;
 #[cfg(feature = "cpsat")]
 pub use cpsat::CpSatSchedulePass;

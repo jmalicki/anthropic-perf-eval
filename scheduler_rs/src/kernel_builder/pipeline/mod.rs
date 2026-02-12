@@ -35,7 +35,7 @@ use passes::{
     FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass,
 };
 #[cfg(feature = "cpsat")]
-use passes::CpSatSchedulePass;
+use passes::{BulkMoveCompactionPass, CpSatSchedulePass};
 
 pub use context::{
     BoundsConfig, PassReport, PipelineConfig, SchedulingBounds, SchedulingDecisions,
@@ -263,6 +263,7 @@ impl PipelineContext {
 
         self.run_pass(&ElideBarriersPass)?;
         self.run_pass(&CpSatSchedulePass)?;
+        self.run_pass(&BulkMoveCompactionPass)?;
         self.run_pass(&FilterDeadStoresPass)?;
 
         // Compute accounting before address assignment (needs SSA ops with metadata)

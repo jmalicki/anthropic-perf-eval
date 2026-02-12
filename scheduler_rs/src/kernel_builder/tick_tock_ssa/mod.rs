@@ -422,6 +422,7 @@ impl SsaTickTockKernelBuilder {
         enable_scratch_tightening: bool,
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
         enable_cse_groups: bool,
+        enable_bulk_move: bool,
     ) -> Result<SsaScheduleResult, String> {
         #[cfg(not(feature = "cpsat"))]
         return Err("CP-SAT not available: compile with --features cpsat".to_string());
@@ -475,6 +476,7 @@ impl SsaTickTockKernelBuilder {
                 enable_scratch_tightening,
                 disable_optional_constraint_groups,
                 enable_cse_groups,
+                enable_bulk_move,
             }),
             ..Default::default()
         };

@@ -21,7 +21,7 @@ use super::config::{
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
-    try_validate_ssa_slot_limits, validate_ssa_slot_limits,
+    validate_ssa_slot_limits,
     verify_select_choice_fma_consumer_precedence,
 };
 
@@ -3938,177 +3938,13 @@ pub fn schedule_ssa_cpsat(
                 );
             }
 
-            // schedule_constraints already built above (for active set and bulk-move).
+            // schedule_constraints already built above (for active set and for BulkMoveCompactionPass).
+            // CP-SAT returns the raw solution; compaction (bulk-move) is a separate pipeline pass.
 
-            // When CP-SAT returns a makespan > actual last cycle (empty cycles), try to compact and use
-            // the compacted schedule so the pipeline gets a tight makespan and CP-SAT effectively optimizes.
-            let mut out_cycle_assignments = cycle_assignments;
-            let mut out_shifted_alu_cycles = shifted_alu_cycles;
-            let mut out_makespan = actual_makespan as usize;
-            let mut out_empty_count = empty_count;
-
-            if empty_count > 0 {
-                // Check capacity first: validate current schedule (with empty cycles) satisfies per-cycle slot limits.
-                // If it doesn't, we'd catch a bug before attempting compaction.
-                if let Err(e) = try_validate_ssa_slot_limits(
-                    ops,
-                    &out_cycle_assignments,
-                    &shifted_ops,
-                    &out_shifted_alu_cycles,
-                    &const_add_imm_ops,
-                    &const_alu_derive_ops,
-                    &select_fma_ops,
-                    &eliminated_vbroadcast_ops,
-                    &machine,
-                ) {
-                    if verbose {
-                        eprintln!(
-                            "  [compact] Schedule already violates capacity before bulk-move: {}",
-                            e
-                        );
-                    }
-                }
-                let mut compact_cycles = out_cycle_assignments.clone();
-                let mut compact_shifted = out_shifted_alu_cycles
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect();
-                use crate::schedule_constraints::{run_bulk_move_simulator, BulkMoveResult};
-                let bulk_result = run_bulk_move_simulator(
-                    ops,
-                    &mut compact_cycles,
-                    &mut compact_shifted,
-                    &schedule_constraints,
-                    actual_makespan as i32,
-                    false,
-                );
-                match &bulk_result {
-                    BulkMoveResult::ReachedEnd {
-                        original_max_cycle_plus_one,
-                        final_max_cycle_plus_one,
-                        steps,
-                    } if *final_max_cycle_plus_one < *original_max_cycle_plus_one => {
-                        let compacted = *final_max_cycle_plus_one as i64;
-                        use crate::schedule_constraints::check_schedule_constraints;
-                        let constraints_ok = check_schedule_constraints(
-                            ops,
-                            &compact_cycles,
-                            &compact_shifted,
-                            &schedule_constraints,
-                        );
-                        let capacity_ok = try_validate_ssa_slot_limits(
-                            ops,
-                            &compact_cycles,
-                            &shifted_ops,
-                            &compact_shifted,
-                            &const_add_imm_ops,
-                            &const_alu_derive_ops,
-                            &select_fma_ops,
-                            &eliminated_vbroadcast_ops,
-                            &machine,
-                        );
-                        if constraints_ok.is_ok() && capacity_ok.is_ok() {
-                            out_cycle_assignments = compact_cycles;
-                            out_shifted_alu_cycles = compact_shifted
-                                .into_iter()
-                                .map(|(k, v)| (k, v))
-                                .collect();
-                            out_makespan = (*final_max_cycle_plus_one) as usize;
-                            out_empty_count = 0;
-                            if verbose {
-                                eprintln!(
-                                    "  [compact] Using compacted schedule: makespan {} -> {} ({} steps); empty cycles eliminated.",
-                                    original_max_cycle_plus_one, final_max_cycle_plus_one, steps
-                                );
-                            }
-                        } else if verbose {
-                            eprintln!(
-                                "  [compact diagnostic] Bulk-move reduced makespan {} -> {} ({} steps). Capacity LB={}.",
-                                original_max_cycle_plus_one,
-                                final_max_cycle_plus_one,
-                                steps,
-                                capacity_lower_bound
-                            );
-                            if let Err(v) = &constraints_ok {
-                                eprintln!(
-                                    "  [compact diagnostic] Compacted schedule violates constraints: {}",
-                                    v.message
-                                );
-                            }
-                            if let Err(e) = &capacity_ok {
-                                eprintln!(
-                                    "  [compact diagnostic] Compacted schedule violates capacity: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if verbose && out_empty_count > 0 {
-                    if let BulkMoveResult::ReachedEnd {
-                        original_max_cycle_plus_one,
-                        final_max_cycle_plus_one,
-                        steps,
-                    } = &bulk_result
-                    {
-                        if *final_max_cycle_plus_one < *original_max_cycle_plus_one {
-                            let compacted = *final_max_cycle_plus_one as i64;
-                            if capacity_lower_bound > compacted {
-                                eprintln!(
-                                    "  [compact diagnostic] Cause (2): capacity LB was too high ({} > {}).",
-                                    capacity_lower_bound, compacted
-                                );
-                            } else {
-                                eprintln!(
-                                    "  [compact diagnostic] Cause (1): LB is fine ({} <= {}). A constraint in the model forbids the tighter schedule.",
-                                    capacity_lower_bound, compacted
-                                );
-                            }
-                        }
-                    } else if let BulkMoveResult::Blocked { empty_c, violation, steps } = &bulk_result {
-                        eprintln!(
-                            "  [compact diagnostic] Bulk-move blocked at empty cycle {} after {} steps: {}",
-                            empty_c, steps, violation.message
-                        );
-                        let binding = crate::schedule_constraints::binding_schedule_constraints(
-                            ops,
-                            &out_cycle_assignments,
-                            &out_shifted_alu_cycles,
-                            &schedule_constraints,
-                        );
-                        let in_active_set = binding.iter().any(|(c, _)| c == &violation.constraint);
-                        if in_active_set {
-                            eprintln!(
-                                "  [compact diagnostic] Blocking constraint IS in active set (binding) — bulk-move correctly identified a tight constraint."
-                            );
-                        } else {
-                            eprintln!(
-                                "  [compact diagnostic] Blocking constraint NOT in active set (binding) — possible bug: constraint was not tight in current solution."
-                            );
-                            let short = match &violation.constraint {
-                                crate::schedule_constraints::ScheduleConstraint::Precedence {
-                                    consumer_idx,
-                                    dep_idx,
-                                    result_offset,
-                                    dep_is_shifted,
-                                } => format!(
-                                    "Precedence consumer_idx={} dep_idx={} result_offset={} dep_is_shifted={}",
-                                    consumer_idx, dep_idx, result_offset, dep_is_shifted
-                                ),
-                                crate::schedule_constraints::ScheduleConstraint::Ordering {
-                                    before_idx,
-                                    after_idx,
-                                } => format!("Ordering before_idx={} after_idx={}", before_idx, after_idx),
-                                crate::schedule_constraints::ScheduleConstraint::Domain { idx, lb, ub } => {
-                                    format!("Domain idx={} lb={} ub={}", idx, lb, ub)
-                                }
-                            };
-                            eprintln!("  [compact diagnostic] Blocking constraint: {}", short);
-                        }
-                    }
-                }
-            }
+            let out_cycle_assignments = cycle_assignments;
+            let out_shifted_alu_cycles = shifted_alu_cycles;
+            let out_makespan = actual_makespan as usize;
+            let out_empty_count = empty_count;
 
             let lb_cycles = if status == CpsatStatus::Optimal {
                 Some(out_makespan)
