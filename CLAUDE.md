@@ -143,6 +143,7 @@ Scheduler options:
 - `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
 - `--enable-asap-alap-tightening` - Non-default debugging: tighten ASAP/ALAP by slot capacity (default: disabled)
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
+- `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** bulk-move is known buggy (can cause same-cycle scratch write conflicts). Use only when the bug is fixed for tighter makespan.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.

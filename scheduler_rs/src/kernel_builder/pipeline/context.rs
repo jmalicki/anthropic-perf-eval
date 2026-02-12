@@ -134,7 +134,9 @@ pub struct CpSatPipelineConfig {
     pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
     /// When true (default), build CSE groups for shared SelectChoice SUB. When false, disable for debugging.
     pub enable_cse_groups: bool,
-    /// When true (default), run bulk-move compaction after CP-SAT to eliminate empty cycles. When false, keep raw CP-SAT solution (for debugging allocator conflicts).
+    /// When true, run bulk-move compaction after CP-SAT to eliminate empty cycles.
+    /// Default false: bulk-move is known to be buggy (can cause same-cycle scratch conflicts).
+    /// Use --bulk-move to enable for tighter makespan when the bug is fixed.
     pub enable_bulk_move: bool,
 }
 
@@ -155,7 +157,7 @@ impl Default for CpSatPipelineConfig {
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
-            enable_bulk_move: true,
+            enable_bulk_move: false, // off by default: buggy (same-cycle scratch conflicts)
         }
     }
 }

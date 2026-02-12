@@ -5,7 +5,9 @@ description: Run the bulk-move simulator to debug schedule makespan and identify
 
 # Using the Bulk-Move Tool
 
-The **bulk-move simulator** checks whether empty cycles in a CP-SAT schedule could be removed by repeatedly "filling" empty cycle C by moving ops from C+1 to C. It uses the **same constraints as the CP-SAT model** (precedence, ordering, domain). When a move is impossible, it reports the **exact constraint** that blocks it—so you can see which constraint type is holding the schedule back.
+The **bulk-move** step compacts a CP-SAT schedule by filling empty cycles (moving ops from C+1 to C). The **bulk-move simulator** script checks whether that compaction is possible and which constraints block it. **Note:** Bulk-move is **off by default** in the kernel generator because it is known buggy (can cause same-cycle scratch write conflicts, e.g. 3r/32). Use `--bulk-move` only when the bug is fixed; the simulator script is still useful for analyzing why compaction would be blocked.
+
+The simulator uses the **same constraints as the CP-SAT model** (precedence, ordering, domain). When a move is impossible, it reports the **exact constraint** that blocks it—so you can see which constraint type is holding the schedule back.
 
 ## When to Use
 

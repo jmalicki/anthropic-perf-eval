@@ -3,6 +3,10 @@
 //! Runs after CpSatSchedulePass when there are empty cycles. Tries to compact the
 //! schedule by moving ops earlier (same constraints as CP-SAT). When disabled or
 //! when there are no empty cycles, this pass is a no-op.
+//!
+//! **Off by default:** Bulk-move is known to be buggy and can cause same-cycle
+//! scratch write conflicts (e.g. 3r/32 at cycle 15). Use --bulk-move to enable
+//! for tighter makespan once the bug is fixed.
 
 use std::collections::HashMap;
 
