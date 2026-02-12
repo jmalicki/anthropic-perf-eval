@@ -195,7 +195,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
@@ -346,7 +346,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
@@ -1203,7 +1203,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
         for select_choice_id in &select_choice_ids {
@@ -1351,7 +1351,7 @@ mod ssa_tests {
         }
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = cpsat_result.select_fma_ops.clone();
-        let assign_result = assign_addresses(&emit.ops, &config);
+        let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
         // With 1 VALU slot, sub and fma must be in consecutive cycles
@@ -1367,7 +1367,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
                 && o.engine == Engine::Valu
@@ -1648,10 +1648,10 @@ mod ssa_tests {
         }
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = cpsat_result.select_fma_ops.clone();
-        let assign_result = assign_addresses(&emit.ops, &config);
+        let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&config, &emit.ops);
+        let intervals = compute_live_intervals(&config, &emit.ops).unwrap();
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1681,7 +1681,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
         let sub_op = lowered.iter().find(|o| {
             o.id == select_choice_id
                 && o.engine == Engine::Valu
@@ -1801,10 +1801,10 @@ mod ssa_tests {
         }
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = cpsat_result.select_fma_ops.clone();
-        let assign_result = assign_addresses(&emit.ops, &config);
+        let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
-        let intervals = compute_live_intervals(&config, &emit.ops);
+        let intervals = compute_live_intervals(&config, &emit.ops).unwrap();
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1876,8 +1876,8 @@ mod ssa_tests {
         }
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = cpsat_result.select_fma_ops.clone();
-        let assign_result = assign_addresses(&emit.ops, &config);
-        let intervals = compute_live_intervals(&config, &emit.ops);
+        let assign_result = assign_addresses(&emit.ops, &config).unwrap();
+        let intervals = compute_live_intervals(&config, &emit.ops).unwrap();
         for (v1, addr1) in &assign_result.vreg_to_addr {
             for (v2, addr2) in &assign_result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1903,7 +1903,7 @@ mod ssa_tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
     }
 }
 
@@ -2607,7 +2607,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Verify that ConstChoice ops were lowered correctly based on CP-SAT decisions
         for (const_choice_id, expected_value) in &const_choice_info {
@@ -2763,7 +2763,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Verify ConstChoice ops were lowered correctly
         for const_choice_id in &const_choice_ids {
@@ -4451,7 +4451,7 @@ mod tests {
             start_addr: 1, // Reserve 0 for ZERO_REG
             ..Default::default()
         };
-        let assign_result = assign_addresses(&scheduled_ops, &config);
+        let assign_result = assign_addresses(&scheduled_ops, &config).unwrap();
 
         // With same-cycle reuse, linear scan should achieve max_addr=1
         // (even though CP-SAT conservatively required budget=2)
@@ -4572,7 +4572,7 @@ mod tests {
             shifted_alu_cycles: r.shifted_alu_cycles.clone(),
             ..Default::default()
         };
-        let assign_result = assign_addresses(&scheduled_ops, &config);
+        let assign_result = assign_addresses(&scheduled_ops, &config).unwrap();
 
         // Address assignment should fit within budget (CP-SAT constraint should match)
         assert!(
@@ -5056,10 +5056,10 @@ mod tests {
             const_alu_derive_ops: r.const_alu_derive_ops.clone(),
             ..Default::default()
         };
-        let assign_result = assign_addresses(&scheduled_ops, &config);
+        let assign_result = assign_addresses(&scheduled_ops, &config).unwrap();
 
         // Verify live intervals: cond and false_val should extend to cycle+1 (where FMA reads them)
-        let intervals = compute_live_intervals(&config, &scheduled_ops);
+        let intervals = compute_live_intervals(&config, &scheduled_ops).unwrap();
         let select_cycle = scheduled_ops[3].cycle;
         let cond_interval = intervals.get(&VReg::scalar(0)).unwrap();
         let false_val_interval = intervals.get(&VReg::scalar(2)).unwrap();
@@ -5285,10 +5285,10 @@ mod tests {
             cse_shared_sub_temp_intervals: cse_shared,
             ..Default::default()
         };
-        let assign_result = assign_addresses(&scheduled_ops, &config);
+        let assign_result = assign_addresses(&scheduled_ops, &config).unwrap();
 
         // Verify shared sub_temp interval exists
-        let intervals = compute_live_intervals(&config, &scheduled_ops);
+        let intervals = compute_live_intervals(&config, &scheduled_ops).unwrap();
         let shared_sub_temp = cse_groups[0].sub_temp_vreg;
         assert!(
             intervals.contains_key(&shared_sub_temp),

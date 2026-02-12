@@ -774,7 +774,7 @@ fn test_vreg_liveness_intervals() {
     ops[2].cycle = 10;
 
     let config = AddressAssignConfig::default();
-    let intervals = compute_live_intervals(&config, &ops);
+    let intervals = compute_live_intervals(&config, &ops).unwrap();
 
     // CLOSED intervals: [start, end] where end = last_read_cycle
     //
@@ -851,7 +851,7 @@ fn test_overlapping_vregs_different_addresses() {
     ops[2].cycle = 5;
 
     let config = AddressAssignConfig::default();
-    let result = assign_addresses(&ops, &config);
+    let result = assign_addresses(&ops, &config).unwrap();
 
     let addr_s0 = result
         .vreg_to_addr
@@ -943,7 +943,7 @@ fn test_non_overlapping_vregs_can_share_addresses() {
     ops[3].cycle = 6;
 
     let config = AddressAssignConfig::default();
-    let result = assign_addresses(&ops, &config);
+    let result = assign_addresses(&ops, &config).unwrap();
 
     let addr_s0 = result
         .vreg_to_addr
@@ -3097,7 +3097,7 @@ fn test_lower_ssa_op_width_consistency() {
     scalar_mapping.insert(VReg::scalar(1), 20);
     scalar_mapping.insert(VReg::scalar(2), 30);
 
-    let lowered_scalar = lower_ssa_op(&scalar_op, &scalar_mapping);
+    let lowered_scalar = lower_ssa_op(&scalar_op, &scalar_mapping).unwrap();
     assert_eq!(
         lowered_scalar.reads.len(),
         2,
@@ -3129,7 +3129,7 @@ fn test_lower_ssa_op_width_consistency() {
     vector_mapping.insert(VReg::vector(4), 200);
     vector_mapping.insert(VReg::vector(5), 300);
 
-    let lowered_vector = lower_ssa_op(&vector_op, &vector_mapping);
+    let lowered_vector = lower_ssa_op(&vector_op, &vector_mapping).unwrap();
     assert_eq!(
         lowered_vector.reads.len(),
         16,

@@ -1942,7 +1942,7 @@ pub fn schedule_ssa_full(ssa_ops: &mut [SsaOp]) -> Result<SsaFullScheduleResult,
 
     // Step 2: Assign addresses
     let config = AddressAssignConfig::default();
-    let assign_result = assign_addresses(ssa_ops, &config);
+    let assign_result = assign_addresses(ssa_ops, &config)?;
 
     if assign_result.budget_exceeded {
         return Err(format!(
@@ -1952,7 +1952,7 @@ pub fn schedule_ssa_full(ssa_ops: &mut [SsaOp]) -> Result<SsaFullScheduleResult,
     }
 
     // Step 3: Lower to concrete Ops
-    let ops = lower_ssa_ops(ssa_ops, &assign_result.vreg_to_addr);
+    let ops = lower_ssa_ops(ssa_ops, &assign_result.vreg_to_addr)?;
 
     Ok(SsaFullScheduleResult {
         ops,
@@ -2332,7 +2332,7 @@ mod ssa_tests {
             start_addr: 1, // Reserve 0 for ZERO_REG
             ..Default::default()
         };
-        let assign_result = assign_addresses(&emit.ops, &config);
+        let assign_result = assign_addresses(&emit.ops, &config).unwrap();
 
         // max_addr should be 1 (one address used: 1)
         // v0 gets addr 1, v1 reuses addr 1 (same-cycle reuse at cycle 1)

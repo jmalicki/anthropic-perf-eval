@@ -51,7 +51,7 @@ impl Pass for LowerToOpsPass {
             #[cfg(not(feature = "cpsat"))]
             cse_group_results: None,
         };
-        let ops = lower_ssa_ops_with_shift(&ctx_lowering);
+        let ops = lower_ssa_ops_with_shift(&ctx_lowering)?;
 
         let n_ops = ops.len();
         ctx.lowered_ops = Some(ops);

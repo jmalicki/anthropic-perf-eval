@@ -93,7 +93,7 @@ impl Pass for AssignAddressesPass {
         // vreg_def is required by address assignment and may be empty by design; always copy.
         assign_config.vreg_def = ctx.vreg_def.clone();
 
-        let address_result = assign_addresses(&ctx.ops, &assign_config);
+        let address_result = assign_addresses(&ctx.ops, &assign_config)?;
 
         // Verify no address conflicts between simultaneously-live VRegs.
         // This catches bugs in live interval computation or address allocation.

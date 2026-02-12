@@ -32,7 +32,7 @@ pub fn can_ssa_valu_shift_to_alu(op: &SsaOp) -> bool {
 
 /// Lower SSA ops to concrete ops (no VALU shifting).
 #[allow(dead_code)]
-pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
+pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Result<Vec<Op>, String> {
     ssa_ops
         .iter()
         .map(|op| lower_ssa_op(op, vreg_to_addr))
@@ -78,7 +78,7 @@ pub struct LoweringContext<'a> {
 ///
 /// When `cse_groups` and `cse_group_results` are provided and non-empty, SelectChoice FMA
 /// consumers in CSE groups use a shared SUB: one SUB per active group, multiple FMAs per group.
-pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
+pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, String> {
     use crate::types::{Opcode, SlotVal};
     use arrayvec::ArrayVec;
 
@@ -562,14 +562,14 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
             }
         } else {
             // Normal lowering
-            result.push(lower_ssa_op(ssa_op, ctx.vreg_to_addr));
+            result.push(lower_ssa_op(ssa_op, ctx.vreg_to_addr)?);
         }
     }
 
     // Post-pass: emit trace_input/trace_output debug ops for ops with trace_id
     emit_trace_debug_ops(&mut result, ctx);
 
-    result
+    Ok(result)
 }
 
 /// Emit trace_input and trace_output debug ops for ops that have trace_id.
@@ -809,7 +809,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -848,7 +848,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         let debug_ops: Vec<_> = result.iter().filter(|o| o.engine == Engine::Debug).collect();
         assert!(
@@ -922,7 +922,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 3); // 3 ConstChoice ops -> 3 lowered ops
         let alu_op = result
@@ -965,7 +965,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 1);
         let op = &result[0];
@@ -1009,7 +1009,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 2);
 
@@ -1084,7 +1084,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 1, "vselect should produce 1 op");
         let op = &result[0];
@@ -1140,7 +1140,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         assert_eq!(result.len(), 1, "FMA with delta should produce 1 op");
         let op = &result[0];
@@ -1199,7 +1199,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // FMA without delta should produce 2 ops: sub + fma
         assert_eq!(
@@ -1284,7 +1284,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: None,
             cse_group_results: None,
-        });
+        }).unwrap();
 
         // Check slot values for invalid addresses
         for op in &result {
@@ -1364,7 +1364,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: Some(&cse_groups),
             cse_group_results: Some(&cse_group_results),
-        });
+        }).unwrap();
 
         // One shared SUB + one FMA (no per-op SUB)
         assert_eq!(result.len(), 2, "CSE path: 1 shared SUB + 1 FMA");
@@ -1430,7 +1430,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: Some(&cse_groups),
             cse_group_results: Some(&cse_group_results),
-        });
+        }).unwrap();
 
         let fma_op = &result[1];
         // FMA reads: cond, sub_temp, false_val (vector lanes)
@@ -1511,7 +1511,7 @@ mod tests {
             eliminated_vb_to_scalar_producer: &HashMap::new(),
             cse_groups: Some(&cse_groups),
             cse_group_results: Some(&cse_group_results),
-        });
+        }).unwrap();
 
         // CSE mapping skipped -> each consumer emits SUB + FMA -> 4 ops
         assert_eq!(

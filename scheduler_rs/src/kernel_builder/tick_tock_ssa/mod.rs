@@ -299,6 +299,16 @@ pub enum KernelBuilderError {
     AddressConflict {
         conflict_count: usize,
     },
+    /// Allocator assigned the same address to two VRegs with overlapping live intervals.
+    OverlappingIntervalsSameAddress {
+        v1: crate::types::VReg,
+        v2: crate::types::VReg,
+        addr: i64,
+        interval1_start: i32,
+        interval1_end: i32,
+        interval2_start: i32,
+        interval2_end: i32,
+    },
     /// Other error with message.
     Other(String),
 }
@@ -341,6 +351,16 @@ impl std::fmt::Display for KernelBuilderError {
                     f,
                     "Address assignment produced {} conflicts between simultaneously-live VRegs",
                     conflict_count
+                )
+            }
+            KernelBuilderError::OverlappingIntervalsSameAddress {
+                v1, v2, addr,
+                interval1_start, interval1_end, interval2_start, interval2_end,
+            } => {
+                write!(
+                    f,
+                    "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap (allocator must not assign same address to overlapping live intervals)",
+                    v1, v2, addr, interval1_start, interval1_end, interval2_start, interval2_end
                 )
             }
             KernelBuilderError::Other(msg) => write!(f, "{}", msg),
@@ -1387,17 +1407,25 @@ impl SsaTickTockKernelBuilder {
                 return Err(error);
             }
 
-            // Assert no two VRegs with overlapping live intervals share the same address
+            // No two VRegs with overlapping live intervals may share the same address.
             let intervals = &ar.live_intervals;
             for (v1, addr1) in &ar.vreg_to_addr {
                 for (v2, addr2) in &ar.vreg_to_addr {
                     if v1 >= v2 || addr1 != addr2 { continue; }
                     if let (Some(i1), Some(i2)) = (intervals.get(v1), intervals.get(v2)) {
-                        assert!(
-                            !i1.overlaps(i2),
-                            "BUG: VRegs {:?} and {:?} share address {} but intervals [{},{}] and [{},{}] overlap",
-                            v1, v2, addr1, i1.start, i1.end, i2.start, i2.end
-                        );
+                        if i1.overlaps(i2) {
+                            let err = KernelBuilderError::OverlappingIntervalsSameAddress {
+                                v1: *v1,
+                                v2: *v2,
+                                addr: *addr1,
+                                interval1_start: i1.start,
+                                interval1_end: i1.end,
+                                interval2_start: i2.start,
+                                interval2_end: i2.end,
+                            };
+                            export_partial_result_on_error(&ctx, &err);
+                            return Err(err);
+                        }
                     }
                 }
             }

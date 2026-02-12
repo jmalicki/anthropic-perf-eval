@@ -157,7 +157,7 @@ impl AddressAssignConfig {
     /// Computes live intervals for all VRegs from the given SSA ops using this config's
     /// zero_vreg, select_fma_ops, shifted_alu_cycles, const_alu_derive_ops, vector_group_lanes,
     /// vreg_def, cse_consumer_op_ids, and cse_shared_sub_temp_intervals.
-    pub fn compute_live_intervals(&self, ops: &[SsaOp]) -> HashMap<VReg, LiveInterval> {
+    pub fn compute_live_intervals(&self, ops: &[SsaOp]) -> Result<HashMap<VReg, LiveInterval>, String> {
         compute_live_intervals(self, ops)
     }
 }
@@ -206,13 +206,8 @@ impl LivenessDef for OpLiveness<'_> {
         {
             (op.cycle + 1, op.cycle + 1)
         } else if let Some(cycles) = ctx.shifted_alu_cycles.get(&op.id) {
-            // Presence = shifted; require valid data or panic
-            if cycles.len() != VLEN {
-                panic!(
-                    "BUG: shifted VALU op {} has shifted_alu_cycles len {} (expected {})",
-                    op.id, cycles.len(), VLEN
-                );
-            }
+            // Validated at start of compute_live_intervals; debug_assert for sanity.
+            debug_assert_eq!(cycles.len(), VLEN, "shifted VALU op {} shifted_alu_cycles len {}", op.id, cycles.len());
             let min_c = *cycles.iter().min().unwrap_or(&op.cycle);
             let max_c = *cycles.iter().max().unwrap_or(&op.cycle);
             (min_c, max_c)
@@ -308,8 +303,19 @@ impl LivenessUse for OpLiveness<'_> {
 pub fn compute_live_intervals(
     config: &AddressAssignConfig,
     ops: &[SsaOp],
-) -> HashMap<VReg, LiveInterval> {
+) -> Result<HashMap<VReg, LiveInterval>, String> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
+
+    // Validate shifted_alu_cycles before we use it in LivenessDef (avoids panic in dest_write_interval).
+    for (op_id, cycles) in &config.shifted_alu_cycles {
+        if cycles.len() != VLEN {
+            return Err(format!(
+                "BUG: shifted VALU op {} has shifted_alu_cycles len {} (expected {})",
+                op_id, cycles.len(), VLEN
+            ));
+        }
+    }
+
     let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
 
     let ctx = LivenessContext {
@@ -357,11 +363,11 @@ pub fn compute_live_intervals(
                          Producer op id: {:?}. Schedule has consumer before producer.",
                         op.id, op.opcode, op.cycle, vreg, interval.start, interval.end, producer_op_id
                     );
-                    panic!(
+                    return Err(format!(
                         "BUG: Schedule has op {} (consumer, cycle {}) before producer of {:?} (interval start {}). \
                          Fix the scheduler so cycle[consumer] >= cycle[producer] + 1.",
                         op.id, op.cycle, vreg, interval.start
-                    );
+                    ));
                 }
                 if debug && op.opcode == Opcode::Vstore && interval.end > old_end {
                     eprintln!(
@@ -564,7 +570,7 @@ pub fn compute_live_intervals(
         }
     }
 
-    intervals
+    Ok(intervals)
 }
 
 /// Compute peak liveness in words at any cycle using the same-cycle reuse model.
@@ -622,12 +628,12 @@ pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
 /// * `config` - Assignment configuration (budget, start address, fixed VRegs)
 ///
 /// # Returns
-/// Assignment result with VReg -> address mapping and statistics.
-pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressAssignmentResult {
+/// Assignment result with VReg -> address mapping and statistics, or an error string.
+pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<AddressAssignmentResult, String> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
 
     // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
-    let intervals = config.compute_live_intervals(ops);
+    let intervals = config.compute_live_intervals(ops)?;
 
     // Debug: Collect vstore source VRegs for tracking
     let vstore_vregs: HashSet<VReg> = if debug {
@@ -647,13 +653,13 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
     let live_intervals = intervals.clone();
 
     if intervals.is_empty() {
-        return AddressAssignmentResult {
+        return Ok(AddressAssignmentResult {
             budget: config.budget,
             peak_live,
             budget_exceeded,
             live_intervals,
             ..Default::default()
-        };
+        });
     }
 
     // Collect intervals with their VRegs, sorted by start cycle
@@ -849,7 +855,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
 
-    AddressAssignmentResult {
+    Ok(AddressAssignmentResult {
         vreg_to_addr,
         peak_live,
         max_addr,
@@ -858,7 +864,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> AddressA
         budget_exceeded,
         budget: config.budget,
         live_intervals,
-    }
+    })
 }
 
 /// An address conflict between two simultaneously-live VRegs.
@@ -942,7 +948,7 @@ use crate::types::{Op, SlotVal};
 use arrayvec::ArrayVec;
 
 /// Lower an SsaOp to a concrete Op using the VReg -> address mapping.
-pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
+pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Result<Op, String> {
     let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
 
     // Debug logging for vstore operations
@@ -970,9 +976,9 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
 
     // Add destination address (if any)
     if let Some(dest) = ssa_op.dest {
-        let addr = vreg_to_addr.get(&dest).copied().unwrap_or_else(|| {
-            panic!("VReg {:?} not found in address mapping", dest);
-        });
+        let addr = vreg_to_addr.get(&dest).copied().ok_or_else(|| {
+            format!("VReg {:?} not found in address mapping", dest)
+        })?;
         slot.push(SlotVal::Int(addr));
     }
 
@@ -980,12 +986,12 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
     for src in &ssa_op.srcs {
         match src {
             Operand::VReg(vreg) => {
-                let addr = vreg_to_addr.get(vreg).copied().unwrap_or_else(|| {
-                    panic!(
+                let addr = vreg_to_addr.get(vreg).copied().ok_or_else(|| {
+                    format!(
                         "VReg {:?} not found in address mapping (op id={}, cycle={})",
                         vreg, ssa_op.id, ssa_op.cycle
-                    );
-                });
+                    )
+                })?;
                 slot.push(SlotVal::Int(addr));
             }
             Operand::Imm(value) => {
@@ -1036,7 +1042,7 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         }
     }
 
-    Op {
+    Ok(Op {
         id: ssa_op.id,
         engine: ssa_op.engine,
         slot,
@@ -1049,11 +1055,11 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         produces_constant: ssa_op.produces_constant,
         from_const_choice: None, // This function doesn't handle ConstChoice/SelectChoice
         from_select_choice: None,
-    }
+    })
 }
 
 /// Lower all SsaOps to concrete Ops.
-pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Vec<Op> {
+pub fn lower_ssa_ops(ssa_ops: &[SsaOp], vreg_to_addr: &HashMap<VReg, i64>) -> Result<Vec<Op>, String> {
     ssa_ops
         .iter()
         .map(|op| lower_ssa_op(op, vreg_to_addr))
@@ -1358,7 +1364,7 @@ mod tests {
         emit.ops[1].cycle = 1;
 
         let config = AddressAssignConfig::default();
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
 
         // v1: defined at cycle 0, last read at cycle 1
         // CLOSED interval: [0, 1] — end = last_read_cycle = 1
@@ -1377,7 +1383,7 @@ mod tests {
         emit.ops[2].cycle = 5;
 
         let config = AddressAssignConfig::default();
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
 
         // CLOSED intervals: end = last_read_cycle
         // v1: defined at 0, last read at 5 → [0, 5]
@@ -1432,7 +1438,7 @@ mod tests {
             select_fma_ops,
             ..Default::default()
         };
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
 
         let dest = emit.ops[select_choice_idx]
             .dest
@@ -1511,10 +1517,10 @@ mod tests {
 
         let mut config = AddressAssignConfig::default();
         config.select_fma_ops = select_fma_ops.clone();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!result.budget_exceeded);
 
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
         for (v1, addr1) in &result.vreg_to_addr {
             for (v2, addr2) in &result.vreg_to_addr {
                 if v1 >= v2 {
@@ -1546,7 +1552,7 @@ mod tests {
         emit.ops[3].cycle = 4; // v3 last used
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // v1 and v3 should share the same address (non-overlapping)
         assert_eq!(result.vreg_to_addr[&v1], result.vreg_to_addr[&v3]);
@@ -1565,7 +1571,7 @@ mod tests {
         emit.ops[2].cycle = 2; // v1 and v2 both live here
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // v1 and v2 must have different addresses
         assert_ne!(result.vreg_to_addr[&v1], result.vreg_to_addr[&v2]);
@@ -1640,7 +1646,7 @@ mod tests {
         ops.push(op_fma);
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&ops, &config);
+        let result = assign_addresses(&ops, &config).unwrap();
 
         assert!(!result.budget_exceeded);
         assert_ne!(
@@ -1660,7 +1666,7 @@ mod tests {
         emit.ops[1].cycle = 1;
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // Vector should get 8 contiguous addresses
         let v_addr = result.vreg_to_addr[&v];
@@ -1681,7 +1687,7 @@ mod tests {
         emit.ops[2].cycle = 2;
 
         let config = AddressAssignConfig::default();
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
         let peak = compute_peak_liveness(&intervals);
 
         // CLOSED intervals (see types.rs for authoritative docs):
@@ -1718,7 +1724,7 @@ mod tests {
             start_addr: 1,
             ..Default::default()
         };
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // With 3 vectors (24 words) + 1 scalar, should exceed budget of 20
         assert!(result.budget_exceeded);
@@ -1737,7 +1743,7 @@ mod tests {
         let dest = emit.ops[2].dest.unwrap();
         vreg_to_addr.insert(dest, 102);
 
-        let lowered = lower_ssa_op(&emit.ops[2], &vreg_to_addr);
+        let lowered = lower_ssa_op(&emit.ops[2], &vreg_to_addr).unwrap();
 
         assert_eq!(lowered.engine, Engine::Alu);
         assert!(lowered.writes.contains(&102));
@@ -1766,7 +1772,7 @@ mod tests {
         let mut config = AddressAssignConfig::default();
         config.fixed_vregs.insert(v1, 500);
 
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         assert_eq!(result.vreg_to_addr[&v1], 500);
         // v2 should use a different address
@@ -1814,7 +1820,7 @@ mod tests {
         emit.ops[3].cycle = 10; // C = B + LONG
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // With closed intervals:
         // A: [0, 5] — last read at cycle 5
@@ -1859,7 +1865,7 @@ mod tests {
         emit.ops[2].cycle = 5; // C = B + B
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // A and B are BOTH written at cycle 3, so they MUST have different addresses
         assert_ne!(
@@ -1896,7 +1902,7 @@ mod tests {
         emit.ops[5].cycle = 7; // use_b = B + B (B last read)
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // Closed intervals:
         // - A: [0, 2] — last read at 2
@@ -2001,7 +2007,7 @@ mod tests {
         emit.ops[6].cycle = 81; // vstore
 
         let config = AddressAssignConfig::default();
-        let intervals = config.compute_live_intervals(&emit.ops);
+        let intervals = config.compute_live_intervals(&emit.ops).unwrap();
 
         // Verify closed intervals
         // partition_addr: defined at 6, last read at 81 → [6, 81]
@@ -2013,7 +2019,7 @@ mod tests {
 
         // Assign addresses - this is where the bug would manifest
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&emit.ops, &config);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
 
         // These MUST have different addresses (the bug is if they're the same)
         assert_ne!(
@@ -2097,11 +2103,11 @@ mod tests {
         ops.last_mut().unwrap().cycle = 11;
 
         let config = AddressAssignConfig::default();
-        let intervals = config.compute_live_intervals(&ops);
+        let intervals = config.compute_live_intervals(&ops).unwrap();
         assert_eq!(intervals[&a_vreg], LiveInterval::new(11, 11));
         assert_eq!(intervals[&b_vreg], LiveInterval::new(11, 11));
 
-        let result = assign_addresses(&ops, &config);
+        let result = assign_addresses(&ops, &config).unwrap();
         assert_ne!(
             result.vreg_to_addr[&a_vreg],
             result.vreg_to_addr[&b_vreg],
@@ -2168,7 +2174,7 @@ mod tests {
         }
 
         let config = AddressAssignConfig::default();
-        let result = assign_addresses(&ops, &config);
+        let result = assign_addresses(&ops, &config).unwrap();
 
         let addrs: std::collections::HashSet<i64> =
             value_vregs.iter().map(|v| result.vreg_to_addr[v]).collect();
