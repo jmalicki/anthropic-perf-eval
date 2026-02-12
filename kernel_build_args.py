@@ -92,6 +92,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Disable CSE groups (debugging depth-3)")
     group.add_argument("--enable-trace-ids", action="store_true",
                        help="Enable trace IDs for semantic debugging (trace_input/trace_output)")
+    group.add_argument("--no-verify-scratch-conflict", action="store_false", dest="verify_same_cycle_scratch",
+                       default=True,
+                       help="Disable same-cycle scratch write conflict check (default: enabled)")
 
     # Output (passed to Rust)
     group.add_argument("--output-json", type=str, default=None,
@@ -206,6 +209,7 @@ def args_to_build_kwargs(
         "optional_constraint_groups_to_disable": optional_constraint_groups_to_disable,
         "enable_cse_groups": enable_cse,
         "enable_trace_ids": get("enable_trace_ids", False),
+        "verify_same_cycle_scratch": get("verify_same_cycle_scratch", True),
     }
 
 

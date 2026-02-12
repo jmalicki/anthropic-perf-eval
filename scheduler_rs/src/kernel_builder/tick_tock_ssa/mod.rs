@@ -167,6 +167,9 @@ pub struct ScratchConflictDebugContext<'a> {
 /// Panics if two distinct ops in the same cycle write overlapping scratch ranges.
 /// Each op's scratch writes are represented as one or more contiguous (base, size) blocks;
 /// no two such blocks (from any ops in the same cycle) may overlap.
+///
+/// Cost: O(ops). One pass to group by cycle; per-cycle pairs are O(k²) with k ≤ slot count (bounded),
+/// so total is linear in ops. No appreciable impact on pipeline speed; always run.
 fn verify_no_same_cycle_scratch_write_conflict(
     ops: &[Op],
     debug_ctx: Option<ScratchConflictDebugContext<'_>>,
@@ -371,6 +374,25 @@ impl SsaTickTockKernelBuilder {
                 "scratch budget exceeded: peak_live={} > budget={}",
                 peak, budget
             ));
+        }
+
+        if ctx.config.compiler.verify_same_cycle_scratch {
+            if let Some(ref ops) = ctx.lowered_ops {
+                let debug_ctx = ctx.address_result.as_ref().map(|ar| {
+                    let shifted_alu_cycles: HashMap<SsaId, Vec<i32>> = ctx
+                        .final_decisions
+                        .shifted_alu_cycles
+                        .iter()
+                        .map(|(&k, v)| (SsaId::from(k), v.clone()))
+                        .collect();
+                    ScratchConflictDebugContext {
+                        address_result: ar,
+                        ssa_ops: &ctx.ops,
+                        shifted_alu_cycles,
+                    }
+                });
+                verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx);
+            }
         }
 
         ctx.into_result()
@@ -1187,11 +1209,10 @@ impl SsaTickTockKernelBuilder {
 
         ctx.run_pass(&LowerToOpsPass)?;
 
-        // Debug: assert no two ops in the same cycle write overlapping scratch addresses
-        if cfg!(debug_assertions) {
+        // Verify no two ops in the same cycle write overlapping scratch (default on; CLI --no-verify-scratch-conflict to disable).
+        if ctx.config.compiler.verify_same_cycle_scratch {
             if let Some(ref ops) = ctx.lowered_ops {
                 let debug_ctx = ctx.address_result.as_ref().map(|ar| {
-                    // Convert HashMap<usize, Vec<i32>> to HashMap<SsaId, Vec<i32>> for type-safe lookups
                     let shifted_alu_cycles: HashMap<SsaId, Vec<i32>> = ctx
                         .final_decisions
                         .shifted_alu_cycles

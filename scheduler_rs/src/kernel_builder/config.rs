@@ -173,6 +173,9 @@ pub struct CompilerConfig {
     /// Controls how the scheduler reacts to rising scratch (register) pressure.
     /// See `ssa_greedy::pressure_policy` module for details.
     pub scheduling_pressure_policy: PressurePolicyKind,
+    /// After lowering, verify no two ops in the same cycle write overlapping scratch (panic if so).
+    /// Default true. Disable via CLI --no-verify-scratch-conflict for debugging.
+    pub verify_same_cycle_scratch: bool,
 }
 
 impl Default for CompilerConfig {
@@ -181,6 +184,7 @@ impl Default for CompilerConfig {
             enable_valu_shift: true,
             enable_ssa_dce: true,
             scheduling_pressure_policy: PressurePolicyKind::default(),
+            verify_same_cycle_scratch: true,
         }
     }
 }
