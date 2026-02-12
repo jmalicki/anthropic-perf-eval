@@ -165,7 +165,7 @@ pub struct ScratchConflictDebugContext<'a> {
 }
 
 /// Returns `Err(SameCycleScratchConflict)` if two distinct ops in the same cycle write overlapping
-/// scratch ranges. Callers must run `export_partial_result_on_error` before returning the error
+/// scratch ranges. Callers must run `export_partial_result_on_error_safe` before returning the error
 /// so error-dump logic can run. Never panics.
 ///
 /// Each op's scratch writes are represented as one or more contiguous (base, size) blocks;
