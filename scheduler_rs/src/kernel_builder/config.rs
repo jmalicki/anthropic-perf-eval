@@ -173,8 +173,8 @@ pub struct CompilerConfig {
     /// Controls how the scheduler reacts to rising scratch (register) pressure.
     /// See `ssa_greedy::pressure_policy` module for details.
     pub scheduling_pressure_policy: PressurePolicyKind,
-    /// After lowering, verify no two ops in the same cycle write overlapping scratch (panic if so).
-    /// Default true. Disable via CLI --no-verify-scratch-conflict for debugging.
+    /// After lowering, verify no two ops in the same cycle write overlapping scratch (return Err so
+    /// export_partial_result_on_error can run). Default true. Disable via CLI --no-verify-scratch-conflict for debugging.
     pub verify_same_cycle_scratch: bool,
 }
 

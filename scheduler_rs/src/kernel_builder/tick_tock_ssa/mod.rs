@@ -164,7 +164,10 @@ pub struct ScratchConflictDebugContext<'a> {
     pub shifted_alu_cycles: HashMap<SsaId, Vec<i32>>,
 }
 
-/// Panics if two distinct ops in the same cycle write overlapping scratch ranges.
+/// Returns `Err(SameCycleScratchConflict)` if two distinct ops in the same cycle write overlapping
+/// scratch ranges. Callers must run `export_partial_result_on_error` before returning the error
+/// so error-dump logic can run. Never panics.
+///
 /// Each op's scratch writes are represented as one or more contiguous (base, size) blocks;
 /// no two such blocks (from any ops in the same cycle) may overlap.
 ///
@@ -263,7 +266,7 @@ macro_rules! run_pass_with_error_export {
     ($ctx:expr, $pass:expr) => {
         $ctx.run_pass($pass).map_err(|e| {
             let error = KernelBuilderError::Other(e);
-            export_partial_result_on_error($ctx, &error);
+            export_partial_result_on_error_safe($ctx, &error);
             error
         })?
     };
@@ -442,6 +445,18 @@ pub fn export_partial_result_on_error(
     }
 }
 
+/// Calls export_partial_result_on_error inside catch_unwind so we always return Err to the caller
+/// even if export panics (e.g. serialization bug). Use this before any `return Err(...)` so error
+/// dump logic runs and the process does not abort.
+fn export_partial_result_on_error_safe(
+    ctx: &super::pipeline::PipelineContext,
+    error: &KernelBuilderError,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        export_partial_result_on_error(ctx, error);
+    }));
+}
+
 impl SsaTickTockKernelBuilder {
     /// Create a new SSA kernel builder with the given configuration.
     pub fn new(config: KernelConfig) -> Self {
@@ -541,7 +556,7 @@ impl SsaTickTockKernelBuilder {
         let mut ctx = PipelineContext::new(program, config);
         ctx.run_greedy_pipeline(self.config.compiler.enable_ssa_dce).map_err(|e| {
             let error = KernelBuilderError::Other(e);
-            export_partial_result_on_error(&ctx, &error);
+            export_partial_result_on_error_safe(&ctx, &error);
             error
         })?;
 
@@ -567,7 +582,7 @@ impl SsaTickTockKernelBuilder {
                 .map(|ar| ar.budget)
                 .unwrap_or(SCRATCH_BUDGET_HW);
             let error = KernelBuilderError::BudgetExceeded { peak_live: peak, budget };
-            export_partial_result_on_error(&ctx, &error);
+            export_partial_result_on_error_safe(&ctx, &error);
             return Err(error);
         }
 
@@ -587,7 +602,7 @@ impl SsaTickTockKernelBuilder {
                     }
                 });
                 if let Err(error) = verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx) {
-                    export_partial_result_on_error(&ctx, &error);
+                    export_partial_result_on_error_safe(&ctx, &error);
                     return Err(error);
                 }
             }
@@ -1004,8 +1019,7 @@ impl SsaTickTockKernelBuilder {
                             budget: effective_budget,
                             time_limit: section_time_limit,
                         };
-                        // Export partial result before returning error
-                        export_partial_result_on_error(&ctx, &error);
+                        export_partial_result_on_error_safe(&ctx, &error);
                         return Err(error);
                     }
                 };
@@ -1098,7 +1112,7 @@ impl SsaTickTockKernelBuilder {
                 sec, *peak, SCRATCH_BUDGET_HW
             );
             let error = KernelBuilderError::Other(msg);
-            export_partial_result_on_error(&ctx, &error);
+            export_partial_result_on_error_safe(&ctx, &error);
             return Err(error);
         }
 
@@ -1124,7 +1138,7 @@ impl SsaTickTockKernelBuilder {
                 hint_peak, SCRATCH_BUDGET_HW
             );
             let error = KernelBuilderError::Other(msg);
-            export_partial_result_on_error(&ctx, &error);
+            export_partial_result_on_error_safe(&ctx, &error);
             return Err(error);
         }
 
@@ -1400,10 +1414,7 @@ impl SsaTickTockKernelBuilder {
                     peak_live: ar.peak_live,
                     budget: ar.budget,
                 };
-                
-                // Export partial result for debugging/reproduction
-                export_partial_result_on_error(&ctx, &error);
-                
+                export_partial_result_on_error_safe(&ctx, &error);
                 return Err(error);
             }
 
@@ -1423,7 +1434,7 @@ impl SsaTickTockKernelBuilder {
                                 interval2_start: i2.start,
                                 interval2_end: i2.end,
                             };
-                            export_partial_result_on_error(&ctx, &err);
+                            export_partial_result_on_error_safe(&ctx, &err);
                             return Err(err);
                         }
                     }
@@ -1450,8 +1461,7 @@ impl SsaTickTockKernelBuilder {
                     }
                 });
                 if let Err(error) = verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx) {
-                    // Export partial result before returning error
-                    export_partial_result_on_error(&ctx, &error);
+                    export_partial_result_on_error_safe(&ctx, &error);
                     return Err(error);
                 }
             }
