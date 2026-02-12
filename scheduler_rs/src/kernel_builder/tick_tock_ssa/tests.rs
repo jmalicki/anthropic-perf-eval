@@ -203,10 +203,11 @@ fn test_budget_exceeded_propagates() {
         result.ok()
     );
     let err = result.unwrap_err();
+    let err_msg = err.to_string();
     assert!(
-        err.contains("scratch budget exceeded"),
+        err_msg.contains("scratch budget exceeded"),
         "Error message must mention scratch budget exceeded: {}",
-        err
+        err_msg
     );
 }
 

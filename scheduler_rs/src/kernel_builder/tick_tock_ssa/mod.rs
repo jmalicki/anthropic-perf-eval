@@ -173,7 +173,7 @@ pub struct ScratchConflictDebugContext<'a> {
 fn verify_no_same_cycle_scratch_write_conflict(
     ops: &[Op],
     debug_ctx: Option<ScratchConflictDebugContext<'_>>,
-) {
+) -> Result<(), KernelBuilderError> {
     use std::collections::BTreeMap;
     // Store (base, len, op_id) to identify which ops conflict
     let by_cycle: BTreeMap<i32, Vec<(i64, usize, usize)>> = {
@@ -236,17 +236,189 @@ fn verify_no_same_cycle_scratch_write_conflict(
                         }
                     }
 
-                    panic!(
-                        "BUG: same-cycle scratch write conflict at cycle {}: op id={} ({}) writes [{}, {}) len {} vs op id={} ({}) writes [{}, {}) len {} (allocator must not assign overlapping scratch to ops in the same cycle)",
-                        _cycle,
-                        id1, op1_info,
-                        a1, a1 + l1 as i64, l1,
-                        id2, op2_info,
-                        a2, a2 + l2 as i64, l2
-                    );
+                    return Err(KernelBuilderError::SameCycleScratchConflict {
+                        cycle: *_cycle,
+                        op1_id: id1,
+                        op1_info,
+                        op1_addr: a1,
+                        op1_len: l1,
+                        op2_id: id2,
+                        op2_info,
+                        op2_addr: a2,
+                        op2_len: l2,
+                    });
                 }
             }
         }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Error Handling (defined early so run_pass_with_error_export! is in scope)
+// ============================================================================
+
+/// Helper macro to run a pipeline pass and convert errors, exporting partial result on failure.
+macro_rules! run_pass_with_error_export {
+    ($ctx:expr, $pass:expr) => {
+        $ctx.run_pass($pass).map_err(|e| {
+            let error = KernelBuilderError::Other(e);
+            export_partial_result_on_error($ctx, &error);
+            error
+        })?
+    };
+}
+
+/// Error types that can occur during kernel building.
+#[derive(Debug, Clone)]
+pub enum KernelBuilderError {
+    /// Scratch budget exceeded during address assignment.
+    BudgetExceeded {
+        peak_live: usize,
+        budget: usize,
+    },
+    /// Same-cycle scratch write conflict detected.
+    SameCycleScratchConflict {
+        cycle: i32,
+        op1_id: usize,
+        op1_info: String,
+        op1_addr: i64,
+        op1_len: usize,
+        op2_id: usize,
+        op2_info: String,
+        op2_addr: i64,
+        op2_len: usize,
+    },
+    /// Per-section CP-SAT failed to find a feasible schedule.
+    PerSectionInfeasible {
+        section: usize,
+        budget: usize,
+        time_limit: f64,
+    },
+    /// Address assignment produced conflicts between simultaneously-live VRegs.
+    AddressConflict {
+        conflict_count: usize,
+    },
+    /// Other error with message.
+    Other(String),
+}
+
+impl std::fmt::Display for KernelBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KernelBuilderError::BudgetExceeded { peak_live, budget } => {
+                write!(f, "scratch budget exceeded: peak_live={} > budget={}", peak_live, budget)
+            }
+            KernelBuilderError::SameCycleScratchConflict {
+                cycle,
+                op1_id,
+                op1_info,
+                op1_addr,
+                op1_len,
+                op2_id,
+                op2_info,
+                op2_addr,
+                op2_len,
+            } => {
+                write!(
+                    f,
+                    "BUG: same-cycle scratch write conflict at cycle {}: op id={} ({}) writes [{}, {}) len {} vs op id={} ({}) writes [{}, {}) len {} (allocator must not assign overlapping scratch to ops in the same cycle)",
+                    cycle, op1_id, op1_info, op1_addr, op1_addr + *op1_len as i64, op1_len,
+                    op2_id, op2_info, op2_addr, op2_addr + *op2_len as i64, op2_len
+                )
+            }
+            KernelBuilderError::PerSectionInfeasible { section, budget, time_limit } => {
+                write!(
+                    f,
+                    "Per-section CP-SAT must find a feasible schedule for section {} (scratch budget {}). \
+                     No solution found within {:.0}s. Either the segment is infeasible (bug in model/liveness) \
+                     or the time limit was too short; per-section feasibility uses at least {}s.",
+                    section, budget, time_limit, PER_SECTION_FEASIBILITY_MIN_SECS
+                )
+            }
+            KernelBuilderError::AddressConflict { conflict_count } => {
+                write!(
+                    f,
+                    "Address assignment produced {} conflicts between simultaneously-live VRegs",
+                    conflict_count
+                )
+            }
+            KernelBuilderError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for KernelBuilderError {}
+
+/// Export partial schedule result to JSON on error for debugging/reproduction.
+///
+/// This function attempts to write a partial `SsaScheduleResult` to JSON even when
+/// the build failed partway through. It respects environment variables:
+/// - `SCHEDULER_NO_EXPORT_ON_ERROR`: If set, skip export
+/// - `SCHEDULER_EXPORT_ON_ERROR_PATH`: Path for JSON file (default: "scheduler_output_error.json")
+///
+/// Returns the path if export succeeded, None if skipped or failed.
+pub fn export_partial_result_on_error(
+    ctx: &super::pipeline::PipelineContext,
+    error: &KernelBuilderError,
+) -> Option<String> {
+    let export_disabled = std::env::var("SCHEDULER_NO_EXPORT_ON_ERROR").is_ok();
+    if export_disabled {
+        return None;
+    }
+
+    let json_path = std::env::var("SCHEDULER_EXPORT_ON_ERROR_PATH")
+        .unwrap_or_else(|_| "scheduler_output_error.json".to_string());
+
+    // Build partial result from current context state
+    let partial_result = SsaScheduleResult {
+        ops: ctx.lowered_ops.clone().unwrap_or_default(),
+        cycles: ctx.final_metrics.cycles,
+        address_result: ctx.address_result.clone().unwrap_or_else(|| {
+            crate::address_assign::AddressAssignmentResult {
+                vreg_to_addr: HashMap::new(),
+                live_intervals: HashMap::new(),
+                peak_live: ctx.final_metrics.peak_live,
+                max_addr: 0,
+                vreg_count: 0,
+                total_words: 0,
+                budget: ctx.config.scratch_budget,
+                budget_exceeded: ctx.final_metrics.budget_exceeded,
+            }
+        }),
+        vreg_count: ctx.vreg_count,
+        valu_shifted: ctx.final_decisions.shifted_ops.len(),
+        budget_exceeded: ctx.final_metrics.budget_exceeded,
+        usage_accounting: ctx.usage_accounting.clone(),
+        vreg_metadata: ctx.vreg_metadata.clone(),
+        shifted_alu_cycles: ctx.final_decisions.shifted_alu_cycles.clone(),
+        empty_cycle_count: ctx.cpsat_extra.as_ref().map(|e| e.empty_cycle_count),
+        makespan_driven_by_capacity: ctx.cpsat_extra.as_ref().map(|e| e.makespan_driven_by_capacity),
+        schedule_constraints: ctx.cpsat_extra.as_ref().map(|e| e.schedule_constraints.clone()),
+        ssa_cycle_assignments: ctx.cpsat_extra.as_ref().map(|e| e.ssa_cycle_assignments.clone()),
+        ssa_ops_bulk_move: ctx.cpsat_extra.as_ref().map(|e| e.ssa_ops_bulk_move.clone()),
+        ssa_ops: Some(ctx.ops.clone()), // Include SSA ops for debugging
+        eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
+        lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+    };
+
+    // Build error message for comment
+    let error_msg = format!("ERROR: {}", error);
+
+    // Write JSON with full liveness detail
+    if let Err(e) = crate::schedule_output::write_ssa_schedule_json(
+        &partial_result,
+        &json_path,
+        crate::schedule_output::LivenessDetail::Full,
+        None, // run_options
+        None, // git_sha
+        Some(error_msg),
+    ) {
+        eprintln!("  Failed to write error JSON to {}: {}", json_path, e);
+        None
+    } else {
+        eprintln!("  [ERROR] Schedule JSON exported to {} ({})", json_path, error);
+        Some(json_path)
     }
 }
 
@@ -315,7 +487,7 @@ impl SsaTickTockKernelBuilder {
     /// 5. Lowering to concrete ops (expanding shifted VALU ops)
     ///
     /// Returns `Err` if scratch budget was exceeded (peak_live > budget); the caller must not use the kernel in that case.
-    pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, String> {
+    pub fn build_and_schedule(&mut self) -> Result<SsaScheduleResult, KernelBuilderError> {
         self.build_and_schedule_with_options(self.config.compiler.enable_valu_shift, None)
     }
 
@@ -330,7 +502,7 @@ impl SsaTickTockKernelBuilder {
         &mut self,
         enable_valu_shift: bool,
         scratch_budget_override: Option<usize>,
-    ) -> Result<SsaScheduleResult, String> {
+    ) -> Result<SsaScheduleResult, KernelBuilderError> {
         use super::pipeline::{PipelineConfig, PipelineContext};
 
         let program = self.build();
@@ -347,7 +519,11 @@ impl SsaTickTockKernelBuilder {
         };
 
         let mut ctx = PipelineContext::new(program, config);
-        ctx.run_greedy_pipeline(self.config.compiler.enable_ssa_dce)?;
+        ctx.run_greedy_pipeline(self.config.compiler.enable_ssa_dce).map_err(|e| {
+            let error = KernelBuilderError::Other(e);
+            export_partial_result_on_error(&ctx, &error);
+            error
+        })?;
 
         // Check budget: address assignment is the ground truth for peak liveness
         // (it accounts for sub_temp_vregs, shifted VALU multi-cycle writes, and
@@ -370,10 +546,9 @@ impl SsaTickTockKernelBuilder {
                 .as_ref()
                 .map(|ar| ar.budget)
                 .unwrap_or(SCRATCH_BUDGET_HW);
-            return Err(format!(
-                "scratch budget exceeded: peak_live={} > budget={}",
-                peak, budget
-            ));
+            let error = KernelBuilderError::BudgetExceeded { peak_live: peak, budget };
+            export_partial_result_on_error(&ctx, &error);
+            return Err(error);
         }
 
         if ctx.config.compiler.verify_same_cycle_scratch {
@@ -391,11 +566,14 @@ impl SsaTickTockKernelBuilder {
                         shifted_alu_cycles,
                     }
                 });
-                verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx);
+                if let Err(error) = verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx) {
+                    export_partial_result_on_error(&ctx, &error);
+                    return Err(error);
+                }
             }
         }
 
-        ctx.into_result()
+        ctx.into_result().map_err(|e| KernelBuilderError::Other(e))
     }
 
     /// Build and schedule using CP-SAT on SSA ops (before register allocation).
@@ -423,9 +601,9 @@ impl SsaTickTockKernelBuilder {
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
         enable_cse_groups: bool,
         enable_bulk_move: bool,
-    ) -> Result<SsaScheduleResult, String> {
+    ) -> Result<SsaScheduleResult, KernelBuilderError> {
         #[cfg(not(feature = "cpsat"))]
-        return Err("CP-SAT not available: compile with --features cpsat".to_string());
+        return Err(KernelBuilderError::Other("CP-SAT not available: compile with --features cpsat".to_string()));
 
         #[cfg(feature = "cpsat")]
         {
@@ -483,10 +661,10 @@ impl SsaTickTockKernelBuilder {
         let mut ctx = PipelineContext::new(program, config);
 
         // Phase 1: Dependencies + DCE + Bounds + Greedy (via pipeline passes)
-        ctx.run_pass(&ComputeDependenciesPass)?;
+        run_pass_with_error_export!(&mut ctx, &ComputeDependenciesPass);
         if self.config.compiler.enable_ssa_dce {
-            ctx.run_pass(&DcePass)?;
-            ctx.run_pass(&ComputeDependenciesPass)?;
+            run_pass_with_error_export!(&mut ctx, &DcePass);
+            run_pass_with_error_export!(&mut ctx, &ComputeDependenciesPass);
         }
 
         // DCE assertion: every defined VReg must have a use
@@ -516,10 +694,10 @@ impl SsaTickTockKernelBuilder {
 
         let barrier_count = count_barriers(&ctx.ops);
 
-        ctx.run_pass(&ComputeBoundsPass)?;
+        run_pass_with_error_export!(&mut ctx, &ComputeBoundsPass);
 
         // Greedy scheduling for hints
-        ctx.run_pass(&super::pipeline::passes::GreedySchedulePass)?;
+        run_pass_with_error_export!(&mut ctx, &super::pipeline::passes::GreedySchedulePass);
 
         let greedy_cycles = ctx.greedy_metrics.cycles;
         let greedy_budget_exceeded = ctx.greedy_metrics.budget_exceeded;
@@ -800,12 +978,16 @@ impl SsaTickTockKernelBuilder {
                     Some(false),
                 ) {
                     Some(r) => r,
-                    None => panic!(
-                        "Per-section CP-SAT must find a feasible schedule for section {} (scratch budget {}). \
-                         No solution found within {:.0}s. Either the segment is infeasible (bug in model/liveness) \
-                         or the time limit was too short; per-section feasibility uses at least {}s.",
-                        k, effective_budget, section_time_limit, PER_SECTION_FEASIBILITY_MIN_SECS
-                    ),
+                    None => {
+                        let error = KernelBuilderError::PerSectionInfeasible {
+                            section: k,
+                            budget: effective_budget,
+                            time_limit: section_time_limit,
+                        };
+                        // Export partial result before returning error
+                        export_partial_result_on_error(&ctx, &error);
+                        return Err(error);
+                    }
                 };
                 section_select_fma_overrides[k] = Some(seg_result.select_fma_ops.clone());
                 for &i in &global_indices {
@@ -890,11 +1072,14 @@ impl SsaTickTockKernelBuilder {
             .section_peaks.iter().enumerate()
             .find(|(_, &p)| p > SCRATCH_BUDGET_HW)
         {
-            return Err(format!(
+            let msg = format!(
                 "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget {}). \
                  This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
                 sec, *peak, SCRATCH_BUDGET_HW
-            ));
+            );
+            let error = KernelBuilderError::Other(msg);
+            export_partial_result_on_error(&ctx, &error);
+            return Err(error);
         }
 
         let rescheduled_by_section_cpsat = actually_rescheduled_op_ids;
@@ -902,7 +1087,7 @@ impl SsaTickTockKernelBuilder {
         // ====================================================================
         // Phase 3: Elide barriers → Full-kernel CP-SAT → Filter → Assign → Lower
         // ====================================================================
-        ctx.run_pass(&ElideBarriersPass)?;
+        run_pass_with_error_export!(&mut ctx, &ElideBarriersPass);
 
         // Collect hints for full-kernel CP-SAT
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
@@ -913,11 +1098,14 @@ impl SsaTickTockKernelBuilder {
         ).section_peaks.iter().copied().max().unwrap_or(0);
 
         if hint_peak > SCRATCH_BUDGET_HW {
-            return Err(format!(
+            let msg = format!(
                 "Merged hint schedule exceeds scratch budget: peak {} words (budget {}). \
                  Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
                 hint_peak, SCRATCH_BUDGET_HW
-            ));
+            );
+            let error = KernelBuilderError::Other(msg);
+            export_partial_result_on_error(&ctx, &error);
+            return Err(error);
         }
 
         // Reset cycles before CP-SAT
@@ -1058,7 +1246,7 @@ impl SsaTickTockKernelBuilder {
             },
             Some(!greedy_budget_exceeded),
         )
-        .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
+        .ok_or_else(|| KernelBuilderError::Other("CP-SAT scheduling failed".to_string()))?;
 
         // Apply cycle assignments
         for (idx, op) in ctx.ops.iter_mut().enumerate() {
@@ -1176,9 +1364,9 @@ impl SsaTickTockKernelBuilder {
         });
 
         // Final passes: Filter → Assign → Lower
-        ctx.run_pass(&FilterDeadStoresPass)?;
+        run_pass_with_error_export!(&mut ctx, &FilterDeadStoresPass);
         ctx.compute_accounting();
-        ctx.run_pass(&AssignAddressesPass)?;
+        run_pass_with_error_export!(&mut ctx, &AssignAddressesPass);
 
         // Budget exceeded check for CP-SAT path
         if let Some(ref ar) = ctx.address_result {
@@ -1188,60 +1376,15 @@ impl SsaTickTockKernelBuilder {
                     ar.peak_live, ar.budget
                 );
                 
-                // Always export schedule JSON for debugging/reproduction (unless explicitly disabled)
-                let export_disabled = std::env::var("SCHEDULER_NO_EXPORT_ON_ERROR").is_ok();
-                if !export_disabled {
-                    let json_path = std::env::var("SCHEDULER_EXPORT_ON_ERROR_PATH")
-                        .unwrap_or_else(|_| "scheduler_output_error.json".to_string());
-                    
-                    // Build partial result for export (CP-SAT succeeded, address assignment failed)
-                    let partial_result = crate::kernel_builder::SsaScheduleResult {
-                        ops: vec![], // Not lowered yet, but we have SSA ops
-                        cycles: ctx.final_metrics.cycles,
-                        address_result: ar.clone(),
-                        vreg_count: ctx.vreg_count,
-                        valu_shifted: ctx.final_decisions.shifted_ops.len(),
-                        budget_exceeded: true,
-                        usage_accounting: ctx.usage_accounting.clone(),
-                        vreg_metadata: ctx.vreg_metadata.clone(),
-                        shifted_alu_cycles: ctx.final_decisions.shifted_alu_cycles.clone(),
-                        empty_cycle_count: ctx.cpsat_extra.as_ref().map(|e| e.empty_cycle_count),
-                        makespan_driven_by_capacity: ctx.cpsat_extra.as_ref().map(|e| e.makespan_driven_by_capacity),
-                        schedule_constraints: ctx.cpsat_extra.as_ref().map(|e| e.schedule_constraints.clone()),
-                        ssa_cycle_assignments: ctx.cpsat_extra.as_ref().map(|e| e.ssa_cycle_assignments.clone()),
-                        ssa_ops_bulk_move: ctx.cpsat_extra.as_ref().map(|e| e.ssa_ops_bulk_move.clone()),
-                        ssa_ops: Some(ctx.ops.clone()), // Include SSA ops for debugging
-                        eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
-                        lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
-                    };
-                    
-                    // Write JSON with full liveness detail
-                    if let Err(e) = crate::schedule_output::write_ssa_schedule_json(
-                        &partial_result,
-                        &json_path,
-                        crate::schedule_output::LivenessDetail::Full,
-                        None, // run_options
-                        None, // git_sha
-                        Some(format!("ERROR: budget exceeded (peak_live={} > budget={})", ar.peak_live, ar.budget)),
-                    ) {
-                        eprintln!("  Failed to write error JSON to {}: {}", json_path, e);
-                    } else {
-                        eprintln!("  [ERROR] Schedule JSON exported to {} (CP-SAT succeeded, address assignment failed)", json_path);
-                    }
-                    
-                    // Also export CP-SAT model proto if path specified (requires storing model in context)
-                    if let Ok(cpsat_model_path) = std::env::var("SCHEDULER_EXPORT_CP_SAT_MODEL_PATH") {
-                        // Note: We don't have direct access to the CP-SAT model here, but we could
-                        // store it in cpsat_extra if needed. For now, just log that proto export
-                        // would require storing the model in the context.
-                        eprintln!("  [ERROR] CP-SAT model proto export requested to {} but model not available in context (would need to store model in cpsat_extra)", cpsat_model_path);
-                    }
-                }
+                let error = KernelBuilderError::BudgetExceeded {
+                    peak_live: ar.peak_live,
+                    budget: ar.budget,
+                };
                 
-                return Err(format!(
-                    "scratch budget exceeded: peak_live={} > budget={}",
-                    ar.peak_live, ar.budget
-                ));
+                // Export partial result for debugging/reproduction
+                export_partial_result_on_error(&ctx, &error);
+                
+                return Err(error);
             }
 
             // Assert no two VRegs with overlapping live intervals share the same address
@@ -1260,7 +1403,7 @@ impl SsaTickTockKernelBuilder {
             }
         }
 
-        ctx.run_pass(&LowerToOpsPass)?;
+        run_pass_with_error_export!(&mut ctx, &LowerToOpsPass);
 
         // Verify no two ops in the same cycle write overlapping scratch (default on; CLI --no-verify-scratch-conflict to disable).
         if ctx.config.compiler.verify_same_cycle_scratch {
@@ -1278,11 +1421,15 @@ impl SsaTickTockKernelBuilder {
                         shifted_alu_cycles,
                     }
                 });
-                verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx);
+                if let Err(error) = verify_no_same_cycle_scratch_write_conflict(ops, debug_ctx) {
+                    // Export partial result before returning error
+                    export_partial_result_on_error(&ctx, &error);
+                    return Err(error);
+                }
             }
         }
 
-        ctx.into_result()
+        ctx.into_result().map_err(|e| KernelBuilderError::Other(e))
         }
     }
 
