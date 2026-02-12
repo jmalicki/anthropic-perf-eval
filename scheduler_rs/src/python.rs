@@ -1166,7 +1166,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         forced_shifts.map(|v| v.into_iter().collect());
     let force_zero_gap = force_zero_gap.unwrap_or(false);
     let enable_vbroadcast_elimination = enable_vbroadcast_elimination.unwrap_or(enable_valu_shift);
-    let enable_asap_alap_tightening = enable_asap_alap_tightening.unwrap_or(false);
+    let enable_asap_alap_tightening = enable_asap_alap_tightening.unwrap_or(true);
     let enable_scratch_tightening = enable_scratch_tightening.unwrap_or(false);
     let enable_cse_groups = enable_cse_groups.unwrap_or(true);
     let disable_optional_set: Option<HashSet<OptionalConstraintGroup>> =

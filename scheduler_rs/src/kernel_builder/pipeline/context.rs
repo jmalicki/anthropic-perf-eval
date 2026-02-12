@@ -153,7 +153,7 @@ impl Default for CpSatPipelineConfig {
             select_choice_mode: SelectChoiceMode::Optimize,
             valu_shift_mode: ValuShiftMode::Optimize,
             force_zero_gap: false,
-            enable_asap_alap_tightening: false,
+            enable_asap_alap_tightening: true,
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,

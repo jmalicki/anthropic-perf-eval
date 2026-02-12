@@ -73,8 +73,8 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--force-zero-gap", action="store_true",
                        help="Force 0 integral gap for proven optimality")
     group.add_argument("--enable-asap-alap-tightening", action=argparse.BooleanOptionalAction,
-                       default=False,
-                       help="Enable ASAP/ALAP slot tightening (default: disabled; non-default debugging option)")
+                       default=True,
+                       help="Enable ASAP/ALAP slot tightening (default: enabled)")
     group.add_argument("--enable-scratch-tightening", action="store_true",
                        help="Enable scratch-aware tightening (default: disabled; non-default debugging option)")
     group.add_argument("--scheduling-pressure-policy",
@@ -177,7 +177,7 @@ def args_to_build_kwargs(
         "select_choice": get("select_choice", "optimize"),
         "valu_shift": get("valu_shift", "optimize"),
         "force_zero_gap": get("force_zero_gap", False) and use_cpsat,
-        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", False) and use_cpsat,
+        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", True) and use_cpsat,
         "enable_scratch_tightening": get("enable_scratch_tightening", False) and use_cpsat,
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "enable_cse_groups": not get("no_cse_groups", False),
@@ -203,7 +203,7 @@ def args_to_build_kwargs(
         "select_choice": get("select_choice", "optimize"),
         "valu_shift": get("valu_shift", "optimize"),
         "force_zero_gap": get("force_zero_gap", False) if use_cpsat else None,
-        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", False) if use_cpsat else None,
+        "enable_asap_alap_tightening": get("enable_asap_alap_tightening", True) if use_cpsat else None,
         "enable_scratch_tightening": get("enable_scratch_tightening", False) if use_cpsat else None,
         "run_options_json": json.dumps(run_options),
         "git_sha": git_sha,

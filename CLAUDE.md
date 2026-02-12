@@ -141,7 +141,7 @@ Scheduler options:
 - `--valu-shift MODE` - VALU shift handling: `optimize` (default), `alu`, or `valu`
 - `--per-section-optimize-secs SECONDS` - Per-section CP-SAT optimization time (0 or omit = feasibility only)
 - `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
-- `--enable-asap-alap-tightening` - Non-default debugging: tighten ASAP/ALAP by slot capacity (default: disabled)
+- `--enable-asap-alap-tightening` - Tighten ASAP/ALAP by slot capacity (default: enabled; use `--no-enable-asap-alap-tightening` to disable)
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
 - `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** bulk-move is known buggy (can cause same-cycle scratch write conflicts). Use only when the bug is fixed for tighter makespan.
 
