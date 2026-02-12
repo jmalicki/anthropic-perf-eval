@@ -298,6 +298,9 @@ pub struct SsaCpsatConfig {
     /// corresponding constraints are not added (they are redundant/helper constraints that help
     /// propagation but are not required for correctness). Empty by default (all optional groups on).
     pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
+    /// When true (default) and select_choice_hints is None, hint each SelectChoice choice_var to 0 (vselect).
+    /// When false, do not add that default hint (solver chooses freely). Used to debug presolve INFEASIBLE.
+    pub hint_select_choice_vselect_by_default: bool,
 }
 
 impl Default for SsaCpsatConfig {
@@ -319,6 +322,7 @@ impl Default for SsaCpsatConfig {
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
+            hint_select_choice_vselect_by_default: true,
         }
     }
 }
@@ -738,8 +742,58 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
     max_asap.values().max().copied().unwrap_or(0) + 1
 }
 
+// =============================================================================
+// Slot-aware ASAP/ALAP tightening: why we exclude optional-interval ops
+// =============================================================================
+//
+// INVARIANT: Tightening must never change feasibility. For every feasible schedule,
+// there must still exist at least one cycle assignment in the tightened [asap, alap]
+// domains. So we may only remove values that are provably infeasible (e.g. would
+// violate capacity in every possible world). If we remove a value that some feasible
+// solution uses, we can create empty domains (asap > alap) or make the CP-SAT model
+// INFEASIBLE in presolve.
+//
+// ENERGETIC REASONING (valid when all counted ops definitely use the engine):
+// For a given engine with capacity C and a time window [t, t+W), at most C*W "op-cycles"
+// can be executed. So if N ops can all start somewhere in [t, t+W) (by current domains),
+// we need N <= C*W, i.e. W >= ceil(N/C). If the current window for an op is too small
+// (too few cycles to fit all ops that could run in that window), we push ASAP forward
+// or ALAP backward so the window grows. That is valid only when every counted op
+// *definitely* uses this engine.
+//
+// OPTIONAL INTERVALS: Some ops have *optional* usage on an engine—the CP-SAT model
+// uses optional intervals and a choice variable, and only one alternative is present
+// in any solution. Examples:
+//   - SelectChoice on Flow: the op may use vselect (Flow) or FMA (VALU). So it does
+//     not definitely use Flow; we must not count it in the Flow profile.
+//   - ConstChoice on Load: the op may use Load or AddImm (Flow). So it does not
+//     definitely use Load; we must not count it in the Load profile.
+//   - Shiftable VALU: the op may stay on VALU or shift to ALU. So it does not
+//     definitely use VALU; we must not count it in the VALU profile when shiftable_valu
+//     is provided.
+//
+// IF WE COUNT THEM: We would over-count demand. E.g. with flow_cap=1 and three
+// SelectChoice ops, we'd assume 3 Flow ops must be scheduled; energetic reasoning
+// would require at least 3 cycles and could push ALAP earlier / ASAP later. But in
+// a feasible solution the solver might choose FMA for all three (0 Flow ops from
+// SelectChoice). Then the tightened bounds would have excluded feasible cycle
+// assignments, and we could get empty domains or presolve INFEASIBLE. So we
+// *exclude* optional-interval ops from both (1) the resource profile and (2) the
+// set of ops whose bounds we tighten for this engine. That way tightening only
+// uses information that holds in every feasible solution.
+//
+// =============================================================================
+
 /// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
 /// Uses difference arrays and prefix sums for O(n + horizon) complexity.
+///
+/// Only counts ops that **definitely** use each engine (required intervals).
+/// Ops with optional usage on an engine are excluded so that we never over-tighten
+/// and never change feasibility. See the block comment above for the full rationale.
+///
+/// - **Flow**: exclude `SelectChoice` (may use FMA/VALU instead of vselect/Flow).
+/// - **Load**: exclude `ConstChoice` (may use AddImm/Flow instead of Load).
+/// - **VALU**: exclude shiftable ops (may shift to ALU) when `shiftable_valu` is provided.
 pub(crate) fn tighten_asap_alap_by_slots(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -751,6 +805,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
     store_cap: i64,
     flow_cap: i64,
     verbose: bool,
+    shiftable_valu: Option<&HashSet<usize>>,
 ) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
     use std::collections::HashMap as StdHashMap;
 
@@ -793,10 +848,26 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 continue;
             }
 
-            // Build resource profile using difference array
-            // profile[t] = number of ops on this engine that CAN start at cycle t
+            // Which ops have *optional* usage on this engine? We must not count them in the
+            // profile (would over-count) and must not tighten their bounds using this engine's
+            // capacity (would assume they use it). See the long comment above this function.
+            let is_optional_on_engine = |idx: usize| -> bool {
+                let op = &ops[idx];
+                match engine {
+                    Engine::Flow => op.opcode == Opcode::SelectChoice, // vselect or FMA
+                    Engine::Load => op.opcode == Opcode::ConstChoice,  // Load or AddImm
+                    Engine::Valu => shiftable_valu.map_or(false, |s| s.contains(&idx)), // VALU or ALU
+                    _ => false,
+                }
+            };
+
+            // Build resource profile from *required* ops only. profile[t] = number of ops
+            // that definitely use this engine and can start at cycle t (given current domains).
             let mut diff = vec![0i64; horizon_usize + 2];
             for &idx in engine_ops {
+                if is_optional_on_engine(idx) {
+                    continue; // do not count: in some solutions this op does not use this engine
+                }
                 let op_id = ops[idx].id;
                 let asap_t = *new_asap.get(&op_id)? as usize;
                 let alap_t = *new_alap.get(&op_id)? as usize;
@@ -822,8 +893,15 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 prefix[t + 1] = prefix[t] + profile[t];
             }
 
-            // For each op on this engine, check if window has enough capacity
+            // For each op that *definitely* uses this engine, apply energetic reasoning:
+            // if the op's window [asap, alap] is too small for the total demand in that window,
+            // push ASAP forward or ALAP backward. Skip optional-interval ops: we excluded them
+            // from the profile, so tightening their bounds from this engine would be inconsistent
+            // (we'd be assuming they contribute to demand here, which they might not).
             for &idx in engine_ops {
+                if is_optional_on_engine(idx) {
+                    continue; // do not tighten from this engine: op may not use it
+                }
                 let op_id = ops[idx].id;
                 let old_asap = *new_asap.get(&op_id)?;
                 let old_alap = *new_alap.get(&op_id)?;
@@ -833,7 +911,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
                     continue;
                 }
 
-                // Count total ops that CAN start in this window
+                // Count total ops that CAN start in this window (profile has required ops only)
                 let window_start = old_asap as usize;
                 let window_end = old_alap as usize;
                 if window_end >= prefix.len() - 1 {
@@ -1226,6 +1304,7 @@ pub fn compute_ssa_asap_alap_bounds(
             store_cap,
             flow_cap,
             verbose,
+            Some(&shiftable_set),
         ) {
             current_asap = slot_asap;
             current_alap = slot_alap;

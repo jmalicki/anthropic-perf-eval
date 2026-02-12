@@ -74,6 +74,7 @@ impl Pass for ComputeBoundsPass {
                     machine.store_slots as i64,
                     machine.flow_slots as i64,
                     false, // verbose
+                    Some(&shiftable_set),
                 )
             {
                 current_asap = slot_asap;

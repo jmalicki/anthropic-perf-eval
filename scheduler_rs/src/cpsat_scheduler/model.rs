@@ -73,6 +73,7 @@ pub fn schedule_ssa_cpsat(
         enable_scratch_tightening,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
+        hint_select_choice_vselect_by_default,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -141,7 +142,7 @@ pub fn schedule_ssa_cpsat(
     let greedy_max = greedy_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
         .unwrap_or(0);
-    let horizon = if greedy_max > 0 {
+    let mut horizon = if greedy_max > 0 {
         // Greedy makespan is a proven upper bound — optimal is at most greedy_max.
         // Add small buffer (+20) for solver flexibility, but keep max_latency_critical_path
         // guard so ALAP backward propagation has enough room.
@@ -154,6 +155,38 @@ pub fn schedule_ssa_cpsat(
             .max(max_latency_critical_path * 2)
             .max(n as i32) as i64
     };
+
+    // Ensure horizon >= capacity_lower_bound so max_cycle/makespan domains are non-empty.
+    // With toy machines (e.g. 1 VALU slot), capacity_lower_bound can exceed the formula above.
+    {
+        let valu_count = ops.iter().filter(|op| op.engine == Engine::Valu).count() as i64;
+        let alu_count = ops.iter().filter(|op| op.engine == Engine::Alu).count() as i64;
+        let load_count = ops.iter().filter(|op| op.engine == Engine::Load).count() as i64;
+        let store_count = ops.iter().filter(|op| op.engine == Engine::Store).count() as i64;
+        let flow_base = ops.iter().filter(|op| op.engine == Engine::Flow).count() as i64;
+        let shiftable_count = shiftable_set.len() as i64;
+        let const_choice_count = ops.iter().filter(|op| op.opcode == Opcode::ConstChoice).count() as i64;
+        let select_choice_count = ops.iter().filter(|op| op.opcode == Opcode::SelectChoice).count() as i64;
+        let cap_result = compute_capacity_lower_bound_global(
+            valu_count,
+            alu_count,
+            load_count,
+            store_count,
+            flow_base,
+            shiftable_count,
+            const_choice_count,
+            select_choice_count,
+            enable_valu_shift,
+            valu_cap,
+            alu_cap,
+            load_cap,
+            store_cap,
+            flow_cap,
+            0i64,
+            cse_groups,
+        );
+        horizon = horizon.max(cap_result.capacity_lower_bound);
+    }
 
     let alap = compute_ssa_alap(ops, horizon as i32, &shiftable_set);
 
@@ -206,6 +239,7 @@ pub fn schedule_ssa_cpsat(
             store_cap,
             flow_cap,
             verbose,
+            Some(&shiftable_set),
         )
         .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
         current_asap = slot_asap;
@@ -1001,7 +1035,7 @@ pub fn schedule_ssa_cpsat(
                     } else {
                         model.add_hint(choice_var, 0);
                     }
-                } else {
+                } else if hint_select_choice_vselect_by_default {
                     model.add_hint(choice_var, 0);
                 }
 
