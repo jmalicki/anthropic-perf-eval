@@ -8,20 +8,19 @@ Default settings:
 - enable_valu_shift=True (VALU→ALU shifting for better slot use)
 - use_cpsat=True (optimal scheduling)
 - cpsat_time_limit=600 (10 minutes - good default)
+- validate=True (validate against reference; use --no-validate to skip)
 
 Example usage:
-    # Default (CP-SAT with VALU shift)
+    # Default (CP-SAT with VALU shift, validation on)
     python generate_ssa_kernel.py
 
-    # Quick iteration with greedy scheduler
-    python generate_ssa_kernel.py --use-greedy
+    # Quick iteration with greedy scheduler (no validation)
+    python generate_ssa_kernel.py --use-greedy --no-validate
 
     # Longer optimization
     python generate_ssa_kernel.py --cpsat-time-limit 3600
 
-    # With validation (kernel is always saved before validation for debugging)
-    python generate_ssa_kernel.py --validate
-    # Kernel written to kernel_to_validate.json; re-validate without rebuilding:
+    # Kernel written to kernel_to_validate.json when validating; re-validate without rebuilding:
     python generate_ssa_kernel.py --validate-only kernel_to_validate.json
 """
 
@@ -49,8 +48,10 @@ def main():
     add_kernel_build_args(parser)
 
     # Script-specific options (not passed to Rust)
-    parser.add_argument("--validate", action="store_true",
-                        help="Validate against reference kernel (kernel is always saved before validation for debugging)")
+    parser.add_argument("--validate", action="store_true", default=True,
+                        help="Validate against reference kernel (default: True). Kernel is always saved before validation for debugging.")
+    parser.add_argument("--no-validate", action="store_false", dest="validate",
+                        help="Skip validation (faster for iteration).")
     parser.add_argument("--validate-only", type=str, metavar="PATH", default=None,
                         help="Load kernel from JSON and run validation only (no build). Use same forest_height, batch_size, rounds, seed.")
     parser.add_argument("--save-kernel", type=str, metavar="PATH", default=None,
