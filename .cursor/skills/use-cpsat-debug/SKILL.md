@@ -24,6 +24,23 @@ When CP-SAT reports INFEASIBLE, the same constraint bugs may cause wrong output 
    ```
    Prints constraint count/type, cumulative capacity/demands. Use `--validate` to run ortools validation.
 
+## Budget Exceeded: Schedule JSON Export
+
+When address assignment exceeds the scratch budget (after CP-SAT succeeds), the schedule JSON is **automatically exported** for debugging/reproduction:
+
+- **Default path:** `scheduler_output_error.json`
+- **Custom path:** Set `SCHEDULER_EXPORT_ON_ERROR_PATH=my_error.json`
+- **Disable export:** Set `SCHEDULER_NO_EXPORT_ON_ERROR=1`
+
+The exported JSON includes:
+- CP-SAT schedule (cycle assignments, VALU shifts, ConstChoice/SelectChoice decisions)
+- SSA ops (for debugging)
+- Address assignment result (even though budget exceeded)
+- Full liveness data
+- Comment indicating the error
+
+Use this JSON to reproduce the issue, analyze why budget was exceeded, or debug the address assignment algorithm.
+
 ## Active Set (Binding Constraints)
 
 Binding constraints are those that hold with equality at the CP-SAT solution—they limit the schedule.

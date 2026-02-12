@@ -83,7 +83,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::types::{EmissionPhase, LiveInterval, Opcode, Operand, SsaOp, VReg, VarType, VLEN};
 
 /// Result of address assignment.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AddressAssignmentResult {
     /// Mapping from VReg to physical address
     pub vreg_to_addr: HashMap<VReg, i64>,

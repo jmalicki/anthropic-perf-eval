@@ -1187,6 +1187,57 @@ impl SsaTickTockKernelBuilder {
                     "Warning: CP-SAT address assignment exceeded budget: peak_live={} > budget={}",
                     ar.peak_live, ar.budget
                 );
+                
+                // Always export schedule JSON for debugging/reproduction (unless explicitly disabled)
+                let export_disabled = std::env::var("SCHEDULER_NO_EXPORT_ON_ERROR").is_ok();
+                if !export_disabled {
+                    let json_path = std::env::var("SCHEDULER_EXPORT_ON_ERROR_PATH")
+                        .unwrap_or_else(|_| "scheduler_output_error.json".to_string());
+                    
+                    // Build partial result for export (CP-SAT succeeded, address assignment failed)
+                    let partial_result = crate::kernel_builder::SsaScheduleResult {
+                        ops: vec![], // Not lowered yet, but we have SSA ops
+                        cycles: ctx.final_metrics.cycles,
+                        address_result: ar.clone(),
+                        vreg_count: ctx.vreg_count,
+                        valu_shifted: ctx.final_decisions.shifted_ops.len(),
+                        budget_exceeded: true,
+                        usage_accounting: ctx.usage_accounting.clone(),
+                        vreg_metadata: ctx.vreg_metadata.clone(),
+                        shifted_alu_cycles: ctx.final_decisions.shifted_alu_cycles.clone(),
+                        empty_cycle_count: ctx.cpsat_extra.as_ref().map(|e| e.empty_cycle_count),
+                        makespan_driven_by_capacity: ctx.cpsat_extra.as_ref().map(|e| e.makespan_driven_by_capacity),
+                        schedule_constraints: ctx.cpsat_extra.as_ref().map(|e| e.schedule_constraints.clone()),
+                        ssa_cycle_assignments: ctx.cpsat_extra.as_ref().map(|e| e.ssa_cycle_assignments.clone()),
+                        ssa_ops_bulk_move: ctx.cpsat_extra.as_ref().map(|e| e.ssa_ops_bulk_move.clone()),
+                        ssa_ops: Some(ctx.ops.clone()), // Include SSA ops for debugging
+                        eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
+                        lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+                    };
+                    
+                    // Write JSON with full liveness detail
+                    if let Err(e) = crate::schedule_output::write_ssa_schedule_json(
+                        &partial_result,
+                        &json_path,
+                        crate::schedule_output::LivenessDetail::Full,
+                        None, // run_options
+                        None, // git_sha
+                        Some(format!("ERROR: budget exceeded (peak_live={} > budget={})", ar.peak_live, ar.budget)),
+                    ) {
+                        eprintln!("  Failed to write error JSON to {}: {}", json_path, e);
+                    } else {
+                        eprintln!("  [ERROR] Schedule JSON exported to {} (CP-SAT succeeded, address assignment failed)", json_path);
+                    }
+                    
+                    // Also export CP-SAT model proto if path specified (requires storing model in context)
+                    if let Ok(cpsat_model_path) = std::env::var("SCHEDULER_EXPORT_CP_SAT_MODEL_PATH") {
+                        // Note: We don't have direct access to the CP-SAT model here, but we could
+                        // store it in cpsat_extra if needed. For now, just log that proto export
+                        // would require storing the model in the context.
+                        eprintln!("  [ERROR] CP-SAT model proto export requested to {} but model not available in context (would need to store model in cpsat_extra)", cpsat_model_path);
+                    }
+                }
+                
                 return Err(format!(
                     "scratch budget exceeded: peak_live={} > budget={}",
                     ar.peak_live, ar.budget
