@@ -87,10 +87,13 @@ def main():
         else args.per_section_optimize_secs
     )
     cpsat_time_limit = args.cpsat_time_limit
-    if args.force_zero_gap and cpsat_time_limit < 7200:
+    # force_zero_gap defaults to 2h time limit, but allow explicit override
+    if args.force_zero_gap and cpsat_time_limit == 3600.0:  # Only auto-set if using default
         cpsat_time_limit = 7200
         if verbose:
             print(f"  (force_zero_gap: using cpsat_time_limit={cpsat_time_limit:.0f}s to allow proving optimality)")
+    elif args.force_zero_gap and verbose:
+        print(f"  (force_zero_gap: using explicit cpsat_time_limit={cpsat_time_limit:.0f}s)")
 
     scheduler_name = "greedy" if args.use_greedy else f"CP-SAT ({cpsat_time_limit:.0f}s)"
     print(f"Building SSA kernel with {scheduler_name}...")

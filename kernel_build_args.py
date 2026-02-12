@@ -144,7 +144,9 @@ def args_to_build_kwargs(
     rounds = get("rounds", 16)
     use_cpsat = not get("use_greedy", False)
     cpsat_time_limit = get("cpsat_time_limit", 3600.0)
-    if get("force_zero_gap", False) and cpsat_time_limit < 7200:
+    # force_zero_gap defaults to 2h time limit, but allow explicit override
+    force_zero_gap = get("force_zero_gap", False)
+    if force_zero_gap and cpsat_time_limit == 3600.0:  # Only auto-set if using default
         cpsat_time_limit = 7200
     per_section = get("per_section_optimize_secs")
     per_section_optimize = None if per_section is None or per_section <= 0 else per_section
