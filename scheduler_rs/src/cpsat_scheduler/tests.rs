@@ -4813,6 +4813,251 @@ mod tests {
             assign_result.peak_live
         );
     }
+
+    /// Test that CP-SAT scratch constraint correctly models CSE shared sub_temp.
+    ///
+    /// Bug fix: CSE groups share one sub_temp_vreg among multiple SelectChoice FMA consumers.
+    /// CP-SAT must:
+    /// 1. Skip individual sub_temp intervals for CSE consumers (they use shared sub_temp)
+    /// 2. Add shared CSE sub_temp interval: [sub_cycle, max_fma_cycle+1] for each active group
+    ///
+    /// Before the fix, CP-SAT added individual sub_temp for CSE consumers AND didn't add shared
+    /// intervals, causing undercounting. Address assignment correctly skips individual and adds shared.
+    ///
+    /// This test creates a CSE group with 2 SelectChoice ops sharing (true_val, false_val):
+    /// - Both ops choose FMA path
+    /// - They share one sub_temp (8 words) instead of two separate sub_temps (16 words)
+    /// - With tight budget, CP-SAT must account for shared sub_temp correctly
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_constraint_cse_shared_sub_temp() {
+        use crate::address_assign::{assign_addresses, compute_live_intervals, AddressAssignConfig};
+        use crate::cpsat_scheduler::build_cse_groups;
+        use crate::types::Opcode;
+
+        // Create 2 SelectChoice ops with same (true_val, false_val) to form a CSE group
+        // op0: cond (scalar)
+        // op1: true_val (scalar)
+        // op2: false_val (scalar)
+        // op3: SelectChoice(cond, true_val, false_val) -> result1 (CSE consumer 1)
+        // op4: SelectChoice(cond, true_val, false_val) -> result2 (CSE consumer 2)
+        // op5: use result1
+        // op6: use result2
+        let mut ops = vec![
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(0)),
+                vec![Operand::imm(1)], // cond
+                vec![],
+            ),
+            make_ssa_op(
+                1,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(1)),
+                vec![Operand::imm(10)], // true_val
+                vec![],
+            ),
+            make_ssa_op(
+                2,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::scalar(2)),
+                vec![Operand::imm(20)], // false_val
+                vec![],
+            ),
+            make_ssa_op(
+                3,
+                Engine::Flow,
+                Opcode::SelectChoice,
+                Some(VReg::scalar(3)),
+                vec![
+                    Operand::scalar(0), // cond
+                    Operand::scalar(1), // true_val
+                    Operand::scalar(2), // false_val
+                ],
+                vec![0, 1, 2],
+            ),
+            make_ssa_op(
+                4,
+                Engine::Flow,
+                Opcode::SelectChoice,
+                Some(VReg::scalar(4)),
+                vec![
+                    Operand::scalar(0), // cond (same)
+                    Operand::scalar(1), // true_val (same)
+                    Operand::scalar(2), // false_val (same)
+                ],
+                vec![0, 1, 2],
+            ),
+            make_ssa_op(
+                5,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::imm(0), Operand::scalar(3)],
+                vec![3],
+            ),
+            make_ssa_op(
+                6,
+                Engine::Store,
+                Opcode::Store,
+                None,
+                vec![Operand::imm(1), Operand::scalar(4)],
+                vec![4],
+            ),
+        ];
+
+        // Set sub_temp_vreg for both SelectChoice ops (no-delta path, uses FMA)
+        // They will form a CSE group sharing one sub_temp
+        ops[3].sub_temp_vreg = Some(VReg::vector(99)); // Will be replaced by CSE group sub_temp
+        ops[4].sub_temp_vreg = Some(VReg::vector(100)); // Will be replaced by CSE group sub_temp
+
+        // Build CSE groups to verify they're detected
+        let cse_groups = build_cse_groups(&ops);
+        assert_eq!(
+            cse_groups.len(),
+            1,
+            "Should have 1 CSE group with 2 consumers"
+        );
+        assert_eq!(
+            cse_groups[0].consumer_indices.len(),
+            2,
+            "CSE group should have 2 consumers (ops 3 and 4)"
+        );
+
+        // Schedule with CP-SAT, forcing FMA path, with tight budget
+        // Budget must accommodate:
+        // - cond (1), true_val (1), false_val (1) = 3 scalars
+        // - result1 (1), result2 (1) = 2 scalars
+        // - SHARED sub_temp (8) = 1 vector (not 2 separate sub_temps = 16)
+        // Peak: cond + true_val + false_val + shared_sub_temp + result1 + result2 = 1+1+1+8+1+1 = 13 words
+        // Use 16 to be safe (allows some overlap)
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: true,
+                scratch_budget: 16, // Tight: must account for shared sub_temp (8), not individual (16)
+                select_choice_mode: SelectChoiceMode::ForceFma, // Force FMA path
+                ..Default::default()
+            },
+            SsaCpsatHints {
+                cse_groups: Some(&cse_groups),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(
+            result.is_some(),
+            "Should find solution with CSE shared sub_temp and tight budget"
+        );
+
+        let r = result.unwrap();
+        eprintln!(
+            "test_ssa_cpsat_scratch_constraint_cse_shared_sub_temp: makespan={}, select_fma_ops={:?}, cse_group_results={:?}",
+            r.makespan, r.select_fma_ops, r.cse_group_results
+        );
+
+        // Verify both ops chose FMA
+        assert!(
+            r.select_fma_ops.contains(&3) && r.select_fma_ops.contains(&4),
+            "Both SelectChoice ops should choose FMA path"
+        );
+
+        // Verify CSE group is active
+        assert_eq!(
+            r.cse_group_results.len(),
+            1,
+            "Should have 1 CSE group result"
+        );
+        assert!(
+            r.cse_group_results[0].sub_active,
+            "CSE group should be active (at least one consumer chose FMA)"
+        );
+
+        // Apply cycle assignments and verify address assignment fits
+        let mut scheduled_ops = ops.clone();
+        for (idx, &cycle) in r.cycle_assignments.iter().enumerate() {
+            scheduled_ops[idx].cycle = cycle;
+        }
+
+        // Build address assignment config with CSE groups
+        let mut cse_consumer_op_ids = std::collections::HashSet::new();
+        let mut cse_shared = Vec::new();
+        for (g, group) in cse_groups.iter().enumerate() {
+            let res = &r.cse_group_results[g];
+            if !res.sub_active {
+                continue;
+            }
+            for &idx in &group.consumer_indices {
+                if idx < scheduled_ops.len() {
+                    cse_consumer_op_ids.insert(scheduled_ops[idx].id);
+                }
+            }
+            // Compute max_fma_cycle: max(cycle + 1) among FMA consumers
+            let max_fma = group
+                .consumer_indices
+                .iter()
+                .filter(|&&idx| idx < scheduled_ops.len() && r.select_fma_ops.contains(&scheduled_ops[idx].id))
+                .map(|&idx| scheduled_ops[idx].cycle + 1)
+                .max()
+                .unwrap_or(res.sub_cycle + 1);
+            cse_shared.push((group.sub_temp_vreg, res.sub_cycle, max_fma + 1));
+        }
+
+        let config = AddressAssignConfig {
+            budget: 16, // Match CP-SAT scratch_budget
+            start_addr: 1,
+            select_fma_ops: r.select_fma_ops.clone(),
+            cse_consumer_op_ids,
+            cse_shared_sub_temp_intervals: cse_shared,
+            ..Default::default()
+        };
+        let assign_result = assign_addresses(&scheduled_ops, &config);
+
+        // Verify shared sub_temp interval exists
+        let intervals = compute_live_intervals(&config, &scheduled_ops);
+        let shared_sub_temp = cse_groups[0].sub_temp_vreg;
+        assert!(
+            intervals.contains_key(&shared_sub_temp),
+            "Shared CSE sub_temp should have a live interval"
+        );
+        let shared_interval = intervals.get(&shared_sub_temp).unwrap();
+        eprintln!(
+            "Shared CSE sub_temp interval: [{}, {}]",
+            shared_interval.start, shared_interval.end
+        );
+
+        // Verify individual sub_temp intervals do NOT exist for CSE consumers
+        // (They should use shared sub_temp instead)
+        assert!(
+            !intervals.contains_key(&VReg::vector(99)),
+            "Individual sub_temp for op3 should NOT exist (uses shared)"
+        );
+        assert!(
+            !intervals.contains_key(&VReg::vector(100)),
+            "Individual sub_temp for op4 should NOT exist (uses shared)"
+        );
+
+        // Address assignment should fit within budget (CP-SAT constraint should match)
+        // Before the fix, CP-SAT would undercount and allow schedules that exceed budget
+        assert!(
+            assign_result.peak_live <= 16,
+            "Address assignment peak_live={} should fit in budget=16 (CP-SAT constraint should match). \
+             Before fix, CP-SAT undercounted CSE shared sub_temp, allowing schedules that exceeded budget.",
+            assign_result.peak_live
+        );
+        assert!(
+            !assign_result.budget_exceeded,
+            "Address assignment should not exceed budget: peak_live={}, budget={}",
+            assign_result.peak_live,
+            config.budget
+        );
+    }
 }
 
 #[cfg(test)]

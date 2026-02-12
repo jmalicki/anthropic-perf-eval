@@ -1950,11 +1950,16 @@ pub fn schedule_ssa_cpsat(
 
             // SelectChoice FMA sub_temp_vreg: live [op.cycle, op.cycle+2) when FMA path is chosen.
             // ForceFma => required interval; Optimize => optional (present when choice_var); ForceVselect => none.
+            // CSE consumers skip individual sub_temp (they use shared sub_temp instead).
             for &idx in &select_choice_ops {
                 if ops[idx].sub_temp_vreg.is_none() {
                     continue; // delta path: no sub_temp
                 }
                 if idx >= cycle_vars.len() {
+                    continue;
+                }
+                // Skip CSE consumers - they use shared sub_temp instead of individual sub_temp
+                if cse_consumer_set.contains(&idx) {
                     continue;
                 }
                 let start = cycle_vars[idx];
@@ -1973,6 +1978,82 @@ pub fn schedule_ssa_cpsat(
                         }
                     }
                     SelectChoiceMode::ForceVselect => {}
+                }
+            }
+
+            // CSE shared sub_temp intervals: one per active group, live [sub_cycle, max_fma_cycle+1]
+            // where max_fma_cycle is the maximum FMA cycle among consumers (FMA writes at cycle+1).
+            // Model end conservatively as horizon+1 (will be tightened by actual FMA cycles in solution).
+            if let Some(groups) = cse_groups {
+                for (g, group) in groups.iter().enumerate() {
+                    let sub_active_var = cse_sub_active_vars[g];
+                    let sub_cycle_var = cse_sub_cycle_vars[g];
+                    
+                    // End cycle: max FMA cycle + 1 among consumers that chose FMA.
+                    // FMA cycle for consumer idx is cycle_vars[idx] + 1 when FMA is chosen.
+                    // Model conservatively: use horizon+1 as upper bound; actual end will be <= this.
+                    let end_cycle_var = model.new_int_var_with_name(
+                        [(0, horizon + 2)],
+                        format!("cse_sub_end_{}", g),
+                    );
+                    // Constraint: end >= sub_cycle + 1 (at least 1 cycle lifetime)
+                    let c_min = model.add_ge(
+                        LinearExpr::from(end_cycle_var),
+                        LinearExpr::from(sub_cycle_var) + 1,
+                    );
+                    model.set_constraint_name(c_min, &format!("cse_sub_end_ge_sub_plus_1_{}", g));
+                    // Constraint: end >= max(cycle_vars[consumer] + 2) for consumers that chose FMA
+                    // (FMA writes at cycle+1, so last read is at cycle+1, interval end is cycle+2)
+                    for &consumer_idx in &group.consumer_indices {
+                        if consumer_idx >= cycle_vars.len() {
+                            continue;
+                        }
+                        match select_choice_mode {
+                            SelectChoiceMode::ForceFma => {
+                                let fma_end = LinearExpr::from(cycle_vars[consumer_idx]) + 2;
+                                let c = model.add_ge(
+                                    LinearExpr::from(end_cycle_var),
+                                    fma_end,
+                                );
+                                model.set_constraint_name(c, &format!("cse_sub_end_ge_fma_{}_c{}", g, consumer_idx));
+                            }
+                            SelectChoiceMode::Optimize => {
+                                if let Some(&choice_var) = select_choice_vars.get(&consumer_idx) {
+                                    let fma_end = LinearExpr::from(cycle_vars[consumer_idx]) + 2;
+                                    // Only enforce when FMA is chosen (sub_active implies at least one FMA)
+                                    let c = model.add_ge(
+                                        LinearExpr::from(end_cycle_var),
+                                        fma_end,
+                                    );
+                                    model.only_enforce_if(c, [sub_active_var, choice_var]);
+                                    model.set_constraint_name(c, &format!("cse_sub_end_ge_fma_opt_{}_c{}", g, consumer_idx));
+                                }
+                            }
+                            SelectChoiceMode::ForceVselect => {}
+                        }
+                    }
+                    
+                    // Add scratch interval: [sub_cycle, end_cycle) when sub_active
+                    let size_var = model.new_int_var_with_name(
+                        [(1, horizon + 2)],
+                        format!("cse_sub_size_{}", g),
+                    );
+                    let c_size = model.add_eq(
+                        LinearExpr::from(sub_cycle_var) + LinearExpr::from(size_var),
+                        LinearExpr::from(end_cycle_var),
+                    );
+                    model.set_constraint_name(c_size, &format!("cse_sub_size_eq_{}", g));
+                    // Only enforce size constraint when sub_active
+                    model.only_enforce_if(c_size, [sub_active_var]);
+                    
+                    let interval = model.new_optional_interval_var(
+                        sub_cycle_var,
+                        size_var,
+                        LinearExpr::from(end_cycle_var),
+                        sub_active_var,
+                    );
+                    scratch_intervals.push(interval);
+                    scratch_demands.push(8); // Vector VReg (8 words)
                 }
             }
 
