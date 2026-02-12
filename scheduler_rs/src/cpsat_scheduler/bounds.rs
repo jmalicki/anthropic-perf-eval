@@ -782,6 +782,23 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 // set of ops whose bounds we tighten for this engine. That way tightening only
 // uses information that holds in every feasible solution.
 //
+// ALGORITHM (per engine, repeated until fixed point or MAX_ITER):
+// 1. Demand profile: For each required op with window [asap, alap], we treat it as
+//    "could run in any cycle in [asap, alap]" (one cycle per op). Using a difference
+//    array (diff[asap]+=1, diff[alap+1]-=1), prefix-sum to get profile[t] = number of
+//    required ops that could be *active* at cycle t. Then prefix[t] = sum(profile[0..t])
+//    so that for any window [a, b], total demand = prefix[b+1]-prefix[a] in O(1).
+// 2. Energetic check: For an op with window [asap, alap], total demand in that window
+//    must be <= capacity * window_width (else there is no way to fit all those ops in
+//    that window). If demand > capacity * width, the window is too small.
+// 3. Tightening: We push this op's ASAP forward (or ALAP backward) so that the window
+//    we consider never has excess demand. Concretely: find the earliest start t such
+//    that [t, alap] has demand <= cap*(alap-t+1), and set new ASAP = t; symmetrically
+//    find the latest end t such that [asap, t] has demand <= cap*(t-asap+1), and set
+//    new ALAP = t. So after tightening, any start in [new_asap, new_alap] lies in a
+//    window that satisfies the capacity constraint. We iterate over engines and
+//    repeat a few times because tightening one op can change the profile for others.
+//
 // =============================================================================
 
 /// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
@@ -861,8 +878,10 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 }
             };
 
-            // Build resource profile from *required* ops only. profile[t] = number of ops
-            // that definitely use this engine and can start at cycle t (given current domains).
+            // Build demand profile from *required* ops only. Each op with window [asap, alap]
+            // can run in any one cycle in that range; we count "how many ops could be active
+            // at cycle t". Difference array: diff[asap_t] += 1, diff[alap_t+1] -= 1; then
+            // prefix-sum gives profile[t] = number of required ops that could be active at t.
             let mut diff = vec![0i64; horizon_usize + 2];
             for &idx in engine_ops {
                 if is_optional_on_engine(idx) {
@@ -879,7 +898,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 }
             }
 
-            // Compute prefix sums to get actual profile
+            // profile[t] = prefix-sum of diff = number of required ops that could be active at t
             let mut profile = vec![0i64; horizon_usize + 1];
             let mut sum = 0i64;
             for t in 0..=horizon_usize {
@@ -887,7 +906,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 profile[t] = sum;
             }
 
-            // Build prefix sums of profile for O(1) window queries
+            // prefix[t] = sum(profile[0..t]) so total demand in [a,b] = prefix[b+1]-prefix[a]
             let mut prefix = vec![0i64; horizon_usize + 2];
             for t in 0..=horizon_usize {
                 prefix[t + 1] = prefix[t] + profile[t];
@@ -911,7 +930,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
                     continue;
                 }
 
-                // Count total ops that CAN start in this window (profile has required ops only)
+                // Total demand in this op's window = sum of profile over [old_asap, old_alap]
                 let window_start = old_asap as usize;
                 let window_end = old_alap as usize;
                 if window_end >= prefix.len() - 1 {
@@ -919,16 +938,17 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 }
                 let total_ops_in_window = prefix[window_end + 1] - prefix[window_start];
 
-                // Check if window is too small (energetic reasoning)
-                // If total ops > capacity * window_size, we need a larger window
+                // Energetic reasoning: demand in window must be <= capacity * window_size.
+                // If not, no feasible schedule can fit all these ops in this window; narrow
+                // this op's window by pushing ASAP forward and/or ALAP backward.
                 if total_ops_in_window > *cap * window_size {
-                    // Tighten ASAP forward: find earliest cycle where there's enough capacity
+                    // Find earliest start t such that [t, old_alap] has demand <= cap * width
                     let mut new_asap_val = old_asap;
                     for t in (old_asap as usize)..=(old_alap as usize) {
                         if t >= prefix.len() - 1 {
                             break;
                         }
-                        // Check if window [t, old_alap] has enough capacity
+                        // Demand in [t, old_alap] = prefix[old_alap+1]-prefix[t]; require <= cap*width
                         let remaining_window = (old_alap - t as i32 + 1) as i64;
                         if remaining_window <= 0 {
                             break;
@@ -940,13 +960,13 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                     }
 
-                    // Tighten ALAP backward: find latest cycle where there's enough capacity
+                    // Find latest end t such that [old_asap, t] has demand <= cap * width
                     let mut new_alap_val = old_alap;
                     for t in ((old_asap as usize)..=(old_alap as usize)).rev() {
                         if t >= prefix.len() - 1 {
                             continue;
                         }
-                        // Check if window [old_asap, t] has enough capacity
+                        // Demand in [old_asap, t] = prefix[t+1] - prefix[old_asap]
                         let remaining_window = (t as i32 - old_asap + 1) as i64;
                         if remaining_window <= 0 {
                             break;
