@@ -154,19 +154,46 @@ def main():
     store_count = engine_counts.get("store", 0)
     flow_count = engine_counts.get("flow", 0)
     
-    # Count ConstChoice and SelectChoice ops
-    const_choice_count = sum(1 for op in ops if op.get("opcode", "").lower() == "constchoice")
-    select_choice_count = sum(1 for op in ops if op.get("opcode", "").lower() == "selectchoice")
+    # Count ConstChoice and SelectChoice ops from annotations
+    # First try to use annotation fields from lowered ops
+    ops_with_const_choice = [op for op in ops if op.get("from_const_choice") is not None]
+    ops_with_select_choice = [op for op in ops if op.get("from_select_choice") is not None]
     
-    # Get actual decisions from schedule
+    # Get actual decisions from schedule (fallback if annotations not available)
     const_add_imm_ops = set(data.get("const_add_imm_ops", []))
     select_fma_ops = set(data.get("select_fma_ops", []))
     
-    const_add_imm_count = len(const_add_imm_ops)
-    const_load_count = const_choice_count - const_add_imm_count
+    # Count by encoding: use annotations if available, otherwise fall back to SSA op counts
+    if ops_with_const_choice:
+        # Count unique ConstChoice source IDs
+        const_choice_ids = set(op.get("from_const_choice") for op in ops_with_const_choice if op.get("from_const_choice") is not None)
+        const_choice_count = len(const_choice_ids)
+        
+        # Count AddImm vs Load/ALU-derived from lowered ops
+        const_add_imm_count = sum(1 for op in ops_with_const_choice if op.get("engine", "").lower() == "flow" and op.get("opcode", "").lower() == "add_imm")
+        const_load_count = sum(1 for op in ops_with_const_choice if op.get("engine", "").lower() == "load" and op.get("opcode", "").lower() == "const")
+        const_alu_derive_count = sum(1 for op in ops_with_const_choice if op.get("engine", "").lower() == "alu" and op.get("from_const_choice") is not None)
+    else:
+        # Fallback: count SSA ops
+        const_choice_count = sum(1 for op in ops if op.get("opcode", "").lower() == "constchoice")
+        const_add_imm_count = len(const_add_imm_ops)
+        const_load_count = const_choice_count - const_add_imm_count
+        const_alu_derive_count = 0
     
-    select_fma_count = len(select_fma_ops)
-    select_vselect_count = select_choice_count - select_fma_count
+    if ops_with_select_choice:
+        # Count unique SelectChoice source IDs
+        select_choice_ids = set(op.get("from_select_choice") for op in ops_with_select_choice if op.get("from_select_choice") is not None)
+        select_choice_count = len(select_choice_ids)
+        
+        # Count FMA vs vselect from lowered ops
+        # FMA path produces both sub (-) and multiply_add ops, but we count unique SelectChoice sources
+        select_fma_count = len(select_choice_ids) - sum(1 for op in ops_with_select_choice if op.get("opcode", "").lower() == "vselect")
+        select_vselect_count = sum(1 for op in ops_with_select_choice if op.get("opcode", "").lower() == "vselect")
+    else:
+        # Fallback: count SSA ops
+        select_choice_count = sum(1 for op in ops if op.get("opcode", "").lower() == "selectchoice")
+        select_fma_count = len(select_fma_ops)
+        select_vselect_count = select_choice_count - select_fma_count
     
     # Analyze VALU ops
     shiftable_valu, non_shiftable_valu, valu_opcodes = analyze_valu_ops(ops)
@@ -219,9 +246,11 @@ def main():
             print(f"  ConstChoice: {const_choice_count} total")
             print(f"    → AddImm (Flow): {const_add_imm_count}")
             print(f"    → Load: {const_load_count}")
+            if const_alu_derive_count > 0:
+                print(f"    → ALU-derived: {const_alu_derive_count}")
         if select_choice_count > 0:
             print(f"  SelectChoice: {select_choice_count} total")
-            print(f"    → FMA (VALU): {select_fma_count}")
+            print(f"    → FMA path (VALU sub+fma): {select_fma_count}")
             print(f"    → vselect (Flow): {select_vselect_count}")
     
     print(f"\nVALU ops breakdown:")

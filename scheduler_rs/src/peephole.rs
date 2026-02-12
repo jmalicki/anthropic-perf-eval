@@ -600,6 +600,8 @@ mod tests {
             last_use_reads: HashSet::new(),
             produces_constant: None,
             trace_id: None,
+            from_const_choice: None,
+            from_select_choice: None,
         }
     }
 
@@ -629,6 +631,8 @@ mod tests {
             last_use_reads: HashSet::new(),
             produces_constant: None,
             trace_id: None,
+            from_const_choice: None,
+            from_select_choice: None,
         }
     }
 

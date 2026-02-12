@@ -157,6 +157,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     last_use_reads: HashSet::new(),
                     produces_constant: None,
                     trace_id: None,
+                    from_const_choice: None,
+                    from_select_choice: None, // CSE shared sub is not from a single SelectChoice
                 });
             }
         }
@@ -255,6 +257,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
                     trace_id: ssa_op.trace_id.clone(),
+                    from_const_choice: Some(ssa_op.id),
+                    from_select_choice: None,
                 });
             } else if ctx.const_add_imm_ops.contains(&ssa_op.id) {
                 // AddImm: dest = scratch[0] + value
@@ -284,6 +288,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
                     trace_id: ssa_op.trace_id.clone(),
+                    from_const_choice: Some(ssa_op.id),
+                    from_select_choice: None,
                 });
             } else {
                 // Load: dest = const value
@@ -306,6 +312,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     last_use_reads: HashSet::new(),
                     produces_constant: Some(value),
                     trace_id: ssa_op.trace_id.clone(),
+                    from_const_choice: Some(ssa_op.id),
+                    from_select_choice: None,
                 });
             }
         } else if ssa_op.opcode == Opcode::SelectChoice {
@@ -401,6 +409,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                         last_use_reads: HashSet::new(),
                         trace_id: ssa_op.trace_id.clone(),
                         produces_constant: None,
+                        from_const_choice: None,
+                        from_select_choice: Some(ssa_op.id),
                     });
                 } else {
                     // No precomputed delta: emit sub + fma ops (both VALU, sequential)
@@ -463,6 +473,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                             last_use_reads: HashSet::new(),
                             produces_constant: None,
                             trace_id: ssa_op.trace_id.clone(),
+                            from_const_choice: None,
+                            from_select_choice: Some(ssa_op.id),
                         });
                     }
 
@@ -503,6 +515,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                         last_use_reads: HashSet::new(),
                         produces_constant: None,
                         trace_id: ssa_op.trace_id.clone(),
+                        from_const_choice: None,
+                        from_select_choice: Some(ssa_op.id),
                     };
                     if std::env::var("SCHEDULER_DEBUG").is_ok() {
                         eprintln!(
@@ -542,6 +556,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Vec<Op> {
                     last_use_reads: HashSet::new(),
                     produces_constant: None,
                     trace_id: ssa_op.trace_id.clone(),
+                    from_const_choice: None,
+                    from_select_choice: Some(ssa_op.id),
                 });
             }
         } else {
@@ -618,6 +634,8 @@ fn emit_trace_debug_ops(result: &mut Vec<Op>, ctx: &LoweringContext<'_>) {
             last_use_reads: HashSet::new(),
             produces_constant: None,
             trace_id: Some(trace_id.clone()),
+            from_const_choice: None,
+            from_select_choice: None,
         });
         debug_op_id += 1;
 
@@ -639,6 +657,8 @@ fn emit_trace_debug_ops(result: &mut Vec<Op>, ctx: &LoweringContext<'_>) {
                 last_use_reads: HashSet::new(),
                 produces_constant: None,
                 trace_id: None, // Don't nest
+                from_const_choice: None,
+                from_select_choice: None,
             });
             debug_op_id += 1;
         }
@@ -734,6 +754,8 @@ pub fn expand_ssa_valu_to_alu(
             last_use_reads: HashSet::new(),
             produces_constant: None,
             trace_id: ssa_op.trace_id.clone(),
+            from_const_choice: None,
+            from_select_choice: None, // Shifted VALU ops are not from SelectChoice
         });
     }
 

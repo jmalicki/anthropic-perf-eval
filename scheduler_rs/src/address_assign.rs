@@ -1047,6 +1047,8 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Op {
         last_use_reads: HashSet::new(), // Will be computed by scheduler
         trace_id: ssa_op.trace_id.clone(),
         produces_constant: ssa_op.produces_constant,
+        from_const_choice: None, // This function doesn't handle ConstChoice/SelectChoice
+        from_select_choice: None,
     }
 }
 

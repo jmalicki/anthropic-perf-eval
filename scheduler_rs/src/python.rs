@@ -202,6 +202,8 @@ pub fn parse_ops(_py: Python<'_>, instrs: &Bound<'_, PyList>) -> PyResult<Vec<Op
                     last_use_reads: HashSet::new(),
                     trace_id: None,
                     produces_constant: None,
+                    from_const_choice: None,
+                    from_select_choice: None,
                 });
                 op_id += 1;
             }

@@ -412,6 +412,16 @@ pub struct Op {
     /// Optional trace ID for debug ops (trace_input/trace_output).
     /// Set when this Op is a debug op; propagated from SsaOp for traced logical ops.
     pub trace_id: Option<String>,
+
+    /// Original ConstChoice op ID if this op came from a ConstChoice lowering.
+    /// Set when lowering ConstChoice ops (AddImm, Load, or ALU-derived).
+    /// None for ops that didn't come from ConstChoice.
+    pub from_const_choice: Option<usize>,
+
+    /// Original SelectChoice op ID if this op came from a SelectChoice lowering.
+    /// Set when lowering SelectChoice ops (vselect, sub, or multiply_add from FMA path).
+    /// None for ops that didn't come from SelectChoice.
+    pub from_select_choice: Option<usize>,
 }
 
 // ============================================================================
@@ -938,6 +948,8 @@ pub fn expand_valu_to_alu_smart(
             last_use_reads: HashSet::new(), // Computed later by compute_last_uses
             produces_constant: None,
             trace_id: None,
+            from_const_choice: None,
+            from_select_choice: None,
         };
         new_ops.push(new_op);
     }
@@ -1066,6 +1078,8 @@ pub fn resolve_pseudo_const(
         last_use_reads: HashSet::new(),
         produces_constant: Some(pc.value),
         trace_id: None,
+        from_const_choice: None,
+        from_select_choice: None,
     })
 }
 

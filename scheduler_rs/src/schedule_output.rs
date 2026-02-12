@@ -426,6 +426,10 @@ struct OpDebugInfo {
     dep_ids: Vec<usize>,
     reads: Vec<i64>,
     writes: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_const_choice: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_select_choice: Option<usize>,
 }
 
 /// Liveness detail level for SSA schedule JSON output.
@@ -480,6 +484,8 @@ pub fn write_ssa_schedule_json(
                 dep_ids: op.dep_ids.iter().copied().collect(),
                 reads: op.reads.iter().copied().collect(),
                 writes: op.writes.iter().copied().collect(),
+                from_const_choice: op.from_const_choice,
+                from_select_choice: op.from_select_choice,
             }
         })
         .collect();

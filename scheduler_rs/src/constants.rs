@@ -464,6 +464,8 @@ pub fn emit_constant_generation_ops(
             dep_ids: HashSet::new(),
             produces_constant: Some(value),
             trace_id: None,
+            from_const_choice: None,
+            from_select_choice: None,
         });
 
         op_id += 1;
