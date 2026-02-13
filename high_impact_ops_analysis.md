@@ -72,11 +72,11 @@
 ### Task 2: ALU Capacity Constraints ✓
 - ALU cumulative constraint correctly allows independent scheduling
 - CP-SAT is clustering all 8 ALU ops (not spreading)
-- This confirms CP-SAT minimizes `completion_cycle` by clustering
+- This confirms CP-SAT minimizes a composite objective (makespan + tie-breaker; see canonical description in `scheduler_rs/src/cpsat_scheduler/model.rs`)
 - **Capacity constraints work correctly**
 
 ### Task 3: Completion Cycle Logic ✓
-- CP-SAT minimizes `completion_cycle` to minimize makespan
+- CP-SAT objective (canonical: model.rs "CANONICAL DESCRIPTION") rewards earlier completion, so it fills earlier slots even when makespan is unchanged
 - If clustering violates capacity, CP-SAT must spread
 - Spreading increases `completion_cycle`, which delays consumers
 - **This is the main reason CP-SAT avoids shifts**
@@ -92,7 +92,7 @@
 
 ## Conclusions
 
-1. **Main issue**: CP-SAT minimizes makespan by minimizing `completion_cycle`
+1. **Main issue**: CP-SAT uses a composite objective (canonical: `scheduler_rs/src/cpsat_scheduler/model.rs` "CANONICAL DESCRIPTION"); the tie-breaker fills earlier slots even when that doesn't reduce makespan. For shift decisions, clustering that violates capacity forces spreading, which increases completion_cycle and delays consumers.
    - If clustering violates capacity, must spread
    - Spreading increases `completion_cycle`, delays consumers
    - CP-SAT avoids shift to prevent makespan increase
