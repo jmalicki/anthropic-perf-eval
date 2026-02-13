@@ -49,6 +49,9 @@ dev = [
     { name = "pytest-timeout" },
     { name = "wandb" },
 ]
+verify = [
+    { name = "z3-solver" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -58,8 +61,9 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "wandb", marker = "extra == 'dev'", specifier = ">=0.15.0" },
+    { name = "z3-solver", marker = "extra == 'verify'", specifier = ">=4.12.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "verify"]
 
 [[package]]
 name = "certifi"
@@ -1053,4 +1057,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d2/34/43b7f18870051047ce6fe18e7eb24ba7ebdc71663a8f1c58e31e855eb8ac/wandb-0.24.0-py3-none-win32.whl", hash = "sha256:42af348998b00d4309ae790c5374040ac6cc353ab21567f4e29c98c9376dee8e", size = 22118243, upload-time = "2026-01-13T22:59:49.555Z" },
     { url = "https://files.pythonhosted.org/packages/a1/92/909c81173cf1399111f57f9ca5399a8f165607b024e406e080178c878f70/wandb-0.24.0-py3-none-win_amd64.whl", hash = "sha256:32604eddcd362e1ed4a2e2ce5f3a239369c4a193af223f3e66603481ac91f336", size = 22118246, upload-time = "2026-01-13T22:59:52.126Z" },
     { url = "https://files.pythonhosted.org/packages/87/85/a845aefd9c2285f98261fa6ffa0a14466366c1ac106d35bc84b654c0ad7f/wandb-0.24.0-py3-none-win_arm64.whl", hash = "sha256:e0f2367552abfca21b0f3a03405fbf48f1e14de9846e70f73c6af5da57afd8ef", size = 20077678, upload-time = "2026-01-13T22:59:56.112Z" },
+]
+
+[[package]]
+name = "z3-solver"
+version = "4.15.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/46/5ab514528111418ed5b93df48a572fecb3e8fe2ed9108d5563a951f3a7d6/z3_solver-4.15.8.0.tar.gz", hash = "sha256:fbb5ebb43e4f59335d415fc78074000953dcf9963b7ad2230fa68293ca25e9cb", size = 5072381, upload-time = "2026-02-12T20:59:04.352Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/f5/625c056c0d86b3f3ae8c1779c9314a9fa7bf74cd863b6f92d5d9c74e197b/z3_solver-4.15.8.0-py3-none-macosx_15_0_arm64.whl", hash = "sha256:24434ff39a86f3f580130380d341796b19ada49e68f139ec05b82ae0cc46b384", size = 36964743, upload-time = "2026-02-12T20:58:34.145Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/56/f5553c5ceaa50c0a1927d58aee4f1ab63ae830fee1d0ae3a8302c92d3465/z3_solver-4.15.8.0-py3-none-macosx_15_0_x86_64.whl", hash = "sha256:f60da7b1da62ba7e2d0b5852395ecf50f095d46c004286a51ddc0c75d4d5132a", size = 47526198, upload-time = "2026-02-12T20:58:38.806Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/d6/beb88db135980497db93ec0211285e83bf4d04fde99925309cb0f5dc9fbb/z3_solver-4.15.8.0-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:05fbd0b2644131c83c535505a26db8057728e45f3de9ce07af2c99d3be365713", size = 31748580, upload-time = "2026-02-12T20:58:43.18Z" },
+    { url = "https://files.pythonhosted.org/packages/63/12/fa348373f437601349b4233c6681d0b8e7f2e8f0f8f63d130f406a4c888e/z3_solver-4.15.8.0-py3-none-manylinux_2_38_aarch64.whl", hash = "sha256:b35ac727aa9e769de0ddbea94be4f1bf382abe49903ea455b1512cc959fc1ac9", size = 27321039, upload-time = "2026-02-12T20:58:47.549Z" },
+    { url = "https://files.pythonhosted.org/packages/70/67/a440ce9386b3c8c6d30929cbaacd35cfb26802471e888595cc633e1976e0/z3_solver-4.15.8.0-py3-none-win32.whl", hash = "sha256:b98df38ceabcae8dd4f5e7d8705d0ffb6e80cde3428d73850f398cdfbf7579bf", size = 13341721, upload-time = "2026-02-12T20:58:55.289Z" },
+    { url = "https://files.pythonhosted.org/packages/33/0a/836ab4e4bbe490cc94472da42001cfcdda9c75b518869b98d4b0097a308e/z3_solver-4.15.8.0-py3-none-win_amd64.whl", hash = "sha256:8f630d5bf139e0c20fea8c09b8b10a4ee52e99666951468e3e365b594690da7f", size = 16419862, upload-time = "2026-02-12T20:58:58.486Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/34/5f361d9320fcf1ce334ecdd77f85858084d7681687809ac10c64ca6a9636/z3_solver-4.15.8.0-py3-none-win_arm64.whl", hash = "sha256:87d5c4a0400ee5dbcaf5b86c6d507525a9fd2d0adb2b64622ebcd29eef59207a", size = 15086043, upload-time = "2026-02-12T20:59:01.957Z" },
 ]

@@ -15,6 +15,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-timeout>=2.0.0",
 ]
+verify = [
+    "z3-solver>=4.12.0",
+]
 
 [tool.pytest.ini_options]
 timeout = 120
@@ -25,7 +28,7 @@ markers = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["solver", "problem.py", "perf_takehome.py"]
+packages = ["solver", "verification", "problem.py", "perf_takehome.py"]
 
 [build-system]
 requires = ["hatchling"]
