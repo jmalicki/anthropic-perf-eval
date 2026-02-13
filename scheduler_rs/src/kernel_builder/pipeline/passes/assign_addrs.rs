@@ -2,7 +2,7 @@
 //!
 //! Assigns concrete scratch addresses to VRegs via linear scan allocation.
 
-use crate::address_assign::{assign_addresses, verify_no_address_conflicts, AddressAssignConfig};
+use crate::address_assign::{assign_addresses, verify_no_address_conflicts_fast, AddressAssignConfig};
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::tick_tock_ssa::SCRATCH_BUDGET_HW;
 
@@ -95,9 +95,9 @@ impl Pass for AssignAddressesPass {
 
         let address_result = assign_addresses(&ctx.ops, &assign_config)?;
 
-        // Verify no address conflicts between simultaneously-live VRegs.
-        // This catches bugs in live interval computation or address allocation.
-        let conflicts = verify_no_address_conflicts(
+        // Verify no address conflicts between simultaneously-live VRegs (T2).
+        // O(n log n) check; catches bugs in live interval computation or address allocation.
+        let conflicts = verify_no_address_conflicts_fast(
             &address_result.live_intervals,
             &address_result.vreg_to_addr,
         );

@@ -570,6 +570,29 @@ pub fn compute_live_intervals(
         }
     }
 
+    // A4 sanity check: for VRegs with at least one consumer, end >= max_consumer_cycle.
+    let mut max_consumer_cycle: HashMap<VReg, i32> = HashMap::new();
+    for op in ops {
+        let op_liv = OpLiveness { op, ctx: &ctx };
+        for (vreg, read_cycle) in op_liv.use_cycles(op, &ctx) {
+            max_consumer_cycle
+                .entry(vreg)
+                .and_modify(|m| *m = (*m).max(read_cycle))
+                .or_insert(read_cycle);
+        }
+    }
+    for (vreg, interval) in &intervals {
+        if let Some(&max_c) = max_consumer_cycle.get(vreg) {
+            assert!(
+                interval.end >= max_c,
+                "A4 sanity: VReg {:?} has consumer at cycle {} but interval end is {}",
+                vreg,
+                max_c,
+                interval.end
+            );
+        }
+    }
+
     Ok(intervals)
 }
 
@@ -634,6 +657,28 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 
     // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
     let intervals = config.compute_live_intervals(ops)?;
+
+    // Verify use-def: every VReg read by an op must have an interval that includes the op's cycle
+    for op in ops {
+        let op_cycle = op.cycle;
+        for vreg in op.reads() {
+            if let Some(interval) = intervals.get(&vreg) {
+                if interval.start > op_cycle || op_cycle > interval.end {
+                    return Err(format!(
+                        "Use-def violation: VReg {:?} read at cycle {} but interval is [{}, {}] (op id={}, opcode={:?}). \
+                         The VReg's live interval does not include the read cycle - this indicates a bug in interval computation.",
+                        vreg, op_cycle, interval.start, interval.end, op.id, op.opcode
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Use-def violation: VReg {:?} read at cycle {} but has no interval (op id={}, opcode={:?}). \
+                     This VReg was never defined or its interval was not computed - indicates an SSA violation or interval computation bug.",
+                    vreg, op_cycle, op.id, op.opcode
+                ));
+            }
+        }
+    }
 
     // Debug: Collect vstore source VRegs for tracking
     let vstore_vregs: HashSet<VReg> = if debug {
@@ -738,6 +783,14 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
                     || (end_cycle == interval.start && !freed_was_point)
             };
             if expire {
+                assert!(
+                    end_cycle < interval.start
+                        || (end_cycle == interval.start && !freed_was_point),
+                    "T1 violation: expired end={} for alloc start={}, freed_was_point={}",
+                    end_cycle,
+                    interval.start,
+                    freed_was_point
+                );
                 active.pop();
                 if !is_in_fixed_range(freed_addr, freed_size, &config.fixed_vregs) {
                     free_ranges.push(Reverse((freed_addr, freed_size)));
@@ -939,6 +992,91 @@ pub fn verify_no_address_conflicts(
             }
         }
     }
+    conflicts
+}
+
+/// O(n log n) verification that no two simultaneously-live VRegs have overlapping
+/// address ranges (T2: overlapping intervals must receive disjoint addresses).
+///
+/// Algorithm: (1) Sort by address and verify disjointness; (2) Group by (addr, size)
+/// and within each group verify time intervals do not overlap.
+///
+/// # Arguments
+/// * `intervals` - Live intervals for all VRegs (from compute_live_intervals)
+/// * `vreg_to_addr` - Assigned addresses (from assign_addresses)
+///
+/// # Returns
+/// Vec of conflicts found. Empty means no conflicts.
+pub fn verify_no_address_conflicts_fast(
+    intervals: &HashMap<VReg, LiveInterval>,
+    vreg_to_addr: &HashMap<VReg, i64>,
+) -> Vec<AddressConflict> {
+    let mut conflicts = Vec::new();
+
+    // Build entries: (VReg, LiveInterval, addr, size) for all VRegs in both maps
+    let mut entries: Vec<(VReg, LiveInterval, i64, usize)> = intervals
+        .iter()
+        .filter_map(|(v, iv)| {
+            vreg_to_addr.get(v).map(|&a| (*v, iv.clone(), a, v.size()))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return conflicts;
+    }
+
+    // Step 1: Sort by addr and verify no overlapping address ranges (allocator sanity).
+    // Only report when ranges overlap but differ (same (addr, size) is handled in step 2).
+    entries.sort_by_key(|(_, _, a, _)| *a);
+    for i in 0..entries.len() - 1 {
+        let (v1, ref iv1, a1, size1) = entries[i];
+        let (v2, ref iv2, a2, size2) = entries[i + 1];
+        let end1 = a1 + size1 as i64;
+        if a2 < end1 && (a1 != a2 || size1 != size2) {
+            // Overlapping but distinct address ranges; conflict iff time intervals overlap (T2)
+            if iv1.overlaps(&iv2) {
+                conflicts.push(AddressConflict {
+                    vreg1: v1,
+                    vreg2: v2,
+                    addr1: a1,
+                    addr2: a2,
+                    interval1: iv1.clone(),
+                    interval2: iv2.clone(),
+                });
+            }
+        }
+    }
+
+    // Step 2: Group by (addr, size); within each group, sort by interval.start and verify
+    // interval[i].end <= interval[i+1].start (no time overlap for same-address reuse).
+    let mut by_addr_size: HashMap<(i64, usize), Vec<(VReg, LiveInterval)>> = HashMap::new();
+    for (vreg, interval, addr, size) in entries {
+        by_addr_size
+            .entry((addr, size))
+            .or_default()
+            .push((vreg, interval));
+    }
+    for (&(addr, _), group) in by_addr_size.iter_mut() {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by_key(|(_, iv)| iv.start);
+        for i in 0..group.len() - 1 {
+            let (v1, ref iv1) = group[i];
+            let (v2, ref iv2) = group[i + 1];
+            if iv1.overlaps(iv2) {
+                conflicts.push(AddressConflict {
+                    vreg1: v1,
+                    vreg2: v2,
+                    addr1: addr,
+                    addr2: addr,
+                    interval1: iv1.clone(),
+                    interval2: iv2.clone(),
+                });
+            }
+        }
+    }
+
     conflicts
 }
 
@@ -1550,15 +1688,18 @@ mod tests {
         let id1 = emit.ops[idx1].id;
         let id2 = emit.ops[idx2].id;
 
-        // Schedule: sel1 at 0 (sub 0, fma 1 → result 2), consumer at 5; sel2 at 2 (sub 2, fma 3 → result 4), consumer at 6
+        // Schedule: both SelectChoices at 0 (so shared inputs have interval [0,0] or extended by consumers),
+        // sel1 consumer at 5, sel2 consumer at 6. Use srcs to set consumer cycles.
+        let sel1_vreg = emit.ops[idx1].dest.unwrap();
+        let sel2_vreg = emit.ops[idx2].dest.unwrap();
         for (i, op) in emit.ops.iter_mut().enumerate() {
-            op.cycle = if i == idx1 {
+            let reads_sel1 = op.srcs.iter().any(|s| s.as_vreg() == Some(sel1_vreg));
+            let reads_sel2 = op.srcs.iter().any(|s| s.as_vreg() == Some(sel2_vreg));
+            op.cycle = if i == idx1 || i == idx2 {
                 0
-            } else if op.dep_ids.contains(&id1) && !op.dep_ids.contains(&id2) {
+            } else if reads_sel1 && !reads_sel2 {
                 5
-            } else if i == idx2 {
-                2
-            } else if op.dep_ids.contains(&id2) {
+            } else if reads_sel2 {
                 6
             } else {
                 0
@@ -2120,6 +2261,61 @@ mod tests {
             result.vreg_to_addr[&partition_addr], result.vreg_to_addr[&computation],
             "BUG: Overlapping VRegs got the same address"
         );
+
+        // Fast verifier should also report no conflicts for this correct allocation
+        let fast_conflicts = verify_no_address_conflicts_fast(
+            &result.live_intervals,
+            &result.vreg_to_addr,
+        );
+        assert!(fast_conflicts.is_empty(), "Correct allocation should have no conflicts");
+    }
+
+    /// Use-def check: assign_addresses returns Err when an op reads a VReg that has no interval
+    /// (SSA violation or interval computation bug).
+    #[test]
+    fn test_use_def_check_rejects_read_with_no_interval() {
+        use crate::types::Operand;
+        let c1 = VReg::scalar(1);
+        let phantom = VReg::scalar(99); // never defined
+        let v2 = VReg::scalar(2);
+        let mut ops: Vec<SsaOp> = vec![
+            SsaOp::new(0, Engine::Load, Opcode::Const, Some(c1), vec![]),
+            SsaOp::new(
+                1,
+                Engine::Alu,
+                Opcode::Add,
+                Some(v2),
+                vec![Operand::VReg(c1), Operand::VReg(phantom)],
+            ),
+        ];
+        ops[0].cycle = 0;
+        ops[1].cycle = 1;
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&ops, &config);
+        assert!(result.is_err(), "assign_addresses should fail when an op reads a VReg with no interval");
+        let err = result.unwrap_err();
+        assert!(err.contains("Use-def violation"), "error message should mention use-def violation");
+        assert!(err.contains("no interval"), "error message should mention no interval");
+    }
+
+    /// Overlapping intervals assigned the same address must be reported as conflicts
+    /// by both verify_no_address_conflicts and verify_no_address_conflicts_fast.
+    #[test]
+    fn test_verify_fast_detects_overlapping_same_addr() {
+        use crate::types::LiveInterval;
+        let v1 = VReg::scalar(1);
+        let v2 = VReg::scalar(2);
+        let mut intervals = HashMap::new();
+        intervals.insert(v1, LiveInterval::new(0, 10));
+        intervals.insert(v2, LiveInterval::new(5, 15)); // overlaps [0,10]
+        let mut vreg_to_addr = HashMap::new();
+        vreg_to_addr.insert(v1, 100);
+        vreg_to_addr.insert(v2, 100); // bug: same address
+
+        let conflicts_slow = verify_no_address_conflicts(&intervals, &vreg_to_addr);
+        let conflicts_fast = verify_no_address_conflicts_fast(&intervals, &vreg_to_addr);
+        assert_eq!(conflicts_slow.len(), 1, "Slow verifier should report one conflict");
+        assert_eq!(conflicts_fast.len(), 1, "Fast verifier should report one conflict");
     }
 
     // ========================================================================
