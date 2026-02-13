@@ -131,10 +131,14 @@ ALAP(pred) ≤ ALAP(succ) - offset_asap(pred)
 ```
 for any fixed-point ALAP assignment. *Derives from A3.*
 
+**Implementation note**: The ALAP domain is computed using the **same** minimum delay (`offset_asap(pred)`) as ASAP, not the maximum delay. The CP-SAT model enforces actual completion cycles (e.g. variable latency for shifted VALU) via separate completion_cycle constraints; using the minimum delay for domain bounding keeps the domain sound and non-restrictive. See `bounds.rs` (compute_ssa_alap, diagnose_precedence_bounds, fix_precedence_bounds_fixpoint).
+
 <a id="t5"></a>
 ### T5. Cycle Domain
 
 **Theorem**: For each op, `ASAP(op) ≤ cycle(op) ≤ ALAP(op)` defines a sound domain (contains all feasible cycles). *Derives from T3, T4, and the definition of ASAP/ALAP as fixpoints.*
+
+**Domain consistency**: For every op, the bounds must satisfy `ASAP(op) ≤ ALAP(op)`. If `ASAP(op) > ALAP(op)` for any op, the domain is empty and the bounds are invalid (e.g. after inconsistent tightening). The implementation diagnoses this in `diagnose_precedence_bounds` (empty_domain_count).
 
 <a id="t6"></a>
 ### T6. Half-Open Conversion
@@ -146,7 +150,12 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 
 **Theorem**: If we push ASAP forward or ALAP backward using slot capacity (A6) so that the demand in each op's window respects the cap, the tightened bounds still contain at least one feasible schedule. *Derives from A6 and the fact that tightening only removes infeasible regions.*
 
-*Scope*: Unconditional in the sense that the theorem holds for any schedule. When the model has optional intervals (choice variables), demand in a window must count only ops that are *present* for the engine in that window; optional-interval ops are excluded from the profile so we do not over-tighten (see `bounds.rs` "optional intervals").
+*Scope*: Unconditional in the sense that the theorem holds for any schedule. When the model has optional intervals (choice variables), demand in a window must count only ops that are *present* for the engine in that window; optional-interval ops are excluded from the profile so we do not over-tighten.
+
+**Optional-interval exclusions (must match `bounds.rs`)**. When building the demand profile for each engine, the following ops are **excluded** from that engine's count (they may not use that engine in a given solution):
+- **Flow**: SelectChoice ops (may use FMA on VALU instead of vselect on Flow).
+- **Load**: ConstChoice ops (may use AddImm on Flow instead of Load).
+- **VALU**: Shiftable VALU ops when VALU shift is enabled (may shift to ALU).
 
 <a id="t8"></a>
 ### T8. Scratch-Aware ASAP/ALAP Tightening
@@ -154,6 +163,8 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 **Theorem**: If we push ASAP forward or ALAP backward using scratch liveness (A7) so that total scratch usage in each candidate window stays within budget, the tightened bounds still contain at least one feasible schedule. *Derives from A7 and the liveness definitions.*
 
 *Scope*: Same as T7 — when optional structures (e.g. CSE shared sub_temp) exist only under a condition, scratch demand in a window should count only VRegs whose intervals are present for the candidate assignment.
+
+**Precedence fixpoint after tightening (T7 or T8)**. Slot-aware and scratch-aware tightening do not preserve T3/T4 by construction; they can narrow an op's window so that precedence edges are violated (e.g. ASAP(succ) &lt; ASAP(pred) + offset). Therefore, **after** applying T7 or T8, the implementation must run a **precedence fixpoint**: repeatedly enforce T3 (forward: ASAP(succ) ≥ ASAP(pred) + offset_asap(pred)) and T4 (backward: ALAP(pred) ≤ ALAP(succ) − offset_asap(pred)) until no change. This restores consistency so that the final ASAP/ALAP satisfy T3, T4, and T5. See `bounds.rs`: `fix_precedence_bounds_fixpoint`, called after slot/scratch tightening in `compute_ssa_asap_alap_bounds`.
 
 <a id="t9"></a>
 ### T9. Expiration Implies No Overlap
@@ -326,6 +337,15 @@ When SelectChoice ops share the same `(true_val, false_val)` operand pair, they 
 
 ---
 
+### 4a. ALAP Horizon
+
+The ALAP backward pass assigns sinks (ops with no consumers) the latest cycle `H − 1`, then propagates backward: for each edge `pred → succ`, `ALAP(pred) ≤ ALAP(succ) − offset_asap(pred)`. For this to yield non-negative ALAP values, the **horizon** `H` must be at least the length of the critical path when using **maximum** delays (`precedence_offset_for_alap`), e.g. 8 for a shiftable VALU op. The implementation computes:
+
+- **ASAP critical path length** = max over paths of (sum of `offset_asap` along path) + 1.
+- **Max-latency critical path** = max over paths of (sum of `offset_for_alap` along path) + 1.
+
+Then **horizon** `H = max(2 · ASAP_critical_path, 2 · max_latency_critical_path, n)` (with `n` = number of ops), so that ALAP for sinks is `H − 1` and backward propagation stays non-negative. The CP-SAT model also ensures `horizon ≥ capacity_lower_bound` so the makespan domain is non-empty. See `bounds.rs`: `compute_max_latency_critical_path`, `compute_ssa_asap_alap_bounds`; `model.rs` uses this horizon for cycle variable domains.
+
 ### 5. Completion Cycle (A5)
 
 **Definition (Completion cycle)**:
@@ -412,12 +432,12 @@ The encoding of conditional constraints (Part II "Constraint scope") uses the fo
 - `scheduler_rs/src/types.rs`: LiveInterval struct, overlaps()
 - `scheduler_rs/src/address_assign.rs`: compute_live_intervals, assign_addresses, expiration logic
 - `scheduler_rs/src/cpsat_scheduler/model.rs`: Scratch cumulative constraint; Flow cumulative and NoOverlap (§9); choice encoding — optional intervals, only_enforce_if (§10)
-- `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation, tightening, capacity lower bound (T14)
+- `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation (T3, T4), horizon and max-latency critical path (§4a), slot-aware tightening (T7) with optional-interval exclusions, scratch-aware tightening (T8), precedence fixpoint after tightening, domain consistency check (ASAP ≤ ALAP), capacity lower bound (T14), ordering pairs for symmetry
 - `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`: CSE group construction
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
 - `docs/SUB_CSE_ALU_SHIFT_DESIGN.md`: CSE shared SUB model and capacity
 
-**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition. All of T1–T15 are checked by refutation. T15 proves that the optional propagation constraints (direct capacity inequalities) are redundant with the cumulative constraints.
+**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition; that instance also proves domain consistency (ASAP ≤ ALAP for both ops: 0 ≤ K−1 and 1 ≤ K). All of T1–T15 are checked by refutation. T15 proves that the optional propagation constraints (direct capacity inequalities) are redundant with the cumulative constraints.
 
 ---
 
@@ -425,6 +445,33 @@ The encoding of conditional constraints (Part II "Constraint scope") uses the fo
 
 The following CP-SAT constraints or model aspects are not yet formalized in this spec:
 
-- **Symmetry breaking** (ordering groups, lexicographic streams) — search heuristics; prune equivalent solutions but don't affect correctness
+- **Symmetry breaking** (ordering groups, lexicographic streams) — search heuristics; prune equivalent solutions but don't affect correctness. Ordering pairs `cycle[i] ≤ cycle[j]` require ASAP[i] ≤ ALAP[j] for consistency; see `bounds.rs` `build_ordering_pairs_from_bounds`.
 - **Segment mode** — live-out, live-through, segment_end for per-section scheduling
 - **Dead VReg exclusion** — CP-SAT scratch model omits dead VRegs (assumes DCE); address assign allocates them
+- **Op-based (address-based) live intervals** — See next subsection.
+
+### Op-based (address-based) live intervals
+
+The main spec defines liveness per **VReg** (SSA value), with intervals in **cycle** units and `end` defined by last read or write (A4, §3). A separate facility in `bounds.rs` computes liveness per **scratch address** from a sequence of **lowered ops** (`Op`) that already have `reads` and `writes` as sets of scratch addresses. This subsection specifies that facility so it is not handwavy.
+
+**Input.** A sequence `ops[0..n]` of `Op`. Each `Op` has:
+- `reads: HashSet<i64>` — scratch addresses read by this op
+- `writes: HashSet<i64>` — scratch addresses written by this op
+
+**Output.** A list of **address-based live intervals**. Each element is a record:
+- `address: i64` — a scratch address
+- `def_op_idx: usize` — index of the **last** op in the sequence that writes this address
+- `last_use_op_idx: usize` — index of the **last** op in the sequence that reads this address
+- `size: i64` — 1 (scalar); the implementation does not distinguish vector size here
+
+**Algorithm** (`bounds.rs` `compute_live_intervals(ops: &[Op])`):
+
+1. Maintain a map `addr → (def_op_idx, last_use_op_idx)`.
+2. For `idx = 0..n` in order:
+   - For each `addr` in `ops[idx].writes`: ensure an entry exists (e.g. `or_insert((idx, idx))`), then set the first component to `idx`. So after the pass, the first component is the index of the **last** op that writes this address.
+   - For each `addr` in `ops[idx].reads`: if `addr` is in the map, set the second component to `max(current_second, idx)`. So after the pass, the second component is the index of the **last** op that reads this address.
+3. Emit one interval per address for which `def_op_idx < last_use_op_idx`. Addresses with `def_op_idx ≥ last_use_op_idx` are dropped (no read after the last write in the sequence).
+
+**Units.** Intervals are in **op index** (position in the array), not in **cycle**. So “last use” means “last op in the sequence that reads this address,” not “latest cycle at which the address is read.” This is only equivalent to cycle-based liveness when the op sequence is ordered by execution (e.g. by cycle, then by some tie-break). The implementation assumes the caller passes ops in such an order.
+
+**Relation to the main spec.** The main spec and the allocation pipeline use **VReg-based** liveness: intervals are per VReg, in **cycles**, with `start`/`end` as in §3 and A4. That is implemented in `address_assign::compute_live_intervals(config, ops: &[SsaOp])` and uses `types::LiveInterval { start, end }` in cycles. The **address-based** variant in `bounds.rs` is a different type (`cpsat_scheduler::bounds::LiveInterval` with `address`, `def_op_idx`, `last_use_op_idx`, `size`) and is used for analyses or tooling that work on a lowered `Op` stream (e.g. tests, scratch usage summaries). It is **not** used by the CP-SAT scratch cumulative or by `address_assign::assign_addresses`; those use VReg-based intervals. This spec does not currently formalize the address-based variant (e.g. how op-index intervals relate to cycle-based overlap); it is documented here so the two notions are clearly distinguished.

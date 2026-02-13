@@ -279,3 +279,22 @@ def check_t14_capacity_lower_bound(ctx=None) -> tuple[str, str, float, dict]:
     result = solver.check()
     stats = _get_stats(solver)
     return ("T14", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
+
+
+def check_t15_optional_capacity_redundant(ctx=None) -> tuple[str, str, float, dict]:
+    """T15: Optional propagation constraints are redundant. Cumulative (N <= C*M) implies
+    the direct capacity inequality (M >= ceil(N/C)). So any solution feasible without the
+    optional constraints is feasible with them. Same encoding as T14: assume cumulative
+    and negation of M >= ceil(N/C) (i.e. M*C < N) => UNSAT."""
+    M, N, C = Ints("M N C")
+    solver = Solver(ctx=ctx)
+    solver.add(C >= 1)
+    solver.add(N >= 0)
+    solver.add(M >= 0)
+    cumulative = N <= M * C  # cumulative constraint for one engine
+    negation_optional = M * C < N  # optional says M >= ceil(N/C); negation is M*C < N
+    solver.add(cumulative)
+    solver.add(negation_optional)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return ("T15", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)

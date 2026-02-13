@@ -7,7 +7,7 @@ import time
 
 import z3
 
-# Path to spec (relative to project root); anchors #t1..#t14 link to each theorem
+# Path to spec (relative to project root); anchors #t1..#t15 link to each theorem
 SPEC_PATH = "docs/LIVENESS_SPECIFICATION.md"
 
 from .fixtures import DEFAULT_TIMEOUT_MS
@@ -26,6 +26,7 @@ from .theorems import (
     check_t12_shifted_valu_with_consumer_end,
     check_t13_occupied_semantics,
     check_t14_capacity_lower_bound,
+    check_t15_optional_capacity_redundant,
 )
 
 THEOREM_CHECKS = [
@@ -43,6 +44,7 @@ THEOREM_CHECKS = [
     ("T12", "Shifted VALU dest with consumer end", check_t12_shifted_valu_with_consumer_end),
     ("T13", "Occupied interval semantics", check_t13_occupied_semantics),
     ("T14", "Capacity lower bound", check_t14_capacity_lower_bound),
+    ("T15", "Optional capacity constraints redundant", check_t15_optional_capacity_redundant),
 ]
 
 
@@ -69,7 +71,7 @@ def run_verification(
         z3.set_param("verbose", 1)
         z3.set_param("stats", True)
     print(f"Z3 verification (timeout={timeout_ms}ms, seed={seed})")
-    print(f"Spec: {SPEC_PATH} (anchors #t1..#t14)")
+    print(f"Spec: {SPEC_PATH} (anchors #t1..#t15)")
     print("-" * 60)
     failures = []
     for name, desc, check_fn in THEOREM_CHECKS:

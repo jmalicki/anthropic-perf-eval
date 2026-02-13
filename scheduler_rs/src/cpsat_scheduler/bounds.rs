@@ -17,7 +17,7 @@ use super::config::{
 ///
 /// Checks that for every RAW edge (pred → succ):
 /// - Forward (ASAP): `asap[succ] >= asap[pred] + pred.offset_for_asap(pred_is_shiftable)`
-/// - Backward (ALAP): `alap[pred] <= alap[succ] - pred.offset_for_alap(pred_is_shiftable)`
+/// - Backward (ALAP): `alap[pred] <= alap[succ] - pred.offset_for_asap(pred_is_shiftable)` (same min delay as ASAP for domain consistency)
 ///
 /// Also checks domain consistency: `asap[op] <= alap[op]` for all ops.
 ///
@@ -1201,7 +1201,7 @@ pub(crate) fn build_ordering_pairs_from_bounds(
 /// After tightening passes (slot, scratch) may have narrowed bounds without respecting
 /// precedence offsets, this pass does bidirectional propagation:
 /// - Forward: increase ASAP[succ] to satisfy `asap[succ] >= asap[pred] + pred.offset_for_asap()`
-/// - Backward: decrease ALAP[pred] to satisfy `alap[pred] <= alap[succ] - pred.offset_for_alap()`
+/// - Backward: decrease ALAP[pred] to satisfy `alap[pred] <= alap[succ] - pred.offset_for_asap()` (same min delay)
 ///
 /// Iterates until convergence (bounded by ops.len() iterations).
 ///
