@@ -171,6 +171,10 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 
 **Theorem**: The expiration rule (T1) ensures that when we reuse an address, the new interval `[S, E]` does not overlap the expired interval `[start(v), end(v)]`. *Proof*: Overlap requires `S < end(v)`; expiration requires `end(v) ≤ S`; contradiction.
 
+**Allocator scope (not CP-SAT).** T1, T2, and T9 govern the **address allocator** (`address_assign.rs`), which runs *after* scheduling to assign physical scratch addresses. The CP-SAT model uses a different mechanism (cumulative scratch constraint over half-open intervals); it does not use expiration-based linear scan. See §11 References.
+
+**Corollary (allocator correctness).** A linear-scan allocator that (a) computes intervals per A4, (b) uses T1 for expiration, and (c) reuses addresses only when expired produces allocations satisfying T2 (overlapping intervals receive disjoint addresses). *Proof*: By induction over allocation order. When allocating w at S, all prior holders of that address were expired with `end(v) ≤ S`; by T9, w's interval does not overlap any of them. For any two prior holders of the same address, one was expired before the other was allocated, so they do not overlap. Hence all same-address pairs are non-overlapping; equivalently, overlapping ⇒ disjoint (T2).
+
 <a id="t10"></a>
 ### T10. Dead Shifted VALU Dest End
 
@@ -430,8 +434,8 @@ The encoding of conditional constraints (Part II "Constraint scope") uses the fo
 ### 11. References and Verification
 
 - `scheduler_rs/src/types.rs`: LiveInterval struct, overlaps()
-- `scheduler_rs/src/address_assign.rs`: compute_live_intervals, assign_addresses, expiration logic
-- `scheduler_rs/src/cpsat_scheduler/model.rs`: Scratch cumulative constraint; Flow cumulative and NoOverlap (§9); choice encoding — optional intervals, only_enforce_if (§10)
+- `scheduler_rs/src/address_assign.rs`: **Allocator** — compute_live_intervals (A4), assign_addresses (T1 expiration, T2 overlap). Uses T1/T2/T9; CP-SAT does not.
+- `scheduler_rs/src/cpsat_scheduler/model.rs`: **CP-SAT** — Scratch cumulative constraint (not allocator; no T1 expiration); Flow cumulative and NoOverlap (§9); choice encoding — optional intervals, only_enforce_if (§10)
 - `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation (T3, T4), horizon and max-latency critical path (§4a), slot-aware tightening (T7) with optional-interval exclusions, scratch-aware tightening (T8), precedence fixpoint after tightening, domain consistency check (ASAP ≤ ALAP), capacity lower bound (T14), ordering pairs for symmetry
 - `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`: CSE group construction
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
