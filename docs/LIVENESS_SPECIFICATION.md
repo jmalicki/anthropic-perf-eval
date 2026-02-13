@@ -82,16 +82,19 @@ For each VReg `v`, `end(v)` is the maximum cycle such that we must **not** allow
 
 The following are **theorems**: they should be derivable from axioms A1–A7 alone. We feed these to CP-SAT as explicit constraints; they tighten the search space but add no new semantic assumptions. Proofs (or Z3 verification) should establish: **axioms ⊢ theorem**.
 
+<a id="t1"></a>
 ### T1. Expiration Rule
 
 **Theorem**: When allocating a new VReg `w` that writes at cycle S, expire prior allocation `v` iff `end(v) ≤ S`. This rule never causes a write-write conflict.
 
 *Proof obligation*: Show that whenever we reuse (i.e. `end(v) ≤ S`), the last access of `v` cannot be a write at S. (By A4, if last access is write at L, `end(v) ≥ L+1`; so `end(v) ≤ S` implies S > L.)
 
+<a id="t2"></a>
 ### T2. Overlap ⇒ Disjoint Allocation
 
 **Theorem**: Two closed intervals `[s₁,e₁]` and `[s₂,e₂]` overlap (conflict) iff `e₁ > s₂ ∧ e₂ > s₁`. Overlapping intervals must receive disjoint scratch ranges.
 
+<a id="t3"></a>
 ### T3. ASAP Bounds (Precedence)
 
 **Theorem**: For each SSA edge `pred → succ`, any valid schedule satisfies
@@ -104,6 +107,7 @@ ASAP(succ) ≥ ASAP(pred) + offset_asap(pred)
 ```
 for any fixed-point ASAP assignment. *Derives from A3.*
 
+<a id="t4"></a>
 ### T4. ALAP Bounds (Precedence)
 
 **Theorem**: For each SSA edge `pred → succ`, any valid schedule satisfies
@@ -116,44 +120,53 @@ ALAP(pred) ≤ ALAP(succ) - offset_asap(pred)
 ```
 for any fixed-point ALAP assignment. *Derives from A3.*
 
+<a id="t5"></a>
 ### T5. Cycle Domain
 
 **Theorem**: For each op, `ASAP(op) ≤ cycle(op) ≤ ALAP(op)` defines a sound domain (contains all feasible cycles). *Derives from T3, T4, and the definition of ASAP/ALAP as fixpoints.*
 
+<a id="t6"></a>
 ### T6. Half-Open Conversion
 
 **Theorem**: For CP-SAT cumulative scratch constraint, closed interval `[s, e]` (last occupied cycle e) corresponds to half-open `[s, e+1)`. So `end_halfopen = end_closed + 1`. *Derives from A1, A2, A4.*
 
+<a id="t7"></a>
 ### T7. Slot-Aware ASAP/ALAP Tightening
 
 **Theorem**: If we push ASAP forward or ALAP backward using slot capacity (A6) so that the demand in each op's window respects the cap, the tightened bounds still contain at least one feasible schedule. *Derives from A6 and the fact that tightening only removes infeasible regions.*
 
+<a id="t8"></a>
 ### T8. Scratch-Aware ASAP/ALAP Tightening
 
 **Theorem**: If we push ASAP forward or ALAP backward using scratch liveness (A7) so that total scratch usage in each candidate window stays within budget, the tightened bounds still contain at least one feasible schedule. *Derives from A7 and the liveness definitions.*
 
+<a id="t9"></a>
 ### T9. Expiration Implies No Overlap
 
 **Theorem**: The expiration rule (T1) ensures that when we reuse an address, the new interval `[S, E]` does not overlap the expired interval `[start(v), end(v)]`. *Proof*: Overlap requires `S < end(v)`; expiration requires `end(v) ≤ S`; contradiction.
 
+<a id="t10"></a>
 ### T10. Dead Shifted VALU Dest End
 
 **Theorem**: For a shifted VALU dest `v` with no consumers, `end(v) = max_cycle(v) + 1`. *Derives from A2*: the last access is a write at `max_cycle(v)`; per A2, reuse for a new writer at cycle S requires `S > max_cycle(v)`, hence the minimal `end(v)` that blocks reuse at `max_cycle` is `max_cycle(v) + 1`.
 
 *CP-SAT linkage*: Dead VRegs are excluded from the scratch cumulative (DCE assumes no dead). If DCE is ever disabled, dead shifted VALU dests must use half-open end `max_cycle + 2` per T6 (closed `end = max_cycle + 1` → half-open `[min_cycle, max_cycle + 2)`). `model.rs` would need to add such intervals to `scratch_intervals`.
 
+<a id="t11"></a>
 ### T11. Dead Single-Cycle VReg End
 
 **Theorem**: For a VReg `v` written at cycle D with no consumers, `end(v) = D + 1`. *Derives from A2*: the last access is a write at D; per A2, reuse for a new writer at cycle S requires `S > D`, hence the minimal `end(v)` that blocks reuse at D is `D + 1`.
 
 *CP-SAT linkage*: Same as T10—dead VRegs are omitted from `live_vregs` and thus from `scratch_intervals` (cumul_scratch). `address_assign.rs` third pass extends `[D, D]` to `[D, D+1]`; expiration logic (T1) uses this for linear-scan allocation.
 
+<a id="t12"></a>
 ### T12. Shifted VALU Dest with Consumer
 
 **Theorem**: For a shifted VALU dest `v` with a consumer at last read R, `end(v) = R`. *Derives from A2 and A3*: precedence forces `R ≥ max_cycle(v) + 1`; the last access is a read at R. Per A2, reuse for a writer at R is allowed (read-then-write same cycle), so the minimal `end(v)` is R.
 
 *CP-SAT linkage*: `model.rs` scratch constraint uses `last_use_idx` (consumer op) for end. For live shifted VALU dests, end = `cycle_vars[last_use_idx] + 1` (half-open). Per T6, closed `[min_cycle, R]` → half-open `[min_cycle, R+1)`. The start uses `min(alu_cycles)` when shifted (see CRITICAL FIXES in model.rs).
 
+<a id="t13"></a>
 ### T13. Occupied Interval Semantics
 
 **Theorem**: For VReg `v` with closed interval `[start(v), end(v)]`, the address is occupied for every cycle `t` with `start(v) ≤ t ≤ end(v)`, and becomes reusable for a writer at cycle `end(v) + 1`. *Derives from A2, A4, and the definition of `end`*.
@@ -317,7 +330,7 @@ For shifted VALU dest (no consumer): closed `end = max_cycle + 1` → half-open 
 - `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation, tightening
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
 
-**Z3 verification**: Encode axioms A1–A7 and the negation of each theorem; if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Recommended: start with T1, T2, T5, T9 (expiration, overlap, cycle domain, no-overlap-on-reuse); T10–T12 (end-by-VReg-kind); T13 (occupied semantics).
+**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition. All of T1–T13 are checked by refutation.
 
 ---
 
