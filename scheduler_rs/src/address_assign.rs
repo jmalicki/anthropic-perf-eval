@@ -68,7 +68,7 @@
 //! |----------|-------|--------------------|--------|
 //! | **SelectChoice FMA** | First pass | Dest: `def_cycle = op.cycle + 1`; sub_temp: `[op.cycle, op.cycle+1]` | FMA writes at cycle+1; sub is read by FMA at cycle+1. Not in srcs as a normal consumer. |
 //! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles)` | One SSA op expands to 8 ALU ops at (possibly) 8 cycles; block in use from first to last write. |
-//! | **SelectChoice FMA reads** | Second pass | Extend cond, false_val, delta to `op.cycle + 1` | FMA reads these at cycle+1; those reads are not in srcs with cycle+1. |
+//! | **SelectChoice FMA reads** | Second pass | Extend cond, **true_val**, false_val, delta to `op.cycle + 1` | Sub (at cycle+1) reads true_val; FMA (at cycle+1) reads cond, sub result, false_val. All src VRegs must be extended so interval includes the cycle they are read. |
 //! | **AluDerive** | Separate pass | Extend left/right producer's interval to derive op's cycle | ConstChoice AluDerive has no VReg srcs; the actual reads are implicit at the derive op's cycle. |
 //! | **Dead VRegs** | Third pass | Extend `[def, def]` to `[def, def+1]` | Prevents same-cycle write conflict (see types.rs). |
 //! | **Vector group** | Separate pass | Synthesize group interval from lane intervals and consumer reads; remove lane VRegs | Structural: lanes share one block; not a single "op" in the usual sense. |
@@ -185,8 +185,14 @@ pub trait LivenessDef {
 }
 
 /// At which cycles does this op read each VReg (including implicit reads)?
+///
+/// **Contract:** Implementations must report every VReg that this op (or its lowering) reads,
+/// at the exact cycle where that read happens. For ops that lower to multiple instructions
+/// (e.g. SelectChoice FMA → sub at cycle+1, then FMA at cycle+1), every read by any of those
+/// instructions must be included. Missing a read leaves that VReg's interval too short and
+/// causes use-def failures when the op is scheduled far from the producer.
 pub trait LivenessUse {
-    /// (VReg, read_cycle) for each use.
+    /// (VReg, read_cycle) for each use. Must include every read at the cycle it occurs.
     fn use_cycles(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32)>;
 }
 
@@ -234,17 +240,19 @@ impl LivenessDef for OpLiveness<'_> {
 impl LivenessUse for OpLiveness<'_> {
     fn use_cycles(&self, op: &SsaOp, ctx: &LivenessContext<'_>) -> Vec<(VReg, i32)> {
         let mut out = Vec::new();
-        // SelectChoice FMA: cond, false_val, delta (and sub_temp) read at cycle+1; skip true_val (index 1)
+        // SelectChoice FMA: cond, true_val, false_val, delta (and sub_temp) read at cycle+1.
+        // The lowered FMA path emits sub = true_val - false_val at cycle+1, so true_val is read
+        // and its live interval must extend to cycle+1. Previously we skipped index 1 (true_val),
+        // which caused use-def violations when the schedule placed SelectChoice at a cycle not
+        // covered by true_val's interval (e.g. interval [8,8] vs read at cycle 20).
         if op.opcode == Opcode::SelectChoice
             && ctx.select_fma_ops.contains(&op.id)
             && op.srcs.len() >= 3
         {
             let read_at = op.cycle + 1;
-            for (i, src) in op.srcs.iter().enumerate() {
-                if i != 1 {
-                    if let Operand::VReg(v) = src {
-                        out.push((*v, read_at));
-                    }
+            for src in &op.srcs {
+                if let Operand::VReg(v) = src {
+                    out.push((*v, read_at));
                 }
             }
             if let Some(delta_vreg) = op.delta_vreg {
@@ -663,14 +671,20 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
     let intervals = config.compute_live_intervals(ops)?;
 
-    // Verify use-def: every VReg read by an op must have an interval that includes the op's cycle.
-    // Lane VRegs (from decompose_vector) have no interval themselves; they share the group key's
-    // allocation and interval. Look up the group's interval when the VReg is a lane.
+    // Verify use-def: every (vreg, read_cycle) reported by use_cycles must have an interval that
+    // includes read_cycle. This uses the same source of truth as interval computation, so we
+    // validate the actual read cycles (e.g. op.cycle+1 for SelectChoice FMA), not just op.cycle.
+    let ctx = LivenessContext {
+        select_fma_ops: &config.select_fma_ops,
+        shifted_alu_cycles: &config.shifted_alu_cycles,
+        const_alu_derive_ops: &config.const_alu_derive_ops,
+        cse_consumer_op_ids: &config.cse_consumer_op_ids,
+        ops,
+    };
     for op in ops {
-        let op_cycle = op.cycle;
-        for vreg in op.reads() {
+        let op_liv = OpLiveness { op, ctx: &ctx };
+        for (vreg, read_cycle) in op_liv.use_cycles(op, &ctx) {
             let interval = intervals.get(&vreg).or_else(|| {
-                // Lane VReg? Use the group key's interval (lane VRegs are removed in vector group pass)
                 config
                     .vector_group_lanes
                     .iter()
@@ -678,18 +692,18 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
                     .and_then(|(group, _)| intervals.get(group))
             });
             if let Some(interval) = interval {
-                if interval.start > op_cycle || op_cycle > interval.end {
+                if interval.start > read_cycle || read_cycle > interval.end {
                     return Err(format!(
                         "Use-def violation: VReg {:?} read at cycle {} but interval is [{}, {}] (op id={}, opcode={:?}). \
-                         The VReg's live interval does not include the read cycle - this indicates a bug in interval computation.",
-                        vreg, op_cycle, interval.start, interval.end, op.id, op.opcode
+                         The VReg's live interval does not include the read cycle - this indicates a bug in interval computation or use_cycles.",
+                        vreg, read_cycle, interval.start, interval.end, op.id, op.opcode
                     ));
                 }
             } else {
                 return Err(format!(
                     "Use-def violation: VReg {:?} read at cycle {} but has no interval (op id={}, opcode={:?}). \
                      This VReg was never defined or its interval was not computed - indicates an SSA violation or interval computation bug.",
-                    vreg, op_cycle, op.id, op.opcode
+                    vreg, read_cycle, op.id, op.opcode
                 ));
             }
         }
@@ -1664,6 +1678,27 @@ mod tests {
 
         // Sub_temp defined at 5, read by FMA at 6 → [5, 6]
         assert_eq!(intervals[&sub_temp], LiveInterval::new(5, 6));
+
+        // Regression: FMA path reads cond, true_val, false_val at cycle+1 (sub/FMA). use_cycles must
+        // report all three so their intervals extend to at least select_cycle+1; otherwise use-def
+        // fails when SelectChoice is scheduled far from producers (e.g. zero-gap + no tightening).
+        let select_cycle = 5i32;
+        let read_at = select_cycle + 1;
+        assert!(
+            intervals[&cond].end >= read_at,
+            "cond must extend to cycle+1 (FMA path reads at cycle+1), got end {}",
+            intervals[&cond].end
+        );
+        assert!(
+            intervals[&true_val].end >= read_at,
+            "true_val must extend to cycle+1 (sub reads it at cycle+1), got end {}",
+            intervals[&true_val].end
+        );
+        assert!(
+            intervals[&false_val].end >= read_at,
+            "false_val must extend to cycle+1 (FMA path reads at cycle+1), got end {}",
+            intervals[&false_val].end
+        );
     }
 
     /// Two SelectChoice FMA ops: after assign_addresses, no two VRegs with overlapping
