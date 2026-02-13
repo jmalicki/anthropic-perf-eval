@@ -990,6 +990,12 @@ impl SsaEmitContext {
     /// The element VRegs inherit the source vector's definer in vreg_def,
     /// so dependency resolution works automatically.
     ///
+    /// # TODO (future liveness)
+    /// Consider having decompose_vector conceptually end the vector VReg's liveness
+    /// and start independent liveness for each new scalar VReg. That would give
+    /// lanes independent intervals and allow tighter packing of chains of ALU ops
+    /// that consume lanes at different times (e.g. scatter-load address lanes).
+    ///
     /// # Arguments
     /// * `v` - A vector VReg that was defined by some prior op (e.g. FMA, vload)
     ///

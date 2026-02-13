@@ -471,6 +471,11 @@ pub fn compute_live_intervals(
     //
     // For read groups, we must preserve the existing interval and extend it to cover
     // all ops that read lane VRegs. Lane VRegs lack intervals so we scan ops directly.
+    //
+    // TODO (future): Have decompose_vector end the vector VReg's liveness and assign
+    // independent intervals to each new scalar (lane) VReg, so we can more tightly
+    // pack chains of ALU ops that consume lanes at different times. See emit_ssa.rs
+    // decompose_vector doc comment and docs/UNIFY_SCRATCH_LIVENESS_PLAN.md.
     for (group_vreg, lane_vregs) in &config.vector_group_lanes {
         // Existing interval for the group key (present for read groups / decomposition)
         let existing_start = intervals.get(group_vreg).map(|i| i.start);
@@ -658,11 +663,21 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // Compute live intervals (include zero_vreg when set so peak_live counts reserved slot)
     let intervals = config.compute_live_intervals(ops)?;
 
-    // Verify use-def: every VReg read by an op must have an interval that includes the op's cycle
+    // Verify use-def: every VReg read by an op must have an interval that includes the op's cycle.
+    // Lane VRegs (from decompose_vector) have no interval themselves; they share the group key's
+    // allocation and interval. Look up the group's interval when the VReg is a lane.
     for op in ops {
         let op_cycle = op.cycle;
         for vreg in op.reads() {
-            if let Some(interval) = intervals.get(&vreg) {
+            let interval = intervals.get(&vreg).or_else(|| {
+                // Lane VReg? Use the group key's interval (lane VRegs are removed in vector group pass)
+                config
+                    .vector_group_lanes
+                    .iter()
+                    .find(|(_, lanes)| lanes.contains(&vreg))
+                    .and_then(|(group, _)| intervals.get(group))
+            });
+            if let Some(interval) = interval {
                 if interval.start > op_cycle || op_cycle > interval.end {
                     return Err(format!(
                         "Use-def violation: VReg {:?} read at cycle {} but interval is [{}, {}] (op id={}, opcode={:?}). \
