@@ -91,7 +91,7 @@ The following are **theorems**: they should be derivable from axioms A1–A7 alo
   - **CSE shared SUB**: The shared sub_temp VReg and its liveness (§3.6, §7) exist only when `sub_active`; scratch and precedence for that SUB are conditional on `sub_active` and on each FMA consumer's choice.
   - **SelectChoice**: Flow (vselect) vs VALU (SUB+FMA) — only the chosen path has intervals and precedence.
 
-When we say a theorem "holds for each fixed assignment" (e.g. T14), we mean: for any assignment to choice variables, the constraint holds for the ops/intervals that are present under that assignment. Tightening (T7, T8) must count only intervals that are *present* for the candidate assignment (optional intervals excluded from demand when the choice is not yet fixed), so the tightened bounds remain valid for both enforce-if and non-enforce-if encodings.
+When we say a theorem "holds for each fixed assignment" (e.g. T14), we mean: for any assignment to choice variables, the constraint holds for the ops/intervals that are present under that assignment. Tightening (T7, T8) must count only intervals that are *present* for the candidate assignment (optional intervals excluded from demand when the choice is not yet fixed), so the tightened bounds remain valid for both enforce-if and non-enforce-if encodings. The encoding of these conditional constraints (optional intervals, only_enforce_if, exactly-one) is specified in Part III §10 (Choice variable encoding).
 
 <a id="t1"></a>
 ### T1. Expiration Rule
@@ -367,17 +367,48 @@ For shifted VALU dest (no consumer): closed `end = max_cycle + 1` → half-open 
 
 ---
 
-### 9. References and Verification
+### 9. Flow NoOverlap
+
+No two Flow intervals that are **present** may overlap in time. Formally: for any two distinct Flow interval variables that are both present, their half-open intervals `[s_i, e_i)` and `[s_j, e_j)` do not overlap (no shared cycle: either `e_i ≤ s_j` or `e_j ≤ s_i`).
+
+**Implementation**: The CP-SAT model adds `add_no_overlap(flow_intervals)` in addition to `add_cumulative(flow_intervals, flow_demands, flow_cap)` (`scheduler_rs/src/cpsat_scheduler/model.rs` ~1549–1553).
+
+**Redundancy**: When **Flow capacity = 1** and **every Flow interval has size (demand) = 1**, the cumulative constraint already enforces that at most one Flow op runs at any cycle. So at any time point at most one interval is active ⇒ no two intervals overlap. In that case NoOverlap is redundant with cumulative.
+
+**When it matters**: If Flow capacity is ever increased (e.g. 2) or if multi-cycle Flow ops (size > 1) are introduced, cumulative alone would allow multiple intervals per cycle up to capacity; NoOverlap still forbids overlapping intervals. The current ISA has Flow cap 1 and all Flow intervals size 1, so the model keeps NoOverlap for clarity and future-proofing.
+
+---
+
+### 10. Choice variable encoding
+
+The encoding of conditional constraints (Part II "Constraint scope") uses the following CP-SAT primitives and four choice kinds.
+
+**Primitives**:
+- **Optional interval**: An interval variable with a **presence literal** (Boolean). The interval is **present** in the schedule iff the literal is true. When present, it contributes to cumulative constraints and obeys precedence; when absent, it does not.
+- **only_enforce_if(C, [lit])**: Constraint C is enforced only when `lit` is true. Used so that precedence and other constraints for an alternative apply only when that alternative is chosen.
+- **Exactly-one (mutual exclusion)**: For N alternatives, one Boolean per alternative with `sum(literals) = 1`. Exactly one alternative is chosen.
+
+**ConstChoice** (e.g. Load vs AddImm vs ALU-derived): One op index; alternatives are Load, AddImm, and optionally several ALU-derived encodings. **Binary**: One Boolean `choice_var`; Load interval optional with presence `¬choice_var`, AddImm/Flow interval optional with presence `choice_var`. **N-way**: N Booleans `use_vars[0..N]` with `sum(use_vars) = 1`; each alternative has an optional interval with presence `use_vars[k]`. Precedence for ALU option k is added with `only_enforce_if(..., [use_alu_k])`. Ref: `model.rs` ConstChoice block (~826–935).
+
+**SelectChoice** (vselect vs FMA): One Boolean `choice_var`: true ⇒ FMA path (VALU), false ⇒ vselect (Flow). Optional Flow interval with presence `¬choice_var`; optional VALU intervals (SUB + FMA) with presence `choice_var`. Precedence for FMA is conditional on the path. Ref: `model.rs` SelectChoice block (~978–1085).
+
+**VALU shift** (VALU vs ALU): One Boolean per shiftable op: stay on VALU or shift to ALU. Optional VALU interval (presence = ¬shift), optional ALU intervals (8, one per lane) with presence = shift. Precedence for consumers uses completion_cycle when shifted; constraints use `only_enforce_if(..., [shift_var])` or the opposite literal as appropriate. Ref: `model.rs` shiftable VALU / completion_cycle (~540–595, 637–675).
+
+**CSE shared SUB**: Already specified in §7 and §3.6. One Boolean `sub_active` per group; optional SUB interval and optional scratch/liveness constraints with `only_enforce_if(..., [sub_active_var])`. Ref: `model.rs` CSE blocks.
+
+---
+
+### 11. References and Verification
 
 - `scheduler_rs/src/types.rs`: LiveInterval struct, overlaps()
 - `scheduler_rs/src/address_assign.rs`: compute_live_intervals, assign_addresses, expiration logic
-- `scheduler_rs/src/cpsat_scheduler/model.rs`: Scratch cumulative constraint
+- `scheduler_rs/src/cpsat_scheduler/model.rs`: Scratch cumulative constraint; Flow cumulative and NoOverlap (§9); choice encoding — optional intervals, only_enforce_if (§10)
 - `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation, tightening, capacity lower bound (T14)
 - `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`: CSE group construction
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
 - `docs/SUB_CSE_ALU_SHIFT_DESIGN.md`: CSE shared SUB model and capacity
 
-**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition. All of T1–T13 are checked by refutation.
+**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition. All of T1–T14 are checked by refutation.
 
 ---
 
@@ -386,7 +417,5 @@ For shifted VALU dest (no consumer): closed `end = max_cycle + 1` → half-open 
 The following CP-SAT constraints or model aspects are not yet formalized in this spec:
 
 - **Symmetry breaking** (ordering groups, lexicographic streams) — search heuristics; prune equivalent solutions but don't affect correctness
-- **Flow NoOverlap** — redundant with cumulative when all Flow intervals are size 1; may matter for multi-cycle Flow ops
-- **Choice variable encoding** — ConstChoice, SelectChoice, VALU shift as decision variables with optional intervals and exactly-one constraints. (Scope of constraints with respect to choices is documented in Part II: "Constraint scope: unconditional vs conditional (enforce-if)".)
 - **Segment mode** — live-out, live-through, segment_end for per-section scheduling
 - **Dead VReg exclusion** — CP-SAT scratch model omits dead VRegs (assumes DCE); address assign allocates them

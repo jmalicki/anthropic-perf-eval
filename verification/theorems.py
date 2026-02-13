@@ -1,4 +1,4 @@
-"""Theorems T1–T13 from LIVENESS_SPECIFICATION.md."""
+"""Theorems T1–T14 from LIVENESS_SPECIFICATION.md."""
 
 from z3 import And, Ints, Not, Or, Solver
 
@@ -260,3 +260,22 @@ def check_t13_occupied_semantics(ctx=None) -> tuple[str, str, float, dict]:
     result = solver.check()
     stats = _get_stats(solver)
     return ("T13", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
+
+
+def check_t14_capacity_lower_bound(ctx=None) -> tuple[str, str, float, dict]:
+    """T14: Capacity lower bound. For engine with capacity C and op-count N, makespan >= ceil(N/C).
+    From A6: at most C ops per cycle, so over M cycles at most M*C ops. So N <= M*C for valid schedule.
+    Negation: valid (N <= M*C) and makespan < ceil(N/C). For integers, M < ceil(N/C) iff M*C < N.
+    So we need N <= M*C and M*C < N => N < N. UNSAT."""
+    M, N, C = Ints("M N C")
+    solver = Solver(ctx=ctx)
+    solver.add(C >= 1)
+    solver.add(N >= 0)
+    solver.add(M >= 0)
+    capacity_constraint = N <= M * C  # at most C ops per cycle over M cycles
+    negation_t14 = M * C < N  # makespan M < ceil(N/C)  <=>  M*C < N for integers
+    solver.add(capacity_constraint)
+    solver.add(negation_t14)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return ("T14", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)

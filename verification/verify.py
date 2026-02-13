@@ -1,10 +1,14 @@
 """CLI to run Z3 verification of liveness theorems."""
 
 import argparse
+import pathlib
 import sys
 import time
 
 import z3
+
+# Path to spec (relative to project root); anchors #t1..#t14 link to each theorem
+SPEC_PATH = "docs/LIVENESS_SPECIFICATION.md"
 
 from .fixtures import DEFAULT_TIMEOUT_MS
 from .theorems import (
@@ -14,8 +18,14 @@ from .theorems import (
     check_t4_alap_bounds,
     check_t5_cycle_domain,
     check_t6_half_open_conversion,
+    check_t7_slot_tightening_one_step,
+    check_t8_scratch_tightening_one_step,
     check_t9_expiration_implies_no_overlap,
     check_t10_dead_shifted_valu_end,
+    check_t11_dead_single_cycle_end,
+    check_t12_shifted_valu_with_consumer_end,
+    check_t13_occupied_semantics,
+    check_t14_capacity_lower_bound,
 )
 
 THEOREM_CHECKS = [
@@ -25,9 +35,21 @@ THEOREM_CHECKS = [
     ("T4", "ALAP bounds (precedence)", check_t4_alap_bounds),
     ("T5", "Cycle domain (ASAP/ALAP sound)", check_t5_cycle_domain),
     ("T6", "Half-open conversion", check_t6_half_open_conversion),
+    ("T7", "Slot-aware tightening (one-step lemma)", check_t7_slot_tightening_one_step),
+    ("T8", "Scratch-aware tightening (one-step lemma)", check_t8_scratch_tightening_one_step),
     ("T9", "Expiration implies no overlap", check_t9_expiration_implies_no_overlap),
     ("T10", "Dead shifted VALU dest end", check_t10_dead_shifted_valu_end),
+    ("T11", "Dead single-cycle VReg end", check_t11_dead_single_cycle_end),
+    ("T12", "Shifted VALU dest with consumer end", check_t12_shifted_valu_with_consumer_end),
+    ("T13", "Occupied interval semantics", check_t13_occupied_semantics),
+    ("T14", "Capacity lower bound", check_t14_capacity_lower_bound),
 ]
+
+
+def _spec_url(theorem_id: str) -> str:
+    """Return file path with anchor for theorem (for terminal/file links)."""
+    root = pathlib.Path(__file__).resolve().parent.parent
+    return str(root / SPEC_PATH) + "#" + theorem_id.lower()
 
 
 def run_verification(
@@ -47,6 +69,7 @@ def run_verification(
         z3.set_param("verbose", 1)
         z3.set_param("stats", True)
     print(f"Z3 verification (timeout={timeout_ms}ms, seed={seed})")
+    print(f"Spec: {SPEC_PATH} (anchors #t1..#t14)")
     print("-" * 60)
     failures = []
     for name, desc, check_fn in THEOREM_CHECKS:
@@ -99,8 +122,17 @@ def main() -> int:
         action="store_true",
         help="Less output (no Z3 stats)",
     )
+    parser.add_argument(
+        "--links",
+        action="store_true",
+        help="Print spec file path with anchors for each theorem",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for Z3")
     args = parser.parse_args()
+    if args.links:
+        for name, _, _ in THEOREM_CHECKS:
+            print(f"{name}: {_spec_url(name)}")
+        return 0
     return run_verification(
         theorems=args.theorem,
         timeout_ms=args.timeout,
