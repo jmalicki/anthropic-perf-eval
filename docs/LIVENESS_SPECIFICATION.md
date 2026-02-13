@@ -82,6 +82,17 @@ For each VReg `v`, `end(v)` is the maximum cycle such that we must **not** allow
 
 The following are **theorems**: they should be derivable from axioms A1–A7 alone. We feed these to CP-SAT as explicit constraints; they tighten the search space but add no new semantic assumptions. Proofs (or Z3 verification) should establish: **axioms ⊢ theorem**.
 
+### Constraint scope: unconditional vs conditional (enforce-if)
+
+- **Unconditional constraints** hold for **every** valid schedule. They do not depend on choice variables (ConstChoice, SelectChoice, VALU shift) or on whether an optional structure is present. The axioms A1–A7 and theorems T1–T6, T9–T13 are in this category: they apply to every op/VReg that exists in the schedule. The CP-SAT model enforces them always (e.g. precedence, overlap, scratch cumulative for live VRegs, half-open conversion).
+
+- **Conditional (enforce-if) constraints** apply only when a given optional part is active. The CP-SAT model encodes these with optional interval variables or `only_enforce_if(condition)` so that the constraint is enforced iff the condition holds. Examples:
+  - **Shifted VALU**: An op may use VALU (one interval) or ALU (eight intervals); only the chosen alternative contributes to slot demand and scratch. Precedence and liveness (T12, T10) apply to the *chosen* placement.
+  - **CSE shared SUB**: The shared sub_temp VReg and its liveness (§3.6, §7) exist only when `sub_active`; scratch and precedence for that SUB are conditional on `sub_active` and on each FMA consumer's choice.
+  - **SelectChoice**: Flow (vselect) vs VALU (SUB+FMA) — only the chosen path has intervals and precedence.
+
+When we say a theorem "holds for each fixed assignment" (e.g. T14), we mean: for any assignment to choice variables, the constraint holds for the ops/intervals that are present under that assignment. Tightening (T7, T8) must count only intervals that are *present* for the candidate assignment (optional intervals excluded from demand when the choice is not yet fixed), so the tightened bounds remain valid for both enforce-if and non-enforce-if encodings.
+
 <a id="t1"></a>
 ### T1. Expiration Rule
 
@@ -135,10 +146,14 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 
 **Theorem**: If we push ASAP forward or ALAP backward using slot capacity (A6) so that the demand in each op's window respects the cap, the tightened bounds still contain at least one feasible schedule. *Derives from A6 and the fact that tightening only removes infeasible regions.*
 
+*Scope*: Unconditional in the sense that the theorem holds for any schedule. When the model has optional intervals (choice variables), demand in a window must count only ops that are *present* for the engine in that window; optional-interval ops are excluded from the profile so we do not over-tighten (see `bounds.rs` "optional intervals").
+
 <a id="t8"></a>
 ### T8. Scratch-Aware ASAP/ALAP Tightening
 
 **Theorem**: If we push ASAP forward or ALAP backward using scratch liveness (A7) so that total scratch usage in each candidate window stays within budget, the tightened bounds still contain at least one feasible schedule. *Derives from A7 and the liveness definitions.*
+
+*Scope*: Same as T7 — when optional structures (e.g. CSE shared sub_temp) exist only under a condition, scratch demand in a window should count only VRegs whose intervals are present for the candidate assignment.
 
 <a id="t9"></a>
 ### T9. Expiration Implies No Overlap
@@ -164,7 +179,7 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 
 **Theorem**: For a shifted VALU dest `v` with a consumer at last read R, `end(v) = R`. *Derives from A2 and A3*: precedence forces `R ≥ max_cycle(v) + 1`; the last access is a read at R. Per A2, reuse for a writer at R is allowed (read-then-write same cycle), so the minimal `end(v)` is R.
 
-*CP-SAT linkage*: `model.rs` scratch constraint uses `last_use_idx` (consumer op) for end. For live shifted VALU dests, end = `cycle_vars[last_use_idx] + 1` (half-open). Per T6, closed `[min_cycle, R]` → half-open `[min_cycle, R+1)`. The start uses `min(alu_cycles)` when shifted (see CRITICAL FIXES in model.rs).
+*CP-SAT linkage*: `model.rs` scratch constraint uses `last_use_idx` (consumer op) for end. For live shifted VALU dests, end = `cycle_vars[last_use_idx] + 1` (half-open). Per T6, closed `[min_cycle, R]` → half-open `[min_cycle, R+1)`. The start uses `min(alu_cycles)` when shifted (see CRITICAL FIXES in model.rs). *Conditional*: this VReg and its interval exist only when the op is shifted to ALU (optional interval / choice); when the op stays on VALU, a single-cycle interval is used instead.
 
 <a id="t13"></a>
 ### T13. Occupied Interval Semantics
@@ -172,6 +187,13 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 **Theorem**: For VReg `v` with closed interval `[start(v), end(v)]`, the address is occupied for every cycle `t` with `start(v) ≤ t ≤ end(v)`, and becomes reusable for a writer at cycle `end(v) + 1`. *Derives from A2, A4, and the definition of `end`*.
 
 *CP-SAT linkage*: The scratch cumulative constraint (`add_cumulative(scratch_intervals, scratch_demands, scratch_budget)`) enforces that at any cycle t, the sum of demands for intervals spanning t does not exceed budget. Intervals are half-open `[start, end)` per T6; the CP-SAT solver treats `t` as contained when `start ≤ t < end`, which corresponds to occupied for `start ≤ t ≤ end_closed` where `end = end_closed + 1`. `address_assign.rs` uses the same occupied semantics for overlap detection (T2) and expiration (T1).
+
+<a id="t14"></a>
+### T14. Capacity Lower Bound
+
+**Theorem**: For each engine with slot capacity C per cycle (A6), if the total number of op-executions (op-count) for that engine in a schedule is N, then the schedule's makespan satisfies `makespan ≥ ⌈N / C⌉`. Therefore any valid schedule has `makespan ≥ max_engine ⌈N_engine / C_engine⌉`. *Derives from A6*: at most C ops of that engine execute per cycle, so at least ⌈N / C⌉ cycles are required.
+
+*CP-SAT linkage*: The solver uses a capacity-derived lower bound on makespan (e.g. `compute_capacity_lower_bound_global` in `bounds.rs`) to set the makespan domain and redundant constraints. *Unconditional*: the inequality makespan ≥ ⌈N/C⌉ holds for every valid schedule (for each engine). When choice variables exist (VALU shift, ConstChoice, SelectChoice), N depends on the assignment; the bound we use is the minimum over all choice assignments of that max, so it remains a valid lower bound for the model with enforce-if. See also T7 (slot-aware tightening).
 
 ---
 
@@ -272,6 +294,17 @@ The FMA writes at cycle `op.cycle + 1`. So:
 - **end** = op.cycle + 1 (FMA reads sub_temp at cycle+1)
 - **Last access type**: read at op.cycle + 1. So `end = op.cycle + 1`.
 
+#### 3.6 CSE shared sub_temp
+
+When SelectChoice ops share the same `(true_val, false_val)` operand pair, they form a **CSE group**; at most one shared SUB computes `sub_temp = true_val - false_val`, and every FMA consumer in that group reads that same `sub_temp`. So the shared sub_temp VReg has **multiple consumers** (one per FMA in the group).
+
+- **start** = sub_cycle (the single cycle when the shared SUB runs).
+- **Last read**: the maximum cycle among all FMA consumers in the group that read sub_temp. Call that cycle R.
+- **Last access type**: read at R.
+- **Rule**: Same as 3.1 (normal VReg with consumers): we need the range through R; reuse for a writer at R is allowed. So **end = R**.
+
+*CP-SAT linkage*: When CSE groups exist, the model introduces one sub_temp VReg per group **when sub_active**. Its liveness interval is `[sub_cycle, R]` (closed) where R is the maximum FMA consumer cycle for that group. Scratch cumulative and address assignment treat it like any other VReg with a single definition and multiple uses. *Conditional*: this VReg and its interval exist only when sub_active (enforce-if / optional); constraints on it are only enforced when the shared SUB is present. See §7 and `docs/SUB_CSE_ALU_SHIFT_DESIGN.md`.
+
 ---
 
 ### 4. Overlap and Allocation Invariant (T2, T9)
@@ -308,7 +341,19 @@ When a VALU op is **shifted** to ALU:
 
 ---
 
-### 7. Half-Open Representation (T6)
+### 7. CSE Shared SUB
+
+**CSE group**: A set of SelectChoice ops (with `needs_subtraction`, no `delta_vreg`) that share the same operand pair `(true_val, false_val)`. Built at emission; see `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`.
+
+**Shared SUB**: For each CSE group G, when at least one consumer chooses FMA, one logical op computes `sub_temp = true_val - false_val`. That SUB runs at cycle `sub_cycle` (decision variable when sub_active). All FMA consumers in G read the same sub_temp; their FMA ops run at cycles ≥ sub_cycle + 1 (A3). All constraints on the shared SUB (placement, precedence, scratch, capacity) are **conditional**: enforced only when sub_active (e.g. optional interval or only_enforce_if in the CP-SAT model). Without CSE or when no consumer in G chooses FMA, the shared SUB and its sub_temp do not exist.
+
+**Liveness of shared sub_temp**: As in §3.6 — `start = sub_cycle`, `end = R` where R is the maximum cycle among FMA consumers in G. So the closed interval is `[sub_cycle, R]`; half-open for CP-SAT is `[sub_cycle, R+1)` per T6.
+
+**Capacity**: With CSE, VALU count for SelectChoice is not 2 per FMA but (1 SUB per active group) + (number of FMA consumers). Capacity lower bound (T14) and slot cumulative constraints use this group-aware count; see `bounds.rs` `min_valu_from_select_cse` and `compute_capacity_lower_bound_global`, and `docs/SUB_CSE_ALU_SHIFT_DESIGN.md` §4.5–4.6.
+
+---
+
+### 8. Half-Open Representation (T6)
 
 The CP-SAT cumulative constraint uses **half-open** intervals `[start, end)`:
 - Occupied for cycles `t` with `start ≤ t < end`.
@@ -322,13 +367,15 @@ For shifted VALU dest (no consumer): closed `end = max_cycle + 1` → half-open 
 
 ---
 
-### 8. References and Verification
+### 9. References and Verification
 
 - `scheduler_rs/src/types.rs`: LiveInterval struct, overlaps()
 - `scheduler_rs/src/address_assign.rs`: compute_live_intervals, assign_addresses, expiration logic
 - `scheduler_rs/src/cpsat_scheduler/model.rs`: Scratch cumulative constraint
-- `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation, tightening
+- `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation, tightening, capacity lower bound (T14)
+- `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`: CSE group construction
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
+- `docs/SUB_CSE_ALU_SHIFT_DESIGN.md`: CSE shared SUB model and capacity
 
 **Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition. All of T1–T13 are checked by refutation.
 
@@ -340,8 +387,6 @@ The following CP-SAT constraints or model aspects are not yet formalized in this
 
 - **Symmetry breaking** (ordering groups, lexicographic streams) — search heuristics; prune equivalent solutions but don't affect correctness
 - **Flow NoOverlap** — redundant with cumulative when all Flow intervals are size 1; may matter for multi-cycle Flow ops
-- **Choice variable encoding** — ConstChoice, SelectChoice, VALU shift as decision variables with optional intervals and exactly-one constraints
-- **Capacity lower bound** — `makespan ≥ ⌈total_ops / capacity⌉` (derivable from A6)
+- **Choice variable encoding** — ConstChoice, SelectChoice, VALU shift as decision variables with optional intervals and exactly-one constraints. (Scope of constraints with respect to choices is documented in Part II: "Constraint scope: unconditional vs conditional (enforce-if)".)
 - **Segment mode** — live-out, live-through, segment_end for per-section scheduling
 - **Dead VReg exclusion** — CP-SAT scratch model omits dead VRegs (assumes DCE); address assign allocates them
-- **CSE shared SUB** — shared sub_temp across SelectChoice ops in a CSE group
