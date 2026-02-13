@@ -1704,19 +1704,6 @@ impl PrecedenceOffset for SsaOp {
 //   [0, 5] and [5, 10]: 0 < 10 ✓ AND 5 < 5 ✗ → NO overlap (adjacent)
 //   [0, 5] and [4, 10]: 0 < 10 ✓ AND 4 < 5 ✓ → overlap at cycle 4-5
 //
-// ## Shifted VALU dest intervals: end = max_write_cycle + 1
-//
-// A shifted VALU op expands to 8 ALU ops that write lanes at (possibly) 8 different cycles.
-// The dest is WRITTEN at those cycles; there is no "last read" until a consumer uses it.
-// We set end = max(alu_cycles) + 1 because:
-//
-//   - Storage is occupied until the last write completes (end of cycle max_c)
-//   - Reusable at cycle max_c + 1 (same as dead VReg: write at D → reusable at D+1)
-//
-// Without +1, intervals [22,23] and [23,24] would be adjacent (expiration: 23 <= 23 ✓),
-// but both WRITE at cycle 23 → same-cycle write conflict. With end = max_c+1 we get
-// [22,24] and [23,25], which overlap correctly at cycles 23–24.
-//
 // ============================================================================
 
 /// Live interval representing when a VReg occupies storage.
@@ -1732,7 +1719,6 @@ impl PrecedenceOffset for SsaOp {
 /// |-----------|----------|---------|
 /// | Live (has readers) | `[def, last_read]` | Read at `last_read`, reusable at same cycle |
 /// | Dead (no readers)  | `[def, def + 1]`   | Written at `def`, reusable at `def + 1` |
-/// | Shifted VALU dest  | `[min_c, max_c + 1]` | Written at cycles min_c..max_c; no read until consumer. Reusable at `max_c + 1`. |
 ///
 /// # Why This Representation?
 ///

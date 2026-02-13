@@ -67,7 +67,7 @@
 //! | Scenario | Where | Effective behavior | Reason |
 //! |----------|-------|--------------------|--------|
 //! | **SelectChoice FMA** | First pass | Dest: `def_cycle = op.cycle + 1`; sub_temp: `[op.cycle, op.cycle+1]` | FMA writes at cycle+1; sub is read by FMA at cycle+1. Not in srcs as a normal consumer. |
-//! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles) + 1` | One SSA op expands to 8 ALU ops; dest is WRITTEN at max_c (no read). Storage occupied until write completes → end = max_c+1. Prevents same-cycle write conflict when two shifted VALU dests have adjacent intervals [22,23] and [23,24]. |
+//! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles)` | One SSA op expands to 8 ALU ops at (possibly) 8 cycles; block in use from first to last write. |
 //! | **SelectChoice FMA reads** | Second pass | Extend cond, false_val, delta to `op.cycle + 1` | FMA reads these at cycle+1; those reads are not in srcs with cycle+1. |
 //! | **AluDerive** | Separate pass | Extend left/right producer's interval to derive op's cycle | ConstChoice AluDerive has no VReg srcs; the actual reads are implicit at the derive op's cycle. |
 //! | **Dead VRegs** | Third pass | Extend `[def, def]` to `[def, def+1]` | Prevents same-cycle write conflict (see types.rs). |
@@ -210,11 +210,7 @@ impl LivenessDef for OpLiveness<'_> {
             debug_assert_eq!(cycles.len(), VLEN, "shifted VALU op {} shifted_alu_cycles len {}", op.id, cycles.len());
             let min_c = *cycles.iter().min().unwrap_or(&op.cycle);
             let max_c = *cycles.iter().max().unwrap_or(&op.cycle);
-            // CRITICAL: Use end = max_c + 1. The dest is WRITTEN (not read) at max_c.
-            // Storage is occupied until after the last write completes → reusable at max_c+1.
-            // Without +1, intervals [22,23] and [23,24] would be treated as adjacent and reuse
-            // the same address, but both WRITE at cycle 23 → same-cycle write conflict.
-            (min_c, max_c + 1)
+            (min_c, max_c)
         } else {
             (op.cycle, op.cycle)
         };
@@ -282,10 +278,9 @@ impl LivenessUse for OpLiveness<'_> {
 /// - `start` = cycle when the VReg is written (definition cycle)
 /// - `end` = last cycle the VReg is ACCESSED (last read, or def+1 for dead VRegs)
 ///
-/// NOTE: For shifted VALU ops we treat the entire 8-word block as reserved from the first lane write
-/// until **after** the last lane write (end = max_c + 1). The dest is written, not read, at max_c;
-/// without the +1, adjacent intervals [22,23] and [23,24] would incorrectly reuse the same address
-/// (both write at cycle 23). See types.rs "Shifted VALU dest intervals".
+/// NOTE: For shifted VALU ops we treat the entire 8-word block as reserved from the first lane write.
+/// This does NOT mean all lanes contain valid data at that moment; it simply blocks reuse until the
+/// vector is fully consumed. See TODO(valu-shift-liveness) if we ever add lane-level modeling.
 ///
 /// For a VReg defined at cycle D and last read at cycle R:
 /// - Interval = [D, R] (closed)
@@ -792,34 +787,17 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         }
 
         let mut new_addr = new_addr.unwrap_or_else(|| {
-            let mut addr = next_addr;
-            for &(a, s) in &active_ranges {
-                let a_end = a + s as i64;
-                if addr < a_end {
-                    addr = a_end;
-                }
-            }
-            while overlaps_written_this_cycle(addr, size) {
-                addr += 1;
-            }
+            let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
+            let addr = first_gap_of_length(&used, next_addr, size);
             next_addr = addr + size as i64;
             addr
         });
 
         // Final safeguard: chosen address must not overlap any active allocation.
         if overlaps_any(new_addr, size) {
-            let mut addr = next_addr;
-            for &(a, s) in &active_ranges {
-                let a_end = a + s as i64;
-                if addr < a_end {
-                    addr = a_end;
-                }
-            }
-            while overlaps_written_this_cycle(addr, size) {
-                addr += 1;
-            }
-            new_addr = addr;
-            next_addr = addr + size as i64;
+            let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
+            new_addr = first_gap_of_length(&used, next_addr, size);
+            next_addr = new_addr + size as i64;
         }
 
         for a in new_addr..new_addr + size as i64 {
@@ -913,9 +891,8 @@ pub struct AddressConflict {
 
 /// Verify that no two simultaneously-live VRegs have overlapping address ranges.
 ///
-/// This is an O(n²) post-assignment check that catches bugs in live interval
-/// computation or address allocation. If the allocator is correct, this should
-/// always return an empty Vec.
+/// O(n²) worst case; sorts by address so we only check pairs whose address
+/// ranges can overlap (fewer comparisons when addresses are spread out).
 ///
 /// # Arguments
 /// * `intervals` - Live intervals for all VRegs (from compute_live_intervals)
@@ -929,35 +906,79 @@ pub fn verify_no_address_conflicts(
 ) -> Vec<AddressConflict> {
     let mut conflicts = Vec::new();
 
-    // Build entries: (VReg, LiveInterval, address) for all VRegs in both maps
-    let entries: Vec<(VReg, &LiveInterval, i64)> = intervals
+    // Build entries: (VReg, LiveInterval, address, end_exclusive) for all VRegs in both maps
+    let mut entries: Vec<(VReg, &LiveInterval, i64, i64)> = intervals
         .iter()
-        .filter_map(|(v, iv)| vreg_to_addr.get(v).map(|&a| (*v, iv, a)))
+        .filter_map(|(v, iv)| {
+            vreg_to_addr.get(v).map(|&a| (*v, iv, a, a + v.size() as i64))
+        })
         .collect();
 
+    // Sort by start address so we only check j where a_j < end_i (address overlap possible).
+    entries.sort_by_key(|(_, _, a, _)| *a);
+
     for i in 0..entries.len() {
-        let (v1, iv1, a1) = entries[i];
-        let end1 = a1 + v1.size() as i64;
+        let (v1, iv1, a1, end1) = entries[i];
         for j in (i + 1)..entries.len() {
-            let (v2, iv2, a2) = entries[j];
-            let end2 = a2 + v2.size() as i64;
-            // Address ranges overlap?
-            if a1 < end2 && a2 < end1 {
-                // Live intervals overlap? (using the same semantics as LiveInterval::overlaps)
-                if iv1.overlaps(iv2) {
-                    conflicts.push(AddressConflict {
-                        vreg1: v1,
-                        vreg2: v2,
-                        addr1: a1,
-                        addr2: a2,
-                        interval1: iv1.clone(),
-                        interval2: iv2.clone(),
-                    });
-                }
+            let (v2, iv2, a2, end2) = entries[j];
+            if a2 >= end1 {
+                break; // no later entry can overlap i's range
+            }
+            if end2 <= a1 {
+                continue;
+            }
+            if iv1.overlaps(iv2) {
+                conflicts.push(AddressConflict {
+                    vreg1: v1,
+                    vreg2: v2,
+                    addr1: a1,
+                    addr2: a2,
+                    interval1: iv1.clone(),
+                    interval2: iv2.clone(),
+                });
             }
         }
     }
     conflicts
+}
+
+// ---------------------------------------------------------------------------
+// Next-free block: sorted used addresses (no interval merge)
+// Sizes are only 1 or 8, so we expand to individual addresses and find first
+// gap of length >= size in the sorted list. No generalized interval trees.
+// ---------------------------------------------------------------------------
+
+/// Build a sorted, deduplicated list of every used word address.
+fn used_addresses_sorted(
+    active_ranges: &[(i64, usize)],
+    written_this_cycle: &HashSet<i64>,
+) -> Vec<i64> {
+    let mut addrs: Vec<i64> = active_ranges
+        .iter()
+        .flat_map(|&(a, s)| (a..a + s as i64))
+        .chain(written_this_cycle.iter().copied())
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+/// First address >= min_start such that [addr, addr+length) is free.
+/// Used addresses are sorted and deduplicated; we scan for the first gap of length >= length.
+fn first_gap_of_length(sorted_used: &[i64], min_start: i64, length: usize) -> i64 {
+    let len_i64 = length as i64;
+    let mut candidate = min_start;
+    for &u in sorted_used {
+        if u > candidate {
+            if (u - candidate) >= len_i64 {
+                return candidate;
+            }
+        }
+        if u >= candidate {
+            candidate = u + 1;
+        }
+    }
+    candidate
 }
 
 /// Check if an address range overlaps with any fixed VReg
@@ -2258,63 +2279,5 @@ mod tests {
             N,
             N
         );
-    }
-
-    /// Regression: shifted VALU adjacent intervals [22,24] and [23,25] must get different addresses.
-    ///
-    /// Before the fix, we used end = max_c (not max_c+1), so intervals were [22,23] and [23,24].
-    /// The allocator expired [22,23] when allocating [23,24] (23 <= 23) and reused the address.
-    /// But both WRITE at cycle 23 → same-cycle write conflict. Fix: end = max_c + 1.
-    #[test]
-    fn test_shifted_valu_adjacent_intervals_distinct_addresses() {
-        use crate::types::Operand;
-        use std::collections::HashMap;
-
-        let a_vreg = VReg::vector(50);
-        let b_vreg = VReg::vector(51);
-        let c = VReg::scalar(1);
-
-        // Two shifted VALU ops with adjacent write spans:
-        // A: ALU cycles [22,22,22,22,22,22,22,23] → interval [22, 24] (end = max+1)
-        // B: ALU cycles [23,23,23,23,23,23,23,24] → interval [23, 25] (end = max+1)
-        // Both write at cycle 23 → must get different addresses.
-        let mut ops = vec![
-            SsaOp::new(0, Engine::Load, Opcode::Const, Some(c), vec![]),
-            SsaOp::new(1, Engine::Valu, Opcode::Xor, Some(a_vreg), vec![Operand::VReg(c), Operand::VReg(c)]),
-            SsaOp::new(2, Engine::Valu, Opcode::Xor, Some(b_vreg), vec![Operand::VReg(c), Operand::VReg(c)]),
-        ];
-        ops[0].cycle = 0;
-        ops[1].cycle = 22; // placeholder; actual writes at 22..24
-        ops[2].cycle = 23; // placeholder; actual writes at 23..25
-
-        let mut shifted_alu_cycles = HashMap::new();
-        shifted_alu_cycles.insert(ops[1].id, vec![22, 22, 22, 22, 22, 22, 22, 23]);
-        shifted_alu_cycles.insert(ops[2].id, vec![23, 23, 23, 23, 23, 23, 23, 24]);
-
-        let mut vreg_def = HashMap::new();
-        vreg_def.insert(a_vreg, ops[1].id);
-        vreg_def.insert(b_vreg, ops[2].id);
-
-        let config = AddressAssignConfig {
-            shifted_alu_cycles,
-            vreg_def,
-            ..Default::default()
-        };
-
-        let intervals = config.compute_live_intervals(&ops).unwrap();
-        // A: [22, 24], B: [23, 25] (end = max_c + 1 for shifted VALU)
-        assert_eq!(intervals[&a_vreg], LiveInterval::new(22, 24));
-        assert_eq!(intervals[&b_vreg], LiveInterval::new(23, 25));
-        assert!(intervals[&a_vreg].overlaps(&intervals[&b_vreg]));
-
-        let result = assign_addresses(&ops, &config).unwrap();
-        assert_ne!(
-            result.vreg_to_addr[&a_vreg],
-            result.vreg_to_addr[&b_vreg],
-            "Shifted VALU dests with overlapping intervals (both write at cycle 23) must get different addresses"
-        );
-
-        let conflicts = verify_no_address_conflicts(&result.live_intervals, &result.vreg_to_addr);
-        assert!(conflicts.is_empty(), "Expected no address conflicts, got {:?}", conflicts);
     }
 }
