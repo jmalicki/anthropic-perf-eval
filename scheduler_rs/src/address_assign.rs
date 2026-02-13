@@ -682,9 +682,13 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // (otherwise we'd assign the same address to both).
     let mut active: BinaryHeap<Reverse<(i32, i64, usize, bool)>> = BinaryHeap::new();
 
-    // Free ranges: list of (base_addr, size) available for reuse
-    // Use BinaryHeap with Reverse to prefer lower addresses
+    // Free ranges: (base_addr, size) available for reuse
     let mut free_ranges: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+
+    // Base addresses we've assigned to intervals that start at the current cycle (same-cycle writers).
+    // When we need an address for another interval that starts at this cycle, we must not reuse any of these.
+    let mut current_cycle: Option<i32> = None;
+    let mut addrs_written_this_cycle: HashSet<i64> = HashSet::new();
 
     // Next fresh address to allocate
     let mut next_addr = config.start_addr;
@@ -697,6 +701,12 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     }
 
     for (vreg, interval) in &sorted {
+        // When we move to a new start cycle, clear the set of addresses written this cycle.
+        if current_cycle != Some(interval.start) {
+            current_cycle = Some(interval.start);
+            addrs_written_this_cycle.clear();
+        }
+
         // Skip fixed VRegs
         if config.fixed_vregs.contains_key(vreg) {
             // Still need to track as active for correct expiry
@@ -725,7 +735,6 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             };
             if expire {
                 active.pop();
-                // Return freed range to pool (don't free fixed ranges)
                 if !is_in_fixed_range(freed_addr, freed_size, &config.fixed_vregs) {
                     free_ranges.push(Reverse((freed_addr, freed_size)));
                 }
@@ -748,11 +757,16 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             })
         };
 
-        // Try to find a free range that fits and doesn't overlap any active allocation.
+        // Try to find a free range that fits, doesn't overlap active, and wasn't already assigned
+        // to another interval that starts at this cycle (two writers at same cycle).
         let mut new_addr: Option<i64> = None;
         let mut temp_ranges: Vec<(i64, usize)> = Vec::new();
 
         while let Some(Reverse((addr, range_size))) = free_ranges.pop() {
+            if addrs_written_this_cycle.contains(&addr) {
+                temp_ranges.push((addr, range_size));
+                continue;
+            }
             if range_size >= size && !overlaps_any(addr, size) {
                 new_addr = Some(addr);
                 if range_size > size {
@@ -792,6 +806,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             next_addr = addr + size as i64;
         }
 
+        addrs_written_this_cycle.insert(new_addr);
         vreg_to_addr.insert(*vreg, new_addr);
         let point = interval.start == interval.end;
         active.push(Reverse((interval.end, new_addr, size, point)));
