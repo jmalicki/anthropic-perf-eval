@@ -67,7 +67,7 @@
 //! | Scenario | Where | Effective behavior | Reason |
 //! |----------|-------|--------------------|--------|
 //! | **SelectChoice FMA** | First pass | Dest: `def_cycle = op.cycle + 1`; sub_temp: `[op.cycle, op.cycle+1]` | FMA writes at cycle+1; sub is read by FMA at cycle+1. Not in srcs as a normal consumer. |
-//! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles)` | One SSA op expands to 8 ALU ops at (possibly) 8 cycles; block in use from first to last write. |
+//! | **Shifted VALU** | First pass | Dest: `start = min(alu_cycles)`, `end = max(alu_cycles) + 1` | One SSA op expands to 8 ALU ops; dest is WRITTEN at max_c (no read). Storage occupied until write completes → end = max_c+1. Prevents same-cycle write conflict when two shifted VALU dests have adjacent intervals [22,23] and [23,24]. |
 //! | **SelectChoice FMA reads** | Second pass | Extend cond, false_val, delta to `op.cycle + 1` | FMA reads these at cycle+1; those reads are not in srcs with cycle+1. |
 //! | **AluDerive** | Separate pass | Extend left/right producer's interval to derive op's cycle | ConstChoice AluDerive has no VReg srcs; the actual reads are implicit at the derive op's cycle. |
 //! | **Dead VRegs** | Third pass | Extend `[def, def]` to `[def, def+1]` | Prevents same-cycle write conflict (see types.rs). |
@@ -210,7 +210,11 @@ impl LivenessDef for OpLiveness<'_> {
             debug_assert_eq!(cycles.len(), VLEN, "shifted VALU op {} shifted_alu_cycles len {}", op.id, cycles.len());
             let min_c = *cycles.iter().min().unwrap_or(&op.cycle);
             let max_c = *cycles.iter().max().unwrap_or(&op.cycle);
-            (min_c, max_c)
+            // CRITICAL: Use end = max_c + 1. The dest is WRITTEN (not read) at max_c.
+            // Storage is occupied until after the last write completes → reusable at max_c+1.
+            // Without +1, intervals [22,23] and [23,24] would be treated as adjacent and reuse
+            // the same address, but both WRITE at cycle 23 → same-cycle write conflict.
+            (min_c, max_c + 1)
         } else {
             (op.cycle, op.cycle)
         };
@@ -278,9 +282,10 @@ impl LivenessUse for OpLiveness<'_> {
 /// - `start` = cycle when the VReg is written (definition cycle)
 /// - `end` = last cycle the VReg is ACCESSED (last read, or def+1 for dead VRegs)
 ///
-/// NOTE: For shifted VALU ops we treat the entire 8-word block as reserved from the first lane write.
-/// This does NOT mean all lanes contain valid data at that moment; it simply blocks reuse until the
-/// vector is fully consumed. See TODO(valu-shift-liveness) if we ever add lane-level modeling.
+/// NOTE: For shifted VALU ops we treat the entire 8-word block as reserved from the first lane write
+/// until **after** the last lane write (end = max_c + 1). The dest is written, not read, at max_c;
+/// without the +1, adjacent intervals [22,23] and [23,24] would incorrectly reuse the same address
+/// (both write at cycle 23). See types.rs "Shifted VALU dest intervals".
 ///
 /// For a VReg defined at cycle D and last read at cycle R:
 /// - Interval = [D, R] (closed)
@@ -685,8 +690,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // Free ranges: (base_addr, size) available for reuse
     let mut free_ranges: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
 
-    // Base addresses we've assigned to intervals that start at the current cycle (same-cycle writers).
-    // When we need an address for another interval that starts at this cycle, we must not reuse any of these.
+    // Scratch addresses (every word) we've assigned to intervals that start at the current cycle.
+    // When we need a range for another interval that starts at this cycle, no address in that range
+    // may be in this set (same-cycle writers must not overlap).
     let mut current_cycle: Option<i32> = None;
     let mut addrs_written_this_cycle: HashSet<i64> = HashSet::new();
 
@@ -707,12 +713,15 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             addrs_written_this_cycle.clear();
         }
 
-        // Skip fixed VRegs
+        // Fixed VRegs: track as active and add their range to same-cycle set so we don't assign that range to another writer at this cycle.
         if config.fixed_vregs.contains_key(vreg) {
-            // Still need to track as active for correct expiry
             let addr = config.fixed_vregs[vreg];
+            let size = vreg.size();
+            for a in addr..addr + size as i64 {
+                addrs_written_this_cycle.insert(a);
+            }
             let point = interval.start == interval.end;
-            active.push(Reverse((interval.end, addr, vreg.size(), point)));
+            active.push(Reverse((interval.end, addr, size, point)));
             continue;
         }
 
@@ -757,17 +766,18 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             })
         };
 
-        // Try to find a free range that fits, doesn't overlap active, and wasn't already assigned
-        // to another interval that starts at this cycle (two writers at same cycle).
+        // True if any address in [addr, addr+len) is in addrs_written_this_cycle.
+        let overlaps_written_this_cycle = |addr: i64, len: usize| {
+            (addr..addr + len as i64).any(|a| addrs_written_this_cycle.contains(&a))
+        };
+
+        // Try to find a free range that fits, doesn't overlap active, and doesn't overlap any
+        // range already assigned this cycle (two writers at same cycle).
         let mut new_addr: Option<i64> = None;
         let mut temp_ranges: Vec<(i64, usize)> = Vec::new();
 
         while let Some(Reverse((addr, range_size))) = free_ranges.pop() {
-            if addrs_written_this_cycle.contains(&addr) {
-                temp_ranges.push((addr, range_size));
-                continue;
-            }
-            if range_size >= size && !overlaps_any(addr, size) {
+            if range_size >= size && !overlaps_any(addr, size) && !overlaps_written_this_cycle(addr, size) {
                 new_addr = Some(addr);
                 if range_size > size {
                     temp_ranges.push((addr + size as i64, range_size - size));
@@ -789,6 +799,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
                     addr = a_end;
                 }
             }
+            while overlaps_written_this_cycle(addr, size) {
+                addr += 1;
+            }
             next_addr = addr + size as i64;
             addr
         });
@@ -802,11 +815,16 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
                     addr = a_end;
                 }
             }
+            while overlaps_written_this_cycle(addr, size) {
+                addr += 1;
+            }
             new_addr = addr;
             next_addr = addr + size as i64;
         }
 
-        addrs_written_this_cycle.insert(new_addr);
+        for a in new_addr..new_addr + size as i64 {
+            addrs_written_this_cycle.insert(a);
+        }
         vreg_to_addr.insert(*vreg, new_addr);
         let point = interval.start == interval.end;
         active.push(Reverse((interval.end, new_addr, size, point)));
@@ -1890,6 +1908,46 @@ mod tests {
     }
 
     #[test]
+    fn test_same_cycle_vector_and_scalar_ranges_non_overlapping() {
+        // Two VRegs written at the SAME cycle where one is a vector (8 words) and one is a scalar (1 word).
+        // Their assigned ranges must not overlap (the bug was tracking only base address, so the scalar
+        // could get an address inside the vector's block).
+        let mut emit = SsaEmitContext::new();
+        let s = emit.emit_const(0);
+        let v = emit.emit_vbroadcast(s); // vector 8 words
+        emit.ops[0].cycle = 5;
+        emit.ops[1].cycle = 5; // s and v both written at cycle 5
+        let config = AddressAssignConfig::default();
+        let result = assign_addresses(&emit.ops, &config).unwrap();
+        let s_addr = result.vreg_to_addr[&s];
+        let v_addr = result.vreg_to_addr[&v];
+        let v_end = v_addr + 8;
+        assert!(
+            s_addr + 1 <= v_addr || s_addr >= v_end,
+            "Scalar (addr {}) must not overlap vector [{}, {}); same-cycle writers",
+            s_addr, v_addr, v_end
+        );
+    }
+
+    #[test]
+    fn test_fixed_vreg_same_cycle_other_gets_different_address() {
+        // Fixed VReg (e.g. zero at 0) and another VReg both written at cycle 0.
+        // The allocator must not assign address 0 (or any in the fixed range) to the other.
+        let mut emit = SsaEmitContext::new();
+        let zero = emit.emit_const(0);
+        let a = emit.emit_const(1);
+        emit.ops[0].cycle = 0;
+        emit.ops[1].cycle = 0;
+        let mut config = AddressAssignConfig::default();
+        config.fixed_vregs.insert(zero, 0);
+        config.zero_vreg = Some(zero);
+        let result = assign_addresses(&emit.ops, &config).unwrap();
+        assert_eq!(result.vreg_to_addr[&zero], 0);
+        let a_addr = result.vreg_to_addr[&a];
+        assert!(a_addr >= 1, "VReg written at same cycle as fixed zero must not get address 0 (got {})", a_addr);
+    }
+
+    #[test]
     fn test_sequential_reuse_vectors() {
         // Test sequential reuse with vectors (8 words each).
         // When VReg A's interval ends BEFORE VReg B's interval starts,
@@ -2200,5 +2258,63 @@ mod tests {
             N,
             N
         );
+    }
+
+    /// Regression: shifted VALU adjacent intervals [22,24] and [23,25] must get different addresses.
+    ///
+    /// Before the fix, we used end = max_c (not max_c+1), so intervals were [22,23] and [23,24].
+    /// The allocator expired [22,23] when allocating [23,24] (23 <= 23) and reused the address.
+    /// But both WRITE at cycle 23 → same-cycle write conflict. Fix: end = max_c + 1.
+    #[test]
+    fn test_shifted_valu_adjacent_intervals_distinct_addresses() {
+        use crate::types::Operand;
+        use std::collections::HashMap;
+
+        let a_vreg = VReg::vector(50);
+        let b_vreg = VReg::vector(51);
+        let c = VReg::scalar(1);
+
+        // Two shifted VALU ops with adjacent write spans:
+        // A: ALU cycles [22,22,22,22,22,22,22,23] → interval [22, 24] (end = max+1)
+        // B: ALU cycles [23,23,23,23,23,23,23,24] → interval [23, 25] (end = max+1)
+        // Both write at cycle 23 → must get different addresses.
+        let mut ops = vec![
+            SsaOp::new(0, Engine::Load, Opcode::Const, Some(c), vec![]),
+            SsaOp::new(1, Engine::Valu, Opcode::Xor, Some(a_vreg), vec![Operand::VReg(c), Operand::VReg(c)]),
+            SsaOp::new(2, Engine::Valu, Opcode::Xor, Some(b_vreg), vec![Operand::VReg(c), Operand::VReg(c)]),
+        ];
+        ops[0].cycle = 0;
+        ops[1].cycle = 22; // placeholder; actual writes at 22..24
+        ops[2].cycle = 23; // placeholder; actual writes at 23..25
+
+        let mut shifted_alu_cycles = HashMap::new();
+        shifted_alu_cycles.insert(ops[1].id, vec![22, 22, 22, 22, 22, 22, 22, 23]);
+        shifted_alu_cycles.insert(ops[2].id, vec![23, 23, 23, 23, 23, 23, 23, 24]);
+
+        let mut vreg_def = HashMap::new();
+        vreg_def.insert(a_vreg, ops[1].id);
+        vreg_def.insert(b_vreg, ops[2].id);
+
+        let config = AddressAssignConfig {
+            shifted_alu_cycles,
+            vreg_def,
+            ..Default::default()
+        };
+
+        let intervals = config.compute_live_intervals(&ops).unwrap();
+        // A: [22, 24], B: [23, 25] (end = max_c + 1 for shifted VALU)
+        assert_eq!(intervals[&a_vreg], LiveInterval::new(22, 24));
+        assert_eq!(intervals[&b_vreg], LiveInterval::new(23, 25));
+        assert!(intervals[&a_vreg].overlaps(&intervals[&b_vreg]));
+
+        let result = assign_addresses(&ops, &config).unwrap();
+        assert_ne!(
+            result.vreg_to_addr[&a_vreg],
+            result.vreg_to_addr[&b_vreg],
+            "Shifted VALU dests with overlapping intervals (both write at cycle 23) must get different addresses"
+        );
+
+        let conflicts = verify_no_address_conflicts(&result.live_intervals, &result.vreg_to_addr);
+        assert!(conflicts.is_empty(), "Expected no address conflicts, got {:?}", conflicts);
     }
 }
