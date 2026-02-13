@@ -365,6 +365,8 @@ fn min_valu_from_select_cse(z: i64, group_sizes: &[usize]) -> i64 {
 ///
 /// For each (x,y,z), computes max(ceil(VALU/6), ceil(ALU/12), ceil(Load/2), Flow, ceil(Store/2))
 /// then returns the minimum over all (x,y,z), capped below by critical_path_len.
+/// When critical_path_len is 0 (as in the CP-SAT model), the result never overestimates the true
+/// minimum makespan: any feasible schedule has makespan ≥ this value.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_capacity_lower_bound_global(
     valu_count: i64,

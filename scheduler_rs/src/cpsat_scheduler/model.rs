@@ -2458,11 +2458,12 @@ pub fn schedule_ssa_cpsat(
     let select_choice_count = select_choice_ops.len() as i64;
     let flow_base = ops.iter().filter(|op| op.engine == Engine::Flow).count() as i64;
 
-    // Use 0 for dependency floor: critical_path_len (max ASAP + 1) assumes +1 per edge, but the model
-    // uses variable-length steps (completion_cycle for shifted, +2 for SelectChoice FMA), so it can
-    // overestimate. The capacity-derived minimum over (x,y,z) is a valid lower bound; precedence
-    // constraints in the model enforce any dependency lower bound, so the solver cannot find
-    // makespan below the true minimum.
+    // Dependency floor = 0 on purpose: critical_path_len (max ASAP + 1) assumes +1 per edge, but the
+    // model uses variable-length steps (completion_cycle for shifted VALU, +2 for SelectChoice FMA),
+    // so critical_path_len can overestimate. If we used it as the makespan domain LB we would
+    // exclude feasible solutions (make them infeasible). The capacity-derived minimum over (x,y,z) is
+    // a valid lower bound; precedence constraints enforce the true dependency lower bound, so the
+    // solver cannot find makespan below the actual minimum.
     let cap_result = compute_capacity_lower_bound_global(
         valu_count,
         alu_count,
@@ -2515,9 +2516,10 @@ pub fn schedule_ssa_cpsat(
     // 10. Create makespan and max_cycle variables; tie makespan to actual last cycle so CP-SAT minimizes it.
     // max_cycle = max over all cycle_vars, completion_cycle_vars, select_choice_fma_last_cycle.
     // makespan = max_cycle + 1 (so minimizing makespan forces packing).
-    // capacity_lower_bound is a valid lower bound (capacity-derived min over choices); we pass 0 for
-    // the dependency floor in compute_capacity_lower_bound_global so it is not inflated by ASAP-based
-    // critical path, which overestimates when the model uses variable-length steps.
+    // capacity_lower_bound is a valid lower bound (min over (x,y,z) of per-choice capacity bound),
+    // so it never overestimates the true minimum and does not exclude feasible makespans. We pass 0
+    // for the dependency floor so the domain is not inflated by ASAP-based critical path (that
+    // would overestimate and incorrectly exclude feasible solutions).
     let max_cycle_lb = (capacity_lower_bound - 1).max(0);
     let max_cycle =
         model.new_int_var_with_name([(max_cycle_lb, (horizon - 1) as i64)], "max_cycle".to_string());
@@ -2544,7 +2546,7 @@ pub fn schedule_ssa_cpsat(
     // bounds for one extreme (all shift / no shift) and would over-constrain when the solver picks a different choice
     // (e.g. shift 163 only → ALU need 121 cycles, but "all shift" bound would force makespan >= 609).
     // Load and store bounds are valid global mins (min over const_choice for load; store is fixed).
-    // Optional group RedundantLinearBounds: helps propagation but not required (cumulatives + domain suffice).
+    // Optional group RedundantLinearBounds: redundant with makespan domain (T15; propagation-only).
     if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::RedundantLinearBounds) {
         if load_bound > 0 {
             let load_lb = model.new_int_var([(load_bound, load_bound)]);
@@ -2594,9 +2596,11 @@ pub fn schedule_ssa_cpsat(
         let z = sum_select_fma.unwrap_or_else(|| LinearExpr::from(zero_var));
         let y = sum_const_add_imm.unwrap_or_else(|| LinearExpr::from(zero_var));
 
-        // Direct capacity linear constraints: optional groups per engine (help propagation; cumulatives enforce the real limits).
-        // VALU: with CSE groups, SelectChoice FMA contributes (1 SUB per active group) + (1 FMA per consumer); without CSE, 2 per FMA.
-        // So 6*makespan >= valu_count - sum(shift) + select_valu_contrib.
+        // Direct capacity linear constraints: optional groups per engine. Redundancy is PROVEN in
+        // LIVENESS_SPECIFICATION.md T15: cumulative implies these inequalities (proof uses T14).
+        // So every solution feasible without them is feasible with them; propagation-only.
+        // Formulas must match the cumulative: VALU ops = valu_count - s + select_valu_contrib (s = number shifted to ALU);
+        // ALU ops = alu_count + 8*(shiftable_count - s). So 6*makespan >= VALU_ops and 12*makespan >= ALU_ops.
         if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityValu)
             && enable_valu_shift
             && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0)
@@ -2626,18 +2630,20 @@ pub fn schedule_ssa_cpsat(
             } else {
                 z.clone() * 2
             };
+            // 6*makespan >= valu_count - s + select_valu_contrib (s = number shifted to ALU; redundant with cumul_valu per T15)
             let lhs = LinearExpr::from(makespan) * 6 + s.clone() - select_valu_contrib;
             let rhs = model.new_int_var([(valu_count, valu_count)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_valu");
         }
-        // ALU: 12*makespan >= alu_count + 8*sum(shift)  =>  12*makespan - 8*s >= alu_count
+        // ALU: 12*makespan >= alu_count + 8*(shiftable_count - s)  =>  12*makespan + 8*s >= alu_count + 8*shiftable_count (s = number shifted to ALU; redundant with cumul_alu per T15)
         if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityAlu)
             && enable_valu_shift
             && (alu_count > 0 || shiftable_count > 0)
         {
-            let lhs = LinearExpr::from(makespan) * 12 - s.clone() * 8;
-            let rhs = model.new_int_var([(alu_count, alu_count)]);
+            let alu_ops_lb = alu_count + 8 * shiftable_count;
+            let lhs = LinearExpr::from(makespan) * 12 + s.clone() * 8;
+            let rhs = model.new_int_var([(alu_ops_lb, alu_ops_lb)]);
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_alu");
         }
@@ -2714,6 +2720,8 @@ pub fn schedule_ssa_cpsat(
 
     // makespan = max_cycle + 1 and max_cycle >= every cycle var already force all work into [0, max_cycle];
     // no need for explicit cycle <= makespan-1.
+    // We do NOT add makespan >= critical_path_len: dependency is enforced only by precedence
+    // (consumer_cycle >= producer_completion + offset), so the true dependency bound is implied and does not overestimate.
 
     // CANONICAL DESCRIPTION (docs should reference this block, not duplicate the formula):
     // Minimize makespan; when equal, minimize sum of effective completion cycles (tie-breaker).
@@ -3686,7 +3694,7 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
                 if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
-                    let s = shifted_ops.len() as i64;
+                    let s = shifted_ops.len() as i64; // number shifted to ALU (model s = sum(shift_vars))
                     let z = select_fma_ops.len() as i64;
                     let select_valu_contrib_solution: i64 = if !cse_group_results.is_empty() {
                         let num_active = cse_group_results.iter().filter(|r| r.sub_active).count() as i64;
@@ -3704,12 +3712,13 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
                 if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
-                    let s = shifted_ops.len() as i64;
-                    let lhs_alu = 12 * (actual_makespan as i64) - 8 * s;
-                    let binding_alu = lhs_alu == alu_count;
+                    let s = shifted_ops.len() as i64; // number shifted to ALU (same s as in model)
+                    let alu_ops_lb = alu_count + 8 * shiftable_count;
+                    let lhs_alu = 12 * (actual_makespan as i64) + 8 * s;
+                    let binding_alu = lhs_alu == alu_ops_lb;
                     if binding_alu {
                         eprintln!(
-                            "    Direct ALU (12*makespan - 8*shift >= alu_count): binding (LHS={})",
+                            "    Direct ALU (12*makespan + 8*shift >= alu_count + 8*shiftable_count): binding (LHS={})",
                             lhs_alu
                         );
                     }
