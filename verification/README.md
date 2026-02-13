@@ -27,6 +27,7 @@ Options:
 - **T2** — Overlap definition: `overlaps([s1,e1],[s2,e2]) iff e1>s2 and e2>s1`
 - **T3** — ASAP bounds: `cycle(succ) >= cycle(pred) + offset` (from A3)
 - **T4** — ALAP bounds: `cycle(pred) <= cycle(succ) - offset` (from A3)
+- **T5** — Cycle domain: `ASAP(op) <= cycle(op) <= ALAP(op)` is sound (2-node chain model)
 - **T6** — Half-open conversion: `end_halfopen = end_closed + 1`
 - **T9** — Expiration implies no overlap
 - **T10** — Dead shifted VALU dest: `end(v) = max_cycle(v) + 1`

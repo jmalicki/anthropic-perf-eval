@@ -105,6 +105,28 @@ def check_t4_alap_bounds(ctx=None) -> tuple[str, str, float, dict]:
     return ("T4", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
 
 
+def check_t5_cycle_domain(ctx=None) -> tuple[str, str, float, dict]:
+    """T5: Cycle domain. ASAP(op) <= cycle(op) <= ALAP(op) is sound (contains all feasible cycles).
+    Model: 2-node chain pred->succ, offset=1, makespan K. Fixpoint: ASAP_pred=0, ALAP_pred=K-1,
+    ASAP_succ=1, ALAP_succ=K. Feasible: precedence and makespan. Negation: feasible schedule
+    but cycle_pred < ASAP_pred or cycle_pred > ALAP_pred or cycle_succ < ASAP_succ or cycle_succ > ALAP_succ."""
+    K = 10  # makespan bound
+    cycle_pred, cycle_succ = Ints("cycle_pred cycle_succ")
+    precedence = cycle_succ >= cycle_pred + 1
+    makespan = cycle_succ <= K
+    nonneg = And(cycle_pred >= 0, cycle_succ >= 0)
+    feasible = And(precedence, makespan, nonneg)
+    # ASAP_pred=0, ALAP_pred=K-1, ASAP_succ=1, ALAP_succ=K
+    violates_pred = Or(cycle_pred < 0, cycle_pred > K - 1)
+    violates_succ = Or(cycle_succ < 1, cycle_succ > K)
+    negated = And(feasible, Or(violates_pred, violates_succ))
+    solver = Solver(ctx=ctx)
+    solver.add(negated)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return ("T5", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
+
+
 def check_t6_half_open_conversion(ctx=None) -> tuple[str, str, float, dict]:
     """T6: Half-open conversion. end_halfopen = end_closed + 1.
     For integer t: t in closed [s,e] (s<=t<=e) iff t in half-open [s,e+1) (s<=t<e+1).
