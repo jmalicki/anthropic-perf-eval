@@ -1,21 +1,47 @@
 ---
 name: use-trace-ids
-description: Use trace_input/trace_output debug ops with --enable-trace-ids to capture semantic trace data and pinpoint where validation failures occur. Use when you need to see exact values flowing through the kernel at specific points (e.g., hash inputs/outputs, tree selection results).
+description: Use trace_input/trace_output debug ops with --enable-trace-ids to capture semantic trace data. The main use is to build both a passing and a failing kernel (e.g. different solver options) with trace support, run both on the same input, and compare their trace_io_logs to find the first divergence. Also use to compare one kernel's trace to the reference.
 ---
 
 # Using Trace IDs for Semantic Debugging
 
 Trace IDs enable **semantic debugging** by instrumenting the kernel with `trace_input` and `trace_output` debug ops that capture values at specific points in execution. Unlike execution traces that show all scratch writes, trace IDs let you mark **semantic points** (e.g., "round 0 group 0 hashed_val output") and see exactly what values flow through those points.
 
+**Primary use:** Build **both** a passing and a failing kernel (e.g. default vs zero-gap, or different solver options) **with trace support** (`--enable-trace-ids`), run **both** on the **same input** with `enable_debug=True`, and **compare their two `trace_io_log`s** to find the **first** (cycle, trace_id, lane) where the values diverge. That tells you exactly which semantic point and round/group first differs between the two compiler/solver outcomes.
+
 Use trace IDs when:
+- You have **two kernels** (e.g. one that validates, one that fails) and want to see **where their behavior first diverges** (good vs bad options, same input, compare traces)
 - You need to see **exact values** at semantic boundaries (e.g., hash outputs per round/group)
 - You want to **compare optimized vs reference** at specific computation points
 - You've localized a failure to a specific round/depth but need to see **where values diverge**
-- You want to verify that **intermediate computations** are correct even if final output is wrong
 
 ---
 
-## 1. Generate kernel with trace IDs enabled
+## 1. Good vs bad: build both with trace IDs and find first divergence
+
+**Goal:** Find the first trace point where a passing kernel and a failing kernel (different options, same problem size) produce different values on the same input.
+
+1. **Build passing kernel with trace IDs:** e.g. default options, no zero-gap.
+   ```bash
+   uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --enable-trace-ids \
+     --validate --save-kernel kernel_pass_trace.json
+   ```
+
+2. **Build failing kernel with trace IDs:** same rounds/batch-size, different options (e.g. `--force-zero-gap`).
+   ```bash
+   uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --force-zero-gap \
+     --enable-trace-ids --cpsat-time-limit 600 --save-kernel kernel_fail_trace.json
+   ```
+
+3. **Run both on the same input** with `enable_debug=True`, capture `trace_io_log` for each.
+
+4. **Compare the two logs:** Walk both logs in order (by cycle, then trace_id). The **first** entry where `(trace_id, values)` differs between the two runs is the first divergence. That (cycle, trace_id, lane) pins the bug to a specific semantic point (e.g. round 0 group 0 hashed_val).
+
+Use the same seed and mem image for both runs so the only difference is the kernel. Optionally compare to the reference as well (see section 4) to see whether the passing trace matches the reference and the failing trace diverges at that same point.
+
+---
+
+## 2. Generate a kernel with trace IDs enabled
 
 **Flag:** `--enable-trace-ids`
 
@@ -32,7 +58,7 @@ uv run generate_ssa_kernel.py --rounds 4 --batch-size 8 --tree-reduce-max-depth 
 
 ---
 
-## 2. Run kernel and capture trace data
+## 3. Run kernel and capture trace data
 
 Run the kernel with `enable_debug=True` to populate `trace_io_log`:
 
@@ -81,7 +107,7 @@ if hasattr(machine, 'trace_io_log') and machine.trace_io_log:
 
 ---
 
-## 3. Compare trace outputs to reference
+## 4. Compare trace outputs to reference
 
 Compare trace outputs to reference kernel to find where values diverge:
 
@@ -118,7 +144,7 @@ for cycle, io_type, trace_id, values in machine.trace_io_log:
 
 ---
 
-## 4. Analyze trace inputs to find divergence point
+## 5. Analyze trace inputs to find divergence point
 
 Trace inputs show what values **enter** a computation. Compare to previous round's outputs:
 
@@ -148,7 +174,7 @@ for cycle, io_type, trace_id, values in machine.trace_io_log:
 
 ---
 
-## 5. Pinpoint root cause from trace patterns
+## 6. Pinpoint root cause from trace patterns
 
 **Pattern analysis:**
 
@@ -165,7 +191,7 @@ for cycle, io_type, trace_id, values in machine.trace_io_log:
 
 ---
 
-## 6. Adding new trace points
+## 7. Adding new trace points
 
 To add trace IDs for other semantic points (e.g., tree selection outputs, branch offsets):
 
@@ -189,11 +215,12 @@ let v_nv = self.select_2way_with_delta(cond, v_td_1, v_tc2);
 
 | Step | Command/Script | Purpose |
 |------|----------------|---------|
+| **Good vs bad (primary)** | Build both kernels with `--enable-trace-ids`, run both, diff `trace_io_log` | Find first (cycle, trace_id) where passing and failing diverge |
 | Generate with trace IDs | `--enable-trace-ids` | Add semantic trace points |
 | Run kernel | Python script with `enable_debug=True` | Capture `trace_io_log` |
-| Compare outputs | Compare trace outputs to reference | Find which rounds/lanes are wrong |
+| Compare outputs | Compare trace outputs to reference (or good vs bad) | Find which rounds/lanes are wrong |
 | Compare inputs | Compare trace inputs to prev round | Find where values diverge |
-| Analyze pattern | Pattern analysis (see section 5) | Pinpoint root cause |
+| Analyze pattern | Pattern analysis (see section 6) | Pinpoint root cause |
 
 ---
 
@@ -219,10 +246,10 @@ from copy import copy
 from problem import Machine, Tree, Input, build_mem_image, DebugInfo, N_CORES, reference_kernel2
 
 # Load kernel, build mem, run optimized
-# ... (see section 2)
+# ... (see section 3)
 
 # Run reference, compare
-# ... (see section 3)
+# ... (see section 4)
 EOF
 ```
 
