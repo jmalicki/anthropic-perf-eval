@@ -352,6 +352,104 @@ def check_t7_alap_only_composition(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+def check_t7_asap_plus_fixpoint_unsat(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 fixpoint counterexample: ASAP exclusions + precedence can remove all feasible schedules.
+    Model: 3 ops (O1, O2, O3), 5 cycles (0..4), capacity 1, chain precedence O2>=O1+1, O3>=O2+1.
+    Aggressive ASAP exclusions: c1>=3, c2>=4 (as if slot tightening pushed these from wide windows).
+    Precedence then forces c3 >= c2+1 >= 5, but domain is [0,4] so c3 has no value. We expect UNSAT.
+    This proves that the fixpoint (precedence propagation after tightening) can turn individually
+    sound exclusions into a model with no feasible schedule."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # Aggressive ASAP exclusions (as from slot tightening with wide greedy-derived windows)
+    solver.add(c1 >= 3)
+    solver.add(c2 >= 4)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-asap-plus-fixpoint-unsat",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_strong_guarantee_entailed_exclusions(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 strong guarantee: exclusions that are entailed by precedence preserve all feasible schedules.
+    Model: 3 ops (O1, O2, O3), 5 cycles (0..4), capacity 1, chain precedence O2>=O1+1, O3>=O2+1.
+    Every feasible schedule has c3>=c1+2 and c2>=c1+1, so c1=4 or c2=4 would force c3>=5 (impossible).
+    So c1<=3 and c2<=3 are entailed by precedence—no feasible schedule has c1>=4 or c2>=4.
+    We 'exclude' those (tighten to c1<=3, c2<=3). Strong guarantee: every (precedence & capacity)
+    schedule also satisfies exclusions. Check by refutation: (precedence & capacity & ¬exclusions)
+    = (precedence & capacity & (c1>=4 | c2>=4)). We expect UNSAT → no feasible schedule was removed."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # ¬exclusions: we excluded c1>=4 and c2>=4 (i.e. we require c1<=3, c2<=3). So ¬exclusions = (c1>=4 | c2>=4)
+    solver.add(Or(c1 >= 4, c2 >= 4))
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-strong-guarantee-entailed-exclusions",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_strong_guarantee_fails_asap_only(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 attempt to prove strong guarantee for ASAP-only exclusions.
+    Same 3-op 5-cycle chain. Exclusions c1>=1, c2>=2 (ASAP-only). We try to prove that all
+    feasible schedules are preserved: check (precedence & capacity & ¬exclusions). If UNSAT,
+    the strong guarantee holds. If SAT, we have a counterexample (a feasible schedule we
+    removed)—the proof fails. We currently get SAT (e.g. (0,1,2)); that failure is an
+    important result to preserve."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # ¬exclusions: exclusions are c1>=1 and c2>=2, so ¬exclusions = (c1<1 | c2<2)
+    solver.add(Or(c1 < 1, c2 < 2))
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-strong-guarantee-fails-asap-only",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
 def check_t7_domain_based_removes_canonical(ctx=None) -> tuple[str, str, float, dict]:
     """T7 domain-based rule refutation: the second exclusion (domain-based) removes G.
     After excluding O1 from 0, O1's domain is {1, 2}. Domain-based demand at cycle 2

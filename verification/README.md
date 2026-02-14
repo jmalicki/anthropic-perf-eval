@@ -2,6 +2,24 @@
 
 Z3-based formal verification of [docs/LIVENESS_SPECIFICATION.md](../docs/LIVENESS_SPECIFICATION.md).
 
+## Z3 vs CP-SAT: two notions of feasibility
+
+We use Z3 to reason about **CP-SAT feasibility** (does a feasible schedule exist?). The meaning of Z3's result depends on how we encode the check—it's easy to confuse them.
+
+**Unified framing (soundness proofs):** In most of our Z3 checks we encode a **violation** of the theorem we want to prove (a counterexample). Then:
+- **Z3 SAT** = Z3 found an assignment that violates our theorems = **bad**.
+- **Z3 UNSAT** = no variable assignment violates our theorems = our theorems hold = **good**.
+
+Example: T7 one-step. We encode the negation ("tightening holds AND feasible with O at t"). If that were satisfiable (SAT), we'd have a counterexample. We get **UNSAT** → no counterexample → theorem holds (good).
+
+**What we want to preserve (strong statement):** We want tightening to preserve that **all** previously feasible schedules are still feasible—i.e. we only ever exclude (O,t) that no feasible schedule uses, so no feasible schedule is removed. That is strictly stronger than "at least one feasible schedule remains." **We have a Z3 proof of the strong guarantee when exclusions are entailed by precedence** (T7-strong-guarantee-entailed-exclusions): we check (precedence ∧ capacity ∧ ¬exclusions); UNSAT means no feasible schedule was removed. The one-step lemma proves it for a single exclusion; T7-two-step shows general composition can fail; witness checks show "at least one exists."
+
+**CP-SAT feasibility (scheduler):** **Infeasible** = no feasible schedule = **bad**. The strong property above implies at least one feasible schedule exists; the converse is false.
+
+**Preservation checks (e.g. T7-asap-only-composition):** We do **not** encode a violation; we ask "does a feasible schedule exist?" by giving Z3 the constraints (precedence + capacity + exclusions) and asking for a **witness**. **Z3 SAT** = witness found = at least one feasible schedule exists = a necessary condition for the strong property = **good**. **Z3 UNSAT** = no witness = we removed all feasible schedules = we violated the strong property = **bad**. So the witness is a **necessary** check: if we get UNSAT, we've definitely broken the strong guarantee. Finding one witness does **not** prove the strong guarantee (all previously feasible still feasible); it only shows that not everything was removed.
+
+So: in **soundness** proofs we encode violations and want **Z3 UNSAT**. In **preservation** checks we ask for a witness and want **Z3 SAT**; that only confirms "at least one exists." Our aim is to use Z3 to show that our tightening procedures preserve the **strong** property (all previously feasible schedules still feasible). See also [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) and [CLAUDE.md](../CLAUDE.md) § Verification (Z3).
+
 ## Setup
 
 ```bash
@@ -50,6 +68,9 @@ Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVE
 | T7-one-exclusion-alap | One ALAP exclusion preserves feasibility | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-asap-only-composition | ASAP-only composition (safe-composition candidate) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-alap-only-composition | ALAP-only composition (safe-composition candidate) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-asap-plus-fixpoint-unsat | ASAP exclusions + precedence can remove all feasible schedules (fixpoint counterexample) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-strong-guarantee-entailed-exclusions | **Strong guarantee:** exclusions entailed by precedence preserve all feasible schedules (Z3 UNSAT) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-strong-guarantee-fails-asap-only | Attempt to prove strong guarantee for ASAP-only; fails (SAT = counterexample); important result preserved | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-greedy-cap-preserves-G | **Greedy-cap rule:** canonical schedule G remains feasible (Z3-proven safe rule) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-domain-based-removes-G | Domain-based rule refutation: second exclusion removes canonical G | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T8 | Scratch-aware tightening: one-step lemma | [#t8](../docs/LIVENESS_SPECIFICATION.md#t8) |

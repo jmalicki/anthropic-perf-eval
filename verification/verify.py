@@ -24,6 +24,9 @@ from .theorems import (
     check_t7_one_exclusion_preserves_feasibility_alap,
     check_t7_asap_only_composition,
     check_t7_alap_only_composition,
+    check_t7_asap_plus_fixpoint_unsat,
+    check_t7_strong_guarantee_entailed_exclusions,
+    check_t7_strong_guarantee_fails_asap_only,
     check_t7_greedy_cap_preserves_canonical,
     check_t7_domain_based_removes_canonical,
     check_t8_scratch_tightening_one_step,
@@ -68,6 +71,21 @@ THEOREM_CHECKS = [
         "T7-alap-only-composition",
         "ALAP-only composition (safe-composition candidate: multiple ALAP exclusions)",
         check_t7_alap_only_composition,
+    ),
+    (
+        "T7-asap-plus-fixpoint-unsat",
+        "ASAP exclusions + precedence can remove all feasible schedules (fixpoint counterexample)",
+        check_t7_asap_plus_fixpoint_unsat,
+    ),
+    (
+        "T7-strong-guarantee-entailed-exclusions",
+        "Strong guarantee: exclusions entailed by precedence preserve all feasible schedules",
+        check_t7_strong_guarantee_entailed_exclusions,
+    ),
+    (
+        "T7-strong-guarantee-fails-asap-only",
+        "Attempt to prove strong guarantee for ASAP-only; fails (SAT = counterexample); result preserved",
+        check_t7_strong_guarantee_fails_asap_only,
     ),
     (
         "T7-greedy-cap-preserves-G",
@@ -133,6 +151,7 @@ def run_verification(
             "T7-one-exclusion-alap",
             "T7-asap-only-composition",
             "T7-alap-only-composition",
+            "T7-strong-guarantee-fails-asap-only",
             "T7-greedy-cap-preserves-G",
         )
         passed = (result_str == "sat") if expect_sat else (result_str == "unsat")
