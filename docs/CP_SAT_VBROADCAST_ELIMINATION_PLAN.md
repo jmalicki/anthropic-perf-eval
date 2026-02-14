@@ -134,7 +134,7 @@ The CP-SAT model minimizes **makespan** with a **tie-breaker**; see the **canoni
 | **Model** | Vbroadcast/scalar analysis; eliminate_vb vars and AND constraints; optional vb intervals; conditional precedence (section 5 + ALU block). |
 | **Result** | Add `eliminated_vbroadcast_ops: HashSet<usize>`; extract from solution. |
 | **Lowering** | Omit eliminated vb; rewrite deps to scalar for shifted consumers of eliminated vb. |
-| **Config** | `enable_vbroadcast_elimination: bool` (default true when `enable_valu_shift`). |
+| **Config** | `enable_vbroadcast_elimination: bool` (default **false**; opt-in via `--enable-eliminate-vbroadcast`. Known buggy: scalar liveness not extended when shifted ALU reads it, can cause wrong results. For experimenting only.). |
 | **Hints** | `eliminate_vbroadcast_hints: Option<&'a HashSet<usize>>`; apply to eliminate_vb vars; derive from greedy when available. |
 | **Tiebreaker** | No change; existing `sum_completion` already rewards vbroadcast elimination (earlier consumer cycles). Use hints to steer when many equivalent options exist. |
 | **JSON** | Write `eliminated_vbroadcast_ops` in scheduler output JSON. |
