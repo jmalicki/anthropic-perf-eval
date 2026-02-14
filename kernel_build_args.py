@@ -62,6 +62,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Enable VALU->ALU shifting (default: True)")
     group.add_argument("--no-valu-shift", action="store_false", dest="enable_valu_shift",
                        help="Disable VALU->ALU shifting")
+    group.add_argument("--no-eliminate-vbroadcast", action="store_true", dest="no_eliminate_vbroadcast",
+                       default=False,
+                       help="Disable vbroadcast elimination: always emit vbroadcast, shifted ALU ops read vector (default: elimination enabled when VALU shift enabled)")
     group.add_argument("--tree-reduce-max-depth", type=int, default=3, metavar="N",
                        help="Max tree depth for tree-reduce (2..4, default: 3)")
     group.add_argument("--const-choice", choices=["optimize", "add_imm", "load"], default="optimize",
@@ -185,6 +188,7 @@ def args_to_build_kwargs(
         "enable_cse_groups": not get("no_cse_groups", False),
         "enable_trace_ids": get("enable_trace_ids", False),
         "enable_bulk_move": get("enable_bulk_move", False),
+        "enable_vbroadcast_elimination": not get("no_eliminate_vbroadcast", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -217,6 +221,7 @@ def args_to_build_kwargs(
         "enable_trace_ids": get("enable_trace_ids", False),
         "verify_same_cycle_scratch": get("verify_same_cycle_scratch", True),
         "enable_bulk_move": get("enable_bulk_move", False),
+        "enable_vbroadcast_elimination": False if get("no_eliminate_vbroadcast", False) else None,
     }
 
 
