@@ -75,6 +75,7 @@ impl Pass for ComputeBoundsPass {
                     machine.flow_slots as i64,
                     false, // verbose
                     Some(&shiftable_set),
+                    None, // no greedy cycles in pipeline bounds pass
                 )
             {
                 current_asap = slot_asap;

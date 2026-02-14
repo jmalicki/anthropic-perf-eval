@@ -811,6 +811,10 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 /// - **Flow**: exclude `SelectChoice` (may use FMA/VALU instead of vselect/Flow).
 /// - **Load**: exclude `ConstChoice` (may use AddImm/Flow instead of Load).
 /// - **VALU**: exclude shiftable ops (may shift to ALU) when `shiftable_valu` is provided.
+///
+/// **Greedy-cap (Z3-proven):** When `greedy_cycles` is `Some(g)`, we never exclude the canonical
+/// cycle for any op: for each op index `idx`, if `g.get(idx)` is `Some(c)`, we clamp so that
+/// the op's domain always contains `c`. This preserves the canonical schedule G (T7-greedy-cap-preserves-G).
 pub(crate) fn tighten_asap_alap_by_slots(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -823,6 +827,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
     flow_cap: i64,
     verbose: bool,
     shiftable_valu: Option<&HashSet<usize>>,
+    greedy_cycles: Option<&[i32]>,
 ) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
     use std::collections::HashMap as StdHashMap;
 
@@ -978,13 +983,33 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                     }
 
+                    // Greedy-cap: never exclude the canonical cycle for this op (Z3 T7-greedy-cap-preserves-G).
+                    if let Some(g) = greedy_cycles {
+                        if let Some(&c) = g.get(idx) {
+                            new_asap_val = new_asap_val.min(c);
+                            new_alap_val = new_alap_val.max(c);
+                        }
+                    }
+
                     // Update bounds if tightened
                     if new_asap_val > old_asap || new_alap_val < old_alap {
                         if new_asap_val > old_asap {
+                            if verbose && new_asap_val > 300 {
+                                eprintln!(
+                                    "  [slot-tighten] ASAP push: idx={} op_id={} engine={:?} iter={} {} -> {}",
+                                    idx, op_id, engine, iter, old_asap, new_asap_val
+                                );
+                            }
                             new_asap.insert(op_id, new_asap_val);
                             changed = true;
                         }
                         if new_alap_val < old_alap {
+                            if verbose && new_alap_val > 300 {
+                                eprintln!(
+                                    "  [slot-tighten] ALAP pull (high): idx={} op_id={} engine={:?} iter={} {} -> {}",
+                                    idx, op_id, engine, iter, old_alap, new_alap_val
+                                );
+                            }
                             new_alap.insert(op_id, new_alap_val);
                             changed = true;
                         }
@@ -1325,6 +1350,7 @@ pub fn compute_ssa_asap_alap_bounds(
             flow_cap,
             verbose,
             Some(&shiftable_set),
+            None, // no greedy cycles in compute_ssa_asap_alap_bounds
         ) {
             current_asap = slot_asap;
             current_alap = slot_alap;

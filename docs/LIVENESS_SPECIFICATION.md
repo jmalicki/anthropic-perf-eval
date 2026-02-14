@@ -148,9 +148,13 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 <a id="t7"></a>
 ### T7. Slot-Aware ASAP/ALAP Tightening
 
-**Theorem**: If we push ASAP forward or ALAP backward using slot capacity (A6) so that the demand in each op's window respects the cap, the tightened bounds still contain at least one feasible schedule. *Derives from A6 and the fact that tightening only removes infeasible regions.*
+**One-step lemma (Z3-verified)**. For a **single** tightening step: if we exclude cycle `t` for op `O` because at `t` the demand from other ops plus the slots of `O` exceeds capacity (A6), then no feasible schedule can have `O` at `t`. So one step only removes an infeasible (op, cycle) pair. *Proof*: See `verification/theorems.py` `check_t7_slot_tightening_one_step`; Z3 shows the negation (tightening holds and feasible with O at t) is UNSAT.
 
-*Scope*: Unconditional in the sense that the theorem holds for any schedule. When the model has optional intervals (choice variables), demand in a window must count only ops that are *present* for the engine in that window; optional-interval ops are excluded from the profile so we do not over-tighten.
+**Composition does not preserve feasibility.** The stronger claim—“after **multiple** valid one-step tightenings and a precedence fixpoint, the tightened bounds still contain at least one feasible schedule”—is **false** in general. A counterexample: 2 ops, 3 cycles, capacity 1, precedence O2 ≥ O1+1; exclude O1 from cycle 0 and O2 from cycle 2 (each exclusion is a valid one-step). Then no feasible schedule remains (Z3 returns UNSAT). See `verification/theorems.py` `check_t7_slot_tightening_two_step_composition` (T7-two-step) and [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md). The implementation runs iterative slot tightening plus a precedence fixpoint, so it can exclude feasible schedules (observed for 2r/16b: with tightening 368 cycles with 295 empty; without, 36-cycle feasible schedule).
+
+**Implementation: greedy-cap rule.** The CP-SAT model builder uses the **greedy-cap** rule so that slot tightening never excludes the canonical (greedy) cycle for any op: when greedy hints are present, we clamp ASAP/ALAP so the op's domain always contains its greedy cycle. This is Z3-proven (T7-greedy-cap-preserves-G; see `verification/README.md` and [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) § "Greedy-cap fix: strengths, weaknesses, future work").
+
+*Scope*: Unconditional in the sense that the one-step lemma holds for any schedule. When the model has optional intervals (choice variables), demand in a window must count only ops that are *present* for the engine in that window; optional-interval ops are excluded from the profile so we do not over-tighten.
 
 **Optional-interval exclusions (must match `bounds.rs`)**. When building the demand profile for each engine, the following ops are **excluded** from that engine's count (they may not use that engine in a given solution):
 - **Flow**: SelectChoice ops (may use FMA on VALU instead of vselect on Flow).
@@ -160,7 +164,7 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 <a id="t8"></a>
 ### T8. Scratch-Aware ASAP/ALAP Tightening
 
-**Theorem**: If we push ASAP forward or ALAP backward using scratch liveness (A7) so that total scratch usage in each candidate window stays within budget, the tightened bounds still contain at least one feasible schedule. *Derives from A7 and the liveness definitions.*
+**One-step lemma (Z3-verified)**. For a **single** tightening step: if we exclude cycle `t` for op `O` because scratch usage by others at `t` plus `O`'s usage would exceed budget (A7), then no feasible schedule can have `O` at `t`. Same structure as T7; see `check_t8_scratch_tightening_one_step`. **Composition** (multiple steps + precedence fixpoint) is not guaranteed to preserve feasibility; the same caveat as T7 applies.
 
 *Scope*: Same as T7 — when optional structures (e.g. CSE shared sub_temp) exist only under a condition, scratch demand in a window should count only VRegs whose intervals are present for the candidate assignment.
 

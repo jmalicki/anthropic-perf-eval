@@ -2171,6 +2171,33 @@ mod precedence_offset_tests {
         assert_eq!(fixed_alap, alap, "Consistent ALAP should not change");
     }
 
+    /// T7-two-step regression: two valid one-step exclusions can leave no feasible schedule.
+    /// Model: 2 ops (O1, O2), precedence O2 >= O1+1, 3 cycles. Domains mirror Z3 counterexample:
+    /// O1 in [1,2] (exclude 0), O2 in [0,1] (exclude 2). After fixpoint, precedence forces
+    /// O1's ALAP <= 0 (from O2's ALAP=1), so O1 ends up with empty domain (ASAP 1 > ALAP 0).
+    /// This documents the known composition failure; see docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md.
+    #[test]
+    fn test_t7_two_step_composition_empty_domain_after_fixpoint() {
+        let o1 = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let o2 = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let ops = vec![o1, o2];
+        let shiftable_set = HashSet::new();
+
+        // T7-two-step exclusions: O1 not at 0 (ASAP push), O2 not at 2 (ALAP pull)
+        let mut asap: HashMap<usize, i32> = HashMap::new();
+        asap.insert(0, 1);
+        asap.insert(1, 0);
+        let mut alap: HashMap<usize, i32> = HashMap::new();
+        alap.insert(0, 2);
+        alap.insert(1, 1);
+
+        let (fixed_asap, fixed_alap) = fix_precedence_bounds_fixpoint(&ops, &asap, &alap, &shiftable_set);
+
+        // Precedence O2 >= O1+1 with O2 in [0,1] forces O1 <= 0; but O1's ASAP is 1 => empty domain
+        let (_, _, empty_domain_count) = diagnose_precedence_bounds(&ops, &fixed_asap, &fixed_alap, &shiftable_set);
+        assert!(empty_domain_count >= 1, "T7-two-step: fixpoint should produce at least one empty domain (known composition failure)");
+    }
+
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_fixpoint_integration_small_kernel() {
@@ -2261,6 +2288,7 @@ mod slot_tightening_tests {
             6, 1, 2, 2, 1, // valu, alu, load, store, flow
             false,
             None::<&HashSet<usize>>,
+            None,
         )
         .expect("tightening should return Some");
 
@@ -2302,6 +2330,7 @@ mod slot_tightening_tests {
             6, 12, 2, 2, 1, // flow_cap=1
             false,
             None::<&HashSet<usize>>,
+            None,
         )
         .expect("tightening should return Some");
 
@@ -2336,6 +2365,7 @@ mod slot_tightening_tests {
             1, 8, 2, 2, 1, // valu_cap=1, alu_cap=8
             false,
             Some(&shiftable_set),
+            None,
         )
         .expect("tightening should return Some");
 
@@ -2343,6 +2373,41 @@ mod slot_tightening_tests {
             let a = *result.0.get(&op.id).unwrap_or(&0);
             let b = *result.1.get(&op.id).unwrap_or(&(horizon - 1));
             assert!(a <= b, "VALU shiftable excluded: no empty domain for op id {}", op.id);
+        }
+    }
+
+    /// Greedy-cap: when greedy_cycles is provided, the canonical cycle for each op must remain
+    /// in the tightened domain (Z3 T7-greedy-cap-preserves-G). 2 ops, greedy at [1, 2].
+    #[test]
+    fn test_slot_tightening_greedy_cap_preserves_canonical_cycle() {
+        let op0 = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
+        let op1 = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
+        let ops = vec![op0, op1];
+        let shiftable_set = HashSet::new();
+        let asap = compute_ssa_asap(&ops, &shiftable_set);
+        let horizon = 20;
+        let alap = compute_ssa_alap(&ops, horizon, &shiftable_set);
+        let greedy_cycles: Vec<i32> = vec![1, 2];
+
+        let result = tighten_asap_alap_by_slots(
+            &ops,
+            &asap,
+            &alap,
+            horizon,
+            6, 2, 2, 2, 1, // alu_cap=2 so slot reasoning can tighten
+            false,
+            None::<&HashSet<usize>>,
+            Some(&greedy_cycles),
+        )
+        .expect("tightening should return Some");
+
+        let asap_res = &result.0;
+        let alap_res = &result.1;
+        for (idx, op) in ops.iter().enumerate() {
+            let c = greedy_cycles[idx];
+            let a = *asap_res.get(&op.id).unwrap_or(&0);
+            let b = *alap_res.get(&op.id).unwrap_or(&(horizon - 1));
+            assert!(a <= c && c <= b, "greedy-cap: op {} canonical cycle {} must be in [asap={}, alap={}]", op.id, c, a, b);
         }
     }
 }

@@ -239,6 +239,7 @@ pub fn schedule_ssa_cpsat(
             flow_cap,
             verbose,
             Some(&shiftable_set),
+            greedy_hints,
         )
         .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
         current_asap = slot_asap;
@@ -3612,11 +3613,12 @@ pub fn schedule_ssa_cpsat(
             };
 
             // Build schedule constraints once (same as CP-SAT; used for active-set binding list and bulk-move).
+            // Use final_asap/final_alap so exported Domain bounds match the cycle var domains the solver used.
             let schedule_constraints = crate::schedule_constraints::build_ssa_schedule_constraints(
                 ops,
                 &op_id_to_idx,
-                &asap,
-                &alap,
+                &final_asap,
+                &final_alap,
                 &shiftable_set,
                 &shifted_ops,
                 &select_choice_with_fma_delay,
