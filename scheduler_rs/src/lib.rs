@@ -67,6 +67,7 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     set_attr("capacity_alu", OptionalConstraintGroup::CapacityAlu)?;
     set_attr("capacity_flow", OptionalConstraintGroup::CapacityFlow)?;
     set_attr("capacity_load", OptionalConstraintGroup::CapacityLoad)?;
+    m.add_function(wrap_pyfunction!(python::run_bulk_move_simulator_from_json, m)?)?;
     Ok(())
 }
 
