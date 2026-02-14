@@ -170,6 +170,218 @@ def check_t7_slot_tightening_one_step(ctx=None) -> tuple[str, str, float, dict]:
     return ("T7", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
 
 
+def check_t7_slot_tightening_two_step_composition(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 two-step composition: show that the one-step lemma does NOT compose.
+    Model: 2 ops (O1, O2), 3 cycles (0,1,2), capacity 1. Precedence: O2 >= O1 + 1.
+    Two valid one-step tightenings: (1) exclude O1 from cycle 0; (2) exclude O2 from cycle 2.
+    We ask: does a feasible schedule (c1, c2) exist? If UNSAT, then no feasible schedule
+    exists after these two valid one-step steps — i.e. the composition theorem fails.
+    This proves that the Z3 one-step proof (T7) is insufficient for the full pipeline."""
+    c1, c2 = Ints("c1 c2")
+    solver = Solver(ctx=ctx)
+    # Cycle domain
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    # Valid one-step tightening 1: O1 excluded from cycle 0 (so c1 != 0)
+    solver.add(c1 != 0)
+    # Valid one-step tightening 2: O2 excluded from cycle 2 (so c2 != 2)
+    solver.add(c2 != 2)
+    # Capacity 1: ops cannot share a cycle
+    solver.add(c1 != c2)
+    # Precedence: O2 must run after O1 (e.g. min delay 1)
+    solver.add(c2 >= c1 + 1)
+    result = solver.check()
+    stats = _get_stats(solver)
+    # We expect UNSAT: no (c1,c2) satisfies all. So remaining domain c1 in {1,2}, c2 in {0,1};
+    # precedence c2>=c1+1 forces c1=0 or c2>=2, but c1!=0 and c2!=2 => no solution.
+    return (
+        "T7-two-step",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_one_exclusion_preserves_feasibility_asap(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 sufficient-condition exploration: one ASAP exclusion preserves feasibility.
+    Same 2-op 3-cycle model as T7-two-step; only exclusion is O1 not at 0 (valid one-step).
+    We expect SAT: (c1=1, c2=2) is feasible. So a single valid one-step exclusion does
+    not necessarily remove all feasible schedules; composition with a second exclusion does."""
+    c1, c2 = Ints("c1 c2")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    solver.add(c1 != 0)  # only exclusion: O1 not at 0 (ASAP push)
+    solver.add(c1 != c2)
+    solver.add(c2 >= c1 + 1)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-one-exclusion-asap",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_one_exclusion_preserves_feasibility_alap(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 sufficient-condition exploration: one ALAP exclusion preserves feasibility.
+    Same 2-op 3-cycle model; only exclusion is O2 not at 2 (valid one-step). We expect SAT:
+    (c1=0, c2=1) is feasible. So one ALAP exclusion alone does not remove all feasible schedules."""
+    c1, c2 = Ints("c1 c2")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    solver.add(c2 != 2)  # only exclusion: O2 not at 2 (ALAP pull)
+    solver.add(c1 != c2)
+    solver.add(c2 >= c1 + 1)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-one-exclusion-alap",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_greedy_cap_preserves_canonical(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 greedy-cap rule: the canonical schedule G remains feasible after exclusions.
+    Model: 2 ops (O1, O2), 3 cycles (0,1,2), capacity 1, precedence O2 >= O1 + 1.
+    Canonical schedule G = (G(O1)=1, G(O2)=2). Greedy-cap: only exclude (O, t) when
+    t != G(O). So we may exclude O1 from {0, 2} and O2 from {0, 1}; we never exclude
+    O1 from 1 or O2 from 2. We add the maximal set of allowed exclusions (c1!=0, c1!=2,
+    c2!=0, c2!=1) plus precedence and capacity, then assert G = (1, 2) is still a
+    solution. SAT proves that under greedy-cap, the canonical schedule remains feasible."""
+    c1, c2 = Ints("c1 c2")
+    solver = Solver(ctx=ctx)
+    # Cycle domain
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    # Capacity and precedence
+    solver.add(c1 != c2)
+    solver.add(c2 >= c1 + 1)
+    # Greedy-cap allowed exclusions only: never exclude G(O) for any O.
+    # G(O1)=1, G(O2)=2. So we may exclude c1 in {0,2}, c2 in {0,1}.
+    solver.add(c1 != 0)
+    solver.add(c1 != 2)
+    solver.add(c2 != 0)
+    solver.add(c2 != 1)
+    # Assert canonical schedule G = (1, 2)
+    solver.add(c1 == 1)
+    solver.add(c2 == 2)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-greedy-cap-preserves-G",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_asap_only_composition(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 safe-composition candidate: multiple ASAP-only exclusions preserve feasibility.
+    Model: 3 ops (O1, O2, O3), 5 cycles (0..4), capacity 1, precedence chain O2>=O1+1, O3>=O2+1.
+    Apply only valid one-step ASAP exclusions: c1>=1 (O1 not at 0), c2>=2 (O2 not at 0,1).
+    Ask: does a feasible schedule (c1,c2,c3) exist? We expect SAT, e.g. (1,2,3). If SAT,
+    ASAP-only composition may be a safe subset for implementation."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # ASAP-only exclusions (push earliest start)
+    solver.add(c1 >= 1)
+    solver.add(c2 >= 2)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-asap-only-composition",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_alap_only_composition(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 safe-composition candidate: multiple ALAP-only exclusions preserve feasibility.
+    Model: 3 ops (O1, O2, O3), 5 cycles (0..4), capacity 1, precedence chain O2>=O1+1, O3>=O2+1.
+    Apply only valid one-step ALAP exclusions: c3<=3 (O3 not at 4), c2<=2 (O2 not at 3,4).
+    Ask: does a feasible schedule exist? We expect SAT, e.g. (0,1,2) or (0,1,3). If SAT,
+    ALAP-only composition may be a safe subset for implementation."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # ALAP-only exclusions (pull latest end)
+    solver.add(c3 <= 3)
+    solver.add(c2 <= 2)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-alap-only-composition",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_domain_based_removes_canonical(ctx=None) -> tuple[str, str, float, dict]:
+    """T7 domain-based rule refutation: the second exclusion (domain-based) removes G.
+    After excluding O1 from 0, O1's domain is {1, 2}. Domain-based demand at cycle 2
+    counts O1 (since 2 in domain(O1)), so we exclude O2 from 2. Then the canonical
+    schedule G = (1, 2) is no longer feasible (c2=2 excluded). We encode: exclusions
+    c1!=0 and c2!=2 (as domain-based would apply), plus G = (1, 2). We expect UNSAT,
+    i.e. G is not a solution after domain-based exclusions."""
+    c1, c2 = Ints("c1 c2")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    solver.add(c1 != 0)   # first exclusion (one-step for O1 at 0)
+    solver.add(c2 != 2)   # second exclusion (domain-based: O2 at 2 excluded)
+    solver.add(c1 != c2)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c1 == 1)
+    solver.add(c2 == 2)   # G = (1, 2)
+    result = solver.check()
+    stats = _get_stats(solver)
+    # UNSAT = G is not feasible after domain-based exclusions (refutation)
+    return (
+        "T7-domain-based-removes-G",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
 def check_t8_scratch_tightening_one_step(ctx=None) -> tuple[str, str, float, dict]:
     """T8 inductive step: one scratch-aware tightening step is sound.
     When we tighten for op O at cycle t because scratch_other(t) + scratch(O) > budget,

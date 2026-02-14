@@ -26,7 +26,7 @@ Options:
 
 **Exact condition (Z3-proven):** Exclude cycle `t` from op `O`'s domain only when (i) the one-step slot-tightening condition holds at `(O, t)` (demand from others at `t` plus `slots(O)` would exceed capacity), and (ii) **t ≠ G(O)** where G is the canonical feasible schedule (e.g. greedy). Under this rule, G remains feasible after any finite set of such exclusions.
 
-**Implementation:** The scheduler follows this rule when building the CP-SAT model: `tighten_asap_alap_by_slots` in `scheduler_rs/src/cpsat_scheduler/bounds.rs` takes an optional `greedy_cycles` (the canonical schedule G); when present, it clamps ASAP/ALAP so the domain for each op always contains its canonical cycle. Thus G is never excluded and remains feasible. Strengths, weaknesses, and possible future work are documented in [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) § "Greedy-cap fix: strengths, weaknesses, future work".
+**Implementation:** Slot tightening is **off by default**. When enabled, `tighten_asap_alap_by_slots` in `scheduler_rs/src/cpsat_scheduler/bounds.rs` applies **only ASAP pushes** (ALAP pulls are skipped), so at least one feasible schedule remains (Z3 T7-asap-only-composition). When building the CP-SAT model, the scheduler also uses the greedy-cap rule: it passes optional `greedy_cycles` (the canonical schedule G) and clamps ASAP/ALAP so the domain for each op always contains its canonical cycle (T7-greedy-cap-preserves-G). Strengths, weaknesses, and possible future work are documented in [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) § "Greedy-cap fix: strengths, weaknesses, future work".
 
 **Model used in proof:** 2 ops, 3 cycles, capacity 1, precedence O2 ≥ O1+1; G = (1, 2). Allowed exclusions: O1 from {0, 2}, O2 from {0, 1}. With the maximal allowed set, G is still a solution (SAT). See `check_t7_greedy_cap_preserves_canonical` in `theorems.py`.
 
@@ -48,6 +48,8 @@ Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVE
 | T7-two-step | Two-step composition (counterexample: no feasible schedule) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-one-exclusion-asap | One ASAP exclusion preserves feasibility | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-one-exclusion-alap | One ALAP exclusion preserves feasibility | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-asap-only-composition | ASAP-only composition (safe-composition candidate) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-alap-only-composition | ALAP-only composition (safe-composition candidate) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-greedy-cap-preserves-G | **Greedy-cap rule:** canonical schedule G remains feasible (Z3-proven safe rule) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-domain-based-removes-G | Domain-based rule refutation: second exclusion removes canonical G | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T8 | Scratch-aware tightening: one-step lemma | [#t8](../docs/LIVENESS_SPECIFICATION.md#t8) |

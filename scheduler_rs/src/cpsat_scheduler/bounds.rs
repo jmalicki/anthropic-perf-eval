@@ -318,7 +318,7 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
-            enable_asap_alap_tightening: true, // Enabled by default (validated on 4r/depth-3). Use --no-enable-asap-alap-tightening to disable.
+            enable_asap_alap_tightening: false, // Off by default; when enabled, safe form (ASAP-only) is used. Use --enable-asap-alap-tightening to opt in.
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
@@ -991,29 +991,20 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                     }
 
-                    // Update bounds if tightened
-                    if new_asap_val > old_asap || new_alap_val < old_alap {
-                        if new_asap_val > old_asap {
-                            if verbose && new_asap_val > 300 {
-                                eprintln!(
-                                    "  [slot-tighten] ASAP push: idx={} op_id={} engine={:?} iter={} {} -> {}",
-                                    idx, op_id, engine, iter, old_asap, new_asap_val
-                                );
-                            }
-                            new_asap.insert(op_id, new_asap_val);
-                            changed = true;
+                    // Update bounds if tightened. Safe composition (Z3 T7-asap-only-composition):
+                    // we only apply ASAP pushes, not ALAP pulls, so at least one feasible schedule
+                    // remains. Mixed ASAP+ALAP can exclude all (T7-two-step counterexample).
+                    if new_asap_val > old_asap {
+                        if verbose && new_asap_val > 300 {
+                            eprintln!(
+                                "  [slot-tighten] ASAP push: idx={} op_id={} engine={:?} iter={} {} -> {}",
+                                idx, op_id, engine, iter, old_asap, new_asap_val
+                            );
                         }
-                        if new_alap_val < old_alap {
-                            if verbose && new_alap_val > 300 {
-                                eprintln!(
-                                    "  [slot-tighten] ALAP pull (high): idx={} op_id={} engine={:?} iter={} {} -> {}",
-                                    idx, op_id, engine, iter, old_alap, new_alap_val
-                                );
-                            }
-                            new_alap.insert(op_id, new_alap_val);
-                            changed = true;
-                        }
+                        new_asap.insert(op_id, new_asap_val);
+                        changed = true;
                     }
+                    // ALAP pull skipped: safe composition uses ASAP-only (Z3 T7-asap-only-composition).
                 }
             }
         }

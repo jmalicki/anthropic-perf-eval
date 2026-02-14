@@ -19,6 +19,13 @@ from .theorems import (
     check_t5_cycle_domain,
     check_t6_half_open_conversion,
     check_t7_slot_tightening_one_step,
+    check_t7_slot_tightening_two_step_composition,
+    check_t7_one_exclusion_preserves_feasibility_asap,
+    check_t7_one_exclusion_preserves_feasibility_alap,
+    check_t7_asap_only_composition,
+    check_t7_alap_only_composition,
+    check_t7_greedy_cap_preserves_canonical,
+    check_t7_domain_based_removes_canonical,
     check_t8_scratch_tightening_one_step,
     check_t9_expiration_implies_no_overlap,
     check_t10_dead_shifted_valu_end,
@@ -37,6 +44,41 @@ THEOREM_CHECKS = [
     ("T5", "Cycle domain (ASAP/ALAP sound)", check_t5_cycle_domain),
     ("T6", "Half-open conversion", check_t6_half_open_conversion),
     ("T7", "Slot-aware tightening (one-step lemma)", check_t7_slot_tightening_one_step),
+    (
+        "T7-two-step",
+        "Slot tightening two-step composition (counterexample: no feasible schedule)",
+        check_t7_slot_tightening_two_step_composition,
+    ),
+    (
+        "T7-one-exclusion-asap",
+        "One ASAP exclusion preserves feasibility (sufficient-condition exploration)",
+        check_t7_one_exclusion_preserves_feasibility_asap,
+    ),
+    (
+        "T7-one-exclusion-alap",
+        "One ALAP exclusion preserves feasibility (sufficient-condition exploration)",
+        check_t7_one_exclusion_preserves_feasibility_alap,
+    ),
+    (
+        "T7-asap-only-composition",
+        "ASAP-only composition (safe-composition candidate: multiple ASAP exclusions)",
+        check_t7_asap_only_composition,
+    ),
+    (
+        "T7-alap-only-composition",
+        "ALAP-only composition (safe-composition candidate: multiple ALAP exclusions)",
+        check_t7_alap_only_composition,
+    ),
+    (
+        "T7-greedy-cap-preserves-G",
+        "Greedy-cap rule: canonical schedule G remains feasible (Z3-proven safe rule)",
+        check_t7_greedy_cap_preserves_canonical,
+    ),
+    (
+        "T7-domain-based-removes-G",
+        "Domain-based rule refutation: second exclusion removes canonical G",
+        check_t7_domain_based_removes_canonical,
+    ),
     ("T8", "Scratch-aware tightening (one-step lemma)", check_t8_scratch_tightening_one_step),
     ("T9", "Expiration implies no overlap", check_t9_expiration_implies_no_overlap),
     ("T10", "Dead shifted VALU dest end", check_t10_dead_shifted_valu_end),
@@ -86,9 +128,20 @@ def run_verification(
             print(f"ERROR: {e}")
             failures.append((name, str(e)))
             continue
-        passed = result_str == "unsat"
-        status = "PASS" if passed else "FAIL"
-        print(f"{status} ({result_str}) in {elapsed:.3f}s")
+        expect_sat = name in (
+            "T7-one-exclusion-asap",
+            "T7-one-exclusion-alap",
+            "T7-asap-only-composition",
+            "T7-alap-only-composition",
+            "T7-greedy-cap-preserves-G",
+        )
+        passed = (result_str == "sat") if expect_sat else (result_str == "unsat")
+        if name == "T7-two-step" and passed:
+            status = "COUNTEREXAMPLE"
+            print(f"{status} ({result_str} = no feasible schedule; composition theorem does not hold) in {elapsed:.3f}s")
+        else:
+            status = "PASS" if passed else "FAIL"
+            print(f"{status} ({result_str}) in {elapsed:.3f}s")
         if verbose and stats:
             for k, v in sorted(stats.items())[:8]:
                 print(f"    {k}: {v}")

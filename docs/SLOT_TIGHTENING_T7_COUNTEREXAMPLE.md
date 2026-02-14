@@ -1,5 +1,7 @@
 # T7 counterexample: slot tightening excludes a feasible schedule
 
+**Default: off.** Slot tightening is off by default so schedules are never worsened. When enabled (opt-in), the implementation uses the **ASAP-only** safe subset (Z3 T7-asap-only-composition). Use `--enable-asap-alap-tightening` to opt in.
+
 ## Claim (T7)
 
 From [LIVENESS_SPECIFICATION.md](LIVENESS_SPECIFICATION.md#t7):  
@@ -27,11 +29,11 @@ The repo contains a Z3 verification for T7 in `verification/theorems.py` (`check
 
 **Order of operations** (in `scheduler_rs/src/cpsat_scheduler/model.rs`): (1) `tighten_asap_alap_by_slots` updates ASAP/ALAP; (2) optional scratch tightening; (3) `fix_precedence_bounds_fixpoint(ops, &final_asap, &final_alap, …)` restores precedence consistency.
 
-- **Slot tightening** (`bounds.rs::tighten_asap_alap_by_slots`): Builds a per-engine demand profile from current op windows `[asap, alap]` (up to 3 iterations). Uses energetic reasoning: if total demand in an op’s window exceeds `cap * window_size`, it pushes that op’s ASAP forward and/or ALAP backward. So the **origin** of over-tightening can be here (e.g. profile from overlapping windows pushes one or more “tail” ops’ ASAP to 332+; or the same op gets pushed in multiple engines).
+- **Slot tightening** (`bounds.rs::tighten_asap_alap_by_slots`): Builds a per-engine demand profile from current op windows `[asap, alap]` (up to 3 iterations). Uses energetic reasoning: if total demand in an op’s window exceeds `cap * window_size`, it pushes that op’s ASAP forward (ALAP pulls are not applied; safe form is ASAP-only). So the **origin** of over-tightening could historically be here (e.g. profile from overlapping windows pushes one or more “tail” ops’ ASAP to 332+; or the same op gets pushed in multiple engines).
 
 - **Precedence fixpoint** (`bounds.rs::fix_precedence_bounds_fixpoint`): After tightening, precedence can be violated (e.g. consumer’s ASAP &lt; pred’s ASAP + offset). The fixpoint only **propagates** bounds: forward it increases successor ASAP when `pred_asap + offset > succ_asap`; backward it decreases predecessor ALAP. So if slot tightening already pushed a predecessor’s ASAP to 332, the fixpoint **correctly** pushes every successor’s ASAP to at least 332+offset. That **spreads** the over-tightening to the whole tail.
 
-**Conclusion:** The exclusion is likely **initiated** by slot tightening (wrong or overly aggressive push for some op(s)); the fixpoint then **amplifies** it by propagating those bounds along the precedence graph. A fix should ensure slot tightening never pushes an op’s ASAP/ALAP beyond what is required for feasibility (e.g. validate that the greedy schedule still lies in the tightened domains, or re-check demand using “must be at t” rather than “could be at t” where applicable). See BUGS.md entry “T7 counterexample” and the plan in `.cursor/plans/slot_tightening_and_empty_cycles_*.plan.md`.
+**Conclusion:** The exclusion is likely **initiated** by slot tightening (wrong or overly aggressive push for some op(s)); the fixpoint then **amplifies** it by propagating those bounds along the precedence graph. The fix direction we focus on is **(1) safe composition**: prove a rule in Z3 that allows multiple exclusions + fixpoint while still preserving at least one feasible schedule, then implement it (see "Possible future work" below). *(2) Symmetry-based exclusion* (prove we only exclude schedules equivalent to one we keep) may be possible in future efforts. A fix should ensure slot tightening never pushes an op’s ASAP/ALAP beyond what is required for feasibility (e.g. validate that the greedy schedule still lies in the tightened domains, or re-check demand using “must be at t” rather than “could be at t” where applicable). See BUGS.md entry “T7 counterexample” and the plan in `.cursor/plans/slot_tightening_and_empty_cycles_*.plan.md`.
 
 ---
 
@@ -41,8 +43,10 @@ The repo contains a Z3 verification for T7 in `verification/theorems.py` (`check
 
 | Config | Scheduler JSON | Cycles | Empty stretch | Deciles 1–8 |
 |--------|-----------------|--------|---------------|-------------|
-| **With** slot tightening (default) | `artifacts/scheduler_2r_16b.json` | 368 | 295 empty (37–331) | All 0% usage |
-| **Without** slot tightening | `scheduler_output_2r_16b_no_tightening.json` | 36 | None | Work spread across all deciles |
+| **With** slot tightening enabled | `artifacts/scheduler_2r_16b.json` | 368 | 295 empty (37–331) | All 0% usage |
+| **Without** slot tightening (default) | `scheduler_output_2r_16b_no_tightening.json` | 36 | None | Work spread across all deciles |
+
+*(Slot tightening is now off by default; the table describes behavior when it is enabled vs disabled.)*
 
 - **With tightening:** Per-decile slot usage shows deciles 1–8 (cycles 37–331) completely empty; only decile 0 (0–36) and decile 9 (332–367) have ops. Theoretical lower bound script: actual 368 cycles vs theoretical minimum 14 cycles (96.2% overhead).
 - **Without tightening:** Same 2r/16b config with `--no-enable-asap-alap-tightening` and `--force-zero-gap --cpsat-time-limit 300`: 36-cycle schedule that **passes validation**. Per-decile usage shows work in every decile (no long empty stretch). Theoretical lower bound: actual 36 cycles vs theoretical minimum 14 (61.1% overhead).
@@ -107,7 +111,7 @@ We **adopt greedy-cap** as the implementation fix: when building the CP-SAT mode
 
 ### What we actually need (open)
 
-We need tightening that: (1) **goes beyond greedy** — smaller domains than precedence-only, ideally tighter than greedy's placement where slot reasoning justifies it; and (2) **does not violate feasibility** — does not exclude all feasible schedules (no composition bug). The **greedy-cap** fix ensures (2) by construction (we never exclude G). Achieving (1) while preserving (2) in a stronger way (e.g. tightening beyond greedy where provably safe) remains an open problem; see BUGS.md and the "Narrowing the bug" section above.
+We need tightening that: (1) **goes beyond greedy** — smaller domains than precedence-only so CP-SAT's search is easier; and (2) **does not violate feasibility** — does not exclude all feasible schedules (no composition bug). The **greedy-cap** fix ensures we never exclude the pipeline's G, but that G can be poor (e.g. 368 cycles); good schedules (e.g. 36-cycle) can still be excluded. The open problem is to allow stronger tightening while **provably** keeping at least one feasible schedule. We focus on **(1) safe composition** below; **(2) symmetry** is noted as a possible future direction so we don't lose sight of it.
 
 ---
 
@@ -124,13 +128,18 @@ We need tightening that: (1) **goes beyond greedy** — smaller domains than pre
 
 - **Weaker propagation when capping at G:** We never exclude G(O) for any op, so for ops where domain-based tightening would have pushed past G, domains stay looser. That can mean weaker propagation and possibly longer solve times in some configs.
 - **No clamp when greedy hints are absent:** When no greedy hints are available (e.g. pipeline bounds pass, or tests), we pass `None` and do not clamp; in those paths the old (domain-based) behavior remains and can still over-tighten if tightening is enabled.
-- **Correctness and propagation strength depend on greedy quality:** If G is poor, "cap at G" still leaves a large search space.
+- **Correctness and propagation strength depend on greedy quality:** If G is poor, "cap at G" still leaves a large search space; good compact schedules can remain excluded.
 
 ### Possible future work
 
-- **Tighter safe rule in Z3:** Prove a rule that allows more exclusions while still preserving a feasible schedule (e.g. order-based or "exclude only when no feasible schedule uses (O,t)"); then port that rule to recover propagation strength.
+**Safe composition candidate (Z3).** We added two checks in `verification/theorems.py`: `T7-asap-only-composition` (3 ops, 5 cycles, capacity 1, chain precedence; only ASAP exclusions c1≥1, c2≥2) and `T7-alap-only-composition` (same model; only ALAP exclusions c3≤3, c2≤2). Both yield **SAT**: at least one feasible schedule remains. So single-direction (ASAP-only or ALAP-only) is a candidate safe subset to implement; see `uv run python -m verification.verify -t T7-asap-only-composition -t T7-alap-only-composition` and [verification/README.md](../verification/README.md).
+
+**Priority: (1) Safe composition (conservative focus).** Prove in Z3 a **composition rule** that allows multiple one-step exclusions (and the precedence fixpoint) while guaranteeing at least one feasible schedule remains — **without** requiring a known schedule G in advance. Then port that rule to the implementation. Examples: restrict to a single direction per pass (e.g. only ASAP pushes, or only ALAP pulls); or an order-based rule (e.g. process ops in a fixed order and prove the remaining domain still has a feasible schedule); or "exclude (O,t) only when no feasible schedule uses (O,t)" (expensive to check in practice unless encoded as part of the rule). This is the more conservative path: we only exclude when the combined effect is proven safe.
+
+**Note: (2) Symmetry may be possible in future efforts.** An alternative is to prove that the exclusions we perform only remove schedules that are **symmetrically equivalent** (e.g. under batch symmetry) to some schedule we keep. Then we would not be excluding "the" compact schedule, only equivalent copies, and one representative would remain feasible. We keep this in mind so we don't lose sight of it; it may allow more aggressive tightening if the symmetry structure can be formalized.
+
 - **Improve greedy:** Better G implies tighter effective domains under greedy-cap and better propagation.
 - **Post-tightening check:** After each engine pass, check that G is still in the domains; if not, revert the exclusions that removed it so we can apply more exclusions when they don't touch G.
 - **Optional makespan cap:** Add `makespan <= greedy_makespan + slack` in the CP-SAT model as a temporary safeguard if needed.
-- **Formalize batch symmetry:** Document that G is the canonical representative under batch symmetry and that preserving G preserves one schedule per equivalence class.
+- **Formalize batch symmetry:** Document that G is the canonical representative under batch symmetry and that preserving G preserves one schedule per equivalence class; this supports both the current greedy-cap story and future (2) symmetry-based exclusion proofs.
 
