@@ -3,6 +3,8 @@
 //! Runs the greedy scheduler to produce an initial schedule (used as
 //! CP-SAT warm-start hints or as the final schedule in greedy-only mode).
 
+use std::collections::HashSet;
+
 use crate::kernel_builder::config::PressurePolicyKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::ssa_greedy;
@@ -11,6 +13,7 @@ use crate::kernel_builder::ssa_greedy::pressure_policy::{
     AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy,
     PressureThrottledPolicy,
 };
+use crate::types::{ConstChoiceEncoding, Opcode, SelectChoiceEncoding};
 
 /// Runs the greedy scheduler with VALU→ALU shifting and choice tracking.
 ///
@@ -70,20 +73,40 @@ impl Pass for GreedySchedulePass {
         } else {
             Some(&ctx.vector_group_lanes)
         };
+        let mut add_imm_ops = HashSet::new();
+        let mut select_fma_ops = HashSet::new();
         let (cycles, budget_exceeded, peak_live) =
             ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut ctx.greedy_decisions.shifted_ops,
                 ctx.config.scratch_budget,
-                Some(&mut ctx.greedy_decisions.select_fma_ops),
+                Some(&mut select_fma_ops),
                 Some(&mut ctx.greedy_decisions.select_sub_cycles),
                 Some(&mut ctx.greedy_decisions.select_fma_cycles),
-                Some(&mut ctx.greedy_decisions.const_add_imm_ops),
+                Some(&mut add_imm_ops),
                 &bounds_usage,
                 &*strategy,
                 vgl,
             )?;
+        for op in &ctx.ops {
+            if op.opcode == Opcode::ConstChoice {
+                let enc = if add_imm_ops.contains(&op.id) {
+                    ConstChoiceEncoding::AddImm
+                } else {
+                    ConstChoiceEncoding::Load
+                };
+                ctx.greedy_decisions.const_choice_encoding.insert(op.id, enc);
+            }
+            if op.opcode == Opcode::SelectChoice {
+                let enc = if select_fma_ops.contains(&op.id) {
+                    SelectChoiceEncoding::Fma
+                } else {
+                    SelectChoiceEncoding::Vselect
+                };
+                ctx.greedy_decisions.select_choice_encoding.insert(op.id, enc);
+            }
+        }
 
         ctx.greedy_metrics = super::super::SchedulingMetrics {
             cycles,

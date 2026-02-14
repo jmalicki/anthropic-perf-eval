@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{AluDeriveInfo, Engine, MachineConfig, Opcode, SsaOp, VLEN};
+use crate::types::{ConstChoiceEncoding, Engine, MachineConfig, Opcode, SelectChoiceEncoding, SsaOp, VLEN};
 
 /// One row of the Flow audit: an op that contributes to the Flow engine at a given cycle.
 #[cfg(feature = "cpsat")]
@@ -19,8 +19,8 @@ pub(crate) struct FlowAuditRow {
 pub(crate) fn build_flow_audit(
     ops: &[SsaOp],
     cycle_assignments: &[i32],
-    const_add_imm_ops: &HashSet<usize>,
-    select_fma_ops: &HashSet<usize>,
+    const_choice_encoding: &HashMap<usize, ConstChoiceEncoding>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) -> (Vec<FlowAuditRow>, Vec<i32>, Vec<Vec<(usize, String)>>) {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
     let makespan_usize = makespan.max(0) as usize;
@@ -36,7 +36,7 @@ pub(crate) fn build_flow_audit(
         }
 
         if op.opcode == Opcode::ConstChoice {
-            if const_add_imm_ops.contains(&op.id) {
+            if matches!(const_choice_encoding.get(&op.id), Some(ConstChoiceEncoding::AddImm)) {
                 let reason = format!("ConstChoice→AddImm (op.id={})", op.id);
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
@@ -53,7 +53,7 @@ pub(crate) fn build_flow_audit(
             continue;
         }
         if op.opcode == Opcode::SelectChoice {
-            if !select_fma_ops.contains(&op.id) {
+            if !matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
                 let reason = format!("SelectChoice→vselect (op.id={})", op.id);
                 flow_per_cycle[cycle] += 1;
                 if cycle < flow_contributors_per_cycle.len() {
@@ -97,10 +97,20 @@ pub(crate) fn format_flow_violation_breadcrumbs(
     limit: usize,
     flow_rows: &[FlowAuditRow],
     flow_contributors_per_cycle: &[Vec<(usize, String)>],
-    const_add_imm_ops: &HashSet<usize>,
-    select_fma_ops: &HashSet<usize>,
+    const_choice_encoding: &HashMap<usize, ConstChoiceEncoding>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     cycle_assignments: &[i32],
 ) -> String {
+    let add_imm_op_ids: Vec<usize> = const_choice_encoding
+        .iter()
+        .filter(|(_, enc)| matches!(enc, ConstChoiceEncoding::AddImm))
+        .map(|(&id, _)| id)
+        .collect();
+    let select_fma_op_ids: Vec<usize> = select_choice_encoding
+        .iter()
+        .filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma))
+        .map(|(&id, _)| id)
+        .collect();
     let mut s = String::new();
     s.push_str(&format!(
         "\n\n=== Flow slot violation at cycle {}: {} > {} ===\n",
@@ -120,11 +130,10 @@ pub(crate) fn format_flow_violation_breadcrumbs(
             r.idx, r.op_id, r.opcode, r.cycle, r.reason
         ));
     }
-    s.push_str("Solution decision sets (op.id):\n");
-    s.push_str(&format!("  const_add_imm_ops = {:?}\n", const_add_imm_ops));
-    s.push_str(&format!("  select_fma_ops   = {:?}\n", select_fma_ops));
-    s.push_str("Interpretation: ConstChoice with op.id in const_add_imm_ops -> AddImm (Flow); ");
-    s.push_str("SelectChoice with op.id NOT in select_fma_ops -> vselect (Flow).\n");
+    s.push_str(&format!(
+        "Solution: ConstChoice AddImm op.ids = {:?}; SelectChoice Fma op.ids = {:?}\n",
+        add_imm_op_ids, select_fma_op_ids
+    ));
     s.push_str("=== end Flow violation breadcrumbs ===\n");
     s
 }
@@ -155,9 +164,8 @@ pub(crate) fn summarise_ssa_solution_engines_and_choices(
     ops: &[SsaOp],
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
-    const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, AluDeriveInfo>,
-    select_fma_ops: &HashSet<usize>,
+    const_choice_encoding: &HashMap<usize, ConstChoiceEncoding>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) -> SsaSolutionSummary {
     let mut alu_total = 0usize;
     let mut valu_total = 0usize;
@@ -176,17 +184,15 @@ pub(crate) fn summarise_ssa_solution_engines_and_choices(
         let _cycle = cycle as usize;
 
         if op.opcode == Opcode::ConstChoice {
-            if const_alu_derive_ops.contains_key(&op.id) {
-                alu_total += 1;
-            } else if const_add_imm_ops.contains(&op.id) {
-                flow_total += 1;
-            } else {
-                load_total += 1;
+            match const_choice_encoding.get(&op.id) {
+                Some(ConstChoiceEncoding::AluDerive(_)) => alu_total += 1,
+                Some(ConstChoiceEncoding::AddImm) => flow_total += 1,
+                Some(ConstChoiceEncoding::Load) | None => load_total += 1,
             }
             continue;
         }
         if op.opcode == Opcode::SelectChoice {
-            if select_fma_ops.contains(&op.id) {
+            if matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
                 valu_total += 1;
                 valu_fma_slots += 1;
                 if op.delta_vreg.is_none() {
@@ -220,21 +226,27 @@ pub(crate) fn summarise_ssa_solution_engines_and_choices(
         }
     }
 
-    let const_total = ops
-        .iter()
-        .filter(|o| o.opcode == Opcode::ConstChoice)
+    let const_add_imm = const_choice_encoding
+        .values()
+        .filter(|enc| matches!(enc, ConstChoiceEncoding::AddImm))
         .count();
-    let const_add_imm = const_add_imm_ops.len();
-    let const_alu_derive = const_alu_derive_ops.len();
-    let const_load = const_total
-        .saturating_sub(const_add_imm)
-        .saturating_sub(const_alu_derive);
+    let const_alu_derive = const_choice_encoding
+        .values()
+        .filter(|enc| matches!(enc, ConstChoiceEncoding::AluDerive(_)))
+        .count();
+    let const_load = const_choice_encoding
+        .values()
+        .filter(|enc| matches!(enc, ConstChoiceEncoding::Load))
+        .count();
 
     let select_total = ops
         .iter()
         .filter(|o| o.opcode == Opcode::SelectChoice)
         .count();
-    let select_fma = select_fma_ops.len();
+    let select_fma = select_choice_encoding
+        .values()
+        .filter(|e| matches!(e, SelectChoiceEncoding::Fma))
+        .count();
     let select_vselect = select_total.saturating_sub(select_fma);
 
     SsaSolutionSummary {
@@ -254,6 +266,38 @@ pub(crate) fn summarise_ssa_solution_engines_and_choices(
     }
 }
 
+/// Validate that shifted_alu_cycles has exactly VLEN entries per shifted op and each cycle is in [0, makespan).
+#[cfg(feature = "cpsat")]
+pub(crate) fn validate_shifted_alu_cycles(
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    makespan: i32,
+) {
+    let makespan_usize = makespan.max(0) as usize;
+    for &op_id in shifted_ops {
+        if let Some(cycles) = shifted_alu_cycles.get(&op_id) {
+            assert_eq!(
+                cycles.len(),
+                VLEN,
+                "BUG: shifted op id={} has {} ALU cycles, expected {} (VLEN)",
+                op_id,
+                cycles.len(),
+                VLEN
+            );
+            for (lane, &c) in cycles.iter().enumerate() {
+                assert!(
+                    c >= 0 && (c as usize) < makespan_usize,
+                    "BUG: shifted op id={} lane {} has cycle {} out of range [0, {})",
+                    op_id,
+                    lane,
+                    c,
+                    makespan_usize
+                );
+            }
+        }
+    }
+}
+
 /// Validate that a CP-SAT solution respects engine slot limits per cycle.
 /// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
 /// Eliminated vbroadcast ops (when vb elimination is used) do not consume VALU slots and are not counted.
@@ -263,9 +307,8 @@ pub(crate) fn validate_ssa_slot_limits(
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
-    const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, AluDeriveInfo>,
-    select_fma_ops: &HashSet<usize>,
+    const_choice_encoding: &HashMap<usize, ConstChoiceEncoding>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
 ) {
@@ -273,6 +316,7 @@ pub(crate) fn validate_ssa_slot_limits(
     if makespan <= 0 {
         return;
     }
+    validate_shifted_alu_cycles(shifted_ops, shifted_alu_cycles, makespan);
     let mut alu_per_cycle: Vec<i32> = vec![0; makespan as usize];
     let mut valu_per_cycle: Vec<i32> = vec![0; makespan as usize];
     let mut load_per_cycle: Vec<i32> = vec![0; makespan as usize];
@@ -289,21 +333,25 @@ pub(crate) fn validate_ssa_slot_limits(
         }
 
         if op.opcode == Opcode::ConstChoice {
-            if const_alu_derive_ops.contains_key(&op.id) {
-                alu_per_cycle[cycle] += 1;
-            } else if const_add_imm_ops.contains(&op.id) {
-                flow_per_cycle[cycle] += 1;
-                if cycle < flow_contributors_per_cycle.len() {
-                    flow_contributors_per_cycle[cycle]
-                        .push((idx, format!("op{} ConstChoice→AddImm", op.id)));
+            match const_choice_encoding.get(&op.id) {
+                Some(ConstChoiceEncoding::AluDerive(_)) => {
+                    alu_per_cycle[cycle] += 1;
                 }
-            } else {
-                load_per_cycle[cycle] += 1;
+                Some(ConstChoiceEncoding::AddImm) => {
+                    flow_per_cycle[cycle] += 1;
+                    if cycle < flow_contributors_per_cycle.len() {
+                        flow_contributors_per_cycle[cycle]
+                            .push((idx, format!("op{} ConstChoice→AddImm", op.id)));
+                    }
+                }
+                Some(ConstChoiceEncoding::Load) | None => {
+                    load_per_cycle[cycle] += 1;
+                }
             }
             continue;
         }
         if op.opcode == Opcode::SelectChoice {
-            if select_fma_ops.contains(&op.id) {
+            if matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
                 valu_per_cycle[cycle] += 1;
                 if op.delta_vreg.is_none() {
                     let cycle2 = cycle + 1;
@@ -385,8 +433,8 @@ pub(crate) fn validate_ssa_slot_limits(
                         let (flow_rows, _, _) = build_flow_audit(
                             ops,
                             cycle_assignments,
-                            const_add_imm_ops,
-                            select_fma_ops,
+                            const_choice_encoding,
+                            select_choice_encoding,
                         );
                         format_flow_violation_breadcrumbs(
                             cycle,
@@ -394,8 +442,8 @@ pub(crate) fn validate_ssa_slot_limits(
                             *limit as usize,
                             &flow_rows,
                             &flow_contributors_per_cycle,
-                            const_add_imm_ops,
-                            select_fma_ops,
+                            const_choice_encoding,
+                            select_choice_encoding,
                             cycle_assignments,
                         )
                     };
@@ -422,9 +470,8 @@ pub(crate) fn try_validate_ssa_slot_limits(
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
-    const_add_imm_ops: &HashSet<usize>,
-    const_alu_derive_ops: &HashMap<usize, AluDeriveInfo>,
-    select_fma_ops: &HashSet<usize>,
+    const_choice_encoding: &HashMap<usize, ConstChoiceEncoding>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
 ) -> Result<(), String> {
@@ -444,17 +491,15 @@ pub(crate) fn try_validate_ssa_slot_limits(
             continue;
         }
         if op.opcode == Opcode::ConstChoice {
-            if const_alu_derive_ops.contains_key(&op.id) {
-                alu_per_cycle[cycle] += 1;
-            } else if const_add_imm_ops.contains(&op.id) {
-                flow_per_cycle[cycle] += 1;
-            } else {
-                load_per_cycle[cycle] += 1;
+            match const_choice_encoding.get(&op.id) {
+                Some(ConstChoiceEncoding::AluDerive(_)) => alu_per_cycle[cycle] += 1,
+                Some(ConstChoiceEncoding::AddImm) => flow_per_cycle[cycle] += 1,
+                Some(ConstChoiceEncoding::Load) | None => load_per_cycle[cycle] += 1,
             }
             continue;
         }
         if op.opcode == Opcode::SelectChoice {
-            if select_fma_ops.contains(&op.id) {
+            if matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
                 valu_per_cycle[cycle] += 1;
                 if op.delta_vreg.is_none() {
                     let cycle2 = cycle + 1;
@@ -522,13 +567,62 @@ pub(crate) fn try_validate_ssa_slot_limits(
     Ok(())
 }
 
+/// Verify that every RAW dependency satisfies cycle[consumer] >= producer_visible_cycle.
+/// Producer visible cycle: SelectChoice FMA => producer_cycle+2; shifted => completion_cycle+1; else producer_cycle+1.
+#[cfg(feature = "cpsat")]
+pub(crate) fn verify_all_raw_precedence(
+    ops: &[SsaOp],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
+) {
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+    for (consumer_idx, op) in ops.iter().enumerate() {
+        let consumer_cycle = cycle_assignments.get(consumer_idx).copied().unwrap_or(-1);
+        for &dep_id in &op.dep_ids {
+            let Some(&producer_idx) = id_to_idx.get(&dep_id) else {
+                continue;
+            };
+            let producer = &ops[producer_idx];
+            let producer_cycle = cycle_assignments.get(producer_idx).copied().unwrap_or(-1);
+            let producer_visible_cycle = if producer.opcode == Opcode::SelectChoice
+                && producer.sub_temp_vreg.is_some()
+                && matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
+            {
+                producer_cycle + 2
+            } else if shifted_ops.contains(&producer.id) {
+                let completion = shifted_alu_cycles
+                    .get(&producer.id)
+                    .and_then(|v| v.iter().max().copied())
+                    .unwrap_or(producer_cycle);
+                completion + 1
+            } else {
+                producer_cycle + 1
+            };
+            assert!(
+                consumer_cycle >= producer_visible_cycle,
+                "BUG: RAW precedence violation: op id={} (consumer) at cycle {} depends on op id={} (producer), result visible at cycle {}",
+                op.id,
+                consumer_cycle,
+                producer.id,
+                producer_visible_cycle
+            );
+        }
+    }
+}
+
 /// Verify that every consumer of a SelectChoice FMA (no-delta) result is scheduled at cycle >= dep_cycle + 2.
 /// SelectChoice FMA emits sub at C and fma at C+1; result is visible at C+2. Panics if violated (model bug).
 #[cfg(feature = "cpsat")]
 pub(crate) fn verify_select_choice_fma_consumer_precedence(
     ops: &[SsaOp],
     cycle_assignments: &[i32],
-    select_fma_ops: &HashSet<usize>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) {
     let id_to_idx: HashMap<usize, usize> = ops
         .iter()
@@ -543,7 +637,7 @@ pub(crate) fn verify_select_choice_fma_consumer_precedence(
             };
             let producer = &ops[producer_idx];
             if producer.opcode != Opcode::SelectChoice
-                || !select_fma_ops.contains(&producer.id)
+                || !matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
                 || producer.sub_temp_vreg.is_none()
             {
                 continue;

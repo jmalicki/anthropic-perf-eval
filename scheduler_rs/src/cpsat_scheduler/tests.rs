@@ -53,9 +53,10 @@ mod ssa_tests {
         assert_eq!(result.cycle_assignments.len(), emit.ops.len());
 
         // Verify ConstChoice decisions are extracted
-        // The result should contain const_add_imm_ops (may be empty if solver chose Load)
+        // The result should contain ConstChoice AddImm decisions (may be empty if solver chose Load)
+        let n_add_imm = result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count();
         assert!(
-            result.const_add_imm_ops.len() <= 2,
+            n_add_imm <= 2,
             "Should have at most 2 ConstChoice ops using AddImm"
         );
 
@@ -97,8 +98,13 @@ mod ssa_tests {
         );
         let r = result.unwrap();
         let n_const = emit.ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
+        let r_add_imm = r
+            .const_choice_encoding
+            .values()
+            .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+            .count();
         assert_eq!(
-            r.const_add_imm_ops.len(),
+            r_add_imm,
             n_const,
             "ForceAddImm: all ConstChoice ops must be AddImm"
         );
@@ -169,7 +175,7 @@ mod ssa_tests {
 
         // Verify CP-SAT decisions are extracted
         assert!(
-            cpsat_result.const_add_imm_ops.len() <= 3,
+            cpsat_result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count() <= 3,
             "Should have at most 3 ConstChoice ops using AddImm"
         );
 
@@ -187,9 +193,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &HashSet::new(), // No shifted ops
-            const_add_imm_ops: &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -207,7 +212,7 @@ mod ssa_tests {
                     expected_value
                 ));
 
-            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+            if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AddImm)) {
                 // CP-SAT chose AddImm - verify it's a Flow op
                 assert_eq!(
                     lowered_op.engine,
@@ -228,7 +233,7 @@ mod ssa_tests {
                     SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
-            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+            } else if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AluDerive(_))) {
                 // CP-SAT chose ALU-derive - verify it's an ALU op
                 assert_eq!(
                     lowered_op.engine,
@@ -321,7 +326,7 @@ mod ssa_tests {
 
         // Verify decisions were extracted
         assert!(
-            cpsat_result.const_add_imm_ops.len() <= 2,
+            cpsat_result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count() <= 2,
             "Should have at most 2 ConstChoice ops using AddImm"
         );
 
@@ -338,9 +343,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &HashSet::new(),
-            const_add_imm_ops: &cpsat_result.const_add_imm_ops,
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -365,7 +369,7 @@ mod ssa_tests {
                     const_choice_id
                 ));
 
-            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+            if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AddImm)) {
                 // Verify AddImm was chosen
                 assert_eq!(
                     lowered_op.engine,
@@ -377,7 +381,7 @@ mod ssa_tests {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
-            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+            } else if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AluDerive(_))) {
                 // Verify ALU-derived was chosen
                 assert_eq!(
                     lowered_op.engine,
@@ -452,7 +456,7 @@ mod ssa_tests {
         // Verify SelectChoice decisions are extracted
         // The result should contain select_fma_ops (may be empty if solver chose vselect)
         assert!(
-            result.select_fma_ops.len() <= 2,
+            result.select_choice_encoding.values().filter(|e| matches!(e, crate::types::SelectChoiceEncoding::Fma)).count() <= 2,
             "Should have at most 2 SelectChoice ops using FMA path"
         );
     }
@@ -710,12 +714,13 @@ mod ssa_tests {
             "Should have 3 SelectChoice ops"
         );
         eprintln!("SelectChoice ops: {:?}", select_choice_info);
-        eprintln!("select_fma_ops: {:?}", cpsat_result.select_fma_ops);
+        let fma_ids: Vec<_> = cpsat_result.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect();
+        eprintln!("SelectChoice Fma op.ids: {:?}", fma_ids);
 
         // Count how many SelectChoice ops chose vselect path (not in select_fma_ops)
         let vselect_ops: Vec<_> = select_choice_info
             .iter()
-            .filter(|(_, op_id, _)| !cpsat_result.select_fma_ops.contains(op_id))
+            .filter(|(_, op_id, _)| !matches!(cpsat_result.select_choice_encoding.get(op_id), Some(crate::types::SelectChoiceEncoding::Fma)))
             .collect();
 
         if vselect_ops.len() > 1 {
@@ -862,8 +867,8 @@ mod ssa_tests {
         // Schedule both in cycle 0 - this should violate Flow limit
         let cycle_assignments = vec![0, 0];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let select_fma_ops = HashSet::new();
+        let const_choice_encoding = HashMap::new();
+        let select_choice_encoding = HashMap::new();
 
         // This should panic because we have 2 Flow ops in cycle 0
         let result = std::panic::catch_unwind(|| {
@@ -872,9 +877,8 @@ mod ssa_tests {
                 &cycle_assignments,
                 &shifted_ops,
                 &HashMap::new(), // shifted_alu_cycles
-                &const_add_imm_ops,
-                &HashMap::new(), // const_alu_derive_ops
-                &select_fma_ops,
+                &const_choice_encoding,
+                &select_choice_encoding,
                 &HashSet::new(), // eliminated_vbroadcast_ops
                 &MachineConfig::default(),
             );
@@ -915,8 +919,8 @@ mod ssa_tests {
         // Schedule in different cycles - this should be valid
         let cycle_assignments = vec![0, 1];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let select_fma_ops = HashSet::new();
+        let const_choice_encoding = HashMap::new();
+        let select_choice_encoding = HashMap::new();
 
         // This should NOT panic
         validate_ssa_slot_limits(
@@ -924,9 +928,8 @@ mod ssa_tests {
             &cycle_assignments,
             &shifted_ops,
             &HashMap::new(), // shifted_alu_cycles
-            &const_add_imm_ops,
-            &HashMap::new(), // const_alu_derive_ops
-            &select_fma_ops,
+            &const_choice_encoding,
+            &select_choice_encoding,
             &HashSet::new(), // eliminated_vbroadcast_ops
             &MachineConfig::default(),
         );
@@ -982,14 +985,14 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         // If any ConstChoice ops chose AddImm path, they should be in different cycles
-        if !cpsat_result.const_add_imm_ops.is_empty() {
+        if cpsat_result.const_choice_encoding.values().any(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)) {
             let addimm_cycles: Vec<i32> = emit
                 .ops
                 .iter()
                 .enumerate()
                 .filter(|(_, op)| {
                     op.opcode == Opcode::ConstChoice
-                        && cpsat_result.const_add_imm_ops.contains(&op.id)
+                        && matches!(cpsat_result.const_choice_encoding.get(&op.id), Some(crate::types::ConstChoiceEncoding::AddImm))
                 })
                 .map(|(idx, _)| cpsat_result.cycle_assignments[idx])
                 .collect();
@@ -1091,7 +1094,7 @@ mod ssa_tests {
             if op.opcode == Opcode::AddImm {
                 flow_users.push((idx, cycle, "AddImm"));
             } else if op.opcode == Opcode::ConstChoice
-                && cpsat_result.const_add_imm_ops.contains(&op.id)
+                && matches!(cpsat_result.const_choice_encoding.get(&op.id), Some(crate::types::ConstChoiceEncoding::AddImm))
             {
                 flow_users.push((idx, cycle, "ConstChoice→AddImm"));
             }
@@ -1179,7 +1182,7 @@ mod ssa_tests {
 
         // Verify decisions were extracted
         assert!(
-            cpsat_result.select_fma_ops.len() <= 2,
+            cpsat_result.select_choice_encoding.values().filter(|e| matches!(e, crate::types::SelectChoiceEncoding::Fma)).count() <= 2,
             "Should have at most 2 SelectChoice ops using FMA path"
         );
 
@@ -1195,9 +1198,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &HashSet::new(), // No shifted ops
-            const_add_imm_ops: &HashSet::new(), // No ConstChoice AddImm ops
-            const_alu_derive_ops: &HashMap::new(), // No ConstChoice ALU-derived
-            select_fma_ops: &cpsat_result.select_fma_ops, // Use CP-SAT decisions
+            const_choice_encoding: &HashMap::new(),
+            select_choice_encoding: &cpsat_result.select_choice_encoding, // Use CP-SAT decisions
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -1207,7 +1209,7 @@ mod ssa_tests {
 
         // Verify that SelectChoice ops were lowered correctly based on CP-SAT decisions
         for select_choice_id in &select_choice_ids {
-            if cpsat_result.select_fma_ops.contains(select_choice_id) {
+            if matches!(cpsat_result.select_choice_encoding.get(select_choice_id), Some(crate::types::SelectChoiceEncoding::Fma)) {
                 // CP-SAT chose FMA path - verify sub and fma ops exist
                 let sub_op = lowered_ops
                     .iter()
@@ -1330,7 +1332,7 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         assert!(
-            cpsat_result.select_fma_ops.contains(&select_choice_id),
+            matches!(cpsat_result.select_choice_encoding.get(&select_choice_id), Some(crate::types::SelectChoiceEncoding::Fma)),
             "ForceFma => select_fma_ops contains SelectChoice id"
         );
         let c = cpsat_result.cycle_assignments[select_choice_idx];
@@ -1350,7 +1352,7 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
+        config.select_fma_ops = cpsat_result.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect();
         let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
@@ -1359,9 +1361,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &assign_result.vreg_to_addr,
             shifted_ops: &HashSet::new(),
-            const_add_imm_ops: &HashSet::new(),
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -1647,7 +1648,7 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
+        config.select_fma_ops = cpsat_result.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect();
         let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
@@ -1673,9 +1674,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &assign_result.vreg_to_addr,
             shifted_ops: &HashSet::new(),
-            const_add_imm_ops: &HashSet::new(),
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -1770,8 +1770,8 @@ mod ssa_tests {
         let cpsat_result = result.unwrap();
 
         assert!(
-            cpsat_result.select_fma_ops.contains(&id1)
-                && cpsat_result.select_fma_ops.contains(&id2)
+            matches!(cpsat_result.select_choice_encoding.get(&id1), Some(crate::types::SelectChoiceEncoding::Fma))
+                && matches!(cpsat_result.select_choice_encoding.get(&id2), Some(crate::types::SelectChoiceEncoding::Fma))
         );
         let c1 = cpsat_result.cycle_assignments[idx1];
         let c2 = cpsat_result.cycle_assignments[idx2];
@@ -1800,7 +1800,7 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
+        config.select_fma_ops = cpsat_result.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect();
         let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         assert!(!assign_result.budget_exceeded);
 
@@ -1875,7 +1875,7 @@ mod ssa_tests {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
         let mut config = AddressAssignConfig::default();
-        config.select_fma_ops = cpsat_result.select_fma_ops.clone();
+        config.select_fma_ops = cpsat_result.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect();
         let assign_result = assign_addresses(&emit.ops, &config).unwrap();
         let intervals = compute_live_intervals(&config, &emit.ops).unwrap();
         for (v1, addr1) in &assign_result.vreg_to_addr {
@@ -1895,9 +1895,8 @@ mod ssa_tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &assign_result.vreg_to_addr,
             shifted_ops: &HashSet::new(),
-            const_add_imm_ops: &HashSet::new(),
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles,
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -2500,9 +2499,10 @@ mod tests {
         assert_eq!(result.cycle_assignments.len(), emit.ops.len());
 
         // Verify ConstChoice decisions are extracted
-        // The result should contain const_add_imm_ops (may be empty if solver chose Load)
+        // The result should contain ConstChoice AddImm decisions (may be empty if solver chose Load)
+        let n_add_imm = result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count();
         assert!(
-            result.const_add_imm_ops.len() <= 2,
+            n_add_imm <= 2,
             "Should have at most 2 ConstChoice ops using AddImm"
         );
 
@@ -2581,7 +2581,7 @@ mod tests {
 
         // Verify CP-SAT decisions are extracted
         assert!(
-            cpsat_result.const_add_imm_ops.len() <= 3,
+            cpsat_result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count() <= 3,
             "Should have at most 3 ConstChoice ops using AddImm"
         );
 
@@ -2599,9 +2599,8 @@ mod tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &HashSet::new(), // No shifted ops
-            const_add_imm_ops: &cpsat_result.const_add_imm_ops, // Use CP-SAT decisions
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -2619,7 +2618,7 @@ mod tests {
                     expected_value
                 ));
 
-            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+            if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AddImm)) {
                 // CP-SAT chose AddImm - verify it's a Flow op
                 assert_eq!(
                     lowered_op.engine,
@@ -2640,7 +2639,7 @@ mod tests {
                     SlotVal::Int(addr) => assert_eq!(*addr, 0, "AddImm should read from address 0"),
                     _ => panic!("AddImm slot[2] should be Int(0)"),
                 }
-            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+            } else if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AluDerive(_))) {
                 // CP-SAT chose ALU-derive - verify it's an ALU op
                 assert_eq!(
                     lowered_op.engine,
@@ -2738,7 +2737,7 @@ mod tests {
 
         // Verify decisions were extracted
         assert!(
-            cpsat_result.const_add_imm_ops.len() <= 2,
+            cpsat_result.const_choice_encoding.values().filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)).count() <= 2,
             "Should have at most 2 ConstChoice ops using AddImm"
         );
 
@@ -2755,9 +2754,8 @@ mod tests {
             ssa_ops: &emit.ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &HashSet::new(),
-            const_add_imm_ops: &cpsat_result.const_add_imm_ops,
-            const_alu_derive_ops: &cpsat_result.const_alu_derive_ops,
-            select_fma_ops: &cpsat_result.select_fma_ops,
+            const_choice_encoding: &cpsat_result.const_choice_encoding,
+            select_choice_encoding: &cpsat_result.select_choice_encoding,
             shifted_alu_cycles: &cpsat_result.shifted_alu_cycles, // Use CP-SAT individual ALU cycles
             eliminated_vbroadcast_ops: &cpsat_result.eliminated_vbroadcast_ops,
             eliminated_vb_to_scalar_producer: &cpsat_result.eliminated_vb_to_scalar_producer,
@@ -2782,7 +2780,7 @@ mod tests {
                     const_choice_id
                 ));
 
-            if cpsat_result.const_add_imm_ops.contains(const_choice_id) {
+            if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AddImm)) {
                 // Verify AddImm was chosen
                 assert_eq!(
                     lowered_op.engine,
@@ -2794,7 +2792,7 @@ mod tests {
                     SlotVal::Str(s) => assert_eq!(s, "add_imm"),
                     _ => panic!("Should be add_imm"),
                 }
-            } else if cpsat_result.const_alu_derive_ops.contains_key(const_choice_id) {
+            } else if matches!(cpsat_result.const_choice_encoding.get(const_choice_id), Some(crate::types::ConstChoiceEncoding::AluDerive(_))) {
                 // Verify ALU-derived was chosen
                 assert_eq!(
                     lowered_op.engine,
@@ -5033,13 +5031,14 @@ mod tests {
 
         let r = result.unwrap();
         eprintln!(
-            "test_ssa_cpsat_scratch_constraint_selectchoice_fma_reads: makespan={}, select_fma_ops={:?}",
-            r.makespan, r.select_fma_ops
+            "test_ssa_cpsat_scratch_constraint_selectchoice_fma_reads: makespan={}, select_fma_op_ids={:?}",
+            r.makespan,
+            r.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect::<Vec<_>>()
         );
 
         // Verify op3 chose FMA
         assert!(
-            r.select_fma_ops.contains(&3),
+            matches!(r.select_choice_encoding.get(&3), Some(crate::types::SelectChoiceEncoding::Fma)),
             "op3 should choose FMA path"
         );
 
@@ -5049,11 +5048,22 @@ mod tests {
             scheduled_ops[idx].cycle = cycle;
         }
 
+        let const_alu_derive_ops: std::collections::HashMap<usize, crate::types::AluDeriveInfo> = r
+            .const_choice_encoding
+            .iter()
+            .filter_map(|(id, enc)| {
+                if let crate::types::ConstChoiceEncoding::AluDerive(info) = enc {
+                    Some((*id, info.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let config = AddressAssignConfig {
             budget: 12, // Match CP-SAT scratch_budget: sub_temp (8) + cond + false_val + true_val + result
             start_addr: 1,
-            select_fma_ops: r.select_fma_ops.clone(),
-            const_alu_derive_ops: r.const_alu_derive_ops.clone(),
+            select_fma_ops: r.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect(),
+            const_alu_derive_ops,
             ..Default::default()
         };
         let assign_result = assign_addresses(&scheduled_ops, &config).unwrap();
@@ -5226,13 +5236,15 @@ mod tests {
 
         let r = result.unwrap();
         eprintln!(
-            "test_ssa_cpsat_scratch_constraint_cse_shared_sub_temp: makespan={}, select_fma_ops={:?}, cse_group_results={:?}",
-            r.makespan, r.select_fma_ops, r.cse_group_results
+            "test_ssa_cpsat_scratch_constraint_cse_shared_sub_temp: makespan={}, select_fma_op_ids={:?}, cse_group_results={:?}",
+            r.makespan,
+            r.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect::<Vec<_>>(),
+            r.cse_group_results
         );
 
         // Verify both ops chose FMA
         assert!(
-            r.select_fma_ops.contains(&3) && r.select_fma_ops.contains(&4),
+            matches!(r.select_choice_encoding.get(&3), Some(crate::types::SelectChoiceEncoding::Fma)) && matches!(r.select_choice_encoding.get(&4), Some(crate::types::SelectChoiceEncoding::Fma)),
             "Both SelectChoice ops should choose FMA path"
         );
 
@@ -5270,7 +5282,7 @@ mod tests {
             let max_fma = group
                 .consumer_indices
                 .iter()
-                .filter(|&&idx| idx < scheduled_ops.len() && r.select_fma_ops.contains(&scheduled_ops[idx].id))
+                .filter(|&&idx| idx < scheduled_ops.len() && matches!(r.select_choice_encoding.get(&scheduled_ops[idx].id), Some(crate::types::SelectChoiceEncoding::Fma)))
                 .map(|&idx| scheduled_ops[idx].cycle + 1)
                 .max()
                 .unwrap_or(res.sub_cycle + 1);
@@ -5280,7 +5292,7 @@ mod tests {
         let config = AddressAssignConfig {
             budget: 16, // Match CP-SAT scratch_budget
             start_addr: 1,
-            select_fma_ops: r.select_fma_ops.clone(),
+            select_fma_ops: r.select_choice_encoding.iter().filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma)).map(|(id, _)| *id).collect(),
             cse_consumer_op_ids,
             cse_shared_sub_temp_intervals: cse_shared,
             ..Default::default()

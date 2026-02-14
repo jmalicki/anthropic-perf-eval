@@ -21,7 +21,7 @@ use super::config::{
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
-    validate_ssa_slot_limits,
+    validate_ssa_slot_limits, verify_all_raw_precedence,
     verify_select_choice_fma_consumer_precedence,
 };
 
@@ -103,9 +103,8 @@ pub fn schedule_ssa_cpsat(
             gap: 0.0,
             shifted_ops: HashSet::new(),
             shifted_alu_cycles: HashMap::new(),
-            const_add_imm_ops: HashSet::new(),
-            const_alu_derive_ops: HashMap::new(),
-            select_fma_ops: HashSet::new(),
+            const_choice_encoding: HashMap::new(),
+            select_choice_encoding: HashMap::new(),
             empty_cycle_count: 0,
             makespan_driven_by_capacity: false,
             lb_cycles: Some(0),
@@ -3494,71 +3493,97 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Extract ConstChoice: ForceAddImm => all; ForceLoad => none; Optimize => from solver
-            // Also extract ALU-derived choices (op_id -> (left_id, right_id, opcode))
-            let (const_add_imm_ops, const_alu_derive_ops): (HashSet<usize>, HashMap<usize, crate::types::AluDeriveInfo>) =
+            // Extract ConstChoice: one encoding per op (Load, AddImm, or AluDerive).
+            let const_choice_encoding: HashMap<usize, crate::types::ConstChoiceEncoding> =
                 match const_choice_mode {
-                    ConstChoiceMode::ForceAddImm => (
-                        const_choice_ops.iter().map(|&idx| ops[idx].id).collect(),
-                        HashMap::new(),
-                    ),
-                    ConstChoiceMode::ForceLoad => (HashSet::new(), HashMap::new()),
+                    ConstChoiceMode::ForceAddImm => const_choice_ops
+                        .iter()
+                        .map(|&idx| (ops[idx].id, crate::types::ConstChoiceEncoding::AddImm))
+                        .collect(),
+                    ConstChoiceMode::ForceLoad => const_choice_ops
+                        .iter()
+                        .map(|&idx| (ops[idx].id, crate::types::ConstChoiceEncoding::Load))
+                        .collect(),
                     ConstChoiceMode::Optimize => {
-                        let mut add_imm = HashSet::new();
-                        let mut alu_derive = HashMap::new();
+                        let mut enc = HashMap::new();
                         for &idx in &const_choice_ops {
-                            if let Some(use_vars) = const_choice_encoding_vars.get(&idx) {
+                            let op_id = ops[idx].id;
+                            let choice = if let Some(use_vars) = const_choice_encoding_vars.get(&idx) {
                                 let chosen = use_vars
                                     .iter()
                                     .position(|&b| b.solution_value(&response));
-                                if chosen == Some(1) {
-                                    add_imm.insert(ops[idx].id);
-                                } else if let Some(k) = chosen {
-                                    if k >= 2 {
+                                match chosen {
+                                    Some(1) => crate::types::ConstChoiceEncoding::AddImm,
+                                    Some(k) if k >= 2 => {
                                         if let Some(info) = const_choice_alu_encoding_info.get(&idx) {
                                             let i = k - 2;
                                             if i < info.len() {
                                                 let (li, ri, opcode) = info[i];
-                                                alu_derive.insert(
-                                                    ops[idx].id,
+                                                crate::types::ConstChoiceEncoding::AluDerive(
                                                     crate::types::AluDeriveInfo {
                                                         left_op_id: ops[li].id,
                                                         right_op_id: ops[ri].id,
                                                         opcode,
                                                     },
-                                                );
+                                                )
+                                            } else {
+                                                crate::types::ConstChoiceEncoding::Load
                                             }
+                                        } else {
+                                            crate::types::ConstChoiceEncoding::Load
                                         }
                                     }
+                                    _ => crate::types::ConstChoiceEncoding::Load,
                                 }
                             } else if let Some(&var) = const_choice_vars.get(&idx) {
                                 if var.solution_value(&response) {
-                                    add_imm.insert(ops[idx].id);
+                                    crate::types::ConstChoiceEncoding::AddImm
+                                } else {
+                                    crate::types::ConstChoiceEncoding::Load
                                 }
-                            }
+                            } else {
+                                crate::types::ConstChoiceEncoding::Load
+                            };
+                            enc.insert(op_id, choice);
                         }
-                        (add_imm, alu_derive)
+                        enc
                     }
                 };
 
-            // Extract SelectChoice: ForceFma => all; ForceVselect => none; Optimize => from solver
-            let select_fma_ops: HashSet<usize> = match select_choice_mode {
-                SelectChoiceMode::ForceFma => {
-                    select_choice_ops.iter().map(|&idx| ops[idx].id).collect()
-                }
-                SelectChoiceMode::ForceVselect => HashSet::new(),
-                SelectChoiceMode::Optimize => {
-                    if select_choice_vars.is_empty() {
-                        HashSet::new()
-                    } else {
-                        select_choice_vars
-                            .iter()
-                            .filter(|(_, &var)| var.solution_value(&response))
-                            .map(|(&idx, _)| ops[idx].id)
-                            .collect()
+            // Extract SelectChoice: one encoding per op (Fma or Vselect).
+            let select_choice_encoding: HashMap<usize, crate::types::SelectChoiceEncoding> =
+                match select_choice_mode {
+                    SelectChoiceMode::ForceFma => select_choice_ops
+                        .iter()
+                        .map(|&idx| (ops[idx].id, crate::types::SelectChoiceEncoding::Fma))
+                        .collect(),
+                    SelectChoiceMode::ForceVselect => select_choice_ops
+                        .iter()
+                        .map(|&idx| (ops[idx].id, crate::types::SelectChoiceEncoding::Vselect))
+                        .collect(),
+                    SelectChoiceMode::Optimize => {
+                        let mut enc = HashMap::new();
+                        for &idx in &select_choice_ops {
+                            let op_id = ops[idx].id;
+                            let e = if select_choice_vars
+                                .get(&idx)
+                                .map(|v| v.solution_value(&response))
+                                .unwrap_or(false)
+                            {
+                                crate::types::SelectChoiceEncoding::Fma
+                            } else {
+                                crate::types::SelectChoiceEncoding::Vselect
+                            };
+                            enc.insert(op_id, e);
+                        }
+                        enc
                     }
-                }
-            };
+                };
+            let select_fma_op_ids: HashSet<usize> = select_choice_encoding
+                .iter()
+                .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+                .map(|(id, _)| *id)
+                .collect();
 
             // Extract CSE group results (sub_active, sub_cycle per group)
             let cse_group_results: Vec<super::cse_groups::CseGroupResult> =
@@ -3595,7 +3620,7 @@ pub fn schedule_ssa_cpsat(
                 &shiftable_set,
                 &shifted_ops,
                 &select_choice_with_fma_delay,
-                &select_fma_ops,
+                &select_fma_op_ids,
                 horizon as i32,
             );
 
@@ -3695,7 +3720,7 @@ pub fn schedule_ssa_cpsat(
                 }
                 if enable_valu_shift && (valu_count > 0 || shiftable_count > 0 || select_choice_count > 0) {
                     let s = shifted_ops.len() as i64; // number shifted to ALU (model s = sum(shift_vars))
-                    let z = select_fma_ops.len() as i64;
+                    let z = select_fma_op_ids.len() as i64;
                     let select_valu_contrib_solution: i64 = if !cse_group_results.is_empty() {
                         let num_active = cse_group_results.iter().filter(|r| r.sub_active).count() as i64;
                         num_active + z
@@ -3724,8 +3749,11 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
                 if flow_base > 0 || const_choice_count > 0 || select_choice_count > 0 {
-                    let z = select_fma_ops.len() as i64;
-                    let y = const_add_imm_ops.len() as i64;
+                    let z = select_fma_op_ids.len() as i64;
+                    let y = const_choice_encoding
+                        .values()
+                        .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                        .count() as i64;
                     let lhs_flow = (actual_makespan as i64) + z - y;
                     let binding_flow = lhs_flow == flow_base;
                     if binding_flow {
@@ -3736,7 +3764,10 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
                 if load_count > 0 && const_choice_count > 0 {
-                    let y = const_add_imm_ops.len() as i64;
+                    let y = const_choice_encoding
+                        .values()
+                        .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                        .count() as i64;
                     let lhs_load = 2 * (actual_makespan as i64) + y;
                     let binding_load = lhs_load == load_count;
                     if binding_load {
@@ -3846,7 +3877,7 @@ pub fn schedule_ssa_cpsat(
                             };
                             let dep_cycle = cycle_assignments[dep_idx];
                             let result_cycle = if select_choice_with_fma_delay.contains(&dep_idx)
-                                && select_fma_ops.contains(&dep_id)
+                                && select_fma_op_ids.contains(&dep_id)
                             {
                                 dep_cycle + 2
                             } else {
@@ -3886,18 +3917,23 @@ pub fn schedule_ssa_cpsat(
             // Solution breadcrumbs: log Flow audit when verbose (before validation)
             if verbose {
                 let (flow_rows, flow_per_cycle, _) =
-                    build_flow_audit(ops, &cycle_assignments, &const_add_imm_ops, &select_fma_ops);
+                    build_flow_audit(ops, &cycle_assignments, &const_choice_encoding, &select_choice_encoding);
                 eprintln!(
                     "[Flow solution breadcrumbs] Total Flow-contributing ops: {}",
                     flow_rows.len()
                 );
+                let add_imm_ids: Vec<usize> = const_choice_encoding
+                    .iter()
+                    .filter(|(_, e)| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                    .map(|(&id, _)| id)
+                    .collect();
                 eprintln!(
-                    "[Flow solution breadcrumbs] const_add_imm_ops (op.id) = {:?}",
-                    const_add_imm_ops
+                    "[Flow solution breadcrumbs] ConstChoice AddImm (op.id) = {:?}",
+                    add_imm_ids
                 );
                 eprintln!(
-                    "[Flow solution breadcrumbs] select_fma_ops (op.id)   = {:?}",
-                    select_fma_ops
+                    "[Flow solution breadcrumbs] SelectChoice Fma (op.id) = {:?}",
+                    select_fma_op_ids
                 );
                 for r in &flow_rows {
                     eprintln!(
@@ -3938,15 +3974,22 @@ pub fn schedule_ssa_cpsat(
                 &cycle_assignments,
                 &shifted_ops,
                 &shifted_alu_cycles,
-                &const_add_imm_ops,
-                &const_alu_derive_ops,
-                &select_fma_ops,
+                &const_choice_encoding,
+                &select_choice_encoding,
                 &eliminated_vbroadcast_ops,
                 &machine,
             );
 
-            // Post-solution validation: SelectChoice FMA result visible at C+2; consumers must be at >= C+2.
-            verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_fma_ops);
+            // Post-solution validation: every RAW dependency satisfies precedence (consumer >= producer visible cycle).
+            verify_all_raw_precedence(
+                ops,
+                &cycle_assignments,
+                &shifted_ops,
+                &shifted_alu_cycles,
+                &select_choice_encoding,
+            );
+            // SelectChoice FMA result visible at C+2 (redundant with verify_all_raw_precedence but kept for clarity).
+            verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_choice_encoding);
 
             if verbose {
                 // Verify objective structure: objective = scale*makespan + tie_breaker, so floor(objective/scale) should equal makespan.
@@ -3968,9 +4011,8 @@ pub fn schedule_ssa_cpsat(
                     ops,
                     &cycle_assignments,
                     &shifted_ops,
-                    &const_add_imm_ops,
-                    &const_alu_derive_ops,
-                    &select_fma_ops,
+                    &const_choice_encoding,
+                    &select_choice_encoding,
                 );
                 eprintln!(
                     "SSA CP-SAT result: {} cycles (best_bound: {:.1}), status {:?}, gap {:.2}%, time {:.2}s",
@@ -4053,12 +4095,20 @@ pub fn schedule_ssa_cpsat(
                     summary.valu_vbroadcast_slots,
                     summary.valu_other_slots
                 );
+                let n_add_imm = const_choice_encoding
+                    .values()
+                    .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                    .count();
+                let n_alu_derive = const_choice_encoding
+                    .values()
+                    .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AluDerive(_)))
+                    .count();
                 eprintln!(
                     "  Shifted {} VALU ops, {} ConstChoice AddImm ops, {} ConstChoice AluDerive ops, {} SelectChoice FMA ops",
                     shifted_ops.len(),
-                    const_add_imm_ops.len(),
-                    const_alu_derive_ops.len(),
-                    select_fma_ops.len()
+                    n_add_imm,
+                    n_alu_derive,
+                    select_fma_op_ids.len()
                 );
             }
 
@@ -4086,9 +4136,8 @@ pub fn schedule_ssa_cpsat(
                 gap,
                 shifted_ops,
                 shifted_alu_cycles: out_shifted_alu_cycles,
-                const_add_imm_ops,
-                const_alu_derive_ops,
-                select_fma_ops,
+                const_choice_encoding,
+                select_choice_encoding,
                 empty_cycle_count: out_empty_count,
                 makespan_driven_by_capacity: (out_makespan as i64) == capacity_lower_bound,
                 lb_cycles,

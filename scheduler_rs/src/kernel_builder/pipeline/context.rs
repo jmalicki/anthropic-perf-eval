@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::types::{AluDeriveInfo, MachineConfig, Opcode};
+use crate::types::{ConstChoiceEncoding, MachineConfig, SelectChoiceEncoding};
 
 use super::super::config::CompilerConfig;
 
@@ -48,12 +48,10 @@ pub struct SchedulingBounds {
 pub struct SchedulingDecisions {
     /// VALU ops shifted to ALU (by op ID).
     pub shifted_ops: HashSet<usize>,
-    /// SelectChoice ops using FMA path (by op ID).
-    pub select_fma_ops: HashSet<usize>,
-    /// ConstChoice ops using AddImm encoding (by op ID).
-    pub const_add_imm_ops: HashSet<usize>,
-    /// ConstChoice ops using ALU-derived encoding: op_id → AluDeriveInfo.
-    pub const_alu_derive_ops: HashMap<usize, AluDeriveInfo>,
+    /// SelectChoice encoding per op ID (exactly one variant per SelectChoice op).
+    pub select_choice_encoding: HashMap<usize, SelectChoiceEncoding>,
+    /// ConstChoice encoding per op ID (exactly one variant per ConstChoice op).
+    pub const_choice_encoding: HashMap<usize, ConstChoiceEncoding>,
     /// Individual ALU cycle assignments for shifted VALU ops: op_id → [c0..c7].
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
     /// Op IDs of vbroadcasts eliminated (not emitted; consumers use scalar producer).

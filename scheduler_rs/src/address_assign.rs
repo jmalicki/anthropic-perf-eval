@@ -945,6 +945,14 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         .max()
         .unwrap_or(0);
 
+    // Ensure no assigned address is at or above budget (linear scan must stay within [0, budget-1]).
+    if max_addr >= config.budget as i64 {
+        return Err(format!(
+            "Address assignment exceeded scratch budget: max_addr {} >= budget {}",
+            max_addr, config.budget
+        ));
+    }
+
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
 

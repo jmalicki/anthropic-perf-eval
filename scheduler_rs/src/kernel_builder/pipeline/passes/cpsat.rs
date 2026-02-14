@@ -46,14 +46,15 @@ impl Pass for CpSatSchedulePass {
         };
         let shift_hints = shift_hints_set.as_ref();
 
-        // Build SelectChoice hints
+        // Build SelectChoice hints (Fma op ids from greedy)
         let op_ids: HashSet<usize> = ctx.ops.iter().map(|op| op.id).collect();
         let select_hints_set: HashSet<usize> = ctx
             .greedy_decisions
-            .select_fma_ops
+            .select_choice_encoding
             .iter()
+            .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+            .map(|(id, _)| *id)
             .filter(|id| op_ids.contains(id))
-            .copied()
             .collect();
         let select_hints = if select_hints_set.is_empty() {
             None
@@ -82,6 +83,13 @@ impl Pass for CpSatSchedulePass {
         } else {
             Some(cse_groups.as_slice())
         };
+        let const_add_imm_hints: std::collections::HashSet<usize> = ctx
+            .greedy_decisions
+            .const_choice_encoding
+            .iter()
+            .filter(|(_, e)| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+            .map(|(id, _)| *id)
+            .collect();
         let cpsat_result = schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
@@ -90,7 +98,7 @@ impl Pass for CpSatSchedulePass {
                 shift_hints,
                 forced_shifts,
                 select_choice_hints: select_hints,
-                const_add_imm_hints: Some(&ctx.greedy_decisions.const_add_imm_ops),
+                const_add_imm_hints: Some(&const_add_imm_hints),
                 eliminate_vbroadcast_hints: None,
                 initial_live: None,
                 live_out_vregs: None,
@@ -113,9 +121,8 @@ impl Pass for CpSatSchedulePass {
         // Populate final decisions from CP-SAT result
         ctx.final_decisions = SchedulingDecisions {
             shifted_ops: cpsat_result.shifted_ops,
-            select_fma_ops: cpsat_result.select_fma_ops,
-            const_add_imm_ops: cpsat_result.const_add_imm_ops,
-            const_alu_derive_ops: cpsat_result.const_alu_derive_ops,
+            select_choice_encoding: cpsat_result.select_choice_encoding,
+            const_choice_encoding: cpsat_result.const_choice_encoding,
             shifted_alu_cycles: cpsat_result.shifted_alu_cycles.clone(),
             eliminated_vbroadcast_ops: cpsat_result.eliminated_vbroadcast_ops.clone(),
             eliminated_vb_to_scalar_producer: cpsat_result
@@ -157,13 +164,23 @@ impl Pass for CpSatSchedulePass {
             .iter()
             .filter(|o| o.opcode == Opcode::ConstChoice)
             .count();
-        let const_add_imm = ctx.final_decisions.const_add_imm_ops.len();
+        let const_add_imm = ctx
+            .final_decisions
+            .const_choice_encoding
+            .values()
+            .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+            .count();
         let select_total = ctx
             .ops
             .iter()
             .filter(|o| o.opcode == Opcode::SelectChoice)
             .count();
-        let select_fma = ctx.final_decisions.select_fma_ops.len();
+        let select_fma = ctx
+            .final_decisions
+            .select_choice_encoding
+            .values()
+            .filter(|e| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+            .count();
 
         Ok(format!(
             "{} cycles (greedy was {}), {} VALU shifted | ConstChoice: {} AddImm, {} Load | SelectChoice: {} FMA, {} vselect",

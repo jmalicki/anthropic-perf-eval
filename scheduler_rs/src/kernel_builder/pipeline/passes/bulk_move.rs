@@ -81,9 +81,8 @@ impl Pass for BulkMoveCompactionPass {
                     &cycle_assignments,
                     &ctx.final_decisions.shifted_ops,
                     &shifted_alu_cycles,
-                    &ctx.final_decisions.const_add_imm_ops,
-                    &ctx.final_decisions.const_alu_derive_ops,
-                    &ctx.final_decisions.select_fma_ops,
+                    &ctx.final_decisions.const_choice_encoding,
+                    &ctx.final_decisions.select_choice_encoding,
                     &ctx.final_decisions.eliminated_vbroadcast_ops,
                     &ctx.config.machine,
                 );

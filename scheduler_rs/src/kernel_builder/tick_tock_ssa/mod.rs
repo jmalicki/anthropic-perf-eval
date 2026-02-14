@@ -758,8 +758,20 @@ impl SsaTickTockKernelBuilder {
 
         // Clone decisions so we can mutate ctx freely in later phases
         let greedy_shifted = ctx.greedy_decisions.shifted_ops.clone();
-        let greedy_select_fma_ops = ctx.greedy_decisions.select_fma_ops.clone();
-        let greedy_const_add_imm_ops = ctx.greedy_decisions.const_add_imm_ops.clone();
+        let greedy_select_fma_ops: HashSet<usize> = ctx
+            .greedy_decisions
+            .select_choice_encoding
+            .iter()
+            .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+            .map(|(id, _)| *id)
+            .collect();
+        let greedy_const_add_imm_ops: HashSet<usize> = ctx
+            .greedy_decisions
+            .const_choice_encoding
+            .iter()
+            .filter(|(_, e)| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+            .map(|(id, _)| *id)
+            .collect();
 
         // ====================================================================
         // Phase 2: Per-section feasibility (stays as orchestration, not a pass)
@@ -1023,12 +1035,20 @@ impl SsaTickTockKernelBuilder {
                         return Err(error);
                     }
                 };
-                section_select_fma_overrides[k] = Some(seg_result.select_fma_ops.clone());
+                let seg_fma: HashSet<usize> = seg_result
+                    .select_choice_encoding
+                    .iter()
+                    .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+                    .map(|(id, _)| *id)
+                    .collect();
+                section_select_fma_overrides[k] = Some(seg_fma);
                 for &i in &global_indices {
                     current_select_fma.remove(&ctx.ops[i].id);
                 }
-                for &id in &seg_result.select_fma_ops {
-                    current_select_fma.insert(id);
+                for (id, enc) in &seg_result.select_choice_encoding {
+                    if matches!(enc, crate::types::SelectChoiceEncoding::Fma) {
+                        current_select_fma.insert(*id);
+                    }
                 }
                 let (start, end) = boundaries[k];
                 for op in &ctx.ops[start..end] {
@@ -1036,8 +1056,10 @@ impl SsaTickTockKernelBuilder {
                         current_const_add_imm.remove(&op.id);
                     }
                 }
-                for &id in &seg_result.const_add_imm_ops {
-                    current_const_add_imm.insert(id);
+                for (id, enc) in &seg_result.const_choice_encoding {
+                    if matches!(enc, crate::types::ConstChoiceEncoding::AddImm) {
+                        current_const_add_imm.insert(*id);
+                    }
                 }
                 // Re-insert ConstChoice ops that were filtered out (AddImm alternatives
                 // not sent to per-section CP-SAT) but were in greedy's original set.
@@ -1339,9 +1361,19 @@ impl SsaTickTockKernelBuilder {
         if std::env::var("SCHEDULER_DEBUG_DECISIONS").is_ok() {
             let mut s: Vec<_> = cpsat_result.shifted_ops.iter().copied().collect();
             s.sort_unstable();
-            let mut c: Vec<_> = cpsat_result.const_add_imm_ops.iter().copied().collect();
+            let mut c: Vec<_> = cpsat_result
+                .const_choice_encoding
+                .iter()
+                .filter(|(_, e)| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                .map(|(id, _)| *id)
+                .collect();
             c.sort_unstable();
-            let mut f: Vec<_> = cpsat_result.select_fma_ops.iter().copied().collect();
+            let mut f: Vec<_> = cpsat_result
+                .select_choice_encoding
+                .iter()
+                .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+                .map(|(id, _)| *id)
+                .collect();
             f.sort_unstable();
             eprintln!(
                 "[CPSAT_DECISIONS] shifted_ops={:?} const_add_imm_ops={:?} select_fma_ops={:?}",
@@ -1357,9 +1389,17 @@ impl SsaTickTockKernelBuilder {
                 cycles, greedy_cycles, shifted_ops.len()
             );
             let const_total = ctx.ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
-            let const_add_imm = cpsat_result.const_add_imm_ops.len();
+            let const_add_imm = cpsat_result
+                .const_choice_encoding
+                .values()
+                .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm))
+                .count();
             let select_total = ctx.ops.iter().filter(|o| o.opcode == Opcode::SelectChoice).count();
-            let select_fma = cpsat_result.select_fma_ops.len();
+            let select_fma = cpsat_result
+                .select_choice_encoding
+                .values()
+                .filter(|e| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+                .count();
             eprintln!(
                 "  ConstChoice: {} AddImm, {} Load | SelectChoice: {} FMA, {} vselect",
                 const_add_imm, const_total.saturating_sub(const_add_imm),
@@ -1377,9 +1417,8 @@ impl SsaTickTockKernelBuilder {
         // Populate final decisions and metrics from CP-SAT result
         ctx.final_decisions = SchedulingDecisions {
             shifted_ops: cpsat_result.shifted_ops.clone(),
-            select_fma_ops: cpsat_result.select_fma_ops.clone(),
-            const_add_imm_ops: cpsat_result.const_add_imm_ops.clone(),
-            const_alu_derive_ops: cpsat_result.const_alu_derive_ops.clone(),
+            select_choice_encoding: cpsat_result.select_choice_encoding.clone(),
+            const_choice_encoding: cpsat_result.const_choice_encoding.clone(),
             shifted_alu_cycles: cpsat_result.shifted_alu_cycles.clone(),
             eliminated_vbroadcast_ops: cpsat_result.eliminated_vbroadcast_ops.clone(),
             eliminated_vb_to_scalar_producer: cpsat_result.eliminated_vb_to_scalar_producer.clone(),

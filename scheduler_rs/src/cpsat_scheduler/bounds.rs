@@ -526,12 +526,10 @@ pub struct SsaCpsatResult {
     /// Individual ALU cycle assignments for shifted VALU ops
     /// Maps op ID -> [cycle0, cycle1, ..., cycle7] (8 cycles, one per ALU op)
     pub shifted_alu_cycles: HashMap<usize, Vec<i32>>,
-    /// Set of ConstChoice op IDs that should use AddImm (Flow) instead of Load
-    pub const_add_imm_ops: HashSet<usize>,
-    /// ConstChoice ops that chose ALU-derived encoding: op_id -> AluDeriveInfo
-    pub const_alu_derive_ops: HashMap<usize, crate::types::AluDeriveInfo>,
-    /// Set of SelectChoice op IDs that should use FMA path (VALU) instead of vselect (Flow)
-    pub select_fma_ops: HashSet<usize>,
+    /// ConstChoice encoding per op ID (exactly one variant per ConstChoice op).
+    pub const_choice_encoding: std::collections::HashMap<usize, crate::types::ConstChoiceEncoding>,
+    /// SelectChoice encoding per op ID (exactly one variant per SelectChoice op).
+    pub select_choice_encoding: std::collections::HashMap<usize, crate::types::SelectChoiceEncoding>,
     /// Number of empty cycles (makespan minus max cycle used). 0 when schedule has no gaps.
     pub empty_cycle_count: usize,
     /// True when makespan equals capacity lower bound (structural bound caused the gap).

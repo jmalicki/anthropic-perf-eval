@@ -2,6 +2,8 @@
 //!
 //! Assigns concrete scratch addresses to VRegs via linear scan allocation.
 
+use std::collections::HashMap;
+
 use crate::address_assign::{assign_addresses, verify_no_address_conflicts_fast, AddressAssignConfig};
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::tick_tock_ssa::SCRATCH_BUDGET_HW;
@@ -33,14 +35,21 @@ impl Pass for AssignAddressesPass {
         }
 
         // Pass scheduling decisions to address assignment
-        if !ctx.final_decisions.select_fma_ops.is_empty() {
-            assign_config.select_fma_ops = ctx.final_decisions.select_fma_ops.clone();
+        let select_fma_op_ids: std::collections::HashSet<usize> = ctx
+            .final_decisions
+            .select_choice_encoding
+            .iter()
+            .filter(|(_, e)| matches!(e, crate::types::SelectChoiceEncoding::Fma))
+            .map(|(id, _)| *id)
+            .collect();
+        if !select_fma_op_ids.is_empty() {
+            assign_config.select_fma_ops = select_fma_op_ids.clone();
         }
         #[cfg(feature = "cpsat")]
         {
             let groups = &ctx.final_decisions.cse_groups;
             let results = &ctx.final_decisions.cse_group_results;
-            let select_fma = &ctx.final_decisions.select_fma_ops;
+            let select_fma = &select_fma_op_ids;
             if !groups.is_empty() && results.len() != groups.len() {
                 eprintln!(
                     "AssignAddresses: CSE block skipped — groups.len() ({}) != results.len() ({}); \
@@ -83,9 +92,22 @@ impl Pass for AssignAddressesPass {
             assign_config.shifted_alu_cycles =
                 ctx.final_decisions.shifted_alu_cycles.clone();
         }
-        if !ctx.final_decisions.const_alu_derive_ops.is_empty() {
-            assign_config.const_alu_derive_ops =
-                ctx.final_decisions.const_alu_derive_ops.clone();
+        {
+            let alu_derive: HashMap<usize, _> = ctx
+                .final_decisions
+                .const_choice_encoding
+                .iter()
+                .filter_map(|(id, enc)| {
+                    if let crate::types::ConstChoiceEncoding::AluDerive(info) = enc {
+                        Some((*id, info.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !alu_derive.is_empty() {
+                assign_config.const_alu_derive_ops = alu_derive;
+            }
         }
         if !ctx.vector_group_lanes.is_empty() {
             assign_config.vector_group_lanes = ctx.vector_group_lanes.clone();

@@ -15,7 +15,7 @@ const CSE_SHARED_SUB_PREFIX: usize = 0xC5E0_0000;
 const TRACE_DEBUG_OP_PREFIX: usize = 0xD3B0_0000;
 
 use crate::address_assign::lower_ssa_op;
-use crate::types::{Engine, Op, SlotVal, SsaId, SsaOp, VReg, VLEN};
+use crate::types::{ConstChoiceEncoding, Engine, Op, SelectChoiceEncoding, SlotVal, SsaId, SsaOp, VReg, VLEN};
 
 /// Check if an SSA VALU op can be shifted to ALU.
 ///
@@ -47,9 +47,8 @@ pub struct LoweringContext<'a> {
     pub ssa_ops: &'a [SsaOp],
     pub vreg_to_addr: &'a HashMap<VReg, i64>,
     pub shifted_ops: &'a HashSet<usize>,
-    pub const_add_imm_ops: &'a HashSet<usize>,
-    pub const_alu_derive_ops: &'a HashMap<usize, crate::types::AluDeriveInfo>,
-    pub select_fma_ops: &'a HashSet<usize>,
+    pub const_choice_encoding: &'a HashMap<usize, ConstChoiceEncoding>,
+    pub select_choice_encoding: &'a HashMap<usize, SelectChoiceEncoding>,
     /// op_id -> [cycle0, ..., cycle7]
     pub shifted_alu_cycles: &'a HashMap<usize, Vec<i32>>,
     pub eliminated_vbroadcast_ops: &'a HashSet<usize>,
@@ -65,22 +64,128 @@ pub struct LoweringContext<'a> {
 /// Each ALU op reads from src[i] and writes to dest[i].
 ///
 /// ConstChoice ops (single op from emit_const_choice) are lowered based on the scheduler's decision:
-/// - If in `const_add_imm_ops`: emit AddImm op (Flow engine)
-/// - Otherwise: emit Const op (Load engine)
+/// - `ConstChoiceEncoding::AddImm`: emit AddImm op (Flow engine)
+/// - `ConstChoiceEncoding::Load`: emit Const op (Load engine)
+/// - `ConstChoiceEncoding::AluDerive(info)`: emit ALU derive op
 ///
-/// The SSA kernel path uses only emit_const_choice(); const_add_imm_ops comes from CP-SAT
-/// (or an empty set for greedy). The legacy emit_const() dual-op path is used only in tests;
-/// there, AddImm ops are filtered before scheduling, so lowering always sees only the Load op.
+/// The SSA kernel path uses only emit_const_choice(); const_choice_encoding comes from CP-SAT
+/// or greedy. The legacy emit_const() dual-op path is used only in tests.
 ///
 /// SelectChoice ops are lowered based on the scheduler's decision:
-/// - If in `select_fma_ops`: emit sub + fma ops (both VALU, sequential)
-/// - Otherwise: emit vselect op (Flow engine)
+/// - `SelectChoiceEncoding::Fma`: emit sub + fma ops (both VALU, sequential)
+/// - `SelectChoiceEncoding::Vselect` or missing: emit vselect op (Flow engine)
 ///
 /// When `cse_groups` and `cse_group_results` are provided and non-empty, SelectChoice FMA
 /// consumers in CSE groups use a shared SUB: one SUB per active group, multiple FMAs per group.
+
+/// Verifies that every VReg that lowering will look up in `vreg_to_addr` is present.
+/// Returns `Err(msg)` on first missing VReg so the pipeline can report a clear error.
+pub fn verify_vreg_mapping_complete(ctx: &LoweringContext<'_>) -> Result<(), String> {
+    use crate::types::{Operand, Opcode};
+    for (idx, op) in ctx.ssa_ops.iter().enumerate() {
+        if let Some(dest) = op.dest {
+            if !ctx.vreg_to_addr.contains_key(&dest) {
+                return Err(format!(
+                    "lowering op[{}] id={}: dest VReg {:?} not in vreg_to_addr",
+                    idx, op.id, dest
+                ));
+            }
+        }
+        for src in &op.srcs {
+            if let Some(vreg) = src.as_vreg() {
+                if !ctx.vreg_to_addr.contains_key(&vreg) {
+                    return Err(format!(
+                        "lowering op[{}] id={}: src VReg {:?} not in vreg_to_addr",
+                        idx, op.id, vreg
+                    ));
+                }
+            }
+        }
+        if op.opcode == Opcode::ConstChoice {
+            if let Some(ConstChoiceEncoding::AluDerive(info)) = ctx.const_choice_encoding.get(&op.id) {
+                let left_dest = ctx
+                    .ssa_ops
+                    .iter()
+                    .find(|o| o.id == info.left_op_id)
+                    .and_then(|o| o.dest)
+                    .ok_or_else(|| format!("ConstChoice AluDerive op[{}]: left producer op id={} not found or no dest", idx, info.left_op_id))?;
+                let right_dest = ctx
+                    .ssa_ops
+                    .iter()
+                    .find(|o| o.id == info.right_op_id)
+                    .and_then(|o| o.dest)
+                    .ok_or_else(|| format!("ConstChoice AluDerive op[{}]: right producer op id={} not found or no dest", idx, info.right_op_id))?;
+                if !ctx.vreg_to_addr.contains_key(&left_dest) {
+                    return Err(format!(
+                        "lowering op[{}] id={}: AluDerive left producer dest {:?} not in vreg_to_addr",
+                        idx, op.id, left_dest
+                    ));
+                }
+                if !ctx.vreg_to_addr.contains_key(&right_dest) {
+                    return Err(format!(
+                        "lowering op[{}] id={}: AluDerive right producer dest {:?} not in vreg_to_addr",
+                        idx, op.id, right_dest
+                    ));
+                }
+            }
+        }
+        if op.opcode == Opcode::SelectChoice {
+            if let Some(delta_vreg) = op.delta_vreg {
+                if !ctx.vreg_to_addr.contains_key(&delta_vreg) {
+                    return Err(format!(
+                        "lowering op[{}] id={}: SelectChoice delta_vreg {:?} not in vreg_to_addr",
+                        idx, op.id, delta_vreg
+                    ));
+                }
+            }
+            if matches!(ctx.select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma))
+                && op.delta_vreg.is_none()
+            {
+                let uses_shared_sub = match (ctx.cse_groups, ctx.cse_group_results) {
+                    (Some(groups), Some(results)) if groups.len() == results.len() => groups
+                        .iter()
+                        .zip(results.iter())
+                        .any(|(g, r)| r.sub_active && g.consumer_indices.contains(&idx)),
+                    _ => false,
+                };
+                if !uses_shared_sub {
+                    if let Some(sub_temp_vreg) = op.sub_temp_vreg {
+                        if !ctx.vreg_to_addr.contains_key(&sub_temp_vreg) {
+                            return Err(format!(
+                                "lowering op[{}] id={}: SelectChoice FMA sub_temp_vreg {:?} not in vreg_to_addr",
+                                idx, op.id, sub_temp_vreg
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(groups), Some(results)) = (ctx.cse_groups, ctx.cse_group_results) {
+        if groups.len() == results.len() {
+            for (group, res) in groups.iter().zip(results.iter()) {
+                if res.sub_active && !ctx.vreg_to_addr.contains_key(&group.sub_temp_vreg) {
+                    return Err(format!(
+                        "CSE group sub_temp_vreg {:?} (sub_active) not in vreg_to_addr",
+                        group.sub_temp_vreg
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// When `cse_groups` and `cse_group_results` are provided and non-empty, SelectChoice FMA
+/// consumers in CSE groups use a shared SUB: one SUB per active group, multiple FMAs per group.
+///
+/// Before lowering, verifies that every VReg that will be looked up in `vreg_to_addr` is present
+/// (see `verify_vreg_mapping_complete`). Returns `Err` on first missing VReg.
 pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, String> {
-    use crate::types::{Opcode, SlotVal};
+    use crate::types::{Operand, Opcode, SlotVal};
     use arrayvec::ArrayVec;
+
+    verify_vreg_mapping_complete(ctx)?;
 
     let mut result = Vec::new();
 
@@ -97,7 +202,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                         continue;
                     };
                     for &idx in &group.consumer_indices {
-                        if idx < ctx.ssa_ops.len() && ctx.select_fma_ops.contains(&ctx.ssa_ops[idx].id) {
+                        if idx < ctx.ssa_ops.len() && matches!(ctx.select_choice_encoding.get(&ctx.ssa_ops[idx].id), Some(SelectChoiceEncoding::Fma)) {
                             m.insert(ctx.ssa_ops[idx].id, sub_temp_addr);
                         }
                     }
@@ -215,7 +320,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                 .produces_constant
                 .expect("ConstChoice op must have produces_constant");
 
-            if let Some(info) = ctx.const_alu_derive_ops.get(&ssa_op.id) {
+            match ctx.const_choice_encoding.get(&ssa_op.id) {
+            Some(ConstChoiceEncoding::AluDerive(info)) => {
                 let left_op_id = info.left_op_id;
                 let right_op_id = info.right_op_id;
                 let opcode = info.opcode;
@@ -260,7 +366,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     from_const_choice: Some(ssa_op.id),
                     from_select_choice: None,
                 });
-            } else if ctx.const_add_imm_ops.contains(&ssa_op.id) {
+            }
+            Some(ConstChoiceEncoding::AddImm) => {
                 // AddImm: dest = scratch[0] + value
                 // IMPORTANT: Scratch memory is ALWAYS initialized to 0 at startup, so scratch[0] == 0
                 // is guaranteed by hardware initialization. add_imm reads from address 0, but we don't
@@ -291,7 +398,8 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     from_const_choice: Some(ssa_op.id),
                     from_select_choice: None,
                 });
-            } else {
+            }
+            Some(ConstChoiceEncoding::Load) | None => {
                 // Load: dest = const value
                 let mut slot: ArrayVec<SlotVal, 6> = ArrayVec::new();
                 slot.push(SlotVal::Str("const".to_string()));
@@ -316,14 +424,15 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     from_select_choice: None,
                 });
             }
+            }
         } else if ssa_op.opcode == Opcode::SelectChoice {
             // Handle SelectChoice based on scheduler decision
             let dest = ssa_op.dest.expect("SelectChoice op must have dest");
             let dest_addr = *ctx.vreg_to_addr.get(&dest).expect("dest VReg not in mapping");
             if std::env::var("SCHEDULER_DEBUG").is_ok() {
                 eprintln!(
-                    "[DEBUG lower_ssa_ops_with_shift] SelectChoice op.id={} cycle={} select_fma_ops.contains={} sub_temp_vreg={:?}",
-                    ssa_op.id, ssa_op.cycle, ctx.select_fma_ops.contains(&ssa_op.id), ssa_op.sub_temp_vreg
+                    "[DEBUG lower_ssa_ops_with_shift] SelectChoice op.id={} cycle={} select_choice=Fma={} sub_temp_vreg={:?}",
+                    ssa_op.id, ssa_op.cycle, matches!(ctx.select_choice_encoding.get(&ssa_op.id), Some(SelectChoiceEncoding::Fma)), ssa_op.sub_temp_vreg
                 );
             }
 
@@ -353,7 +462,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                 .get(&false_val_vreg)
                 .expect("false_val VReg not in mapping");
 
-            if ctx.select_fma_ops.contains(&ssa_op.id) {
+            if matches!(ctx.select_choice_encoding.get(&ssa_op.id), Some(SelectChoiceEncoding::Fma)) {
                 // FMA path: check if we have a precomputed delta
                 if std::env::var("SCHEDULER_DEBUG").is_ok() {
                     eprintln!(
@@ -795,15 +904,14 @@ mod tests {
 
         let ssa_ops = vec![ssa_op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new(); // Use Load
+        let const_choice_encoding = HashMap::new(); // Use Load (None => Load)
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &HashSet::new(),
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &HashMap::new(),
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -834,15 +942,14 @@ mod tests {
 
         let ssa_ops = vec![ssa_op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new(); // Use Load
+        let const_choice_encoding = HashMap::new();
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &HashSet::new(),
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &HashMap::new(),
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -899,24 +1006,24 @@ mod tests {
 
         let ssa_ops = vec![op1, op2, op3];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut const_alu_derive_ops = HashMap::new();
-        const_alu_derive_ops.insert(
+        let mut const_choice_encoding = HashMap::new();
+        const_choice_encoding.insert(1, ConstChoiceEncoding::Load);
+        const_choice_encoding.insert(2, ConstChoiceEncoding::Load);
+        const_choice_encoding.insert(
             3,
-            crate::types::AluDeriveInfo {
+            ConstChoiceEncoding::AluDerive(crate::types::AluDeriveInfo {
                 left_op_id: 1,
                 right_op_id: 2,
                 opcode: Opcode::Add,
-            },
+            }),
         ); // op 3 = op1 + op2
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &const_alu_derive_ops,
-            select_fma_ops: &HashSet::new(),
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &HashMap::new(),
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -950,16 +1057,15 @@ mod tests {
 
         let ssa_ops = vec![ssa_op];
         let shifted_ops = HashSet::new();
-        let mut const_add_imm_ops = HashSet::new();
-        const_add_imm_ops.insert(99); // Use AddImm
+        let mut const_choice_encoding = HashMap::new();
+        const_choice_encoding.insert(99, ConstChoiceEncoding::AddImm);
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &HashSet::new(),
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &HashMap::new(),
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -994,16 +1100,16 @@ mod tests {
 
         let ssa_ops = vec![op1, op2];
         let shifted_ops = HashSet::new();
-        let mut const_add_imm_ops = HashSet::new();
-        const_add_imm_ops.insert(1); // op1 uses AddImm, op2 uses Load
+        let mut const_choice_encoding = HashMap::new();
+        const_choice_encoding.insert(1, ConstChoiceEncoding::AddImm);
+        const_choice_encoding.insert(2, ConstChoiceEncoding::Load);
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &HashSet::new(),
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &HashMap::new(),
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1069,16 +1175,15 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let select_fma_ops = HashSet::new(); // vselect path
+        let const_choice_encoding = HashMap::new();
+        let select_choice_enc = HashMap::new(); // vselect path
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_enc,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1124,17 +1229,16 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42); // FMA path
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_enc = HashMap::new();
+        select_choice_enc.insert(42, SelectChoiceEncoding::Fma);
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_enc,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1183,17 +1287,16 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42); // FMA path WITHOUT delta
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_encoding = HashMap::new();
+        select_choice_encoding.insert(42, SelectChoiceEncoding::Fma);
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_encoding,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1268,17 +1371,16 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42); // FMA path WITHOUT delta
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_encoding = HashMap::new();
+        select_choice_encoding.insert(42, SelectChoiceEncoding::Fma);
 
         let result = lower_ssa_ops_with_shift(&LoweringContext {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_encoding,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1334,9 +1436,9 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42);
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_enc = HashMap::new();
+        select_choice_enc.insert(42, SelectChoiceEncoding::Fma);
 
         let cse_groups: Vec<CseGroup> = vec![CseGroup {
             true_val,
@@ -1356,9 +1458,8 @@ mod tests {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_enc,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1400,9 +1501,9 @@ mod tests {
 
         let ssa_ops = vec![op];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42);
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_enc = HashMap::new();
+        select_choice_enc.insert(42, SelectChoiceEncoding::Fma);
 
         let cse_groups: Vec<CseGroup> = vec![CseGroup {
             true_val,
@@ -1422,9 +1523,8 @@ mod tests {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_enc,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
@@ -1473,10 +1573,10 @@ mod tests {
 
         let ssa_ops = vec![op1, op2];
         let shifted_ops = HashSet::new();
-        let const_add_imm_ops = HashSet::new();
-        let mut select_fma_ops = HashSet::new();
-        select_fma_ops.insert(42);
-        select_fma_ops.insert(43);
+        let const_choice_encoding = HashMap::new();
+        let mut select_choice_encoding = HashMap::new();
+        select_choice_encoding.insert(42, SelectChoiceEncoding::Fma);
+        select_choice_encoding.insert(43, SelectChoiceEncoding::Fma);
 
         // Mismatch: one group, two results
         let cse_groups: Vec<CseGroup> = vec![CseGroup {
@@ -1503,9 +1603,8 @@ mod tests {
             ssa_ops: &ssa_ops,
             vreg_to_addr: &vreg_to_addr,
             shifted_ops: &shifted_ops,
-            const_add_imm_ops: &const_add_imm_ops,
-            const_alu_derive_ops: &HashMap::new(),
-            select_fma_ops: &select_fma_ops,
+            const_choice_encoding: &const_choice_encoding,
+            select_choice_encoding: &select_choice_encoding,
             shifted_alu_cycles: &HashMap::new(),
             eliminated_vbroadcast_ops: &HashSet::new(),
             eliminated_vb_to_scalar_producer: &HashMap::new(),
