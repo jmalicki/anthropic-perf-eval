@@ -50,11 +50,12 @@ def parse_arm(arm_str):
     return arm_str.strip(), ""
 
 
-def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_args_str):
+def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_args_str, quiet=False):
     """Run a single ablation arm.
 
     Constructs and runs a generate_ssa_kernel.py command from shared options
-    plus arm-specific options. Streams output to both stdout and a log file.
+    plus arm-specific options. By default streams output to both stdout and a
+    log file; use quiet=True to only write to the log file.
 
     Returns a result dict with makespan, timing, solver stats, and the
     loaded scheduler output JSON.
@@ -111,7 +112,8 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
             lines.append(line)
             log_f.write(line)
             log_f.flush()
-            print(line, end='')
+            if not quiet:
+                print(line, end='')
         proc.wait()
         stdout_output = ''.join(lines)
 
@@ -415,6 +417,8 @@ Examples:
                         help="Extra args applied to ALL arms (e.g. '--no-valu-shift')")
     parser.add_argument("--output", type=str, default="ablation_general_results.json",
                         help="Output JSON path (default: ablation_general_results.json)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Only write scheduler output to log files; do not print to terminal")
 
     args = parser.parse_args()
 
@@ -460,6 +464,7 @@ Examples:
             batch_size=args.batch_size,
             time_limit=args.time_limit,
             shared_args_str=args.shared_args,
+            quiet=args.quiet,
         )
         results.append(result)
 

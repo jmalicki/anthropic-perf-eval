@@ -19,8 +19,12 @@ import sys
 import time
 from pathlib import Path
 
-def run_experiment(config_name, enable_slot_tightening, enable_scratch_tightening, rounds=4, batch_size=64, time_limit=600):
-    """Run a single experiment configuration."""
+def run_experiment(config_name, enable_slot_tightening, enable_scratch_tightening, rounds=4, batch_size=64, time_limit=600, quiet=False):
+    """Run a single experiment configuration.
+
+    By default streams scheduler output to both stdout and the log file.
+    Set quiet=True to only write to the log file.
+    """
     print(f"\n{'='*80}")
     print(f"Running: {config_name}")
     print(f"  Slot-aware tightening: {'ENABLED' if enable_slot_tightening else 'DISABLED'}")
@@ -70,7 +74,8 @@ def run_experiment(config_name, enable_slot_tightening, enable_scratch_tightenin
             lines.append(line)
             log_f.write(line)
             log_f.flush()
-            print(line, end='')
+            if not quiet:
+                print(line, end='')
         proc.wait()
         result = type('Result', (), {'returncode': proc.returncode, 'stdout': ''.join(lines), 'stderr': None})()
 
@@ -329,7 +334,9 @@ def main():
                         help="CP-SAT time limit in seconds (default: 600)")
     parser.add_argument("--output", type=str, default="ablation_results.json",
                         help="Output file for results (default: ablation_results.json)")
-    
+    parser.add_argument("--quiet", action="store_true",
+                        help="Only write scheduler output to log files; do not print to terminal")
+
     args = parser.parse_args()
     
     if args.batch_size % 8 != 0:
@@ -352,6 +359,7 @@ def main():
         rounds=args.rounds,
         batch_size=args.batch_size,
         time_limit=args.time_limit,
+        quiet=args.quiet,
     )
     if baseline_result:
         results.append(baseline_result)
@@ -364,6 +372,7 @@ def main():
         rounds=args.rounds,
         batch_size=args.batch_size,
         time_limit=args.time_limit,
+        quiet=args.quiet,
     )
     if slot_tightening_result:
         results.append(slot_tightening_result)
@@ -376,6 +385,7 @@ def main():
         rounds=args.rounds,
         batch_size=args.batch_size,
         time_limit=args.time_limit,
+        quiet=args.quiet,
     )
     if scratch_tightening_result:
         results.append(scratch_tightening_result)
@@ -388,6 +398,7 @@ def main():
         rounds=args.rounds,
         batch_size=args.batch_size,
         time_limit=args.time_limit,
+        quiet=args.quiet,
     )
     if slot_scratch_tightening_result:
         results.append(slot_scratch_tightening_result)
