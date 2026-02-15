@@ -70,6 +70,7 @@ pub fn schedule_ssa_cpsat(
         enable_vbroadcast_elimination,
         force_zero_gap,
         enable_asap_alap_tightening,
+        use_energetic_slot_tightening,
         enable_scratch_tightening,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
@@ -226,7 +227,10 @@ pub fn schedule_ssa_cpsat(
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    if enable_asap_alap_tightening {
+    // When slot tightening is enabled, by default we use R_precedence_only (no slot-based exclusions):
+    // only precedence-derived bounds + fixpoint + greedy-cap. This is the only solver-free rule that
+    // preserves the strong guarantee. Set use_energetic_slot_tightening for the energetic loop (may over-tighten).
+    if enable_asap_alap_tightening && use_energetic_slot_tightening {
         let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
             ops,
             &current_asap,

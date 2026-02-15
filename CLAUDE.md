@@ -144,7 +144,7 @@ Scheduler options:
 - `--valu-shift MODE` - VALU shift handling: `optimize` (default), `alu`, or `valu`
 - `--per-section-optimize-secs SECONDS` - Per-section CP-SAT optimization time (0 or omit = feasibility only)
 - `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
-- `--enable-asap-alap-tightening` - Tighten ASAP/ALAP by slot capacity (default: disabled so schedules are never worsened; when enabled, uses ASAP-only safe subset per Z3 T7-asap-only-composition). See [docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md).
+- `--enable-asap-alap-tightening` / `--no-enable-asap-alap-tightening` - ASAP/ALAP slot tightening (default: enabled, R_precedence_only — proved safe; use `--no-enable-asap-alap-tightening` to disable; add `--energetic-slot-tightening` for energetic loop, not strong-guarantee safe). See [docs/ASAP_ALAP_SLOT_TIGHTENING.md](docs/ASAP_ALAP_SLOT_TIGHTENING.md).
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
 - `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** bulk-move is known buggy (can cause same-cycle scratch write conflicts). Use only when the bug is fixed for tighter makespan.
 
@@ -278,6 +278,15 @@ Each cycle executes one bundle (dict of engine → list of operations):
 5. **VALU→ALU shifting** - Move ops to underutilized ALU slots
 6. **Constant derivation** - Generate constants via ALU instead of loads
 
+## Verification (Z3)
+
+Z3 is used to prove that tightening (e.g. slot-aware ASAP/ALAP) **preserves CP-SAT feasibility**. The property we want is **strong**: **all** previously feasible schedules should still be feasible (we only exclude (O,t) that no feasible schedule uses). That is stronger than "at least one feasible schedule remains." **Do not confuse the two notions of feasibility:**
+
+- **Soundness proofs (most checks):** We encode a **violation** of the theorem (counterexample). **Z3 SAT** = it found a violation = **bad**. **Z3 UNSAT** = no assignment violates our theorems = theorems hold = **good**.
+- **Preservation checks** (e.g. T7-asap-only-composition): We ask for a **witness** (a feasible schedule). **Z3 SAT** = witness found = we preserved feasibility = **good**. **Z3 UNSAT** = no witness = no feasible schedule = **bad**.
+
+Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-SAT: two notions of feasibility."
+
 ## Key Files
 
 | File | Purpose |
@@ -294,6 +303,9 @@ Each cycle executes one bundle (dict of engine → list of operations):
 | `solver/kernel_builder/ssa_wrapper.py` | Python wrapper (SSAKernelBuilder) calling build_tick_tock_kernel_ssa |
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
 | `docs/4-round-phase-results.md` | Recorded 4-round optimization progress |
+| `docs/ASAP_ALAP_SLOT_TIGHTENING.md` | **Canonical design:** slot tightening rules (R_entailed, R_precedence_only), strong guarantee, tried-and-unsafe (R_precedence_demand), implementation flags |
+| `docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md` | T7 investigation: 2r/16b counterexample, Z3 proofs, ablation; design lives in ASAP_ALAP_SLOT_TIGHTENING.md |
+| `verification/` | Z3 verification of liveness/slot-tightening theorems; see [verification/README.md](verification/README.md) (Z3 vs CP-SAT feasibility) |
 
 ## Important Constraints
 

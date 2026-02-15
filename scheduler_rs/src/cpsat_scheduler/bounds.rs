@@ -285,6 +285,11 @@ pub struct SsaCpsatConfig {
     /// Uses energetic reasoning to tighten domains before creating cycle variables.
     /// Default: false (test first, validate carefully).
     pub enable_asap_alap_tightening: bool,
+    /// When true and slot tightening is enabled, run the energetic slot-based loop (ASAP-only + greedy-cap).
+    /// When false (default), slot tightening uses only precedence-derived bounds + fixpoint + greedy-cap
+    /// (R_precedence_only: no slot-based exclusions). This is the only solver-free rule that preserves
+    /// the strong guarantee (no feasible schedule removed). Use true only for experiments.
+    pub use_energetic_slot_tightening: bool,
     /// If true, consider scratch constraints when tightening ASAP/ALAP bounds.
     /// Can be used independently of enable_asap_alap_tightening. Computes maximum scratch usage
     /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
@@ -318,7 +323,8 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
-            enable_asap_alap_tightening: false, // Off by default; when enabled, safe form (ASAP-only) is used. Use --enable-asap-alap-tightening to opt in.
+            enable_asap_alap_tightening: true,  // On by default (R_precedence_only). Use --no-enable-asap-alap-tightening to disable.
+            use_energetic_slot_tightening: false, // Default: when tightening is on, use R_precedence_only (no slot exclusions). Set true for energetic loop.
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),

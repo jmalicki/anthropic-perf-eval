@@ -98,6 +98,8 @@ pub struct SchedulingMetrics {
 pub struct BoundsConfig {
     /// Enable ASAP/ALAP tightening by slot capacity (energetic reasoning).
     pub enable_asap_alap_tightening: bool,
+    /// When true, run energetic slot-based tightening. When false (default), use R_precedence_only (no slot exclusions).
+    pub use_energetic_slot_tightening: bool,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
 }
@@ -126,6 +128,9 @@ pub struct CpSatPipelineConfig {
     pub force_zero_gap: bool,
     /// Enable ASAP/ALAP tightening by slot capacity.
     pub enable_asap_alap_tightening: bool,
+    /// When true, run energetic slot-based tightening (ASAP-only + greedy-cap). When false (default),
+    /// slot tightening uses R_precedence_only (no slot exclusions). Only used when enable_asap_alap_tightening is true.
+    pub use_energetic_slot_tightening: bool,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
     /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
@@ -151,7 +156,8 @@ impl Default for CpSatPipelineConfig {
             select_choice_mode: SelectChoiceMode::Optimize,
             valu_shift_mode: ValuShiftMode::Optimize,
             force_zero_gap: false,
-            enable_asap_alap_tightening: false,
+            enable_asap_alap_tightening: true,
+            use_energetic_slot_tightening: false,
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
@@ -178,6 +184,7 @@ impl CpSatPipelineConfig {
             valu_shift_mode: self.valu_shift_mode,
             force_zero_gap: self.force_zero_gap,
             enable_asap_alap_tightening: self.enable_asap_alap_tightening,
+            use_energetic_slot_tightening: self.use_energetic_slot_tightening,
             enable_scratch_tightening: self.enable_scratch_tightening,
             disable_optional_constraint_groups: self.disable_optional_constraint_groups.clone(),
             ..Default::default()

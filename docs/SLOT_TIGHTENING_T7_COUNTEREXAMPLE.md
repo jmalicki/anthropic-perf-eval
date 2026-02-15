@@ -1,6 +1,8 @@
 # T7 counterexample: slot tightening excludes a feasible schedule
 
-**Default: off.** Slot tightening is off by default so schedules are never worsened. When enabled (opt-in), the implementation uses the **ASAP-only** safe subset (Z3 T7-asap-only-composition). Use `--enable-asap-alap-tightening` to opt in.
+**This document is the investigation** for the T7 counterexample (2r/16b, 368 vs 36 cycles, Z3 proofs and ablation). **General design, safe/unsafe rules, and implementation behavior** are documented in **[ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md)**.
+
+**Default: on (R_precedence_only).** Slot tightening is **on** by default (no energetic loop); the implementation uses **R_precedence_only** (no slot exclusions). Use `--no-enable-asap-alap-tightening` to disable; add `--energetic-slot-tightening` for the energetic loop (not strong-guarantee safe). See [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md).
 
 ## Claim (T7)
 
@@ -56,7 +58,7 @@ The repo contains a Z3 verification for T7 in `verification/theorems.py` (`check
 | **With** slot tightening enabled | `artifacts/scheduler_2r_16b.json` | 368 | 295 empty (37–331) | All 0% usage |
 | **Without** slot tightening (default) | `scheduler_output_2r_16b_no_tightening.json` | 36 | None | Work spread across all deciles |
 
-*(Slot tightening is now off by default; the table describes behavior when it is enabled vs disabled.)*
+*(Slot tightening is on by default (R_precedence_only); the table describes behavior when energetic was used vs disabled.)*
 
 - **With tightening:** Per-decile slot usage shows deciles 1–8 (cycles 37–331) completely empty; only decile 0 (0–36) and decile 9 (332–367) have ops. Theoretical lower bound script: actual 368 cycles vs theoretical minimum 14 cycles (96.2% overhead).
 - **Without tightening:** Same 2r/16b config with `--no-enable-asap-alap-tightening` and `--force-zero-gap --cpsat-time-limit 300`: 36-cycle schedule that **passes validation**. Per-decile usage shows work in every decile (no long empty stretch). Theoretical lower bound: actual 36 cycles vs theoretical minimum 14 (61.1% overhead).
@@ -93,7 +95,7 @@ uv run python scripts/analyze_ablation.py ablation_2r_16b_tightening.json
 | no-tightening (default) | **36** | OPTIMAL | 6.99s |
 | asap-only-tightening | **368** | OPTIMAL | 0.09s |
 
-**Finding: bug.** Cycles differ (36 vs 368). The ASAP-only implementation still leads to a 368-cycle schedule; the 36-cycle schedule is either excluded by the tightened domains (plus fixpoint) or the solver returns the greedy hint without searching. So the safe-composition guarantee from the small Z3 model does not yet hold in the full pipeline for 2r/16b. Slot tightening remains **off by default**; when enabled, ASAP-only is used but may still worsen makespan for this config. See `ablation_2r_16b_tightening.json` and logs `ablation_log_no-tightening.txt`, `ablation_log_asap-only-tightening.txt`.
+**Finding: bug.** Cycles differ (36 vs 368). The **energetic** (ASAP-only) slot loop leads to a 368-cycle schedule; the 36-cycle schedule is either excluded by the tightened domains (plus fixpoint) or the solver returns the greedy hint without searching. So the safe-composition guarantee from the small Z3 model does not hold in the full pipeline for 2r/16b when using energetic. **Default is now R_precedence_only** (tightening on, no energetic), which is proved safe; use `--energetic-slot-tightening` only for experiments. See `ablation_2r_16b_tightening.json` and logs `ablation_log_no-tightening.txt`, `ablation_log_asap-only-tightening.txt`.
 
 ---
 
@@ -172,7 +174,7 @@ The **implementation** does: greedy-derived horizon/ALAP → slot tightening (AS
 
 **Gap:** We proved *when* feasibility is preserved (mild exclusions) and *when* it is lost (aggressive exclusions + fixpoint). We did **not** prove that the implementation’s choices (greedy-derived bounds + fixpoint) keep exclusions in the mild regime. In practice they do not—e.g. 2r/16b lands in the aggressive regime (368 cycles). So the gap is: **the implementation uses inputs and a fixpoint that can produce the aggressive regime we proved removes feasibility.**
 
-To close the gap we can: **(1)** Change the implementation so it stays in the proved-safe regime (e.g. do not run fixpoint after slot tightening when tightening is on; or use precedence-only initial bounds when “safe” tightening is desired). **(2)** Add a proved sufficient condition that restricts when we run fixpoint or use greedy-derived bounds so that exclusions stay mild (e.g. only run fixpoint when exclusions are below some bound; then prove that condition holds). Until then, slot tightening remains **off by default** and greedy-cap only guarantees that the canonical (greedy) schedule remains feasible, not that a compact schedule does.
+To close the gap we can: **(1)** Change the implementation so it stays in the proved-safe regime (e.g. do not run fixpoint after slot tightening when tightening is on; or use precedence-only initial bounds when “safe” tightening is desired). **(2)** Add a proved sufficient condition that restricts when we run fixpoint or use greedy-derived bounds so that exclusions stay mild (e.g. only run fixpoint when exclusions are below some bound; then prove that condition holds). Slot tightening is **on by default** (R_precedence_only, proved safe); energetic remains opt-in and greedy-cap only guarantees that the canonical (greedy) schedule remains feasible when using energetic, not that a compact schedule does.
 
 ---
 
@@ -245,11 +247,18 @@ We need tightening that: (1) **goes beyond greedy** — smaller domains than pre
 - **No clamp when greedy hints are absent:** When no greedy hints are available (e.g. pipeline bounds pass, or tests), we pass `None` and do not clamp; in those paths the old (domain-based) behavior remains and can still over-tighten if tightening is enabled.
 - **Correctness and propagation strength depend on greedy quality:** If G is poor, "cap at G" still leaves a large search space; good compact schedules can remain excluded.
 
+**Safe and unsafe rules (design):** See **[ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md)** for the canonical description of R_entailed (proved, needs solver), R_precedence_only (solver-free, implemented), and R_precedence_demand (tried and proved unsafe — do not use).
+
+
+### Possible future work
+
 ### Possible future work
 
 **Safe composition candidate (Z3).** We added two checks in `verification/theorems.py`: `T7-asap-only-composition` (3 ops, 5 cycles, capacity 1, chain precedence; only ASAP exclusions c1≥1, c2≥2) and `T7-alap-only-composition` (same model; only ALAP exclusions c3≤3, c2≤2). Both yield **SAT**: at least one feasible schedule remains. So single-direction (ASAP-only or ALAP-only) is a candidate safe subset to implement; see `uv run python -m verification.verify -t T7-asap-only-composition -t T7-alap-only-composition` and [verification/README.md](../verification/README.md).
 
-**Priority: (1) Safe composition (conservative focus).** Prove in Z3 a **composition rule** that allows multiple one-step exclusions (and the precedence fixpoint) while guaranteeing **all** previously feasible schedules remain feasible — **without** requiring a known schedule G in advance. For a gap analysis (why Z3 and the implementation can differ, e.g. fixpoint not in Z3, greedy-derived bounds), see the section **Investigation: Z3 vs implementation — why 2r/16b still gets 368 cycles** above. Then port that rule to the implementation. Examples: restrict to a single direction per pass (e.g. only ASAP pushes, or only ALAP pulls); or an order-based rule (e.g. process ops in a fixed order and prove the remaining domain still has a feasible schedule); or "exclude (O,t) only when no feasible schedule uses (O,t)" (expensive to check in practice unless encoded as part of the rule). This is the more conservative path: we only exclude when the combined effect is proven safe.
+**Design approach: lead with Z3, change R not the result.** The **result** we need is fixed: no previously feasible schedule becomes infeasible (strong guarantee). We **can** change the **rule R** (the exact operations the theorem is proved for). So we search for an R such that: (1) Z3 proves "if the implementation only does R, then the strong guarantee holds"; (2) we then change the code to do exactly R. The theorem can also require that **R does not untighten** (R never widens a domain—new [ASAP, ALAP] is a subset of or equal to the previous one). "Do nothing" is fine; loosening is not.
+
+**Priority: (1) Safe composition (conservative focus).** One such R is already proved: **R_entailed** — exclude (O,t) only when (precedence ∧ capacity ∧ O at t) is UNSAT; see [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md). For a stronger (but not yet proved) composition, we would need to prove in Z3 an R that allows multiple one-step exclusions (and the precedence fixpoint) while guaranteeing **all** previously feasible schedules remain feasible — **without** requiring a known schedule G in advance. For a gap analysis (why Z3 and the implementation can differ, e.g. fixpoint not in Z3, greedy-derived bounds), see the section **Investigation: Z3 vs implementation — why 2r/16b still gets 368 cycles** above. Then port R to the implementation. Examples for future R: restrict to a single direction per pass; or an order-based rule; or cheaper sufficient conditions that imply entailment.
 
 **Note: (2) Symmetry may be possible in future efforts.** An alternative is to prove that the exclusions we perform only remove schedules that are **symmetrically equivalent** (e.g. under batch symmetry) to some schedule we keep. Then we would not be excluding "the" compact schedule, only equivalent copies, and one representative would remain feasible. We keep this in mind so we don't lose sight of it; it may allow more aggressive tightening if the symmetry structure can be formalized.
 

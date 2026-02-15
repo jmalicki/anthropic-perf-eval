@@ -3437,6 +3437,7 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         ValuShiftMode::Optimize,
         false, // force_zero_gap
         false, // enable_asap_alap_tightening
+        false, // use_energetic_slot_tightening
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
@@ -3606,6 +3607,7 @@ fn test_depth4_cpsat() {
         ValuShiftMode::Optimize,
         false, // force_zero_gap
         false, // enable_asap_alap_tightening
+        false, // use_energetic_slot_tightening
         false, // enable_scratch_tightening
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups

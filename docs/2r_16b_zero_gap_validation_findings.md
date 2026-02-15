@@ -44,6 +44,10 @@ A related **live-interval bug** appeared when slot tightening was disabled; that
 
 **Did our fixes introduce the failures?** No. The 2r/16b zero-gap validation failure and the CP-SAT toy presolve INFEASIBLE were both present before the live-interval/use-def changes. Our changes only affect interval computation and the use-def check in address assignment; they do not affect CP-SAT presolve or the zero-gap schedule/validation path.
 
+### Checks vs this bug
+
+Reproduced failing build (2r/16b zero-gap, 600s); build completes and validation fails; **no new runtime check triggers** (scratch budget, shifted_alu_cycles, general precedence, VReg mapping all pass). The bug is consistent with correct model/schedule but wrong use at runtime (e.g. read from wrong address).
+
 ---
 
 ## 1. Scheduler output differences
@@ -139,6 +143,115 @@ So the **semantic content** is “same algorithm, different placement (VALU vs A
 
 5. **Slot ASAP/ALAP tightening creating precedence violations**  
    The pipeline runs slot-aware tightening (and optionally scratch tightening) *before* a precedence fixpoint. That can leave producer ASAP later than consumer ASAP (e.g. producer 348, consumer 4), which the diagnostic reports as "24 edge violations". The fixpoint repair then pushes consumer ASAP to 349+, which forces the whole tail into the last decile and creates the empty middle. If the same precedence-inconsistent bounds or the order of operations (widen for greedy hint after repair) somehow affects which solution CP-SAT finds—e.g. different VALU-shift or cycle choices—that could change the emitted kernel and expose a lowering bug. So slot tightening could be *indirectly* related to the validation failure (different schedule → different shift decisions → bug in shift path).
+
+### Investigation results (trace scripts)
+
+**Tools used:** `debug_validation_trace.py`, `trace_group20.py` (group 0), `diff_kernels.py`, `dump_cycle_instrs.py`, `who_wrote_addr.py`, `addr_conflict_report.py` on `artifacts/kernel_2r_16b_zero_gap.json` and `artifacts/scheduler_2r_16b_zero_gap.json` with `--rounds 2 --batch-size 16`.
+
+**Mismatches:** All 16 batch indices fail (value and/or index wrong). Affected groups: 0 and 1.
+
+**Cycle and instruction for wrong writes:**
+
+| Cycle | What's wrong | Instruction (failing kernel) |
+|-------|----------------|-----------------------------|
+| **365** | Value store (all 8 lanes wrong) | `vstore` to dest 59 **from scratch 18**; same cycle VALU `^` writes to 18 (hash), then vstore reads 18. |
+| **367** | Index store (7 of 8 lanes wrong) | `vstore` to dest 42 **from scratch 18**; VALU `multiply_add(8, 150, 34, 8)` same cycle. |
+
+**Scratch 18:** Last write to address 18 before cycle 366 is at **cycle 365** (VALU `^`). Last write before cycle 368 is at **cycle 366** (`multiply_add(18, 142, 34, 8)` writes to 18, then `vstore(60, 18)` reads 18). So at 367, scratch 18 holds the **result of the multiply_add at 366** (new idx). The vstore at 367 stores that to output 42 (index output). If that result is wrong, the inputs to the 366 multiply_add were wrong (e.g. wrong offset or idx from earlier).
+
+**Passing vs failing at 364–367:** The **passing** kernel uses different scratch layout: at 367 it has `multiply_add(6, 146, 6, 26)` and `vstore(3, 18)` — offset source is scratch **26**, and dest addresses 1, 2, 3 for stores. The **failing** kernel uses dests 59, 60, 42 and offset/operands from 8, 34, 18. So different address assignment and possibly different operand locations; the first **instruction diff** is at **cycle 1** (47 differing cycles total).
+
+**addr_conflict_report:** For address 18 on the zero-gap scheduler JSON: **no overlapping intervals** reported. So the allocator did not assign two VRegs with overlapping live intervals to the same address; the wrong output is not explained by a simple interval overlap at 18.
+
+**Likely hypothesis:** **(C) Schedule/address assignment divergence from cycle 1.** The first difference is at cycle 1 (different `add_imm`/`const` dests and constants). That different schedule and scratch layout propagates: by cycles 365–367 we observe wrong values and indices, but the immediate cause is that the **values in scratch 18** (and the chain feeding it) are wrong because constants, loads, and operands were assigned to different addresses and/or different cycles in the zero-gap kernel. So the bug is likely not a single reuse bug at 18 (no overlap at 18), but **wrong values** due to the different schedule and address assignment from cycle 1 onward (hypotheses 2 and 3: cycle reordering + address assignment, ConstChoice emission order). Next step for a fix: compare SSA→address mapping and ConstChoice/operand ordering between the two scheduler outputs at early cycles, or bisect with `--no-valu-shift` to see if zero-gap without VALU shift still fails.
+
+### SSA→address and early-cycle comparison
+
+**Cycle 1 — which SSA ops run and their scratch addresses:**
+
+| Run      | Op indices at cycle 1 | Example: same op, different addr |
+|----------|------------------------|----------------------------------|
+| Zero-gap | 1, 3, 5, 6, 8, 19, 24  | Op 6 (ConstChoice) dest v18_s → addr **5**; op 3 (load) v15_s → addr **1** |
+| Default  | 3, 4, 6, 25            | Op 6 (ConstChoice) dest v18_s → addr **1**; op 3 (load) v15_s → addr **4** |
+
+So at cycle 1 the **set of ops** differs: zero-gap has 7 ops (ConstChoice at 1,3,5,6,8,19 and vbroadcast at 24), default has 4 (load 3, ConstChoice 4,6, vbroadcast 25). For **the same SSA op**, the assigned scratch address can differ: e.g. op 6 (ConstChoice, dest v18_s) gets addr **5** in zero-gap and addr **1** in default; op 3 (load, v15_s) gets addr **1** in zero-gap and addr **4** in default. So both (1) **which ops** are at cycle 1 and (2) **where they are stored** (vreg_to_addr) differ. That confirms schedule + address-assignment divergence from cycle 1.
+
+**Cycle 2:** Zero-gap has many more ops (including ALU `+` from shifted VALU and extra ConstChoice/vbroadcast); default has only 6. Again, same op index can map to different address (e.g. op 7 load v19_s → addr 3 vs 16; op 28 ALU → addr 5 vs 4).
+
+### Zero-gap with `--no-valu-shift`
+
+**Command:** `uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --force-zero-gap --no-valu-shift --cpsat-time-limit 600 --validate --save-kernel artifacts/kernel_2r_16b_zero_gap_no_shift.json -q`
+
+**Result:** **PASSED** — kernel produces correct output (135 cycles, 137 instructions, 0 VALU ops shifted). So the 2r/16b zero-gap validation failure **only occurs when VALU shift is enabled**. The bug is in the **VALU-shift path** (or the interaction of zero-gap schedule with shifted-ALU lowering/address assignment), not in zero-gap scheduling alone.
+
+### First scratch divergence (cycle 1, addrs 1 and 2)
+
+**Tool:** `scripts/compare_kernel_scratch_cycle.py` — run both kernels on the same input and compare scratch at the end of each cycle.
+
+**Result:** First difference at **cycle 1**, **addresses 1 and 2**:
+- **Passing (no_shift):** s[1]=5, s[2]=4  
+- **Failing (shift):** s[1]=4, s[2]=5  
+
+So the same two values (4 and 5) are written in **swapped** scratch slots. Cycle 1 instructions:
+
+| Kernel  | Instruction that writes 5 | Instruction that writes 4 |
+|---------|----------------------------|----------------------------|
+| Passing | add_imm **1** 0 5 → dest **1** | const **2** **4** → dest **2** |
+| Failing | add_imm **2** 0 5 → dest **2** | const **1** **4** → dest **1** |
+
+So in the failing run, the **destinations** assigned to the constant 4 and to the add_imm(5) are swapped relative to the passing run. **Why that's a bug (not just "unstable"):** In a correct run, each SSA value has one scratch address and every **use** of that value reads from that address. Swapping which address holds 4 vs 5 is fine *if* every consumer of "constant 5" still reads from the address where 5 was stored, and every consumer of "constant 4" reads from the address where 4 was stored. So instability of assignment (different addresses across runs) is not by itself a bug—it only hurts debuggability. The **actual bug** is that in the failing run, at least one **use** is reading from the wrong scratch address: it reads from an address that holds a *different* SSA value (e.g. a consumer that should read "constant 5" is reading from the slot that got 4, or vice versa). So either (1) **address assignment** gave the same address to two live values, or (2) **lowering/emission** is emitting an instruction that uses a different scratch address than the one assigned to that SSA operand (e.g. emission order or operand indexing is tied to slot 1/2 instead of to the VReg/SSA value). Fix direction: find the **incorrect use**—the instruction(s) that read from an address that doesn't correspond to their SSA source—and fix the allocator or the emission so that every use reads the address of its SSA definition. Stable assignment can help debugging but is not the correctness fix.
+
+**Root-cause summary (refined):** The observable symptom is different scratch slots for 4 and 5 at cycle 1. The real bug is that some later **use** reads from the wrong address (see above). Fix: find that incorrect use and fix allocator or emission so each use reads the address of its SSA definition. (Stable assignment helps debuggability but is not the correctness fix.)
+
+### Root cause (investigation complete)
+
+A structured investigation (see plan “find root cause of 2r16b zero-gap wrong use”) produced the following.
+
+**Step 1 — VRegs at addrs 1 and 2 (failing vs passing):**
+
+| Run     | Addr 1 VReg (id, value) | Addr 2 VReg (id, value) |
+|---------|-------------------------|--------------------------|
+| Failing | VReg 3 (value 4)        | VReg 16 (value 5)        |
+| Passing | VReg 3 (value 4)        | VReg 16 (value 5) at addr **5** (not 2) |
+
+So in the failing run, value 4 is at addr 1 and value 5 at addr 2; in the passing run, value 5 is at addr 5 (not 2). No duplicate assignment to 1 or 2 in the failing run (multiple VRegs share 1 or 2 at different times; linear scan reuses addresses).
+
+**Step 2 — SSA ops at cycle 1 (failing):** Cycle 1 (scheduler) has load/ALU/flow/vbroadcast; the *writers* of value 4 and 5 are at cycle 0: const_choice (value 4 → v3_s → addr 1), add_imm (value 5 → v16_s → addr 2). Confirmed: value 4 → addr 1, value 5 → addr 2.
+
+**Step 3 — Consumers of addrs 1 and 2:** Script `scripts/find_wrong_scratch_use.py` was run on `artifacts/scheduler_2r_16b_zero_gap.json` for addrs 1 and 2. For every lowered op that reads from 1 or 2, the script compared the emitted read address to `vreg_to_addr[SSA source]`. **No incorrect use found:** whenever the expected address (from vreg_to_addr) was 1 or 2, the emitted slot matched. So for addrs 1 and 2 there is no instruction where “read address ≠ vreg_to_addr[SSA source]”.
+
+**Step 4 — Lowering path:** With no single incorrect-use instruction identified for 1 and 2, there is no specific SSA op to attribute to (A) vs (B). Lowering in `ssa_lower.rs` uses `ctx.vreg_to_addr.get(&ssa_op.srcs[i])` for source addresses; the failing JSON is self-consistent for those uses.
+
+**Step 5 — Overlap at 1 and 2:** `addr_conflict_report` was run for addresses 1 and 2 on the failing scheduler JSON. **No overlapping intervals** at either address. So the failure is not explained by two live VRegs sharing 1 or 2.
+
+**Conclusion:** For addrs 1 and 2 we did **not** find (A) an allocator bug (overlap) or (B) a specific lowering bug (wrong address emitted for a use). The failing kernel’s cycle‑1 writes (const(1,4), add_imm(2,0,5)) match the failing run’s vreg_to_addr. The first scratch *difference* between passing and failing kernels is at cycle 1 at 1 and 2 (swapped values); that reflects different allocation between runs, not a wrong read we could pin to one instruction. The **wrong output** (value/index mismatch) may still be due to a wrong use at a **different** address (e.g. 18, as in §3 cycles 365/367) or a more subtle interaction. **Recommended next steps:** run `find_wrong_scratch_use` for other addresses in the wrong-value chain (e.g. 18), or trace execution to find where computed values first diverge from the reference. **Update:** Trace comparison (see below) did find a wrong use: shift amount read from wrong address.
+
+### Trace comparison (good vs bad)
+
+We built **both** a passing and a failing kernel with **trace support** (`--enable-trace-ids`), ran both on the **same input** (seed 123), and compared their `trace_io_log`s to find the first semantic point where values diverge. See the use-trace-ids skill for the workflow.
+
+**Kernels:**
+- Passing: `uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --enable-trace-ids --cpsat-time-limit 300 --validate --save-kernel artifacts/kernel_2r_16b_trace.json -q`
+- Failing: `uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --force-zero-gap --enable-trace-ids --cpsat-time-limit 600 --save-kernel artifacts/kernel_2r_16b_zero_gap_trace.json -q`
+
+**Comparison script:** `uv run python -m scripts.compare_trace_logs artifacts/kernel_2r_16b_trace.json artifacts/kernel_2r_16b_zero_gap_trace.json --rounds 2 --batch-size 16`
+
+**Result — first divergence:**
+- **Cycle 20, `input`, `r0_g1_hashed_val`** (round 0, group 1 hash **input**).
+- Passing: 16 values (8 main + 8 extra), all non-zero.
+- Failing: first 8 values differ from passing; lanes 8–15 are **0** in the failing run vs non-zero in the passing run.
+- So the **inputs** to the round‑0 group‑1 hash are already wrong in the failing kernel (wrong values and zeros where the passing kernel has data).
+
+**Note:** The same trace point can appear at different cycles in the two kernels (e.g. `r0_g0_hashed_val` at cycle 16 in failing vs cycle 18 in passing) because the schedules differ. The first *value* divergence in the trace is at cycle 20, `r0_g1_hashed_val` input, which pins the bug to something feeding round‑0 group‑1 hash input—consistent with scratch diverging from cycle 1 at addrs 1 and 2 and that error propagating.
+
+### Root cause from trace: wrong scratch address for shift amount
+
+Following the trace divergence (cycle 20, r0_g1_hashed_val input), we inspected which scratch addresses that trace point reads and who wrote to them.
+
+- **Failing kernel:** trace_input r0_g1_hashed_val reads from addrs **[62, 142]** (cycle 20). The second 8 values (142..149) are **zero** in the trace. At cycle 19 the kernel has ALU `>>` ops that write 142..149 from 62..69 with shift amount from **scratch[4]** (slot `['>>', 142, 62, 4]` — the Machine treats the last operand as an address). At start of cycle 19 in the failing run, **s[4] = 112449971** (a data value, not the constant 4). So 237246175 >> 112449971 = 0, which explains the zeros in the second half of the trace input.
+- **Passing kernel:** cycle 19 has VALU `['>>', 50, 34, 26]`; shift amount comes from **s[26] = 16** (correct for that hash step). So the passing kernel reads the shift amount from a different address (26) that holds the correct constant.
+
+**Conclusion:** In the failing kernel, the ALU `>>` at cycle 19 uses **address 4** for the shift amount. At cycle 1 we had s[1]=4 and s[2]=5 (constant 4 is at **address 1**, not 4). So the instruction is **reading the shift amount from the wrong address**: it reads from 4 (which holds 112449971) instead of from 1 (where the constant 4 lives). That is a **wrong use** — the lowering or constant materialization is emitting **address 4** for the shift-amount operand when it should emit the address that holds the constant 4 in this run (e.g. 1). So the bug is in **lowering/emission** (wrong address for a constant operand) or in how the constant 4 is assigned and referenced (e.g. the SSA value for “constant 4” is assigned to vreg→addr 1, but some code path emits 4 as a literal address). Next step: in the scheduler/lowering for the shifted ALU ops that emit `>>`, find where the shift amount address is chosen and fix it to use `vreg_to_addr` for the constant’s VReg instead of a literal or wrong index.
 
 ---
 
@@ -238,7 +351,8 @@ So either:
 - [ ] Confirm `const_add_imm_ops` and `select_fma_ops` are identical between the two scheduler JSONs.
 - [ ] Trace one ConstChoice op that appears in cycle 1 in both: same op_id? same constant value? different dest in emitted kernel?
 - [ ] For one shifted op (e.g. op_id 85, cycle 9 in zero-gap): check in zero-gap kernel that the emitted ALU op at cycle 9 uses the correct source addresses and that no consumer reads before the op’s “completion” (e.g. if completion is cycle 10 for a lane, no consumer at 9 should read that lane).
-- [ ] Run validation with `--no-valu-shift` and zero-gap (if supported) to see if zero-gap alone (same shifts as default) still fails; if it passes, the bug is in the VALU-shift path.
+- [x] **SSA→address and early-cycle comparison:** Compared scheduler JSONs: at cycle 1, different op indices run (zero-gap 7 vs default 4) and same SSA op gets different scratch addr (e.g. op 6 → addr 5 vs 1). See §3 "SSA→address and early-cycle comparison".
+- [x] **Zero-gap with --no-valu-shift:** 2r/16b zero-gap with `--no-valu-shift` (600s) **PASSED**. So the failure is specific to the VALU-shift path; see §3 "Zero-gap with --no-valu-shift".
 - [x] Add to BUGS.md: "2r/16b zero-gap (10 min) kernel fails validation; zero-gap run shifts 16 VALU ops, default shifts 0; kernels diverge from cycle 1."
 - [x] **Zero-gap with slot tightening disabled:** Run 2r/16b with `--force-zero-gap --no-enable-asap-alap-tightening --cpsat-time-limit 300` and validate. **Result:** Did not reach validation. Solver found a much shorter schedule (objective 3601726 → ~36 cycles) because domains are wide without tightening. Lowering then failed with **use-def violation:** "VReg 126 read at cycle 20 but interval is [8, 8] (op id=127, opcode=SelectChoice). The VReg's live interval does not include the read cycle." So disabling slot tightening (1) changes the solution radically (36 vs 368 cycles) and (2) exposes a bug in live-interval computation when the schedule has SelectChoice at a cycle not covered by the VReg's interval. Conclusion: we cannot test "zero-gap + no tightening → validation pass" until this interval bug is fixed; the interval bug may be related to shifted ops or SelectChoice and wide domains.
 
@@ -255,7 +369,12 @@ So either:
   `uv run python -m scripts.inspect_binding_constraints artifacts/scheduler_2r_16b_zero_gap.json`
 - **Zero-gap with no slot tightening (experiment):**  
   `uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --force-zero-gap --no-enable-asap-alap-tightening --cpsat-time-limit 300 --output-json artifacts/scheduler_2r_16b_zero_gap_no_tightening.json --save-kernel artifacts/kernel_2r_16b_zero_gap_no_tightening.json --validate`
+- **First scratch divergence (no_shift vs shift):**  
+  `uv run python -m scripts.compare_kernel_scratch_cycle artifacts/kernel_2r_16b_zero_gap_no_shift.json artifacts/kernel_2r_16b_zero_gap.json --rounds 2 --batch-size 16`
+- **Trace comparison (good vs bad):** Kernels with `--enable-trace-ids`: `artifacts/kernel_2r_16b_trace.json` (passing), `artifacts/kernel_2r_16b_zero_gap_trace.json` (failing). Compare trace_io_logs:  
+  `uv run python -m scripts.compare_trace_logs artifacts/kernel_2r_16b_trace.json artifacts/kernel_2r_16b_zero_gap_trace.json --rounds 2 --batch-size 16`  
+  (First divergence: cycle 20, `r0_g1_hashed_val` input; see §3 "Trace comparison (good vs bad)".)
 
 ---
 
-*Last updated: 2026-02-13 (What's fixed / Current state summary; §5b: why tests missed it, preventing recurrence; use-def check uses use_cycles).*
+*Last updated: 2026-02-13 (§3 Trace comparison: first value divergence at cycle 20, r0_g1_hashed_val input; §3 First scratch divergence at cycle 1 addrs 1/2).*

@@ -60,7 +60,7 @@ impl Pass for ComputeBoundsPass {
         // Optional tightening (controlled by BoundsConfig)
         let bounds_cfg = &ctx.config.bounds;
 
-        if bounds_cfg.enable_asap_alap_tightening {
+        if bounds_cfg.enable_asap_alap_tightening && bounds_cfg.use_energetic_slot_tightening {
             let machine = &ctx.config.machine;
             if let Some((slot_asap, slot_alap)) =
                 crate::cpsat_scheduler::bounds::tighten_asap_alap_by_slots(
