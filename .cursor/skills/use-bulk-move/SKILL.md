@@ -5,7 +5,9 @@ description: Run the bulk-move simulator to debug schedule makespan and identify
 
 # Using the Bulk-Move Tool
 
-The **bulk-move** step compacts a CP-SAT schedule by filling empty cycles (moving ops from C+1 to C). The **bulk-move simulator** script checks whether that compaction is possible and which constraints block it. **Note:** Bulk-move is **off by default** in the kernel generator because it is known buggy (can cause same-cycle scratch write conflicts, e.g. 3r/32). Use `--bulk-move` only when the bug is fixed; the simulator script is still useful for analyzing why compaction would be blocked.
+The **bulk-move** step compacts a CP-SAT schedule by filling empty cycles (moving ops from C+1 to C). The **bulk-move simulator** script checks whether that compaction is possible and which constraints block it.
+
+**Why bulk-move is off by default:** CP-SAT should produce schedules without empty cycles—the solver minimizes makespan and packs ops. Bulk-move merely **masks** solver/model bugs rather than fixing them; when CP-SAT leaves empty cycles, the right fix is to understand and fix the model or solver, not to post-process. Bulk-move is also buggy (can cause same-cycle scratch write conflicts, e.g. 3r/32). It exists **only for experimenting**—use the simulator to debug why compaction would be blocked; use `--bulk-move` only for experimentation, not production.
 
 The simulator uses the **same constraints as the CP-SAT model** (precedence, ordering, domain). When a move is impossible, it reports the **exact constraint** that blocks it—so you can see which constraint type is holding the schedule back.
 
@@ -43,6 +45,10 @@ uv run scripts/simulate_bulk_move.py --verbose path.json
 
 ## Interpreting Results
 
+**Lower bound and constraints:** The constraints that block compaction (precedence, ordering, domain) and the capacity constraints (VALU, ALU, Load, Flow) also drive the **lower bound** (capacity_lower_bound, solver best_bound). Those constraints set the structural minimum; the lower bound is affected by them. See [use-cpsat-debug](../use-cpsat-debug/SKILL.md) for active-set analysis.
+
+**Empty cycles are trivially not minimal:** A schedule with empty cycles can be compacted; it is not at the minimum makespan.
+
 | Result | Meaning | Next step |
 |--------|--------|-----------|
 | **NoEmptyCycles** | No empty cycles; schedule is already compact. | Nothing to compact; look at slot utilization or other optimizations. |
@@ -69,6 +75,8 @@ The script prints:
 **Op indices** are into the SSA op list in the same order as `schedule_constraints`. Use the JSON `ops` / `ssa_ops_bulk_move` to map index → op id or instruction.
 
 ## Follow-Up: Which constraints are binding
+
+We inspect binding constraints to find **what we got wrong** in the model: if the proven optimum has hundreds of empty cycles, our constraints are incorrect (empty cycles can be removed). See [use-cpsat-debug](../use-cpsat-debug/SKILL.md) for that motivation.
 
 When bulk-move **blocks**, the blocking constraint is one of the **binding** (tight) constraints at the CP-SAT solution. To identify it:
 

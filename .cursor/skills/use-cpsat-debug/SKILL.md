@@ -1,6 +1,6 @@
 ---
 name: use-cpsat-debug
-description: Debug CP-SAT INFEASIBLE results and inspect active set (binding constraints). Use when investigating infeasible configs (e.g. 3r/40 with const=load or shift=alu) or which constraints limit the schedule.
+description: Debug CP-SAT INFEASIBLE and inspect active set (binding constraints). We do this because we may have given CP-SAT incorrect constraints—e.g. if the proven optimum has 300+ empty cycles, our model is wrong. Use when investigating infeasible configs or which constraints are wrong (capacity, domain, makespan linkage).
 ---
 
 # CP-SAT Debug Tools
@@ -43,7 +43,9 @@ Use this JSON to reproduce the issue, analyze why budget was exceeded, or debug 
 
 ## Active Set (Binding Constraints)
 
-Binding constraints are those that hold with equality at the CP-SAT solution—they limit the schedule.
+We inspect the active set (binding constraints) **because we suspect our constraints may be incorrect**. We trust CP-SAT: if the proven optimum has hundreds of empty cycles, the error is in the **model we gave it**—empty cycles can be removed, so a correct model would not have a proven minimum with 300+ empty cycles. We look at which constraints are binding to find what we did wrong.
+
+Binding constraints are those that hold with equality at the CP-SAT solution—they limit the schedule. The same constraints also determine the **lower bound** (capacity_lower_bound, solver best_bound). When the optimum has many empty cycles, the constraints driving that bound are wrong (e.g. capacity formulas, domain bounds, or how we link makespan to choices).
 
 - **During generation:** Run `generate_ssa_kernel.py` without `-q`; stderr prints `[Makespan active set]` and binding schedule constraints (precedence, ordering, domain).
 - **From saved JSON:** Use `python -m scripts.inspect_binding_constraints` on scheduler output (CP-SAT run with `--output-json`):
