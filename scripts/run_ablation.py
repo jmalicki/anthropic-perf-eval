@@ -140,6 +140,8 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
             return_code=proc.returncode,
             output_json=output_json,
             log_file=log_file,
+            lb_cycles=None,
+            optimization_milestones=[],
         )
 
     # Parse makespan
@@ -157,6 +159,11 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
     # Parse solver statistics from output and JSON
     solver_stats = _parse_solver_stats(stdout_output, json_data)
 
+    # Parse lower bound and optimization milestones
+    lb_cycles = _parse_lower_bound(json_data)
+    scale = _parse_objective_scale(stdout_output)
+    optimization_milestones = _parse_optimization_milestones(stdout_output, scale=scale)
+
     # Use the more detailed solver_status from solver_stats if available
     final_status = solver_stats.pop('solver_status', None) or solver_status
 
@@ -169,6 +176,8 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
         output_json=output_json,
         log_file=log_file,
         json_data=json_data,
+        lb_cycles=lb_cycles,
+        optimization_milestones=optimization_milestones,
         **solver_stats,
     )
 
@@ -212,6 +221,49 @@ def _parse_makespan(stdout_output):
             except (ValueError, IndexError):
                 pass
     return makespan
+
+
+def _parse_objective_scale(stdout_output):
+    """Parse CP-SAT objective scale from log. floor(obj/scale) = makespan cycles."""
+    match = re.search(r'Objective:\s*scale=(\d+)', stdout_output, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return 1_000_000  # default for typical larger problems
+
+
+def _parse_lower_bound(json_data):
+    """Extract proven lower bound on cycles from scheduler output JSON."""
+    if not json_data:
+        return None
+    return json_data.get('lb_cycles')
+
+
+def _parse_optimization_milestones(stdout_output, scale=None):
+    """Parse CP-SAT progress log for time-to-cycle milestones.
+
+    CP-SAT logs have lines like:
+      #1       0.77s best:96026397 next:[...] quick_restart_no_lp [hint]
+      #2       4.22s best:96026185 next:[...] rnd_var_lns
+
+    Objective is scaled (scale from log, or 1e6 default), so cycles = floor(obj / scale).
+    Returns list of {'cycles': N, 'time_secs': T} for each cycle value first achieved,
+    in chronological order.
+    """
+    if scale is None:
+        scale = _parse_objective_scale(stdout_output)
+    seen_cycles = set()
+    milestones = []
+    for line in stdout_output.split('\n'):
+        # Match solution improvement lines: #N TIME best:OBJ
+        match = re.search(r'#\d+\s+([\d.]+)s\s+best:(\d+)', line)
+        if match:
+            time_secs = float(match.group(1))
+            obj = int(match.group(2))
+            cycles = obj // scale
+            if cycles not in seen_cycles:
+                seen_cycles.add(cycles)
+                milestones.append({'cycles': cycles, 'time_secs': time_secs})
+    return milestones
 
 
 def _parse_solver_stats(stdout_output, json_data):
@@ -312,7 +364,7 @@ def _make_result(arm_name, extra_args, rounds, batch_size, *, makespan,
                  log_file, json_data=None, solve_time_secs=None,
                  time_to_feasibility=None, time_to_optimum=None,
                  optimality_gap=None, solver_iterations=None,
-                 solution_count=0):
+                 solution_count=0, lb_cycles=None, optimization_milestones=None):
     """Build a result dict for one arm."""
     return {
         'arm_name': arm_name,
@@ -332,7 +384,51 @@ def _make_result(arm_name, extra_args, rounds, batch_size, *, makespan,
         'output_json': output_json,
         'log_file': log_file,
         'json_data': json_data,
+        'lb_cycles': lb_cycles,
+        'optimization_milestones': optimization_milestones or [],
     }
+
+
+def _do_reanalyze(path: str) -> int:
+    """Re-parse existing ablation logs/JSON; extract lb_cycles and milestones; save in-place."""
+    p = Path(path)
+    if not p.exists():
+        print(f"ERROR: --reanalyze path not found: {path}")
+        return 1
+
+    with open(p, 'r') as f:
+        data = json.load(f)
+
+    results = data.get('results', [])
+    if not results:
+        print("ERROR: No results in ablation file")
+        return 1
+
+    for r in results:
+        log_file = r.get('log_file')
+        output_json = r.get('output_json')
+        if log_file and Path(log_file).exists():
+            with open(log_file, 'r') as f:
+                log_content = f.read()
+            scale = _parse_objective_scale(log_content)
+            r['optimization_milestones'] = _parse_optimization_milestones(log_content, scale=scale)
+        else:
+            r['optimization_milestones'] = r.get('optimization_milestones') or []
+
+        if output_json and Path(output_json).exists():
+            try:
+                with open(output_json, 'r') as f:
+                    sched = json.load(f)
+                r['lb_cycles'] = _parse_lower_bound(sched)
+            except Exception as e:
+                print(f"Warning: Could not parse {output_json}: {e}")
+                r['lb_cycles'] = r.get('lb_cycles')
+
+    print_summary(results)
+    with open(p, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"\nResults saved to: {p}")
+    return 0
 
 
 def print_summary(results):
@@ -364,10 +460,23 @@ def print_summary(results):
             print(f"    Status: {r['solver_status']}")
         if r.get('optimality_gap') is not None:
             print(f"    Gap: {r['optimality_gap']:.4f}")
+        if r.get('lb_cycles') is not None:
+            print(f"    Lower bound: {r['lb_cycles']} cycles")
         if r.get('solver_iterations'):
             print(f"    Branches: {r['solver_iterations']}")
         if r.get('solution_count'):
             print(f"    Solutions: {r['solution_count']}")
+
+        # Optimization milestones: "reached X cycles after Ys"
+        milestones = r.get('optimization_milestones') or []
+        if milestones:
+            ms_strs = [f"{m['cycles']}@{m['time_secs']:.1f}s" for m in milestones]
+            if len(ms_strs) <= 10:
+                print(f"    Milestones: {' → '.join(ms_strs)}")
+            else:
+                head = ms_strs[:3]
+                tail = ms_strs[-3:]
+                print(f"    Milestones: {' → '.join(head)} ... {' → '.join(tail)}")
 
         # Compare to baseline
         if i > 0 and baseline.get('makespan') and makespan:
@@ -401,6 +510,9 @@ Examples:
     --shared-args "--no-valu-shift" \\
     --arm "optimize:--const-choice optimize" \\
     --arm "load:--const-choice load"
+
+  # Re-parse existing ablation logs (extract lb_cycles, milestones) without re-running
+  %(prog)s --reanalyze ablation_tightening_extensions_3r_64b_240s.json
 """)
 
     parser.add_argument("--rounds", type=int, default=4,
@@ -409,24 +521,32 @@ Examples:
                         help="Batch size (default: 256, must be multiple of 8)")
     parser.add_argument("--time-limit", type=float, default=600.0,
                         help="CP-SAT time limit per arm in seconds (default: 600)")
-    parser.add_argument("--arm", action="append", required=True,
+    parser.add_argument("--arm", action="append", default=None,
                         metavar='"name:options"',
                         help='Arm specification as "name:extra_args". '
-                             'Repeat for each arm. First arm is treated as baseline.')
+                             'Repeat for each arm. First arm is treated as baseline. '
+                             'Not required with --reanalyze.')
     parser.add_argument("--shared-args", type=str, default="",
                         help="Extra args applied to ALL arms (e.g. '--no-valu-shift')")
     parser.add_argument("--output", type=str, default="ablation_general_results.json",
                         help="Output JSON path (default: ablation_general_results.json)")
     parser.add_argument("--quiet", action="store_true",
                         help="Only write scheduler output to log files; do not print to terminal")
+    parser.add_argument("--reanalyze", type=str, metavar="PATH",
+                        help="Re-parse existing ablation logs/JSON; skip running. Loads PATH, "
+                             "re-extracts lb_cycles and optimization_milestones, prints summary, saves.")
 
     args = parser.parse_args()
+
+    # Reanalyze mode: load existing results, re-parse logs, update and save (in-place)
+    if args.reanalyze:
+        return _do_reanalyze(args.reanalyze)
 
     if args.batch_size % 8 != 0:
         print(f"ERROR: batch_size must be a multiple of 8 (got {args.batch_size})")
         return 1
 
-    if len(args.arm) < 2:
+    if not args.arm or len(args.arm) < 2:
         print("ERROR: need at least 2 arms for an ablation study")
         return 1
 
