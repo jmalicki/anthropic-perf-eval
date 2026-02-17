@@ -832,6 +832,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             temp_used.insert(a..a + 1);
         }
         let budget_i64 = config.budget as i64;
+        let end_addr = config.start_addr + budget_i64; // valid range is [start_addr, end_addr)
         let size_i64 = size as i64;
 
         // Try freed ranges first (same order as old allocator: reuse freed slots).
@@ -853,17 +854,19 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 
         // Else first-fit from gaps (rangemap: O(V) per allocation).
         let new_addr = new_addr.unwrap_or_else(|| {
-            let gap_outer = config.start_addr..budget_i64;
+            let gap_outer = config.start_addr..end_addr;
             temp_used
                 .gaps(&gap_outer)
                 .find(|gap| gap.end - gap.start >= size_i64)
                 .map(|gap| gap.start)
                 .unwrap_or_else(|| {
                     // Fallback: no gap large enough; build sorted used list and find first fit.
-                    let active_ranges: Vec<(i64, usize)> = used_range_set
+                    let mut active_ranges: Vec<(i64, usize)> = used_range_set
                         .iter()
                         .map(|r| (r.start, (r.end - r.start) as usize))
                         .collect();
+                    // Sentinel so we never allocate past end_addr (first_gap_of_length sees end_addr as used).
+                    active_ranges.push((end_addr, 1));
                     let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
                     first_gap_of_length(&used, config.start_addr, size)
                 })
