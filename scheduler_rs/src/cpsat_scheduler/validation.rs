@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::cse_groups::CseGroupResult;
 use crate::types::{ConstChoiceEncoding, Engine, MachineConfig, Opcode, SelectChoiceEncoding, SsaOp, VLEN};
 
 /// One row of the Flow audit: an op that contributes to the Flow engine at a given cycle.
@@ -299,8 +300,14 @@ pub(crate) fn validate_shifted_alu_cycles(
 }
 
 /// Validate that a CP-SAT solution respects engine slot limits per cycle.
-/// Panics with a descriptive message if any cycle exceeds limits (indicates a model bug).
+/// Returns `Err(msg)` if any cycle exceeds limits (indicates a model bug).
 /// Eliminated vbroadcast ops (when vb elimination is used) do not consume VALU slots and are not counted.
+///
+/// When `cse_group_results` and `op_idx_to_cse_group` are provided and non-empty, validation uses
+/// CSE-aware counting: for SelectChoice FMA (no-delta) ops in CSE groups, only the FMA at cycle+1
+/// is counted per consumer; the shared SUB is counted once per active group at its sub_cycle.
+/// Without CSE info, each SelectChoice FMA (no-delta) is counted as sub at cycle + fma at cycle+1
+/// (which would over-count when CSE is used, causing false validation failures).
 #[cfg(feature = "cpsat")]
 pub(crate) fn validate_ssa_slot_limits(
     ops: &[SsaOp],
@@ -311,10 +318,12 @@ pub(crate) fn validate_ssa_slot_limits(
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
-) {
+    cse_group_results: &[CseGroupResult],
+    op_idx_to_cse_group: &HashMap<usize, usize>,
+) -> Result<(), String> {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
     if makespan <= 0 {
-        return;
+        return Ok(());
     }
     validate_shifted_alu_cycles(shifted_ops, shifted_alu_cycles, makespan);
     let mut alu_per_cycle: Vec<i32> = vec![0; makespan as usize];
@@ -352,12 +361,25 @@ pub(crate) fn validate_ssa_slot_limits(
         }
         if op.opcode == Opcode::SelectChoice {
             if matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
-                valu_per_cycle[cycle] += 1;
+                let in_cse_group = op_idx_to_cse_group.contains_key(&idx);
                 if op.delta_vreg.is_none() {
-                    let cycle2 = cycle + 1;
-                    if cycle2 < valu_per_cycle.len() {
-                        valu_per_cycle[cycle2] += 1;
+                    // No-delta: sub at cycle C, fma at C+1. CSE groups share one SUB.
+                    if in_cse_group {
+                        // Only count FMA at cycle+1; shared SUB counted separately
+                        let cycle2 = cycle + 1;
+                        if cycle2 < valu_per_cycle.len() {
+                            valu_per_cycle[cycle2] += 1;
+                        }
+                    } else {
+                        valu_per_cycle[cycle] += 1;
+                        let cycle2 = cycle + 1;
+                        if cycle2 < valu_per_cycle.len() {
+                            valu_per_cycle[cycle2] += 1;
+                        }
                     }
+                } else {
+                    // Delta: single VALU at cycle
+                    valu_per_cycle[cycle] += 1;
                 }
             } else {
                 flow_per_cycle[cycle] += 1;
@@ -406,6 +428,16 @@ pub(crate) fn validate_ssa_slot_limits(
         }
     }
 
+    // CSE shared SUB: one VALU slot per active group at sub_cycle (model has one interval per group)
+    for result in cse_group_results {
+        if result.sub_active {
+            let sub_cycle = result.sub_cycle as usize;
+            if sub_cycle < valu_per_cycle.len() {
+                valu_per_cycle[sub_cycle] += 1;
+            }
+        }
+    }
+
     let limits: [(u32, &str); 5] = [
         (machine.slot_limit(Engine::Alu), "ALU"),
         (machine.slot_limit(Engine::Valu), "VALU"),
@@ -451,16 +483,47 @@ pub(crate) fn validate_ssa_slot_limits(
                         " contributors at cycle {}: {:?}.{}",
                         cycle, contribs, breadcrumbs
                     )
+                } else if *name == "VALU" {
+                    // List ops contributing to VALU at this cycle for debugging
+                    let contribs: Vec<String> = ops
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, op)| {
+                            let c = cycle_assignments.get(*idx).copied().unwrap_or(-1) as i32;
+                            if c < 0 {
+                                return false;
+                            }
+                            let contribs_to_cycle = |target: usize| -> bool {
+                                if op.engine == Engine::Valu
+                                    && !shifted_ops.contains(&op.id)
+                                    && !eliminated_vbroadcast_ops.contains(&op.id)
+                                {
+                                    c as usize == target
+                                } else if op.opcode == Opcode::SelectChoice
+                                    && matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma))
+                                {
+                                    c as usize == target
+                                        || (op.delta_vreg.is_none() && c as usize + 1 == target)
+                                } else {
+                                    false
+                                }
+                            };
+                            contribs_to_cycle(cycle)
+                        })
+                        .map(|(idx, op)| format!("idx={} op.id={} {:?}", idx, op.id, op.opcode))
+                        .collect();
+                    format!(" contributors at cycle {}: {:?}", cycle, contribs)
                 } else {
                     String::new()
                 };
-                panic!(
-                    "BUG: CP-SAT solution violates {} slot limit at cycle {}: {} > {} (model constraint error).{}",
+                return Err(format!(
+                    "CP-SAT solution violates {} slot limit at cycle {}: {} > {} (model constraint error).{}",
                     name, cycle, count, limit, detail
-                );
+                ));
             }
         }
     }
+    Ok(())
 }
 
 /// Same as validate_ssa_slot_limits but returns Err(msg) instead of panicking. Used for diagnostic checks.
@@ -474,6 +537,8 @@ pub(crate) fn try_validate_ssa_slot_limits(
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     eliminated_vbroadcast_ops: &HashSet<usize>,
     machine: &MachineConfig,
+    cse_group_results: &[CseGroupResult],
+    op_idx_to_cse_group: &HashMap<usize, usize>,
 ) -> Result<(), String> {
     let makespan = cycle_assignments.iter().max().copied().unwrap_or(-1) + 1;
     if makespan <= 0 {
@@ -500,12 +565,22 @@ pub(crate) fn try_validate_ssa_slot_limits(
         }
         if op.opcode == Opcode::SelectChoice {
             if matches!(select_choice_encoding.get(&op.id), Some(SelectChoiceEncoding::Fma)) {
-                valu_per_cycle[cycle] += 1;
+                let in_cse_group = op_idx_to_cse_group.contains_key(&idx);
                 if op.delta_vreg.is_none() {
-                    let cycle2 = cycle + 1;
-                    if cycle2 < valu_per_cycle.len() {
-                        valu_per_cycle[cycle2] += 1;
+                    if in_cse_group {
+                        let cycle2 = cycle + 1;
+                        if cycle2 < valu_per_cycle.len() {
+                            valu_per_cycle[cycle2] += 1;
+                        }
+                    } else {
+                        valu_per_cycle[cycle] += 1;
+                        let cycle2 = cycle + 1;
+                        if cycle2 < valu_per_cycle.len() {
+                            valu_per_cycle[cycle2] += 1;
+                        }
                     }
+                } else {
+                    valu_per_cycle[cycle] += 1;
                 }
             } else {
                 flow_per_cycle[cycle] += 1;
@@ -536,6 +611,15 @@ pub(crate) fn try_validate_ssa_slot_limits(
             Engine::Store => store_per_cycle[cycle] += 1,
             Engine::Flow => flow_per_cycle[cycle] += 1,
             _ => {}
+        }
+    }
+
+    for result in cse_group_results {
+        if result.sub_active {
+            let sub_cycle = result.sub_cycle as usize;
+            if sub_cycle < valu_per_cycle.len() {
+                valu_per_cycle[sub_cycle] += 1;
+            }
         }
     }
 

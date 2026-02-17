@@ -77,6 +77,15 @@ impl Pass for BulkMoveCompactionPass {
                     &shifted_alu_cycles,
                     constraints,
                 );
+                let op_idx_to_cse_group: HashMap<usize, usize> = ctx
+                    .final_decisions
+                    .cse_groups
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(g, group)| {
+                        group.consumer_indices.iter().map(move |&idx| (idx, g))
+                    })
+                    .collect();
                 let capacity_ok = try_validate_ssa_slot_limits(
                     &ctx.ops,
                     &cycle_assignments,
@@ -86,6 +95,8 @@ impl Pass for BulkMoveCompactionPass {
                     &ctx.final_decisions.select_choice_encoding,
                     &ctx.final_decisions.eliminated_vbroadcast_ops,
                     &ctx.config.machine,
+                    &ctx.final_decisions.cse_group_results,
+                    &op_idx_to_cse_group,
                 );
                 if constraints_ok.is_ok() && capacity_ok.is_ok() {
                     for (i, op) in ctx.ops.iter_mut().enumerate() {

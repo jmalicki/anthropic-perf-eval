@@ -3363,7 +3363,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
     );
 
     match cpsat_result {
-        Some(result) => {
+        Ok(Some(result)) => {
             eprintln!(
                 "CP-SAT found solution: {} cycles, status={:?}",
                 result.makespan, result.status
@@ -3400,10 +3400,13 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
                 "CP-SAT should find a feasible solution"
             );
         }
-        None => {
+        Ok(None) => {
             eprintln!("CP-SAT returned NO SOLUTION - problem may be infeasible within budget");
             // This is an expected outcome if the kernel truly cannot fit in 1536 words
             // We don't fail the test - just report the finding
+        }
+        Err(e) => {
+            panic!("CP-SAT validation failed: {}", e);
         }
     }
 }

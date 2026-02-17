@@ -1024,13 +1024,18 @@ impl SsaTickTockKernelBuilder {
                     },
                     Some(false),
                 ) {
-                    Some(r) => r,
-                    None => {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
                         let error = KernelBuilderError::PerSectionInfeasible {
                             section: k,
                             budget: effective_budget,
                             time_limit: section_time_limit,
                         };
+                        export_partial_result_on_error_safe(&ctx, &error);
+                        return Err(error);
+                    }
+                    Err(e) => {
+                        let error = KernelBuilderError::Other(e);
                         export_partial_result_on_error_safe(&ctx, &error);
                         return Err(error);
                     }
@@ -1285,7 +1290,7 @@ impl SsaTickTockKernelBuilder {
             vec![]
         };
         let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
-        let cpsat_result = schedule_ssa_cpsat(
+        let cpsat_result = match schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
             SsaCpsatHints {
@@ -1301,8 +1306,19 @@ impl SsaTickTockKernelBuilder {
                 cse_groups: cse_groups_ref,
             },
             Some(!greedy_budget_exceeded),
-        )
-        .ok_or_else(|| KernelBuilderError::Other("CP-SAT scheduling failed".to_string()))?;
+        ) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let error = KernelBuilderError::Other("CP-SAT scheduling failed".to_string());
+                export_partial_result_on_error_safe(&ctx, &error);
+                return Err(error);
+            }
+            Err(e) => {
+                let error = KernelBuilderError::Other(e);
+                export_partial_result_on_error_safe(&ctx, &error);
+                return Err(error);
+            }
+        };
 
         // Apply cycle assignments
         for (idx, op) in ctx.ops.iter_mut().enumerate() {

@@ -107,7 +107,7 @@ impl Pass for CpSatSchedulePass {
             },
             Some(!greedy_budget_exceeded),
         )
-        .ok_or_else(|| "CP-SAT scheduling failed".to_string())?;
+        .and_then(|o| o.ok_or_else(|| "CP-SAT scheduling failed".to_string()))?;
 
         // Apply cycle assignments
         for (idx, op) in ctx.ops.iter_mut().enumerate() {

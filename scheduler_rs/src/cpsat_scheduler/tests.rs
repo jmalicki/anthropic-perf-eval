@@ -46,8 +46,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let result = result.unwrap().unwrap();
 
         // Verify all ops are scheduled
         assert_eq!(result.cycle_assignments.len(), emit.ops.len());
@@ -93,10 +93,10 @@ mod ssa_tests {
             None,
         );
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "ForceAddImm must be feasible; if this fails, AddImm constraints are wrong"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         let n_const = emit.ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).count();
         let r_add_imm = r
             .const_choice_encoding
@@ -148,8 +148,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Verify all ops are scheduled
         assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
@@ -311,8 +311,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Find ConstChoice op IDs
         let const_choice_ids: Vec<usize> = emit
@@ -447,8 +447,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let result = result.unwrap().unwrap();
 
         // Verify all ops are scheduled
         assert_eq!(result.cycle_assignments.len(), emit.ops.len());
@@ -516,10 +516,10 @@ mod ssa_tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "CP-SAT should find a solution with 1 VALU / 8 ALU toy caps"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(r.cycle_assignments.len(), emit.ops.len());
 
         // With 1 VALU slot and 3 chains (6 VALU ops), shifting at least one valu1 to ALU should help.
@@ -580,7 +580,7 @@ mod ssa_tests {
 
         // 1) Baseline: toy machine, default hints (hint vselect)
         let r1 = schedule_ssa_cpsat(&emit.ops, base_config.clone(), SsaCpsatHints::default(), None);
-        if r1.is_some() {
+        if matches!(r1, Ok(Some(_))) {
             passed.push("baseline (toy, default hints)");
         } else {
             failed.push("baseline (toy, default hints)");
@@ -590,7 +590,7 @@ mod ssa_tests {
         let mut c2 = base_config.clone();
         c2.hint_select_choice_vselect_by_default = false;
         let r2 = schedule_ssa_cpsat(&emit.ops, c2, SsaCpsatHints::default(), None);
-        if r2.is_some() {
+        if matches!(r2, Ok(Some(_))) {
             passed.push("hint_select_choice_vselect_by_default: false");
         } else {
             failed.push("hint_select_choice_vselect_by_default: false");
@@ -601,7 +601,7 @@ mod ssa_tests {
         c3.machine = MachineConfig::default();
         c3.model_name = Some("investigate_default_machine".to_string());
         let r3 = schedule_ssa_cpsat(&emit.ops, c3, SsaCpsatHints::default(), None);
-        if r3.is_some() {
+        if matches!(r3, Ok(Some(_))) {
             passed.push("default machine");
         } else {
             failed.push("default machine");
@@ -612,7 +612,7 @@ mod ssa_tests {
         c4.asap_alap_tightening = AsapAlapTightening::None;
         c4.model_name = Some("investigate_no_tightening".to_string());
         let r4 = schedule_ssa_cpsat(&emit.ops, c4, SsaCpsatHints::default(), None);
-        if r4.is_some() {
+        if matches!(r4, Ok(Some(_))) {
             passed.push("asap_alap_tightening: None");
         } else {
             failed.push("asap_alap_tightening: None");
@@ -623,7 +623,7 @@ mod ssa_tests {
         c5.select_choice_mode = SelectChoiceMode::ForceFma;
         c5.model_name = Some("investigate_force_fma".to_string());
         let r5 = schedule_ssa_cpsat(&emit.ops, c5, SsaCpsatHints::default(), None);
-        if r5.is_some() {
+        if matches!(r5, Ok(Some(_))) {
             passed.push("select_choice_mode: ForceFma");
         } else {
             failed.push("select_choice_mode: ForceFma");
@@ -696,8 +696,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Find SelectChoice op indices and their cycles
         let select_choice_info: Vec<(usize, usize, i32)> = emit
@@ -805,8 +805,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Collect all Flow-engine ops and their cycles
         let flow_ops: Vec<(usize, i32)> = emit
@@ -870,23 +870,23 @@ mod ssa_tests {
         let const_choice_encoding = HashMap::new();
         let select_choice_encoding = HashMap::new();
 
-        // This should panic because we have 2 Flow ops in cycle 0
-        let result = std::panic::catch_unwind(|| {
-            validate_ssa_slot_limits(
-                &ops,
-                &cycle_assignments,
-                &shifted_ops,
-                &HashMap::new(), // shifted_alu_cycles
-                &const_choice_encoding,
-                &select_choice_encoding,
-                &HashSet::new(), // eliminated_vbroadcast_ops
-                &MachineConfig::default(),
-            );
-        });
+        // This should return Err because we have 2 Flow ops in cycle 0
+        let result = validate_ssa_slot_limits(
+            &ops,
+            &cycle_assignments,
+            &shifted_ops,
+            &HashMap::new(), // shifted_alu_cycles
+            &const_choice_encoding,
+            &select_choice_encoding,
+            &HashSet::new(), // eliminated_vbroadcast_ops
+            &MachineConfig::default(),
+            &[],              // cse_group_results
+            &HashMap::new(),  // op_idx_to_cse_group
+        );
 
         assert!(
             result.is_err(),
-            "validate_ssa_slot_limits should panic when 2 Flow ops are in same cycle"
+            "validate_ssa_slot_limits should return Err when 2 Flow ops are in same cycle"
         );
 
         eprintln!("test_validate_ssa_slot_limits_detects_flow_violation PASSED");
@@ -922,8 +922,8 @@ mod ssa_tests {
         let const_choice_encoding = HashMap::new();
         let select_choice_encoding = HashMap::new();
 
-        // This should NOT panic
-        validate_ssa_slot_limits(
+        // This should return Ok(())
+        let result = validate_ssa_slot_limits(
             &ops,
             &cycle_assignments,
             &shifted_ops,
@@ -932,9 +932,176 @@ mod ssa_tests {
             &select_choice_encoding,
             &HashSet::new(), // eliminated_vbroadcast_ops
             &MachineConfig::default(),
+            &[],              // cse_group_results
+            &HashMap::new(),  // op_idx_to_cse_group
         );
 
+        assert!(result.is_ok(), "validate_ssa_slot_limits should pass for valid schedule");
+
         eprintln!("test_validate_ssa_slot_limits_passes_valid_schedule PASSED");
+    }
+
+    /// Test that CSE shared SUB is counted correctly in VALU validation.
+    /// Without CSE-aware counting: 3 SelectChoice FMA (no-delta) consumers each add sub at cycle 5,
+    /// plus 4 other VALU ops at cycle 5 = 7 at cycle 5 (exceeds limit 6).
+    /// With CSE-aware counting: 1 shared SUB at sub_cycle=5, plus 4 VALU = 5 at cycle 5 (valid).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_validate_ssa_slot_limits_cse_shared_sub() {
+        use crate::types::Operand;
+
+        // Producers for SelectChoice (cond, true_val, false_val) - indices 0,1,2
+        let op0 = SsaOp::new(
+            0,
+            Engine::Load,
+            Opcode::Const,
+            Some(VReg::scalar(0)),
+            vec![Operand::imm(1)],
+        );
+        let op1 = SsaOp::new(
+            1,
+            Engine::Load,
+            Opcode::Const,
+            Some(VReg::scalar(1)),
+            vec![Operand::imm(10)],
+        );
+        let op2 = SsaOp::new(
+            2,
+            Engine::Load,
+            Opcode::Const,
+            Some(VReg::scalar(2)),
+            vec![Operand::imm(20)],
+        );
+
+        // 3 SelectChoice FMA (no-delta) in CSE group - indices 3,4,5, at cycle 5 (sub at 5, fma at 6)
+        let mut op3 = SsaOp::new(
+            3,
+            Engine::Flow,
+            Opcode::SelectChoice,
+            Some(VReg::scalar(3)),
+            vec![
+                Operand::scalar(0),
+                Operand::scalar(1),
+                Operand::scalar(2),
+            ],
+        );
+        op3.sub_temp_vreg = Some(VReg::vector(99));
+
+        let mut op4 = SsaOp::new(
+            4,
+            Engine::Flow,
+            Opcode::SelectChoice,
+            Some(VReg::scalar(4)),
+            vec![
+                Operand::scalar(0),
+                Operand::scalar(1),
+                Operand::scalar(2),
+            ],
+        );
+        op4.sub_temp_vreg = Some(VReg::vector(100));
+
+        let mut op5 = SsaOp::new(
+            5,
+            Engine::Flow,
+            Opcode::SelectChoice,
+            Some(VReg::scalar(5)),
+            vec![
+                Operand::scalar(0),
+                Operand::scalar(1),
+                Operand::scalar(2),
+            ],
+        );
+        op5.sub_temp_vreg = Some(VReg::vector(101));
+
+        // 4 VALU ops at cycle 5 - indices 6,7,8,9
+        let op6 = SsaOp::new(
+            6,
+            Engine::Valu,
+            Opcode::Vbroadcast,
+            Some(VReg::vector(10)),
+            vec![Operand::scalar(0)],
+        );
+        let op7 = SsaOp::new(
+            7,
+            Engine::Valu,
+            Opcode::Vbroadcast,
+            Some(VReg::vector(11)),
+            vec![Operand::scalar(1)],
+        );
+        let op8 = SsaOp::new(
+            8,
+            Engine::Valu,
+            Opcode::Vbroadcast,
+            Some(VReg::vector(12)),
+            vec![Operand::scalar(2)],
+        );
+        let op9 = SsaOp::new(
+            9,
+            Engine::Valu,
+            Opcode::Vbroadcast,
+            Some(VReg::vector(13)),
+            vec![Operand::scalar(0)],
+        );
+
+        let ops = vec![op0, op1, op2, op3, op4, op5, op6, op7, op8, op9];
+
+        // Schedule: producers at 0,1,2 (Load limit 2), SelectChoice at 5, VALU ops at 5
+        let cycle_assignments = vec![0, 0, 1, 5, 5, 5, 5, 5, 5, 5];
+
+        let mut select_choice_encoding = HashMap::new();
+        select_choice_encoding.insert(3, crate::types::SelectChoiceEncoding::Fma);
+        select_choice_encoding.insert(4, crate::types::SelectChoiceEncoding::Fma);
+        select_choice_encoding.insert(5, crate::types::SelectChoiceEncoding::Fma);
+
+        let cse_group_results = vec![CseGroupResult {
+            sub_active: true,
+            sub_cycle: 5,
+        }];
+
+        let mut op_idx_to_cse_group = HashMap::new();
+        op_idx_to_cse_group.insert(3, 0);
+        op_idx_to_cse_group.insert(4, 0);
+        op_idx_to_cse_group.insert(5, 0);
+
+        // With CSE-aware validation: 1 shared SUB at cycle 5 + 4 VALU at cycle 5 = 5 (valid)
+        let result = validate_ssa_slot_limits(
+            &ops,
+            &cycle_assignments,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &select_choice_encoding,
+            &HashSet::new(),
+            &MachineConfig::default(),
+            &cse_group_results,
+            &op_idx_to_cse_group,
+        );
+
+        assert!(
+            result.is_ok(),
+            "CSE-aware validation should pass: 1 shared SUB + 4 VALU = 5 at cycle 5 <= 6"
+        );
+
+        // Without CSE info (old behavior): would over-count 3 subs at cycle 5 → 7, should fail
+        let result_no_cse = validate_ssa_slot_limits(
+            &ops,
+            &cycle_assignments,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &select_choice_encoding,
+            &HashSet::new(),
+            &MachineConfig::default(),
+            &[],              // no cse_group_results
+            &HashMap::new(),  // no op_idx_to_cse_group
+        );
+
+        assert!(
+            result_no_cse.is_err(),
+            "Without CSE info, validation should fail (over-counts 3 subs + 4 VALU = 7 > 6)"
+        );
+
+        eprintln!("test_validate_ssa_slot_limits_cse_shared_sub PASSED");
     }
 
     /// Test that ConstChoice ops are correctly handled when they choose AddImm path.
@@ -981,8 +1148,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // If any ConstChoice ops chose AddImm path, they should be in different cycles
         if cpsat_result.const_choice_encoding.values().any(|e| matches!(e, crate::types::ConstChoiceEncoding::AddImm)) {
@@ -1081,8 +1248,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Collect all ops that use Flow slot:
         // 1. AddImm ops (from emit_const)
@@ -1167,8 +1334,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Find SelectChoice op IDs
         let select_choice_ids: Vec<usize> = emit
@@ -1326,10 +1493,10 @@ mod ssa_tests {
             None,
         );
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "CP-SAT should find a solution with ForceFma"
         );
-        let cpsat_result = result.unwrap();
+        let cpsat_result = result.unwrap().unwrap();
 
         assert!(
             matches!(cpsat_result.select_choice_encoding.get(&select_choice_id), Some(crate::types::SelectChoiceEncoding::Fma)),
@@ -1434,7 +1601,8 @@ mod ssa_tests {
             SsaCpsatHints::default(),
             None,
         )
-        .expect("CP-SAT ForceValu schedule");
+        .expect("CP-SAT ForceValu schedule")
+        .expect("No solution found");
 
         let shift_cycle = result.cycle_assignments[shift_idx];
         let consumer_cycle = result.cycle_assignments[consumer_idx];
@@ -1485,7 +1653,8 @@ mod ssa_tests {
             SsaCpsatHints::default(),
             None,
         )
-        .expect("CP-SAT should find solution for vb -> valu1 -> valu2 -> valu3 with ForceAlu");
+        .expect("CP-SAT should find solution for vb -> valu1 -> valu2 -> valu3 with ForceAlu")
+        .expect("No solution found");
 
         let alu1 = result
             .shifted_alu_cycles
@@ -1557,8 +1726,8 @@ mod ssa_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let r = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let r = result.unwrap().unwrap();
         if r.shifted_ops.contains(&add_id) {
             assert!(
                 r.eliminated_vbroadcast_ops.contains(&vb_id),
@@ -1626,10 +1795,10 @@ mod ssa_tests {
             None,
         );
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "CP-SAT should find a solution with default machine + ForceFma"
         );
-        let cpsat_result = result.unwrap();
+        let cpsat_result = result.unwrap().unwrap();
 
         let c = cpsat_result.cycle_assignments[select_choice_idx];
         for (idx, op) in emit.ops.iter().enumerate() {
@@ -1766,8 +1935,8 @@ mod ssa_tests {
             SsaCpsatHints::default(),
             None,
         );
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         assert!(
             matches!(cpsat_result.select_choice_encoding.get(&id1), Some(crate::types::SelectChoiceEncoding::Fma))
@@ -1870,7 +2039,7 @@ mod ssa_tests {
             SsaCpsatHints::default(),
             None,
         );
-        let cpsat_result = result.unwrap();
+        let cpsat_result = result.unwrap().unwrap();
         for (idx, op) in emit.ops.iter_mut().enumerate() {
             op.cycle = cpsat_result.cycle_assignments[idx];
         }
@@ -2225,7 +2394,7 @@ mod precedence_offset_tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution with fixpoint enabled");
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution with fixpoint enabled");
     }
 }
 
@@ -2561,8 +2730,8 @@ mod tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let result = result.unwrap().unwrap();
 
         // Verify all ops are scheduled
         assert_eq!(result.cycle_assignments.len(), emit.ops.len());
@@ -2623,8 +2792,8 @@ mod tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Verify all ops are scheduled
         assert_eq!(cpsat_result.cycle_assignments.len(), emit.ops.len());
@@ -2791,8 +2960,8 @@ mod tests {
             None,
         );
 
-        assert!(result.is_some(), "CP-SAT should find a solution");
-        let cpsat_result = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution");
+        let cpsat_result = result.unwrap().unwrap();
 
         // Find ConstChoice op IDs
         let const_choice_ids: Vec<usize> = emit
@@ -2956,10 +3125,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with generous budget"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.status,
             CpsatStatus::Optimal,
@@ -3046,10 +3215,10 @@ mod tests {
         );
 
         assert!(
-            result_generous.is_some(),
+            matches!(result_generous, Ok(Some(_))),
             "Should find solution with generous budget"
         );
-        let r_generous = result_generous.unwrap();
+        let r_generous = result_generous.unwrap().unwrap();
         eprintln!(
             "Generous budget: makespan={}, status={:?}",
             r_generous.makespan, r_generous.status
@@ -3071,7 +3240,7 @@ mod tests {
         // The tight budget should either:
         // 1. Force a longer schedule (more cycles to reduce concurrent live values), or
         // 2. Return infeasible if impossible
-        if let Some(r_tight) = result_tight {
+        if let Ok(Some(r_tight)) = result_tight {
             eprintln!(
                 "Tight budget: makespan={}, status={:?}",
                 r_tight.makespan, r_tight.status
@@ -3136,10 +3305,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution when scratch constraint disabled"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         eprintln!(
             "Disabled constraint: makespan={}, status={:?}",
             r.makespan, r.status
@@ -3211,8 +3380,8 @@ mod tests {
             Some(true), // valid hints, within scratch
         );
 
-        assert!(result.is_some(), "Should find solution with valid hints");
-        let r = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "Should find solution with valid hints");
+        let r = result.unwrap().unwrap();
 
         // Critical: with stop_after_first_solution, we should get exactly the hinted solution
         assert_eq!(
@@ -3286,10 +3455,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with valid hints and scratch constraint"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
 
         // Critical: hints should be feasible with scratch constraint
         assert_eq!(
@@ -3365,10 +3534,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with valid vector hints and scratch constraint"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
 
         // Critical: hints should be feasible
         assert_eq!(
@@ -3447,7 +3616,7 @@ mod tests {
         // 1. Find a different (valid) schedule that fits the budget, or
         // 2. Return infeasible if no valid schedule exists
         // It should NOT return the infeasible hint as-is
-        if let Some(r) = result {
+        if let Ok(Some(r)) = result {
             // If it found a solution, it should NOT be the original hint
             // because that hint violates the scratch budget
             eprintln!(
@@ -3520,10 +3689,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with same-cycle interval (size=1)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should return the hinted solution"
@@ -3584,10 +3753,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with consecutive-cycle interval (size=2)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should return the hinted solution"
@@ -3697,10 +3866,10 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with gap interval (size=6)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should return the hinted solution"
@@ -3816,10 +3985,10 @@ mod tests {
 
         // The verification code should NOT panic, and we should get a valid result
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with 6 VALU ops at same cycle (exactly at limit)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should accept the hinted solution"
@@ -3980,10 +4149,10 @@ mod tests {
 
         // The verification code should NOT panic, and we should get a valid result
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with 12 ALU ops at same cycle (exactly at limit)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should accept the hinted solution"
@@ -4102,10 +4271,10 @@ mod tests {
         // shift_hints to verify that the greedy hints don't violate capacity. If the verification
         // panicked, we wouldn't reach this point. Getting a result means verification passed.
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with shifted VALU (8) + 4 ALU = 12 (at limit)"
         );
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         assert_eq!(
             r.cycle_assignments, hints,
             "Should accept the hinted solution"
@@ -4206,8 +4375,8 @@ mod tests {
 
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
         // For a simple chain, hints should be optimal (ASAP), so solver may return exact hints.
-        assert!(result.is_some(), "Simple chain should be schedulable");
-        let r = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "Simple chain should be schedulable");
+        let r = result.unwrap().unwrap();
         // Verify basic constraints are satisfied
         assert!(
             r.makespan >= 4,
@@ -4312,8 +4481,8 @@ mod tests {
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
         // Note: The solver may find a better schedule than the hints, so we don't assert exact match.
         // The key test is that vreg_last_use computation doesn't produce impossible results.
-        assert!(result.is_some(), "Reordered schedule should be schedulable");
-        let r = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "Reordered schedule should be schedulable");
+        let r = result.unwrap().unwrap();
         // Verify basic constraints are satisfied
         assert!(
             r.makespan >= 2,
@@ -4406,8 +4575,8 @@ mod tests {
         // The test passes if we don't panic from "BUG: X VRegs have last_use_cycle < def_cycle"
         // Note: The solver may find a better schedule than the hints, so we don't assert exact match.
         // The key test is that vreg_last_use computation doesn't produce impossible results.
-        assert!(result.is_some(), "Multiple readers should be schedulable");
-        let r = result.unwrap();
+        assert!(matches!(result, Ok(Some(_))), "Multiple readers should be schedulable");
+        let r = result.unwrap().unwrap();
         // Verify basic constraints are satisfied
         assert!(
             r.makespan >= 2,
@@ -4488,11 +4657,11 @@ mod tests {
 
         // CP-SAT should find a solution with budget=2
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "CP-SAT should find a schedule with 2-word budget"
         );
 
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         eprintln!(
             "test_ssa_cpsat_minimal_budget_2_words: makespan={}, assignments={:?}",
             r.makespan, r.cycle_assignments
@@ -4611,11 +4780,11 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with shifted VALU and tight budget"
         );
 
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         eprintln!(
             "test_ssa_cpsat_scratch_constraint_shifted_valu_dest: makespan={}, shifted_ops={:?}",
             r.makespan, r.shifted_ops
@@ -4702,7 +4871,7 @@ mod tests {
         );
 
         assert!(
-            result_no_tightening.is_some(),
+            matches!(result_no_tightening, Ok(Some(_))),
             "CP-SAT should find a solution without tightening"
         );
 
@@ -4720,12 +4889,12 @@ mod tests {
         );
 
         assert!(
-            result_with_tightening.is_some(),
+            matches!(result_with_tightening, Ok(Some(_))),
             "CP-SAT should find a solution with tightening enabled"
         );
 
-        let r_no_tightening = result_no_tightening.unwrap();
-        let r_with_tightening = result_with_tightening.unwrap();
+        let r_no_tightening = result_no_tightening.unwrap().unwrap();
+        let r_with_tightening = result_with_tightening.unwrap().unwrap();
 
         eprintln!(
             "test_asap_alap_tightening_enabled: makespan without tightening={}, with tightening={}",
@@ -4831,7 +5000,7 @@ mod tests {
         );
 
         assert!(
-            result_no_tightening.is_some(),
+            matches!(result_no_tightening, Ok(Some(_))),
             "CP-SAT should find a solution without scratch tightening"
         );
 
@@ -4851,12 +5020,12 @@ mod tests {
         );
 
         assert!(
-            result_with_scratch_tightening.is_some(),
+            matches!(result_with_scratch_tightening, Ok(Some(_))),
             "CP-SAT should find a solution with scratch tightening enabled"
         );
 
-        let r_no_tightening = result_no_tightening.unwrap();
-        let r_with_scratch = result_with_scratch_tightening.unwrap();
+        let r_no_tightening = result_no_tightening.unwrap().unwrap();
+        let r_with_scratch = result_with_scratch_tightening.unwrap().unwrap();
 
         eprintln!(
             "test_scratch_tightening_enabled: makespan without tightening={}, with scratch tightening={}",
@@ -4958,11 +5127,11 @@ mod tests {
         );
 
         assert!(
-            result_both.is_some(),
+            matches!(result_both, Ok(Some(_))),
             "CP-SAT should find a solution with both tightening methods enabled"
         );
 
-        let r_both = result_both.unwrap();
+        let r_both = result_both.unwrap().unwrap();
 
         eprintln!(
             "test_both_tightening_methods_together: makespan with both tightening={}",
@@ -5094,11 +5263,11 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with SelectChoice FMA and tight budget"
         );
 
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         eprintln!(
             "test_ssa_cpsat_scratch_constraint_selectchoice_fma_reads: makespan={}, select_fma_op_ids={:?}",
             r.makespan,
@@ -5299,11 +5468,11 @@ mod tests {
         );
 
         assert!(
-            result.is_some(),
+            matches!(result, Ok(Some(_))),
             "Should find solution with CSE shared sub_temp and tight budget"
         );
 
-        let r = result.unwrap();
+        let r = result.unwrap().unwrap();
         eprintln!(
             "test_ssa_cpsat_scratch_constraint_cse_shared_sub_temp: makespan={}, select_fma_op_ids={:?}, cse_group_results={:?}",
             r.makespan,

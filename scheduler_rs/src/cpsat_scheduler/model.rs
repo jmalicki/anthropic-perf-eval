@@ -46,15 +46,16 @@ use super::validation::{
 ///   sanity-check: we panic if greedy makespan < capacity_lower_bound only when this is `Some(true)`.
 ///
 /// # Returns
-/// * `Some(SsaCpsatResult)` if a solution was found (includes shift decisions)
-/// * `None` if no solution found or feature not enabled
+/// * `Ok(Some(SsaCpsatResult))` if a solution was found (includes shift decisions)
+/// * `Ok(None)` if no solution found or feature not enabled
+/// * `Err(msg)` if a solution was found but post-solve validation failed (e.g. slot limit violated)
 #[cfg(feature = "cpsat")]
 pub fn schedule_ssa_cpsat(
     ops: &[SsaOp],
     config: SsaCpsatConfig,
     hints: SsaCpsatHints<'_>,
     greedy_within_scratch_budget: Option<bool>,
-) -> Option<SsaCpsatResult> {
+) -> Result<Option<SsaCpsatResult>, String> {
     use cp_sat::builder::BoolVar;
 
     let SsaCpsatConfig {
@@ -96,7 +97,7 @@ pub fn schedule_ssa_cpsat(
     let n = ops.len();
 
     if n == 0 {
-        return Some(SsaCpsatResult {
+        return Ok(Some(SsaCpsatResult {
             cycle_assignments: vec![],
             makespan: 0,
             status: CpsatStatus::Optimal,
@@ -113,7 +114,7 @@ pub fn schedule_ssa_cpsat(
             eliminated_vb_to_scalar_producer: HashMap::new(),
             cse_group_results: vec![],
             schedule_constraints: vec![],
-        });
+        }));
     }
 
     // 0. Identify shiftable VALU ops (needed for precedence offsets in ASAP/ALAP)
@@ -4010,7 +4011,9 @@ pub fn schedule_ssa_cpsat(
                 &select_choice_encoding,
                 &eliminated_vbroadcast_ops,
                 &machine,
-            );
+                &cse_group_results,
+                &op_idx_to_cse_group,
+            )?;
 
             // Post-solution validation: every RAW dependency satisfies precedence (consumer >= producer visible cycle).
             verify_all_raw_precedence(
@@ -4160,7 +4163,7 @@ pub fn schedule_ssa_cpsat(
                 })
             };
 
-            Some(SsaCpsatResult {
+            Ok(Some(SsaCpsatResult {
                 cycle_assignments: out_cycle_assignments,
                 makespan: out_makespan,
                 status,
@@ -4177,7 +4180,7 @@ pub fn schedule_ssa_cpsat(
                 eliminated_vb_to_scalar_producer,
                 cse_group_results,
                 schedule_constraints,
-            })
+            }))
         }
         _ => {
             if verbose {
@@ -4200,7 +4203,7 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
             }
-            None
+            Ok(None)
         }
     }
 }
@@ -4212,7 +4215,7 @@ pub fn schedule_ssa_cpsat(
     _config: SsaCpsatConfig,
     _hints: SsaCpsatHints<'_>,
     _greedy_within_scratch_budget: Option<bool>,
-) -> Option<SsaCpsatResult> {
+) -> Result<Option<SsaCpsatResult>, String> {
     eprintln!("SSA CP-SAT scheduler not available: compile with --features cpsat");
-    None
+    Ok(None)
 }
