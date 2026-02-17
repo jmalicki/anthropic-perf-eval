@@ -181,7 +181,7 @@ pub use config::{
 pub use legacy::{compute_asap, compute_alap};
 pub use cse_groups::{build_cse_groups, CseGroup, CseGroupResult};
 pub use bounds::{
-    CapacityLowerBoundResult, CpsatConfig, CpsatResultWithShift, LiveInterval,
+    AsapAlapTightening, CapacityLowerBoundResult, CpsatConfig, CpsatResultWithShift, LiveInterval,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
     compute_capacity_lower_bound_global, compute_live_intervals, compute_max_latency_critical_path,
     compute_ssa_alap, compute_ssa_asap,

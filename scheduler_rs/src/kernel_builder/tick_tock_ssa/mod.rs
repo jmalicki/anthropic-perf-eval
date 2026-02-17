@@ -631,9 +631,7 @@ impl SsaTickTockKernelBuilder {
         select_choice_mode: crate::cpsat_scheduler::SelectChoiceMode,
         valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
         force_zero_gap: bool,
-        enable_asap_alap_tightening: bool,
-        use_energetic_slot_tightening: bool,
-        use_symmetry_aware_slot_tightening: bool,
+        asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening,
         enable_scratch_tightening: bool,
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
         enable_cse_groups: bool,
@@ -674,9 +672,7 @@ impl SsaTickTockKernelBuilder {
             scratch_budget: SCRATCH_BUDGET_HW,
             verbose,
             bounds: BoundsConfig {
-                enable_asap_alap_tightening,
-                use_energetic_slot_tightening,
-                use_symmetry_aware_slot_tightening,
+                asap_alap_tightening,
                 enable_scratch_tightening,
             },
             cpsat: Some(CpSatPipelineConfig {
@@ -689,9 +685,7 @@ impl SsaTickTockKernelBuilder {
                 select_choice_mode,
                 valu_shift_mode,
                 force_zero_gap,
-                enable_asap_alap_tightening,
-                use_energetic_slot_tightening,
-                use_symmetry_aware_slot_tightening,
+                asap_alap_tightening,
                 enable_scratch_tightening,
                 disable_optional_constraint_groups,
                 enable_cse_groups,
@@ -1189,19 +1183,7 @@ impl SsaTickTockKernelBuilder {
             select_choice_mode,
             valu_shift_mode,
             force_zero_gap,
-            enable_asap_alap_tightening,
-            use_energetic_slot_tightening: ctx
-                .config
-                .cpsat
-                .as_ref()
-                .map(|c| c.use_energetic_slot_tightening)
-                .unwrap_or(false),
-            use_symmetry_aware_slot_tightening: ctx
-                .config
-                .cpsat
-                .as_ref()
-                .map(|c| c.use_symmetry_aware_slot_tightening)
-                .unwrap_or(true),
+            asap_alap_tightening,
             enable_scratch_tightening,
             disable_optional_constraint_groups: ctx
                 .config

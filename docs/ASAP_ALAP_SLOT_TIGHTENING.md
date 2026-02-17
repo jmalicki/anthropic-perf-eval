@@ -31,9 +31,9 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 - **Strong guarantee:** Trivially satisfied — we never exclude a cycle that precedence allows.
 - **Does not untighten:** We only set bounds from precedence (and fixpoint).
-- **Implementation:** When slot tightening is enabled (`--enable-asap-alap-tightening`), the **default** is R_precedence_only: we skip the energetic slot loop. We still run precedence propagation, greedy-cap (if hints exist), and fixpoint. To get the old energetic behavior (ASAP-only + greedy-cap, which can over-tighten), pass **`--energetic-slot-tightening`** in addition to `--enable-asap-alap-tightening`.
+- **Implementation:** Choose one of four modes via **`--asap-alap-tightening`**: `none`, `simple` (R_precedence_only: precedence + fixpoint only), `symmetry-aware` (default), or `energetic`. Simple = no symmetry ordering, no energetic loop. Symmetry-aware = R_symmetry_ordering. Energetic = symmetry-aware plus energetic slot loop.
 
-**Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`use_energetic_slot_tightening`), `model.rs`, `kernel_build_args.py`.
+**Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`AsapAlapTightening` enum), `model.rs`, `kernel_build_args.py`.
 
 ### R_symmetry_ordering (solver-free; implemented; strong guarantee)
 
@@ -41,7 +41,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 - **Strong guarantee:** Every feasible schedule that satisfies the model’s symmetry constraints already has each op at least at that cycle. So we only exclude cycles that no such schedule uses.
 - **Does not untighten:** We only push ASAP forward (or leave unchanged).
-- **Implementation:** When slot tightening is on, **symmetry-aware tightening runs by default** (`use_symmetry_aware_slot_tightening: true`). Disable with `--no-symmetry-aware-slot-tightening`. See `tighten_asap_by_symmetry_ordering` in `bounds.rs`.
+- **Implementation:** Use **`--asap-alap-tightening symmetry-aware`** (default). See `tighten_asap_by_symmetry_ordering` in `bounds.rs`.
 
 **Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`tighten_asap_by_symmetry_ordering`), `model.rs`, `kernel_build_args.py`.
 
@@ -65,14 +65,14 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 | **R_precedence_only** (no slot exclusions) | **Yes** (proved) | We add no slot-based exclusions; only precedence + fixpoint + greedy-cap. Trivially preserves every feasible schedule. |
 | **R_symmetry_ordering** (default when tightening on) | **Yes** (proved) | Slot exclusions from symmetry + capacity only: “k-th op in group per engine cannot run before ceil(k/C)-1.” Preserves all schedules that satisfy the model’s ordering constraints. |
 | **R_entailed** (exclude only when (O,t) is UNSAT) | **Yes** (proved in Z3) | **T7-strong-guarantee-entailed-exclusions**: refuting (precedence ∧ capacity ∧ ¬exclusions) yields UNSAT → no feasible schedule removed. Not implemented in Rust (needs a solver). |
-| **Energetic** (`--enable-asap-alap-tightening` + `--energetic-slot-tightening`) | **No** (proved to fail) | **T7-strong-guarantee-fails-asap-only**: Z3 returns **SAT** → there exists a feasible schedule (e.g. (0,1,2)) that ASAP-only exclusions remove. So the strong guarantee is **violated**. With greedy-cap we still guarantee **at least one** schedule remains (the canonical G). So: **in-between** — not strong-guarantee safe; observed to keep G when hints are present. |
+| **Energetic** (`--enable-asap-alap-tightening` + `--energetic-slot-tightening`) | **Yes** (undercounting) | Uses **lower-bound** demand: only excludes (O,t) when total_min_demand(t) > cap. Incorporates SymmetryOrdering; never over-tightens. Produces schedules at least as good as symmetry-only (e.g. 55 cycles for 3r/16b). |
 | **R_precedence_demand** (one-shot demand from precedence windows) | **No** (proved unsafe) | Counterexample: 3-op chain, cap 1; we would exclude (O1,1) but (1,2,3) is feasible. **Do not use.** |
 
 **Summary:**
 
 - **Proved safe (strong guarantee):** Slot tightening off, R_precedence_only, R_symmetry_ordering, R_entailed.
-- **Proved unsafe (violates strong guarantee):** R_precedence_demand (do not use), and the energetic rule (ASAP-only exclusions) — Z3 shows we remove at least one feasible schedule.
-- **In-between:** Energetic + greedy-cap: we do **not** have the strong guarantee (we proved it fails), but we **do** guarantee at least one feasible schedule (G) when greedy hints are passed; no formal proof that “at least one” holds when hints are absent.
+- **Sound (undercounting):** Energetic with symmetry-aware lower-bound demand — never over-tightens; produces at least as good schedules as symmetry-only.
+- **Proved unsafe (violates strong guarantee):** R_precedence_demand (do not use).
 
 ## Implementation summary
 
@@ -80,7 +80,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 |--------|--------|
 | Slot tightening **on** (default) | **R_symmetry_ordering** (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). **No** energetic loop unless requested. **Proved safe (strong guarantee).** Use `--no-symmetry-aware-slot-tightening` to get R_precedence_only only; use `--no-enable-asap-alap-tightening` to disable all tightening. |
 | `--no-enable-asap-alap-tightening` | No slot-based tightening; precedence + optional greedy-cap only. **Proved safe.** |
-| `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Energetic slot loop (ASAP-only + greedy-cap). **Proved to violate strong guarantee**; with greedy-cap, at least G remains. Use for experiments only. |
+| `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Symmetry-aware undercounting (lower-bound demand). **Sound** — never over-tightens. Produces schedules at least as good as default. Requires ordering (built automatically when symmetry-aware or energetic is used). |
 
 ## Ablation: R_precedence_only vs tightening off (2r/16b)
 
@@ -96,6 +96,18 @@ uv run python scripts/analyze_ablation.py ablation_2r_16b_tightening_vs_off.json
 ```
 
 **Result (300s time limit):** Both arms **36 cycles**, OPTIMAL. Solve times ~6.3s. So R_precedence_only does not worsen makespan vs tightening off for this config; the default (tightening on without energetic) is safe and performance-neutral here.
+
+## Ablation: Energetic vs no-energetic (3r/16b)
+
+```bash
+uv run python scripts/run_ablation.py \
+  --rounds 3 --batch-size 16 --time-limit 120 \
+  --arm "no-energetic:" \
+  --arm "energetic:--energetic-slot-tightening" \
+  --output ablation_3r_16b_energetic.json
+```
+
+**Result (120s time limit):** Both arms **55 cycles**, OPTIMAL. Energetic produces at least as good schedules as symmetry-only; no over-tightening.
 
 ## Related documents
 

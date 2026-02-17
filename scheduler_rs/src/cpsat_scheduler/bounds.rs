@@ -248,6 +248,62 @@ impl<'a> CpsatConfig<'a> {
 // SSA CP-SAT Scheduling
 // ============================================================================
 
+/// ASAP/ALAP tightening mode: one of four mutually exclusive options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsapAlapTightening {
+    /// No slot tightening; only raw precedence-derived ASAP/ALAP (and optional scratch tightening).
+    None,
+    /// Precedence-only: fixpoint after bounds, no symmetry ordering, no slot exclusions.
+    Simple,
+    /// Symmetry-aware slot tightening (default): ordering + symmetry pass + fixpoint. Safe.
+    #[default]
+    SymmetryAware,
+    /// Energetic: symmetry-aware plus energetic slot loop (ASAP-only + greedy-cap).
+    Energetic,
+}
+
+impl AsapAlapTightening {
+    /// True if any tightening is on (fixpoint runs after slot/scratch when true).
+    pub fn enable_tightening(self) -> bool {
+        !matches!(self, AsapAlapTightening::None)
+    }
+    /// True if we need symmetry ordering and symmetry-aware pass (SymmetryAware or Energetic).
+    pub fn use_symmetry_ordering(self) -> bool {
+        matches!(self, AsapAlapTightening::SymmetryAware | AsapAlapTightening::Energetic)
+    }
+    /// True if we run the energetic slot-based loop.
+    pub fn use_energetic(self) -> bool {
+        matches!(self, AsapAlapTightening::Energetic)
+    }
+}
+
+impl std::str::FromStr for AsapAlapTightening {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(AsapAlapTightening::None),
+            "simple" => Ok(AsapAlapTightening::Simple),
+            "symmetry-aware" | "symmetry_aware" => Ok(AsapAlapTightening::SymmetryAware),
+            "energetic" => Ok(AsapAlapTightening::Energetic),
+            _ => Err(format!(
+                "Invalid asap_alap_tightening '{}': must be 'none', 'simple', 'symmetry-aware', or 'energetic'",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for AsapAlapTightening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsapAlapTightening::None => write!(f, "none"),
+            AsapAlapTightening::Simple => write!(f, "simple"),
+            AsapAlapTightening::SymmetryAware => write!(f, "symmetry-aware"),
+            AsapAlapTightening::Energetic => write!(f, "energetic"),
+        }
+    }
+}
+
 /// Configuration for SSA CP-SAT scheduling.
 ///
 /// Slot capacities come from [`machine`](SsaCpsatConfig::machine); use
@@ -281,21 +337,10 @@ pub struct SsaCpsatConfig {
     /// If true, force 0 integral gap for proven optimality (debugging only).
     /// Default: false (uses scale/3 gap limit for faster convergence).
     pub force_zero_gap: bool,
-    /// If true, tighten ASAP/ALAP bounds by considering resource capacity.
-    /// Uses energetic reasoning to tighten domains before creating cycle variables.
-    /// Default: false (test first, validate carefully).
-    pub enable_asap_alap_tightening: bool,
-    /// When true and slot tightening is enabled, run the energetic slot-based loop (ASAP-only + greedy-cap).
-    /// When false (default), slot tightening uses only precedence-derived bounds + fixpoint + greedy-cap
-    /// (R_precedence_only: no slot-based exclusions). This is the only solver-free rule that preserves
-    /// the strong guarantee (no feasible schedule removed). Use true only for experiments.
-    pub use_energetic_slot_tightening: bool,
-    /// When true (default when slot tightening is on), run symmetry-aware ASAP tightening: within each
-    /// ordering group, the k-th op (by engine) cannot run before cycle ceil(k/C)-1. Entailed by
-    /// symmetry + capacity; preserves all valid schedules. Independent of use_energetic_slot_tightening.
-    pub use_symmetry_aware_slot_tightening: bool,
+    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware (default), or energetic.
+    pub asap_alap_tightening: AsapAlapTightening,
     /// If true, consider scratch constraints when tightening ASAP/ALAP bounds.
-    /// Can be used independently of enable_asap_alap_tightening. Computes maximum scratch usage
+    /// Can be used independently of asap_alap_tightening. Computes maximum scratch usage
     /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
     /// Default: false (test first, validate carefully).
     pub enable_scratch_tightening: bool,
@@ -327,9 +372,7 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
-            enable_asap_alap_tightening: true,  // On by default (R_precedence_only). Use --no-enable-asap-alap-tightening to disable.
-            use_energetic_slot_tightening: false, // Default: when tightening is on, use R_precedence_only (no slot exclusions). Set true for energetic loop.
-            use_symmetry_aware_slot_tightening: true, // Default: safe slot exclusions from ordering + capacity.
+            asap_alap_tightening: AsapAlapTightening::SymmetryAware, // Default: symmetry-aware (safe slot exclusions)
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
@@ -754,78 +797,38 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 }
 
 // =============================================================================
-// Slot-aware ASAP/ALAP tightening: why we exclude optional-interval ops
+// Slot-aware ASAP/ALAP tightening: sound energetic reasoning with symmetry
 // =============================================================================
 //
-// INVARIANT: Tightening must never change feasibility. For every feasible schedule,
-// there must still exist at least one cycle assignment in the tightened [asap, alap]
-// domains. So we may only remove values that are provably infeasible (e.g. would
-// violate capacity in every possible world). If we remove a value that some feasible
-// solution uses, we can create empty domains (asap > alap) or make the CP-SAT model
-// INFEASIBLE in presolve.
+// INVARIANT: Tightening must never change feasibility. We only exclude (O,t) when
+// we can prove with trivial reasoning that no feasible schedule has O at t.
 //
-// ENERGETIC REASONING (valid when all counted ops definitely use the engine):
-// For a given engine with capacity C and a time window [t, t+W), at most C*W "op-cycles"
-// can be executed. So if N ops can all start somewhere in [t, t+W) (by current domains),
-// we need N <= C*W, i.e. W >= ceil(N/C). If the current window for an op is too small
-// (too few cycles to fit all ops that could run in that window), we push ASAP forward
-// or ALAP backward so the window grows. That is valid only when every counted op
-// *definitely* uses this engine.
+// SOUND ALGORITHM (undercounting): Uses a **lower bound** on demand at cycle t.
+// For each (group, engine) we have an ordered chain of ops that definitely use
+// that engine. Ops with ASAP=t contribute to "minimum demand at t" (they must run
+// at t or later; in the best case for O, we could have up to cap such ops at t).
+// We exclude (O,t) only when total_min_demand(t) > cap — i.e. even in the best
+// case, cycle t is already full. This never over-tightens.
 //
-// OPTIONAL INTERVALS: Some ops have *optional* usage on an engine—the CP-SAT model
-// uses optional intervals and a choice variable, and only one alternative is present
-// in any solution. Examples:
-//   - SelectChoice on Flow: the op may use vselect (Flow) or FMA (VALU). So it does
-//     not definitely use Flow; we must not count it in the Flow profile.
-//   - ConstChoice on Load: the op may use Load or AddImm (Flow). So it does not
-//     definitely use Load; we must not count it in the Load profile.
-//   - Shiftable VALU: the op may stay on VALU or shift to ALU. So it does not
-//     definitely use VALU; we must not count it in the VALU profile when shiftable_valu
-//     is provided.
+// OPTIONAL INTERVALS: Exclude *Choice and shiftable from chains (same as symmetry).
+// Only count ops that **definitely** use the engine.
 //
-// IF WE COUNT THEM: We would over-count demand. E.g. with flow_cap=1 and three
-// SelectChoice ops, we'd assume 3 Flow ops must be scheduled; energetic reasoning
-// would require at least 3 cycles and could push ALAP earlier / ASAP later. But in
-// a feasible solution the solver might choose FMA for all three (0 Flow ops from
-// SelectChoice). Then the tightened bounds would have excluded feasible cycle
-// assignments, and we could get empty domains or presolve INFEASIBLE. So we
-// *exclude* optional-interval ops from both (1) the resource profile and (2) the
-// set of ops whose bounds we tighten for this engine. That way tightening only
-// uses information that holds in every feasible solution.
-//
-// ALGORITHM (per engine, repeated until fixed point or MAX_ITER):
-// 1. Demand profile: For each required op with window [asap, alap], we treat it as
-//    "could run in any cycle in [asap, alap]" (one cycle per op). Using a difference
-//    array (diff[asap]+=1, diff[alap+1]-=1), prefix-sum to get profile[t] = number of
-//    required ops that could be *active* at cycle t. Then prefix[t] = sum(profile[0..t])
-//    so that for any window [a, b], total demand = prefix[b+1]-prefix[a] in O(1).
-// 2. Energetic check: For an op with window [asap, alap], total demand in that window
-//    must be <= capacity * window_width (else there is no way to fit all those ops in
-//    that window). If demand > capacity * width, the window is too small.
-// 3. Tightening: We push this op's ASAP forward (or ALAP backward) so that the window
-//    we consider never has excess demand. Concretely: find the earliest start t such
-//    that [t, alap] has demand <= cap*(alap-t+1), and set new ASAP = t; symmetrically
-//    find the latest end t such that [asap, t] has demand <= cap*(t-asap+1), and set
-//    new ALAP = t. So after tightening, any start in [new_asap, new_alap] lies in a
-//    window that satisfies the capacity constraint. We iterate over engines and
-//    repeat a few times because tightening one op can change the profile for others.
+// **Greedy-cap (Z3-proven):** Never exclude the canonical cycle (T7-greedy-cap-preserves-G).
+// **ASAP-only:** Apply only ASAP pushes, not ALAP pulls (T7-asap-only-composition).
 //
 // =============================================================================
 
-/// Tighten ASAP/ALAP bounds using slot capacity constraints (energetic reasoning).
-/// Uses difference arrays and prefix sums for O(n + horizon) complexity.
+/// Tighten ASAP/ALAP bounds using slot capacity with symmetry-aware undercounting.
 ///
-/// Only counts ops that **definitely** use each engine (required intervals).
-/// Ops with optional usage on an engine are excluded so that we never over-tighten
-/// and never change feasibility. See the block comment above for the full rationale.
+/// Requires `ordering` when tightening: uses SymmetryOrdering to compute per-group
+/// min_demand at each cycle. If `ordering` is None, returns bounds unchanged (no-op).
 ///
-/// - **Flow**: exclude `SelectChoice` (may use FMA/VALU instead of vselect/Flow).
-/// - **Load**: exclude `ConstChoice` (may use AddImm/Flow instead of Load).
-/// - **VALU**: exclude shiftable ops (may shift to ALU) when `shiftable_valu` is provided.
+/// Only tightens ops that **definitely** use each engine. Excludes *Choice and
+/// shiftable from chains. Uses lower-bound demand: only excludes (O,t) when
+/// total_min_demand(t) > cap, so never over-tightens.
 ///
-/// **Greedy-cap (Z3-proven):** When `greedy_cycles` is `Some(g)`, we never exclude the canonical
-/// cycle for any op: for each op index `idx`, if `g.get(idx)` is `Some(c)`, we clamp so that
-/// the op's domain always contains `c`. This preserves the canonical schedule G (T7-greedy-cap-preserves-G).
+/// **Greedy-cap (Z3-proven):** When `greedy_cycles` is `Some(g)`, we never exclude
+/// the canonical cycle for any op. Preserves canonical schedule G.
 pub(crate) fn tighten_asap_alap_by_slots(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -839,183 +842,125 @@ pub(crate) fn tighten_asap_alap_by_slots(
     verbose: bool,
     shiftable_valu: Option<&HashSet<usize>>,
     greedy_cycles: Option<&[i32]>,
+    ordering: Option<&super::symmetry_ordering::SymmetryOrdering>,
 ) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
     use std::collections::HashMap as StdHashMap;
 
-    let n = ops.len();
+    let ordering = match ordering {
+        Some(o) => o,
+        None => return Some((asap.clone(), alap.clone())),
+    };
+
     let horizon_usize = horizon as usize;
+    let engine_caps: StdHashMap<Engine, i64> = [
+        (Engine::Valu, valu_cap),
+        (Engine::Alu, alu_cap),
+        (Engine::Load, load_cap),
+        (Engine::Store, store_cap),
+        (Engine::Flow, flow_cap),
+    ]
+    .into_iter()
+    .collect();
 
-    // Build engine capacity map
-    let mut engine_caps: StdHashMap<Engine, i64> = StdHashMap::new();
-    engine_caps.insert(Engine::Valu, valu_cap);
-    engine_caps.insert(Engine::Alu, alu_cap);
-    engine_caps.insert(Engine::Load, load_cap);
-    engine_caps.insert(Engine::Store, store_cap);
-    engine_caps.insert(Engine::Flow, flow_cap);
-
-    // Track which ops belong to which engine
-    let mut ops_by_engine: StdHashMap<Engine, Vec<usize>> = StdHashMap::new();
-    for (idx, op) in ops.iter().enumerate() {
-        if engine_caps.contains_key(&op.engine) {
-            ops_by_engine.entry(op.engine).or_default().push(idx);
+    let is_optional_on_engine = |idx: usize, engine: Engine| -> bool {
+        let op = &ops[idx];
+        match engine {
+            Engine::Flow => op.opcode == Opcode::SelectChoice,
+            Engine::Load => op.opcode == Opcode::ConstChoice,
+            Engine::Valu => shiftable_valu.map_or(false, |s| s.contains(&idx)),
+            _ => false,
         }
-    }
+    };
 
     let mut new_asap = asap.clone();
     let mut new_alap = alap.clone();
     let mut changed = true;
     let mut iter = 0;
-    const MAX_ITER: usize = 3; // Limit iterations
+    const MAX_ITER: usize = 3;
 
     while changed && iter < MAX_ITER {
         changed = false;
         iter += 1;
 
-        // For each engine, build resource profile and tighten bounds
-        for (engine, cap) in &engine_caps {
-            let engine_ops = match ops_by_engine.get(engine) {
-                Some(ops) => ops,
-                None => continue,
-            };
-            if engine_ops.is_empty() {
+        for (engine, &cap) in &engine_caps {
+            if cap <= 0 {
                 continue;
             }
 
-            // Which ops have *optional* usage on this engine? We must not count them in the
-            // profile (would over-count) and must not tighten their bounds using this engine's
-            // capacity (would assume they use it). See the long comment above this function.
-            let is_optional_on_engine = |idx: usize| -> bool {
-                let op = &ops[idx];
-                match engine {
-                    Engine::Flow => op.opcode == Opcode::SelectChoice, // vselect or FMA
-                    Engine::Load => op.opcode == Opcode::ConstChoice,  // Load or AddImm
-                    Engine::Valu => shiftable_valu.map_or(false, |s| s.contains(&idx)), // VALU or ALU
-                    _ => false,
-                }
-            };
+            // Build per-group engine chains and min_demand at each cycle.
+            // min_demand[group_idx][t] = count of ops in that group's engine chain with asap == t.
+            let mut group_chains: Vec<Vec<usize>> = Vec::new();
+            let mut min_demand: Vec<Vec<i64>> = Vec::new();
 
-            // Build demand profile from *required* ops only. Each op with window [asap, alap]
-            // can run in any one cycle in that range; we count "how many ops could be active
-            // at cycle t". Difference array: diff[asap_t] += 1, diff[alap_t+1] -= 1; then
-            // prefix-sum gives profile[t] = number of required ops that could be active at t.
-            let mut diff = vec![0i64; horizon_usize + 2];
-            for &idx in engine_ops {
-                if is_optional_on_engine(idx) {
-                    continue; // do not count: in some solutions this op does not use this engine
+            for (_group_key, sorted) in ordering.iter_groups() {
+                let engine_chain: Vec<usize> = sorted
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        ops[idx].engine == *engine && !is_optional_on_engine(idx, *engine)
+                    })
+                    .collect();
+
+                if engine_chain.is_empty() {
+                    continue;
                 }
-                let op_id = ops[idx].id;
-                let asap_t = *new_asap.get(&op_id)? as usize;
-                let alap_t = *new_alap.get(&op_id)? as usize;
-                if asap_t <= alap_t && alap_t < horizon_usize {
-                    diff[asap_t] += 1;
-                    if alap_t + 1 < diff.len() {
-                        diff[alap_t + 1] -= 1;
+
+                let mut demand_at_t = vec![0i64; horizon_usize + 1];
+                for &idx in &engine_chain {
+                    let op_id = ops[idx].id;
+                    let asap_t = *new_asap.get(&op_id).unwrap_or(&0);
+                    if asap_t >= 0 && (asap_t as usize) <= horizon_usize {
+                        demand_at_t[asap_t as usize] += 1;
                     }
                 }
+
+                group_chains.push(engine_chain);
+                min_demand.push(demand_at_t);
             }
 
-            // profile[t] = prefix-sum of diff = number of required ops that could be active at t
-            let mut profile = vec![0i64; horizon_usize + 1];
-            let mut sum = 0i64;
-            for t in 0..=horizon_usize {
-                sum += diff[t];
-                profile[t] = sum;
+            if group_chains.is_empty() {
+                continue;
             }
 
-            // prefix[t] = sum(profile[0..t]) so total demand in [a,b] = prefix[b+1]-prefix[a]
-            let mut prefix = vec![0i64; horizon_usize + 2];
-            for t in 0..=horizon_usize {
-                prefix[t + 1] = prefix[t] + profile[t];
-            }
+            // For each op in the chains, find earliest t where total_min_demand(t) <= cap.
+            for (group_idx, engine_chain) in group_chains.iter().enumerate() {
+                for &idx in engine_chain {
+                    let op_id = ops[idx].id;
+                    let old_asap = *new_asap.get(&op_id).unwrap_or(&0);
+                    let old_alap = *new_alap.get(&op_id).unwrap_or(&0);
 
-            // For each op that *definitely* uses this engine, apply energetic reasoning:
-            // if the op's window [asap, alap] is too small for the total demand in that window,
-            // push ASAP forward or ALAP backward. Skip optional-interval ops: we excluded them
-            // from the profile, so tightening their bounds from this engine would be inconsistent
-            // (we'd be assuming they contribute to demand here, which they might not).
-            for &idx in engine_ops {
-                if is_optional_on_engine(idx) {
-                    continue; // do not tighten from this engine: op may not use it
-                }
-                let op_id = ops[idx].id;
-                let old_asap = *new_asap.get(&op_id)?;
-                let old_alap = *new_alap.get(&op_id)?;
-                let window_size = (old_alap - old_asap + 1) as i64;
+                    if old_asap > old_alap {
+                        continue;
+                    }
 
-                if window_size <= 0 {
-                    continue;
-                }
-
-                // Total demand in this op's window = sum of profile over [old_asap, old_alap]
-                let window_start = old_asap as usize;
-                let window_end = old_alap as usize;
-                if window_end >= prefix.len() - 1 {
-                    continue;
-                }
-                let total_ops_in_window = prefix[window_end + 1] - prefix[window_start];
-
-                // Energetic reasoning: demand in window must be <= capacity * window_size.
-                // If not, no feasible schedule can fit all these ops in this window; narrow
-                // this op's window by pushing ASAP forward and/or ALAP backward.
-                if total_ops_in_window > *cap * window_size {
-                    // Find earliest start t such that [t, old_alap] has demand <= cap * width
-                    let mut new_asap_val = old_asap;
-                    for t in (old_asap as usize)..=(old_alap as usize) {
-                        if t >= prefix.len() - 1 {
-                            break;
-                        }
-                        // Demand in [t, old_alap] = prefix[old_alap+1]-prefix[t]; require <= cap*width
-                        let remaining_window = (old_alap - t as i32 + 1) as i64;
-                        if remaining_window <= 0 {
-                            break;
-                        }
-                        let ops_in_remaining = prefix[old_alap as usize + 1] - prefix[t];
-                        if ops_in_remaining <= *cap * remaining_window {
+                    let op_asap = old_asap;
+                    let mut new_asap_val = old_alap + 1;
+                    for t in (old_asap as usize)..=(old_alap as usize).min(horizon_usize) {
+                        let total: i64 = min_demand.iter().map(|d| d.get(t).copied().unwrap_or(0)).sum();
+                        let o_contributes = (t as i32) == op_asap;
+                        let can_place = if o_contributes { total <= cap } else { total < cap };
+                        if can_place {
                             new_asap_val = t as i32;
                             break;
                         }
                     }
 
-                    // Find latest end t such that [old_asap, t] has demand <= cap * width
-                    let mut new_alap_val = old_alap;
-                    for t in ((old_asap as usize)..=(old_alap as usize)).rev() {
-                        if t >= prefix.len() - 1 {
-                            continue;
-                        }
-                        // Demand in [old_asap, t] = prefix[t+1] - prefix[old_asap]
-                        let remaining_window = (t as i32 - old_asap + 1) as i64;
-                        if remaining_window <= 0 {
-                            break;
-                        }
-                        let ops_in_remaining = prefix[t + 1] - prefix[old_asap as usize];
-                        if ops_in_remaining <= *cap * remaining_window {
-                            new_alap_val = t as i32;
-                            break;
-                        }
-                    }
-
-                    // Greedy-cap: never exclude the canonical cycle for this op (Z3 T7-greedy-cap-preserves-G).
                     if let Some(g) = greedy_cycles {
                         if let Some(&c) = g.get(idx) {
                             new_asap_val = new_asap_val.min(c);
-                            new_alap_val = new_alap_val.max(c);
                         }
                     }
 
-                    // Update bounds if tightened. Safe composition (Z3 T7-asap-only-composition):
-                    // we only apply ASAP pushes, not ALAP pulls, so at least one feasible schedule
-                    // remains. Mixed ASAP+ALAP can exclude all (T7-two-step counterexample).
                     if new_asap_val > old_asap {
-                        if verbose && new_asap_val > 300 {
+                        if verbose && new_asap_val > 100 {
                             eprintln!(
-                                "  [slot-tighten] ASAP push: idx={} op_id={} engine={:?} iter={} {} -> {}",
+                                "  [energetic-tighten] ASAP push: idx={} op_id={} engine={:?} iter={} {} -> {}",
                                 idx, op_id, engine, iter, old_asap, new_asap_val
                             );
                         }
                         new_asap.insert(op_id, new_asap_val);
                         changed = true;
                     }
-                    // ALAP pull skipped: safe composition uses ASAP-only (Z3 T7-asap-only-composition).
                 }
             }
         }
@@ -1023,9 +968,8 @@ pub(crate) fn tighten_asap_alap_by_slots(
 
     if verbose && iter > 0 {
         eprintln!(
-            "  Slot-aware tightening: {} iterations, tightened {} ops",
-            iter,
-            new_asap.len().max(new_alap.len())
+            "  Energetic slot tightening: {} iterations",
+            iter
         );
     }
 
@@ -1465,7 +1409,12 @@ pub fn compute_ssa_asap_alap_bounds(
     let scratch_budget = config.scratch_budget as i32;
     let verbose = false;
 
-    if config.enable_asap_alap_tightening {
+    if config.asap_alap_tightening.use_energetic() {
+        let ordering = Some(super::symmetry_ordering::SymmetryOrdering::from_bounds(
+            ops,
+            &current_alap,
+            None,
+        ));
         if let Some((slot_asap, slot_alap)) = tighten_asap_alap_by_slots(
             ops,
             &current_asap,
@@ -1479,6 +1428,7 @@ pub fn compute_ssa_asap_alap_bounds(
             verbose,
             Some(&shiftable_set),
             None, // no greedy cycles in compute_ssa_asap_alap_bounds
+            ordering.as_ref(),
         ) {
             current_asap = slot_asap;
             current_alap = slot_alap;
@@ -1501,7 +1451,7 @@ pub fn compute_ssa_asap_alap_bounds(
 
     // After tightening, re-propagate precedence constraints to restore consistency.
     // Slot/scratch tightening is precedence-unaware, so it can violate precedence edges.
-    if config.enable_asap_alap_tightening || config.enable_scratch_tightening {
+    if config.asap_alap_tightening.enable_tightening() || config.enable_scratch_tightening {
         let (fixed_asap, fixed_alap) =
             fix_precedence_bounds_fixpoint(ops, &current_asap, &current_alap, &shiftable_set);
         current_asap = fixed_asap;

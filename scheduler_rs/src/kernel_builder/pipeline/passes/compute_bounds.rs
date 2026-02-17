@@ -63,26 +63,33 @@ impl Pass for ComputeBoundsPass {
         let bounds_cfg = &ctx.config.bounds;
         let machine = &ctx.config.machine;
 
-        if bounds_cfg.enable_asap_alap_tightening && bounds_cfg.use_symmetry_aware_slot_tightening {
-            let ordering = SymmetryOrdering::from_bounds(&ctx.ops, &current_alap, None);
-            let (sym_asap, sym_alap) = tighten_asap_by_symmetry_ordering(
-                &ctx.ops,
-                &current_asap,
-                &current_alap,
-                &ordering,
-                machine.valu_slots as i64,
-                machine.alu_slots as i64,
-                machine.load_slots as i64,
-                machine.store_slots as i64,
-                machine.flow_slots as i64,
-                Some(&shiftable_set),
-                false, // verbose
-            );
-            current_asap = sym_asap;
-            current_alap = sym_alap;
+        let symmetry_ordering = if bounds_cfg.asap_alap_tightening.use_symmetry_ordering() {
+            Some(SymmetryOrdering::from_bounds(&ctx.ops, &current_alap, None))
+        } else {
+            None
+        };
+
+        if let Some(ref ordering) = symmetry_ordering {
+            if bounds_cfg.asap_alap_tightening.use_symmetry_ordering() {
+                let (sym_asap, sym_alap) = tighten_asap_by_symmetry_ordering(
+                    &ctx.ops,
+                    &current_asap,
+                    &current_alap,
+                    ordering,
+                    machine.valu_slots as i64,
+                    machine.alu_slots as i64,
+                    machine.load_slots as i64,
+                    machine.store_slots as i64,
+                    machine.flow_slots as i64,
+                    Some(&shiftable_set),
+                    false, // verbose
+                );
+                current_asap = sym_asap;
+                current_alap = sym_alap;
+            }
         }
 
-        if bounds_cfg.enable_asap_alap_tightening && bounds_cfg.use_energetic_slot_tightening {
+        if bounds_cfg.asap_alap_tightening.use_energetic() {
             if let Some((slot_asap, slot_alap)) =
                 crate::cpsat_scheduler::bounds::tighten_asap_alap_by_slots(
                     &ctx.ops,
@@ -97,6 +104,7 @@ impl Pass for ComputeBoundsPass {
                     false, // verbose
                     Some(&shiftable_set),
                     None, // no greedy cycles in pipeline bounds pass
+                    symmetry_ordering.as_ref(),
                 )
             {
                 current_asap = slot_asap;
@@ -122,7 +130,7 @@ impl Pass for ComputeBoundsPass {
         }
 
         // After tightening, re-propagate precedence constraints
-        if bounds_cfg.enable_asap_alap_tightening || bounds_cfg.enable_scratch_tightening {
+        if bounds_cfg.asap_alap_tightening.enable_tightening() || bounds_cfg.enable_scratch_tightening {
             let (fixed_asap, fixed_alap) =
                 crate::cpsat_scheduler::bounds::fix_precedence_bounds_fixpoint(
                     &ctx.ops,

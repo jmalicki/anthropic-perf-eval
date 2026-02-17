@@ -70,9 +70,7 @@ pub fn schedule_ssa_cpsat(
         valu_shift_mode,
         enable_vbroadcast_elimination,
         force_zero_gap,
-        enable_asap_alap_tightening,
-        use_energetic_slot_tightening,
-        use_symmetry_aware_slot_tightening,
+        asap_alap_tightening,
         enable_scratch_tightening,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
@@ -225,12 +223,12 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
-    // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once; use it for
-    // symmetry-aware tightening and for the model's ordering constraints.
+    // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
+    // symmetry-aware or energetic tightening is used; use it for both passes and model constraints.
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    let symmetry_ordering = if enable_asap_alap_tightening && use_symmetry_aware_slot_tightening {
+    let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering() {
         Some(SymmetryOrdering::from_bounds(ops, &current_alap, greedy_hints))
     } else {
         None
@@ -254,8 +252,8 @@ pub fn schedule_ssa_cpsat(
         current_alap = sym_alap;
     }
 
-    // Energetic slot loop (may over-tighten): demand-profile-based ASAP push. Use for experiments only.
-    if enable_asap_alap_tightening && use_energetic_slot_tightening {
+    // Energetic slot loop: symmetry-aware undercounting (sound, never over-tightens).
+    if asap_alap_tightening.use_energetic() {
         let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
             ops,
             &current_asap,
@@ -269,6 +267,7 @@ pub fn schedule_ssa_cpsat(
             verbose,
             Some(&shiftable_set),
             greedy_hints,
+            symmetry_ordering.as_ref(),
         )
         .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
         current_asap = slot_asap;

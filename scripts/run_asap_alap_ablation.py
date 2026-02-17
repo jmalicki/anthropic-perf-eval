@@ -47,8 +47,8 @@ def run_experiment(config_name, enable_slot_tightening, enable_scratch_tightenin
         "--comment", config_name,
     ]
     
-    if enable_slot_tightening:
-        cmd.append("--enable-asap-alap-tightening")
+    cmd.append("--asap-alap-tightening")
+    cmd.append("symmetry-aware" if enable_slot_tightening else "none")
     if enable_scratch_tightening:
         cmd.append("--enable-scratch-tightening")
     

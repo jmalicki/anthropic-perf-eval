@@ -276,7 +276,7 @@ Then search for **sufficient conditions** (e.g. limits on push magnitude, orderi
 
 We can get **safe** slot-based exclusions without a solver by using the **same order as symmetry breaking**. The model adds constraints `cycle[i] <= cycle[j]` for consecutive ops in each ordering group (sorted by greedy then ALAP). So within a group, for a given engine with capacity C, the k-th op (1-based) that uses that engine cannot run before cycle `ceil(k/C) - 1`: the preceding k−1 ops must be scheduled first and at most C fit per cycle. So we set ASAP(op) = max(ASAP(op), ceil(k/C) − 1). This exclusion is **entailed** by (symmetry + capacity): every feasible schedule satisfying the model’s ordering constraints already has this op at least at that cycle. **Strong guarantee** holds; no solver needed.
 
-**Implementation:** `tighten_asap_by_symmetry_ordering` in `bounds.rs`. On by default when slot tightening is enabled (`use_symmetry_aware_slot_tightening: true`). Disable with `--no-symmetry-aware-slot-tightening`. See [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md) § R_symmetry_ordering.
+**Implementation:** `tighten_asap_by_symmetry_ordering` in `bounds.rs`. Use `--asap-alap-tightening symmetry-aware` (default) or `energetic`. See [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md) § R_symmetry_ordering.
 
 ### 7.1 Energetic with Undercounting (Current Implementation)
 

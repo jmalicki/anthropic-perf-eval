@@ -14,6 +14,8 @@ use crate::types::{ConstChoiceEncoding, MachineConfig, SelectChoiceEncoding};
 
 use super::super::config::CompilerConfig;
 
+use crate::cpsat_scheduler::AsapAlapTightening;
+
 #[cfg(feature = "cpsat")]
 use crate::cpsat_scheduler::{
     CseGroup, CseGroupResult, ConstChoiceMode, OptionalConstraintGroup,
@@ -96,12 +98,8 @@ pub struct SchedulingMetrics {
 /// pipeline uses them as domain hints for cycle variables.
 #[derive(Debug, Clone, Default)]
 pub struct BoundsConfig {
-    /// Enable ASAP/ALAP tightening by slot capacity (energetic reasoning).
-    pub enable_asap_alap_tightening: bool,
-    /// When true, run energetic slot-based tightening. When false (default), use R_precedence_only (no slot exclusions).
-    pub use_energetic_slot_tightening: bool,
-    /// When true (default), run symmetry-aware ASAP tightening (safe; preserves all valid schedules).
-    pub use_symmetry_aware_slot_tightening: bool,
+    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware (default), or energetic.
+    pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
 }
@@ -128,13 +126,8 @@ pub struct CpSatPipelineConfig {
     pub valu_shift_mode: ValuShiftMode,
     /// Force zero optimality gap (proven optimal).
     pub force_zero_gap: bool,
-    /// Enable ASAP/ALAP tightening by slot capacity.
-    pub enable_asap_alap_tightening: bool,
-    /// When true, run energetic slot-based tightening (ASAP-only + greedy-cap). When false (default),
-    /// slot tightening uses R_precedence_only (no slot exclusions). Only used when enable_asap_alap_tightening is true.
-    pub use_energetic_slot_tightening: bool,
-    /// When true (default), run symmetry-aware slot tightening (safe; preserves all valid schedules).
-    pub use_symmetry_aware_slot_tightening: bool,
+    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware (default), or energetic.
+    pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
     /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
@@ -160,9 +153,7 @@ impl Default for CpSatPipelineConfig {
             select_choice_mode: SelectChoiceMode::Optimize,
             valu_shift_mode: ValuShiftMode::Optimize,
             force_zero_gap: false,
-            enable_asap_alap_tightening: true,
-            use_energetic_slot_tightening: false,
-            use_symmetry_aware_slot_tightening: true,
+            asap_alap_tightening: AsapAlapTightening::SymmetryAware,
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
@@ -188,9 +179,7 @@ impl CpSatPipelineConfig {
             select_choice_mode: self.select_choice_mode,
             valu_shift_mode: self.valu_shift_mode,
             force_zero_gap: self.force_zero_gap,
-            enable_asap_alap_tightening: self.enable_asap_alap_tightening,
-            use_energetic_slot_tightening: self.use_energetic_slot_tightening,
-            use_symmetry_aware_slot_tightening: self.use_symmetry_aware_slot_tightening,
+            asap_alap_tightening: self.asap_alap_tightening,
             enable_scratch_tightening: self.enable_scratch_tightening,
             disable_optional_constraint_groups: self.disable_optional_constraint_groups.clone(),
             ..Default::default()

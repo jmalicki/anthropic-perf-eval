@@ -44,10 +44,18 @@ uv run python scripts/run_ablation.py \
   --arm "load:--const-choice load"
 
 # VALU shift on vs off
-uv run python scripts/run_ablation.py \
-  --rounds 4 --time-limit 600 \
-  --arm "valu-shift:--enable-valu-shift" \
-  --arm "no-valu-shift:--no-valu-shift"
+    uv run python scripts/run_ablation.py \
+      --rounds 4 --time-limit 600 \
+      --arm "valu-shift:--enable-valu-shift" \
+      --arm "no-valu-shift:--no-valu-shift"
+
+# ASAP/ALAP tightening (4 arms: none, simple, symmetry-aware, energetic)
+    uv run python scripts/run_ablation.py \
+      --rounds 3 --batch-size 64 --time-limit 480 \
+      --arm "no-tightening:--asap-alap-tightening none" \
+      --arm "simple:--asap-alap-tightening simple" \
+      --arm "symmetry-aware:--asap-alap-tightening symmetry-aware" \
+      --arm "energetic:--asap-alap-tightening energetic"
 
 # With shared args applied to all arms
 uv run python scripts/run_ablation.py \

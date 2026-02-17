@@ -609,13 +609,13 @@ mod ssa_tests {
 
         // 4) No ASAP/ALAP tightening
         let mut c4 = base_config.clone();
-        c4.enable_asap_alap_tightening = false;
+        c4.asap_alap_tightening = AsapAlapTightening::None;
         c4.model_name = Some("investigate_no_tightening".to_string());
         let r4 = schedule_ssa_cpsat(&emit.ops, c4, SsaCpsatHints::default(), None);
         if r4.is_some() {
-            passed.push("enable_asap_alap_tightening: false");
+            passed.push("asap_alap_tightening: None");
         } else {
-            failed.push("enable_asap_alap_tightening: false");
+            failed.push("asap_alap_tightening: None");
         }
 
         // 5) ForceFma: no optional Flow intervals (SelectChoice all FMA path)
@@ -633,10 +633,10 @@ mod ssa_tests {
         eprintln!("  Passed: {:?}", passed);
         eprintln!("  Failed: {:?}", failed);
 
-        // Root cause: enable_asap_alap_tightening. When true (default), presolve reports INFEASIBLE.
-        // When false, the model is feasible. So ASAP/ALAP tightening over-constrains for this program.
+        // Root cause: asap_alap_tightening. When SymmetryAware (default), presolve reports INFEASIBLE.
+        // When None, the model is feasible. So ASAP/ALAP tightening over-constrains for this program.
         assert!(
-            passed.contains(&"enable_asap_alap_tightening: false"),
+            passed.contains(&"asap_alap_tightening: None"),
             "Disabling ASAP/ALAP tightening should fix presolve INFEASIBLE; passed={:?}, failed={:?}",
             passed,
             failed
@@ -2289,6 +2289,7 @@ mod slot_tightening_tests {
             false,
             None::<&HashSet<usize>>,
             None,
+            None, // no ordering: no-op, bounds unchanged
         )
         .expect("tightening should return Some");
 
@@ -2331,6 +2332,7 @@ mod slot_tightening_tests {
             false,
             None::<&HashSet<usize>>,
             None,
+            None, // no ordering: no-op, bounds unchanged
         )
         .expect("tightening should return Some");
 
@@ -2366,6 +2368,7 @@ mod slot_tightening_tests {
             false,
             Some(&shiftable_set),
             None,
+            None, // no ordering: no-op, bounds unchanged
         )
         .expect("tightening should return Some");
 
@@ -2398,6 +2401,7 @@ mod slot_tightening_tests {
             false,
             None::<&HashSet<usize>>,
             Some(&greedy_cycles),
+            None, // no ordering: no-op, bounds unchanged
         )
         .expect("tightening should return Some");
 
@@ -4690,7 +4694,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: false,
-                enable_asap_alap_tightening: false,
+                asap_alap_tightening: AsapAlapTightening::None,
                 ..Default::default()
             },
             SsaCpsatHints::default(),
@@ -4708,7 +4712,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: false,
-                enable_asap_alap_tightening: true,
+                asap_alap_tightening: AsapAlapTightening::SymmetryAware,
                 ..Default::default()
             },
             SsaCpsatHints::default(),
@@ -4817,7 +4821,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: false,
-                enable_asap_alap_tightening: false,
+                asap_alap_tightening: AsapAlapTightening::None,
                 enable_scratch_tightening: false,
                 scratch_budget: 10, // Tight budget to force scratch pressure
                 ..Default::default()
@@ -4837,7 +4841,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: false,
-                enable_asap_alap_tightening: false,
+                asap_alap_tightening: AsapAlapTightening::None,
                 enable_scratch_tightening: true,
                 scratch_budget: 10, // Tight budget
                 ..Default::default()
@@ -4944,7 +4948,7 @@ mod tests {
             SsaCpsatConfig {
                 time_limit_secs: 10.0,
                 verbose: false,
-                enable_asap_alap_tightening: true,
+                asap_alap_tightening: AsapAlapTightening::SymmetryAware,
                 enable_scratch_tightening: true,
                 scratch_budget: 20, // Moderate budget
                 ..Default::default()

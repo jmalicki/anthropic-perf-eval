@@ -112,10 +112,7 @@ def main():
         print(f"  disable_optional_constraint_groups={names}")
     if args.force_zero_gap:
         print(f"  force_zero_gap=True")
-    if not args.enable_asap_alap_tightening:
-        print(f"  enable_asap_alap_tightening=False (disabled)")
-    if getattr(args, "use_energetic_slot_tightening", False):
-        print(f"  use_energetic_slot_tightening=True")
+    print(f"  asap_alap_tightening={getattr(args, 'asap_alap_tightening', 'symmetry-aware')}")
     if args.enable_scratch_tightening:
         print(f"  enable_scratch_tightening=True")
     if args.scheduling_pressure_policy != "adaptive":
