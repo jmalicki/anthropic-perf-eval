@@ -77,6 +77,26 @@ pub fn sections_exceeding_budget(
         }
     }
 
+    // Per-section cycle ranges (min/max op cycle). Used to extend section k's sampling
+    // through the gap to the next section so we don't miss the global peak in gap cycles.
+    let section_ranges: Vec<(i32, i32)> = boundaries
+        .iter()
+        .map(|&(start, end)| {
+            let mut min_c = i32::MAX;
+            let mut max_c = i32::MIN;
+            for op in &ops[start..end] {
+                if op.opcode == Opcode::Barrier {
+                    continue;
+                }
+                if op.cycle >= 0 {
+                    min_c = min_c.min(op.cycle);
+                    max_c = max_c.max(op.cycle);
+                }
+            }
+            (min_c, max_c)
+        })
+        .collect();
+
     let mut section_peaks = Vec::with_capacity(boundaries.len());
     let mut section_exceeds_budget = Vec::with_capacity(boundaries.len());
 
@@ -100,22 +120,21 @@ pub fn sections_exceeding_budget(
             }
         }
 
-        // Cycle range for this section: min and max cycle among non-barrier ops with cycle >= 0
-        let mut min_c = i32::MAX;
-        let mut max_c = i32::MIN;
-        for op in &ops[start..end] {
-            if op.opcode == Opcode::Barrier {
-                continue;
+        let (min_c, max_c) = section_ranges[k];
+        // Sample through the gap after this section: from min_c through (next section's first
+        // cycle - 1), so we include liveness in gap cycles where section k's values are still live.
+        let end_c = boundaries.get(k + 1).and_then(|_| {
+            let (next_min, _) = section_ranges[k + 1];
+            if next_min > max_c {
+                Some(next_min - 1)
+            } else {
+                None
             }
-            if op.cycle >= 0 {
-                min_c = min_c.min(op.cycle);
-                max_c = max_c.max(op.cycle);
-            }
-        }
+        }).unwrap_or(max_c);
 
-        let peak = if min_c <= max_c {
+        let peak = if min_c <= end_c {
             let mut peak_words = 0usize;
-            for t in min_c..=max_c {
+            for t in min_c..=end_c {
                 let mut live = 0usize;
                 for (vreg, &def_c) in &section_def {
                     let last_c = section_last_use.get(vreg).copied().unwrap_or(def_c);
