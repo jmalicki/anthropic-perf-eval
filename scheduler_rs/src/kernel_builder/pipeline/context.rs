@@ -98,7 +98,7 @@ pub struct SchedulingMetrics {
 /// pipeline uses them as domain hints for cycle variables.
 #[derive(Debug, Clone, Default)]
 pub struct BoundsConfig {
-    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware (default), or energetic.
+    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware, or energetic (default).
     pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
@@ -126,7 +126,7 @@ pub struct CpSatPipelineConfig {
     pub valu_shift_mode: ValuShiftMode,
     /// Force zero optimality gap (proven optimal).
     pub force_zero_gap: bool,
-    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware (default), or energetic.
+    /// ASAP/ALAP tightening mode: none, simple, symmetry-aware, or energetic (default).
     pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,

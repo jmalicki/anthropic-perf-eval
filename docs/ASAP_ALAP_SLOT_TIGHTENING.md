@@ -31,7 +31,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 - **Strong guarantee:** Trivially satisfied — we never exclude a cycle that precedence allows.
 - **Does not untighten:** We only set bounds from precedence (and fixpoint).
-- **Implementation:** Choose one of four modes via **`--asap-alap-tightening`**: `none`, `simple` (R_precedence_only: precedence + fixpoint only), `symmetry-aware` (default), or `energetic`. Simple = no symmetry ordering, no energetic loop. Symmetry-aware = R_symmetry_ordering. Energetic = symmetry-aware plus energetic slot loop.
+- **Implementation:** Choose one of four modes via **`--asap-alap-tightening`**: `none`, `simple` (R_precedence_only: precedence + fixpoint only), `symmetry-aware`, or `energetic` (default). Simple = no symmetry ordering, no energetic loop. Symmetry-aware = R_symmetry_ordering. Energetic = symmetry-aware plus energetic slot loop.
 
 **Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`AsapAlapTightening` enum), `model.rs`, `kernel_build_args.py`.
 
@@ -41,7 +41,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 - **Strong guarantee:** Every feasible schedule that satisfies the model’s symmetry constraints already has each op at least at that cycle. So we only exclude cycles that no such schedule uses.
 - **Does not untighten:** We only push ASAP forward (or leave unchanged).
-- **Implementation:** Use **`--asap-alap-tightening symmetry-aware`** (default). See `tighten_asap_by_symmetry_ordering` in `bounds.rs`.
+- **Implementation:** Use **`--asap-alap-tightening symmetry-aware`**. See `tighten_asap_by_symmetry_ordering` in `bounds.rs`.
 
 **Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`tighten_asap_by_symmetry_ordering`), `model.rs`, `kernel_build_args.py`.
 
@@ -78,7 +78,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 | Option | Effect |
 |--------|--------|
-| Slot tightening **on** (default) | **R_symmetry_ordering** (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). **No** energetic loop unless requested. **Proved safe (strong guarantee).** Use `--no-symmetry-aware-slot-tightening` to get R_precedence_only only; use `--no-enable-asap-alap-tightening` to disable all tightening. |
+| Slot tightening **on** (default) | **Energetic** (contributing-only undercounting, Z3-proven) + R_symmetry_ordering + R_precedence_only. **Proved sound** — all exclusions covered by Z3. Use `--asap-alap-tightening symmetry-aware` for symmetry-only; use `--no-enable-asap-alap-tightening` to disable all tightening. |
 | `--no-enable-asap-alap-tightening` | No slot-based tightening; precedence + optional greedy-cap only. **Proved safe.** |
 | `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Contributing-only undercounting. **Z3-proven sound** — all exclusions covered by T7-undercount-* theorems. Requires ordering (built automatically). |
 

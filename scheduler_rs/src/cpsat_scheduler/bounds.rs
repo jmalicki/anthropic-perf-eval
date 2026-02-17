@@ -255,10 +255,10 @@ pub enum AsapAlapTightening {
     None,
     /// Precedence-only: fixpoint after bounds, no symmetry ordering, no slot exclusions.
     Simple,
-    /// Symmetry-aware slot tightening (default): ordering + symmetry pass + fixpoint. Safe.
-    #[default]
+    /// Symmetry-aware slot tightening: ordering + symmetry pass + fixpoint. Safe.
     SymmetryAware,
-    /// Energetic: symmetry-aware plus energetic slot loop (ASAP-only + greedy-cap).
+    /// Energetic slot tightening (default): symmetry-aware plus energetic slot loop (ASAP-only + greedy-cap). Z3-proven sound.
+    #[default]
     Energetic,
 }
 
@@ -372,7 +372,7 @@ impl Default for SsaCpsatConfig {
             valu_shift_mode: ValuShiftMode::default(),
             enable_vbroadcast_elimination: false, // Set to true by caller when enable_valu_shift is true if desired
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
-            asap_alap_tightening: AsapAlapTightening::SymmetryAware, // Default: symmetry-aware (safe slot exclusions)
+            asap_alap_tightening: AsapAlapTightening::Energetic, // Default: energetic (Z3-proven sound, faster convergence)
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),

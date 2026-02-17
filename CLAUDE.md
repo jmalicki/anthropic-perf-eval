@@ -144,7 +144,7 @@ Scheduler options:
 - `--valu-shift MODE` - VALU shift handling: `optimize` (default), `alu`, or `valu`
 - `--per-section-optimize-secs SECONDS` - Per-section CP-SAT optimization time (0 or omit = feasibility only)
 - `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
-- `--asap-alap-tightening {none,simple,symmetry-aware,energetic}` - ASAP/ALAP tightening mode (default: symmetry-aware). See [docs/ASAP_ALAP_SLOT_TIGHTENING.md](docs/ASAP_ALAP_SLOT_TIGHTENING.md).
+- `--asap-alap-tightening {none,simple,symmetry-aware,energetic}` - ASAP/ALAP tightening mode (default: energetic). See [docs/ASAP_ALAP_SLOT_TIGHTENING.md](docs/ASAP_ALAP_SLOT_TIGHTENING.md).
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
 - `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** CP-SAT should produce schedules without empty cycles; bulk-move merely masks solver/model bugs rather than fixing them, and is buggy (can cause same-cycle scratch write conflicts). Use only for experimenting; do not rely on it for production.
 
