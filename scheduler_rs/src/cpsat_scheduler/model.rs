@@ -73,6 +73,10 @@ pub fn schedule_ssa_cpsat(
         force_zero_gap,
         asap_alap_tightening,
         enable_scratch_tightening,
+        symmetry_precedence_integrated,
+        energetic_alap_pulls,
+        energetic_bounded_push_k,
+        precedence_neutral_horizon,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
         hint_select_choice_vselect_by_default,
@@ -140,10 +144,15 @@ pub fn schedule_ssa_cpsat(
 
     // Use a reasonable horizon: when greedy hints exist, greedy_max is a proven upper bound
     // on makespan, so we only need a small buffer beyond it. Without greedy, use conservative 2x.
+    // precedence_neutral_horizon: always use 2x formula, ignoring greedy (for ablation/debugging).
     let greedy_max = greedy_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
         .unwrap_or(0);
-    let mut horizon = if greedy_max > 0 {
+    let mut horizon = if precedence_neutral_horizon {
+        (critical_path_len * 2)
+            .max(max_latency_critical_path * 2)
+            .max(n as i32) as i64
+    } else if greedy_max > 0 {
         // Greedy makespan is a proven upper bound — optimal is at most greedy_max.
         // Add small buffer (+20) for solver flexibility, but keep max_latency_critical_path
         // guard so ALAP backward propagation has enough room.
@@ -151,7 +160,6 @@ pub fn schedule_ssa_cpsat(
             .max(max_latency_critical_path as i64)
             .max(n as i64)
     } else {
-        // No greedy hints: keep conservative formula
         (critical_path_len * 2)
             .max(max_latency_critical_path * 2)
             .max(n as i32) as i64
@@ -230,7 +238,13 @@ pub fn schedule_ssa_cpsat(
     let mut current_alap = alap.clone();
 
     let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering() {
-        Some(SymmetryOrdering::from_bounds(ops, &current_alap, greedy_hints))
+        Some(SymmetryOrdering::from_bounds(
+            ops,
+            &current_asap,
+            &current_alap,
+            greedy_hints,
+            symmetry_precedence_integrated,
+        ))
     } else {
         None
     };
@@ -269,6 +283,8 @@ pub fn schedule_ssa_cpsat(
             Some(&shiftable_set),
             greedy_hints,
             symmetry_ordering.as_ref(),
+            energetic_alap_pulls,
+            energetic_bounded_push_k,
         )
         .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
         current_asap = slot_asap;

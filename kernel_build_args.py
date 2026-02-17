@@ -80,6 +80,16 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default)")
     group.add_argument("--enable-scratch-tightening", action="store_true",
                        help="Enable scratch-aware tightening (default: disabled; non-default debugging option)")
+    group.add_argument("--symmetry-precedence-integrated", action="store_true",
+                       help="Integrate precedence into symmetry ordering tie-breaking (experimental)")
+    group.add_argument("--energetic-alap-pulls", action="store_true",
+                       help="Enable ALAP pulls in energetic tightening (experimental; T7-two-step risk)")
+    group.add_argument("--energetic-bounded-push", action="store_true", dest="energetic_bounded_push",
+                       help="Cap ASAP push / ALAP pull magnitude per iteration (experimental)")
+    group.add_argument("--energetic-bounded-push-k", type=int, default=None, metavar="K",
+                       help="Cap push/pull to K cycles when --energetic-bounded-push (default: 2)")
+    group.add_argument("--precedence-neutral-horizon", action="store_true",
+                       help="Use precedence-neutral horizon (2x critical path) instead of greedy-based")
     group.add_argument("--scheduling-pressure-policy",
                        choices=["greedy", "throttled", "gated", "adaptive", "cascade"],
                        default="adaptive",
@@ -184,6 +194,11 @@ def args_to_build_kwargs(
         "force_zero_gap": get("force_zero_gap", False) and use_cpsat,
         "asap_alap_tightening": get("asap_alap_tightening", "energetic"),
         "enable_scratch_tightening": get("enable_scratch_tightening", False) and use_cpsat,
+        "symmetry_precedence_integrated": get("symmetry_precedence_integrated", False),
+        "energetic_alap_pulls": get("energetic_alap_pulls", False),
+        "energetic_bounded_push": get("energetic_bounded_push", False),
+        "energetic_bounded_push_k": get("energetic_bounded_push_k"),
+        "precedence_neutral_horizon": get("precedence_neutral_horizon", False),
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "enable_cse_groups": not get("no_cse_groups", False),
         "enable_trace_ids": get("enable_trace_ids", False),
@@ -211,6 +226,11 @@ def args_to_build_kwargs(
         "force_zero_gap": get("force_zero_gap", False) if use_cpsat else None,
         "asap_alap_tightening": get("asap_alap_tightening", "energetic"),
         "enable_scratch_tightening": get("enable_scratch_tightening", False) if use_cpsat else None,
+        "symmetry_precedence_integrated": get("symmetry_precedence_integrated", False),
+        "energetic_alap_pulls": get("energetic_alap_pulls", False),
+        "energetic_bounded_push": get("energetic_bounded_push", False),
+        "energetic_bounded_push_k": get("energetic_bounded_push_k"),
+        "precedence_neutral_horizon": get("precedence_neutral_horizon", False),
         "run_options_json": json.dumps(run_options),
         "git_sha": git_sha,
         "comment": get("comment"),

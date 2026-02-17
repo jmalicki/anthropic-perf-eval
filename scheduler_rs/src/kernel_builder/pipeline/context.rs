@@ -102,6 +102,14 @@ pub struct BoundsConfig {
     pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
+    /// When true, symmetry ordering considers precedence in tie-breaking (experimental).
+    pub symmetry_precedence_integrated: bool,
+    /// When true, apply ALAP pulls in energetic loop (experimental; T7-two-step shows composition risk).
+    pub energetic_alap_pulls: bool,
+    /// Cap ASAP push / ALAP pull magnitude to at most k cycles per iteration (None = unbounded).
+    pub energetic_bounded_push_k: Option<u32>,
+    /// When true, use precedence-neutral horizon (2x critical path) instead of greedy-based.
+    pub precedence_neutral_horizon: bool,
 }
 
 /// CP-SAT-specific pipeline configuration.
@@ -130,6 +138,14 @@ pub struct CpSatPipelineConfig {
     pub asap_alap_tightening: AsapAlapTightening,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
+    /// Symmetry ordering: integrate precedence in tie-breaking (experimental).
+    pub symmetry_precedence_integrated: bool,
+    /// Energetic loop: enable ALAP pulls (experimental).
+    pub energetic_alap_pulls: bool,
+    /// Energetic loop: cap push/pull magnitude to k cycles (None = unbounded).
+    pub energetic_bounded_push_k: Option<u32>,
+    /// Use precedence-neutral horizon instead of greedy-based.
+    pub precedence_neutral_horizon: bool,
     /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
     pub disable_optional_constraint_groups: HashSet<OptionalConstraintGroup>,
     /// When true (default), build CSE groups for shared SelectChoice SUB. When false, disable for debugging.
@@ -155,6 +171,10 @@ impl Default for CpSatPipelineConfig {
             force_zero_gap: false,
             asap_alap_tightening: AsapAlapTightening::SymmetryAware,
             enable_scratch_tightening: false,
+            symmetry_precedence_integrated: false,
+            energetic_alap_pulls: false,
+            energetic_bounded_push_k: None,
+            precedence_neutral_horizon: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
             enable_bulk_move: false, // off by default: buggy (same-cycle scratch conflicts)
@@ -181,6 +201,10 @@ impl CpSatPipelineConfig {
             force_zero_gap: self.force_zero_gap,
             asap_alap_tightening: self.asap_alap_tightening,
             enable_scratch_tightening: self.enable_scratch_tightening,
+            symmetry_precedence_integrated: self.symmetry_precedence_integrated,
+            energetic_alap_pulls: self.energetic_alap_pulls,
+            energetic_bounded_push_k: self.energetic_bounded_push_k,
+            precedence_neutral_horizon: self.precedence_neutral_horizon,
             disable_optional_constraint_groups: self.disable_optional_constraint_groups.clone(),
             ..Default::default()
         }

@@ -30,8 +30,10 @@ impl SymmetryOrdering {
     /// to require at least one group to exist.
     pub fn from_bounds(
         ops: &[SsaOp],
+        asap: &HashMap<usize, i32>,
         alap: &HashMap<usize, i32>,
         greedy_hints: Option<&[i32]>,
+        precedence_integrated: bool,
     ) -> Self {
         let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
@@ -51,10 +53,23 @@ impl SymmetryOrdering {
                 indices.sort_by_key(|&idx| {
                     let greedy = hints.get(idx).copied().unwrap_or(0);
                     let alap_val = *alap.get(&ops[idx].id).unwrap_or(&0);
-                    (greedy, alap_val)
+                    let asap_val = if precedence_integrated {
+                        *asap.get(&ops[idx].id).unwrap_or(&0)
+                    } else {
+                        0
+                    };
+                    (greedy, alap_val, asap_val, idx)
                 });
             } else {
-                indices.sort_by_key(|&idx| *alap.get(&ops[idx].id).unwrap_or(&0));
+                indices.sort_by_key(|&idx| {
+                    let alap_val = *alap.get(&ops[idx].id).unwrap_or(&0);
+                    let asap_val = if precedence_integrated {
+                        *asap.get(&ops[idx].id).unwrap_or(&0)
+                    } else {
+                        0
+                    };
+                    (alap_val, asap_val, idx)
+                });
             }
         }
         Self { groups }

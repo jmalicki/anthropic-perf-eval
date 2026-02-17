@@ -64,7 +64,13 @@ impl Pass for ComputeBoundsPass {
         let machine = &ctx.config.machine;
 
         let symmetry_ordering = if bounds_cfg.asap_alap_tightening.use_symmetry_ordering() {
-            Some(SymmetryOrdering::from_bounds(&ctx.ops, &current_alap, None))
+            Some(SymmetryOrdering::from_bounds(
+                &ctx.ops,
+                &current_asap,
+                &current_alap,
+                None,
+                bounds_cfg.symmetry_precedence_integrated,
+            ))
         } else {
             None
         };
@@ -105,6 +111,8 @@ impl Pass for ComputeBoundsPass {
                     Some(&shiftable_set),
                     None, // no greedy cycles in pipeline bounds pass
                     symmetry_ordering.as_ref(),
+                    bounds_cfg.energetic_alap_pulls,
+                    bounds_cfg.energetic_bounded_push_k,
                 )
             {
                 current_asap = slot_asap;

@@ -344,6 +344,14 @@ pub struct SsaCpsatConfig {
     /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
     /// Default: false (test first, validate carefully).
     pub enable_scratch_tightening: bool,
+    /// Symmetry ordering: integrate precedence in tie-breaking (experimental).
+    pub symmetry_precedence_integrated: bool,
+    /// Energetic loop: enable ALAP pulls (experimental; T7-two-step shows composition risk).
+    pub energetic_alap_pulls: bool,
+    /// Energetic loop: cap push/pull magnitude to k cycles per iteration (None = unbounded).
+    pub energetic_bounded_push_k: Option<u32>,
+    /// Use precedence-neutral horizon (2x critical path) instead of greedy-based.
+    pub precedence_neutral_horizon: bool,
     /// If true, enable verbose logging of the precedence fixpoint repair pass.
     /// The fixpoint always runs after slot/scratch tightening to restore precedence consistency.
     /// This flag just controls whether to log the number of ASAP/ALAP changes.
@@ -374,6 +382,10 @@ impl Default for SsaCpsatConfig {
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
             asap_alap_tightening: AsapAlapTightening::Energetic, // Default: energetic (Z3-proven sound, faster convergence)
             enable_scratch_tightening: false, // Default: disabled for ablation studies
+            symmetry_precedence_integrated: false,
+            energetic_alap_pulls: false,
+            energetic_bounded_push_k: None,
+            precedence_neutral_horizon: false,
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
             hint_select_choice_vselect_by_default: true,
@@ -827,6 +839,11 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 ///
 /// **Greedy-cap (Z3-proven):** When `greedy_cycles` is `Some(g)`, we never exclude
 /// the canonical cycle for any op. Preserves canonical schedule G.
+///
+/// **Extensions (experimental):**
+/// - `energetic_alap_pulls`: when true, also apply ALAP pulls (T7-two-step shows composition risk).
+/// - `energetic_bounded_push_k`: cap ASAP push / ALAP pull magnitude to at most k cycles per iteration.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tighten_asap_alap_by_slots(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -841,6 +858,8 @@ pub(crate) fn tighten_asap_alap_by_slots(
     shiftable_valu: Option<&HashSet<usize>>,
     greedy_cycles: Option<&[i32]>,
     ordering: Option<&super::symmetry_ordering::SymmetryOrdering>,
+    energetic_alap_pulls: bool,
+    energetic_bounded_push_k: Option<u32>,
 ) -> Option<(HashMap<usize, i32>, HashMap<usize, i32>)> {
     use std::collections::HashMap as StdHashMap;
 
@@ -951,6 +970,12 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                     }
 
+                    // Bounded push: cap magnitude at k cycles per iteration
+                    if let Some(k) = energetic_bounded_push_k {
+                        let push = (new_asap_val - old_asap).min(k as i32);
+                        new_asap_val = old_asap + push;
+                    }
+
                     if new_asap_val > old_asap {
                         if verbose && new_asap_val > 100 {
                             eprintln!(
@@ -960,6 +985,50 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                         new_asap.insert(op_id, new_asap_val);
                         changed = true;
+                    }
+                }
+            }
+
+            // ALAP pulls (experimental; T7-two-step shows composition risk when combined with ASAP)
+            if energetic_alap_pulls {
+                for (_, engine_chain) in group_chains.iter().enumerate() {
+                    for &idx in engine_chain {
+                        let op_id = ops[idx].id;
+                        let old_asap = *new_asap.get(&op_id).unwrap_or(&0);
+                        let old_alap = *new_alap.get(&op_id).unwrap_or(&0);
+
+                        if old_asap > old_alap {
+                            continue;
+                        }
+
+                        let mut new_alap_val = old_asap - 1;
+                        let end = (old_alap as usize).min(horizon_usize);
+                        for t in (old_asap as usize..=end).rev() {
+                            let total: i64 =
+                                min_demand.iter().map(|d| d.get(t).copied().unwrap_or(0)).sum();
+                            // When placing O at t: need total + 1 <= cap (O may not be in total if asap[O]!=t)
+                            let can_place = total + 1 <= cap;
+                            if can_place {
+                                new_alap_val = t as i32;
+                                break;
+                            }
+                        }
+
+                        if let Some(g) = greedy_cycles {
+                            if let Some(&c) = g.get(idx) {
+                                new_alap_val = new_alap_val.max(c);
+                            }
+                        }
+
+                        if let Some(k) = energetic_bounded_push_k {
+                            let pull = (old_alap - new_alap_val).min(k as i32);
+                            new_alap_val = old_alap - pull;
+                        }
+
+                        if new_alap_val < old_alap {
+                            new_alap.insert(op_id, new_alap_val);
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -1412,8 +1481,10 @@ pub fn compute_ssa_asap_alap_bounds(
     if config.asap_alap_tightening.use_energetic() {
         let ordering = Some(super::symmetry_ordering::SymmetryOrdering::from_bounds(
             ops,
+            &current_asap,
             &current_alap,
             None,
+            config.symmetry_precedence_integrated,
         ));
         if let Some((slot_asap, slot_alap)) = tighten_asap_alap_by_slots(
             ops,
@@ -1429,6 +1500,8 @@ pub fn compute_ssa_asap_alap_bounds(
             Some(&shiftable_set),
             None, // no greedy cycles in compute_ssa_asap_alap_bounds
             ordering.as_ref(),
+            config.energetic_alap_pulls,
+            config.energetic_bounded_push_k,
         ) {
             current_asap = slot_asap;
             current_alap = slot_alap;

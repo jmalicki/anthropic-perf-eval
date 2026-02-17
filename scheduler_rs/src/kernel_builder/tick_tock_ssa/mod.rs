@@ -633,6 +633,10 @@ impl SsaTickTockKernelBuilder {
         force_zero_gap: bool,
         asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening,
         enable_scratch_tightening: bool,
+        symmetry_precedence_integrated: bool,
+        energetic_alap_pulls: bool,
+        energetic_bounded_push_k: Option<u32>,
+        precedence_neutral_horizon: bool,
         disable_optional_constraint_groups: Option<std::collections::HashSet<OptionalConstraintGroup>>,
         enable_cse_groups: bool,
         enable_bulk_move: bool,
@@ -674,6 +678,10 @@ impl SsaTickTockKernelBuilder {
             bounds: BoundsConfig {
                 asap_alap_tightening,
                 enable_scratch_tightening,
+                symmetry_precedence_integrated,
+                energetic_alap_pulls,
+                energetic_bounded_push_k,
+                precedence_neutral_horizon,
             },
             cpsat: Some(CpSatPipelineConfig {
                 time_limit_secs,
@@ -687,6 +695,10 @@ impl SsaTickTockKernelBuilder {
                 force_zero_gap,
                 asap_alap_tightening,
                 enable_scratch_tightening,
+                symmetry_precedence_integrated,
+                energetic_alap_pulls,
+                energetic_bounded_push_k,
+                precedence_neutral_horizon,
                 disable_optional_constraint_groups,
                 enable_cse_groups,
                 enable_bulk_move,
@@ -1175,6 +1187,7 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Build full-kernel CP-SAT config
+        let cpsat_cfg = ctx.config.cpsat.as_ref().unwrap();
         let cpsat_config = SsaCpsatConfig {
             time_limit_secs,
             verbose,
@@ -1190,12 +1203,11 @@ impl SsaTickTockKernelBuilder {
             force_zero_gap,
             asap_alap_tightening,
             enable_scratch_tightening,
-            disable_optional_constraint_groups: ctx
-                .config
-                .cpsat
-                .as_ref()
-                .map(|c| c.disable_optional_constraint_groups.clone())
-                .unwrap_or_else(std::collections::HashSet::new),
+            symmetry_precedence_integrated: cpsat_cfg.symmetry_precedence_integrated,
+            energetic_alap_pulls: cpsat_cfg.energetic_alap_pulls,
+            energetic_bounded_push_k: cpsat_cfg.energetic_bounded_push_k,
+            precedence_neutral_horizon: cpsat_cfg.precedence_neutral_horizon,
+            disable_optional_constraint_groups: cpsat_cfg.disable_optional_constraint_groups.clone(),
             ..Default::default()
         };
 

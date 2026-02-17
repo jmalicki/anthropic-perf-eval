@@ -2459,6 +2459,8 @@ mod slot_tightening_tests {
             None::<&HashSet<usize>>,
             None,
             None, // no ordering: no-op, bounds unchanged
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
         )
         .expect("tightening should return Some");
 
@@ -2502,6 +2504,8 @@ mod slot_tightening_tests {
             None::<&HashSet<usize>>,
             None,
             None, // no ordering: no-op, bounds unchanged
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
         )
         .expect("tightening should return Some");
 
@@ -2538,6 +2542,8 @@ mod slot_tightening_tests {
             Some(&shiftable_set),
             None,
             None, // no ordering: no-op, bounds unchanged
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
         )
         .expect("tightening should return Some");
 
@@ -2571,6 +2577,8 @@ mod slot_tightening_tests {
             None::<&HashSet<usize>>,
             Some(&greedy_cycles),
             None, // no ordering: no-op, bounds unchanged
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
         )
         .expect("tightening should return Some");
 

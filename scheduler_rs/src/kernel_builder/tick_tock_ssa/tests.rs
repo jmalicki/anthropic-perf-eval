@@ -3441,6 +3441,10 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         false, // force_zero_gap
         crate::cpsat_scheduler::AsapAlapTightening::None,
         false, // enable_scratch_tightening
+        false, // symmetry_precedence_integrated
+        false, // energetic_alap_pulls
+        None,  // energetic_bounded_push_k
+        false, // precedence_neutral_horizon
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
         true,  // enable_bulk_move
@@ -3610,6 +3614,10 @@ fn test_depth4_cpsat() {
         false, // force_zero_gap
         crate::cpsat_scheduler::AsapAlapTightening::None,
         false, // enable_scratch_tightening
+        false, // symmetry_precedence_integrated
+        false, // energetic_alap_pulls
+        None,  // energetic_bounded_push_k
+        false, // precedence_neutral_horizon
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
         true,  // enable_bulk_move

@@ -1061,7 +1061,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1087,6 +1087,11 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     comment: Option<String>,
     asap_alap_tightening: &str,
     enable_scratch_tightening: Option<bool>,
+    symmetry_precedence_integrated: bool,
+    energetic_alap_pulls: bool,
+    energetic_bounded_push: bool,
+    energetic_bounded_push_k: Option<u32>,
+    precedence_neutral_horizon: bool,
     scheduling_pressure_policy: &str,
     optional_constraint_groups_to_disable: Option<Vec<OptionalConstraintGroupPy>>,
     enable_cse_groups: Option<bool>,
@@ -1172,6 +1177,11 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     let asap_alap_tightening = crate::cpsat_scheduler::AsapAlapTightening::from_str(asap_alap_tightening)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
     let enable_scratch_tightening = enable_scratch_tightening.unwrap_or(false);
+    let energetic_bounded_push_k = if energetic_bounded_push {
+        Some(energetic_bounded_push_k.unwrap_or(2))
+    } else {
+        None
+    };
     let enable_cse_groups = enable_cse_groups.unwrap_or(true);
     let disable_optional_set: Option<HashSet<OptionalConstraintGroup>> =
         optional_constraint_groups_to_disable.map(|v| v.into_iter().map(|p| p.inner).collect());
@@ -1190,6 +1200,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 force_zero_gap,
                 asap_alap_tightening,
                 enable_scratch_tightening,
+                symmetry_precedence_integrated,
+                energetic_alap_pulls,
+                energetic_bounded_push_k,
+                precedence_neutral_horizon,
                 disable_optional_set,
                 enable_cse_groups,
                 enable_bulk_move,
