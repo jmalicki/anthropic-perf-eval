@@ -290,9 +290,10 @@ The energetic pass (`tighten_asap_alap_by_slots`) now uses **undercounting** ins
 
 **The old demand-profile algorithm** (overcounting) was replaced. It violated the strong guarantee (see §4). The new undercounting algorithm fixes that.
 
-**Z3 proofs** (simplified chain models): Three theorems in `verification/theorems.py` prove properties of the undercounting algorithm:
-- T7-undercount-one-exclusion-sound: one exclusion is sound (UNSAT)
-- T7-undercount-chain-preserves-witness: chain exclusions preserve a feasible schedule (SAT)
+**Z3 proofs** (parallelism + symmetry ordering): Four theorems in `verification/theorems.py` prove properties of the undercounting algorithm:
+- T7-undercount-one-exclusion-sound: one exclusion sound (2 parallel ops, cap 1, ordering; UNSAT)
+- T7-undercount-chain-preserves-witness: fan-out exclusions preserve a witness (O1→O2,O3; SAT)
+- T7-undercount-parallel-contributing-sound: contributing exclusion sound (3 parallel ops, cap 2; UNSAT)
 - T7-undercount-contributing-implies-T7: contributing exclusion implies T7 one-step (UNSAT)
 
 **Recommended next steps** (optional future work):

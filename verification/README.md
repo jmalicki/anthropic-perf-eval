@@ -54,11 +54,12 @@ Options:
 
 The energetic slot tightening (`--energetic-slot-tightening`) uses **undercounting**: at cycle t, `min_demand(t)` = count of ops with `asap[op]==t` (per group, engine). We exclude (O,t) only when `total_min_demand(t) > cap` (O contributes) or `total_min_demand(t) >= cap` (O does not contribute). This never over-tightens. See `scheduler_rs/src/cpsat_scheduler/bounds.rs` and [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1.
 
-**Z3 proofs (simplified chain models; we assume single-group, single-engine, min_demand = count of ops with asap==t):**
+**Z3 proofs (parallelism + symmetry ordering; single-group, single-engine):**
 
-- **T7-undercount-one-exclusion-sound**: One undercounting exclusion (non-contributing case) is sound: no feasible schedule has O at t. Model: 3-op chain, exclude O2 from 0; prove (precedence ∧ capacity ∧ c2=0) UNSAT.
-- **T7-undercount-chain-preserves-witness**: Undercounting exclusions for a chain preserve at least one feasible schedule. Witness (0,1,2) satisfies precedence, capacity, and exclusions c2≥1, c3≥2. SAT.
-- **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds (demand_other ≥ cap). Links undercounting to the general T7 soundness lemma.
+- **T7-undercount-one-exclusion-sound**: One exclusion is sound. Model: 2 parallel ops, cap 1, ordering c1≤c2. Both asap 0 → min_demand(0)=2. Exclude O2 from 0. Prove (capacity ∧ ordering ∧ c2=0) UNSAT.
+- **T7-undercount-chain-preserves-witness**: Exclusions preserve a witness. Model: fan-out O1→O2, O1→O3, cap 1. At t=1, min_demand=2; exclude O2 from 1. Witness (0,2,3) satisfies precedence, ordering, capacity. SAT.
+- **T7-undercount-parallel-contributing-sound**: Contributing exclusion with 3 parallel ops, cap 2. All asap 0 → min_demand=3. Exclude O3 from 0. Prove (capacity ∧ ordering ∧ c3=0) UNSAT.
+- **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds. Symbolic link to general T7 soundness lemma.
 
 ## Theorems
 
@@ -83,8 +84,9 @@ Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVE
 | T7-strong-guarantee-fails-asap-only | Attempt to prove strong guarantee for ASAP-only; fails (SAT = counterexample); important result preserved | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-greedy-cap-preserves-G | **Greedy-cap rule:** canonical schedule G remains feasible (Z3-proven safe rule) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-domain-based-removes-G | Domain-based rule refutation: second exclusion removes canonical G | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
-| T7-undercount-one-exclusion-sound | **Undercounting:** one exclusion (non-contributing) is sound | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
-| T7-undercount-chain-preserves-witness | **Undercounting:** chain exclusions preserve at least one feasible schedule (witness) | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
+| T7-undercount-one-exclusion-sound | **Undercounting:** one exclusion sound (2 parallel ops, ordering, cap 1) | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
+| T7-undercount-chain-preserves-witness | **Undercounting:** fan-out exclusions preserve witness (O1→O2,O3 parallel) | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
+| T7-undercount-parallel-contributing-sound | **Undercounting:** contributing exclusion sound (3 parallel ops, cap 2) | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
 | T7-undercount-contributing-implies-T7 | **Undercounting:** contributing exclusion implies T7 one-step condition | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
 | T8 | Scratch-aware tightening: one-step lemma | [#t8](../docs/LIVENESS_SPECIFICATION.md#t8) |
 | T9 | Expiration implies no overlap | [#t9](../docs/LIVENESS_SPECIFICATION.md#t9) |

@@ -598,9 +598,11 @@ def check_t14_capacity_lower_bound(ctx=None) -> tuple[str, str, float, dict]:
 # The energetic pass uses UNDERCOUNTING: at cycle t, min_demand(t) = count of ops
 # in each (group, engine) chain with asap[op] == t. We exclude (O,t) only when
 # total_min_demand(t) > cap (O contributes) or total_min_demand(t) >= cap (O does
-# not contribute). This never over-tightens. These theorems prove soundness and
-# preservation for simplified chain models. We assume single-group, single-engine
-# and that min_demand equals the count of ops with asap==t (exact for chains).
+# not contribute). This never over-tightens.
+#
+# Models use PARALLELISM (fan-out, multiple ops at same ASAP) and SYMMETRY ORDERING
+# (cycle[i] <= cycle[j] for consecutive ops in the chain) — otherwise slot pressure
+# is trivial. We assume single-group, single-engine; min_demand = count with asap==t.
 #
 # See: scheduler_rs/src/cpsat_scheduler/bounds.rs § "SOUND ALGORITHM (undercounting)"
 #      docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md § 7.1
@@ -608,26 +610,22 @@ def check_t14_capacity_lower_bound(ctx=None) -> tuple[str, str, float, dict]:
 
 
 def check_t7_undercount_one_exclusion_sound(ctx=None) -> tuple[str, str, float, dict]:
-    """T7-undercount: One undercounting exclusion is sound (no feasible schedule has O at t).
-    Model: 3-op chain O1->O2->O3, cap 1, cycles 0..2. Initial asap: 0,1,2.
-    At t=0: min_demand(0)=1 (only O1 has asap 0). For O2 at t=0: O2 does not contribute
-    (asap[O2]=1), total=1, cap=1, total>=cap -> exclude (O2,0). So c2>=1.
-    Prove: (precedence & capacity & c2=0) is UNSAT. c2=0 and c2>=c1+1 => c1<=-1;
-    c1>=0 => impossible. UNSAT proves the exclusion was sound."""
-    c1, c2, c3 = Ints("c1 c2 c3")
+    """T7-undercount: One undercounting exclusion is sound (parallel + symmetry).
+    Model: 2 parallel ops O1, O2 (no precedence), cap 1, cycles 0..2. Symmetry
+    ordering c1 <= c2. Both have asap 0, so min_demand(0)=2. For O2 at t=0: O2
+    contributes, total=2>1 -> exclude (O2,0). So c2>=1.
+    Prove: (capacity & ordering & c2=0) is UNSAT. c2=0 and c1<=c2 => c1<=0 =>
+    c1=0. Both at 0, cap 1 -> conflict. UNSAT proves the exclusion was sound.
+    Parallelism is essential: with a chain, the exclusion would be trivial (precedence)."""
+    c1, c2 = Ints("c1 c2")
     solver = Solver(ctx=ctx)
     solver.add(c1 >= 0)
     solver.add(c1 <= 2)
     solver.add(c2 >= 0)
     solver.add(c2 <= 2)
-    solver.add(c3 >= 0)
-    solver.add(c3 <= 2)
-    solver.add(c1 != c2)
-    solver.add(c1 != c3)
-    solver.add(c2 != c3)
-    solver.add(c2 >= c1 + 1)
-    solver.add(c3 >= c2 + 1)
-    # Undercounting exclusion: O2 cannot be at 0 (min_demand(0)=1, O2 doesn't contribute, 1>=cap)
+    solver.add(c1 != c2)  # capacity 1: no two ops same cycle
+    solver.add(c1 <= c2)  # symmetry ordering (O1 before O2 in chain)
+    # Undercounting exclusion: O2 cannot be at 0 (min_demand(0)=2, O2 contributes, 2>cap)
     solver.add(c2 == 0)
     result = solver.check()
     stats = _get_stats(solver)
@@ -640,12 +638,13 @@ def check_t7_undercount_one_exclusion_sound(ctx=None) -> tuple[str, str, float, 
 
 
 def check_t7_undercount_chain_preserves_witness(ctx=None) -> tuple[str, str, float, dict]:
-    """T7-undercount: Undercounting exclusions for a chain preserve at least one feasible schedule.
-    Model: 3-op chain O1->O2->O3, cap 1, cycles 0..4. Initial asap: 0,1,2.
-    Undercounting pushes: c2>=1 (O2 excluded from 0), c3>=2 (O3 excluded from 0,1).
-    Witness check: does (c1,c2,c3)=(0,1,2) satisfy precedence, capacity, and exclusions?
-    SAT proves that undercounting-style exclusions leave a feasible schedule.
-    Note: This is a necessary (not sufficient) check for the strong guarantee."""
+    """T7-undercount: Undercounting exclusions with parallelism preserve a witness.
+    Model: Fan-out O1 -> O2, O1 -> O3 (parallel branches), cap 1, cycles 0..4.
+    ASAP: 0,1,1. Ordering c2<=c3. At t=1: min_demand(1)=2 (O2 and O3). Process O2
+    first: O2 contributes, total=2>1 -> exclude (O2,1), push c2>=2. O3 stays at 1.
+    Witness (0,2,3): O1=0, O2=2, O3=3. Precedence c2>=1, c3>=1; ordering c2<=c3;
+    capacity all distinct. SAT proves undercounting exclusions leave a feasible schedule.
+    Parallelism creates real slot pressure at t=1; chain-only would be trivial."""
     c1, c2, c3 = Ints("c1 c2 c3")
     solver = Solver(ctx=ctx)
     solver.add(c1 >= 0)
@@ -657,20 +656,52 @@ def check_t7_undercount_chain_preserves_witness(ctx=None) -> tuple[str, str, flo
     solver.add(c1 != c2)
     solver.add(c1 != c3)
     solver.add(c2 != c3)
-    solver.add(c2 >= c1 + 1)
-    solver.add(c3 >= c2 + 1)
-    # Undercounting exclusions (ASAP pushes from min_demand)
-    solver.add(c2 >= 1)
-    solver.add(c3 >= 2)
-    # Assert witness (0,1,2)
+    solver.add(c2 >= c1 + 1)  # O2 depends on O1
+    solver.add(c3 >= c1 + 1)  # O3 depends on O1
+    solver.add(c2 <= c3)  # symmetry ordering
+    # Undercounting exclusion: O2 pushed from t=1 (min_demand(1)=2, O2 contributes)
+    solver.add(c2 >= 2)
+    # Assert witness (0,2,3)
     solver.add(c1 == 0)
-    solver.add(c2 == 1)
-    solver.add(c3 == 2)
+    solver.add(c2 == 2)
+    solver.add(c3 == 3)
     result = solver.check()
     stats = _get_stats(solver)
     return (
         "T7-undercount-chain-preserves-witness",
         "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_undercount_parallel_contributing_sound(ctx=None) -> tuple[str, str, float, dict]:
+    """T7-undercount: Contributing exclusion sound with 3 parallel ops (real slot pressure).
+    Model: 3 parallel ops O1,O2,O3 (no precedence), cap 2, cycles 0..3. Ordering
+    c1<=c2<=c3. All have asap 0, so min_demand(0)=3. For O3 at t=0: O3 contributes,
+    total=3>2 -> exclude (O3,0). So c3>=1.
+    Prove: (capacity & ordering & c3=0) is UNSAT. c3=0 => c1<=c2<=0 => c1=c2=c3=0.
+    Three ops at cycle 0, cap 2 -> conflict. UNSAT. Parallelism is essential: with
+    cap 3 or a chain, the exclusion would not arise."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 3)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 3)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 3)
+    # Capacity 2: at most 2 ops per cycle (not all three at same cycle)
+    solver.add(Or(c1 != c2, c2 != c3, c1 != c3))
+    solver.add(c1 <= c2)
+    solver.add(c2 <= c3)
+    # Exclusion: O3 cannot be at 0 (contributing, total=3>2)
+    solver.add(c3 == 0)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-undercount-parallel-contributing-sound",
+        "unsat" if str(result) == "unsat" else str(result),
         0.0,
         stats,
     )

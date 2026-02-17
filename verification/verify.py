@@ -31,6 +31,7 @@ from .theorems import (
     check_t7_domain_based_removes_canonical,
     check_t7_undercount_one_exclusion_sound,
     check_t7_undercount_chain_preserves_witness,
+    check_t7_undercount_parallel_contributing_sound,
     check_t7_undercount_contributing_implies_t7,
     check_t8_scratch_tightening_one_step,
     check_t9_expiration_implies_no_overlap,
@@ -102,13 +103,18 @@ THEOREM_CHECKS = [
     ),
     (
         "T7-undercount-one-exclusion-sound",
-        "Undercounting: one exclusion (non-contributing) is sound (no feasible O at t)",
+        "Undercounting: one exclusion sound (2 parallel ops, ordering, cap 1)",
         check_t7_undercount_one_exclusion_sound,
     ),
     (
         "T7-undercount-chain-preserves-witness",
-        "Undercounting: chain exclusions preserve at least one feasible schedule (witness)",
+        "Undercounting: fan-out exclusions preserve witness (O1->O2,O3 parallel)",
         check_t7_undercount_chain_preserves_witness,
+    ),
+    (
+        "T7-undercount-parallel-contributing-sound",
+        "Undercounting: contributing exclusion sound with 3 parallel ops, cap 2",
+        check_t7_undercount_parallel_contributing_sound,
     ),
     (
         "T7-undercount-contributing-implies-T7",
