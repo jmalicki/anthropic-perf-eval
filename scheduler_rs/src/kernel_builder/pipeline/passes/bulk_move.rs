@@ -4,9 +4,10 @@
 //! schedule by moving ops earlier (same constraints as CP-SAT). When disabled or
 //! when there are no empty cycles, this pass is a no-op.
 //!
-//! **Off by default:** Bulk-move is known to be buggy and can cause same-cycle
-//! scratch write conflicts (e.g. 3r/32 at cycle 15). Use --bulk-move to enable
-//! for tighter makespan once the bug is fixed.
+//! **Off by default:** CP-SAT should produce schedules without empty cycles;
+//! bulk-move masks solver/model bugs rather than fixing them, and is buggy
+//! (same-cycle scratch conflicts, e.g. 3r/32). Use --bulk-move only for
+//! experimenting, not production.
 
 use std::collections::HashMap;
 
