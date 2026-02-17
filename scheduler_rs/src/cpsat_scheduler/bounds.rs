@@ -1001,7 +1001,8 @@ pub(crate) fn tighten_asap_alap_by_slots(
                             continue;
                         }
 
-                        let mut new_alap_val = old_asap - 1;
+                        // Default: no tightening; only update if we find a valid earlier cycle.
+                        let mut new_alap_val = old_alap;
                         let end = (old_alap as usize).min(horizon_usize);
                         for t in (old_asap as usize..=end).rev() {
                             let total: i64 =
