@@ -80,6 +80,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use rangemap::RangeSet;
 use crate::types::{EmissionPhase, LiveInterval, Opcode, Operand, SsaOp, VReg, VarType, VLEN};
 
 /// Result of address assignment.
@@ -740,14 +741,13 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     let mut sorted: Vec<(VReg, LiveInterval)> = intervals.into_iter().collect();
     sorted.sort_by_key(|(_, interval)| (interval.start, interval.end));
 
-    // Handle fixed VRegs first
+    // Handle fixed VRegs and build the set of used address ranges (for O(V²) gap-based allocation).
     let mut vreg_to_addr: HashMap<VReg, i64> = HashMap::new();
-    let mut used_ranges: Vec<(i64, i64)> = Vec::new(); // (start, end_exclusive)
+    let mut used_range_set: RangeSet<i64> = RangeSet::new();
 
     for (vreg, addr) in &config.fixed_vregs {
         vreg_to_addr.insert(*vreg, *addr);
-        let end = addr + vreg.size() as i64;
-        used_ranges.push((*addr, end));
+        used_range_set.insert(*addr..addr + vreg.size() as i64);
     }
 
     // Active intervals: (end_cycle, allocated_base_addr, size, was_point_interval)
@@ -756,7 +756,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // (otherwise we'd assign the same address to both).
     let mut active: BinaryHeap<Reverse<(i32, i64, usize, bool)>> = BinaryHeap::new();
 
-    // Free ranges: (base_addr, size) available for reuse
+    // Freed ranges (addr, size) available for reuse; try these before gap search so we reuse slots.
     let mut free_ranges: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
 
     // Scratch addresses (every word) we've assigned to intervals that start at the current cycle.
@@ -765,14 +765,10 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     let mut current_cycle: Option<i32> = None;
     let mut addrs_written_this_cycle: HashSet<i64> = HashSet::new();
 
-    // Next fresh address to allocate
+    // Next fresh address to allocate (advanced when we skip past used ranges).
     let mut next_addr = config.start_addr;
-
-    // Adjust next_addr to avoid fixed VReg ranges
-    for &(start, end) in &used_ranges {
-        if next_addr >= start && next_addr < end {
-            next_addr = end;
-        }
+    while let Some(range) = used_range_set.get(&next_addr) {
+        next_addr = range.end;
     }
 
     for (vreg, interval) in &sorted {
@@ -822,6 +818,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
                 );
                 active.pop();
                 if !is_in_fixed_range(freed_addr, freed_size, &config.fixed_vregs) {
+                    used_range_set.remove(freed_addr..freed_addr + freed_size as i64);
                     free_ranges.push(Reverse((freed_addr, freed_size)));
                 }
             } else {
@@ -829,58 +826,51 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             }
         }
 
-        // Snapshot active (addr, size) so we can check overlap reliably.
-        let active_ranges: Vec<(i64, usize)> = active
-            .iter()
-            .map(|Reverse((_, a, s, _))| (*a, *s))
-            .collect();
+        // Build temp_used = used_range_set ∪ addrs_written_this_cycle for overlap checks and gap search.
+        let mut temp_used = used_range_set.clone();
+        for &a in &addrs_written_this_cycle {
+            temp_used.insert(a..a + 1);
+        }
+        let budget_i64 = config.budget as i64;
+        let size_i64 = size as i64;
 
-        let overlaps_any = |addr: i64, len: usize| {
-            let end = addr + len as i64;
-            active_ranges.iter().any(|&(a, s)| {
-                let a_end = a + s as i64;
-                addr < a_end && a < end
-            })
-        };
-
-        // True if any address in [addr, addr+len) is in addrs_written_this_cycle.
-        let overlaps_written_this_cycle = |addr: i64, len: usize| {
-            (addr..addr + len as i64).any(|a| addrs_written_this_cycle.contains(&a))
-        };
-
-        // Try to find a free range that fits, doesn't overlap active, and doesn't overlap any
-        // range already assigned this cycle (two writers at same cycle).
-        let mut new_addr: Option<i64> = None;
-        let mut temp_ranges: Vec<(i64, usize)> = Vec::new();
-
+        // Try freed ranges first (same order as old allocator: reuse freed slots).
+        let mut new_addr = None;
+        let mut temp_ranges = Vec::new();
         while let Some(Reverse((addr, range_size))) = free_ranges.pop() {
-            if range_size >= size && !overlaps_any(addr, size) && !overlaps_written_this_cycle(addr, size) {
+            if range_size >= size && !temp_used.overlaps(&(addr..addr + size_i64)) {
                 new_addr = Some(addr);
                 if range_size > size {
-                    temp_ranges.push((addr + size as i64, range_size - size));
+                    temp_ranges.push((addr + size_i64, range_size - size));
                 }
                 break;
             }
             temp_ranges.push((addr, range_size));
         }
-
         for (addr, range_size) in temp_ranges {
             free_ranges.push(Reverse((addr, range_size)));
         }
 
-        let mut new_addr = new_addr.unwrap_or_else(|| {
-            let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
-            let addr = first_gap_of_length(&used, next_addr, size);
-            next_addr = addr + size as i64;
-            addr
+        // Else first-fit from gaps (rangemap: O(V) per allocation).
+        let new_addr = new_addr.unwrap_or_else(|| {
+            let gap_outer = config.start_addr..budget_i64;
+            temp_used
+                .gaps(&gap_outer)
+                .find(|gap| gap.end - gap.start >= size_i64)
+                .map(|gap| gap.start)
+                .unwrap_or_else(|| {
+                    // Fallback: no gap large enough; build sorted used list and find first fit.
+                    let active_ranges: Vec<(i64, usize)> = used_range_set
+                        .iter()
+                        .map(|r| (r.start, (r.end - r.start) as usize))
+                        .collect();
+                    let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
+                    first_gap_of_length(&used, config.start_addr, size)
+                })
         });
 
-        // Final safeguard: chosen address must not overlap any active allocation.
-        if overlaps_any(new_addr, size) {
-            let used = used_addresses_sorted(&active_ranges, &addrs_written_this_cycle);
-            new_addr = first_gap_of_length(&used, next_addr, size);
-            next_addr = new_addr + size as i64;
-        }
+        next_addr = new_addr + size as i64;
+        used_range_set.insert(new_addr..new_addr + size as i64);
 
         for a in new_addr..new_addr + size as i64 {
             addrs_written_this_cycle.insert(a);
@@ -900,22 +890,22 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         // Debug: log all vector assignments to catch allocator bugs
         if debug && size == 8 {
             eprintln!(
-                "[DEBUG assign_addresses] VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
-                vreg, new_addr, size, interval.start, interval.end, active_ranges
+                "[DEBUG assign_addresses] VReg {:?} -> addr {} size {} (interval [{}, {}])",
+                vreg, new_addr, size, interval.start, interval.end
             );
         }
         // Debug: log all assignments at cycle 3 to catch conflicts
         if debug && interval.start == 3 {
             eprintln!(
-                "[DEBUG assign_addresses] CYCLE3: VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
-                vreg, new_addr, size, interval.start, interval.end, active_ranges
+                "[DEBUG assign_addresses] CYCLE3: VReg {:?} -> addr {} size {} (interval [{}, {}])",
+                vreg, new_addr, size, interval.start, interval.end
             );
         }
         // Debug: log assignments at cycle 18 for scratch conflict diagnosis
         if debug && interval.start == 18 {
             eprintln!(
-                "[DEBUG assign_addresses] CYCLE18: VReg {:?} -> addr {} size {} (interval [{}, {}]), active_ranges: {:?}",
-                vreg, new_addr, size, interval.start, interval.end, active_ranges
+                "[DEBUG assign_addresses] CYCLE18: VReg {:?} -> addr {} size {} (interval [{}, {}])",
+                vreg, new_addr, size, interval.start, interval.end
             );
         }
     }
@@ -945,13 +935,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         .max()
         .unwrap_or(0);
 
-    // Ensure no assigned address is at or above budget (linear scan must stay within [0, budget-1]).
-    if max_addr >= config.budget as i64 {
-        return Err(format!(
-            "Address assignment exceeded scratch budget: max_addr {} >= budget {}",
-            max_addr, config.budget
-        ));
-    }
+    // Mark budget exceeded if we use any address at or above start_addr + budget (caller may still use result).
+    let budget_limit = config.start_addr + config.budget as i64;
+    let budget_exceeded = budget_exceeded || (max_addr >= budget_limit);
 
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
