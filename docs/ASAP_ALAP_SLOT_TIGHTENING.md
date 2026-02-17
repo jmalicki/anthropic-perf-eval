@@ -65,13 +65,13 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 | **R_precedence_only** (no slot exclusions) | **Yes** (proved) | We add no slot-based exclusions; only precedence + fixpoint + greedy-cap. Trivially preserves every feasible schedule. |
 | **R_symmetry_ordering** (default when tightening on) | **Yes** (proved) | Slot exclusions from symmetry + capacity only: “k-th op in group per engine cannot run before ceil(k/C)-1.” Preserves all schedules that satisfy the model’s ordering constraints. |
 | **R_entailed** (exclude only when (O,t) is UNSAT) | **Yes** (proved in Z3) | **T7-strong-guarantee-entailed-exclusions**: refuting (precedence ∧ capacity ∧ ¬exclusions) yields UNSAT → no feasible schedule removed. Not implemented in Rust (needs a solver). |
-| **Energetic** (`--enable-asap-alap-tightening` + `--energetic-slot-tightening`) | **Yes** (undercounting) | Uses **lower-bound** demand: only excludes (O,t) when total_min_demand(t) > cap. Incorporates SymmetryOrdering; never over-tightens. Produces schedules at least as good as symmetry-only (e.g. 55 cycles for 3r/16b). |
+| **Energetic** (`--enable-asap-alap-tightening` + `--energetic-slot-tightening`) | **Yes** (contributing-only, Z3-proven) | Uses **contributing-only undercounting**: only excludes (O,t) when O contributes (`asap[O]==t`) and total_min_demand(t) > cap. Non-contributing case skipped (not proved). All exclusions are covered by Z3 (T7-undercount-*). |
 | **R_precedence_demand** (one-shot demand from precedence windows) | **No** (proved unsafe) | Counterexample: 3-op chain, cap 1; we would exclude (O1,1) but (1,2,3) is feasible. **Do not use.** |
 
 **Summary:**
 
 - **Proved safe (strong guarantee):** Slot tightening off, R_precedence_only, R_symmetry_ordering, R_entailed.
-- **Sound (undercounting):** Energetic with symmetry-aware lower-bound demand — never over-tightens; produces at least as good schedules as symmetry-only.
+- **Proved sound (contributing-only undercounting):** Energetic — all exclusions Z3-proven (T7-undercount-*); non-contributing case omitted.
 - **Proved unsafe (violates strong guarantee):** R_precedence_demand (do not use).
 
 ## Implementation summary
@@ -80,7 +80,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 |--------|--------|
 | Slot tightening **on** (default) | **R_symmetry_ordering** (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). **No** energetic loop unless requested. **Proved safe (strong guarantee).** Use `--no-symmetry-aware-slot-tightening` to get R_precedence_only only; use `--no-enable-asap-alap-tightening` to disable all tightening. |
 | `--no-enable-asap-alap-tightening` | No slot-based tightening; precedence + optional greedy-cap only. **Proved safe.** |
-| `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Symmetry-aware undercounting (lower-bound demand). **Sound** — never over-tightens. Produces schedules at least as good as default. Requires ordering (built automatically when symmetry-aware or energetic is used). |
+| `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Contributing-only undercounting. **Z3-proven sound** — all exclusions covered by T7-undercount-* theorems. Requires ordering (built automatically). |
 
 ## Ablation: R_precedence_only vs tightening off (2r/16b)
 

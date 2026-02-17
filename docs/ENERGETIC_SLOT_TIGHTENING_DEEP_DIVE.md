@@ -280,21 +280,23 @@ We can get **safe** slot-based exclusions without a solver by using the **same o
 
 ### 7.1 Energetic with Undercounting (Current Implementation)
 
-The energetic pass (`tighten_asap_alap_by_slots`) now uses **undercounting** instead of overcounting. For each (group, engine) we build an ordered chain of ops that definitely use that engine. At each cycle t, `min_demand_group(t)` = count of ops in that group's chain with `asap[op] == t`. We exclude (O,t) only when `total_min_demand(t) > cap` (summed over all groups for that engine). When O has `asap[O] == t`, O contributes to the count, so we require `total <= cap`. When O has `asap[O] < t`, O doesn't contribute, so we require `total < cap` (room for O). This never over-tightens: we only exclude when even in the best case, cycle t is full. Requires `SymmetryOrdering`; when `ordering` is None, returns bounds unchanged (no-op).
+The energetic pass (`tighten_asap_alap_by_slots`) uses **undercounting**. For each (group, engine) we build an ordered chain of ops that definitely use that engine. At each cycle t, `min_demand_group(t)` = count of ops in that group's chain with `asap[op] == t`. Requires `SymmetryOrdering`; when `ordering` is None, returns bounds unchanged (no-op).
+
+**Contributing-only policy (Z3-proven sound):** We exclude (O,t) only when O *contributes* to min_demand(t) — i.e. `asap[O] == t` — and `total_min_demand(t) > cap`. When O has `asap[O] < t`, we do *not* exclude (non-contributing case). This policy is **proved sound in Z3**; the non-contributing case is not proved, so we omit it to stay within proven bounds.
+
+**Z3 proofs for contributing-only:** Four theorems in `verification/theorems.py` prove that each contributing exclusion only removes infeasible (O,t):
+- **T7-undercount-one-exclusion-sound**: One contributing exclusion is sound (2 parallel ops, cap 1; UNSAT)
+- **T7-undercount-chain-preserves-witness**: Contributing exclusions preserve a feasible schedule (fan-out; SAT)
+- **T7-undercount-parallel-contributing-sound**: Contributing exclusion with 3 ops, cap 2 (UNSAT)
+- **T7-undercount-contributing-implies-T7**: Contributing condition (total>cap when O contributes) implies T7 one-step (symbolic refutation; UNSAT)
 
 ## 8. Current State and Recommendations
 
 **Current default**: R_symmetry_ordering (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). We run symmetry-aware tightening then skip the energetic loop unless requested. **Proved safe** (strong guarantee for symmetry-based exclusions).
 
-**Energetic** (`--energetic-slot-tightening`): Uses **symmetry-aware undercounting** — a lower bound on demand at each cycle. Only excludes (O,t) when total_min_demand(t) > cap. Incorporates SymmetryOrdering; never over-tightens. Produces schedules at least as good as symmetry-only (e.g. 55 cycles for 3r/16b). **Sound** — safe to use.
+**Energetic** (`--energetic-slot-tightening`): Uses **symmetry-aware undercounting, contributing-only**. Excludes (O,t) only when O contributes (`asap[O]==t`) and `total_min_demand(t) > cap`. Skips the non-contributing case (not Z3-proven). Incorporates SymmetryOrdering; greedy-cap when hints available. **Proved sound** — all exclusions we make are covered by Z3 (see §7.1).
 
-**The old demand-profile algorithm** (overcounting) was replaced. It violated the strong guarantee (see §4). The new undercounting algorithm fixes that.
-
-**Z3 proofs** (parallelism + symmetry ordering): Four theorems in `verification/theorems.py` prove properties of the undercounting algorithm:
-- T7-undercount-one-exclusion-sound: one exclusion sound (2 parallel ops, cap 1, ordering; UNSAT)
-- T7-undercount-chain-preserves-witness: fan-out exclusions preserve a witness (O1→O2,O3; SAT)
-- T7-undercount-parallel-contributing-sound: contributing exclusion sound (3 parallel ops, cap 2; UNSAT)
-- T7-undercount-contributing-implies-T7: contributing exclusion implies T7 one-step (UNSAT)
+**The old demand-profile algorithm** (overcounting) was replaced. It violated the strong guarantee (see §4). The undercounting algorithm fixes that.
 
 **Recommended next steps** (optional future work):
 1. **Formalize full strong guarantee**: Extend Z3 to prove undercounting preserves all feasible schedules (not just one witness) under symmetry assumptions.

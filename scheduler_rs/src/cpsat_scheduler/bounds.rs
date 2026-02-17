@@ -803,12 +803,10 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 // INVARIANT: Tightening must never change feasibility. We only exclude (O,t) when
 // we can prove with trivial reasoning that no feasible schedule has O at t.
 //
-// SOUND ALGORITHM (undercounting): Uses a **lower bound** on demand at cycle t.
-// For each (group, engine) we have an ordered chain of ops that definitely use
-// that engine. Ops with ASAP=t contribute to "minimum demand at t" (they must run
-// at t or later; in the best case for O, we could have up to cap such ops at t).
-// We exclude (O,t) only when total_min_demand(t) > cap — i.e. even in the best
-// case, cycle t is already full. This never over-tightens.
+// SOUND ALGORITHM (contributing-only undercounting, Z3-proven):
+// We exclude (O,t) only when O contributes (asap[O]==t) and total_min_demand(t) > cap.
+// We skip the non-contributing case (asap[O] < t); not proved in Z3.
+// See docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md §7.1 and verification/README.md §T7-undercount-*.
 //
 // OPTIONAL INTERVALS: Exclude *Choice and shiftable from chains (same as symmetry).
 // Only count ops that **definitely** use the engine.
@@ -938,7 +936,9 @@ pub(crate) fn tighten_asap_alap_by_slots(
                     for t in (old_asap as usize)..=(old_alap as usize).min(horizon_usize) {
                         let total: i64 = min_demand.iter().map(|d| d.get(t).copied().unwrap_or(0)).sum();
                         let o_contributes = (t as i32) == op_asap;
-                        let can_place = if o_contributes { total <= cap } else { total < cap };
+                        // Contributing only: only exclude when O contributes to min_demand(t) (ASAP==t).
+                        // Skip non-contributing case (ASAP < t) — not proved in Z3.
+                        let can_place = if o_contributes { total <= cap } else { true };
                         if can_place {
                             new_asap_val = t as i32;
                             break;

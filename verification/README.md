@@ -52,12 +52,14 @@ Options:
 
 ## Undercounting energetic tightening (T7-undercount-*)
 
-The energetic slot tightening (`--energetic-slot-tightening`) uses **undercounting**: at cycle t, `min_demand(t)` = count of ops with `asap[op]==t` (per group, engine). We exclude (O,t) only when `total_min_demand(t) > cap` (O contributes) or `total_min_demand(t) >= cap` (O does not contribute). This never over-tightens. See `scheduler_rs/src/cpsat_scheduler/bounds.rs` and [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1.
+The energetic slot tightening (`--energetic-slot-tightening`) uses **contributing-only undercounting**. At cycle t, `min_demand(t)` = count of ops with `asap[op]==t`. We exclude (O,t) **only when O contributes** (`asap[O]==t`) and `total_min_demand(t) > cap`. We skip the non-contributing case (O has `asap[O] < t`); that case is not proved in Z3. See `scheduler_rs/src/cpsat_scheduler/bounds.rs` and [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1.
+
+**Contributing-only is proved sound:** All exclusions we make fall under the contributing case, which is covered by the Z3 theorems below.
 
 **Z3 proofs (parallelism + symmetry ordering; single-group, single-engine):**
 
-- **T7-undercount-one-exclusion-sound**: One exclusion is sound. Model: 2 parallel ops, cap 1, ordering c1≤c2. Both asap 0 → min_demand(0)=2. Exclude O2 from 0. Prove (capacity ∧ ordering ∧ c2=0) UNSAT.
-- **T7-undercount-chain-preserves-witness**: Exclusions preserve a witness. Model: fan-out O1→O2, O1→O3, cap 1. At t=1, min_demand=2; exclude O2 from 1. Witness (0,2,3) satisfies precedence, ordering, capacity. SAT.
+- **T7-undercount-one-exclusion-sound**: One contributing exclusion is sound. Model: 2 parallel ops, cap 1, ordering c1≤c2. Both asap 0 → min_demand(0)=2. Exclude O2 from 0. Prove (capacity ∧ ordering ∧ c2=0) UNSAT.
+- **T7-undercount-chain-preserves-witness**: Contributing exclusions preserve a witness. Model: fan-out O1→O2, O1→O3, cap 1. At t=1, min_demand=2; exclude O2 from 1. Witness (0,2,3) satisfies precedence, ordering, capacity. SAT.
 - **T7-undercount-parallel-contributing-sound**: Contributing exclusion with 3 parallel ops, cap 2. All asap 0 → min_demand=3. Exclude O3 from 0. Prove (capacity ∧ ordering ∧ c3=0) UNSAT.
 - **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds. Symbolic link to general T7 soundness lemma.
 
