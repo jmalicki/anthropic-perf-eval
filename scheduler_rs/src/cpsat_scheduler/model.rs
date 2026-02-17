@@ -12,9 +12,10 @@ use super::bounds::{
     compute_capacity_lower_bound_global, compute_max_latency_critical_path, compute_ssa_alap,
     compute_ssa_asap, diagnose_precedence_bounds, fix_precedence_bounds_fixpoint,
     tighten_asap_alap_by_scratch, tighten_asap_alap_by_slots,
-    build_ordering_pairs_from_bounds,
+    tighten_asap_by_symmetry_ordering,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
 };
+use super::symmetry_ordering::SymmetryOrdering;
 use super::config::{
     ConstChoiceMode, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
 };
@@ -71,6 +72,7 @@ pub fn schedule_ssa_cpsat(
         force_zero_gap,
         enable_asap_alap_tightening,
         use_energetic_slot_tightening,
+        use_symmetry_aware_slot_tightening,
         enable_scratch_tightening,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
@@ -223,13 +225,36 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
-    // 1b. Tighten ASAP/ALAP bounds if enabled. Ordering for symmetry is decided later from final bounds.
+    // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once; use it for
+    // symmetry-aware tightening and for the model's ordering constraints.
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    // When slot tightening is enabled, by default we use R_precedence_only (no slot-based exclusions):
-    // only precedence-derived bounds + fixpoint + greedy-cap. This is the only solver-free rule that
-    // preserves the strong guarantee. Set use_energetic_slot_tightening for the energetic loop (may over-tighten).
+    let symmetry_ordering = if enable_asap_alap_tightening && use_symmetry_aware_slot_tightening {
+        Some(SymmetryOrdering::from_bounds(ops, &current_alap, greedy_hints))
+    } else {
+        None
+    };
+
+    if let Some(ref ordering) = symmetry_ordering {
+        let (sym_asap, sym_alap) = tighten_asap_by_symmetry_ordering(
+            ops,
+            &current_asap,
+            &current_alap,
+            ordering,
+            valu_cap,
+            alu_cap,
+            load_cap,
+            store_cap,
+            flow_cap,
+            Some(&shiftable_set),
+            verbose,
+        );
+        current_asap = sym_asap;
+        current_alap = sym_alap;
+    }
+
+    // Energetic slot loop (may over-tighten): demand-profile-based ASAP push. Use for experiments only.
     if enable_asap_alap_tightening && use_energetic_slot_tightening {
         let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
             ops,
@@ -454,11 +479,15 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5b. Symmetry breaking (ordering groups): ops with same ordering_group get cycle[i] <= cycle[j].
-    // When greedy hints are available, order by greedy cycle so constraints match the hint.
-    // Falls back to ALAP-based ordering (original behavior) when no greedy hints.
+    // 5b. Symmetry breaking (ordering groups): use the canonical ordering built earlier.
+    // Validate that final bounds are consistent with the ordering, then add cycle[i] <= cycle[j].
     {
-        let ordering_pairs = build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints);
+        let ordering_pairs: Vec<(usize, usize)> = if let Some(ref ord) = symmetry_ordering {
+            ord.validate_bounds(ops, &final_asap, &final_alap, greedy_hints);
+            ord.ordering_pairs()
+        } else {
+            super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints)
+        };
         let n_ordering = ordering_pairs.len();
         let order_source = if greedy_hints.is_some() { "greedy" } else { "ALAP" };
         for (i, j) in &ordering_pairs {
@@ -2640,15 +2669,14 @@ pub fn schedule_ssa_cpsat(
             let c = model.add_ge(lhs, LinearExpr::from(rhs));
             model.set_constraint_name(c, "capacity_valu");
         }
-        // ALU: 12*makespan >= alu_count + 8*(shiftable_count - s)  =>  12*makespan + 8*s >= alu_count + 8*shiftable_count (s = number shifted to ALU; redundant with cumul_alu per T15)
+        // ALU: 12*makespan >= alu_count + 8*s (s = number shifted to ALU; redundant with cumul_alu per T15)
         if !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::CapacityAlu)
             && enable_valu_shift
             && (alu_count > 0 || shiftable_count > 0)
         {
-            let alu_ops_lb = alu_count + 8 * shiftable_count;
-            let lhs = LinearExpr::from(makespan) * 12 + s.clone() * 8;
-            let rhs = model.new_int_var([(alu_ops_lb, alu_ops_lb)]);
-            let c = model.add_ge(lhs, LinearExpr::from(rhs));
+            let alu_const = model.new_int_var([(alu_count, alu_count)]);
+            let lhs = LinearExpr::from(makespan) * 12 - s.clone() * 8;
+            let c = model.add_ge(lhs, LinearExpr::from(alu_const));
             model.set_constraint_name(c, "capacity_alu");
         }
         // Flow: makespan >= flow_base + sum(const_add_imm) - sum(select_fma)  =>  makespan + z - y >= flow_base
@@ -3744,12 +3772,11 @@ pub fn schedule_ssa_cpsat(
                 }
                 if enable_valu_shift && (alu_count > 0 || shiftable_count > 0) {
                     let s = shifted_ops.len() as i64; // number shifted to ALU (same s as in model)
-                    let alu_ops_lb = alu_count + 8 * shiftable_count;
-                    let lhs_alu = 12 * (actual_makespan as i64) + 8 * s;
-                    let binding_alu = lhs_alu == alu_ops_lb;
+                    let lhs_alu = 12 * (actual_makespan as i64) - 8 * s;
+                    let binding_alu = lhs_alu == alu_count;
                     if binding_alu {
                         eprintln!(
-                            "    Direct ALU (12*makespan + 8*shift >= alu_count + 8*shiftable_count): binding (LHS={})",
+                            "    Direct ALU (12*makespan - 8*shift >= alu_count): binding (LHS={})",
                             lhs_alu
                         );
                     }

@@ -169,6 +169,7 @@ pub mod legacy;
 pub mod validation;
 pub mod bounds;
 pub mod model;
+pub(crate) mod symmetry_ordering;
 #[cfg(test)]
 mod tests;
 

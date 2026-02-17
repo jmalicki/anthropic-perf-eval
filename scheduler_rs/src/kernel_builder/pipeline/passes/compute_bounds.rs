@@ -8,7 +8,9 @@
 
 use crate::cpsat_scheduler::bounds::{
     compute_max_latency_critical_path, compute_ssa_alap, compute_ssa_asap,
+    tighten_asap_by_symmetry_ordering,
 };
+use crate::cpsat_scheduler::symmetry_ordering::SymmetryOrdering;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext, SchedulingBounds};
 use crate::types::Engine;
 use std::collections::HashSet;
@@ -59,9 +61,28 @@ impl Pass for ComputeBoundsPass {
 
         // Optional tightening (controlled by BoundsConfig)
         let bounds_cfg = &ctx.config.bounds;
+        let machine = &ctx.config.machine;
+
+        if bounds_cfg.enable_asap_alap_tightening && bounds_cfg.use_symmetry_aware_slot_tightening {
+            let ordering = SymmetryOrdering::from_bounds(&ctx.ops, &current_alap, None);
+            let (sym_asap, sym_alap) = tighten_asap_by_symmetry_ordering(
+                &ctx.ops,
+                &current_asap,
+                &current_alap,
+                &ordering,
+                machine.valu_slots as i64,
+                machine.alu_slots as i64,
+                machine.load_slots as i64,
+                machine.store_slots as i64,
+                machine.flow_slots as i64,
+                Some(&shiftable_set),
+                false, // verbose
+            );
+            current_asap = sym_asap;
+            current_alap = sym_alap;
+        }
 
         if bounds_cfg.enable_asap_alap_tightening && bounds_cfg.use_energetic_slot_tightening {
-            let machine = &ctx.config.machine;
             if let Some((slot_asap, slot_alap)) =
                 crate::cpsat_scheduler::bounds::tighten_asap_alap_by_slots(
                     &ctx.ops,

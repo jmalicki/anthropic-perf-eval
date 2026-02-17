@@ -290,6 +290,10 @@ pub struct SsaCpsatConfig {
     /// (R_precedence_only: no slot-based exclusions). This is the only solver-free rule that preserves
     /// the strong guarantee (no feasible schedule removed). Use true only for experiments.
     pub use_energetic_slot_tightening: bool,
+    /// When true (default when slot tightening is on), run symmetry-aware ASAP tightening: within each
+    /// ordering group, the k-th op (by engine) cannot run before cycle ceil(k/C)-1. Entailed by
+    /// symmetry + capacity; preserves all valid schedules. Independent of use_energetic_slot_tightening.
+    pub use_symmetry_aware_slot_tightening: bool,
     /// If true, consider scratch constraints when tightening ASAP/ALAP bounds.
     /// Can be used independently of enable_asap_alap_tightening. Computes maximum scratch usage
     /// over VReg lifetimes and tightens bounds to avoid cycles where scratch exceeds budget.
@@ -325,6 +329,7 @@ impl Default for SsaCpsatConfig {
             force_zero_gap: false, // Default: use scale/3 gap limit for faster convergence
             enable_asap_alap_tightening: true,  // On by default (R_precedence_only). Use --no-enable-asap-alap-tightening to disable.
             use_energetic_slot_tightening: false, // Default: when tightening is on, use R_precedence_only (no slot exclusions). Set true for energetic loop.
+            use_symmetry_aware_slot_tightening: true, // Default: safe slot exclusions from ordering + capacity.
             enable_scratch_tightening: false, // Default: disabled for ablation studies
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
@@ -1154,6 +1159,132 @@ pub(crate) fn tighten_asap_alap_by_scratch(
     }
 
     Some((new_asap, new_alap))
+}
+
+// =============================================================================
+// Symmetry-aware slot tightening (safe: preserves all valid schedules)
+// =============================================================================
+//
+// The model adds symmetry-breaking constraints: within each ordering_group, ops are
+// ordered (cycle[i] <= cycle[j] for consecutive i, j in sort order). So for the k-th
+// op (1-based) in a group that uses engine E with capacity C, at most k ops from
+// that group can be scheduled at or before any cycle. With capacity C per cycle,
+// the earliest cycle that can contain the k-th op is ceil(k/C) - 1. So we can set
+// ASAP(op) = max(ASAP(op), ceil(k/C) - 1) for that op. This exclusion is entailed
+// by (symmetry + capacity): every feasible schedule satisfying the model's ordering
+// constraints already has this op at least at that cycle. No solver needed.
+//
+// =============================================================================
+
+/// Tighten ASAP using the canonical symmetry ordering and per-engine capacity.
+///
+/// Requires that `ordering` was built from the same ops and current bounds (see [super::symmetry_ordering::SymmetryOrdering]).
+/// For each engine E we take the subsequence of ops in each group that **definitely** use E
+/// (same optional-interval exclusions as `tighten_asap_alap_by_slots`). The j-th op (0-based)
+/// in that subsequence cannot run before cycle `ceil((j+1)/C) - 1`. We **cap** each push so that
+/// we never set `asap[i] > alap[j]` for the next op `j` in the same group, keeping the ordering valid.
+///
+/// **Strong guarantee:** Only excludes cycles that no feasible schedule uses, given the
+/// model's symmetry constraints. All valid schedules are preserved.
+pub(crate) fn tighten_asap_by_symmetry_ordering(
+    ops: &[SsaOp],
+    asap: &HashMap<usize, i32>,
+    alap: &HashMap<usize, i32>,
+    ordering: &super::symmetry_ordering::SymmetryOrdering,
+    valu_cap: i64,
+    alu_cap: i64,
+    load_cap: i64,
+    store_cap: i64,
+    flow_cap: i64,
+    shiftable_valu: Option<&HashSet<usize>>,
+    verbose: bool,
+) -> (HashMap<usize, i32>, HashMap<usize, i32>) {
+    use std::collections::HashMap as StdHashMap;
+
+    let engine_caps: StdHashMap<Engine, i64> = [
+        (Engine::Valu, valu_cap),
+        (Engine::Alu, alu_cap),
+        (Engine::Load, load_cap),
+        (Engine::Store, store_cap),
+        (Engine::Flow, flow_cap),
+    ]
+    .into_iter()
+    .collect();
+
+    let is_optional_on_engine = |idx: usize, engine: Engine| -> bool {
+        let op = &ops[idx];
+        match engine {
+            Engine::Flow => op.opcode == Opcode::SelectChoice,
+            Engine::Load => op.opcode == Opcode::ConstChoice,
+            Engine::Valu => shiftable_valu.map_or(false, |s| s.contains(&idx)),
+            _ => false,
+        }
+    };
+
+    let mut new_asap = asap.clone();
+    let mut new_alap = alap.clone();
+    let mut changed_count = 0usize;
+
+    for (_group_key, sorted) in ordering.iter_groups() {
+        for (engine, &cap) in &engine_caps {
+            if cap <= 0 {
+                continue;
+            }
+            let cap_i64 = cap;
+
+            let engine_chain: Vec<usize> = sorted
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    ops[idx].engine == *engine && !is_optional_on_engine(idx, *engine)
+                })
+                .collect();
+
+            for (j, &idx) in engine_chain.iter().enumerate() {
+                let earliest = ((j + 1) as i64 + cap_i64 - 1) / cap_i64 - 1;
+                let earliest_i32 = earliest as i32;
+                if earliest_i32 <= 0 {
+                    continue;
+                }
+                // Cap: do not push asap above the next op in the same group's ALAP (keeps ordering valid).
+                let pos_in_group = sorted.iter().position(|&p| p == idx).unwrap_or(0);
+                let next_alap = if pos_in_group + 1 < sorted.len() {
+                    let next_idx = sorted[pos_in_group + 1];
+                    *alap.get(&ops[next_idx].id).unwrap_or(&i32::MAX)
+                } else {
+                    i32::MAX
+                };
+                let new_asap_val = earliest_i32.min(next_alap);
+
+                let op_id = ops[idx].id;
+                let current = *new_asap.get(&op_id).unwrap_or(&0);
+                if new_asap_val > current {
+                    new_asap.insert(op_id, new_asap_val);
+                    changed_count += 1;
+                    if verbose && new_asap_val > 100 {
+                        eprintln!(
+                            "  [symmetry-tighten] ASAP push: idx={} op_id={} engine={:?} pos={}/{} -> {}",
+                            idx,
+                            op_id,
+                            engine,
+                            j + 1,
+                            engine_chain.len(),
+                            new_asap_val
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if verbose && changed_count > 0 {
+        eprintln!(
+            "  Symmetry-aware slot tightening: {} ASAP updates",
+            changed_count
+        );
+    }
+
+    (new_asap, new_alap)
 }
 
 /// Build ordering pairs (i, j) for symmetry breaking: cycle[i] <= cycle[j].

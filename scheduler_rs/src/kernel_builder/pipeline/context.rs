@@ -100,6 +100,8 @@ pub struct BoundsConfig {
     pub enable_asap_alap_tightening: bool,
     /// When true, run energetic slot-based tightening. When false (default), use R_precedence_only (no slot exclusions).
     pub use_energetic_slot_tightening: bool,
+    /// When true (default), run symmetry-aware ASAP tightening (safe; preserves all valid schedules).
+    pub use_symmetry_aware_slot_tightening: bool,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
 }
@@ -131,6 +133,8 @@ pub struct CpSatPipelineConfig {
     /// When true, run energetic slot-based tightening (ASAP-only + greedy-cap). When false (default),
     /// slot tightening uses R_precedence_only (no slot exclusions). Only used when enable_asap_alap_tightening is true.
     pub use_energetic_slot_tightening: bool,
+    /// When true (default), run symmetry-aware slot tightening (safe; preserves all valid schedules).
+    pub use_symmetry_aware_slot_tightening: bool,
     /// Enable scratch-aware domain tightening.
     pub enable_scratch_tightening: bool,
     /// Optional constraint groups to disable (redundant/helper constraints). See SsaCpsatConfig.
@@ -138,8 +142,8 @@ pub struct CpSatPipelineConfig {
     /// When true (default), build CSE groups for shared SelectChoice SUB. When false, disable for debugging.
     pub enable_cse_groups: bool,
     /// When true, run bulk-move compaction after CP-SAT to eliminate empty cycles.
-    /// Default false: bulk-move is known to be buggy (can cause same-cycle scratch conflicts).
-    /// Use --bulk-move to enable for tighter makespan when the bug is fixed.
+    /// Default false: CP-SAT should do it; bulk-move masks bugs and is buggy.
+    /// Use --bulk-move only for experimenting, not production.
     pub enable_bulk_move: bool,
 }
 
@@ -158,6 +162,7 @@ impl Default for CpSatPipelineConfig {
             force_zero_gap: false,
             enable_asap_alap_tightening: true,
             use_energetic_slot_tightening: false,
+            use_symmetry_aware_slot_tightening: true,
             enable_scratch_tightening: false,
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
@@ -185,6 +190,7 @@ impl CpSatPipelineConfig {
             force_zero_gap: self.force_zero_gap,
             enable_asap_alap_tightening: self.enable_asap_alap_tightening,
             use_energetic_slot_tightening: self.use_energetic_slot_tightening,
+            use_symmetry_aware_slot_tightening: self.use_symmetry_aware_slot_tightening,
             enable_scratch_tightening: self.enable_scratch_tightening,
             disable_optional_constraint_groups: self.disable_optional_constraint_groups.clone(),
             ..Default::default()

@@ -1,6 +1,9 @@
 # ASAP/ALAP Slot Tightening: Design and Rules
 
-This document is the **canonical design reference** for slot-based tightening of scheduling bounds (ASAP/ALAP). It defines the guarantee we want, which rules are safe or unsafe, and how the implementation behaves. For the specific T7 counterexample investigation (2r/16b, 368 vs 36 cycles, Z3 proofs), see [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md).
+This document is the **canonical design reference** for slot-based tightening of scheduling bounds (ASAP/ALAP). It defines the guarantee we want, which rules are safe or unsafe, and how the implementation behaves.
+
+- **Deep dive (recommended for newcomers):** [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) — explains from first principles why energetic tightening broke, the algorithm in detail, and fix options.
+- **T7 counterexample investigation (2r/16b, 368 vs 36 cycles, Z3 proofs):** [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md).
 
 ## Purpose of slot tightening
 
@@ -32,6 +35,16 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 **Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`use_energetic_slot_tightening`), `model.rs`, `kernel_build_args.py`.
 
+### R_symmetry_ordering (solver-free; implemented; strong guarantee)
+
+**Rule:** Use the **same ordering as symmetry breaking** (ordering groups, sort by greedy then ALAP). Within each group, for each engine, the k-th op (1-based) that definitely uses that engine cannot run before cycle `ceil(k/C) - 1`, because the model adds `cycle[i] <= cycle[j]` for consecutive pairs and at most C ops fit per cycle. So we set ASAP(op) = max(ASAP(op), ceil(k/C) - 1) for that op.
+
+- **Strong guarantee:** Every feasible schedule that satisfies the model’s symmetry constraints already has each op at least at that cycle. So we only exclude cycles that no such schedule uses.
+- **Does not untighten:** We only push ASAP forward (or leave unchanged).
+- **Implementation:** When slot tightening is on, **symmetry-aware tightening runs by default** (`use_symmetry_aware_slot_tightening: true`). Disable with `--no-symmetry-aware-slot-tightening`. See `tighten_asap_by_symmetry_ordering` in `bounds.rs`.
+
+**Code:** `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`tighten_asap_by_symmetry_ordering`), `model.rs`, `kernel_build_args.py`.
+
 ## Rules tried and proved unsafe (for posterity)
 
 ### R_precedence_demand (one-shot; no solver) — do not use
@@ -49,14 +62,15 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 | Option or rule | Strong guarantee (all feasible schedules remain)? | Evidence |
 |----------------|---------------------------------------------------|----------|
 | **Slot tightening off** (`--no-enable-asap-alap-tightening`) | **Yes** (trivial) | We add no exclusions. |
-| **R_precedence_only** (default: tightening on, no energetic) | **Yes** (proved) | We add no slot-based exclusions; only precedence + fixpoint + greedy-cap. Trivially preserves every feasible schedule. |
+| **R_precedence_only** (no slot exclusions) | **Yes** (proved) | We add no slot-based exclusions; only precedence + fixpoint + greedy-cap. Trivially preserves every feasible schedule. |
+| **R_symmetry_ordering** (default when tightening on) | **Yes** (proved) | Slot exclusions from symmetry + capacity only: “k-th op in group per engine cannot run before ceil(k/C)-1.” Preserves all schedules that satisfy the model’s ordering constraints. |
 | **R_entailed** (exclude only when (O,t) is UNSAT) | **Yes** (proved in Z3) | **T7-strong-guarantee-entailed-exclusions**: refuting (precedence ∧ capacity ∧ ¬exclusions) yields UNSAT → no feasible schedule removed. Not implemented in Rust (needs a solver). |
 | **Energetic** (`--enable-asap-alap-tightening` + `--energetic-slot-tightening`) | **No** (proved to fail) | **T7-strong-guarantee-fails-asap-only**: Z3 returns **SAT** → there exists a feasible schedule (e.g. (0,1,2)) that ASAP-only exclusions remove. So the strong guarantee is **violated**. With greedy-cap we still guarantee **at least one** schedule remains (the canonical G). So: **in-between** — not strong-guarantee safe; observed to keep G when hints are present. |
 | **R_precedence_demand** (one-shot demand from precedence windows) | **No** (proved unsafe) | Counterexample: 3-op chain, cap 1; we would exclude (O1,1) but (1,2,3) is feasible. **Do not use.** |
 
 **Summary:**
 
-- **Proved safe (strong guarantee):** Slot tightening off, R_precedence_only, R_entailed.
+- **Proved safe (strong guarantee):** Slot tightening off, R_precedence_only, R_symmetry_ordering, R_entailed.
 - **Proved unsafe (violates strong guarantee):** R_precedence_demand (do not use), and the energetic rule (ASAP-only exclusions) — Z3 shows we remove at least one feasible schedule.
 - **In-between:** Energetic + greedy-cap: we do **not** have the strong guarantee (we proved it fails), but we **do** guarantee at least one feasible schedule (G) when greedy hints are passed; no formal proof that “at least one” holds when hints are absent.
 
@@ -64,7 +78,7 @@ A weaker property (“at least one feasible schedule remains”) is insufficient
 
 | Option | Effect |
 |--------|--------|
-| Slot tightening **on** (default) | **R_precedence_only**: precedence, fixpoint, greedy-cap; **no** energetic slot loop. **Proved safe (strong guarantee).** Use `--no-enable-asap-alap-tightening` to disable. |
+| Slot tightening **on** (default) | **R_symmetry_ordering** (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). **No** energetic loop unless requested. **Proved safe (strong guarantee).** Use `--no-symmetry-aware-slot-tightening` to get R_precedence_only only; use `--no-enable-asap-alap-tightening` to disable all tightening. |
 | `--no-enable-asap-alap-tightening` | No slot-based tightening; precedence + optional greedy-cap only. **Proved safe.** |
 | `--enable-asap-alap-tightening` + `--energetic-slot-tightening` | Energetic slot loop (ASAP-only + greedy-cap). **Proved to violate strong guarantee**; with greedy-cap, at least G remains. Use for experiments only. |
 
@@ -85,6 +99,7 @@ uv run python scripts/analyze_ablation.py ablation_2r_16b_tightening_vs_off.json
 
 ## Related documents
 
+- [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) — Deep dive: why energetic tightening broke, algorithm in detail, fix options.
 - [LIVENESS_SPECIFICATION.md](LIVENESS_SPECIFICATION.md) — Axioms and theorems (T7 one-step lemma, etc.).
 - [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) — Investigation: 2r/16b counterexample, Z3 proofs, ablation (energetic vs off), why 368 cycles.
 - [verification/README.md](verification/README.md) — Z3 theorem list and preservation vs soundness.
