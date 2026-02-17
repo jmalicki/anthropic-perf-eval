@@ -29,6 +29,9 @@ from .theorems import (
     check_t7_strong_guarantee_fails_asap_only,
     check_t7_greedy_cap_preserves_canonical,
     check_t7_domain_based_removes_canonical,
+    check_t7_undercount_one_exclusion_sound,
+    check_t7_undercount_chain_preserves_witness,
+    check_t7_undercount_contributing_implies_t7,
     check_t8_scratch_tightening_one_step,
     check_t9_expiration_implies_no_overlap,
     check_t10_dead_shifted_valu_end,
@@ -97,6 +100,21 @@ THEOREM_CHECKS = [
         "Domain-based rule refutation: second exclusion removes canonical G",
         check_t7_domain_based_removes_canonical,
     ),
+    (
+        "T7-undercount-one-exclusion-sound",
+        "Undercounting: one exclusion (non-contributing) is sound (no feasible O at t)",
+        check_t7_undercount_one_exclusion_sound,
+    ),
+    (
+        "T7-undercount-chain-preserves-witness",
+        "Undercounting: chain exclusions preserve at least one feasible schedule (witness)",
+        check_t7_undercount_chain_preserves_witness,
+    ),
+    (
+        "T7-undercount-contributing-implies-T7",
+        "Undercounting: contributing exclusion implies T7 one-step condition",
+        check_t7_undercount_contributing_implies_t7,
+    ),
     ("T8", "Scratch-aware tightening (one-step lemma)", check_t8_scratch_tightening_one_step),
     ("T9", "Expiration implies no overlap", check_t9_expiration_implies_no_overlap),
     ("T10", "Dead shifted VALU dest end", check_t10_dead_shifted_valu_end),
@@ -153,6 +171,7 @@ def run_verification(
             "T7-alap-only-composition",
             "T7-strong-guarantee-fails-asap-only",
             "T7-greedy-cap-preserves-G",
+            "T7-undercount-chain-preserves-witness",
         )
         passed = (result_str == "sat") if expect_sat else (result_str == "unsat")
         if name == "T7-two-step" and passed:

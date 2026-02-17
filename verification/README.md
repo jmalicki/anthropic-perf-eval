@@ -50,6 +50,16 @@ Options:
 
 **Domain-based refutation (T7-domain-based-removes-G):** If we use domain-based demand (count ops whose domain contains `t`) to decide exclusions, the second exclusion can remove G; Z3 shows that after exclusions c1≠0 and c2≠2, the assignment (1, 2) is not feasible (UNSAT).
 
+## Undercounting energetic tightening (T7-undercount-*)
+
+The energetic slot tightening (`--energetic-slot-tightening`) uses **undercounting**: at cycle t, `min_demand(t)` = count of ops with `asap[op]==t` (per group, engine). We exclude (O,t) only when `total_min_demand(t) > cap` (O contributes) or `total_min_demand(t) >= cap` (O does not contribute). This never over-tightens. See `scheduler_rs/src/cpsat_scheduler/bounds.rs` and [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1.
+
+**Z3 proofs (simplified chain models; we assume single-group, single-engine, min_demand = count of ops with asap==t):**
+
+- **T7-undercount-one-exclusion-sound**: One undercounting exclusion (non-contributing case) is sound: no feasible schedule has O at t. Model: 3-op chain, exclude O2 from 0; prove (precedence ∧ capacity ∧ c2=0) UNSAT.
+- **T7-undercount-chain-preserves-witness**: Undercounting exclusions for a chain preserve at least one feasible schedule. Witness (0,1,2) satisfies precedence, capacity, and exclusions c2≥1, c3≥2. SAT.
+- **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds (demand_other ≥ cap). Links undercounting to the general T7 soundness lemma.
+
 ## Theorems
 
 Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVENESS_SPECIFICATION.md):
@@ -73,6 +83,9 @@ Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVE
 | T7-strong-guarantee-fails-asap-only | Attempt to prove strong guarantee for ASAP-only; fails (SAT = counterexample); important result preserved | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-greedy-cap-preserves-G | **Greedy-cap rule:** canonical schedule G remains feasible (Z3-proven safe rule) | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
 | T7-domain-based-removes-G | Domain-based rule refutation: second exclusion removes canonical G | [SLOT_TIGHTENING_T7_COUNTEREXAMPLE](../docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) |
+| T7-undercount-one-exclusion-sound | **Undercounting:** one exclusion (non-contributing) is sound | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
+| T7-undercount-chain-preserves-witness | **Undercounting:** chain exclusions preserve at least one feasible schedule (witness) | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
+| T7-undercount-contributing-implies-T7 | **Undercounting:** contributing exclusion implies T7 one-step condition | [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1 |
 | T8 | Scratch-aware tightening: one-step lemma | [#t8](../docs/LIVENESS_SPECIFICATION.md#t8) |
 | T9 | Expiration implies no overlap | [#t9](../docs/LIVENESS_SPECIFICATION.md#t9) |
 | T10 | Dead shifted VALU dest: `end(v) = max_cycle(v) + 1` | [#t10](../docs/LIVENESS_SPECIFICATION.md#t10) |

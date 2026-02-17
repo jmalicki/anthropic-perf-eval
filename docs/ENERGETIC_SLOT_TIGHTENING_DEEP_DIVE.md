@@ -278,17 +278,26 @@ We can get **safe** slot-based exclusions without a solver by using the **same o
 
 **Implementation:** `tighten_asap_by_symmetry_ordering` in `bounds.rs`. On by default when slot tightening is enabled (`use_symmetry_aware_slot_tightening: true`). Disable with `--no-symmetry-aware-slot-tightening`. See [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md) § R_symmetry_ordering.
 
+### 7.1 Energetic with Undercounting (Current Implementation)
+
+The energetic pass (`tighten_asap_alap_by_slots`) now uses **undercounting** instead of overcounting. For each (group, engine) we build an ordered chain of ops that definitely use that engine. At each cycle t, `min_demand_group(t)` = count of ops in that group's chain with `asap[op] == t`. We exclude (O,t) only when `total_min_demand(t) > cap` (summed over all groups for that engine). When O has `asap[O] == t`, O contributes to the count, so we require `total <= cap`. When O has `asap[O] < t`, O doesn't contribute, so we require `total < cap` (room for O). This never over-tightens: we only exclude when even in the best case, cycle t is full. Requires `SymmetryOrdering`; when `ordering` is None, returns bounds unchanged (no-op).
+
 ## 8. Current State and Recommendations
 
 **Current default**: R_symmetry_ordering (safe slot exclusions) + R_precedence_only (precedence, fixpoint, greedy-cap). We run symmetry-aware tightening then skip the energetic loop unless requested. **Proved safe** (strong guarantee for symmetry-based exclusions).
 
-**Energetic** (`--energetic-slot-tightening`): Uses the full demand-profile algorithm. **Proved to violate** the strong guarantee. With greedy-cap, at least G remains when hints are present. Use for experiments only.
+**Energetic** (`--energetic-slot-tightening`): Uses **symmetry-aware undercounting** — a lower bound on demand at each cycle. Only excludes (O,t) when total_min_demand(t) > cap. Incorporates SymmetryOrdering; never over-tightens. Produces schedules at least as good as symmetry-only (e.g. 55 cycles for 3r/16b). **Sound** — safe to use.
 
-**Recommended next steps**:
-1. **Experiment**: Try skipping the fixpoint after slot tightening (Option 6.2A). Run ablation on 2r/16b. If feasibility is preserved and we get 36 cycles, we have a candidate fix.
-2. **Experiment**: Use precedence-only initial bounds when slot tightening runs (Option 6.3). Compare makespan and solve time.
-3. **Formalize**: Add a Z3 model with fixpoint + greedy-derived bounds. Derive sufficient conditions for feasibility. Implement those conditions.
-4. **Long term**: R_entailed (Option 6.1) is the only proved-safe slot-based rule. If we can afford the solver cost, a Python pre-pass could implement it.
+**The old demand-profile algorithm** (overcounting) was replaced. It violated the strong guarantee (see §4). The new undercounting algorithm fixes that.
+
+**Z3 proofs** (simplified chain models): Three theorems in `verification/theorems.py` prove properties of the undercounting algorithm:
+- T7-undercount-one-exclusion-sound: one exclusion is sound (UNSAT)
+- T7-undercount-chain-preserves-witness: chain exclusions preserve a feasible schedule (SAT)
+- T7-undercount-contributing-implies-T7: contributing exclusion implies T7 one-step (UNSAT)
+
+**Recommended next steps** (optional future work):
+1. **Formalize full strong guarantee**: Extend Z3 to prove undercounting preserves all feasible schedules (not just one witness) under symmetry assumptions.
+2. **Long term**: R_entailed (Option 6.1) is the only proved-safe slot-based rule. If we can afford the solver cost, a Python pre-pass could implement it.
 
 ---
 

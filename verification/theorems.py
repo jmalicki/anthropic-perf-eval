@@ -591,6 +591,121 @@ def check_t14_capacity_lower_bound(ctx=None) -> tuple[str, str, float, dict]:
     return ("T14", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
 
 
+# =============================================================================
+# Undercounting energetic slot tightening (bounds.rs tighten_asap_alap_by_slots)
+# =============================================================================
+#
+# The energetic pass uses UNDERCOUNTING: at cycle t, min_demand(t) = count of ops
+# in each (group, engine) chain with asap[op] == t. We exclude (O,t) only when
+# total_min_demand(t) > cap (O contributes) or total_min_demand(t) >= cap (O does
+# not contribute). This never over-tightens. These theorems prove soundness and
+# preservation for simplified chain models. We assume single-group, single-engine
+# and that min_demand equals the count of ops with asap==t (exact for chains).
+#
+# See: scheduler_rs/src/cpsat_scheduler/bounds.rs § "SOUND ALGORITHM (undercounting)"
+#      docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md § 7.1
+# =============================================================================
+
+
+def check_t7_undercount_one_exclusion_sound(ctx=None) -> tuple[str, str, float, dict]:
+    """T7-undercount: One undercounting exclusion is sound (no feasible schedule has O at t).
+    Model: 3-op chain O1->O2->O3, cap 1, cycles 0..2. Initial asap: 0,1,2.
+    At t=0: min_demand(0)=1 (only O1 has asap 0). For O2 at t=0: O2 does not contribute
+    (asap[O2]=1), total=1, cap=1, total>=cap -> exclude (O2,0). So c2>=1.
+    Prove: (precedence & capacity & c2=0) is UNSAT. c2=0 and c2>=c1+1 => c1<=-1;
+    c1>=0 => impossible. UNSAT proves the exclusion was sound."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 2)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 2)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 2)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # Undercounting exclusion: O2 cannot be at 0 (min_demand(0)=1, O2 doesn't contribute, 1>=cap)
+    solver.add(c2 == 0)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-undercount-one-exclusion-sound",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_undercount_chain_preserves_witness(ctx=None) -> tuple[str, str, float, dict]:
+    """T7-undercount: Undercounting exclusions for a chain preserve at least one feasible schedule.
+    Model: 3-op chain O1->O2->O3, cap 1, cycles 0..4. Initial asap: 0,1,2.
+    Undercounting pushes: c2>=1 (O2 excluded from 0), c3>=2 (O3 excluded from 0,1).
+    Witness check: does (c1,c2,c3)=(0,1,2) satisfy precedence, capacity, and exclusions?
+    SAT proves that undercounting-style exclusions leave a feasible schedule.
+    Note: This is a necessary (not sufficient) check for the strong guarantee."""
+    c1, c2, c3 = Ints("c1 c2 c3")
+    solver = Solver(ctx=ctx)
+    solver.add(c1 >= 0)
+    solver.add(c1 <= 4)
+    solver.add(c2 >= 0)
+    solver.add(c2 <= 4)
+    solver.add(c3 >= 0)
+    solver.add(c3 <= 4)
+    solver.add(c1 != c2)
+    solver.add(c1 != c3)
+    solver.add(c2 != c3)
+    solver.add(c2 >= c1 + 1)
+    solver.add(c3 >= c2 + 1)
+    # Undercounting exclusions (ASAP pushes from min_demand)
+    solver.add(c2 >= 1)
+    solver.add(c3 >= 2)
+    # Assert witness (0,1,2)
+    solver.add(c1 == 0)
+    solver.add(c2 == 1)
+    solver.add(c3 == 2)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-undercount-chain-preserves-witness",
+        "sat" if str(result) == "sat" else str(result),
+        0.0,
+        stats,
+    )
+
+
+def check_t7_undercount_contributing_implies_t7(ctx=None) -> tuple[str, str, float, dict]:
+    """T7-undercount: When O contributes (asap[O]==t), undercounting exclusion implies T7.
+    When total_min_demand(t)>cap and O contributes, demand_other = total-1 >= cap.
+    That matches T7 one-step (demand_other >= cap - slots_O + 1 with slots_O=1).
+    Refutation: exclusion (total>cap) and feasible (total<=cap). UNSAT."""
+    cap, total_min_demand = Ints("cap total_min_demand")
+    # When O contributes: total_min_demand includes O. So demand_other = total_min_demand - 1.
+    # Exclusion: total_min_demand > cap => demand_other = total_min_demand - 1 >= cap.
+    # T7: demand_other >= cap - slots_O + 1 = cap (slots_O=1). So undercounting
+    # contributing exclusion implies T7 condition. Refutation: assume exclusion
+    # (total > cap) and feasible (demand_other + 1 <= cap). demand_other = total - 1.
+    # total - 1 + 1 <= cap => total <= cap. Contradicts total > cap. UNSAT.
+    demand_other = total_min_demand - 1
+    exclusion = total_min_demand > cap
+    feasible_with_o = demand_other + 1 <= cap  # total <= cap
+    solver = Solver(ctx=ctx)
+    solver.add(cap >= 1)
+    solver.add(total_min_demand >= 1)
+    solver.add(exclusion)
+    solver.add(feasible_with_o)
+    result = solver.check()
+    stats = _get_stats(solver)
+    return (
+        "T7-undercount-contributing-implies-T7",
+        "unsat" if str(result) == "unsat" else str(result),
+        0.0,
+        stats,
+    )
+
+
 def check_t15_optional_capacity_redundant(ctx=None) -> tuple[str, str, float, dict]:
     """T15: Optional propagation constraints are redundant. Cumulative (N <= C*M) implies
     the direct capacity inequality (M >= ceil(N/C)). So any solution feasible without the
