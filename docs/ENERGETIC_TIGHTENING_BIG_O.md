@@ -2,11 +2,12 @@
 
 This document characterizes the time and space complexity of the **energetic** slot tightening implementation in `scheduler_rs/src/cpsat_scheduler/bounds.rs` (`tighten_asap_alap_by_slots`).
 
-## Algorithm summary
+## Algorithm summary (current: segment tree)
 
 - **Input:** ops, asap/alap maps, horizon, per-engine capacities, optional shiftable set, greedy cycles, and `SymmetryOrdering`.
 - **Behavior:** Uses symmetry-aware **undercounting**: for each engine, builds per-group chains of ops that definitely use that engine; at each cycle `t`, `min_demand[group][t]` = count of ops in that group’s chain with `asap[op] == t`. For each op, finds the earliest `t` in its window where `total_min_demand(t) <= cap` (and applies greedy-cap). Only ASAP pushes; no ALAP pulls.
 - **Iteration:** Up to `MAX_ITER` (3) iterations; each iteration runs over all 5 engines. Stops early if no bound changed.
+- **Implementation:** Single `total_min_demand[0..=H]` plus a segment tree (`DemandSegmentTree` in `bounds.rs`) for O(log H) "first/last index in [L,R] where value ≤ cap" queries and point updates; see below.
 
 ## Notation
 
@@ -19,9 +20,51 @@ This document characterizes the time and space complexity of the **energetic** s
 | **I** | Max iterations = 3 (constant) |
 | **W** | Max window size per op = `alap - asap + 1`; worst case **W = O(H)** |
 
-## Time complexity
+## Time complexity (with segment tree — current implementation)
 
 ### Per engine, per iteration
+
+1. **Build phase**
+   - Iterate over all groups and build `engine_chain` per group (filter by engine and not optional) ⇒ **O(N)** over all groups.
+   - Build **total_min_demand[0..=H]** in one pass over all ops in `group_chains`: for each op, `total_min_demand[asap[op]] += 1` ⇒ **O(N)**.
+   - Build segment tree from `total_min_demand` ⇒ **O(H)**.
+   - **Build total: O(N + H).**
+
+2. **Tighten phase (ASAP)**
+   - For each op in `group_chains` (same order as before): **O(N)** op visits.
+   - Per op: one **query_first(L, R, cap)** ⇒ **O(log H)**; optional **contributing-only** check (read `total_min_demand[op_asap]`, O(1)); if ASAP changed, two **point updates** on the segment tree ⇒ **O(log H)**.
+   - **Tighten total: O(N · log H).**
+
+3. **ALAP pulls (optional)**  
+   Rebuild `total_min_demand` and segment tree from current `new_asap` ⇒ **O(N + H)**; then for each op one **query_last(L, R, cap-1)** ⇒ **O(N log H)**.
+
+**Per engine per iteration:**  
+**O(N + H + N log H) = O(N log H)** when H = Ω(N).
+
+### Full procedure (segment tree)
+
+- **Iterations:** at most **I** (3).
+- **Engines:** **E** (5).
+
+**Time complexity (with segment tree):**
+
+**T = O(I · E · (N + N log H)) = O(N log H).**
+
+When **H = O(N)** (horizon scales with makespan and N), this is **O(N log N)**.
+
+### Typical scaling
+
+- **N:** Grows with problem size (e.g. rounds × batch × tree work). Often in the thousands to tens of thousands for 16-round kernels.
+- **H:** Horizon ≈ greedy makespan + 20; **O(makespan)**; in practice often **O(N)**.
+- **G:** No longer in the dominant term (we use a single total demand array and segment tree).
+
+So in practice the procedure is **O(N log N)** when H = O(N).
+
+---
+
+## Time complexity (previous: naive per-group demand)
+
+### Per engine, per iteration (naive)
 
 1. **Build phase**
    - Iterate over all groups: **O(G)**.
@@ -58,21 +101,22 @@ Constants I and E are fixed, so the **dominant term is N · H · G**.
 
 So in practice the procedure can be **cubic in problem size** when N, H, and G all scale (e.g. with rounds and batch): **O(N · H · G)**.
 
-## Space complexity
+## Space complexity (with segment tree)
 
 - **Per engine, per iteration:**
   - `group_chains`: **O(N)** (total op indices across groups).
-  - `min_demand`: **G** vectors of length **H + 1** ⇒ **O(G · H)**.
+  - `total_min_demand`: one vector of length **H + 1** ⇒ **O(H)**.
+  - Segment tree over `total_min_demand`: **O(H)** (e.g. 4× rounded size).
 - **Persistent state:** `new_asap` / `new_alap`: **O(N)** (copies of input maps).
-- **No accumulation across iterations:** we reuse and overwrite `group_chains` and `min_demand` each time.
+- **No accumulation across iterations:** we reuse and overwrite `group_chains`, `total_min_demand`, and the tree each time.
 
-**Space complexity: O(N + G · H).**
+**Space complexity: O(N + H).**
 
-## Summary
+## Summary (current implementation)
 
 | Complexity | Bound | Notes |
 |------------|--------|--------|
-| **Time** | **O(N · H · G)** | Dominant: for each op, scan up to H cycles and sum over G groups; × I × E is constant. |
-| **Space** | **O(N + G · H)** | Maps + per-group demand vectors over horizon. |
+| **Time** | **O(N log H)** | Build total_min_demand + tree O(N + H); N queries/updates at O(log H) each. With H = O(N) → **O(N log N)**. |
+| **Space** | **O(N + H)** | Maps + one demand vector + segment tree over horizon. |
 
-So the energetic ASAP/ALAP tightening is **linear in N**, **linear in H**, and **linear in G**, i.e. **O(N · H · G)** time and **O(N + G · H)** space. When N, H, and G all grow with problem size (rounds, batch, makespan), the runtime grows like the product of those three dimensions.
+The segment tree supports **point update** (add delta at index `i`) and **query_first** / **query_last** (first/last index in `[L,R]` where value ≤ cap), each in **O(log H)**. See `DemandSegmentTree` in `bounds.rs` and the comment block above `tighten_asap_alap_by_slots`.

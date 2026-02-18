@@ -809,6 +809,161 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 }
 
 // =============================================================================
+// Segment tree for O(log H) "first/last index in [L,R] where value <= X" queries
+// =============================================================================
+//
+// Used by energetic slot tightening to avoid O(N·H·G) linear scan; gives O(N log H) per engine.
+// See docs/ENERGETIC_TIGHTENING_BIG_O.md (segment tree subsection).
+
+/// Segment tree over an array of i64 supporting point updates (add delta) and
+/// queries: first index in [L,R] where value <= cap, and last index in [L,R] where value <= cap.
+struct DemandSegmentTree {
+    /// Length of the logical array (horizon + 1).
+    n: usize,
+    /// Tree nodes: min value in segment. Leaves are the actual values; internal nodes = min of children.
+    /// 0-based: node 0 = root [0, n-1]; left = 2*i+1, right = 2*i+2.
+    tree: Vec<i64>,
+}
+
+impl DemandSegmentTree {
+    /// Build from initial slice. O(n). Empty slice produces a no-op tree (queries return None).
+    fn new(data: &[i64]) -> Self {
+        let n = data.len();
+        if n == 0 {
+            return Self {
+                n: 0,
+                tree: vec![],
+            };
+        }
+        let size = next_power_of_2(n).max(1);
+        let mut tree = vec![i64::MAX; 4 * size];
+        Self::build_rec(0, 0, n - 1, data, &mut tree);
+        Self { n, tree }
+    }
+
+    fn build_rec(node: usize, l: usize, r: usize, data: &[i64], tree: &mut [i64]) {
+        if l == r {
+            tree[node] = data[l];
+            return;
+        }
+        let mid = l + (r - l) / 2;
+        let left = 2 * node + 1;
+        let right = 2 * node + 2;
+        Self::build_rec(left, l, mid, data, tree);
+        Self::build_rec(right, mid + 1, r, data, tree);
+        tree[node] = tree[left].min(tree[right]);
+    }
+
+    /// Add delta at index i. i must be in [0, n). O(log n). No-op if n == 0.
+    fn add(&mut self, i: usize, delta: i64) {
+        if self.n == 0 || i >= self.n {
+            return;
+        }
+        self.add_rec(0, 0, self.n - 1, i, delta);
+    }
+
+    fn add_rec(&mut self, node: usize, l: usize, r: usize, i: usize, delta: i64) {
+        if l == r {
+            self.tree[node] += delta;
+            return;
+        }
+        let mid = l + (r - l) / 2;
+        let left = 2 * node + 1;
+        let right = 2 * node + 2;
+        if i <= mid {
+            self.add_rec(left, l, mid, i, delta);
+        } else {
+            self.add_rec(right, mid + 1, r, i, delta);
+        }
+        self.tree[node] = self.tree[left].min(self.tree[right]);
+    }
+
+    /// First index t in [l_range, r_range] such that value[t] <= cap, or None. O(log n).
+    fn query_first(&self, l_range: usize, r_range: usize, cap: i64) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        self.query_first_rec(0, 0, self.n - 1, l_range, r_range, cap)
+    }
+
+    fn query_first_rec(
+        &self,
+        node: usize,
+        l: usize,
+        r: usize,
+        l_range: usize,
+        r_range: usize,
+        cap: i64,
+    ) -> Option<usize> {
+        if r < l_range || l > r_range {
+            return None;
+        }
+        if self.tree[node] > cap {
+            return None;
+        }
+        if l == r {
+            return Some(l);
+        }
+        let mid = l + (r - l) / 2;
+        let left = 2 * node + 1;
+        let right = 2 * node + 2;
+        if let Some(idx) = self.query_first_rec(left, l, mid, l_range, r_range, cap) {
+            return Some(idx);
+        }
+        self.query_first_rec(right, mid + 1, r, l_range, r_range, cap)
+    }
+
+    /// Last index t in [l_range, r_range] such that value[t] <= cap, or None. O(log n).
+    fn query_last(&self, l_range: usize, r_range: usize, cap: i64) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        self.query_last_rec(0, 0, self.n - 1, l_range, r_range, cap)
+    }
+
+    fn query_last_rec(
+        &self,
+        node: usize,
+        l: usize,
+        r: usize,
+        l_range: usize,
+        r_range: usize,
+        cap: i64,
+    ) -> Option<usize> {
+        if r < l_range || l > r_range {
+            return None;
+        }
+        if self.tree[node] > cap {
+            return None;
+        }
+        if l == r {
+            return Some(l);
+        }
+        let mid = l + (r - l) / 2;
+        let left = 2 * node + 1;
+        let right = 2 * node + 2;
+        if let Some(idx) = self.query_last_rec(right, mid + 1, r, l_range, r_range, cap) {
+            return Some(idx);
+        }
+        self.query_last_rec(left, l, mid, l_range, r_range, cap)
+    }
+}
+
+fn next_power_of_2(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    let mut v = n - 1;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v |= v >> 32;
+    v + 1
+}
+
+// =============================================================================
 // Slot-aware ASAP/ALAP tightening: sound energetic reasoning with symmetry
 // =============================================================================
 //
@@ -825,6 +980,9 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
 //
 // **Greedy-cap (Z3-proven):** Never exclude the canonical cycle (T7-greedy-cap-preserves-G).
 // **ASAP-only:** Apply only ASAP pushes, not ALAP pulls (T7-asap-only-composition).
+//
+// **Complexity:** O(N log H) per engine per iteration using a segment tree over total_min_demand;
+// space O(N + H). See docs/ENERGETIC_TIGHTENING_BIG_O.md.
 //
 // =============================================================================
 
@@ -904,11 +1062,8 @@ pub(crate) fn tighten_asap_alap_by_slots(
                 continue;
             }
 
-            // Build per-group engine chains and min_demand at each cycle.
-            // min_demand[group_idx][t] = count of ops in that group's engine chain with asap == t.
+            // Build per-group engine chains only (no per-group min_demand; we use a single total).
             let mut group_chains: Vec<Vec<usize>> = Vec::new();
-            let mut min_demand: Vec<Vec<i64>> = Vec::new();
-
             for (_group_key, sorted) in ordering.iter_groups() {
                 let engine_chain: Vec<usize> = sorted
                     .iter()
@@ -917,30 +1072,33 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         ops[idx].engine == *engine && !is_optional_on_engine(idx, *engine)
                     })
                     .collect();
-
                 if engine_chain.is_empty() {
                     continue;
                 }
-
-                let mut demand_at_t = vec![0i64; horizon_usize + 1];
-                for &idx in &engine_chain {
-                    let op_id = ops[idx].id;
-                    let asap_t = *new_asap.get(&op_id).unwrap_or(&0);
-                    if asap_t >= 0 && (asap_t as usize) <= horizon_usize {
-                        demand_at_t[asap_t as usize] += 1;
-                    }
-                }
-
                 group_chains.push(engine_chain);
-                min_demand.push(demand_at_t);
             }
 
             if group_chains.is_empty() {
                 continue;
             }
 
-            // For each op in the chains, find earliest t where total_min_demand(t) <= cap.
-            for (group_idx, engine_chain) in group_chains.iter().enumerate() {
+            // Single total_min_demand[t] = count of ops (across all chains) with new_asap[op] == t. O(N).
+            let mut total_min_demand = vec![0i64; horizon_usize + 1];
+            for engine_chain in &group_chains {
+                for &idx in engine_chain {
+                    let op_id = ops[idx].id;
+                    let asap_t = *new_asap.get(&op_id).unwrap_or(&0);
+                    if asap_t >= 0 && (asap_t as usize) <= horizon_usize {
+                        total_min_demand[asap_t as usize] += 1;
+                    }
+                }
+            }
+
+            // Segment tree for O(log H) "first/last index in [L,R] where value <= cap" queries.
+            let mut seg_tree = DemandSegmentTree::new(&total_min_demand);
+
+            // ASAP pass: for each op, find earliest t in window where total_min_demand(t) <= cap (contributing-only).
+            for engine_chain in &group_chains {
                 for &idx in engine_chain {
                     let op_id = ops[idx].id;
                     let old_asap = *new_asap.get(&op_id).unwrap_or(&0);
@@ -951,16 +1109,29 @@ pub(crate) fn tighten_asap_alap_by_slots(
                     }
 
                     let op_asap = old_asap;
+                    let start = old_asap as usize;
+                    let end = (old_alap as usize).min(horizon_usize);
+                    // First t in [start, end] where we can place: (t != op_asap) or (total(t) <= cap).
                     let mut new_asap_val = old_alap + 1;
-                    for t in (old_asap as usize)..=(old_alap as usize).min(horizon_usize) {
-                        let total: i64 = min_demand.iter().map(|d| d.get(t).copied().unwrap_or(0)).sum();
-                        let o_contributes = (t as i32) == op_asap;
-                        // Contributing only: only exclude when O contributes to min_demand(t) (ASAP==t).
-                        // Skip non-contributing case (ASAP < t) — not proved in Z3.
-                        let can_place = if o_contributes { total <= cap } else { true };
-                        if can_place {
+                    if (op_asap as usize) >= start && (op_asap as usize) <= end {
+                        let total_at_op = total_min_demand[op_asap as usize];
+                        if total_at_op <= cap {
+                            new_asap_val = op_asap;
+                        } else {
+                            // Cannot place at op_asap; first valid is min(op_asap+1, first t with total <= cap).
+                            let first_ok = seg_tree.query_first(start, end, cap).map(|t| t as i32);
+                            let cand_plus_one =
+                                if (op_asap as usize) < end { Some(op_asap + 1) } else { None };
+                            new_asap_val = match (first_ok, cand_plus_one) {
+                                (Some(a), Some(b)) => a.min(b),
+                                (Some(a), None) => a,
+                                (None, Some(b)) => b,
+                                (None, None) => old_alap + 1,
+                            };
+                        }
+                    } else {
+                        if let Some(t) = seg_tree.query_first(start, end, cap) {
                             new_asap_val = t as i32;
-                            break;
                         }
                     }
 
@@ -970,7 +1141,6 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                     }
 
-                    // Bounded push: cap magnitude at k cycles per iteration
                     if let Some(k) = energetic_bounded_push_k {
                         let push = (new_asap_val - old_asap).min(k as i32);
                         new_asap_val = old_asap + push;
@@ -985,13 +1155,32 @@ pub(crate) fn tighten_asap_alap_by_slots(
                         }
                         new_asap.insert(op_id, new_asap_val);
                         changed = true;
+                        // Keep total_min_demand and segment tree in sync for later ops.
+                        total_min_demand[old_asap as usize] -= 1;
+                        total_min_demand[new_asap_val as usize] += 1;
+                        seg_tree.add(old_asap as usize, -1);
+                        seg_tree.add(new_asap_val as usize, 1);
                     }
                 }
             }
 
-            // ALAP pulls (experimental; T7-two-step shows composition risk when combined with ASAP)
+            // ALAP pulls (experimental; T7-two-step shows composition risk when combined with ASAP).
             if energetic_alap_pulls {
-                for (_, engine_chain) in group_chains.iter().enumerate() {
+                // Rebuild total_min_demand after ASAP pass (ALAP doesn't change it; we need current state).
+                total_min_demand.fill(0);
+                for engine_chain in &group_chains {
+                    for &idx in engine_chain {
+                        let op_id = ops[idx].id;
+                        let asap_t = *new_asap.get(&op_id).unwrap_or(&0);
+                        if asap_t >= 0 && (asap_t as usize) <= horizon_usize {
+                            total_min_demand[asap_t as usize] += 1;
+                        }
+                    }
+                }
+                let mut seg_tree_alap = DemandSegmentTree::new(&total_min_demand);
+                // Last t in [asap, alap] where total(t) + 1 <= cap <=> total(t) <= cap - 1.
+                let cap_minus_one = cap - 1;
+                for engine_chain in &group_chains {
                     for &idx in engine_chain {
                         let op_id = ops[idx].id;
                         let old_asap = *new_asap.get(&op_id).unwrap_or(&0);
@@ -1001,18 +1190,11 @@ pub(crate) fn tighten_asap_alap_by_slots(
                             continue;
                         }
 
-                        // Default: no tightening; only update if we find a valid earlier cycle.
-                        let mut new_alap_val = old_alap;
+                        let start = old_asap as usize;
                         let end = (old_alap as usize).min(horizon_usize);
-                        for t in (old_asap as usize..=end).rev() {
-                            let total: i64 =
-                                min_demand.iter().map(|d| d.get(t).copied().unwrap_or(0)).sum();
-                            // When placing O at t: need total + 1 <= cap (O may not be in total if asap[O]!=t)
-                            let can_place = total + 1 <= cap;
-                            if can_place {
-                                new_alap_val = t as i32;
-                                break;
-                            }
+                        let mut new_alap_val = old_alap;
+                        if let Some(t) = seg_tree_alap.query_last(start, end, cap_minus_one) {
+                            new_alap_val = t as i32;
                         }
 
                         if let Some(g) = greedy_cycles {

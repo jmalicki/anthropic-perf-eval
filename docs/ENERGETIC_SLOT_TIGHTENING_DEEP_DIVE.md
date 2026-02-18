@@ -106,6 +106,8 @@ If `total_demand > C * W`, we tighten O's window.
 - Tightening one op changes its window → changes the profile → can justify more tightening for other ops.
 - The same op can be tightened by multiple engines (e.g. an ALU op gets its ASAP pushed by the ALU pass, then again by the next iteration).
 
+For time/space Big-O analysis (including the O(N log N) segment-tree implementation), see [ENERGETIC_TIGHTENING_BIG_O.md](ENERGETIC_TIGHTENING_BIG_O.md).
+
 ---
 
 ## 4. Why It Broke: Failure Modes
