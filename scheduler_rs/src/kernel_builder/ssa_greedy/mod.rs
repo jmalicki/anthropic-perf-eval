@@ -32,7 +32,9 @@ pub mod pressure_policy;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::types::{EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN};
+use crate::types::{
+    ConstChoiceEncoding, EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN,
+};
 
 use self::pressure_policy::{GreedyPolicy, PressurePolicy};
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
@@ -495,6 +497,11 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         &GreedyPolicy,
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
     )
 }
 
@@ -508,6 +515,10 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
 ///
 /// SelectChoice tracking is self-contained: ops report their relationship via methods.
 /// The sub and fma ops know they belong to a SelectChoice op through `select_choice_parent`.
+///
+/// When hint passes are enabled, the pipeline passes fixed-default flags so the hint pass
+/// "owns" the decision: const_choice_fixed_to_load (all ConstChoice use Load), 
+/// select_choice_fixed_to_vselect (no FMA), valu_shift_fixed_to_none (no shifts).
 pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -521,6 +532,13 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     strategy: &dyn PressurePolicy,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    // When Some, use these encodings for ConstChoice (engine from map); do not write to const_add_imm_ops.
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    // When Some, use this set for shift decisions (op in set => place as shifted); do not add to shifted_ops.
+    fixed_shifted_ops: Option<&HashSet<usize>>,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -998,9 +1016,9 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                             let engine = ops[idx].engine;
                             if engine.is_hardware() {
                                 let cap = engine_capacity(engine);
+                                // min_demand already includes the current op (we haven't scheduled it yet)
                                 let min_demand = profile.min_demand_at_cycle(cycle as i32, engine);
-                                let slots_needed = 1i64; // All ops use 1 slot on their natural engine
-                                if min_demand + slots_needed > cap {
+                                if min_demand > cap {
                                     let ub = *alap_map.get(&ops[idx].id).unwrap_or(&i32::MAX);
                                     let next_feasible = (cycle as i32 + 1).min(ub);
                                     deferred_by_bounds.push((next_feasible, idx));
@@ -1093,8 +1111,19 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                 // ConstChoice: use add_imm (Flow) only if there is a free Flow slot and no
                 // other schedulable Flow op (vselect, jump, etc.); otherwise use Load.
+                // When const_choice_fixed_to_load (hint pass enabled), always use Load so the hint pass owns the decision.
+                // When fixed_const_choice_encoding is Some (schedule-with-fixed-choices), use the map.
+                let op_id = ops[idx].id;
                 let engine = if ops[idx].opcode == Opcode::ConstChoice {
-                    if slots.flow_used < 1 && flow_other_ready == 0 {
+                    if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
+                        if matches!(enc, ConstChoiceEncoding::AddImm) {
+                            Engine::Flow
+                        } else {
+                            Engine::Load
+                        }
+                    } else if const_choice_fixed_to_load {
+                        Engine::Load
+                    } else if slots.flow_used < 1 && flow_other_ready == 0 {
                         Engine::Flow
                     } else {
                         Engine::Load
@@ -1103,12 +1132,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     ops[idx].engine
                 };
                 let dest = ops[idx].dest;
-                let op_id = ops[idx].id;
                 let srcs: Vec<Operand> = ops[idx].srcs.clone();
 
-                let can_shift = enable_valu_shift
-                    && engine == Engine::Valu
-                    && can_ssa_valu_shift_to_alu(&ops[idx]);
+                // When fixed_shifted_ops is Some, can_shift = op is in the set (we place as shifted only those).
+                let can_shift = if let Some(fixed) = fixed_shifted_ops {
+                    fixed.contains(&op_id)
+                } else {
+                    enable_valu_shift
+                        && engine == Engine::Valu
+                        && can_ssa_valu_shift_to_alu(&ops[idx])
+                };
 
                 // Check slot availability
                 if !slots.fits(engine, can_shift) {
@@ -1159,15 +1192,21 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
                 match slots.try_place(engine, can_shift, allow_shift) {
                     SlotResult::Placed => {
-                        // Record ConstChoice scheduled as add_imm for lowering
-                        if engine == Engine::Flow && ops[idx].opcode == Opcode::ConstChoice {
+                        // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
+                        if fixed_const_choice_encoding.is_none()
+                            && !const_choice_fixed_to_load
+                            && engine == Engine::Flow
+                            && ops[idx].opcode == Opcode::ConstChoice
+                        {
                             if let Some(ref mut set) = const_add_imm_ops {
                                 set.insert(op_id);
                             }
                         }
                     }
                     SlotResult::Shifted => {
-                        shifted_ops.insert(op_id);
+                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                            shifted_ops.insert(op_id);
+                        }
                     }
                     SlotResult::NoRoom => {
                         // VALU full, shift suppressed by strategy — defer to next cycle
@@ -1280,15 +1319,31 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
             });
 
             let force_idx = budget_deferred.remove(0);
-            let engine = ops[force_idx].engine;
-            let dest = ops[force_idx].dest;
             let op_id = ops[force_idx].id;
+            let engine = if ops[force_idx].opcode == Opcode::ConstChoice {
+                if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
+                    if matches!(enc, ConstChoiceEncoding::AddImm) {
+                        Engine::Flow
+                    } else {
+                        Engine::Load
+                    }
+                } else {
+                    ops[force_idx].engine
+                }
+            } else {
+                ops[force_idx].engine
+            };
+            let dest = ops[force_idx].dest;
             let srcs: Vec<Operand> = ops[force_idx].srcs.clone();
 
             // Check slot availability - we still respect slot limits
-            let can_shift = enable_valu_shift
-                && engine == Engine::Valu
-                && can_ssa_valu_shift_to_alu(&ops[force_idx]);
+            let can_shift = if let Some(fixed) = fixed_shifted_ops {
+                fixed.contains(&op_id)
+            } else {
+                enable_valu_shift
+                    && engine == Engine::Valu
+                    && can_ssa_valu_shift_to_alu(&ops[force_idx])
+            };
 
             if slots.fits(engine, can_shift) {
                 // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
@@ -1314,12 +1369,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 #[allow(unused_assignments)]
                 match slots.try_place(engine, can_shift, allow_shift) {
                     SlotResult::Placed => {}
-                    SlotResult::Shifted => { shifted_ops.insert(op_id); }
+                    SlotResult::Shifted => {
+                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                            shifted_ops.insert(op_id);
+                        }
+                    }
                     SlotResult::NoRoom => {
-                        // Strategy blocked shift but VALU is full — force the shift.
-                        match slots.try_place(engine, can_shift, true) {
-                            SlotResult::Shifted => { shifted_ops.insert(op_id); }
-                            _ => {} // Truly no room — shouldn't happen since fits() passed
+                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                            if let SlotResult::Shifted = slots.try_place(engine, can_shift, true) {
+                                shifted_ops.insert(op_id);
+                            }
                         }
                     }
                 }
@@ -1479,17 +1538,20 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // but will not find any expanded SelectChoice ops.
     // =========================================================================
     if let Some(fma_ops) = select_choice_fma_ops {
-        // Find all SelectChoice ops that were expanded (have sub/fma children)
-        // Since we no longer expand SelectChoice ops, this will be empty
-        let mut selectchoice_to_fma: HashSet<usize> = HashSet::new();
-        for op in ops.iter() {
-            if let Some(parent_id) = op.select_choice_parent_id() {
-                if op.is_select_choice_sub() || op.is_select_choice_fma() {
-                    selectchoice_to_fma.insert(parent_id);
+        // When select_choice_fixed_to_vselect (hint pass enabled), leave set empty so hint pass owns the decision.
+        if !select_choice_fixed_to_vselect {
+            // Find all SelectChoice ops that were expanded (have sub/fma children)
+            // Since we no longer expand SelectChoice ops, this will be empty
+            let mut selectchoice_to_fma: HashSet<usize> = HashSet::new();
+            for op in ops.iter() {
+                if let Some(parent_id) = op.select_choice_parent_id() {
+                    if op.is_select_choice_sub() || op.is_select_choice_fma() {
+                        selectchoice_to_fma.insert(parent_id);
+                    }
                 }
             }
+            fma_ops.extend(selectchoice_to_fma);
         }
-        fma_ops.extend(selectchoice_to_fma);
     }
 
     if let Some(sub_cycles) = select_sub_cycles {
