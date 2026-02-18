@@ -998,9 +998,9 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                             let engine = ops[idx].engine;
                             if engine.is_hardware() {
                                 let cap = engine_capacity(engine);
+                                // min_demand already includes the current op (we haven't scheduled it yet)
                                 let min_demand = profile.min_demand_at_cycle(cycle as i32, engine);
-                                let slots_needed = 1i64; // All ops use 1 slot on their natural engine
-                                if min_demand + slots_needed > cap {
+                                if min_demand > cap {
                                     let ub = *alap_map.get(&ops[idx].id).unwrap_or(&i32::MAX);
                                     let next_feasible = (cycle as i32 + 1).min(ub);
                                     deferred_by_bounds.push((next_feasible, idx));
