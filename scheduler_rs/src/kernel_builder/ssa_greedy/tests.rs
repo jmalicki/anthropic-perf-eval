@@ -2299,6 +2299,7 @@ fn test_greedy_policy_unchanged_regression() {
         &GreedyBoundsUsage::None,
         &GreedyPolicy,
         None,
+        false,
     );
 
     assert!(result.is_ok(), "GreedyPolicy should schedule: {:?}", result.err());
@@ -2346,6 +2347,7 @@ fn test_throttled_policy_produces_valid_schedule() {
         &GreedyBoundsUsage::None,
         &PressureThrottledPolicy::default(),
         None,
+        false,
     );
 
     assert!(result.is_ok(), "PressureThrottledPolicy should schedule: {:?}", result.err());
@@ -2380,6 +2382,7 @@ fn test_gated_policy_produces_valid_schedule() {
         &GreedyBoundsUsage::None,
         &PressureGatedPolicy::default(),
         None,
+        false,
     );
 
     assert!(result.is_ok(), "PressureGatedPolicy should schedule: {:?}", result.err());
@@ -2414,6 +2417,7 @@ fn test_adaptive_policy_produces_valid_schedule() {
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
         None,
+        false,
     );
 
     assert!(result.is_ok(), "AdaptivePolicy should schedule: {:?}", result.err());
@@ -2522,6 +2526,7 @@ fn test_adaptive_no_cascading_deferral() {
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
         None,
+        false,
     );
 
     assert!(result.is_ok(), "Should complete: {:?}", result.err());
@@ -2596,6 +2601,7 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
         None,
+        false,
     );
 
     assert!(result.is_ok(), "Scheduler should complete: {:?}", result.err());
@@ -3116,6 +3122,7 @@ fn test_cascade_inflation_in_scheduler() {
         &bounds_policy_only,
         &CascadePolicy::default(),
         None,
+        false,
     );
 
     assert!(
@@ -3144,6 +3151,7 @@ fn test_cascade_inflation_in_scheduler() {
         &bounds_policy_only2,
         &GreedyPolicy,
         None,
+        false,
     );
 
     assert!(result_greedy.is_ok());

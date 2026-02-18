@@ -542,7 +542,7 @@ impl SsaTickTockKernelBuilder {
 
         let program = self.build();
 
-        let config = PipelineConfig {
+        let mut config = PipelineConfig {
             compiler: super::config::CompilerConfig {
                 enable_valu_shift,
                 ..self.config.compiler.clone()
@@ -552,6 +552,7 @@ impl SsaTickTockKernelBuilder {
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             ..Default::default()
         };
+        config.bounds.greedy_use_full_bounds = self.config.compiler.greedy_use_full_bounds;
 
         let mut ctx = PipelineContext::new(program, config);
         ctx.run_greedy_pipeline(self.config.compiler.enable_ssa_dce).map_err(|e| {
@@ -682,6 +683,8 @@ impl SsaTickTockKernelBuilder {
                 energetic_alap_pulls,
                 energetic_bounded_push_k,
                 precedence_neutral_horizon,
+                enable_capacity_deferral: true,
+                greedy_use_full_bounds: false, // CP-SAT path uses Full via is_cpsat_pipeline
             },
             cpsat: Some(CpSatPipelineConfig {
                 time_limit_secs,

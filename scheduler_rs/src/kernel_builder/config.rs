@@ -176,6 +176,9 @@ pub struct CompilerConfig {
     /// After lowering, verify no two ops in the same cycle write overlapping scratch (return Err so
     /// export_partial_result_on_error can run). Default true. Disable via CLI --no-verify-scratch-conflict for debugging.
     pub verify_same_cycle_scratch: bool,
+    /// When true with greedy-only, use Full bounds (ASAP deferral, clamping, capacity deferral).
+    /// Used for comparing PolicyOnly vs Full greedy (feasibility investigation).
+    pub greedy_use_full_bounds: bool,
 }
 
 impl Default for CompilerConfig {
@@ -185,6 +188,7 @@ impl Default for CompilerConfig {
             enable_ssa_dce: true,
             scheduling_pressure_policy: PressurePolicyKind::default(),
             verify_same_cycle_scratch: true,
+            greedy_use_full_bounds: false,
         }
     }
 }

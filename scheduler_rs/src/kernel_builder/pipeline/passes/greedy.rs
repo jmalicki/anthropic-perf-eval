@@ -49,15 +49,16 @@ impl Pass for GreedySchedulePass {
 
         // Determine bounds usage mode based on pipeline configuration.
         // CP-SAT pipeline → Full (deferral + inflation + clamping for solver domain compliance).
-        // Greedy-only pipeline → PolicyOnly (inflation only, no deferral regression).
+        // Greedy-only pipeline → PolicyOnly unless greedy_use_full_bounds (investigation mode).
         // No bounds → None (pure greedy, backward-compatible).
         #[cfg(feature = "cpsat")]
         let is_cpsat_pipeline = ctx.config.cpsat.is_some();
         #[cfg(not(feature = "cpsat"))]
         let is_cpsat_pipeline = false;
+        let use_full_bounds = is_cpsat_pipeline || ctx.config.bounds.greedy_use_full_bounds;
 
         let bounds_usage = match ctx.bounds.as_ref() {
-            Some(b) if is_cpsat_pipeline => GreedyBoundsUsage::Full {
+            Some(b) if use_full_bounds => GreedyBoundsUsage::Full {
                 asap: &b.asap,
                 alap: &b.alap,
             },
@@ -75,6 +76,7 @@ impl Pass for GreedySchedulePass {
         };
         let mut add_imm_ops = HashSet::new();
         let mut select_fma_ops = HashSet::new();
+        let enable_capacity_deferral = ctx.config.bounds.enable_capacity_deferral;
         let (cycles, budget_exceeded, peak_live) =
             ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ctx.ops,
@@ -88,6 +90,7 @@ impl Pass for GreedySchedulePass {
                 &bounds_usage,
                 &*strategy,
                 vgl,
+                enable_capacity_deferral,
             )?;
         for op in &ctx.ops {
             if op.opcode == Opcode::ConstChoice {

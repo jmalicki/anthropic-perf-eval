@@ -111,6 +111,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--bulk-move", action="store_true", dest="enable_bulk_move",
                        default=False,
                        help="Enable bulk-move compaction after CP-SAT. Off by default: CP-SAT should do it; bulk-move masks bugs and is buggy (same-cycle scratch conflicts). Experimentation only.")
+    group.add_argument("--greedy-full-bounds", action="store_true", dest="greedy_use_full_bounds",
+                       default=False,
+                       help="With --use-greedy, use Full bounds (ASAP deferral, clamping, capacity deferral). For comparing PolicyOnly vs Full greedy schedules (feasibility investigation).")
 
     # Output (passed to Rust)
     group.add_argument("--output-json", type=str, default=None,
@@ -242,6 +245,7 @@ def args_to_build_kwargs(
         "verify_same_cycle_scratch": get("verify_same_cycle_scratch", True),
         "enable_bulk_move": get("enable_bulk_move", False),
         "enable_vbroadcast_elimination": True if get("enable_eliminate_vbroadcast", False) else None,
+        "greedy_use_full_bounds": get("greedy_use_full_bounds", False),
     }
 
 

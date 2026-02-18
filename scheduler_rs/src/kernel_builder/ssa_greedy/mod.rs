@@ -88,6 +88,94 @@ impl<'a> GreedyBoundsUsage<'a> {
 }
 
 // ============================================================================
+// IncrementalDemandProfile: capacity-aware deferral (energetic logic)
+// ============================================================================
+
+/// Per-engine demand profile for capacity-aware deferral.
+///
+/// Tracks `demand[engine][t]` = count of unscheduled ops with engine E and ASAP==t.
+/// Matches energetic tightening's "contributing-only" policy: we only count ops
+/// that contribute to demand at their ASAP cycle. Optional ops (ConstChoice,
+/// SelectChoice, shiftable VALU) are excluded.
+struct IncrementalDemandProfile {
+    /// demand[engine_index][cycle] = count of unscheduled ops with that engine and ASAP==cycle
+    demand: [Vec<i64>; 5],
+}
+
+impl IncrementalDemandProfile {
+    fn new(
+        ops: &[SsaOp],
+        asap: &HashMap<usize, i32>,
+        shiftable_set: &HashSet<usize>,
+        dead_store_indices: &HashSet<usize>,
+        horizon: usize,
+    ) -> Self {
+        let mut demand: [Vec<i64>; 5] = [
+            vec![0; horizon + 1],
+            vec![0; horizon + 1],
+            vec![0; horizon + 1],
+            vec![0; horizon + 1],
+            vec![0; horizon + 1],
+        ];
+        for (idx, op) in ops.iter().enumerate() {
+            if dead_store_indices.contains(&idx) {
+                continue;
+            }
+            if !Self::is_optional_on_engine(idx, op.engine, shiftable_set, op.opcode) {
+                let asap_t = *asap.get(&op.id).unwrap_or(&0);
+                if asap_t >= 0 && (asap_t as usize) <= horizon {
+                    let ei = engine_index(op.engine);
+                    demand[ei][asap_t as usize] += 1;
+                }
+            }
+        }
+        Self { demand }
+    }
+
+    fn is_optional_on_engine(idx: usize, engine: Engine, shiftable_set: &HashSet<usize>, opcode: Opcode) -> bool {
+        match engine {
+            Engine::Flow => opcode == Opcode::SelectChoice,
+            Engine::Load => opcode == Opcode::ConstChoice,
+            Engine::Valu => shiftable_set.contains(&idx),
+            _ => false,
+        }
+    }
+
+    fn min_demand_at_cycle(&self, cycle: i32, engine: Engine) -> i64 {
+        if cycle < 0 {
+            return 0;
+        }
+        let ei = engine_index(engine);
+        self.demand[ei].get(cycle as usize).copied().unwrap_or(0)
+    }
+
+    fn schedule_op(&mut self, idx: usize, op: &SsaOp, asap_t: i32, shiftable_set: &HashSet<usize>) {
+        if Self::is_optional_on_engine(idx, op.engine, shiftable_set, op.opcode) {
+            return;
+        }
+        let ei = engine_index(op.engine);
+        if asap_t >= 0 && (asap_t as usize) < self.demand[ei].len() {
+            self.demand[ei][asap_t as usize] = self.demand[ei][asap_t as usize].saturating_sub(1);
+        }
+    }
+}
+
+fn engine_index(e: Engine) -> usize {
+    match e {
+        Engine::Load => 0,
+        Engine::Store => 1,
+        Engine::Alu => 2,
+        Engine::Valu => 3,
+        Engine::Flow => 4,
+        _ => 2, // Default to ALU for non-slot engines (shouldn't be used)
+    }
+}
+
+fn engine_capacity(e: Engine) -> i64 {
+    e.slot_limit() as i64
+}
+
+// ============================================================================
 // InflationStats: lightweight counters for ASAP inflation diagnostics
 // ============================================================================
 
@@ -406,6 +494,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         &GreedyBoundsUsage::None,
         &GreedyPolicy,
         None,
+        false,
     )
 }
 
@@ -431,6 +520,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     bounds_usage: &GreedyBoundsUsage,
     strategy: &dyn PressurePolicy,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -675,6 +765,21 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
 
+    // Capacity-aware deferral: per-engine demand profile (only when Full bounds + enabled)
+    let mut demand_profile: Option<IncrementalDemandProfile> = None;
+    if enable_capacity_deferral {
+        if let Some((asap_map, alap_map)) = bounds_usage.core_bounds() {
+            let horizon = alap_map.values().copied().max().unwrap_or(5000) as usize;
+            demand_profile = Some(IncrementalDemandProfile::new(
+                ops,
+                asap_map,
+                &shiftable_set,
+                &dead_store_indices,
+                horizon,
+            ));
+        }
+    }
+
     while scheduled.len() < ops.len() && cycle < max_cycles {
         // Note: scheduled includes dead stores (pre-marked), so we check against ops.len()
         // Free expired VRegs (O(log n) per VReg)
@@ -856,14 +961,54 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 slots: &slots.view(),
             };
 
+            // Capacity deferral: min pass-through safeguard (same pattern as ASAP inflation)
+            const MIN_CAPACITY_PASS_THROUGH: usize = 3;
+            let max_capacity_deferrals = ready_this_cycle_len.saturating_sub(MIN_CAPACITY_PASS_THROUGH);
+            let mut capacity_deferred_count: usize = 0;
+            let capacity_deferral_disabled = consecutive_empty >= 3;
+
             for idx in ready_this_cycle.drain(..) {
                 // ASAP deferral: only in Full mode (core loop mechanics).
                 // Defers ops whose ASAP cycle hasn't been reached yet.
-                if let Some((asap_map, _alap_map)) = bounds_usage.core_bounds() {
+                if let Some((asap_map, _)) = bounds_usage.core_bounds() {
                     let lb = *asap_map.get(&ops[idx].id).unwrap_or(&0);
                     if (cycle as i32) < lb {
                         deferred_by_bounds.push((lb, idx));
                         continue;
+                    }
+                }
+                // Capacity-aware deferral: only in Full mode when enabled (contributing-only).
+                // Uses energetic logic: defer if demand[engine][cycle] + slots > capacity.
+                // Skip optional ops (ConstChoice, SelectChoice, shiftable) - they don't contribute.
+                if let Some(ref mut profile) = demand_profile {
+                    if let Some((asap_map, alap_map)) = bounds_usage.core_bounds() {
+                        let op_asap = *asap_map.get(&ops[idx].id).unwrap_or(&0);
+                        let o_contributes = op_asap == cycle as i32;
+                        let is_optional = IncrementalDemandProfile::is_optional_on_engine(
+                            idx,
+                            ops[idx].engine,
+                            &shiftable_set,
+                            ops[idx].opcode,
+                        );
+                        if o_contributes
+                            && !is_optional
+                            && !capacity_deferral_disabled
+                            && capacity_deferred_count < max_capacity_deferrals
+                        {
+                            let engine = ops[idx].engine;
+                            if engine.is_hardware() {
+                                let cap = engine_capacity(engine);
+                                let min_demand = profile.min_demand_at_cycle(cycle as i32, engine);
+                                let slots_needed = 1i64; // All ops use 1 slot on their natural engine
+                                if min_demand + slots_needed > cap {
+                                    let ub = *alap_map.get(&ops[idx].id).unwrap_or(&i32::MAX);
+                                    let next_feasible = (cycle as i32 + 1).min(ub);
+                                    deferred_by_bounds.push((next_feasible, idx));
+                                    capacity_deferred_count += 1;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
                 // ASAP inflation: available in PolicyOnly + Full mode (policy decisions).
@@ -1046,6 +1191,14 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 made_progress = true;
                 scheduled_this_cycle += 1;
 
+                // Update capacity demand profile: op no longer contributes at its ASAP cycle
+                if let (Some(ref mut profile), Some((asap_map, _))) =
+                    (demand_profile.as_mut(), bounds_usage.core_bounds())
+                {
+                    let asap_t = *asap_map.get(&ops[idx].id).unwrap_or(&0);
+                    profile.schedule_op(idx, &ops[idx], asap_t, &shiftable_set);
+                }
+
                 // Update live tracking for destination VReg
                 if let Some(d) = dest {
                     if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
@@ -1176,6 +1329,14 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 ops[force_idx].cycle = force_cycle;
                 scheduled.insert(force_idx);
                 scheduled_this_cycle += 1;
+
+                // Update capacity demand profile (same as normal path)
+                if let (Some(ref mut profile), Some((asap_map, _))) =
+                    (demand_profile.as_mut(), bounds_usage.core_bounds())
+                {
+                    let asap_t = *asap_map.get(&ops[force_idx].id).unwrap_or(&0);
+                    profile.schedule_op(force_idx, &ops[force_idx], asap_t, &shiftable_set);
+                }
 
                 // Update liveness (same as normal scheduling path)
                 if let Some(dest_vreg) = dest {
