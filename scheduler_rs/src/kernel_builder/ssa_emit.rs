@@ -41,6 +41,11 @@ impl SsaTickTockKernelBuilder {
             self.emit.set_round_context(rnd, tree_depth);
             self.emit_round(rnd, tree_depth, n_groups, n_iters, is_last_round);
 
+            // Snapshot round-(rounds-2) hash output so StoreData xor can attach keep_live
+            if self.config.spec.rounds >= 2 && rnd == self.config.spec.rounds - 2 {
+                self.ctx.round_before_last_hash = Some(self.ctx.all_val.clone());
+            }
+
             // Emit barrier between rounds for greedy scheduler
             // (barriers are elided before CP-SAT and final output)
             if !is_last_round {
@@ -60,6 +65,12 @@ impl SsaTickTockKernelBuilder {
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
         for g in 0..n_groups {
             self.emit.set_next_var_type(VarType::BatchData);
+            // Keep round-(rounds-2) hash output live until this xor (transitive pipeline dep)
+            if let Some(ref rb) = self.ctx.round_before_last_hash {
+                if let Some(v) = rb.get(g).and_then(|o| *o) {
+                    self.emit.set_next_keep_live(vec![v]);
+                }
+            }
             let val = self.ctx.all_val[g].unwrap();
             self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_stage5_xor));
         }
