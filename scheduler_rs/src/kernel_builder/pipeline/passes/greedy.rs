@@ -21,6 +21,10 @@ use crate::types::{ConstChoiceEncoding, Opcode, SelectChoiceEncoding};
 /// `ctx.greedy_metrics` with cycle count and peak liveness. The greedy
 /// schedule is written directly into `op.cycle` on each SSA op.
 ///
+/// When a hint pass is enabled (enable_*_hint_pass), greedy uses a fixed default
+/// for that choice so the hint pass owns the decision: ConstChoice→Load,
+/// SelectChoice→vselect, VALU shift→none.
+///
 /// Bounds usage mode is determined by the pipeline configuration:
 /// - **CP-SAT pipeline** (`cpsat` config present): `Full` — core loop uses ASAP for
 ///   priority, deferral, and clamping so greedy hints stay within solver domains.
@@ -77,6 +81,10 @@ impl Pass for GreedySchedulePass {
         let mut add_imm_ops = HashSet::new();
         let mut select_fma_ops = HashSet::new();
         let enable_capacity_deferral = ctx.config.bounds.enable_capacity_deferral;
+        // When a hint pass is enabled, greedy uses fixed default so the hint pass owns the decision.
+        let const_choice_fixed_to_load = ctx.config.compiler.enable_const_choice_hint_pass;
+        let select_choice_fixed_to_vselect = ctx.config.compiler.enable_select_choice_hint_pass;
+        let valu_shift_fixed_to_none = ctx.config.compiler.enable_valu_shift_hint_pass;
         let (cycles, budget_exceeded, peak_live) =
             ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ctx.ops,
@@ -91,6 +99,12 @@ impl Pass for GreedySchedulePass {
                 &*strategy,
                 vgl,
                 enable_capacity_deferral,
+                const_choice_fixed_to_load,
+                select_choice_fixed_to_vselect,
+                valu_shift_fixed_to_none,
+                None, // fixed_const_choice_encoding
+                None, // fixed_shifted_ops
+                None, // fixed_select_choice_encoding
             )?;
         for op in &ctx.ops {
             if op.opcode == Opcode::ConstChoice {

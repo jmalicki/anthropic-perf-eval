@@ -655,9 +655,11 @@ impl SsaTickTockKernelBuilder {
         use super::pipeline::{
             BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
             SchedulingDecisions,
-            passes::{ComputeBoundsPass, ComputeDependenciesPass, DcePass,
-                     ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass,
-                     LowerToOpsPass},
+            passes::{
+                ComputeBoundsPass, ConstChoiceHintPass, ComputeDependenciesPass, DcePass,
+                ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass, LowerToOpsPass,
+                ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
+            },
         };
         use crate::cpsat_scheduler::{
             schedule_ssa_cpsat, OptionalConstraintGroup, SsaCpsatConfig, SsaCpsatHints,
@@ -748,6 +750,23 @@ impl SsaTickTockKernelBuilder {
 
         // Greedy scheduling for hints
         run_pass_with_error_export!(&mut ctx, &super::pipeline::passes::GreedySchedulePass);
+
+        // Hint passes (overwrite greedy_decisions; then re-schedule so op.cycle matches)
+        if ctx.config.compiler.enable_const_choice_hint_pass {
+            run_pass_with_error_export!(&mut ctx, &ConstChoiceHintPass);
+        }
+        if ctx.config.compiler.enable_select_choice_hint_pass {
+            run_pass_with_error_export!(&mut ctx, &SelectChoiceHintPass);
+        }
+        if ctx.config.compiler.enable_valu_shift_hint_pass {
+            run_pass_with_error_export!(&mut ctx, &ValuShiftHintPass);
+        }
+        let any_hint_pass = ctx.config.compiler.enable_const_choice_hint_pass
+            || ctx.config.compiler.enable_select_choice_hint_pass
+            || ctx.config.compiler.enable_valu_shift_hint_pass;
+        if any_hint_pass || ctx.config.compiler.enable_schedule_with_fixed_choices {
+            run_pass_with_error_export!(&mut ctx, &ScheduleWithFixedChoicesPass);
+        }
 
         let greedy_cycles = ctx.greedy_metrics.cycles;
         let greedy_budget_exceeded = ctx.greedy_metrics.budget_exceeded;

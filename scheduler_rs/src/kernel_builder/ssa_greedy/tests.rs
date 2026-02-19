@@ -2300,6 +2300,12 @@ fn test_greedy_policy_unchanged_regression() {
         &GreedyPolicy,
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "GreedyPolicy should schedule: {:?}", result.err());
@@ -2348,6 +2354,12 @@ fn test_throttled_policy_produces_valid_schedule() {
         &PressureThrottledPolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "PressureThrottledPolicy should schedule: {:?}", result.err());
@@ -2383,6 +2395,12 @@ fn test_gated_policy_produces_valid_schedule() {
         &PressureGatedPolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "PressureGatedPolicy should schedule: {:?}", result.err());
@@ -2418,6 +2436,12 @@ fn test_adaptive_policy_produces_valid_schedule() {
         &AdaptivePolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "AdaptivePolicy should schedule: {:?}", result.err());
@@ -2527,6 +2551,12 @@ fn test_adaptive_no_cascading_deferral() {
         &AdaptivePolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "Should complete: {:?}", result.err());
@@ -2602,6 +2632,12 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         &AdaptivePolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "Scheduler should complete: {:?}", result.err());
@@ -3123,6 +3159,12 @@ fn test_cascade_inflation_in_scheduler() {
         &CascadePolicy::default(),
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(
@@ -3152,6 +3194,12 @@ fn test_cascade_inflation_in_scheduler() {
         &GreedyPolicy,
         None,
         false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result_greedy.is_ok());

@@ -33,7 +33,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::types::{
-    ConstChoiceEncoding, EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SsaOp, VReg, VLEN,
+    ConstChoiceEncoding, EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SelectChoiceEncoding,
+    SsaOp, VReg, VLEN,
 };
 
 use self::pressure_policy::{GreedyPolicy, PressurePolicy};
@@ -292,6 +293,18 @@ impl SlotTracker {
             _ => SlotResult::NoRoom,
         }
     }
+
+    /// Try to place a VALU op only as shifted (ALU). Used when the op is in
+    /// fixed_shifted_ops so the hint and schedule must agree (shifted => 8 ALU slots).
+    /// Returns NoRoom if ALU cannot fit VLEN slots.
+    fn try_place_shifted_only(&mut self) -> SlotResult {
+        if self.alu_used + VLEN <= 12 {
+            self.alu_used += VLEN;
+            SlotResult::Shifted
+        } else {
+            SlotResult::NoRoom
+        }
+    }
 }
 
 /// Dump usage breakdown for currently live VRegs when budget is exceeded.
@@ -502,6 +515,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -539,6 +553,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
     // When Some, use this set for shift decisions (op in set => place as shifted); do not add to shifted_ops.
     fixed_shifted_ops: Option<&HashSet<usize>>,
+    // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -1113,6 +1129,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // other schedulable Flow op (vselect, jump, etc.); otherwise use Load.
                 // When const_choice_fixed_to_load (hint pass enabled), always use Load so the hint pass owns the decision.
                 // When fixed_const_choice_encoding is Some (schedule-with-fixed-choices), use the map.
+                // SelectChoice: when fixed_select_choice_encoding is Some, use map (Fma => VALU, Vselect => Flow).
                 let op_id = ops[idx].id;
                 let engine = if ops[idx].opcode == Opcode::ConstChoice {
                     if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
@@ -1128,6 +1145,18 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     } else {
                         Engine::Load
                     }
+                } else if ops[idx].opcode == Opcode::SelectChoice {
+                    if let Some(enc) = fixed_select_choice_encoding.and_then(|m| m.get(&op_id)) {
+                        if matches!(enc, SelectChoiceEncoding::Fma) {
+                            Engine::Valu
+                        } else {
+                            Engine::Flow
+                        }
+                    } else if select_choice_fixed_to_vselect {
+                        Engine::Flow
+                    } else {
+                        ops[idx].engine // default Flow (vselect)
+                    }
                 } else {
                     ops[idx].engine
                 };
@@ -1135,6 +1164,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 let srcs: Vec<Operand> = ops[idx].srcs.clone();
 
                 // When fixed_shifted_ops is Some, can_shift = op is in the set (we place as shifted only those).
+                // When in fixed_shifted_ops we must place as shifted only (never VALU), so we need ALU room.
                 let can_shift = if let Some(fixed) = fixed_shifted_ops {
                     fixed.contains(&op_id)
                 } else {
@@ -1142,9 +1172,20 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         && engine == Engine::Valu
                         && can_ssa_valu_shift_to_alu(&ops[idx])
                 };
+                let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
                 // Check slot availability
-                if !slots.fits(engine, can_shift) {
+                if must_place_shifted {
+                    if slots.alu_used + VLEN > 12 {
+                        let next_priority = bounds_usage
+                            .core_bounds()
+                            .and_then(|(a, _)| a.get(&op_id).copied())
+                            .map(|lb| ((cycle + 1) as i32).max(lb))
+                            .unwrap_or_else(|| (cycle + 1) as i32);
+                        ready_heap.push(Reverse((next_priority, idx)));
+                        continue;
+                    }
+                } else if !slots.fits(engine, can_shift) {
                     // Reinsert to heap for next cycle
                     let next_priority = bounds_usage
                         .core_bounds()
@@ -1188,9 +1229,14 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 }
 
                 // Schedule the op via SlotTracker.
-                // Strategy can suppress shifting; if suppressed and VALU full, defer.
+                // When must_place_shifted (op in fixed_shifted_ops), use shift-only path so hint matches (ALU count).
                 let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
-                match slots.try_place(engine, can_shift, allow_shift) {
+                let place_result = if must_place_shifted {
+                    slots.try_place_shifted_only()
+                } else {
+                    slots.try_place(engine, can_shift, allow_shift)
+                };
+                match place_result {
                     SlotResult::Placed => {
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
@@ -1330,6 +1376,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 } else {
                     ops[force_idx].engine
                 }
+            } else if ops[force_idx].opcode == Opcode::SelectChoice {
+                if let Some(enc) = fixed_select_choice_encoding.and_then(|m| m.get(&op_id)) {
+                    if matches!(enc, SelectChoiceEncoding::Fma) {
+                        Engine::Valu
+                    } else {
+                        Engine::Flow
+                    }
+                } else {
+                    ops[force_idx].engine
+                }
             } else {
                 ops[force_idx].engine
             };
@@ -1344,8 +1400,21 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     && engine == Engine::Valu
                     && can_ssa_valu_shift_to_alu(&ops[force_idx])
             };
+            let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
-            if slots.fits(engine, can_shift) {
+            // When must_place_shifted we need ALU room; if not, defer to next cycle
+            if must_place_shifted && slots.alu_used + VLEN > 12 {
+                ready_heap.push(Reverse(((cycle + 1) as i32, force_idx)));
+                continue;
+            }
+
+            let slots_ok = if must_place_shifted {
+                true
+            } else {
+                slots.fits(engine, can_shift)
+            };
+
+            if slots_ok {
                 // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
                 // This is intentional behavior - DO NOT REMOVE unless explicitly instructed.
                 // The force-schedule allows progress when retry loops fail to free enough
@@ -1363,11 +1432,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     last_budget_dump_cycle = Some(cycle);
                 }
                 budget_exceeded = true;
-                // Try with strategy first; if NoRoom (strategy blocked shift), force
-                // with allow_shift=true to maintain slot capacity invariants.
+                // When must_place_shifted use shift-only path; else try with strategy first.
                 let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
                 #[allow(unused_assignments)]
-                match slots.try_place(engine, can_shift, allow_shift) {
+                let force_place_result = if must_place_shifted {
+                    slots.try_place_shifted_only()
+                } else {
+                    slots.try_place(engine, can_shift, allow_shift)
+                };
+                #[allow(unused_assignments)]
+                match force_place_result {
                     SlotResult::Placed => {}
                     SlotResult::Shifted => {
                         if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
