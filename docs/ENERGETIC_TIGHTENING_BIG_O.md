@@ -5,7 +5,7 @@ This document characterizes the time and space complexity of the **energetic** s
 ## Algorithm summary (current: segment tree)
 
 - **Input:** ops, asap/alap maps, horizon, per-engine capacities, optional shiftable set, greedy cycles, and `SymmetryOrdering`.
-- **Behavior:** Uses symmetry-aware **undercounting**: for each engine, builds per-group chains of ops that definitely use that engine; at each cycle `t`, `min_demand[group][t]` = count of ops in that group’s chain with `asap[op] == t`. For each op, finds the earliest `t` in its window where `total_min_demand(t) <= cap` (and applies greedy-cap). Only ASAP pushes; no ALAP pulls.
+- **Behavior:** Uses symmetry-aware **undercounting**: for each engine, builds per-group chains of ops that definitely use that engine; at each cycle `t`, `min_demand[group][t]` = count of ops in that group’s chain with `asap[op] == t`. For each op, finds the earliest `t` in its window where `total_min_demand(t) <= cap` (and applies greedy-cap). Only ASAP pushes; no ALAP pulls (ALAP pulls are not implemented in the current version).
 - **Iteration:** Up to `MAX_ITER` (3) iterations; each iteration runs over all 5 engines. Stops early if no bound changed.
 - **Implementation:** Single `total_min_demand[0..=H]` plus a segment tree (`DemandSegmentTree` in `bounds.rs`) for O(log H) "first/last index in [L,R] where value ≤ cap" queries and point updates; see below.
 
@@ -35,8 +35,8 @@ This document characterizes the time and space complexity of the **energetic** s
    - Per op: one **query_first(L, R, cap)** ⇒ **O(log H)**; optional **contributing-only** check (read `total_min_demand[op_asap]`, O(1)); if ASAP changed, two **point updates** on the segment tree ⇒ **O(log H)**.
    - **Tighten total: O(N · log H).**
 
-3. **ALAP pulls (optional)**  
-   Rebuild `total_min_demand` and segment tree from current `new_asap` ⇒ **O(N + H)**; then for each op one **query_last(L, R, cap-1)** ⇒ **O(N log H)**.
+3. **ALAP pulls (not implemented)**  
+   If implemented, would rebuild `total_min_demand` and segment tree from current `new_asap` ⇒ **O(N + H)**; then for each op one **query_last(L, R, cap-1)** ⇒ **O(N log H)**. Current code does not run this phase.
 
 **Per engine per iteration:**  
 **O(N + H + N log H) = O(N log H)** when H = Ω(N).

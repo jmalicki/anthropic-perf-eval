@@ -40,10 +40,10 @@ When `query_last` returns **`None`**:
 - We still do `new_alap.insert(op_id, old_asap - 1)` because `old_asap - 1 < old_alap`.
 - So we set **ALAP = old_asap - 1** for that op.
 
-But ALAP must be ≥ ASAP. So we have **ALAP &lt; ASAP** (invalid window). That is an over-tightening bug: we excluded every cycle in the window without a proof (we never found a valid `t`). Consequences:
+But ALAP must be ≥ ASAP. So we have **ALAP < ASAP** (invalid window). That is an over-tightening bug: we excluded every cycle in the window without a proof (we never found a valid `t`). Consequences:
 
-- Downstream (e.g. `new_int_var_with_name([lb, ub)]`) can see empty or invalid domains (ub &lt; lb).
-- The precedence fixpoint does **not** repair “ALAP &lt; ASAP”; it only propagates precedence. So the invalid bound can persist and lead to INFEASIBLE or undefined behavior.
+- Downstream (e.g. `new_int_var_with_name([lb, ub)]`) can see empty or invalid domains (ub < lb).
+- The precedence fixpoint does **not** repair “ALAP < ASAP”; it only propagates precedence. So the invalid bound can persist and lead to INFEASIBLE or undefined behavior.
 
 So **any** run where `query_last` returns `None` for some op is buggy with the old code. For runs that “work” with the old code, we are either (a) never hitting `None`, or (b) relying on some other step (e.g. domain construction) to effectively mask the invalid value.
 
