@@ -1444,7 +1444,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 match force_place_result {
                     SlotResult::Placed => {}
                     SlotResult::Shifted => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                        if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
                     }
