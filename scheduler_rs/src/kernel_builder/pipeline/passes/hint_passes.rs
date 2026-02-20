@@ -128,6 +128,10 @@ impl Pass for SelectChoiceHintPass {
                     .select_choice_encoding
                     .insert(op.id, SelectChoiceEncoding::Fma);
                 flipped += 1;
+                if let Some(v) = cycle_valu.get_mut(&c) {
+                    *v = v.saturating_sub(1);
+                }
+                *cycle_flow.entry(c).or_insert(0) += 1;
             }
         }
 
@@ -177,7 +181,9 @@ impl Pass for ValuShiftHintPass {
                 continue;
             }
             if op.engine == Engine::Valu {
-                *cycle_valu.entry(c).or_insert(0) += 1;
+                if !ctx.greedy_decisions.shifted_ops.contains(&op.id) {
+                    *cycle_valu.entry(c).or_insert(0) += 1;
+                }
             }
             if op.engine == Engine::Alu {
                 *cycle_alu.entry(c).or_insert(0) += 1;
