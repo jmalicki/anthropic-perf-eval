@@ -1192,6 +1192,7 @@ pub(crate) fn tighten_asap_alap_by_slots(
 
                         let start = old_asap as usize;
                         let end = (old_alap as usize).min(horizon_usize);
+                        // Only tighten when we find a valid t; otherwise leave ALAP unchanged (see BOUNDS_ALAP_PULL_INIT_ANALYSIS.md).
                         let mut new_alap_val = old_alap;
                         if let Some(t) = seg_tree_alap.query_last(start, end, cap_minus_one) {
                             new_alap_val = t as i32;

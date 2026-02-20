@@ -179,6 +179,18 @@ pub struct CompilerConfig {
     /// When true with greedy-only, use Full bounds (ASAP deferral, clamping, capacity deferral).
     /// Used for comparing PolicyOnly vs Full greedy (feasibility investigation).
     pub greedy_use_full_bounds: bool,
+    // === Hint passes (run after GreedySchedule; overwrite greedy_decisions only) ===
+    /// When true, run ConstChoice hint pass after greedy: set add_imm where Flow has slack and Load is tight.
+    /// Off by default. When enabled, greedy uses fixed default for ConstChoice so the pass owns the decision.
+    pub enable_const_choice_hint_pass: bool,
+    /// When true, run SelectChoice hint pass after greedy: prefer FMA (Flow) over vselect when VALU saturated.
+    /// Off by default. When enabled, greedy uses fixed default for SelectChoice so the pass owns the decision.
+    pub enable_select_choice_hint_pass: bool,
+    /// When true, run VALU shift hint pass after greedy: add ops to shifted_ops where ALU has slack.
+    /// Off by default. When enabled, greedy uses fixed no-shift default so the pass owns the decision.
+    pub enable_valu_shift_hint_pass: bool,
+    /// When true, run schedule-with-fixed-choices pass after hint passes: re-run greedy with encodings fixed.
+    pub enable_schedule_with_fixed_choices: bool,
 }
 
 impl Default for CompilerConfig {
@@ -189,6 +201,10 @@ impl Default for CompilerConfig {
             scheduling_pressure_policy: PressurePolicyKind::default(),
             verify_same_cycle_scratch: true,
             greedy_use_full_bounds: false,
+            enable_const_choice_hint_pass: false,
+            enable_select_choice_hint_pass: false,
+            enable_valu_shift_hint_pass: false,
+            enable_schedule_with_fixed_choices: false,
         }
     }
 }

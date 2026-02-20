@@ -46,8 +46,8 @@ impl SsaTickTockKernelBuilder {
                 self.ctx.round_before_last_hash = Some(self.ctx.all_val.clone());
             }
 
-            // Emit barrier between rounds for greedy scheduler
-            // (barriers are elided before CP-SAT and final output)
+            // Emit barrier between rounds as a hint: we do pre-optimization between
+            // barriers (per-section), then full-kernel optimization (LTO-style).
             if !is_last_round {
                 self.emit.emit_barrier();
             }
