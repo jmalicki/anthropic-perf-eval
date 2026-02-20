@@ -95,7 +95,7 @@ def dep_effective_cycle(
         return -1
     if not dep_is_shifted:
         return cycle_assignments[dep_idx]
-    op_id = ops[dep_idx]["id"] if dep_idx < len(ops) else None
+    op_id = ops[dep_idx].get("id") if dep_idx < len(ops) else None
     if op_id is None:
         return cycle_assignments[dep_idx]
     alu_cycles = shifted_alu_cycles.get(op_id)
@@ -215,13 +215,14 @@ def main() -> int:
         print("Error: cpsat_ref has no schedule_constraints. Run with CP-SAT.", file=sys.stderr)
         return 1
 
-    ssa_ops = policy.get("ssa_ops") or cpsat.get("ssa_ops")
+    policy_ssa_ops = policy.get("ssa_ops")
+    ssa_ops = policy_ssa_ops or cpsat.get("ssa_ops")
     if not ssa_ops:
         print("Error: no ssa_ops in policy or cpsat_ref", file=sys.stderr)
         return 1
 
-    # Cycle assignments from PolicyOnly
-    policy_cycles = [op.get("cycle", -1) for op in ssa_ops]
+    # Cycle assignments from PolicyOnly (always from policy ssa_ops, not cpsat fallback)
+    policy_cycles = [op.get("cycle", -1) for op in (policy_ssa_ops or [])]
     full_cycles = [op.get("cycle", -1) for op in (full.get("ssa_ops") or ssa_ops)]
 
     print("=== Schedule comparison ===")
