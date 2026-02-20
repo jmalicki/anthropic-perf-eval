@@ -46,6 +46,11 @@ def get_expected_addrs_for_op(ssa_op, v2a, ssa_ops_by_id):
         if len(srcs) >= 1:
             k = vreg_key_from_operand(srcs[0])
             return [(2, v2a.get(k) if k else None)]
+    if opcode == "vstore":
+        # vstore addr, value -> slot [vstore, addr, value]; value (srcs[1]) read at slot 2
+        if len(srcs) >= 2:
+            k = vreg_key_from_operand(srcs[1])
+            return [(2, v2a.get(k) if k else None)]
     if opcode == "const_choice":
         # ConstChoice ALU derive: slot [opcode, dest, left_addr, right_addr]. Use dep_ids as producers.
         dep_ids = ssa_op.get("dep_ids", [])
