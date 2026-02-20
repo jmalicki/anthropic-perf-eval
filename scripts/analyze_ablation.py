@@ -117,6 +117,16 @@ def print_arm_detail(idx: int, result: Dict[str, Any], is_baseline: bool):
     if result.get('extra_args'):
         print(f"   Options: {result['extra_args']}")
 
+    # Failure / validation
+    if result.get('failure_reason'):
+        print(f"   Failure reason: {result['failure_reason']}")
+    if result.get('validation_passed') is False:
+        print(f"   Validation: FAILED")
+    elif result.get('validation_passed') is True:
+        print(f"   Validation: PASSED")
+    if result.get('return_code', 0) != 0:
+        print(f"   Return code: {result['return_code']}")
+
     # Basic metrics
     makespan = result.get('makespan')
     if makespan is not None:
@@ -332,9 +342,10 @@ def print_summary_table(results: List[Dict[str, Any]]):
     # Header
     name_width = max(len(r['arm_name']) for r in results)
     name_width = max(name_width, 4)  # minimum "Name"
+    note_width = 18  # failure_reason or validation
     print(f"  {'Name':<{name_width}}  {'Cycles':>7}  {'Status':>8}  {'Solve(s)':>8}  "
-          f"{'Peak Live':>9}  {'VALU Shift':>10}  {'vs Base':>8}")
-    print(f"  {'-'*name_width}  {'-'*7}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*10}  {'-'*8}")
+          f"{'Peak Live':>9}  {'VALU Shift':>10}  {'vs Base':>8}  {'Note':<{note_width}}")
+    print(f"  {'-'*name_width}  {'-'*7}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*10}  {'-'*8}  {'-'*note_width}")
 
     baseline_makespan = results[0].get('makespan') if results else None
 
@@ -358,8 +369,16 @@ def print_summary_table(results: List[Dict[str, Any]]):
             diff = makespan - baseline_makespan
             vs_str = f"{diff:+d}"
 
+        # Note: failure reason or validation status
+        note = r.get('failure_reason') or ''
+        if not note and r.get('validation_passed') is False:
+            note = 'validation_failed'
+        if not note and r.get('validation_passed') is True:
+            note = 'OK'
+        note_str = (note or '')[:note_width]
+
         print(f"  {name:<{name_width}}  {ms_str:>7}  {status:>8}  {solve_str:>8}  "
-              f"{peak_str:>9}  {shift_str:>10}  {vs_str:>8}")
+              f"{peak_str:>9}  {shift_str:>10}  {vs_str:>8}  {note_str:<{note_width}}")
 
 
 def main():

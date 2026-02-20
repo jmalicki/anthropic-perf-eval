@@ -128,26 +128,8 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
     # Parse solver status from output
     solver_status = _parse_solver_status(stdout_output)
 
-    # On failure, still record result
-    if proc.returncode != 0:
-        print(f"Command failed with return code {proc.returncode}")
-        print(f"  Solver status: {solver_status or 'not parsed'}")
-        return _make_result(
-            arm_name, extra_args_str, rounds, batch_size,
-            makespan=None,
-            elapsed_time=elapsed_time,
-            solver_status=solver_status or 'UNKNOWN',
-            return_code=proc.returncode,
-            output_json=output_json,
-            log_file=log_file,
-            lb_cycles=None,
-            optimization_milestones=[],
-        )
-
-    # Parse makespan
+    # Always parse makespan and load JSON when present (even on non-zero exit)
     makespan = _parse_makespan(stdout_output)
-
-    # Load scheduler output JSON
     json_data = None
     if Path(output_json).exists():
         try:
@@ -156,30 +138,68 @@ def run_arm(arm_name, extra_args_str, rounds, batch_size, time_limit, shared_arg
         except Exception as e:
             print(f"Warning: Could not parse JSON: {e}")
 
-    # Parse solver statistics from output and JSON
+    # Parse solver statistics, lb, milestones, validation
     solver_stats = _parse_solver_stats(stdout_output, json_data)
-
-    # Parse lower bound and optimization milestones
     lb_cycles = _parse_lower_bound(json_data)
     scale = _parse_objective_scale(stdout_output)
     optimization_milestones = _parse_optimization_milestones(stdout_output, scale=scale)
+    validation_passed = _parse_validation(stdout_output)
 
     # Use the more detailed solver_status from solver_stats if available
     final_status = solver_stats.pop('solver_status', None) or solver_status
+
+    # On non-zero exit, infer failure reason and still record full parsed result
+    failure_reason = None
+    if proc.returncode != 0:
+        failure_reason = _parse_failure_reason(stdout_output, proc.returncode)
+        print(f"Command failed with return code {proc.returncode}")
+        print(f"  Solver status: {final_status or 'not parsed'}")
+        if failure_reason:
+            print(f"  Failure reason: {failure_reason}")
+        if validation_passed is False:
+            print("  Validation: FAILED")
 
     return _make_result(
         arm_name, extra_args_str, rounds, batch_size,
         makespan=makespan,
         elapsed_time=elapsed_time,
-        solver_status=final_status,
+        solver_status=final_status or solver_status or 'UNKNOWN',
         return_code=proc.returncode,
         output_json=output_json,
         log_file=log_file,
         json_data=json_data,
         lb_cycles=lb_cycles,
-        optimization_milestones=optimization_milestones,
+        optimization_milestones=optimization_milestones or [],
+        validation_passed=validation_passed,
+        failure_reason=failure_reason,
         **solver_stats,
     )
+
+
+def _parse_validation(stdout_output):
+    """Parse validation result from stdout. Returns True if PASSED, False if FAILED, None if not run."""
+    for line in stdout_output.split('\n'):
+        if 'PASSED - kernel produces correct output' in line or 'Validation: PASSED' in line:
+            return True
+        if 'FAILED - kernel produces incorrect output' in line or 'Validation: FAILED' in line:
+            return False
+    return None
+
+
+def _parse_failure_reason(stdout_output, return_code):
+    """Infer human-readable failure reason from stdout and return code. None if return_code is 0."""
+    if return_code == 0:
+        return None
+    out = stdout_output
+    if 'FAILED - kernel produces incorrect output' in out or 'Value mismatch:' in out:
+        return 'validation_failed'
+    if 'budget exceeded' in out.lower() or 'Skipping validation - budget exceeded' in out:
+        return 'budget_exceeded'
+    if 'INFEASIBLE' in out.upper():
+        return 'infeasible'
+    if 'error' in out.lower() or 'Error' in out:
+        return 'error'
+    return 'non_zero_exit'
 
 
 def _parse_solver_status(stdout_output):
@@ -364,7 +384,8 @@ def _make_result(arm_name, extra_args, rounds, batch_size, *, makespan,
                  log_file, json_data=None, solve_time_secs=None,
                  time_to_feasibility=None, time_to_optimum=None,
                  optimality_gap=None, solver_iterations=None,
-                 solution_count=0, lb_cycles=None, optimization_milestones=None):
+                 solution_count=0, lb_cycles=None, optimization_milestones=None,
+                 validation_passed=None, failure_reason=None):
     """Build a result dict for one arm."""
     return {
         'arm_name': arm_name,
@@ -386,6 +407,8 @@ def _make_result(arm_name, extra_args, rounds, batch_size, *, makespan,
         'json_data': json_data,
         'lb_cycles': lb_cycles,
         'optimization_milestones': optimization_milestones or [],
+        'validation_passed': validation_passed,
+        'failure_reason': failure_reason,
     }
 
 
@@ -412,6 +435,12 @@ def _do_reanalyze(path: str) -> int:
                 log_content = f.read()
             scale = _parse_objective_scale(log_content)
             r['optimization_milestones'] = _parse_optimization_milestones(log_content, scale=scale)
+            # Fill makespan / failure_reason from log when missing (e.g. from a run before we stored them on failure)
+            if r.get('makespan') is None:
+                r['makespan'] = _parse_makespan(log_content)
+            if r.get('failure_reason') is None and r.get('return_code', 0) != 0:
+                r['failure_reason'] = _parse_failure_reason(log_content, r.get('return_code', 1))
+            r['validation_passed'] = _parse_validation(log_content)
         else:
             r['optimization_milestones'] = r.get('optimization_milestones') or []
 
@@ -420,6 +449,9 @@ def _do_reanalyze(path: str) -> int:
                 with open(output_json, 'r') as f:
                     sched = json.load(f)
                 r['lb_cycles'] = _parse_lower_bound(sched)
+                # Fill json_data if missing (e.g. from a run that exited with 1 before we stored it)
+                if r.get('json_data') is None:
+                    r['json_data'] = sched
             except Exception as e:
                 print(f"Warning: Could not parse {output_json}: {e}")
                 r['lb_cycles'] = r.get('lb_cycles')
@@ -466,6 +498,8 @@ def print_summary(results):
             print(f"    Branches: {r['solver_iterations']}")
         if r.get('solution_count'):
             print(f"    Solutions: {r['solution_count']}")
+        if r.get('validation_passed') is not None:
+            print(f"    Validation: {'PASSED' if r['validation_passed'] else 'FAILED'}")
 
         # Optimization milestones: "reached X cycles after Ys"
         milestones = r.get('optimization_milestones') or []
@@ -535,6 +569,10 @@ Examples:
     parser.add_argument("--reanalyze", type=str, metavar="PATH",
                         help="Re-parse existing ablation logs/JSON; skip running. Loads PATH, "
                              "re-extracts lb_cycles and optimization_milestones, prints summary, saves.")
+    parser.add_argument("--validate", action="store_true",
+                        help="Add --validate to each arm's generator command (run reference validation).")
+    parser.add_argument("--fail-on-validation-error", action="store_true",
+                        help="Exit with code 1 if any arm fails validation (use with --validate).")
 
     args = parser.parse_args()
 
@@ -549,6 +587,11 @@ Examples:
     if not args.arm or len(args.arm) < 2:
         print("ERROR: need at least 2 arms for an ablation study")
         return 1
+
+    # If --validate, prepend to shared_args so every arm runs with validation
+    shared_args_str = args.shared_args
+    if args.validate:
+        shared_args_str = ("--validate " + shared_args_str).strip()
 
     # Parse arms
     arms = []
@@ -566,8 +609,8 @@ Examples:
     print("=" * 80)
     print(f"Rounds: {args.rounds}, Batch size: {args.batch_size}")
     print(f"Time limit: {args.time_limit}s per arm")
-    if args.shared_args:
-        print(f"Shared args: {args.shared_args}")
+    if shared_args_str:
+        print(f"Shared args: {shared_args_str}")
     print(f"Arms ({len(arms)}):")
     for i, arm in enumerate(arms):
         label = " (baseline)" if i == 0 else ""
@@ -583,7 +626,7 @@ Examples:
             rounds=args.rounds,
             batch_size=args.batch_size,
             time_limit=args.time_limit,
-            shared_args_str=args.shared_args,
+            shared_args_str=shared_args_str,
             quiet=args.quiet,
         )
         results.append(result)
@@ -591,13 +634,21 @@ Examples:
     # Print summary
     print_summary(results)
 
+    # Optionally fail if any arm failed validation
+    if args.fail_on_validation_error:
+        failed = [r['arm_name'] for r in results if r.get('validation_passed') is False]
+        if failed:
+            print(f"\nERROR: Validation failed for arm(s): {', '.join(failed)}")
+            return 1
+
     # Save results
     output_data = {
         'config': {
             'rounds': args.rounds,
             'batch_size': args.batch_size,
             'time_limit': args.time_limit,
-            'shared_args': args.shared_args,
+            'shared_args': shared_args_str,
+            'validate': args.validate,
             'arms': arms,
         },
         'results': results,
