@@ -75,8 +75,17 @@ impl SsaTickTockKernelBuilder {
             self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_stage5_xor));
         }
 
+        // Capture StoreData xor results and current idx so vstores use exactly these VRegs
+        // (avoids any risk of reading stale or wrong ctx slot during emit_store_data).
+        let store_data_vals: Vec<crate::types::VReg> = (0..n_groups)
+            .map(|g| self.ctx.all_val[g].unwrap())
+            .collect();
+        let store_data_idxs: Vec<crate::types::VReg> = (0..n_groups)
+            .map(|g| self.ctx.all_idx[g].unwrap())
+            .collect();
+
         // Store data
-        self.emit_store_data(n_groups);
+        self.emit_store_data(n_groups, &store_data_idxs, &store_data_vals);
     }
 
     // =========================================================================
@@ -443,7 +452,15 @@ impl SsaTickTockKernelBuilder {
         }
     }
 
-    pub(super) fn emit_store_data(&mut self, n_groups: usize) {
+    pub(super) fn emit_store_data(
+        &mut self,
+        n_groups: usize,
+        store_data_idxs: &[crate::types::VReg],
+        store_data_vals: &[crate::types::VReg],
+    ) {
+        assert_eq!(store_data_idxs.len(), n_groups);
+        assert_eq!(store_data_vals.len(), n_groups);
+
         let idx_p = self.ctx.idx_p.unwrap();
         let val_p = self.ctx.val_p.unwrap();
 
@@ -455,10 +472,8 @@ impl SsaTickTockKernelBuilder {
             let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
             self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit
-                .emit_vstore(idx_addr_a, self.ctx.all_idx[g].unwrap());
-            self.emit
-                .emit_vstore(val_addr_a, self.ctx.all_val[g].unwrap());
+            self.emit.emit_vstore(idx_addr_a, store_data_idxs[g]);
+            self.emit.emit_vstore(val_addr_a, store_data_vals[g]);
 
             if g + 1 < n_groups {
                 let offset_b = ((g + 1) * VLEN) as i64;
@@ -468,10 +483,8 @@ impl SsaTickTockKernelBuilder {
                 let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
                 self.emit.set_next_var_type(VarType::Address);
                 let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
-                self.emit
-                    .emit_vstore(idx_addr_b, self.ctx.all_idx[g + 1].unwrap());
-                self.emit
-                    .emit_vstore(val_addr_b, self.ctx.all_val[g + 1].unwrap());
+                self.emit.emit_vstore(idx_addr_b, store_data_idxs[g + 1]);
+                self.emit.emit_vstore(val_addr_b, store_data_vals[g + 1]);
             }
         }
     }
