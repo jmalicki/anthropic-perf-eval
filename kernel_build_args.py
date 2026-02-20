@@ -115,6 +115,23 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        default=False,
                        help="With --use-greedy, use Full bounds (ASAP deferral, clamping, capacity deferral). For comparing PolicyOnly vs Full greedy schedules (feasibility investigation).")
 
+    # Hint passes (run after GreedySchedule; overwrite greedy_decisions only). Off by default.
+    group.add_argument("--hint-passes", action="store_true", dest="hint_passes",
+                       default=False,
+                       help="Enable all three hint passes (ConstChoice, SelectChoice, VALU shift). For ablation.")
+    group.add_argument("--const-choice-hint-pass", action="store_true", dest="enable_const_choice_hint_pass",
+                       default=False,
+                       help="ConstChoice hint pass: set add_imm where Flow has slack and Load is tight.")
+    group.add_argument("--select-choice-hint-pass", action="store_true", dest="enable_select_choice_hint_pass",
+                       default=False,
+                       help="SelectChoice hint pass: prefer FMA over vselect when VALU saturated.")
+    group.add_argument("--valu-shift-hint-pass", action="store_true", dest="enable_valu_shift_hint_pass",
+                       default=False,
+                       help="VALU shift hint pass: add ops to shifted_ops where ALU has slack.")
+    group.add_argument("--schedule-with-fixed-choices", action="store_true", dest="enable_schedule_with_fixed_choices",
+                       default=False,
+                       help="After hint passes, re-run greedy with encodings fixed to fill freed slots.")
+
     # Output (passed to Rust)
     group.add_argument("--output-json", type=str, default=None,
                        help=f"Schedule JSON path (default: {DEFAULT_SCHEDULER_JSON})")
@@ -207,6 +224,11 @@ def args_to_build_kwargs(
         "enable_trace_ids": get("enable_trace_ids", False),
         "enable_bulk_move": get("enable_bulk_move", False),
         "enable_vbroadcast_elimination": get("enable_eliminate_vbroadcast", False),
+        "greedy_use_full_bounds": get("greedy_use_full_bounds", False),
+        "enable_const_choice_hint_pass": get("hint_passes", False) or get("enable_const_choice_hint_pass", False),
+        "enable_select_choice_hint_pass": get("hint_passes", False) or get("enable_select_choice_hint_pass", False),
+        "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
+        "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -246,6 +268,10 @@ def args_to_build_kwargs(
         "enable_bulk_move": get("enable_bulk_move", False),
         "enable_vbroadcast_elimination": True if get("enable_eliminate_vbroadcast", False) else None,
         "greedy_use_full_bounds": get("greedy_use_full_bounds", False),
+        "enable_const_choice_hint_pass": get("hint_passes", False) or get("enable_const_choice_hint_pass", False),
+        "enable_select_choice_hint_pass": get("hint_passes", False) or get("enable_select_choice_hint_pass", False),
+        "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
+        "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
     }
 
 
