@@ -20,4 +20,10 @@ if [ -z "${ORTOOLS_PREFIX}" ]; then
   export ORTOOLS_PREFIX
 fi
 
+# PyO3 picks the first python on PATH, which may be newer than it supports (e.g. a system
+# 3.15 with PyO3 0.27). Build against the project venv's interpreter unless told otherwise.
+if [ -z "${PYO3_PYTHON}" ] && [ -x ".venv/bin/python" ]; then
+  export PYO3_PYTHON="$(pwd)/.venv/bin/python"
+fi
+
 BUILD_FROM_PROJECT_ROOT=1 uv run maturin develop --manifest-path scheduler_rs/Cargo.toml "$@"
