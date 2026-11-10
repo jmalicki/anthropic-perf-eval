@@ -293,53 +293,56 @@ class Report:
         return not self.findings
 
 
-def _execute(terms: Terms, read, engine: str, slot: list) -> tuple[list[int], list[int], list[int]] | None:
+def _execute(terms: Terms, read, engine: str, slot: list) -> tuple[list[int], list[int], list[list[int]]] | None:
     """Symbolically execute one slot against the pre-cycle state.
 
-    Returns (written addresses, result terms, operand base addresses), or None for slots
-    with no scratch effect (stores are handled by the caller; pause/halt do nothing).
-    Operand bases are in operand order; a vector operand is named by its first address.
+    Returns (written addresses, result terms, operand addresses per result), or None for
+    slots with no scratch effect (stores are handled by the caller; pause/halt do nothing).
+    Entry k of the third list holds, in operand order, the addresses read to produce
+    result k, so a diagnostic can name the exact lane that went wrong.
     """
     name = slot[0]
     lanes = range(VLEN)
     if engine == "alu":
         _, d, a, b = slot
-        return [d], [terms.binop(name, read(a), read(b))], [a, b]
+        return [d], [terms.binop(name, read(a), read(b))], [[a, b]]
     if engine == "valu":
         d = slot[1]
         dests = [d + k for k in lanes]
         if name == "vbroadcast":
-            return dests, [read(slot[2])] * VLEN, [slot[2]]
+            return dests, [read(slot[2])] * VLEN, [[slot[2]]] * VLEN
         if name == "multiply_add":
             _, _, a, b, c = slot
-            return dests, [terms.fma(read(a + k), read(b + k), read(c + k)) for k in lanes], [a, b, c]
+            return (dests, [terms.fma(read(a + k), read(b + k), read(c + k)) for k in lanes],
+                    [[a + k, b + k, c + k] for k in lanes])
         _, _, a, b = slot
-        return dests, [terms.binop(name, read(a + k), read(b + k)) for k in lanes], [a, b]
+        return dests, [terms.binop(name, read(a + k), read(b + k)) for k in lanes], [[a + k, b + k] for k in lanes]
     if engine == "load":
         d = slot[1]
         if name == "const":
-            return [d], [terms.const(slot[2])], []
+            return [d], [terms.const(slot[2])], [[]]
         if name == "load":
-            return [d], [terms.mem(read(slot[2]))], [slot[2]]
+            return [d], [terms.mem(read(slot[2]))], [[slot[2]]]
         if name == "load_offset":
-            return [d + slot[3]], [terms.mem(read(slot[2] + slot[3]))], [slot[2] + slot[3]]
+            return [d + slot[3]], [terms.mem(read(slot[2] + slot[3]))], [[slot[2] + slot[3]]]
         if name == "vload":
             base = read(slot[2])
             return ([d + k for k in lanes],
-                    [terms.mem(terms.binop("+", base, terms.const(k))) for k in lanes], [slot[2]])
+                    [terms.mem(terms.binop("+", base, terms.const(k))) for k in lanes], [[slot[2]]] * VLEN)
     if engine == "flow":
         if name in ("pause", "halt"):
             return None
         d = slot[1]
         if name == "add_imm":
-            return [d], [terms.binop("+", read(slot[2]), terms.const(slot[3]))], [slot[2]]
+            return [d], [terms.binop("+", read(slot[2]), terms.const(slot[3]))], [[slot[2]]]
         if name == "select":
             _, _, c, a, b = slot
-            return [d], [terms.select(read(c), read(a), read(b))], [c, a, b]
+            return [d], [terms.select(read(c), read(a), read(b))], [[c, a, b]]
         if name == "vselect":
             _, _, c, a, b = slot
             return ([d + k for k in lanes],
-                    [terms.select(read(c + k), read(a + k), read(b + k)) for k in lanes], [c, a, b])
+                    [terms.select(read(c + k), read(a + k), read(b + k)) for k in lanes],
+                    [[c + k, a + k, b + k] for k in lanes])
     raise ValueError(f"{engine} slot {slot} not modelled (the kernel must be straight-line)")
 
 
@@ -417,7 +420,7 @@ def check(kernel: dict | list, sched: dict) -> Report:
 
     # Non-SSA terms computed by the kernel and not yet shown to be lowering temporaries
     # (a temporary is consumed by an op that produces an SSA value).
-    foreign: dict[int, tuple[int, str, list, list[str]]] = {}
+    foreign: dict[int, tuple[int, str, list, str, list[str]]] = {}
     kernel_stores: dict[int, tuple[int, int, list]] = {}
     findings: list[Finding] = []
     n_ops = 0
@@ -440,21 +443,20 @@ def check(kernel: dict | list, sched: dict) -> Report:
                 if effect is None:
                     continue
                 dests, results, operands = effect
-                width = len(dests)
-                for dest, tid in zip(dests, results):
+                for lane, (dest, tid) in enumerate(zip(dests, results)):
                     writes.append((dest, tid, engine, slot))
                     if tid in ssa.names or terms.const_value(tid) is not None:
-                        for base in operands:
-                            for k in range(width):
-                                foreign.pop(state.read(base + k), None)
+                        for addr in operands[lane]:
+                            foreign.pop(state.read(addr), None)
                     elif tid not in foreign:
-                        foreign[tid] = (cycle, engine, slot, [state.describe(a) for a in operands])
+                        where = f" lane {lane}" if len(dests) > 1 else ""
+                        foreign[tid] = (cycle, engine, slot, where, [state.describe(a) for a in operands[lane]])
         findings += state.commit(cycle, writes)
 
-    for tid, (cycle, engine, slot, held) in foreign.items():
+    for tid, (cycle, engine, slot, where, held) in foreign.items():
         findings.append(Finding(
             "foreign-value", cycle,
-            f"cycle {cycle}: {engine} {slot} computes a value no SSA op computes: {terms.show(tid)}."
+            f"cycle {cycle}: {engine} {slot}{where} computes a value no SSA op computes: {terms.show(tid)}."
             + _near_miss(terms, ssa, tid)
             + "".join(f"\n      operand {i + 1}: {h}" for i, h in enumerate(held))))
 
@@ -505,11 +507,21 @@ def explain_cycle(kernel: dict | list, sched: dict, cycle: int) -> list[str]:
         for slot in slots:
             lines.append(f"{engine} {slot}")
             if engine == "store":
-                operands = [slot[1], slot[2]]
+                width = VLEN if slot[0] == "vstore" else 1
+                per_lane = [[slot[1], slot[2] + k] for k in range(width)]
             else:
                 effect = _execute(terms, state.read, engine, slot)
-                operands = effect[2] if effect is not None else []
-            lines += [f"    {state.describe(addr)}" for addr in operands]
+                per_lane = effect[2] if effect is not None else []
+                if effect is not None:
+                    # Name the SSA value this slot produces, so a slot can be traced to its op.
+                    made = [state.name(tid) for tid in effect[1]]
+                    lines.append(f"    -> {made[0]}" + (f" … {made[-1]}" if len(made) > 1 and made[-1] != made[0] else ""))
+            shown: set[int] = set()
+            for lane, addrs in enumerate(per_lane):
+                for addr in addrs:
+                    if addr not in shown:
+                        shown.add(addr)
+                        lines.append(f"    {state.describe(addr)}")
     return lines
 
 

@@ -195,3 +195,19 @@ def test_delta_spelling_of_select_true_value_is_one_term():
     assert terms.binop("+", f, delta) == t
     assert terms.binop("+", delta, f) == t
     assert terms.binop("-", terms.binop("+", t, f), f) == t
+
+
+def test_single_lane_corruption_names_that_lane(greedy):
+    """A scalar write landing inside a live vector corrupts one lane; the report must name it."""
+    kernel, sched = greedy
+    mutant = copy.deepcopy(kernel)
+    instrs = mutant["instrs"]
+    cycle, i = _first_slot(instrs, "valu", len(instrs) // 2, lambda s: s[0] == "^")
+    src = instrs[cycle]["valu"][i][2]
+    # One cycle earlier, clobber lane 5 of the first operand with a constant.
+    instrs[cycle - 1].setdefault("load", []).append(["const", src + 5, 12345])
+    report = check(mutant, sched)
+    first = next(f for f in report.findings if f.kind == "foreign-value")
+    assert first.cycle == cycle
+    assert "lane 5" in first.message
+    assert f"s[{src + 5}]" in first.message and "0x3039" in first.message
