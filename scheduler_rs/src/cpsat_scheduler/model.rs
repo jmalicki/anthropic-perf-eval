@@ -61,6 +61,53 @@ fn select_fma_extra_delay(
     }
 }
 
+/// Whether the greedy schedule's encoding choices are allowed by the forced modes.
+///
+/// # Arguments
+/// * `ops` - SSA ops
+/// * `shiftable_valu` - Indices of VALU ops that may be shifted to ALU
+/// * `valu_shift_mode`, `const_choice_mode`, `select_choice_mode` - Forced or free encodings
+/// * `shift_hints`, `const_add_imm_hints`, `select_choice_hints` - Op IDs for which the greedy
+///   chose ALU, add_imm and FMA respectively (None = chose none)
+///
+/// # Returns
+/// `true` if every forced encoding agrees with what the greedy chose, so the greedy cycles
+/// are a feasible schedule of the model being built.
+#[cfg(feature = "cpsat")]
+#[allow(clippy::too_many_arguments)]
+fn greedy_schedule_matches_forced_modes(
+    ops: &[SsaOp],
+    shiftable_valu: &[usize],
+    valu_shift_mode: ValuShiftMode,
+    const_choice_mode: ConstChoiceMode,
+    select_choice_mode: SelectChoiceMode,
+    shift_hints: Option<&HashSet<usize>>,
+    const_add_imm_hints: Option<&HashSet<usize>>,
+    select_choice_hints: Option<&HashSet<usize>>,
+) -> bool {
+    // `all` = every listed op is in the greedy's set; `none` = the greedy's set is empty.
+    let chosen = |set: Option<&HashSet<usize>>, id: usize| set.map_or(false, |s| s.contains(&id));
+    let none_chosen = |set: Option<&HashSet<usize>>| set.map_or(true, |s| s.is_empty());
+    let ids_of = |opcode: Opcode| ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
+
+    let shift_ok = match valu_shift_mode {
+        ValuShiftMode::Optimize => true,
+        ValuShiftMode::ForceAlu => shiftable_valu.iter().all(|&idx| chosen(shift_hints, ops[idx].id)),
+        ValuShiftMode::ForceValu => none_chosen(shift_hints),
+    };
+    let const_ok = match const_choice_mode {
+        ConstChoiceMode::Optimize => true,
+        ConstChoiceMode::ForceAddImm => ids_of(Opcode::ConstChoice).all(|id| chosen(const_add_imm_hints, id)),
+        ConstChoiceMode::ForceLoad => none_chosen(const_add_imm_hints),
+    };
+    let select_ok = match select_choice_mode {
+        SelectChoiceMode::Optimize => true,
+        SelectChoiceMode::ForceFma => ids_of(Opcode::SelectChoice).all(|id| chosen(select_choice_hints, id)),
+        SelectChoiceMode::ForceVselect => none_chosen(select_choice_hints),
+    };
+    shift_ok && const_ok && select_ok
+}
+
 /// Schedule SSA operations using CP-SAT solver.
 ///
 /// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
@@ -167,6 +214,27 @@ pub fn schedule_ssa_cpsat(
     };
     let shiftable_set: HashSet<usize> = shiftable_valu.iter().copied().collect();
 
+    // The greedy schedule bounds the search (horizon, ALAP warm start, greedy-cap tightening,
+    // domain widening) only if it is a feasible schedule of *this* model. With a forced
+    // encoding the greedy did not use, its cycles prove nothing and bounds derived from them
+    // can exclude every feasible schedule. It is still passed to the solver as a hint.
+    let greedy_matches_forced_modes = greedy_schedule_matches_forced_modes(
+        ops,
+        &shiftable_valu,
+        valu_shift_mode,
+        const_choice_mode,
+        select_choice_mode,
+        shift_hints,
+        const_add_imm_hints,
+        select_choice_hints,
+    );
+    if verbose && greedy_hints.is_some() && !greedy_matches_forced_modes {
+        eprintln!(
+            "  Greedy schedule uses encodings that the forced modes exclude; not using it to bound domains or horizon"
+        );
+    }
+    let bound_hints = greedy_hints.filter(|_| greedy_matches_forced_modes);
+
     // 1. Compute ASAP/ALAP bounds using RAW-only dependencies (with precedence offsets)
     let asap = compute_ssa_asap(ops, &shiftable_set);
     let critical_path_len = asap.values().max().copied().unwrap_or(0) + 1;
@@ -179,7 +247,7 @@ pub fn schedule_ssa_cpsat(
     // Use a reasonable horizon: when greedy hints exist, greedy_max is a proven upper bound
     // on makespan, so we only need a small buffer beyond it. Without greedy, use conservative 2x.
     // precedence_neutral_horizon: always use 2x formula, ignoring greedy (for ablation/debugging).
-    let greedy_max = greedy_hints
+    let greedy_max = bound_hints
         .map(|h| h.iter().max().copied().unwrap_or(0) + 1)
         .unwrap_or(0);
     let mut horizon = if precedence_neutral_horizon {
@@ -236,7 +304,7 @@ pub fn schedule_ssa_cpsat(
     // 1a. Warm-start ALAP from greedy schedule: intersect each op's ALAP with greedy_cycle + slack.
     // The greedy schedule is a proven feasible solution, so greedy_cycle[op] + slack is a valid
     // upper bound. This tightens domains before energetic reasoning for compounding benefit.
-    let alap = if let Some(hints) = greedy_hints {
+    let alap = if let Some(hints) = bound_hints {
         let slack = 15i32; // conservative slack to avoid excluding optimal
         let mut tighter_alap = alap;
         let mut tightened_count = 0usize;
@@ -276,7 +344,7 @@ pub fn schedule_ssa_cpsat(
             ops,
             &current_asap,
             &current_alap,
-            greedy_hints,
+            bound_hints,
             symmetry_precedence_integrated,
         ))
     } else {
@@ -315,7 +383,7 @@ pub fn schedule_ssa_cpsat(
             flow_cap,
             verbose,
             Some(&shiftable_set),
-            greedy_hints,
+            bound_hints,
             symmetry_ordering.as_ref(),
             energetic_alap_pulls,
             energetic_bounded_push_k,
@@ -378,7 +446,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Log greedy hints that fall outside [final_asap, final_alap] domains
-        if let Some(hints) = greedy_hints {
+        if let Some(hints) = bound_hints {
             let mut rejected_count = 0usize;
             for (idx, &hint_cycle) in hints.iter().enumerate() {
                 if idx >= ops.len() {
@@ -441,7 +509,7 @@ pub fn schedule_ssa_cpsat(
     // scratch budget). If domain tightening excluded any greedy values, the tightening was
     // overly conservative. Widening ensures the hint is always within domain, so CP-SAT
     // gets a feasible warm start instead of searching from scratch.
-    if let Some(hints) = greedy_hints {
+    if let Some(hints) = bound_hints {
         let mut widened_count = 0usize;
         for (idx, &hint_cycle) in hints.iter().enumerate() {
             if idx >= ops.len() || hint_cycle < 0 {
@@ -3096,13 +3164,13 @@ pub fn schedule_ssa_cpsat(
     // Hint completion_cycle and alu_cycle for shiftable ops so CP-SAT gets a full solution hint.
     // Greedy gives one cycle per op; we use that for completion_cycle and all 8 alu_cycles
     // (valid when shifted: all 8 ALU ops at same cycle -> completion_cycle = that cycle).
-    // When ForceAlu, greedy scheduled these as VALU (one slot each); hinting all 8 ALU ops at
-    // the same cycle per op would exceed ALU capacity (12/cycle). Skip these hints so the solver
-    // can find a feasible assignment.
+    // If the greedy scheduled these with encodings the forced modes exclude (e.g. as VALU under
+    // ForceAlu), hinting all 8 ALU ops at its cycle would exceed ALU capacity (12/cycle). Skip
+    // these hints then so the solver can find a feasible assignment.
     if let Some(hints) = greedy_hints {
-        let skip_shifted_hints = matches!(valu_shift_mode, ValuShiftMode::ForceAlu);
+        let skip_shifted_hints = !greedy_matches_forced_modes;
         if skip_shifted_hints && verbose {
-            eprintln!("  Skipping completion/alu_cycle hints for shiftable ops (ForceAlu: greedy hint would violate ALU capacity)");
+            eprintln!("  Skipping completion/alu_cycle hints for shiftable ops (greedy schedule does not use the forced encodings)");
         }
         for &idx in &shiftable_valu {
             if skip_shifted_hints {

@@ -3,7 +3,7 @@
 //! Runs the greedy scheduler to produce an initial schedule (used as
 //! CP-SAT warm-start hints or as the final schedule in greedy-only mode).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::kernel_builder::config::PressurePolicyKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
@@ -32,6 +32,64 @@ use crate::types::{ConstChoiceEncoding, Opcode, SelectChoiceEncoding};
 ///   but core loop mechanics are unaffected, avoiding ASAP deferral regression.
 /// - **No bounds computed**: `None` — pure greedy scheduling.
 pub struct GreedySchedulePass;
+
+/// Encodings the greedy must use because CP-SAT will force them. `None` = greedy decides.
+#[derive(Default)]
+struct ForcedEncodings {
+    const_choice: Option<HashMap<usize, ConstChoiceEncoding>>,
+    shifted_ops: Option<HashSet<usize>>,
+    select_choice: Option<HashMap<usize, SelectChoiceEncoding>>,
+}
+
+impl ForcedEncodings {
+    #[cfg(feature = "cpsat")]
+    fn from_context(ctx: &PipelineContext) -> Self {
+        use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+        use crate::types::Engine;
+
+        let Some(cpsat) = ctx.config.cpsat.as_ref() else {
+            return Self::default();
+        };
+        let all = |opcode: Opcode| ctx.ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
+        let const_choice = match cpsat.const_choice_mode {
+            ConstChoiceMode::Optimize => None,
+            ConstChoiceMode::ForceAddImm => {
+                Some(all(Opcode::ConstChoice).map(|id| (id, ConstChoiceEncoding::AddImm)).collect())
+            }
+            ConstChoiceMode::ForceLoad => {
+                Some(all(Opcode::ConstChoice).map(|id| (id, ConstChoiceEncoding::Load)).collect())
+            }
+        };
+        let select_choice = match cpsat.select_choice_mode {
+            SelectChoiceMode::Optimize => None,
+            SelectChoiceMode::ForceFma => {
+                Some(all(Opcode::SelectChoice).map(|id| (id, SelectChoiceEncoding::Fma)).collect())
+            }
+            SelectChoiceMode::ForceVselect => {
+                Some(all(Opcode::SelectChoice).map(|id| (id, SelectChoiceEncoding::Vselect)).collect())
+            }
+        };
+        // Same shiftable set as the CP-SAT model (cpsat_scheduler/model.rs, section 0).
+        let shifted_ops = match cpsat.valu_shift_mode {
+            ValuShiftMode::Optimize => None,
+            ValuShiftMode::ForceValu => Some(HashSet::new()),
+            ValuShiftMode::ForceAlu if ctx.config.compiler.enable_valu_shift => Some(
+                ctx.ops
+                    .iter()
+                    .filter(|op| op.engine == Engine::Valu && op.opcode.can_shift_to_alu())
+                    .map(|op| op.id)
+                    .collect(),
+            ),
+            ValuShiftMode::ForceAlu => None,
+        };
+        Self { const_choice, shifted_ops, select_choice }
+    }
+
+    #[cfg(not(feature = "cpsat"))]
+    fn from_context(_ctx: &PipelineContext) -> Self {
+        Self::default()
+    }
+}
 
 impl Pass for GreedySchedulePass {
     fn name(&self) -> &'static str {
@@ -85,6 +143,10 @@ impl Pass for GreedySchedulePass {
         let const_choice_fixed_to_load = ctx.config.compiler.enable_const_choice_hint_pass;
         let select_choice_fixed_to_vselect = ctx.config.compiler.enable_select_choice_hint_pass;
         let valu_shift_fixed_to_none = ctx.config.compiler.enable_valu_shift_hint_pass;
+        // Forced CP-SAT encodings (--valu-shift alu, --const-choice add_imm, --select-choice fma,
+        // and their opposites) must be honoured here too: CP-SAT bounds its search with this
+        // schedule, which is only valid if it uses the encodings the model will force.
+        let forced = ForcedEncodings::from_context(ctx);
         let (cycles, budget_exceeded, peak_live) =
             ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 &mut ctx.ops,
@@ -102,10 +164,29 @@ impl Pass for GreedySchedulePass {
                 const_choice_fixed_to_load,
                 select_choice_fixed_to_vselect,
                 valu_shift_fixed_to_none,
-                None, // fixed_const_choice_encoding
-                None, // fixed_shifted_ops
-                None, // fixed_select_choice_encoding
+                forced.const_choice.as_ref(),
+                forced.shifted_ops.as_ref(),
+                forced.select_choice.as_ref(),
             )?;
+        // With a fixed encoding the scheduler does not record its (non-)decisions; record them
+        // here so hints and lowering see what was scheduled.
+        if let Some(shifted) = forced.shifted_ops {
+            ctx.greedy_decisions.shifted_ops = shifted;
+        }
+        if let Some(fixed) = &forced.const_choice {
+            add_imm_ops = fixed
+                .iter()
+                .filter(|(_, enc)| matches!(enc, ConstChoiceEncoding::AddImm))
+                .map(|(id, _)| *id)
+                .collect();
+        }
+        if let Some(fixed) = &forced.select_choice {
+            select_fma_ops = fixed
+                .iter()
+                .filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma))
+                .map(|(id, _)| *id)
+                .collect();
+        }
         for op in &ctx.ops {
             if op.opcode == Opcode::ConstChoice {
                 let enc = if add_imm_ops.contains(&op.id) {
