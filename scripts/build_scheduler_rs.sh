@@ -4,6 +4,8 @@
 # Do not run maturin from inside scheduler_rs/ - this script sets BUILD_FROM_PROJECT_ROOT
 # so the build succeeds and installs to the correct venv.
 # Locates OR-Tools (for cp_sat dependency) and exports ORTOOLS_PREFIX so the cp_sat build finds headers.
+# Use this script from any worktree or when invoking maturin directly; otherwise cp_sat build may
+# default to /opt/ortools and fail with "ortools/sat/cp_model.h not found".
 set -e
 cd "$(dirname "$0")/.."
 

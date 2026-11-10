@@ -2299,6 +2299,13 @@ fn test_greedy_policy_unchanged_regression() {
         &GreedyBoundsUsage::None,
         &GreedyPolicy,
         None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "GreedyPolicy should schedule: {:?}", result.err());
@@ -2346,6 +2353,13 @@ fn test_throttled_policy_produces_valid_schedule() {
         &GreedyBoundsUsage::None,
         &PressureThrottledPolicy::default(),
         None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "PressureThrottledPolicy should schedule: {:?}", result.err());
@@ -2380,6 +2394,13 @@ fn test_gated_policy_produces_valid_schedule() {
         &GreedyBoundsUsage::None,
         &PressureGatedPolicy::default(),
         None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "PressureGatedPolicy should schedule: {:?}", result.err());
@@ -2413,6 +2434,13 @@ fn test_adaptive_policy_produces_valid_schedule() {
         None,
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
         None,
     );
 
@@ -2522,6 +2550,13 @@ fn test_adaptive_no_cascading_deferral() {
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
         None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(result.is_ok(), "Should complete: {:?}", result.err());
@@ -2595,6 +2630,13 @@ fn test_force_schedule_never_exceeds_valu_capacity() {
         None,
         &GreedyBoundsUsage::None,
         &AdaptivePolicy::default(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
         None,
     );
 
@@ -2820,6 +2862,57 @@ fn test_slot_tracker_shift_blocked_by_alu_full() {
     }
     assert!(!slots.fits(Engine::Valu, true)); // no room even with shift
     assert_eq!(slots.try_place(Engine::Valu, true, true), SlotResult::NoRoom);
+}
+
+// =========================================================================
+// fixed_shifted_ops: why we need try_place_shifted_only (Bug #2)
+// =========================================================================
+//
+// When encoding is *optional* (can_shift=true), we may place on VALU or shift.
+// When encoding is *fixed* to shifted (op in fixed_shifted_ops), the verifier
+// will count 8 ALU for that op. So the schedule must actually place 8 ALU for
+// it—we must not place on VALU or the counts diverge and we can exceed ALU cap.
+
+/// **Why try_place_shifted_only exists:** try_place(Engine::Valu, true, true) prefers
+/// VALU when there is room (valu_used < 6). So a "shiftable" op can be placed on
+/// VALU even when we intend it to be shifted. If the hint says "shifted", the verifier
+/// counts 8 ALU; if we placed on VALU we count 1 VALU. So we must use a path that
+/// never places on VALU when the op is in fixed_shifted_ops.
+#[test]
+fn test_slot_tracker_try_place_valu_prefers_valu_when_room() {
+    let mut slots = SlotTracker::new();
+    // Empty slots: can_shift=true, allow_shift=true → still places on VALU first (VALU has room)
+    let result = slots.try_place(Engine::Valu, true, true);
+    assert_eq!(result, SlotResult::Placed, "try_place prefers VALU when valu_used < 6");
+    assert_eq!(slots.valu_used, 1);
+    assert_eq!(slots.alu_used, 0);
+}
+
+/// **Why we use try_place_shifted_only for fixed_shifted_ops:** The shift-only path
+/// never touches VALU. So when the encoding fixes "this op is shifted", we must use
+/// this path so the schedule matches the verifier's count (8 ALU, 0 VALU for that op).
+#[test]
+fn test_slot_tracker_try_place_shifted_only_never_uses_valu() {
+    let mut slots = SlotTracker::new();
+    assert_eq!(slots.try_place_shifted_only(), SlotResult::Shifted);
+    assert_eq!(slots.valu_used, 0);
+    assert_eq!(slots.alu_used, VLEN);
+    assert_eq!(slots.try_place_shifted_only(), SlotResult::NoRoom); // 8+8 > 12
+    assert_eq!(slots.valu_used, 0);
+    assert_eq!(slots.alu_used, VLEN);
+}
+
+/// **Why we must defer when ALU is full for fixed_shifted_ops:** One shifted op uses
+/// 8 ALU slots; a second in the same cycle would use 16 > 12. So at most one
+/// try_place_shifted_only can succeed per cycle. The scheduler must defer the second
+/// "must shift" op to a later cycle.
+#[test]
+fn test_slot_tracker_try_place_shifted_only_respects_alu_cap() {
+    let mut slots = SlotTracker::new();
+    assert_eq!(slots.try_place_shifted_only(), SlotResult::Shifted);
+    assert_eq!(slots.alu_used, VLEN);
+    assert_eq!(slots.try_place_shifted_only(), SlotResult::NoRoom);
+    assert_eq!(slots.alu_used, VLEN);
 }
 
 #[test]
@@ -3116,6 +3209,13 @@ fn test_cascade_inflation_in_scheduler() {
         &bounds_policy_only,
         &CascadePolicy::default(),
         None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
     );
 
     assert!(
@@ -3143,6 +3243,13 @@ fn test_cascade_inflation_in_scheduler() {
         None,
         &bounds_policy_only2,
         &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
         None,
     );
 

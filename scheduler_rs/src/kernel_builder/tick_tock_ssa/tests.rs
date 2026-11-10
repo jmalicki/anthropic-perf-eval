@@ -2,7 +2,7 @@ use super::*;
 use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies_with_barriers, eliminate_ssa_dead_code};
 use crate::kernel_builder::ssa_greedy;
 use crate::kernel_builder::ssa_lower::expand_ssa_valu_to_alu;
-use crate::types::{Engine, Opcode, Operand};
+use crate::types::{Engine, Opcode, Operand, SlotVal};
 use std::collections::HashMap;
 
 /// Helper to create a simple SsaOp for testing
@@ -1886,6 +1886,57 @@ fn test_greedy_real_kernel_full_scale() {
             peak_live
         );
     }
+}
+
+// =========================================================================
+// Hint pass tests (ConstChoice, SelectChoice, VALU shift)
+// =========================================================================
+
+/// With ConstChoice hint pass enabled, greedy uses fixed Load default; pass can flip to AddImm when Flow has slack.
+#[test]
+fn test_const_choice_hint_pass_flips_to_add_imm() {
+    let mut config = KernelConfig::new(4, 15, 8, 2); // small: 2r/8b
+    config.compiler.enable_const_choice_hint_pass = true;
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    let result = builder.build_and_schedule();
+    assert!(result.is_ok(), "Build with ConstChoice hint pass should succeed: {:?}", result.err());
+    let result = result.unwrap();
+    let add_imm_count = result
+        .ops
+        .iter()
+        .filter(|op| {
+            op.engine == Engine::Flow
+                && matches!(op.slot.get(0), Some(SlotVal::Str(s)) if s == "add_imm")
+        })
+        .count();
+    assert!(
+        add_imm_count >= 1,
+        "ConstChoice hint pass should produce at least one add_imm when slack allows (got {})",
+        add_imm_count
+    );
+}
+
+/// With SelectChoice hint pass enabled, encoding can flip to FMA when VALU saturated.
+#[test]
+fn test_select_choice_hint_pass_runs() {
+    let mut config = KernelConfig::new(4, 15, 8, 2);
+    config.compiler.enable_select_choice_hint_pass = true;
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    let result = builder.build_and_schedule();
+    assert!(result.is_ok(), "Build with SelectChoice hint pass should succeed: {:?}", result.err());
+}
+
+/// With VALU shift hint pass enabled, some VALU ops can be shifted when ALU has slack.
+#[test]
+fn test_valu_shift_hint_pass_runs() {
+    let mut config = KernelConfig::new(4, 15, 8, 2);
+    config.compiler.enable_valu_shift_hint_pass = true;
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    let result = builder.build_and_schedule();
+    assert!(result.is_ok(), "Build with VALU shift hint pass should succeed: {:?}", result.err());
+    let result = result.unwrap();
+    // With hint pass, we may have shifted ops (ALU used for element-wise); kernel should be valid
+    assert!(!result.ops.is_empty(), "Should produce lowered ops");
 }
 
 // =========================================================================

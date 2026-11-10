@@ -272,6 +272,13 @@ impl LivenessUse for OpLiveness<'_> {
                 out.push((*v, op.cycle));
             }
         }
+        // Liveness-only deps: emission can mark VRegs that must stay live until this op
+        // (e.g. transitive pipeline deps) without adding them as semantic srcs.
+        if let Some(ref keep) = op.keep_live {
+            for &v in keep {
+                out.push((v, op.cycle));
+            }
+        }
         out
     }
 }

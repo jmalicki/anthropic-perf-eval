@@ -96,7 +96,7 @@ pub struct SchedulingMetrics {
 /// Always available (not feature-gated). Used by both greedy and CP-SAT
 /// pipelines. The greedy pipeline uses bounds for ASAP inflation; the CP-SAT
 /// pipeline uses them as domain hints for cycle variables.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BoundsConfig {
     /// ASAP/ALAP tightening mode: none, simple, symmetry-aware, or energetic (default).
     pub asap_alap_tightening: AsapAlapTightening,
@@ -110,6 +110,26 @@ pub struct BoundsConfig {
     pub energetic_bounded_push_k: Option<u32>,
     /// When true, use precedence-neutral horizon (2x critical path) instead of greedy-based.
     pub precedence_neutral_horizon: bool,
+    /// When true (default), use capacity-aware deferral in greedy when Full bounds. Uses energetic logic.
+    pub enable_capacity_deferral: bool,
+    /// When true with greedy-only pipeline, use Full bounds (ASAP deferral, clamping, capacity deferral).
+    /// Used for investigating feasibility: compare PolicyOnly vs Full greedy schedules.
+    pub greedy_use_full_bounds: bool,
+}
+
+impl Default for BoundsConfig {
+    fn default() -> Self {
+        Self {
+            asap_alap_tightening: AsapAlapTightening::SymmetryAware,
+            enable_scratch_tightening: false,
+            symmetry_precedence_integrated: false,
+            energetic_alap_pulls: false,
+            energetic_bounded_push_k: None,
+            precedence_neutral_horizon: false,
+            enable_capacity_deferral: true,
+            greedy_use_full_bounds: false,
+        }
+    }
 }
 
 /// CP-SAT-specific pipeline configuration.

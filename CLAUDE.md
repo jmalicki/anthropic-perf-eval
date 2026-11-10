@@ -147,6 +147,9 @@ Scheduler options:
 - `--asap-alap-tightening {none,simple,symmetry-aware,energetic}` - ASAP/ALAP tightening mode (default: energetic). See [docs/ASAP_ALAP_SLOT_TIGHTENING.md](docs/ASAP_ALAP_SLOT_TIGHTENING.md).
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
 - `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** CP-SAT should produce schedules without empty cycles; bulk-move merely masks solver/model bugs rather than fixing them, and is buggy (can cause same-cycle scratch write conflicts). Use only for experimenting; do not rely on it for production.
+- `--hint-passes` - Enable all three greedy hint passes (ConstChoice, SelectChoice, VALU shift). Off by default. See [docs/GREEDY_HINT_PASSES_ABLATION.md](docs/GREEDY_HINT_PASSES_ABLATION.md).
+- `--const-choice-hint-pass`, `--select-choice-hint-pass`, `--valu-shift-hint-pass` - Enable hint passes individually.
+- `--schedule-with-fixed-choices` - After hint passes, re-run greedy with encodings fixed to assign cycles.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
@@ -305,6 +308,7 @@ Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-
 | `docs/4-round-phase-results.md` | Recorded 4-round optimization progress |
 | `docs/ASAP_ALAP_SLOT_TIGHTENING.md` | **Canonical design:** slot tightening rules (R_entailed, R_precedence_only), strong guarantee, tried-and-unsafe (R_precedence_demand), implementation flags |
 | `docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md` | T7 investigation: 2r/16b counterexample, Z3 proofs, ablation; design lives in ASAP_ALAP_SLOT_TIGHTENING.md |
+| `docs/GREEDY_HINT_PASSES_ABLATION.md` | Hint-pass lowering (greedy-only uses greedy_decisions), ablation config, Phase 1/2 commands |
 | `verification/` | Z3 verification of liveness/slot-tightening theorems; see [verification/README.md](verification/README.md) (Z3 vs CP-SAT feasibility) |
 
 ## Important Constraints

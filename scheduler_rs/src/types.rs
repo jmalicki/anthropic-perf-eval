@@ -1465,6 +1465,12 @@ pub struct SsaOp {
     /// Optional trace ID for semantic debugging (trace_input/trace_output).
     /// When set, lowering emits debug ops at first/last cycle. Format: "r{round}_g{group}_{phase}".
     pub trace_id: Option<String>,
+
+    /// Optional liveness-only dependencies: VRegs that must stay live until this op's cycle
+    /// (for address allocation), but are not semantic sources of this op. Set by emission when
+    /// a value is consumed transitively (e.g. through a pipeline) and the allocator would
+    /// otherwise expire it too early. Compiler treats these like srcs for interval extension only.
+    pub keep_live: Option<Vec<VReg>>,
 }
 
 impl SsaOp {
@@ -1495,6 +1501,7 @@ impl SsaOp {
             select_choice_parent: None, // Default: not part of SelectChoice expansion
             sub_temp_vreg: None, // Default: no sub temp needed (set for SelectChoice without delta)
             trace_id: None,
+            keep_live: None,
         }
     }
 

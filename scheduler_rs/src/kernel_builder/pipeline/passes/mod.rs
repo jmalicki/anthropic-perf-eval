@@ -8,6 +8,7 @@ pub mod dce;
 pub mod elide_barriers;
 pub mod filter_dead;
 pub mod greedy;
+pub mod hint_passes;
 pub mod assign_addrs;
 pub mod lower;
 
@@ -23,6 +24,9 @@ pub use dce::DcePass;
 pub use elide_barriers::ElideBarriersPass;
 pub use filter_dead::FilterDeadStoresPass;
 pub use greedy::GreedySchedulePass;
+pub use hint_passes::{
+    ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
+};
 pub use assign_addrs::AssignAddressesPass;
 pub use lower::LowerToOpsPass;
 

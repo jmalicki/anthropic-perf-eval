@@ -80,6 +80,8 @@ pub struct SsaEmitContext {
     pub next_var_type: Option<VarType>,
     /// Trace ID for the next emitted op (if set, for trace_input/trace_output)
     pub next_trace_id: Option<String>,
+    /// VRegs that must stay live until the next emitted op (liveness-only; set by emission)
+    pub next_keep_live: Option<Vec<VReg>>,
 
     // =========================================================================
     // Constant Alternative Tracking (for CP-SAT optimization)
@@ -132,6 +134,7 @@ impl SsaEmitContext {
             current_symmetry_hint: None,
             next_var_type: None,
             next_trace_id: None,
+            next_keep_live: None,
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
@@ -299,6 +302,11 @@ impl SsaEmitContext {
         self.next_trace_id = Some(trace_id);
     }
 
+    /// Mark VRegs that must stay live until the next emitted op (liveness-only deps).
+    pub fn set_next_keep_live(&mut self, vregs: Vec<VReg>) {
+        self.next_keep_live = Some(vregs);
+    }
+
     /// Record that a VReg is defined by a specific op.
     ///
     /// Panics if the VReg is already defined - this indicates an SSA violation.
@@ -345,6 +353,9 @@ impl SsaEmitContext {
         }
         if let Some(trace_id) = self.next_trace_id.take() {
             op.trace_id = Some(trace_id);
+        }
+        if let Some(keep) = self.next_keep_live.take() {
+            op.keep_live = Some(keep);
         }
 
         self.next_op_id += 1;

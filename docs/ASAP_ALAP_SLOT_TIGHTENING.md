@@ -112,6 +112,7 @@ uv run python scripts/run_ablation.py \
 ## Related documents
 
 - [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) — Deep dive: why energetic tightening broke, algorithm in detail, fix options.
+- [ENERGETIC_TIGHTENING_BIG_O.md](ENERGETIC_TIGHTENING_BIG_O.md) — Energetic complexity (Big-O): O(N log N) with segment tree, space O(N + H).
 - [LIVENESS_SPECIFICATION.md](LIVENESS_SPECIFICATION.md) — Axioms and theorems (T7 one-step lemma, etc.).
 - [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md) — Investigation: 2r/16b counterexample, Z3 proofs, ablation (energetic vs off), why 368 cycles.
 - [verification/README.md](verification/README.md) — Z3 theorem list and preservation vs soundness.

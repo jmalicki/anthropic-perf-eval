@@ -38,4 +38,4 @@ uv run python -m scripts.find_wrong_scratch_use path/to/sched.json --addrs 1 2 -
 - **INCORRECT USE:** cycle, engine, opcode, op_id, slot, slot[index] (actual) vs expected (vreg_to_addr[SSA src]), and SSA op id/opcode/srcs.
 - Or: `No incorrect use found among ops reading the given addrs.`
 
-Supports binary ALU, load, vbroadcast, and const_choice ALU-derive slot layout. Use the reported op_id/cycle with `dump_cycle_instrs.py` or scheduler inspection to confirm the lowering path.
+Supports binary ALU, load, vbroadcast, vstore (value slot), and const_choice ALU-derive slot layout. Use the reported op_id/cycle with `dump_cycle_instrs.py` or scheduler inspection to confirm the lowering path.

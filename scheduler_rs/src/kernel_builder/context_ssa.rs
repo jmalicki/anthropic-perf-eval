@@ -155,6 +155,11 @@ pub struct SsaScratchContext {
     pub partition_val_offset: Option<VReg>, // Offset to val section in partition buffer
     pub part_left_count: Option<VReg>, // Partition counter
     pub part_right_count: Option<VReg>, // Partition counter
+
+    /// Snapshot of all_val after round (rounds-2) hash. Used by emission to attach
+    /// keep_live on the StoreData xor so the allocator keeps that hash output live
+    /// until the final xor (transitive pipeline dependency).
+    pub round_before_last_hash: Option<Vec<Option<VReg>>>,
 }
 
 impl SsaScratchContext {

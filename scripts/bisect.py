@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--cpsat-time-limit", type=float, default=60.0, help="CP-SAT time limit per run (default: 60)")
     parser.add_argument("--seed", type=int, default=123, help="Random seed (default: 123)")
     parser.add_argument("--use-greedy", action="store_true", help="Run greedy only (one run, no CP-SAT)")
+    parser.add_argument("--skip-greedy-baseline", action="store_true", help="With --sweep-choice: run CP-SAT grid even if greedy baseline fails")
 
     # Sweep axes
     parser.add_argument("--sweep-choice", action="store_true", help="Sweep const/select/valu choice options")
@@ -387,8 +388,8 @@ def main():
             **extra_kw,
         )
         print(f"  Greedy (baseline): {'PASS' if ok else 'FAIL'}")
-        if not ok:
-            print("  Greedy failed; fix baseline before bisecting.", file=sys.stderr)
+        if not ok and not args.skip_greedy_baseline:
+            print("  Greedy failed; fix baseline before bisecting (or use --skip-greedy-baseline to run CP-SAT grid anyway).", file=sys.stderr)
             return 1
         print()
 

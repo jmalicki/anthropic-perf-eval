@@ -34,6 +34,9 @@ use passes::{
     AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
     FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass,
 };
+use passes::{
+    ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
+};
 #[cfg(feature = "cpsat")]
 use passes::{BulkMoveCompactionPass, CpSatSchedulePass};
 
@@ -229,6 +232,25 @@ impl PipelineContext {
         self.run_pass(&ComputeBoundsPass)?;
         self.run_pass(&GreedySchedulePass)?;
 
+        // Hint passes (overwrite greedy_decisions only; run when enabled)
+        if self.config.compiler.enable_const_choice_hint_pass {
+            self.run_pass(&ConstChoiceHintPass)?;
+        }
+        if self.config.compiler.enable_select_choice_hint_pass {
+            self.run_pass(&SelectChoiceHintPass)?;
+        }
+        if self.config.compiler.enable_valu_shift_hint_pass {
+            self.run_pass(&ValuShiftHintPass)?;
+        }
+        // When any hint pass ran, re-schedule with fixed encodings so op.cycle matches greedy_decisions
+        // (avoids inconsistent hints when CP-SAT or greedy-only uses cycle + encoding).
+        let any_hint_pass = self.config.compiler.enable_const_choice_hint_pass
+            || self.config.compiler.enable_select_choice_hint_pass
+            || self.config.compiler.enable_valu_shift_hint_pass;
+        if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
+            self.run_pass(&ScheduleWithFixedChoicesPass)?;
+        }
+
         // In greedy-only mode, final decisions = greedy decisions
         self.final_decisions = self.greedy_decisions.clone();
         self.final_metrics = self.greedy_metrics.clone();
@@ -257,6 +279,25 @@ impl PipelineContext {
         }
         self.run_pass(&ComputeBoundsPass)?;
         self.run_pass(&GreedySchedulePass)?;
+
+        // Hint passes (overwrite greedy_decisions; CP-SAT will use as hints)
+        if self.config.compiler.enable_const_choice_hint_pass {
+            self.run_pass(&ConstChoiceHintPass)?;
+        }
+        if self.config.compiler.enable_select_choice_hint_pass {
+            self.run_pass(&SelectChoiceHintPass)?;
+        }
+        if self.config.compiler.enable_valu_shift_hint_pass {
+            self.run_pass(&ValuShiftHintPass)?;
+        }
+        // When any hint pass ran, re-schedule with fixed encodings so cycle hints match greedy_decisions
+        // (avoids "Merged hint violates engine capacity" in CP-SAT verification).
+        let any_hint_pass = self.config.compiler.enable_const_choice_hint_pass
+            || self.config.compiler.enable_select_choice_hint_pass
+            || self.config.compiler.enable_valu_shift_hint_pass;
+        if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
+            self.run_pass(&ScheduleWithFixedChoicesPass)?;
+        }
 
         // Per-section feasibility stays in tick_tock_ssa orchestration (not a pass)
         // — it involves conditional looping with CP-SAT sub-calls per section.
