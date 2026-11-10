@@ -410,6 +410,40 @@ pub(super) fn dump_live_usage_breakdown(
     eprintln!("=== End Budget Exceeded Dump ===\n");
 }
 
+/// VRegs whose remaining-user count drops when an op reading `srcs` is scheduled.
+///
+/// Readers name only one side of a vector group (the lanes of a read group, the alias of a
+/// write group), so the other side must be released through `liveness_aliases` or it stays
+/// live forever.
+///
+/// # Arguments
+/// * `srcs` - Operands read by the op being scheduled
+/// * `liveness_aliases` - Read-group lane → group key; write-group alias → lanes
+///
+/// # Returns
+/// The source VRegs followed by their aliases (each alias at most once per op).
+fn liveness_release_vregs(
+    srcs: &[Operand],
+    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
+) -> Vec<VReg> {
+    let mut released: Vec<VReg> = Vec::with_capacity(srcs.len());
+    let mut aliases: Vec<VReg> = Vec::new();
+    for src in srcs {
+        if let Operand::VReg(vreg) = src {
+            released.push(*vreg);
+            if let Some(extra) = liveness_aliases.get(vreg) {
+                for alias in extra {
+                    if !aliases.contains(alias) {
+                        aliases.push(*alias);
+                    }
+                }
+            }
+        }
+    }
+    released.extend(aliases);
+    released
+}
+
 /// Build a lightweight `SchedulingCandidate` for the ASAP inflation check.
 ///
 /// Computes the same fields as the sort-ready candidate builder (LUC, words_freed,
@@ -638,8 +672,19 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     //   If the group alias has users, all lane VRegs are implicitly used.
     // Read groups (decompose_vector): lanes → group key.
     //   If any lane VReg has users, the group key's definer is implicitly used.
+    let mut liveness_aliases: HashMap<VReg, Vec<VReg>> = HashMap::new();
     if let Some(groups) = vector_group_lanes {
         for (group_vreg, lanes) in groups {
+            // Liveness release mirrors the user propagation below: a read group's key
+            // (defined by an op) is released by its lane readers; a write group's lanes
+            // are released by the alias readers.
+            if vreg_def.contains_key(group_vreg) {
+                for lane_vreg in lanes {
+                    liveness_aliases.entry(*lane_vreg).or_default().push(*group_vreg);
+                }
+            } else {
+                liveness_aliases.entry(*group_vreg).or_default().extend(lanes);
+            }
             // Write group direction: alias users → lane VRegs
             if let Some(group_users) = vreg_users.get(group_vreg).cloned() {
                 for lane_vreg in lanes {
@@ -1297,8 +1342,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // Update remaining users and last use cycle for source VRegs
                 // With same-cycle reuse model: VRegs can be freed immediately after their
                 // last use is scheduled, allowing other ops in the same cycle to reuse the space.
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
+                for vreg in &liveness_release_vregs(&srcs, &liveness_aliases) {
+                    {
                         // Decrement remaining users count
                         if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
                             *remaining = remaining.saturating_sub(1);
@@ -1478,8 +1523,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     vreg_def_cycle.insert(dest_vreg, force_cycle);
                 }
 
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
+                for vreg in &liveness_release_vregs(&srcs, &liveness_aliases) {
+                    {
                         if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
                             *remaining = remaining.saturating_sub(1);
                             if *remaining == 0 && live_vregs.contains(vreg) {
