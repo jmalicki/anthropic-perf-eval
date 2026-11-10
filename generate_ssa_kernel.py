@@ -52,6 +52,8 @@ def main():
                         help="Validate against reference kernel (default: True). Kernel is always saved before validation for debugging.")
     parser.add_argument("--no-validate", action="store_false", dest="validate",
                         help="Skip validation (faster for iteration).")
+    parser.add_argument("--no-dataflow-check", action="store_false", dest="dataflow_check", default=True,
+                        help="With --validate, skip the symbolic kernel-vs-SSA replay (verification/kernel_dataflow.py)")
     parser.add_argument("--validate-only", type=str, metavar="PATH", default=None,
                         help="Load kernel from JSON and run validation only (no build). Use same forest_height, batch_size, rounds, seed.")
     parser.add_argument("--save-kernel", type=str, metavar="PATH", default=None,
@@ -168,6 +170,12 @@ def main():
         if budget_exceeded:
             print("\nSkipping validation - budget exceeded (results known to be incorrect)")
             return 1
+        if args.dataflow_check:
+            # Symbolic replay first: it holds for all inputs and, on failure, names the
+            # first cycle where the kernel departs from the SSA program.
+            print("\nChecking kernel dataflow against the SSA program...")
+            if not check_kernel_dataflow(instrs, output_json_path):
+                return 1
         print("\nValidating against reference kernel...")
         correct = validate_kernel(
             instrs,
@@ -183,6 +191,26 @@ def main():
             return 1
 
     return 0
+
+
+def check_kernel_dataflow(instrs, scheduler_json_path):
+    """Prove the emitted kernel computes what its SSA program computes (all inputs).
+
+    Returns False only when the replay finds a divergence; a scheduler JSON without SSA
+    ops (e.g. written by an older build) skips the check with a message.
+    """
+    from verification.kernel_dataflow import check, format_report
+
+    try:
+        with open(scheduler_json_path) as f:
+            sched = json.load(f)
+        # Round-trip through JSON so slots are plain lists, as in a saved kernel.
+        report = check(json.loads(json.dumps(list(instrs))), sched)
+    except (OSError, ValueError) as e:
+        print(f"  SKIPPED - {e}")
+        return True
+    print("  " + format_report(report).replace("\n", "\n  "))
+    return report.ok
 
 
 def load_kernel_from_json(path):

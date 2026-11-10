@@ -89,6 +89,9 @@ pub struct SsaScheduleResult {
     pub eliminated_vbroadcast_ops: Vec<usize>,
     /// Proven lower bound on cycles (CP-SAT only). When Optimal, equals cycles; when Feasible, solver best_bound in cycles.
     pub lb_cycles: Option<usize>,
+    /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
+    /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
+    pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -423,6 +426,7 @@ pub fn export_partial_result_on_error(
         ssa_ops: Some(ctx.ops.clone()), // Include SSA ops for debugging
         eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
         lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+        vector_group_lanes: ctx.vector_group_lanes.clone(),
     };
 
     // Build error message for comment
