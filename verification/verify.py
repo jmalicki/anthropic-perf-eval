@@ -52,6 +52,8 @@ from .precedence_fixpoint import (
     model_slot_tightening_before_fixpoint_preserves_feasibility,
 )
 
+from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
+
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
     ("T1", "Expiration rule (no write-write conflict)", check_t1_expiration_no_write_conflict),
@@ -177,6 +179,10 @@ THEOREM_CHECKS = [
 ]
 
 
+# Bit-vector identities behind emission rewrites and the dataflow checker (verification/rewrites.py).
+THEOREM_CHECKS += REWRITE_CHECKS
+
+
 def _spec_url(theorem_id: str) -> str:
     """Return file path with anchor for theorem (for terminal/file links)."""
     root = pathlib.Path(__file__).resolve().parent.parent
@@ -226,6 +232,7 @@ def run_verification(
             "fixpoint-convergence",
             "fixpoint-with-fanout",
             "fixpoint-iteration-bounded",
+            *REWRITE_EXPECT_SAT,
         )
         # Special handling for multi-result theorems
         if name == "fixpoint-cascade-analysis":
