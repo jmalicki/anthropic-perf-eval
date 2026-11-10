@@ -3318,3 +3318,62 @@ fn test_asap_inflation_graduated_response() {
         inflation_high, inflation_low
     );
 }
+
+/// Regression: vector-group VRegs must be released from the greedy's live set.
+///
+/// A gather reads lanes of a decomposed address vector and writes lanes of an assembled
+/// result vector. Readers name only one side of each group, so the address vector and the
+/// loaded lanes used to stay live forever (16 words per gather), which pushed any kernel
+/// with three or more scatter rounds over the scratch budget.
+#[test]
+fn test_vector_group_vregs_released_after_last_use() {
+    const GATHERS: usize = 300; // leaked 16 words each before the fix: 4800 > 1536
+
+    let mut emit = SsaEmitContext::new();
+    let base = emit.emit_const(100);
+    let v_base = emit.emit_vbroadcast(base);
+    let mut idx = emit.emit_vload_imm(200);
+    for _ in 0..GATHERS {
+        let v_addr = emit.emit_valu(Opcode::Add, idx, v_base);
+        let addr_lanes = emit.decompose_vector(v_addr);
+        let (v_loaded, loaded_lanes) = emit.fresh_vector_group();
+        for (addr, dest) in addr_lanes.iter().zip(loaded_lanes.iter()) {
+            emit.emit_load_into(*addr, *dest);
+        }
+        idx = emit.emit_valu(Opcode::Xor, idx, v_loaded);
+    }
+    emit.emit_vstore_imm(300, idx);
+
+    let groups = emit.take_vector_group_lanes();
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, Some(&groups));
+
+    let mut shifted_ops = HashSet::new();
+    let result = schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        Some(&groups),
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+    );
+
+    let (_cycles, budget_exceeded, peak_live) = result.expect("gather chain should schedule");
+    assert!(!budget_exceeded, "vector-group liveness leaked: peak_live={}", peak_live);
+    assert!(
+        peak_live < 64,
+        "one gather is live at a time, so peak should be a few vectors, got {}",
+        peak_live
+    );
+}
