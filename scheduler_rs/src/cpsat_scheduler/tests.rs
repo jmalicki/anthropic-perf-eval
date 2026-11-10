@@ -2061,6 +2061,77 @@ mod ssa_tests {
         }
     }
 
+    /// Regression: the shared CSE SUB (true_val - false_val) of a SelectChoice group must
+    /// wait cycle + 2 for an operand that is itself a SelectChoice lowered as FMA. It only
+    /// waited cycle + 1, so it read the operand's address one cycle before the multiply_add
+    /// wrote it (`--select-choice fma` validation failure). The post-solve validator
+    /// `verify_cse_sub_precedence` panics inside the solve if the model allows that.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_cse_shared_sub_waits_for_selectchoice_fma_operand() {
+        use crate::cpsat_scheduler::build_cse_groups;
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond_a = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let cond_b = emit.emit_valu(Opcode::Eq, v_c1, v_c1);
+        let c10 = emit.emit_const(10);
+        let v10 = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let v20 = emit.emit_vbroadcast(c20);
+        let c30 = emit.emit_const(30);
+        let v30 = emit.emit_vbroadcast(c30);
+        // inner is an FMA select; it is the shared false_val of the two outer selects.
+        let inner = emit.emit_select_choice(cond_a, v10, v20);
+        let outer_a = emit.emit_select_choice(cond_a, v30, inner);
+        let outer_b = emit.emit_select_choice(cond_b, v30, inner);
+        emit.emit_vstore_imm(100, outer_a);
+        emit.emit_vstore_imm(108, outer_b);
+        // Two more readers of `inner` on a 2-VALU machine make the slot beside inner's
+        // multiply_add the only spare one: running the shared SUB there (one cycle too
+        // early) would save a cycle, so an optimal solver takes it unless the model forbids it.
+        let filler_a = emit.emit_valu(Opcode::Add, inner, v30);
+        let filler_b = emit.emit_valu(Opcode::Xor, inner, v30);
+        emit.emit_vstore_imm(116, filler_a);
+        emit.emit_vstore_imm(124, filler_b);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        let cse_groups = build_cse_groups(&emit.ops);
+        let inner_idx = emit.ops.iter().position(|o| o.dest == Some(inner)).expect("inner");
+        assert!(
+            cse_groups
+                .iter()
+                .any(|g| g.consumer_indices.len() == 2 && g.producer_false_idx == Some(inner_idx)),
+            "the two outer selects should share a SUB whose false_val is the inner select"
+        );
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                scratch_budget: 1536,
+                enable_valu_shift: false,
+                machine: crate::types::MachineConfig { valu_slots: 2, ..SMALL_MACHINE_FMA },
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                ..Default::default()
+            },
+            SsaCpsatHints {
+                cse_groups: Some(&cse_groups),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution: {:?}", result.err());
+    }
+
     /// The post-solve precedence validator must check the lane cycles of shifted consumers.
     #[cfg(feature = "cpsat")]
     #[test]

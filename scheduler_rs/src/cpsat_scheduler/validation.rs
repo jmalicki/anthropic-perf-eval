@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::cse_groups::CseGroupResult;
+use super::cse_groups::{CseGroup, CseGroupResult};
 use crate::types::{ConstChoiceEncoding, Engine, MachineConfig, Opcode, SelectChoiceEncoding, SsaOp, VLEN};
 
 /// One row of the Flow audit: an op that contributes to the Flow engine at a given cycle.
@@ -678,20 +678,13 @@ pub(crate) fn verify_all_raw_precedence(
             };
             let producer = &ops[producer_idx];
             let producer_cycle = cycle_assignments.get(producer_idx).copied().unwrap_or(-1);
-            let producer_visible_cycle = if producer.opcode == Opcode::SelectChoice
-                && producer.sub_temp_vreg.is_some()
-                && matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
-            {
-                producer_cycle + 2
-            } else if shifted_ops.contains(&producer.id) {
-                let completion = shifted_alu_cycles
-                    .get(&producer.id)
-                    .and_then(|v| v.iter().max().copied())
-                    .unwrap_or(producer_cycle);
-                completion + 1
-            } else {
-                producer_cycle + 1
-            };
+            let producer_visible_cycle = producer_visible_cycle(
+                producer,
+                producer_cycle,
+                shifted_ops,
+                shifted_alu_cycles,
+                select_choice_encoding,
+            );
             assert!(
                 consumer_cycle >= producer_visible_cycle,
                 "BUG: RAW precedence violation: op id={} (consumer) at cycle {} depends on op id={} (producer), result visible at cycle {}",
@@ -723,6 +716,72 @@ pub(crate) fn verify_all_raw_precedence(
                     lane_visible
                 );
             }
+        }
+    }
+}
+
+/// Cycle from which the result of `producer` can be read.
+/// SelectChoice FMA => cycle+2; shifted => last lane cycle+1; else cycle+1.
+#[cfg(feature = "cpsat")]
+pub(crate) fn producer_visible_cycle(
+    producer: &SsaOp,
+    producer_cycle: i32,
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
+) -> i32 {
+    if producer.opcode == Opcode::SelectChoice
+        && producer.sub_temp_vreg.is_some()
+        && matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
+    {
+        producer_cycle + 2
+    } else if shifted_ops.contains(&producer.id) {
+        shifted_alu_cycles
+            .get(&producer.id)
+            .and_then(|v| v.iter().max().copied())
+            .unwrap_or(producer_cycle)
+            + 1
+    } else {
+        producer_cycle + 1
+    }
+}
+
+/// Verify that each active CSE shared SUB runs no earlier than its operands are visible.
+/// The shared SUB computes true_val - false_val at `sub_cycle`. Panics if violated (model bug).
+#[cfg(feature = "cpsat")]
+pub(crate) fn verify_cse_sub_precedence(
+    ops: &[SsaOp],
+    groups: &[CseGroup],
+    results: &[CseGroupResult],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
+) {
+    for (g, (group, res)) in groups.iter().zip(results.iter()).enumerate() {
+        if !res.sub_active {
+            continue;
+        }
+        for (name, producer_idx) in [("true_val", group.producer_true_idx), ("false_val", group.producer_false_idx)] {
+            let Some(idx) = producer_idx else {
+                continue;
+            };
+            let visible = producer_visible_cycle(
+                &ops[idx],
+                cycle_assignments.get(idx).copied().unwrap_or(-1),
+                shifted_ops,
+                shifted_alu_cycles,
+                select_choice_encoding,
+            );
+            assert!(
+                res.sub_cycle >= visible,
+                "BUG: CSE group {} shared SUB at cycle {} reads {} from op id={}, result visible at cycle {}",
+                g,
+                res.sub_cycle,
+                name,
+                ops[idx].id,
+                visible
+            );
         }
     }
 }

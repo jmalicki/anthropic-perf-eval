@@ -1,5 +1,5 @@
 #[cfg(feature = "cpsat")]
-use cp_sat::builder::{CpModelBuilder, IntVar, IntervalVar, LinearExpr};
+use cp_sat::builder::{BoolVar, CpModelBuilder, IntVar, IntervalVar, LinearExpr};
 #[cfg(feature = "cpsat")]
 use cp_sat::proto::SatParameters;
 
@@ -22,9 +22,44 @@ use super::config::{
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
-    validate_ssa_slot_limits, verify_all_raw_precedence,
+    validate_ssa_slot_limits, verify_all_raw_precedence, verify_cse_sub_precedence,
     verify_select_choice_fma_consumer_precedence,
 };
+
+/// Extra cycles, beyond the usual +1, before the result of op `dep_idx` can be read.
+///
+/// A SelectChoice lowered as FMA (no delta) runs sub at its cycle and multiply_add one cycle
+/// later, so its result is visible at cycle + 2. Every constraint that orders a reader after
+/// a producer must add this term; omitting it lets the reader see the address one cycle
+/// before the multiply_add writes it.
+///
+/// # Arguments
+/// * `dep_idx` - Index of the producing op
+/// * `select_choice_with_fma_delay` - SelectChoice ops whose FMA path has the extra cycle
+/// * `select_choice_mode` - Whether the FMA path is forced, forbidden or chosen by the solver
+/// * `select_choice_vars` - Per-op "FMA chosen" Booleans (Optimize mode)
+///
+/// # Returns
+/// A linear expression equal to 1 when the producer takes the FMA path and 0 otherwise.
+#[cfg(feature = "cpsat")]
+fn select_fma_extra_delay(
+    dep_idx: usize,
+    select_choice_with_fma_delay: &HashSet<usize>,
+    select_choice_mode: SelectChoiceMode,
+    select_choice_vars: &HashMap<usize, BoolVar>,
+) -> LinearExpr {
+    let none = LinearExpr::default();
+    if !select_choice_with_fma_delay.contains(&dep_idx) {
+        return none;
+    }
+    match select_choice_mode {
+        SelectChoiceMode::ForceVselect => none,
+        SelectChoiceMode::ForceFma => none + 1,
+        SelectChoiceMode::Optimize => select_choice_vars
+            .get(&dep_idx)
+            .map_or(none, |&fma_chosen| LinearExpr::from(fma_chosen)),
+    }
+}
 
 /// Schedule SSA operations using CP-SAT solver.
 ///
@@ -56,7 +91,6 @@ pub fn schedule_ssa_cpsat(
     hints: SsaCpsatHints<'_>,
     greedy_within_scratch_budget: Option<bool>,
 ) -> Result<Option<SsaCpsatResult>, String> {
-    use cp_sat::builder::BoolVar;
 
     let SsaCpsatConfig {
         time_limit_secs,
@@ -1175,7 +1209,8 @@ pub fn schedule_ssa_cpsat(
             cse_sub_cycle_vars.push(sub_cycle_var);
 
             // Producer precedence: when sub is active, sub_cycle >= producer result visible cycle.
-            // Uses completion_cycle for shiftable VALU producers (result at completion+1), else cycle+1.
+            // Uses completion_cycle for shiftable VALU producers (result at completion+1), else cycle+1,
+            // plus one more cycle when the producer is itself a SelectChoice lowered as FMA.
             // For complex_phi, one or both producers are None; we only add precedence for present producers.
             if let Some(pt) = group.producer_true_idx {
                 let producer_cycle = completion_cycle_vars
@@ -1184,7 +1219,14 @@ pub fn schedule_ssa_cpsat(
                     .unwrap_or(cycle_vars[pt]);
                 let c = model.add_ge(
                     LinearExpr::from(sub_cycle_var),
-                    LinearExpr::from(producer_cycle) + 1,
+                    LinearExpr::from(producer_cycle)
+                        + 1
+                        + select_fma_extra_delay(
+                            pt,
+                            &select_choice_with_fma_delay,
+                            select_choice_mode,
+                            &select_choice_vars,
+                        ),
                 );
                 model.set_constraint_name(c, &format!("cse_sub_after_producer_true_g{}", g));
                 model.only_enforce_if(c, [sub_active_var]);
@@ -1196,7 +1238,14 @@ pub fn schedule_ssa_cpsat(
                     .unwrap_or(cycle_vars[pf]);
                 let c = model.add_ge(
                     LinearExpr::from(sub_cycle_var),
-                    LinearExpr::from(producer_cycle) + 1,
+                    LinearExpr::from(producer_cycle)
+                        + 1
+                        + select_fma_extra_delay(
+                            pf,
+                            &select_choice_with_fma_delay,
+                            select_choice_mode,
+                            &select_choice_vars,
+                        ),
                 );
                 model.set_constraint_name(c, &format!("cse_sub_after_producer_false_g{}", g));
                 model.only_enforce_if(c, [sub_active_var]);
@@ -4056,6 +4105,18 @@ pub fn schedule_ssa_cpsat(
             );
             // SelectChoice FMA result visible at C+2 (redundant with verify_all_raw_precedence but kept for clarity).
             verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_choice_encoding);
+            // Shared CSE subs read true_val/false_val at sub_cycle; those must be visible by then.
+            if let Some(groups) = cse_groups {
+                verify_cse_sub_precedence(
+                    ops,
+                    groups,
+                    &cse_group_results,
+                    &cycle_assignments,
+                    &shifted_ops,
+                    &shifted_alu_cycles,
+                    &select_choice_encoding,
+                );
+            }
 
             if verbose {
                 // Verify objective structure: objective = scale*makespan + tie_breaker, so floor(objective/scale) should equal makespan.
