@@ -397,6 +397,7 @@ impl PipelineContext {
                 .into_iter()
                 .collect(),
             lb_cycles: self.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+            vector_group_lanes: self.vector_group_lanes,
         })
     }
 }

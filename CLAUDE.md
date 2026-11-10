@@ -29,6 +29,7 @@ Benchmark/default parameters:
 
 When working in this repo, read and follow these project-specific skills when they apply:
 
+- **Kernel dataflow replay (first step for any wrong kernel)** — Read [.cursor/skills/use-kernel-dataflow/SKILL.md](.cursor/skills/use-kernel-dataflow/SKILL.md). `verification/kernel_dataflow.py` executes the emitted kernel symbolically and proves it equals its SSA program for all inputs, or names the first cycle, slot and operand where it does not. Runs automatically under `--validate`; standalone: `uv run python -m verification.kernel_dataflow --kernel kern.json --scheduler sched.json [--explain-cycle N]`.
 - **Debugging makespan / empty cycles** — Read [.cursor/skills/use-bulk-move/SKILL.md](.cursor/skills/use-bulk-move/SKILL.md). Use the bulk-move simulator to see if empty cycles can be compacted (ReachedEnd) or which constraint blocks (Blocked). Requires CP-SAT run with `--output-json`; run `uv run scripts/simulate_bulk_move.py` on that JSON.
 - **Schedule debug / per-decile slot utilization** — Read [.cursor/skills/use-schedule-debug/SKILL.md](.cursor/skills/use-schedule-debug/SKILL.md). Use per-decile slot utilization to find optimization opportunities (slot balance, encoding improvements). Run `uv run scripts/slot_usage_by_decile.py` on scheduler output JSON; see [docs/PER_DECILE_SLOT_UTILIZATION.md](docs/PER_DECILE_SLOT_UTILIZATION.md).
 - **What-if shift (debug VALU shift decisions)** — Read [.cursor/skills/use-whatif-shift/SKILL.md](.cursor/skills/use-whatif-shift/SKILL.md). Force a specific VALU op to shift to ALU, re-optimize with CP-SAT, and optionally compare to baseline. Run `uv run scripts/what_if_shift.py --op-id <id> [--compare-with scheduler_output.json]`.
@@ -154,6 +155,7 @@ Scheduler options:
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
 - `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
+- `--no-dataflow-check` - With `--validate`, skip the symbolic kernel-vs-SSA replay that runs before numeric validation.
 - `--validate-only PATH` - Load kernel from JSON and run validation only (no build).
 - `--save-kernel PATH` - Save kernel to this path (default when `--validate`: `kernel_to_validate.json`).
 - `--liveness-detail LEVEL` - Liveness detail in JSON: `none`, `summary`, or `full` (default)

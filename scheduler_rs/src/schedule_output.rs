@@ -364,6 +364,9 @@ struct SsaScheduleOutput {
     /// Proven lower bound on cycles (CP-SAT only). When optimal, equals total_cycles; when feasible, solver best_bound in cycles.
     #[serde(skip_serializing_if = "Option::is_none")]
     lb_cycles: Option<usize>,
+    /// Vector group key/alias VReg id → lane VReg ids, in lane order. Always written (even
+    /// when empty) so checkers can tell "no groups" from "JSON predates this field".
+    vector_group_lanes: std::collections::BTreeMap<u32, Vec<u32>>,
 }
 
 #[derive(Serialize)]
@@ -667,6 +670,11 @@ pub fn write_ssa_schedule_json(
         git_sha,
         comment,
         lb_cycles: result.lb_cycles,
+        vector_group_lanes: result
+            .vector_group_lanes
+            .iter()
+            .map(|(group, lanes)| (group.id, lanes.iter().map(|lane| lane.id).collect()))
+            .collect(),
     };
 
     let json = serde_json::to_string_pretty(&output)
