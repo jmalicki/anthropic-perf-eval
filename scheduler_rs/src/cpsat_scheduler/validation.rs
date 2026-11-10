@@ -653,6 +653,10 @@ pub(crate) fn try_validate_ssa_slot_limits(
 
 /// Verify that every RAW dependency satisfies cycle[consumer] >= producer_visible_cycle.
 /// Producer visible cycle: SelectChoice FMA => producer_cycle+2; shifted => completion_cycle+1; else producer_cycle+1.
+///
+/// A shifted consumer executes as VLEN scalar ops at `shifted_alu_cycles[consumer]`, so each of
+/// those lane cycles is checked as well: against the producer's visible cycle, or lane by lane
+/// when the producer is shifted too (lane i reads only the producer's lane i).
 #[cfg(feature = "cpsat")]
 pub(crate) fn verify_all_raw_precedence(
     ops: &[SsaOp],
@@ -696,6 +700,29 @@ pub(crate) fn verify_all_raw_precedence(
                 producer.id,
                 producer_visible_cycle
             );
+            if !shifted_ops.contains(&op.id) {
+                continue;
+            }
+            let Some(consumer_lanes) = shifted_alu_cycles.get(&op.id) else {
+                continue;
+            };
+            let producer_lanes = shifted_alu_cycles
+                .get(&producer.id)
+                .filter(|_| shifted_ops.contains(&producer.id));
+            for (lane, &lane_cycle) in consumer_lanes.iter().enumerate() {
+                let lane_visible = producer_lanes
+                    .and_then(|lanes| lanes.get(lane))
+                    .map_or(producer_visible_cycle, |&c| c + 1);
+                assert!(
+                    lane_cycle >= lane_visible,
+                    "BUG: RAW precedence violation: shifted op id={} lane {} at cycle {} depends on op id={} (producer), result visible at cycle {}",
+                    op.id,
+                    lane,
+                    lane_cycle,
+                    producer.id,
+                    lane_visible
+                );
+            }
         }
     }
 }

@@ -1990,6 +1990,102 @@ mod ssa_tests {
         }
     }
 
+    /// Regression: a shifted consumer of a SelectChoice FMA must wait dep_cycle + 2 on every
+    /// lane. The lanes are separate cycle variables; they only had the vselect delay (+1), so
+    /// one lane could read the address a cycle before the FMA wrote it (3r/64b validation
+    /// failure in BUGS.md).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_shifted_consumer_of_selectchoice_fma_waits_two_cycles_per_lane() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v_c0 = emit.emit_vbroadcast(c0);
+        let v_c1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v_c0, v_c1);
+        let c10 = emit.emit_const(10);
+        let if_true = emit.emit_vbroadcast(c10);
+        let c20 = emit.emit_const(20);
+        let if_false = emit.emit_vbroadcast(c20);
+        let sel = emit.emit_select_choice(cond, if_true, if_false);
+        let consumer = emit.emit_valu(Opcode::Xor, sel, v_c1);
+        emit.emit_vstore_imm(100, consumer);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        let sel_idx = emit.ops.iter().position(|o| o.opcode == Opcode::SelectChoice).expect("select");
+        let sel_id = emit.ops[sel_idx].id;
+        let consumer_id = emit
+            .ops
+            .iter()
+            .find(|o| o.opcode == Opcode::Xor && o.dep_ids.contains(&sel_id))
+            .expect("consumer")
+            .id;
+
+        // The post-solve validator panics on any lane that runs before its operand exists.
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: true,
+                scratch_budget: 1536,
+                machine: SMALL_MACHINE_FMA,
+                const_choice_mode: ConstChoiceMode::Optimize,
+                select_choice_mode: SelectChoiceMode::ForceFma,
+                valu_shift_mode: ValuShiftMode::ForceAlu,
+                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+        let cpsat_result = result.expect("solve").expect("solution");
+        let sel_cycle = cpsat_result.cycle_assignments[sel_idx];
+        let lanes = cpsat_result
+            .shifted_alu_cycles
+            .get(&consumer_id)
+            .filter(|_| cpsat_result.shifted_ops.contains(&consumer_id))
+            .expect("ForceAlu should shift the consumer");
+        for (lane, &cycle) in lanes.iter().enumerate() {
+            assert!(
+                cycle >= sel_cycle + 2,
+                "lane {} at cycle {} reads SelectChoice FMA result before cycle {}",
+                lane,
+                cycle,
+                sel_cycle + 2
+            );
+        }
+    }
+
+    /// The post-solve precedence validator must check the lane cycles of shifted consumers.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    #[should_panic(expected = "lane 5")]
+    fn test_verify_all_raw_precedence_checks_shifted_consumer_lanes() {
+        use crate::cpsat_scheduler::validation::verify_all_raw_precedence;
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let v0 = emit.emit_vbroadcast(c0);
+        let producer = emit.emit_valu(Opcode::Add, v0, v0);
+        let _consumer = emit.emit_valu(Opcode::Xor, producer, v0);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        // const@0, vbroadcast@1, producer@2 (visible at 3), consumer nominally @3.
+        let cycles = vec![0, 1, 2, 3];
+        let consumer_id = emit.ops[3].id;
+        let shifted_ops: HashSet<usize> = [consumer_id].into_iter().collect();
+        let mut shifted_alu_cycles = HashMap::new();
+        shifted_alu_cycles.insert(consumer_id, vec![3, 3, 3, 3, 3, 2, 3, 3]);
+        verify_all_raw_precedence(&emit.ops, &cycles, &shifted_ops, &shifted_alu_cycles, &HashMap::new());
+    }
+
     /// Full pipeline: CP-SAT ForceFma then assign then lower; verify no overlapping
     /// intervals share an address (regression test for validation failure).
     /// Uses small machine (1 VALU slot) so sub and fma are in consecutive bundles.

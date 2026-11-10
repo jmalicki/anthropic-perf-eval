@@ -1274,6 +1274,10 @@ pub fn schedule_ssa_cpsat(
             if !select_choice_with_fma_delay.contains(&dep_idx) {
                 continue;
             }
+            // A shifted consumer executes as 8 scalar ops at alu_cycle_vars[idx][lane], not at
+            // cycle_vars[idx], so each lane needs the same FMA delay. Section 5b only gives the
+            // lanes dep_cycle + 1 (the vselect delay).
+            let consumer_lanes: &[IntVar] = alu_cycle_vars.get(&idx).map_or(&[], |v| v.as_slice());
             match select_choice_mode {
                 SelectChoiceMode::ForceVselect => {
                     let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
@@ -1282,6 +1286,10 @@ pub fn schedule_ssa_cpsat(
                 SelectChoiceMode::ForceFma => {
                     let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
                     model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_fma", idx, dep_idx));
+                    for (lane_i, alu_cycle) in consumer_lanes.iter().enumerate() {
+                        let c = model.add_ge(*alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                        model.set_constraint_name(c, &format!("select_prec_{}_{}_dep_{}_fma", idx, lane_i, dep_idx));
+                    }
                 }
                 SelectChoiceMode::Optimize => {
                     let choice_var = select_choice_vars
@@ -1299,6 +1307,13 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
                     );
                     model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_opt", idx, dep_idx));
+                    for (lane_i, alu_cycle) in consumer_lanes.iter().enumerate() {
+                        let c = model.add_ge(
+                            *alu_cycle,
+                            LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
+                        );
+                        model.set_constraint_name(c, &format!("select_prec_{}_{}_dep_{}_opt", idx, lane_i, dep_idx));
+                    }
                     select_fma_extra_vars.insert((dep_idx, idx), extra);
                 }
             }
