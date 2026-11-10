@@ -75,25 +75,25 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 **Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). `tests/submission_tests.py` exercises the end-to-end pipeline.
 
+**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
+
 ```bash
-# Rust: full scheduler_rs test suite (from project root)
-BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat
+./scripts/test.sh                 # everything
+./scripts/test.sh rust            # cargo test --features cpsat
+./scripts/test.sh rust -- test_vector_group      # one Rust test
+./scripts/test.sh python          # pytest: interface, dataflow replay, forced modes, rewrite proofs
+./scripts/test.sh python tests/test_kernel_dataflow.py -k lane
+./scripts/test.sh proofs          # Z3: liveness theorems + rewrite identities
+./scripts/test.sh kernel          # greedy 2r and 16r builds with dataflow replay + validation
 
 # Rust: include optional/CI-only tests (slow proptest, minimal failing config, etc.)
-BUILD_FROM_PROJECT_ROOT=1 cargo test --manifest-path scheduler_rs/Cargo.toml --features "cpsat ci-tests"
-
-# Python: interface test only (scheduler_rs build → Machine → reference)
-uv run pytest tests/test_scheduler_rs_interface.py -v
+./scripts/test.sh rust --features "cpsat ci-tests"
 
 # Python: submission tests (end-to-end pipeline)
 uv run tests/submission_tests.py
-
-# Python: remaining solver utility tests
-uv run pytest solver/test_slot_utilization.py -v
-
-# Manual / CI: optimized kernel with optional --rust-builder
-uv run test_optimized.py
 ```
+
+`uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
 
 **Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, use a pytest marker (e.g. `@pytest.mark.ci_only`) and run default with `-m "not ci_only"`; document in `pyproject.toml`.
 
