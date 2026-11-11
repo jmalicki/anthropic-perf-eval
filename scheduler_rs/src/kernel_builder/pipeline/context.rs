@@ -18,7 +18,7 @@ use crate::cpsat_scheduler::AsapAlapTightening;
 
 #[cfg(feature = "cpsat")]
 use crate::cpsat_scheduler::{
-    CseGroup, CseGroupResult, ConstChoiceMode, OptionalConstraintGroup,
+    CseGroup, CseGroupResult, ConstChoiceMode, CpsatTuning, OptionalConstraintGroup,
     SelectChoiceMode, SsaCpsatConfig, ValuShiftMode,
 };
 
@@ -144,6 +144,8 @@ pub struct CpSatPipelineConfig {
     pub time_limit_secs: f64,
     /// Per-solve budget in CP-SAT deterministic time (None = wall-clock limit only).
     pub deterministic_time_limit: Option<f64>,
+    /// Switchable solver configuration for the full-kernel solve (default = unchanged behaviour).
+    pub tuning: CpsatTuning,
     /// Whether to print verbose solver output.
     pub verbose: bool,
     /// Enable vbroadcast elimination optimization.
@@ -188,6 +190,7 @@ impl Default for CpSatPipelineConfig {
         CpSatPipelineConfig {
             time_limit_secs: 3600.0,
             deterministic_time_limit: None,
+            tuning: CpsatTuning::default(),
             verbose: true,
             enable_vbroadcast_elimination: false,
             per_section_optimize_secs: None,
@@ -216,6 +219,7 @@ impl CpSatPipelineConfig {
         SsaCpsatConfig {
             time_limit_secs: self.time_limit_secs,
             deterministic_time_limit: self.deterministic_time_limit,
+            tuning: self.tuning.clone(),
             verbose: self.verbose,
             stop_after_first_solution: false,
             enable_valu_shift: false, // set by caller from pipeline config

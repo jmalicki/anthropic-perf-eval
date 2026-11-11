@@ -136,6 +136,128 @@ impl std::fmt::Display for OptionalConstraintGroup {
     }
 }
 
+// ============================================================================
+// Solver tuning (ablation switches)
+// ============================================================================
+
+/// Full-problem subsolver names OR-Tools 9.15 defines (`GetNamedParameters` in
+/// `ortools/sat/cp_model_search.cc`). Naming any other one in `subsolvers` or
+/// `extra_subsolvers` makes the solver abort.
+pub const KNOWN_FULL_SUBSOLVERS: [&str; 41] = [
+    "auto", "core", "core_default_lp", "core_max_lp", "default", "default_lp", "fixed", "fixed_max_lp",
+    "fixed_no_lp", "lb_tree_search", "lb_tree_search_no_lp", "less_encoding", "lns", "lns_base",
+    "lns_routing", "lns_stalling", "max_hs", "max_lp", "max_lp_sym", "no_lp", "objective_lb_search",
+    "objective_lb_search_max_lp", "objective_lb_search_no_lp", "objective_shaving",
+    "objective_shaving_max_lp", "objective_shaving_no_lp", "portfolio", "portfolio_max_lp",
+    "portfolio_no_lp", "probing", "probing_max_lp", "probing_no_lp", "pseudo_costs", "quick_restart",
+    "quick_restart_max_lp", "quick_restart_no_lp", "reduced_costs", "shared_tree", "variables_shaving",
+    "variables_shaving_max_lp", "variables_shaving_no_lp",
+];
+
+/// Switchable CP-SAT configuration and modelling choices for the full-kernel solve.
+///
+/// Every field defaults to what the scheduler did before the switch existed, so
+/// `CpsatTuning::default()` builds the same model and the same solver parameters. The
+/// per-section feasibility solves do not read this struct.
+///
+/// Carried across the Python binding as JSON (`cpsat_tuning_json`); unknown keys are
+/// rejected and missing keys take the default.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CpsatTuning {
+    /// `num_workers` (default 8). Ignored (forced to 1) when the solve stops at the first solution.
+    pub workers: i32,
+    /// `interleave_search` (default true): deterministic round-robin of subsolvers. OR-Tools
+    /// 9.15 does not start the probing, shaving, `lb_tree_search` and `objective_lb_search`
+    /// workers in this mode. With false the parallel search is not reproducible.
+    pub interleave_search: bool,
+    /// `subsolvers`: replaces CP-SAT's default list of full-problem subsolvers (empty = default list).
+    pub subsolvers: Vec<String>,
+    /// `extra_subsolvers`: appended to the list of full-problem subsolvers.
+    pub extra_subsolvers: Vec<String>,
+    /// `ignore_subsolvers`: removed from the list of subsolvers (full-problem and LNS).
+    pub ignore_subsolvers: Vec<String>,
+}
+
+impl Default for CpsatTuning {
+    fn default() -> Self {
+        Self {
+            workers: 8,
+            interleave_search: true,
+            subsolvers: Vec::new(),
+            extra_subsolvers: Vec::new(),
+            ignore_subsolvers: Vec::new(),
+        }
+    }
+}
+
+impl CpsatTuning {
+    /// Parse a tuning from JSON, filling missing keys with the defaults.
+    ///
+    /// # Arguments
+    /// * `json` - A JSON object whose keys are field names of [`CpsatTuning`]; `None` or a
+    ///   blank string means "all defaults".
+    ///
+    /// # Returns
+    /// The tuning, or a message naming the unknown key, wrong type or out-of-range value.
+    pub fn from_json(json: Option<&str>) -> Result<Self, String> {
+        let tuning: Self = match json.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Self::default(),
+            Some(text) => {
+                // serde would also accept a positional array for a struct; only objects are meant.
+                let value: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|e| format!("invalid cpsat_tuning_json: {}", e))?;
+                if !value.is_object() {
+                    return Err(format!("invalid cpsat_tuning_json: expected a JSON object, got {}", value));
+                }
+                serde_json::from_value(value).map_err(|e| format!("invalid cpsat_tuning_json: {}", e))?
+            }
+        };
+        tuning.validate()?;
+        Ok(tuning)
+    }
+
+    /// Check value ranges that the types do not express.
+    ///
+    /// # Returns
+    /// `Err` naming the offending field when a value cannot be passed to the solver.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.workers < 1 {
+            return Err(format!("cpsat tuning: workers must be at least 1, got {}", self.workers));
+        }
+        for (field, names) in [
+            ("subsolvers", &self.subsolvers),
+            ("extra_subsolvers", &self.extra_subsolvers),
+            ("ignore_subsolvers", &self.ignore_subsolvers),
+        ] {
+            if let Some(bad) = names.iter().find(|n| n.is_empty() || n.trim() != n.as_str()) {
+                return Err(format!("cpsat tuning: {} has an empty or padded name {:?}", field, bad));
+            }
+        }
+        // CP-SAT aborts the process on an unknown full-problem subsolver name, so check here.
+        // (ignore_subsolvers is a filter and may name LNS and other subsolvers too.)
+        for (field, names) in [("subsolvers", &self.subsolvers), ("extra_subsolvers", &self.extra_subsolvers)] {
+            if let Some(bad) = names.iter().find(|n| !KNOWN_FULL_SUBSOLVERS.contains(&n.as_str())) {
+                return Err(format!(
+                    "cpsat tuning: {} names {:?}, which is not a full-problem subsolver of OR-Tools 9.15; known: {}",
+                    field,
+                    bad,
+                    KNOWN_FULL_SUBSOLVERS.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The tuning as a JSON object with every field present (recorded in `run_options`).
+    ///
+    /// # Returns
+    /// A JSON string that [`CpsatTuning::from_json`] parses back to `self`.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("CpsatTuning serialises to JSON")
+    }
+}
+
 /// Result from CP-SAT scheduling
 #[derive(Debug, Clone)]
 pub struct CpsatResult {

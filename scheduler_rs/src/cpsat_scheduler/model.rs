@@ -17,7 +17,8 @@ use super::bounds::{
 };
 use super::symmetry_ordering::SymmetryOrdering;
 use super::config::{
-    ConstChoiceMode, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
+    ConstChoiceMode, CpsatStatus, CpsatTuning, OptionalConstraintGroup, SelectChoiceMode,
+    ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::validation::{
@@ -121,6 +122,79 @@ fn max_deterministic_time_from_env() -> Option<f64> {
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// Solver parameters for one CP-SAT solve.
+///
+/// # Arguments
+/// * `time_limit_secs` - Wall-clock limit (`max_time_in_seconds`).
+/// * `deterministic_budget` - `max_deterministic_time`, when a budget is set.
+/// * `stop_after_first_solution` - Feasibility-only solve: one worker, stop at the first solution.
+/// * `absolute_gap_limit` - `absolute_gap_limit`, when the objective defines one.
+/// * `tuning` - Switchable search configuration; `CpsatTuning::default()` gives the
+///   parameters used before the switches existed (8 workers, interleaved search).
+///
+/// # Returns
+/// The `SatParameters` handed to the solver.
+#[cfg(feature = "cpsat")]
+pub(crate) fn build_sat_parameters(
+    time_limit_secs: f64,
+    deterministic_budget: Option<f64>,
+    stop_after_first_solution: bool,
+    absolute_gap_limit: Option<f64>,
+    tuning: &CpsatTuning,
+) -> SatParameters {
+    let mut params = SatParameters::default();
+    params.max_time_in_seconds = Some(time_limit_secs);
+    params.max_deterministic_time = deterministic_budget;
+    // Optional: crash when presolve adjusts a hint. Not default: presolve can tighten domains and
+    // clamp hints; that's expected and the solve still succeeds.
+    if std::env::var("CPSAT_DEBUG_PRESOLVE_HINT").is_ok() {
+        params.debug_crash_if_presolve_breaks_hint = Some(true);
+    }
+    // Always log search progress by default - user must go out of their way to suppress
+    params.log_search_progress = Some(true);
+    // With multiple workers, CP-SAT may keep improving after one worker finds a feasible solution;
+    // use a single worker when we only need feasibility so stop_after_first_solution is honored.
+    params.num_workers = if stop_after_first_solution {
+        Some(1)
+    } else {
+        Some(tuning.workers)
+    };
+    params.absolute_gap_limit = absolute_gap_limit;
+
+    // Optimize LP relaxation for tighter bounds and faster convergence
+    // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
+    //   - Cumulative constraints have weak LP relaxations by default
+    //   - Level 2 linearizes more constraints, giving tighter best_objective_bound
+    //   - Expected: Gap reduction from 10-15% to 3-8%, 20-40% faster convergence
+    // cp_model_presolve=true: Preprocessing to simplify model before solving
+    //   - Removes redundant variables/constraints, detects symmetries
+    //   - Usually <1% of solve time, but significantly speeds up search
+    // cp_model_probing_level=2: Aggressive probing to tighten variable domains
+    //   - Temporarily fixes variables and observes consequences
+    //   - Strengthens domains and adds binary clauses
+    //   - Expected: 5-15% tighter domains, 10-20% faster search
+    // randomize_search=true: Help escape local optima
+    //   - Adds randomization to search decisions
+    //   - Helps when solver gets stuck in suboptimal regions
+    params.linearization_level = Some(2);
+    params.cp_model_presolve = Some(true);
+    params.cp_model_probing_level = Some(2);
+    params.randomize_search = Some(true);
+    // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
+    // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
+    // shaving, lb_tree_search and objective_lb_search workers in this mode; turning it off
+    // gets them back at the price of reproducibility.
+    params.interleave_search = Some(tuning.interleave_search);
+    params.subsolvers = tuning.subsolvers.clone();
+    params.extra_subsolvers = tuning.extra_subsolvers.clone();
+    params.ignore_subsolvers = tuning.ignore_subsolvers.clone();
+
+    if stop_after_first_solution {
+        params.stop_after_first_solution = Some(true);
+    }
+    params
 }
 
 /// Entries of `map` in ascending key order.
@@ -281,6 +355,7 @@ pub fn schedule_ssa_cpsat(
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
         hint_select_choice_vselect_by_default,
+        ref tuning,
     } = config;
 
     let valu_cap: i64 = machine.valu_slots as i64;
@@ -3588,74 +3663,38 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 12. Configure solver
-    let mut params = SatParameters::default();
-    params.max_time_in_seconds = Some(time_limit_secs);
     // Wall-clock limits make the result depend on machine load: the same command explores
     // less on a busy machine and returns a different schedule. A deterministic-time budget
     // (CP-SAT's own work counter) gives the same schedule every time. The wall-clock limit
-    // above stays as a backstop.
+    // stays as a backstop.
     let deterministic_budget = deterministic_time_limit
         .filter(|d| d.is_finite() && *d > 0.0)
         .or_else(max_deterministic_time_from_env);
     if let Some(dtime) = deterministic_budget {
-        params.max_deterministic_time = Some(dtime);
         if verbose {
             eprintln!("  CP-SAT deterministic time limit: {}", dtime);
         }
     }
-    // Optional: crash when presolve adjusts a hint. Not default: presolve can tighten domains and
-    // clamp hints; that's expected and the solve still succeeds.
-    if std::env::var("CPSAT_DEBUG_PRESOLVE_HINT").is_ok() {
-        params.debug_crash_if_presolve_breaks_hint = Some(true);
-    }
-    // Always log search progress by default - user must go out of their way to suppress
-    params.log_search_progress = Some(true);
-    // With multiple workers, CP-SAT may keep improving after one worker finds a feasible solution;
-    // use a single worker when we only need feasibility so stop_after_first_solution is honored.
-    params.num_workers = if stop_after_first_solution {
-        Some(1)
-    } else {
-        Some(8)
-    };
-
     // Gap limit: default uses scale/3 for faster convergence, but can force 0 for debugging.
     // Stop when gap <= scale/3: remaining improvement is only in the tie-breaker (sum of completion_cycle).
     // One extra cycle costs scale in the objective, so scale/3 guarantees we're within ~1 cycle worst case.
-    if force_zero_gap {
+    let absolute_gap_limit = if force_zero_gap {
         // Force 0 integral gap for proven optimality (debugging only).
         // This ensures CP-SAT explores all possibilities, including tie-breaker optimizations
         // like moving ConstChoice ops earlier via add_imm.
-        params.absolute_gap_limit = Some(0.0);
-    } else if let Some(scale) = objective_scale {
-        params.absolute_gap_limit = Some((scale / 3) as f64);
-    }
-
-    // Optimize LP relaxation for tighter bounds and faster convergence
-    // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
-    //   - Cumulative constraints have weak LP relaxations by default
-    //   - Level 2 linearizes more constraints, giving tighter best_objective_bound
-    //   - Expected: Gap reduction from 10-15% to 3-8%, 20-40% faster convergence
-    // cp_model_presolve=true: Preprocessing to simplify model before solving
-    //   - Removes redundant variables/constraints, detects symmetries
-    //   - Usually <1% of solve time, but significantly speeds up search
-    // cp_model_probing_level=2: Aggressive probing to tighten variable domains
-    //   - Temporarily fixes variables and observes consequences
-    //   - Strengthens domains and adds binary clauses
-    //   - Expected: 5-15% tighter domains, 10-20% faster search
-    // randomize_search=true: Help escape local optima
-    //   - Adds randomization to search decisions
-    //   - Helps when solver gets stuck in suboptimal regions
-    params.linearization_level = Some(2);
-    params.cp_model_presolve = Some(true);
-    params.cp_model_probing_level = Some(2);
-    params.randomize_search = Some(true);
-    // interleave_search: interleaves LNS neighborhoods and core search deterministically.
-    // For scheduling-heavy models, this improves convergence by giving LNS (which finds
-    // most improvements) more regular opportunities to fire.
-    params.interleave_search = Some(true);
-
-    if stop_after_first_solution {
-        params.stop_after_first_solution = Some(true);
+        Some(0.0)
+    } else {
+        objective_scale.map(|scale| (scale / 3) as f64)
+    };
+    let params = build_sat_parameters(
+        time_limit_secs,
+        deterministic_budget,
+        stop_after_first_solution,
+        absolute_gap_limit,
+        tuning,
+    );
+    if verbose && *tuning != CpsatTuning::default() {
+        eprintln!("  CP-SAT tuning: {}", tuning.to_json());
     }
 
     // 13b. Decision strategy: branch on structural choices first, then bottleneck engines.
