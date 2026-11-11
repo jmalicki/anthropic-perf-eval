@@ -158,6 +158,8 @@ def _non_negative_int(text: str) -> int:
 EMISSION_DEFAULTS = {
     "merge_hash_stages": False,
     "index_form": "zero-based",
+    "prune_dead_index": False,
+    "values_only": False,
 }
 
 
@@ -176,6 +178,17 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "(no multiply_add) and none in the wrap round; initial indices are assumed 0 and "
                             "not loaded "
                             "(proofs: R9 to R11)")
+    group.add_argument("--prune-dead-index", action="store_true", default=EMISSION_DEFAULTS["prune_dead_index"],
+                       help="Zero-based index form: do not emit index work whose result is known. At depth 0 "
+                            "every index is 0, so the update needs no multiply_add and the initial indices are "
+                            "not loaded; the wrap round shares one zero vector. Output unchanged (proof: "
+                            "R12-index-update-from-root). No effect with --index-form mirrored, which has none "
+                            "of this work")
+    group.add_argument("--values-only", action="store_true", default=EMISSION_DEFAULTS["values_only"],
+                       help="CHANGES THE OUTPUT: do not store the final indices, only the values (which is all "
+                            "the upstream tests compare). The last round's index update and everything else "
+                            "that only fed the index store is then dead and removed. --validate checks values "
+                            "only under this flag")
     return group
 
 

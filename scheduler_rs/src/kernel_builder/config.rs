@@ -124,6 +124,17 @@ pub struct ProblemSpec {
     pub merge_hash_stages: bool,
     /// Representation of the tree index between rounds. Default `IndexForm::ZeroBased`.
     pub index_form: IndexForm,
+    /// Do not emit index work whose result is known (`IndexForm::ZeroBased` only; the
+    /// mirrored form has none): at depth 0 every index is 0, so the update is its offset
+    /// (no multiply_add) and the initial indices are not loaded; the wrap round shares one
+    /// vector of zeros instead of one broadcast per group. Output is unchanged. Proof:
+    /// `R12-index-update-from-root`. Default false.
+    pub prune_dead_index: bool,
+    /// Do not store the final indices. The kernel then leaves the index memory as it found
+    /// it, and everything that only fed the index store (the last round's update, and any
+    /// index chain after the last gather) is removed by dead code elimination. **Changes
+    /// the output**: only the values are correct. Default false.
+    pub values_only: bool,
 }
 
 impl Default for ProblemSpec {
@@ -146,6 +157,8 @@ impl Default for ProblemSpec {
             max_alu_depth: None,
             merge_hash_stages: false,
             index_form: IndexForm::ZeroBased,
+            prune_dead_index: false,
+            values_only: false,
         }
     }
 }
