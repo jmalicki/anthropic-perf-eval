@@ -2192,6 +2192,97 @@ fn test_greedy_priority_spellings_and_shape() {
 }
 
 // =========================================================================
+// Greedy schedule shape: split shifts
+// =========================================================================
+
+/// On the real 8-round kernel with the wavefront priority, split shifts shorten the
+/// schedule further; the lowered kernel (whose shifted ops are placed lane by lane) respects
+/// the slot limits and the scratch budget.
+#[test]
+fn test_split_shift_on_real_kernel() {
+    let rounds = 8;
+    let whole = schedule_shape_kernel(rounds, configure_wavefront);
+    let split = schedule_shape_kernel(rounds, |c| {
+        configure_wavefront(c);
+        c.compiler.greedy_split_shift = true;
+    });
+    assert!(whole.shifted_alu_cycles.is_empty(), "no lane cycles without split shifts");
+    assert!(!split.shifted_alu_cycles.is_empty(), "split shifts recorded lane cycles");
+    for (op_id, lanes) in &split.shifted_alu_cycles {
+        assert_eq!(lanes.len(), crate::types::VLEN, "op {}", op_id);
+        let (first, last) = (*lanes.iter().min().unwrap(), *lanes.iter().max().unwrap());
+        assert_eq!(last, first + 1, "op {} lanes {:?}", op_id, lanes);
+    }
+    assert_slot_limits_hold(&split);
+    assert!(!split.budget_exceeded, "split shifts exceeded the scratch budget");
+    assert!(split.address_result.peak_live <= SCRATCH_BUDGET_HW);
+    assert!(
+        split.cycles < whole.cycles,
+        "split shifts did not shorten the schedule: {} vs {}",
+        split.cycles,
+        whole.cycles
+    );
+}
+
+/// Split shifts with the default queue and barriers: still a valid kernel.
+#[test]
+fn test_split_shift_alone_on_real_kernel() {
+    let result = schedule_shape_kernel(4, |c| c.compiler.greedy_split_shift = true);
+    assert_slot_limits_hold(&result);
+    assert!(!result.budget_exceeded);
+    assert!(result.address_result.peak_live <= SCRATCH_BUDGET_HW);
+}
+
+/// CP-SAT hints carry one cycle per op, so the greedy that feeds CP-SAT makes no split
+/// shifts even when they are requested: the hint is accepted and the build succeeds.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_split_shift_ignored_when_cpsat_follows() {
+    use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+    use crate::kernel_builder::config::ProblemSpec;
+
+    let mut config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 63,
+            batch_size: 64,
+            rounds: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    configure_wavefront(&mut config);
+    config.compiler.greedy_split_shift = true;
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.cpsat_deterministic_time = Some(2.0);
+    let result = builder
+        .build_and_schedule_cpsat(
+            120.0, // time limit
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,  // per_section_optimize_secs
+            None,  // forced_shifts
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false, // force_zero_gap
+            crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+            false, // enable_scratch_tightening
+            false, // symmetry_precedence_integrated
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
+            false, // precedence_neutral_horizon
+            None,  // disable_optional_constraint_groups
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        )
+        .expect("CP-SAT accepts the greedy hint");
+    assert!(!result.budget_exceeded);
+    assert_slot_limits_hold(&result);
+}
+
+// =========================================================================
 // Hint pass tests (ConstChoice, SelectChoice, VALU shift)
 // =========================================================================
 

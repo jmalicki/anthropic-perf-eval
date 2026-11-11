@@ -2844,6 +2844,7 @@ fn schedule_with_shape(ops: &mut [SsaOp], shape: &GreedyShape) -> (usize, bool, 
         None,
         &mut GreedyDiagnostics::new(false),
         shape,
+        &mut HashMap::new(),
     )
     .expect("greedy schedules the chains");
     assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
@@ -2853,6 +2854,7 @@ fn schedule_with_shape(ops: &mut [SsaOp], shape: &GreedyShape) -> (usize, bool, 
 fn wavefront_shape(stagger_cycles: u32, groups_in_flight: Option<usize>) -> GreedyShape {
     GreedyShape {
         priority: GreedyPriority::Wavefront { stagger_cycles, groups_in_flight },
+        ..Default::default()
     }
 }
 
@@ -2959,6 +2961,159 @@ fn test_default_shape_is_fifo() {
     schedule_ssa_greedy_with_shift_budget(&mut b.ops, false, &mut shifted, 1536).unwrap();
     let cycles = |ops: &[SsaOp]| ops.iter().map(|op| op.cycle).collect::<Vec<_>>();
     assert_eq!(cycles(&a.ops), cycles(&b.ops));
+}
+
+// =========================================================================
+// Split shifts (GreedyShape::split_shift)
+// =========================================================================
+
+/// Schedule `ops` with shifting enabled and the given shape.
+///
+/// # Returns
+/// `(cycles, shifted op ids, per-lane cycles of split shifts)`.
+fn schedule_with_shift_and_shape(
+    ops: &mut [SsaOp],
+    shape: &GreedyShape,
+) -> (usize, HashSet<usize>, HashMap<usize, Vec<i32>>) {
+    let mut shifted = HashSet::new();
+    let mut lane_cycles = HashMap::new();
+    let ((cycles, budget_exceeded, _), agreement) = schedule_ssa_greedy_shaped(
+        ops,
+        true,
+        &mut shifted,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        shape,
+        &mut lane_cycles,
+    )
+    .expect("greedy schedules the chains");
+    assert!(!budget_exceeded);
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (cycles, shifted, lane_cycles)
+}
+
+/// Scalar ALU slots used per cycle by shifted ops: all VLEN lanes at the op's cycle, or the
+/// per-lane cycles of a split shift.
+fn shifted_alu_use(
+    ops: &[SsaOp],
+    shifted: &HashSet<usize>,
+    lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> HashMap<i32, usize> {
+    let mut used: HashMap<i32, usize> = HashMap::new();
+    for op in ops.iter().filter(|op| shifted.contains(&op.id)) {
+        match lane_cycles.get(&op.id) {
+            Some(lanes) => lanes.iter().for_each(|&c| *used.entry(c).or_default() += 1),
+            None => *used.entry(op.cycle).or_default() += VLEN,
+        }
+    }
+    used
+}
+
+/// With split shifts a shifted op may straddle two cycles: the scalar slots carry three
+/// shifted ops per two cycles instead of two, no cycle uses more than 12 scalar slots, a
+/// split op completes at its last lane, and its consumers run after that.
+#[test]
+fn test_split_shift_fills_scalar_slots() {
+    let split = GreedyShape { split_shift: true, ..Default::default() };
+
+    let (mut whole_ops, _) = emit_independent_chains(30, 12);
+    let (whole_cycles, whole_shifted, whole_lanes) =
+        schedule_with_shift_and_shape(&mut whole_ops.ops, &GreedyShape::default());
+    assert!(whole_lanes.is_empty(), "no split shifts unless enabled");
+    assert!(!whole_shifted.is_empty(), "the chains saturate the vector slots");
+    let whole_use = shifted_alu_use(&whole_ops.ops, &whole_shifted, &whole_lanes);
+    assert!(whole_use.values().all(|&n| n == VLEN), "whole shifts: 8 scalar slots per cycle");
+
+    let (mut emit, level_ops) = emit_independent_chains(30, 12);
+    let (cycles, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &split);
+    assert!(!lanes.is_empty(), "split shifts happen when the vector slots are full");
+    assert!(cycles < whole_cycles, "split {} cycles, whole {} cycles", cycles, whole_cycles);
+
+    let alu_use = shifted_alu_use(&emit.ops, &shifted, &lanes);
+    assert!(alu_use.values().all(|&n| n <= 12), "scalar slots over capacity: {:?}", alu_use);
+    assert!(alu_use.values().any(|&n| n > VLEN), "no cycle uses more than 8 scalar slots");
+
+    let by_id: HashMap<usize, &SsaOp> = emit.ops.iter().map(|op| (op.id, op)).collect();
+    for (op_id, lane) in &lanes {
+        assert!(shifted.contains(op_id), "split op {} is recorded as shifted", op_id);
+        assert_eq!(lane.len(), VLEN);
+        let (first, last) = (*lane.iter().min().unwrap(), *lane.iter().max().unwrap());
+        assert_eq!(last, first + 1, "a split shift spans two consecutive cycles: {:?}", lane);
+        assert!(lane.windows(2).all(|w| w[0] <= w[1]), "low lanes run first: {:?}", lane);
+        assert_eq!(by_id[op_id].cycle, last, "the op completes at its last lane");
+    }
+    // Every add reads the previous level's value: it runs after that op has completed.
+    for levels in &level_ops {
+        for pair in levels.windows(2) {
+            let (producer, consumer) = (&emit.ops[pair[0]], &emit.ops[pair[1]]);
+            let consumer_start = lanes
+                .get(&consumer.id)
+                .map_or(consumer.cycle, |l| *l.iter().min().unwrap());
+            assert!(
+                consumer_start > producer.cycle,
+                "op {} starts at {} but its operand completes at {}",
+                consumer.id,
+                consumer_start,
+                producer.cycle
+            );
+        }
+    }
+}
+
+/// Lane cycles of a split shift: the first lanes in the first cycle, the rest in the last.
+#[test]
+fn test_split_shift_lane_cycles() {
+    let split = SplitShift { idx: 0, first_cycle: 7, first_lanes: 3 };
+    assert_eq!(split.lane_cycles(8), vec![7, 7, 7, 8, 8, 8, 8, 8]);
+}
+
+/// Split shifts need the scheduler to own the shift decision: with shifting off or with
+/// fixed shift encodings there are none.
+#[test]
+fn test_split_shift_off_without_shift_decisions() {
+    let split = GreedyShape { split_shift: true, ..Default::default() };
+    let (mut emit, _) = emit_independent_chains(30, 12);
+    let mut shifted = HashSet::new();
+    let mut lane_cycles = HashMap::new();
+    schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false, // shifting disabled
+        &mut shifted,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &split,
+        &mut lane_cycles,
+    )
+    .unwrap();
+    assert!(shifted.is_empty() && lane_cycles.is_empty());
 }
 
 // =========================================================================
