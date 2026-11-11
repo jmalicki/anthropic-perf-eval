@@ -249,6 +249,45 @@ pub const DEFAULT_GREEDY_STAGGER_CYCLES: u32 = 12;
 /// Default number of group chains allowed to run at once (`--greedy-groups-in-flight`).
 pub const DEFAULT_GREEDY_GROUPS_IN_FLIGHT: usize = 16;
 
+/// Overrides for the pressure policies' thresholds, as fractions of the scratch budget.
+///
+/// `None` keeps the policy's built-in value (soft 0.85, critical 0.95, inflation 0.80). The
+/// built-in values were tuned before the greedy's live-word counter was exact. A policy
+/// ignores the thresholds it does not have (`Greedy` has none; `PressureThrottled` only
+/// `soft`; `PressureGated` `soft` and `critical`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PressureThresholds {
+    /// Above this fraction the ready queue blends in net pressure and shifts are
+    /// suppressed when the scalar ALU is busy.
+    pub soft: Option<f64>,
+    /// Above this fraction no vector op is shifted to the scalar ALU.
+    pub critical: Option<f64>,
+    /// Above this fraction producers with slack are deferred (ASAP inflation). A value of
+    /// 1.0 or more turns inflation off.
+    pub inflation: Option<f64>,
+}
+
+impl PressureThresholds {
+    /// Check that every override is a positive finite number.
+    ///
+    /// # Returns
+    /// `Err` naming the first invalid threshold.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("pressure_soft_threshold", self.soft),
+            ("pressure_critical_threshold", self.critical),
+            ("pressure_inflation_threshold", self.inflation),
+        ] {
+            if let Some(v) = value {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(format!("{} must be a positive finite number, got {}", name, v));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Compilation concern: how to optimize and schedule.
 ///
 /// Controls scheduling and optimization passes — these don't affect
@@ -290,6 +329,11 @@ pub struct CompilerConfig {
     pub greedy_stagger_cycles: u32,
     /// Wavefront priority: group chains allowed to run at once; 0 = no limit.
     pub greedy_groups_in_flight: usize,
+    /// Overrides for the pressure policy's thresholds (default: none).
+    pub pressure_thresholds: PressureThresholds,
+    /// Words the greedy keeps free below the scratch budget (default: 0). Address
+    /// assignment can need a few words more than the greedy's counter reports.
+    pub greedy_budget_headroom: usize,
     /// Greedy-only: let a shifted vector op straddle two cycles so all 12 scalar slots can
     /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
     /// carry one cycle per op.
@@ -313,11 +357,60 @@ impl Default for CompilerConfig {
             greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
             greedy_split_shift: false,
+            pressure_thresholds: PressureThresholds::default(),
+            greedy_budget_headroom: 0,
         }
     }
 }
 
 impl CompilerConfig {
+    /// The configured pressure policy with any threshold overrides applied.
+    pub fn pressure_policy(&self) -> Box<dyn super::ssa_greedy::pressure_policy::PressurePolicy> {
+        use super::ssa_greedy::pressure_policy::{
+            AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy,
+            PressureThrottledPolicy,
+        };
+        let t = &self.pressure_thresholds;
+        match self.scheduling_pressure_policy {
+            PressurePolicyKind::Greedy => Box::new(GreedyPolicy),
+            PressurePolicyKind::PressureThrottled => {
+                let mut policy = PressureThrottledPolicy::default();
+                policy.soft_threshold_fraction = t.soft.unwrap_or(policy.soft_threshold_fraction);
+                Box::new(policy)
+            }
+            PressurePolicyKind::PressureGated => {
+                let mut policy = PressureGatedPolicy::default();
+                policy.soft_threshold_fraction = t.soft.unwrap_or(policy.soft_threshold_fraction);
+                policy.critical_threshold_fraction =
+                    t.critical.unwrap_or(policy.critical_threshold_fraction);
+                Box::new(policy)
+            }
+            PressurePolicyKind::Adaptive => {
+                let mut policy = AdaptivePolicy::default();
+                policy.soft_threshold_fraction = t.soft.unwrap_or(policy.soft_threshold_fraction);
+                policy.critical_threshold_fraction =
+                    t.critical.unwrap_or(policy.critical_threshold_fraction);
+                policy.inflation_threshold_fraction =
+                    t.inflation.unwrap_or(policy.inflation_threshold_fraction);
+                Box::new(policy)
+            }
+            PressurePolicyKind::Cascade => {
+                let mut policy = CascadePolicy::default();
+                policy.soft_threshold_fraction = t.soft.unwrap_or(policy.soft_threshold_fraction);
+                policy.critical_threshold_fraction =
+                    t.critical.unwrap_or(policy.critical_threshold_fraction);
+                policy.inflation_threshold_fraction =
+                    t.inflation.unwrap_or(policy.inflation_threshold_fraction);
+                Box::new(policy)
+            }
+        }
+    }
+
+    /// The scratch budget the greedy schedules against: `budget` less the configured headroom.
+    pub fn greedy_scratch_budget(&self, budget: usize) -> usize {
+        budget.saturating_sub(self.greedy_budget_headroom)
+    }
+
     /// Schedule-shape switches for the greedy scheduler, as configured here.
     pub fn greedy_shape(&self) -> super::ssa_greedy::GreedyShape {
         use super::ssa_greedy::{GreedyPriority, GreedyShape};
