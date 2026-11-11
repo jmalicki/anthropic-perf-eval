@@ -7,7 +7,7 @@ import time
 
 import z3
 
-# Path to spec (relative to project root); anchors #t1..#t15 link to each theorem
+# Path to spec (relative to project root); anchors #t1..#t16 link to each theorem
 SPEC_PATH = "docs/LIVENESS_SPECIFICATION.md"
 
 from .fixtures import DEFAULT_TIMEOUT_MS
@@ -41,6 +41,9 @@ from .theorems import (
     check_t13_occupied_semantics,
     check_t14_capacity_lower_bound,
     check_t15_optional_capacity_redundant,
+    check_t16_counter_agreement,
+    check_t16_per_operand_decrement_counterexample,
+    check_t16_write_group_per_lane_counterexample,
 )
 from .precedence_fixpoint import (
     model_fixpoint_convergence,
@@ -140,6 +143,17 @@ THEOREM_CHECKS = [
     ("T13", "Occupied interval semantics", check_t13_occupied_semantics),
     ("T14", "Capacity lower bound", check_t14_capacity_lower_bound),
     ("T15", "Optional capacity constraints redundant", check_t15_optional_capacity_redundant),
+    ("T16", "Greedy counter agrees with interval liveness (one value, 3 readers)", check_t16_counter_agreement),
+    (
+        "T16-per-operand-decrement",
+        "Old counter rule, one decrement per operand: disagrees (SAT = counterexample)",
+        check_t16_per_operand_decrement_counterexample,
+    ),
+    (
+        "T16-write-group-per-lane",
+        "Old counter rule, write group counted lane by lane: disagrees (SAT = counterexample)",
+        check_t16_write_group_per_lane_counterexample,
+    ),
     # Precedence fixpoint models
     (
         "fixpoint-convergence",
@@ -206,7 +220,7 @@ def run_verification(
         z3.set_param("verbose", 1)
         z3.set_param("stats", True)
     print(f"Z3 verification (timeout={timeout_ms}ms, seed={seed})")
-    print(f"Spec: {SPEC_PATH} (anchors #t1..#t15)")
+    print(f"Spec: {SPEC_PATH} (anchors #t1..#t16)")
     print("-" * 60)
     failures = []
     for name, desc, check_fn in THEOREM_CHECKS:
@@ -229,6 +243,8 @@ def run_verification(
             "T7-strong-guarantee-fails-asap-only",
             "T7-greedy-cap-preserves-G",
             "T7-undercount-chain-preserves-witness",
+            "T16-per-operand-decrement",
+            "T16-write-group-per-lane",
             "fixpoint-convergence",
             "fixpoint-with-fanout",
             "fixpoint-iteration-bounded",

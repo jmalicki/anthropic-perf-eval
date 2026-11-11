@@ -507,18 +507,20 @@ pub fn compute_live_intervals(
                 .filter_map(|lv| intervals.get(lv).map(|i| i.end))
             .max();
 
-        // Consumer reads of the group alias VReg (ops that use the vector group)
+        // Consumer reads of the group alias VReg (ops that use the vector group or hold
+        // it through `keep_live`)
         let consumer_end = ops
                 .iter()
                 .filter(|op| {
                     op.srcs
                         .iter()
                         .any(|s| matches!(s, Operand::VReg(v) if *v == *group_vreg))
+                        || op.keep_live.iter().flatten().any(|v| *v == *group_vreg)
                 })
                 .map(|op| op.cycle)
             .max();
 
-        // Lane VReg uses: ops that read any lane VReg directly.
+        // Lane VReg uses: ops that read any lane VReg directly or hold one through `keep_live`.
         // Critical for read groups where lane VRegs have no intervals.
         let lane_vreg_set: HashSet<VReg> = lane_vregs.iter().copied().collect();
         let lane_use_end = ops
@@ -527,6 +529,7 @@ pub fn compute_live_intervals(
                     op.srcs
                         .iter()
                         .any(|s| matches!(s, Operand::VReg(v) if lane_vreg_set.contains(v)))
+                        || op.keep_live.iter().flatten().any(|v| lane_vreg_set.contains(v))
                 })
                 .map(|op| op.cycle)
             .max();

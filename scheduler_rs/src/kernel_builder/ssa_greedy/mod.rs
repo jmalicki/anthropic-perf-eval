@@ -5,7 +5,8 @@
 //!
 //! Key features:
 //! - LUC (Last-Use-Count) heuristic for prioritizing ops that free scratch
-//! - Same-cycle reuse model for accurate liveness tracking
+//! - Same-cycle reuse model for liveness tracking, checked against interval liveness
+//!   after every run (docs/LIVENESS_SPECIFICATION.md, T16)
 //! - Emergency force-scheduling to break deadlocks
 //! - VALU→ALU shifting when VALU slots are saturated
 //! - Dead store elimination (see below)
@@ -33,9 +34,11 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::types::{
-    ConstChoiceEncoding, EmissionPhase, Engine, Opcode, Operand, PrecedenceOffset, SelectChoiceEncoding,
-    SsaOp, VReg, VLEN,
+    ConstChoiceEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, PrecedenceOffset,
+    SelectChoiceEncoding, SsaOp, VReg, VLEN,
 };
+
+use crate::address_assign::{compute_live_intervals, compute_peak_liveness, AddressAssignConfig};
 
 use self::pressure_policy::{GreedyPolicy, PressurePolicy};
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
@@ -410,38 +413,368 @@ pub(super) fn dump_live_usage_breakdown(
     eprintln!("=== End Budget Exceeded Dump ===\n");
 }
 
-/// VRegs whose remaining-user count drops when an op reading `srcs` is scheduled.
+/// VRegs whose remaining-user count drops when an op is scheduled.
 ///
-/// Readers name only one side of a vector group (the lanes of a read group, the alias of a
-/// write group), so the other side must be released through `liveness_aliases` or it stays
-/// live forever.
+/// The count is of reader ops, so each VReg appears once however many operands name it.
+/// Readers name only one side of a vector group (a lane or the group VReg), so the other
+/// side is released through `liveness_aliases`; without it that side stays live forever.
 ///
 /// # Arguments
-/// * `srcs` - Operands read by the op being scheduled
-/// * `liveness_aliases` - Read-group lane → group key; write-group alias → lanes
+/// * `op` - The op being scheduled (reads its `srcs` and holds its `keep_live` values)
+/// * `liveness_aliases` - Lane → group VReg (both group kinds); write-group VReg → lanes
 ///
 /// # Returns
-/// The source VRegs followed by their aliases (each alias at most once per op).
-fn liveness_release_vregs(
-    srcs: &[Operand],
-    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
-) -> Vec<VReg> {
-    let mut released: Vec<VReg> = Vec::with_capacity(srcs.len());
-    let mut aliases: Vec<VReg> = Vec::new();
-    for src in srcs {
-        if let Operand::VReg(vreg) = src {
-            released.push(*vreg);
-            if let Some(extra) = liveness_aliases.get(vreg) {
-                for alias in extra {
-                    if !aliases.contains(alias) {
-                        aliases.push(*alias);
-                    }
+/// The VRegs the op reads or keeps live, then their aliases, each exactly once.
+fn liveness_release_vregs(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> Vec<VReg> {
+    let mut released: Vec<VReg> = Vec::with_capacity(op.srcs.len());
+    for vreg in liveness_read_vregs(op) {
+        if !released.contains(&vreg) {
+            released.push(vreg);
+        }
+    }
+    let direct = released.len();
+    for i in 0..direct {
+        if let Some(extra) = liveness_aliases.get(&released[i]) {
+            for alias in extra {
+                if !released.contains(alias) {
+                    released.push(*alias);
                 }
             }
         }
     }
-    released.extend(aliases);
     released
+}
+
+/// Write groups as the live-word counter sees them.
+///
+/// A write group (`fresh_vector_group`) is one block of VLEN words, held from its first
+/// lane write until its last read, and at least until the cycle after a lane write that
+/// nothing reads (as in address assignment). The counter therefore tracks the group VReg,
+/// never the lanes.
+#[derive(Default)]
+struct WriteGroups {
+    /// Lane → group VReg.
+    of: HashMap<VReg, VReg>,
+    /// Lane writes still to be scheduled, per group.
+    pending_writes: HashMap<VReg, usize>,
+    /// First cycle at which the group may be released, set by writes of unread lanes.
+    hold_until: HashMap<VReg, i32>,
+}
+
+impl WriteGroups {
+    /// The VReg the counter tracks for a written VReg: its group for a lane, else itself.
+    fn counted(&self, dest: VReg) -> VReg {
+        self.of.get(&dest).copied().unwrap_or(dest)
+    }
+
+    /// Whether `vreg` can leave the counter at `cycle` once its last reader has run.
+    /// Always true for a VReg that is not a write group.
+    fn releasable_at(&self, vreg: &VReg, cycle: usize) -> bool {
+        self.pending_writes.get(vreg).map_or(true, |&p| p == 0)
+            && self.hold_until.get(vreg).map_or(true, |&c| c <= cycle as i32)
+    }
+}
+
+/// Add the value written by a just-scheduled op to the live-word counter.
+///
+/// A write-group lane counts as its group: the whole block is added at the first lane
+/// write. A value no scheduled op will read is still held for the cycle of its write and
+/// released at the next cycle (spec A4, case 2).
+fn count_written_dest(
+    dest: VReg,
+    cycle: usize,
+    write_groups: &mut WriteGroups,
+    vreg_remaining_users: &HashMap<VReg, usize>,
+    live_vregs: &mut HashSet<VReg>,
+    live_words: &mut usize,
+    vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
+    trace: &mut CounterTrace,
+) {
+    let unread = |vreg: &VReg| vreg_remaining_users.get(vreg).map_or(true, |&n| n == 0);
+    let counted = write_groups.counted(dest);
+    if counted != dest {
+        if let Some(pending) = write_groups.pending_writes.get_mut(&counted) {
+            *pending = pending.saturating_sub(1);
+        }
+        if unread(&dest) {
+            write_groups.hold_until.insert(counted, (cycle + 1) as i32);
+        }
+    }
+    if live_vregs.insert(counted) {
+        *live_words += counted.size();
+        trace.spans.insert(counted, (cycle as i32, None));
+    }
+    let writes_done = write_groups.pending_writes.get(&counted).map_or(true, |&p| p == 0);
+    if writes_done && unread(&counted) {
+        vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, counted)));
+    }
+}
+
+/// Decrement the remaining-reader count of everything a just-scheduled op read, and
+/// release from the live-word counter each value whose last reader it was.
+///
+/// Release is immediate (same-cycle reuse: reads happen before writes within a cycle),
+/// except for a write group that is still being written or holds an unread lane.
+fn release_read_values(
+    op: &SsaOp,
+    cycle: usize,
+    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
+    write_groups: &WriteGroups,
+    vreg_remaining_users: &mut HashMap<VReg, usize>,
+    live_vregs: &mut HashSet<VReg>,
+    live_words: &mut usize,
+    vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
+    trace: &mut CounterTrace,
+) {
+    for vreg in &liveness_release_vregs(op, liveness_aliases) {
+        let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
+            continue;
+        };
+        *remaining = remaining.saturating_sub(1);
+        if *remaining != 0 || !live_vregs.contains(vreg) {
+            continue;
+        }
+        if write_groups.releasable_at(vreg, cycle) {
+            live_vregs.remove(vreg);
+            *live_words = live_words.saturating_sub(vreg.size());
+            trace.release(vreg, cycle);
+        } else if let Some(&hold_until) = write_groups.hold_until.get(vreg) {
+            // Written out, but an unread lane holds the block one more cycle.
+            if write_groups.pending_writes.get(vreg).map_or(true, |&p| p == 0) {
+                vreg_expiry_heap.push(Reverse((hold_until, *vreg)));
+            }
+        }
+        // Otherwise lane writes are still pending; the last one releases the group.
+    }
+}
+
+/// VRegs an op holds until it runs: its VReg operands and its `keep_live` list
+/// (the same reads `address_assign`'s `LivenessUse` reports). May contain duplicates.
+fn liveness_read_vregs(op: &SsaOp) -> impl Iterator<Item = VReg> + '_ {
+    op.srcs
+        .iter()
+        .filter_map(|src| src.as_vreg())
+        .chain(op.keep_live.iter().flatten().copied())
+}
+
+// ============================================================================
+// Liveness agreement: the scheduler's counter against interval liveness
+// ============================================================================
+
+/// Comparison of the greedy scheduler's live-word counter with interval liveness
+/// (`address_assign::compute_live_intervals`) of the schedule the same run produced.
+///
+/// Interval liveness at cycle `t` is the words of every value with `start <= t < end`:
+/// what is still held once cycle `t`'s writes are done, with a value last read at `t`
+/// already released (docs/LIVENESS_SPECIFICATION.md, A2 and T1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LivenessAgreement {
+    /// Peak the scheduler reports: the counter's maximum after any single op.
+    pub counter_peak: usize,
+    /// Maximum of the counter sampled after the last op of each cycle.
+    pub counter_cycle_end_peak: usize,
+    /// Peak of interval liveness; equals `address_assign::compute_peak_liveness`.
+    pub interval_peak: usize,
+    /// Cycles where the cycle-end counter differs from interval liveness.
+    pub mismatched_cycles: usize,
+    /// Largest amount by which the cycle-end counter is below interval liveness.
+    pub max_undercount: usize,
+    /// Largest amount by which the cycle-end counter is above interval liveness.
+    pub max_overcount: usize,
+    /// First differing cycle as `(cycle, counter, interval)`.
+    pub first_mismatch: Option<(usize, usize, usize)>,
+    /// Which kinds of value differ, one line per kind (empty when every cycle agrees).
+    pub value_mismatches: Vec<String>,
+}
+
+impl LivenessAgreement {
+    /// True when the counter equals interval liveness at the end of every cycle.
+    pub fn agrees(&self) -> bool {
+        self.mismatched_cycles == 0
+    }
+}
+
+impl std::fmt::Display for LivenessAgreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "counter peak {} (cycle-end {}), interval peak {}, mismatched cycles {}, \
+             max undercount {}, max overcount {}",
+            self.counter_peak,
+            self.counter_cycle_end_peak,
+            self.interval_peak,
+            self.mismatched_cycles,
+            self.max_undercount,
+            self.max_overcount
+        )?;
+        if let Some((cycle, counter, interval)) = self.first_mismatch {
+            write!(f, ", first at cycle {} (counter {}, interval {})", cycle, counter, interval)?;
+        }
+        Ok(())
+    }
+}
+
+/// What the scheduler's live-word counter did during one run.
+#[derive(Default)]
+struct CounterTrace {
+    /// The counter after the last op of each cycle (index = cycle).
+    cycle_end_live: Vec<usize>,
+    /// Per value: the cycle it was added to the counter and the cycle it was released.
+    spans: HashMap<VReg, (i32, Option<i32>)>,
+}
+
+impl CounterTrace {
+    fn release(&mut self, vreg: &VReg, cycle: usize) {
+        if let Some(span) = self.spans.get_mut(vreg) {
+            span.1 = Some(cycle as i32);
+        }
+    }
+}
+
+/// Interval liveness per cycle for a schedule: words with `start <= t < end`.
+///
+/// # Arguments
+/// * `ops` - Ops with assigned cycles; ops with a negative cycle (skipped dead stores) are ignored
+/// * `vector_group_lanes` - Vector groups, as passed to the scheduler
+///
+/// # Returns
+/// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
+/// `address_assign::compute_peak_liveness` of `intervals`.
+pub(super) fn interval_liveness_curve(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
+    let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+    // A group none of whose VRegs is written by a scheduled op occupies nothing.
+    // (`compute_live_intervals` would give it a phantom [0, 1] interval.)
+    let written: HashSet<VReg> = scheduled.iter().filter_map(|op| op.dest).collect();
+    let groups: HashMap<VReg, Vec<VReg>> = vector_group_lanes
+        .into_iter()
+        .flatten()
+        .filter(|(key, lanes)| written.contains(*key) || lanes.iter().any(|l| written.contains(l)))
+        .map(|(key, lanes)| (*key, lanes.clone()))
+        .collect();
+    let config = AddressAssignConfig { vector_group_lanes: groups, ..Default::default() };
+    let intervals = compute_live_intervals(&config, &scheduled)?;
+    let n_cycles = scheduled.iter().map(|op| op.cycle + 1).max().unwrap_or(0) as usize;
+    // Difference array: +size at start, -size at end, prefix-summed.
+    let mut delta: Vec<i64> = vec![0; n_cycles + 2];
+    for (vreg, interval) in &intervals {
+        if interval.end <= interval.start {
+            continue;
+        }
+        delta[interval.start as usize] += vreg.size() as i64;
+        delta[(interval.end as usize).min(n_cycles + 1)] -= vreg.size() as i64;
+    }
+    let mut curve: Vec<usize> = Vec::with_capacity(n_cycles);
+    let mut live: i64 = 0;
+    for d in delta.iter().take(n_cycles) {
+        live += d;
+        curve.push(live as usize);
+    }
+    Ok((curve, compute_peak_liveness(&intervals), intervals))
+}
+
+/// Compare the scheduler's counter with interval liveness of the finished schedule.
+///
+/// # Arguments
+/// * `ops` - Ops as scheduled by the greedy
+/// * `vector_group_lanes` - Vector groups, as passed to the scheduler
+/// * `trace` - What the counter did during the run
+/// * `counter_peak` - The peak the scheduler reports
+///
+/// # Returns
+/// The comparison, or `Err` if interval liveness cannot be computed for the schedule.
+fn compare_counter_with_intervals(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    trace: &CounterTrace,
+    counter_peak: usize,
+) -> Result<LivenessAgreement, String> {
+    let cycle_end_live = &trace.cycle_end_live;
+    let (curve, interval_peak, intervals) = interval_liveness_curve(ops, vector_group_lanes)?;
+    let mut agreement = LivenessAgreement {
+        counter_peak,
+        counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
+        interval_peak,
+        ..Default::default()
+    };
+    for cycle in 0..curve.len().max(cycle_end_live.len()) {
+        let counter = cycle_end_live.get(cycle).copied().unwrap_or(0);
+        let interval = curve.get(cycle).copied().unwrap_or(0);
+        if counter == interval {
+            continue;
+        }
+        agreement.mismatched_cycles += 1;
+        agreement.max_undercount = agreement.max_undercount.max(interval.saturating_sub(counter));
+        agreement.max_overcount = agreement.max_overcount.max(counter.saturating_sub(interval));
+        if agreement.first_mismatch.is_none() {
+            agreement.first_mismatch = Some((cycle, counter, interval));
+        }
+    }
+    if agreement.mismatched_cycles > 0 {
+        agreement.value_mismatches = describe_value_mismatches(ops, vector_group_lanes, trace, &intervals);
+    }
+    Ok(agreement)
+}
+
+/// Per-value differences between the counter's spans and the intervals, grouped by kind.
+///
+/// # Returns
+/// One line per kind of value (producer opcode, or "write group") whose counter span
+/// `[added, released)` differs from its interval `[start, end)`, with a count and an example.
+fn describe_value_mismatches(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    trace: &CounterTrace,
+    intervals: &HashMap<VReg, LiveInterval>,
+) -> Vec<String> {
+    let producer: HashMap<VReg, &SsaOp> =
+        ops.iter().filter(|op| op.cycle >= 0).filter_map(|op| op.dest.map(|d| (d, op))).collect();
+    let empty = HashMap::new();
+    let groups = vector_group_lanes.unwrap_or(&empty);
+    let mut by_kind: HashMap<String, (usize, String)> = HashMap::new();
+    let mut note = |kind: String, example: String| {
+        let entry = by_kind.entry(kind).or_insert((0, example));
+        entry.0 += 1;
+    };
+    let mut seen: HashSet<VReg> = HashSet::new();
+    for (vreg, interval) in intervals {
+        seen.insert(*vreg);
+        let kind = match producer.get(vreg) {
+            Some(op) => format!("{:?}", op.opcode),
+            None if groups.contains_key(vreg) => "write group".to_string(),
+            None => "no producer".to_string(),
+        };
+        // A value still counted when the schedule ends is released at the cycle after it.
+        let n_cycles = trace.cycle_end_live.len() as i32;
+        match trace.spans.get(vreg) {
+            Some(&(added, released))
+                if added == interval.start && released.unwrap_or(n_cycles) == interval.end => {}
+            Some(&(added, released)) => note(
+                kind,
+                format!(
+                    "{:?} interval [{}, {}) counter [{}, {:?})",
+                    vreg, interval.start, interval.end, added, released
+                ),
+            ),
+            None => note(
+                format!("{} (never counted)", kind),
+                format!("{:?} interval [{}, {})", vreg, interval.start, interval.end),
+            ),
+        }
+    }
+    for (vreg, span) in &trace.spans {
+        if !seen.contains(vreg) {
+            note("counted, no interval".to_string(), format!("{:?} counter {:?}", vreg, span));
+        }
+    }
+    let mut lines: Vec<String> = by_kind
+        .into_iter()
+        .map(|(kind, (count, example))| format!("{}: {} values, e.g. {}", kind, count, example))
+        .collect();
+    lines.sort();
+    lines
 }
 
 /// Build a lightweight `SchedulingCandidate` for the ASAP inflation check.
@@ -575,6 +908,127 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     select_choice_fma_ops: Option<&mut HashSet<usize>>,
     select_sub_cycles: Option<&mut HashMap<usize, i32>>,
     select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+    const_add_imm_ops: Option<&mut HashSet<usize>>,
+    bounds_usage: &GreedyBoundsUsage,
+    strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    // When Some, use these encodings for ConstChoice (engine from map); do not write to const_add_imm_ops.
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    // When Some, use this set for shift decisions (op in set => place as shifted); do not add to shifted_ops.
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+    // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+) -> Result<(usize, bool, usize), String> {
+    schedule_ssa_greedy_with_liveness_agreement(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops,
+        select_sub_cycles,
+        select_fma_cycles,
+        const_add_imm_ops,
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+    )
+    .map(|(result, _agreement)| result)
+}
+
+/// Same as [`schedule_ssa_greedy_with_shift_budget_and_selectchoice`], and also returns the
+/// comparison of the scheduler's live-word counter with interval liveness of the schedule it
+/// produced (see [`LivenessAgreement`]).
+///
+/// # Returns
+/// `((cycles, budget_exceeded, peak_live), agreement)`. `Err` if scheduling fails or the
+/// counter disagrees with the intervals (a bug in the counter, never a property of the input;
+/// set `SCHEDULER_LIVENESS_AGREEMENT=warn` to continue with a warning).
+pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
+    ops: &mut [SsaOp],
+    enable_valu_shift: bool,
+    shifted_ops: &mut HashSet<usize>,
+    scratch_budget: usize,
+    select_choice_fma_ops: Option<&mut HashSet<usize>>,
+    select_sub_cycles: Option<&mut HashMap<usize, i32>>,
+    select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+    const_add_imm_ops: Option<&mut HashSet<usize>>,
+    bounds_usage: &GreedyBoundsUsage,
+    strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    // When Some, use these encodings for ConstChoice (engine from map); do not write to const_add_imm_ops.
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    // When Some, use this set for shift decisions (op in set => place as shifted); do not add to shifted_ops.
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+    // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    let mut trace = CounterTrace::default();
+    let result = schedule_ssa_greedy_core(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops,
+        select_sub_cycles,
+        select_fma_cycles,
+        const_add_imm_ops,
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+        &mut trace,
+    )?;
+    let agreement = compare_counter_with_intervals(ops, vector_group_lanes, &trace, result.2)?;
+    // SCHEDULER_LIVENESS_AGREEMENT: any value prints the comparison; `warn` also turns a
+    // disagreement from an error into a warning.
+    let mode = std::env::var("SCHEDULER_LIVENESS_AGREEMENT").ok();
+    if mode.is_some() {
+        eprintln!("Greedy liveness agreement: {}", agreement);
+    }
+    if !agreement.agrees() {
+        let message = format!(
+            "BUG: greedy live-word counter disagrees with interval liveness of its own schedule: {}\n  {}",
+            agreement,
+            agreement.value_mismatches.join("\n  ")
+        );
+        if mode.as_deref() == Some("warn") {
+            eprintln!("Warning: {}", message);
+        } else {
+            return Err(message);
+        }
+    }
+    Ok((result, agreement))
+}
+
+fn schedule_ssa_greedy_core(
+    ops: &mut [SsaOp],
+    enable_valu_shift: bool,
+    shifted_ops: &mut HashSet<usize>,
+    scratch_budget: usize,
+    select_choice_fma_ops: Option<&mut HashSet<usize>>,
+    select_sub_cycles: Option<&mut HashMap<usize, i32>>,
+    select_fma_cycles: Option<&mut HashMap<usize, i32>>,
     mut const_add_imm_ops: Option<&mut HashSet<usize>>,
     bounds_usage: &GreedyBoundsUsage,
     strategy: &dyn PressurePolicy,
@@ -589,6 +1043,8 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     fixed_shifted_ops: Option<&HashSet<usize>>,
     // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
     fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+    // Out: what the live-word counter did, for the comparison with interval liveness.
+    trace: &mut CounterTrace,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -656,11 +1112,10 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 vreg_def.insert(dest, idx);
             }
         }
-        // Still track users from AddImm alternatives (they read zero_vreg)
-        for src in &op.srcs {
-            if let Operand::VReg(vreg) = src {
-                vreg_users.entry(*vreg).or_default().insert(idx);
-            }
+        // Still track users from AddImm alternatives (they read zero_vreg).
+        // `keep_live` values count as read: address assignment holds them until this op.
+        for vreg in liveness_read_vregs(op) {
+            vreg_users.entry(vreg).or_default().insert(idx);
         }
     }
 
@@ -673,17 +1128,23 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // Read groups (decompose_vector): lanes → group key.
     //   If any lane VReg has users, the group key's definer is implicitly used.
     let mut liveness_aliases: HashMap<VReg, Vec<VReg>> = HashMap::new();
+    // Write-group lane → group VReg. A write group is one block of VLEN words held from
+    // its first lane write to its last read (as in address assignment), so the counter
+    // tracks the group VReg and not the individual lanes.
+    let mut write_group_of: HashMap<VReg, VReg> = HashMap::new();
     if let Some(groups) = vector_group_lanes {
         for (group_vreg, lanes) in groups {
-            // Liveness release mirrors the user propagation below: a read group's key
-            // (defined by an op) is released by its lane readers; a write group's lanes
-            // are released by the alias readers.
-            if vreg_def.contains_key(group_vreg) {
-                for lane_vreg in lanes {
-                    liveness_aliases.entry(*lane_vreg).or_default().push(*group_vreg);
-                }
-            } else {
+            // Liveness release mirrors the user propagation below: every reader of a lane
+            // releases the group VReg (whose users are all lane readers), and a write
+            // group's lanes are released by the readers of the group VReg.
+            for lane_vreg in lanes {
+                liveness_aliases.entry(*lane_vreg).or_default().push(*group_vreg);
+            }
+            if !vreg_def.contains_key(group_vreg) {
                 liveness_aliases.entry(*group_vreg).or_default().extend(lanes);
+                for lane_vreg in lanes {
+                    write_group_of.insert(*lane_vreg, *group_vreg);
+                }
             }
             // Write group direction: alias users → lane VRegs
             if let Some(group_users) = vreg_users.get(group_vreg).cloned() {
@@ -756,6 +1217,15 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         }
     }
 
+    // Lane writes still to come per write group. The block is held until the last of them
+    // even when every reader of the group has already run (or none ever will).
+    let mut write_groups = WriteGroups { of: write_group_of, ..Default::default() };
+    for (lane, group) in &write_groups.of {
+        if vreg_def.get(lane).map_or(false, |def_idx| !dead_store_indices.contains(def_idx)) {
+            *write_groups.pending_writes.entry(*group).or_default() += 1;
+        }
+    }
+
     // Build reverse dependency map: op_idx -> list of consumer indices
     // This enables O(1) lookup of which ops depend on a given op
     let mut consumers: Vec<Vec<usize>> = vec![vec![]; ops.len()];
@@ -802,9 +1272,13 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     let mut scheduled: HashSet<usize> = dead_store_indices.clone();
     let ops_to_schedule = ops.len() - dead_store_indices.len();
 
+    // Readers that will be scheduled. Skipped dead stores never run, so counting them
+    // would keep their operands live forever.
     let mut vreg_remaining_users: HashMap<VReg, usize> = vreg_users
         .iter()
-        .map(|(vreg, users)| (*vreg, users.len()))
+        .map(|(vreg, users)| {
+            (*vreg, users.iter().filter(|u| !dead_store_indices.contains(u)).count())
+        })
         .collect();
     let mut live_words: usize = 0;
     let mut live_vregs: HashSet<VReg> = HashSet::new();
@@ -868,6 +1342,7 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 vreg_expiry_heap.pop();
                 if live_vregs.remove(&vreg) {
                     live_words = live_words.saturating_sub(vreg.size());
+                    trace.release(&vreg, cycle);
                 }
             } else {
                 break;
@@ -1206,7 +1681,6 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                     ops[idx].engine
                 };
                 let dest = ops[idx].dest;
-                let srcs: Vec<Operand> = ops[idx].srcs.clone();
 
                 // When fixed_shifted_ops is Some, can_shift = op is in the set (we place as shifted only those).
                 // When in fixed_shifted_ops we must place as shifted only (never VALU), so we need ALU room.
@@ -1243,18 +1717,23 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                 // Check scratch budget with same-cycle reuse model:
                 // VRegs that will be freed when this op runs (their last use) reduce pressure.
-                let words_added = dest.map_or(0, |d| d.size());
-                let mut words_freed = 0usize;
-                for src in &srcs {
-                    if let Operand::VReg(vreg) = src {
-                        // If this is the last use of vreg, it will be freed after this op
-                        if let Some(&remaining) = vreg_remaining_users.get(vreg) {
-                            if remaining == 1 && live_vregs.contains(vreg) {
-                                words_freed += vreg.size();
-                            }
-                        }
-                    }
-                }
+                let words_added = match dest.map(|d| write_groups.counted(d)) {
+                    // Later lanes of a write group land in the block its first lane reserved.
+                    Some(counted) if live_vregs.contains(&counted) => 0,
+                    Some(counted) => counted.size(),
+                    None => 0,
+                };
+                // Exactly what the release loop below frees: every value (operand, keep_live
+                // or vector-group alias) for which this op is the last remaining reader.
+                let words_freed: usize = liveness_release_vregs(&ops[idx], &liveness_aliases)
+                    .iter()
+                    .filter(|vreg| {
+                        vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
+                            && live_vregs.contains(vreg)
+                            && write_groups.releasable_at(vreg, cycle)
+                    })
+                    .map(|vreg| vreg.size())
+                    .sum();
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
                 let projected_live = live_words + words_added - words_freed;
                 if projected_live > scratch_budget {
@@ -1331,10 +1810,16 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                 // Update live tracking for destination VReg
                 if let Some(d) = dest {
-                    if vreg_remaining_users.get(&d).map_or(false, |&n| n > 0) {
-                        live_vregs.insert(d);
-                        live_words += d.size();
-                    }
+                    count_written_dest(
+                        d,
+                        cycle,
+                        &mut write_groups,
+                        &vreg_remaining_users,
+                        &mut live_vregs,
+                        &mut live_words,
+                        &mut vreg_expiry_heap,
+                        trace,
+                    );
                     // Track when this VReg was defined
                     vreg_def_cycle.insert(d, cycle as i32);
                 }
@@ -1342,23 +1827,17 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 // Update remaining users and last use cycle for source VRegs
                 // With same-cycle reuse model: VRegs can be freed immediately after their
                 // last use is scheduled, allowing other ops in the same cycle to reuse the space.
-                for vreg in &liveness_release_vregs(&srcs, &liveness_aliases) {
-                    {
-                        // Decrement remaining users count
-                        if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                            *remaining = remaining.saturating_sub(1);
-                            // Free VReg immediately when last user is scheduled (same-cycle reuse)
-                            // This is safe because reads happen before writes within a cycle.
-                            if *remaining == 0 && live_vregs.contains(vreg) {
-                                live_vregs.remove(vreg);
-                                live_words = live_words.saturating_sub(vreg.size());
-                                // Add to expiry heap for cleanup (in case it gets re-added)
-                                // Expiry is at next cycle
-                                vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, *vreg)));
-                            }
-                        }
-                    }
-                }
+                release_read_values(
+                    &ops[idx],
+                    cycle,
+                    &liveness_aliases,
+                    &write_groups,
+                    &mut vreg_remaining_users,
+                    &mut live_vregs,
+                    &mut live_words,
+                    &mut vreg_expiry_heap,
+                    trace,
+                );
 
                 // Record peak after both adds and frees, matching the same-cycle
                 // reuse model used by address assignment's interval-based liveness.
@@ -1435,7 +1914,6 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                 ops[force_idx].engine
             };
             let dest = ops[force_idx].dest;
-            let srcs: Vec<Operand> = ops[force_idx].srcs.clone();
 
             // Check slot availability - we still respect slot limits
             let can_shift = if let Some(fixed) = fixed_shifted_ops {
@@ -1447,14 +1925,9 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
             };
             let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
-            // When must_place_shifted we need ALU room; if not, defer to next cycle
-            if must_place_shifted && slots.alu_used + VLEN > 12 {
-                ready_heap.push(Reverse(((cycle + 1) as i32, force_idx)));
-                continue;
-            }
-
+            // When must_place_shifted we need ALU room for all lanes.
             let slots_ok = if must_place_shifted {
-                true
+                slots.alu_used + VLEN <= 12
             } else {
                 slots.fits(engine, can_shift)
             };
@@ -1518,23 +1991,30 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
 
                 // Update liveness (same as normal scheduling path)
                 if let Some(dest_vreg) = dest {
-                    live_vregs.insert(dest_vreg);
-                    live_words += dest_vreg.size();
+                    count_written_dest(
+                        dest_vreg,
+                        cycle,
+                        &mut write_groups,
+                        &vreg_remaining_users,
+                        &mut live_vregs,
+                        &mut live_words,
+                        &mut vreg_expiry_heap,
+                        trace,
+                    );
                     vreg_def_cycle.insert(dest_vreg, force_cycle);
                 }
 
-                for vreg in &liveness_release_vregs(&srcs, &liveness_aliases) {
-                    {
-                        if let Some(remaining) = vreg_remaining_users.get_mut(vreg) {
-                            *remaining = remaining.saturating_sub(1);
-                            if *remaining == 0 && live_vregs.contains(vreg) {
-                                live_vregs.remove(vreg);
-                                live_words = live_words.saturating_sub(vreg.size());
-                                vreg_expiry_heap.push(Reverse(((cycle + 1) as i32, *vreg)));
-                            }
-                        }
-                    }
-                }
+                release_read_values(
+                    &ops[force_idx],
+                    cycle,
+                    &liveness_aliases,
+                    &write_groups,
+                    &mut vreg_remaining_users,
+                    &mut live_vregs,
+                    &mut live_words,
+                    &mut vreg_expiry_heap,
+                    trace,
+                );
 
                 // Record peak after both adds and frees
                 peak_live_words = peak_live_words.max(live_words);
@@ -1555,6 +2035,10 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
                         ready_heap.push(Reverse((priority, consumer_idx)));
                     }
                 }
+            } else {
+                // No slot this cycle: back with the other deferred ops for the next one.
+                // (Dropping it here left the op unscheduled forever.)
+                budget_deferred.push(force_idx);
             }
         }
 
@@ -1574,6 +2058,13 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         } else {
             consecutive_empty = 0;
         }
+
+        // Counter value once every op of this cycle is placed (compared with interval
+        // liveness after the run; see `compare_counter_with_intervals`).
+        if trace.cycle_end_live.len() <= cycle {
+            trace.cycle_end_live.resize(cycle + 1, 0);
+        }
+        trace.cycle_end_live[cycle] = live_words;
 
         cycle += 1;
     }
