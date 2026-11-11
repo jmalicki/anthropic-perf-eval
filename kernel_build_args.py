@@ -74,7 +74,7 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--valu-shift", choices=["optimize", "alu", "valu"], default="optimize",
                        help="CP-SAT VALU shift (default: optimize)")
     group.add_argument("--force-zero-gap", action="store_true",
-                       help="Force 0 integral gap for proven optimality")
+                       help="Force 0 integral gap: prove the schedule optimal for the emitted ops (not for the problem)")
     group.add_argument("--asap-alap-tightening", choices=["none", "simple", "symmetry-aware", "energetic"],
                        default="energetic",
                        help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default)")

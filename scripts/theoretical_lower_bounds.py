@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compute theoretical lower bounds for kernel makespan.
+"""Compute the capacity floor for the ops one kernel emission contains.
+
+The result is conditional on the emission: a kernel that emits fewer ops has a lower
+floor, so this is not a bound on the problem. For the everyday report (same floor, plus
+per-round spans and utilisation over time) use scripts/schedule_report.py.
 
 Analyzes scheduler output JSON to compute capacity-based lower bounds,
 accounting for:
@@ -73,22 +77,13 @@ def find_optimal_shift(
     Returns:
         (best_shift, best_makespan, best_bounds)
     """
-    # Approximate optimal shift: balance VALU and ALU bounds
-    # Solve: ceil((valu - shift)/6) ≈ ceil((alu + 8*shift)/12)
-    # Approximate: shift ≈ (2*shiftable_valu - alu_count) / 10
-    optimal_shift_approx = max(0, (2 * shiftable_valu - alu_count) // 10)
-    optimal_shift_approx = min(optimal_shift_approx, shiftable_valu)
-    
     best_makespan = float("inf")
     best_shift = 0
     best_bounds = {}
-    
-    # Search around approximate optimal point
-    search_range = 50
-    for shift in range(
-        max(0, optimal_shift_approx - search_range),
-        min(shiftable_valu + 1, optimal_shift_approx + search_range),
-    ):
+
+    # Exhaustive over the shift count. (This used to search only +/-50 around an estimate
+    # that was far off for the 16-round kernel and reported 1342 where the minimum is 1271.)
+    for shift in range(shiftable_valu + 1):
         # VALU: non-shiftable + (shiftable - shifted)
         valu_remaining = non_shiftable_valu + (shiftable_valu - shift)
         # ALU: original + 8*shifted (each shifted VALU becomes 8 ALU ops)
@@ -304,6 +299,7 @@ def main():
     print(f"  Flow: {flow_count} ops → {best_bounds['Flow']} cycles")
     
     print(f"\n  Theoretical minimum makespan: {best_makespan} cycles")
+    print("  (floor for the ops this emission contains; fewer emitted ops lower it; not a bound on the problem)")
     bottlenecks = [k for k, v in best_bounds.items() if v == best_makespan]
     print(f"  Bottleneck: {bottlenecks}")
     

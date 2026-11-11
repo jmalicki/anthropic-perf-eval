@@ -43,13 +43,15 @@ The scheduler output JSON includes:
 - `peak_live` — Peak scratch usage (words)
 - `run_options.rounds` — Number of rounds
 - `run_options.batch_size` — Batch size
-- `lb_cycles` — Proven lower bound (CP-SAT only). When `lb_cycles == total_cycles`, status is OPTIMAL; otherwise FEASIBLE
+- `lb_cycles` — Solver lower bound for this emission and its encoding choices (CP-SAT only; `lb_scope` is `"emission"`). It is not a bound on the problem: emitting fewer ops lowers it. When `lb_cycles == total_cycles`, status is OPTIMAL; otherwise FEASIBLE
 - File modification date (for tracking when run occurred)
 
 **Solver status:** The JSON doesn't include an explicit `solver_status` field, but you can infer it:
-- **OPTIMAL:** `lb_cycles == total_cycles` (proven optimal)
-- **FEASIBLE:** `lb_cycles < total_cycles` or `lb_cycles` is null (found a solution but not proven optimal)
+- **OPTIMAL:** `lb_cycles == total_cycles` (optimal for the emitted ops, not for the problem)
+- **FEASIBLE:** `lb_cycles < total_cycles` or `lb_cycles` is null (found a solution, not shown optimal for the emitted ops)
 - **Greedy:** No `lb_cycles` field (greedy scheduler doesn't prove optimality)
+
+For the capacity floor of an emission and the gap to it (any scheduler), run `uv run python -m scripts.schedule_report <json>`; see [use-schedule-report](../use-schedule-report/SKILL.md).
 
 Alternatively, check the command output for "status: OPTIMAL" or "status: FEASIBLE" in the CP-SAT solver summary.
 

@@ -218,7 +218,7 @@ def print_summary(data: Dict[str, Any]):
             print(f"   Peak liveness: {json_data.get('peak_live_words', 'N/A')} words")
             print(f"   VALU shifted: {json_data.get('valu_shifted', 0)} ops")
             print(f"   Budget exceeded: {json_data.get('budget_exceeded', False)}")
-            print(f"   Lower bound cycles: {json_data.get('lb_cycles', 'N/A')}")
+            print(f"   Lower bound cycles (this emission): {json_data.get('lb_cycles', 'N/A')}")
             
             # Liveness analysis
             if 'liveness_curve' in json_data:

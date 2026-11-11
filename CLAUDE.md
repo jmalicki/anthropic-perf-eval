@@ -10,8 +10,9 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 **Performance Status:**
 - Baseline: 147,734 cycles
-- Current best (4 rounds): 485 cycles (304.6x speedup, CP-SAT 1800s, no VALU shift)
-- Current best (16 rounds): TBD
+- Current best (16 rounds, the benchmark size): 2,007 cycles (73.6x speedup; greedy via the CLI, validated). Whole-program CP-SAT did not improve on the greedy schedule in 600 s.
+- 4 rounds (development size, not comparable with the 16-round baseline): 485 cycles (CP-SAT 1800s, no VALU shift)
+- Capacity floor for the ops we emit today (16 rounds): 1,271 cycles. This is a floor for this emission (9,526 vector-op equivalents), not a bound on the problem: public kernels emit fewer ops and reach 863. See [docs/BOUND_GAP_ANALYSIS.md](docs/BOUND_GAP_ANALYSIS.md).
 - Target: 1,487 cycles (100x speedup)
 
 ## Default Problem Size
@@ -45,6 +46,7 @@ When working in this repo, read and follow these project-specific skills when th
 - **Trace IDs (semantic debugging with trace_input/trace_output)** — Read [.cursor/skills/use-trace-ids/SKILL.md](.cursor/skills/use-trace-ids/SKILL.md). Use `--enable-trace-ids` to generate kernels with semantic trace points; run with `enable_debug=True` to capture `trace_io_log` and compare trace outputs to reference to pinpoint where values diverge. Use when you need to see exact values at semantic boundaries (e.g., hash outputs per round) or verify intermediate computations.
 - **Hypothesis quantification (schedule optimization ideas)** — Read [.cursor/skills/use-schedule-hypotheses/SKILL.md](.cursor/skills/use-schedule-hypotheses/SKILL.md). Use `scripts/quantify_schedule_hypotheses.py` on scheduler output JSON to estimate impact of vbroadcast elimination, element-wise chaining, and ConstChoice; use A/B runs and bulk-move/what-if for VALU shift and precedence.
 - **Ablation analysis (ASAP/ALAP tightening)** — Read [.cursor/skills/use-ablation-analysis/SKILL.md](.cursor/skills/use-ablation-analysis/SKILL.md). Run 4-arm ablation study (baseline, slot-aware, scratch-aware, both) with `scripts/run_asap_alap_ablation.py`; analyze results with `scripts/analyze_ablation_results.py`.
+- **Schedule report (how good is this schedule?)** — Read [.cursor/skills/use-schedule-report/SKILL.md](.cursor/skills/use-schedule-report/SKILL.md). `uv run python -m scripts.schedule_report sched.json` prints per-engine floors, the capacity floor for the ops this run emitted, the gap to it, per-round cycle spans and utilisation over time; `--compare` diffs two runs. The generator prints the floor and gap after every build. The floor (and `lb_cycles`) is for this emission only, never a bound on the problem.
 - **Round progress tracking** — Read [.cursor/skills/use-round-progress/SKILL.md](.cursor/skills/use-round-progress/SKILL.md). Run kernel generation with validation and update [docs/round-progress.md](docs/round-progress.md) to track SHA vs cycles over time. Use when benchmarking different round counts, batch sizes, or configurations.
 
 ## Build & Development Commands
@@ -157,7 +159,7 @@ Scheduler options:
 - `--select-choice MODE` - SelectChoice handling: `optimize` (default), `fma`, or `vselect`
 - `--valu-shift MODE` - VALU shift handling: `optimize` (default), `alu`, or `valu`
 - `--per-section-optimize-secs SECONDS` - Per-section CP-SAT optimization time (0 or omit = feasibility only)
-- `--force-zero-gap` - Force 0 integral gap for proven optimality (auto uses 2h time limit)
+- `--force-zero-gap` - Force 0 integral gap: prove the schedule optimal for the emitted ops and encoding choices, not for the problem (auto uses 2h time limit)
 - `--asap-alap-tightening {none,simple,symmetry-aware,energetic}` - ASAP/ALAP tightening mode (default: energetic). See [docs/ASAP_ALAP_SLOT_TIGHTENING.md](docs/ASAP_ALAP_SLOT_TIGHTENING.md).
 - `--enable-scratch-tightening` - Non-default debugging: scratch-aware domain tightening (default: disabled)
 - `--bulk-move` - Enable bulk-move compaction after CP-SAT to eliminate empty cycles. **Off by default:** CP-SAT should produce schedules without empty cycles; bulk-move merely masks solver/model bugs rather than fixing them, and is buggy (can cause same-cycle scratch write conflicts). Use only for experimenting; do not rely on it for production.

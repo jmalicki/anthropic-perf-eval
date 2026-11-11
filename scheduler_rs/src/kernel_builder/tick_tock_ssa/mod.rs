@@ -87,7 +87,9 @@ pub struct SsaScheduleResult {
     pub ssa_ops: Option<Vec<SsaOp>>,
     /// Op IDs of vbroadcasts eliminated by CP-SAT (not emitted; consumers use scalar producer). Empty for greedy.
     pub eliminated_vbroadcast_ops: Vec<usize>,
-    /// Proven lower bound on cycles (CP-SAT only). When Optimal, equals cycles; when Feasible, solver best_bound in cycles.
+    /// Solver lower bound on cycles for this emission and its encoding choices (CP-SAT only).
+    /// When Optimal, equals cycles; when Feasible, solver best_bound in cycles. Not a bound on
+    /// the problem: emitting fewer ops lowers it.
     pub lb_cycles: Option<usize>,
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
