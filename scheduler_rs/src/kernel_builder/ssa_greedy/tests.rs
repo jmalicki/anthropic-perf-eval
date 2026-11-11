@@ -3685,9 +3685,29 @@ fn test_liveness_agreement_property_extended() {
 
 /// Regression: a force-schedule candidate that finds no free slot stays queued.
 ///
-/// The force path used to drop it, and the run ended with "Scheduling failed: only
-/// scheduled 16/21 ops". Case 706 of this seed (budget 16) is the program that showed it.
+/// With budget 2, cycle 0 places the two constants on both Load slots. The ConstChoice
+/// would still fit on Flow, so it is deferred for budget, not for slots. The force path
+/// then tries it on its Load engine, finds Load full, and used to drop it: the run ended
+/// with "Scheduling failed: only scheduled 5/6 ops ... Ready but unscheduled".
 #[test]
 fn test_force_schedule_without_slot_keeps_op() {
-    check_liveness_agreement_property(2u64.wrapping_mul(0xD6E8_FEB8_6659_FD93), 707);
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const_force(200); // op 0
+    let c2 = emit.emit_const_force(300); // op 1
+    let k = emit.emit_const_choice(5); // op 2
+    let s = emit.emit_alu(Opcode::Add, c1, c2);
+    let t = emit.emit_alu(Opcode::Add, s, k);
+    emit.emit_store(k, t);
+
+    let (_, agreement) =
+        schedule_for_agreement(&mut emit, &HashMap::new(), false, 2, &GreedyPolicy)
+            .expect("the deferred ConstChoice must not be dropped");
+
+    assert!(agreement.agrees(), "{}", agreement);
+    assert!(emit.ops.iter().all(|op| op.cycle >= 0), "every op must be scheduled");
+    // The scenario the test is about: Load was full in cycle 0, and the ConstChoice,
+    // deferred there, was placed in a later cycle.
+    assert_eq!((emit.ops[0].cycle, emit.ops[1].cycle), (0, 0), "constants fill Load in cycle 0");
+    assert_eq!(emit.ops[2].opcode, Opcode::ConstChoice);
+    assert!(emit.ops[2].cycle > 0, "ConstChoice placed after cycle 0");
 }
