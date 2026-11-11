@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_FROM_PROJECT_ROOT: "1"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  # scheduler_rs unit tests (debug profile, --features cpsat).
+  rust:
+    name: Rust tests (scheduler_rs)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
+        run: |
+          brew install or-tools
+          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
+          brew list --versions or-tools protobuf abseil
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: test
+
+      # Creates .venv with the pinned Python (.python-version); the scripts point PYO3_PYTHON at it.
+      - name: Create project venv
+        run: uv sync
+
+      - name: Rust tests
+        run: ./scripts/test.sh rust
+
+  # Release build of the extension, then everything that imports it.
+  python:
+    name: Python tests, proofs, kernel builds
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
+        run: |
+          brew install or-tools
+          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
+          brew list --versions or-tools protobuf abseil
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: release
+
+      - name: Create project venv
+        run: uv sync
+
+      - name: Build scheduler_rs (release)
+        run: ./scripts/build_scheduler_rs.sh --release
+
+      - name: Python tests
+        run: ./scripts/test.sh python
+
+      - name: Z3 proofs
+        run: ./scripts/test.sh proofs
+
+      - name: Kernel builds (greedy 2-round and 16-round, replay + validation)
+        run: ./scripts/test.sh kernel
