@@ -2091,6 +2091,107 @@ fn test_greedy_barrier_mode_spellings() {
 }
 
 // =========================================================================
+// Greedy schedule shape: wavefront priority
+// =========================================================================
+
+/// Barriers off and the wavefront priority with its default stagger and window.
+fn configure_wavefront(config: &mut KernelConfig) {
+    use crate::kernel_builder::config::{GreedyBarrierMode, GreedyPriorityKind};
+    config.compiler.greedy_barriers = GreedyBarrierMode::None;
+    config.compiler.greedy_priority = GreedyPriorityKind::Wavefront;
+}
+
+/// On the real 8-round kernel the wavefront priority runs gather rounds of some groups
+/// alongside select rounds of others: the schedule is much shorter than the default, the
+/// last round starts long before the first gather round ends, and the slot limits and the
+/// scratch budget hold.
+#[test]
+fn test_wavefront_staggers_groups_on_real_kernel() {
+    let rounds = 8;
+    let default = schedule_shape_kernel(rounds, |_| {});
+    let wavefront = schedule_shape_kernel(rounds, configure_wavefront);
+
+    assert_slot_limits_hold(&wavefront);
+    assert!(!wavefront.budget_exceeded, "wavefront exceeded the scratch budget");
+    assert!(
+        wavefront.address_result.peak_live <= SCRATCH_BUDGET_HW,
+        "peak_live {} over the scratch budget",
+        wavefront.address_result.peak_live
+    );
+    assert!(
+        wavefront.cycles * 10 <= default.cycles * 9,
+        "wavefront {} cycles is not at least 10% shorter than the default {}",
+        wavefront.cycles,
+        default.cycles
+    );
+    let spans = round_cycle_spans(&wavefront, rounds);
+    // Round 4 is the first gather round (tree depth 4); round 7 is the last round.
+    assert!(
+        spans[7].0 < spans[4].1,
+        "round 7 starts at {} but round 4 ends at {}: groups are not staggered",
+        spans[7].0,
+        spans[4].1
+    );
+}
+
+/// The wavefront schedule is a function of its inputs: two builds give the same cycle for
+/// every op.
+#[test]
+fn test_wavefront_is_deterministic() {
+    let cycles = |result: &SsaScheduleResult| -> Vec<(usize, i32)> {
+        result.ssa_ops.as_ref().unwrap().iter().map(|op| (op.id, op.cycle)).collect()
+    };
+    let a = schedule_shape_kernel(4, configure_wavefront);
+    let b = schedule_shape_kernel(4, configure_wavefront);
+    assert_eq!(a.cycles, b.cycles);
+    assert_eq!(cycles(&a), cycles(&b));
+}
+
+/// A smaller in-flight window uses less scratch.
+#[test]
+fn test_wavefront_window_bounds_scratch() {
+    let peak = |groups_in_flight: usize| -> usize {
+        schedule_shape_kernel(8, |c| {
+            configure_wavefront(c);
+            c.compiler.greedy_groups_in_flight = groups_in_flight;
+        })
+        .address_result
+        .peak_live
+    };
+    let (narrow, wide) = (peak(4), peak(16));
+    assert!(narrow < wide, "4 groups in flight peak {} is not below 16 groups' {}", narrow, wide);
+}
+
+/// The priority spellings accepted by the CLI and the Python binding, and the shape they
+/// configure.
+#[test]
+fn test_greedy_priority_spellings_and_shape() {
+    use crate::kernel_builder::config::{CompilerConfig, GreedyPriorityKind};
+    use crate::kernel_builder::ssa_greedy::GreedyPriority;
+    assert_eq!(GreedyPriorityKind::from_str("fifo"), Ok(GreedyPriorityKind::Fifo));
+    assert_eq!(GreedyPriorityKind::from_str("wavefront"), Ok(GreedyPriorityKind::Wavefront));
+    assert!(GreedyPriorityKind::from_str("lifo").is_err());
+    for kind in [GreedyPriorityKind::Fifo, GreedyPriorityKind::Wavefront] {
+        assert_eq!(GreedyPriorityKind::from_str(kind.as_str()), Ok(kind));
+    }
+
+    let mut compiler = CompilerConfig::default();
+    assert_eq!(compiler.greedy_shape().priority, GreedyPriority::Fifo);
+    compiler.greedy_priority = GreedyPriorityKind::Wavefront;
+    compiler.greedy_stagger_cycles = 7;
+    compiler.greedy_groups_in_flight = 0;
+    assert_eq!(
+        compiler.greedy_shape().priority,
+        GreedyPriority::Wavefront { stagger_cycles: 7, groups_in_flight: None }
+    );
+    compiler.greedy_groups_in_flight = 5;
+    assert_eq!(
+        compiler.greedy_shape().priority,
+        GreedyPriority::Wavefront { stagger_cycles: 7, groups_in_flight: Some(5) }
+    );
+}
+
+// =========================================================================
 // Hint pass tests (ConstChoice, SelectChoice, VALU shift)
 // =========================================================================
 

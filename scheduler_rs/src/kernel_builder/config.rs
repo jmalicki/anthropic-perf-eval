@@ -202,6 +202,53 @@ impl GreedyBarrierMode {
     }
 }
 
+/// Ready-queue order of the greedy scheduler (`--greedy-priority`).
+///
+/// See `ssa_greedy::wavefront` for the wavefront key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GreedyPriorityKind {
+    /// First-come-first-served by ready cycle, then emission order (default).
+    #[default]
+    Fifo,
+    /// Stagger the independent group chains (`greedy_stagger_cycles`, `greedy_groups_in_flight`).
+    Wavefront,
+}
+
+impl GreedyPriorityKind {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"fifo"` or `"wavefront"`
+    ///
+    /// # Returns
+    /// The kind, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "fifo" => Ok(GreedyPriorityKind::Fifo),
+            "wavefront" => Ok(GreedyPriorityKind::Wavefront),
+            other => Err(format!(
+                "Invalid greedy_priority '{}': must be 'fifo' or 'wavefront'",
+                other
+            )),
+        }
+    }
+
+    /// The CLI/binding spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GreedyPriorityKind::Fifo => "fifo",
+            GreedyPriorityKind::Wavefront => "wavefront",
+        }
+    }
+}
+
+/// Default virtual start delay between consecutive group chains, in cycles
+/// (`--greedy-stagger-cycles`). About three quarters of one round's critical path.
+pub const DEFAULT_GREEDY_STAGGER_CYCLES: u32 = 12;
+
+/// Default number of group chains allowed to run at once (`--greedy-groups-in-flight`).
+pub const DEFAULT_GREEDY_GROUPS_IN_FLIGHT: usize = 16;
+
 /// Compilation concern: how to optimize and schedule.
 ///
 /// Controls scheduling and optimization passes — these don't affect
@@ -237,6 +284,12 @@ pub struct CompilerConfig {
     pub enable_schedule_with_fixed_choices: bool,
     /// Whether round barriers constrain the greedy scheduler (default: `Round`).
     pub greedy_barriers: GreedyBarrierMode,
+    /// Ready-queue order of the greedy scheduler (default: `Fifo`).
+    pub greedy_priority: GreedyPriorityKind,
+    /// Wavefront priority: virtual start delay between consecutive group chains, in cycles.
+    pub greedy_stagger_cycles: u32,
+    /// Wavefront priority: group chains allowed to run at once; 0 = no limit.
+    pub greedy_groups_in_flight: usize,
 }
 
 impl Default for CompilerConfig {
@@ -252,6 +305,26 @@ impl Default for CompilerConfig {
             enable_valu_shift_hint_pass: false,
             enable_schedule_with_fixed_choices: false,
             greedy_barriers: GreedyBarrierMode::default(),
+            greedy_priority: GreedyPriorityKind::default(),
+            greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
+            greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
+        }
+    }
+}
+
+impl CompilerConfig {
+    /// Schedule-shape switches for the greedy scheduler, as configured here.
+    pub fn greedy_shape(&self) -> super::ssa_greedy::GreedyShape {
+        use super::ssa_greedy::{GreedyPriority, GreedyShape};
+        GreedyShape {
+            priority: match self.greedy_priority {
+                GreedyPriorityKind::Fifo => GreedyPriority::Fifo,
+                GreedyPriorityKind::Wavefront => GreedyPriority::Wavefront {
+                    stagger_cycles: self.greedy_stagger_cycles,
+                    groups_in_flight: (self.greedy_groups_in_flight > 0)
+                        .then_some(self.greedy_groups_in_flight),
+                },
+            },
         }
     }
 }
