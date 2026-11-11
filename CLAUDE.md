@@ -178,10 +178,12 @@ Scheduler options:
 Emission options (change which ops the kernel contains; all off by default, each backed by a Z3 proof in `verification/rewrites.py`; measurements in [docs/EMISSION_ABLATION.md](docs/EMISSION_ABLATION.md)):
 - `--merge-hash-stages` - Hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per hash instead of 11 (proof `R8-hash-stage-merge`).
 - `--index-form {zero-based,mirrored}` - Tree index representation between rounds (default: `zero-based`). `mirrored` tracks `n = L_d - idx` (position in the level from the right, `L_d = 2^(d+1) - 2`): index update in 2 vector ops instead of 3, none at depth 0 and in the wrap round. The initial indices are assumed 0 (as the root broadcast in round 0 already assumes) and not loaded; the final indices are still stored and validated (proofs `R9` to `R11`).
+- `--prune-dead-index` - Zero-based index form only: do not emit index work whose result is known. At depth 0 every index is 0, so the update needs no multiply_add and the initial indices are not loaded; the wrap round shares one zero vector. Output unchanged (proof `R12-index-update-from-root`). No effect with `--index-form mirrored`, which has none of this work.
+- `--values-only` - **Changes the output:** the final indices are not stored, only the values (all the upstream tests compare). The last round's index update and everything else that only fed the index store is then removed by DCE. `--validate` compares values only under this flag and says so; the saved kernel JSON records `values_only` so `--validate-only` does the same.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
-- `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
+- `--validate` - Validate against reference kernel (final values and final indices; values only with `--values-only`). **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.
 - `--no-dataflow-check` - With `--validate`, skip the symbolic kernel-vs-SSA replay that runs before numeric validation.
 - `--validate-only PATH` - Load kernel from JSON and run validation only (no build).
 - `--save-kernel PATH` - Save kernel to this path (default when `--validate`: `kernel_to_validate.json`).

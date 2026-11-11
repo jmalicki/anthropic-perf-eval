@@ -84,12 +84,15 @@ impl SsaTickTockKernelBuilder {
             .map(|g| self.ctx.all_val[g].unwrap())
             .collect();
         // `tree_depth` is now the depth the indices are at after the last round.
-        let store_data_idxs: Vec<crate::types::VReg> = (0..n_groups)
-            .map(|g| self.final_index(g, tree_depth))
-            .collect();
+        // With values_only nothing is stored for the indices, so nothing is converted either.
+        let store_data_idxs: Option<Vec<crate::types::VReg>> = if self.config.spec.values_only {
+            None
+        } else {
+            Some((0..n_groups).map(|g| self.final_index(g, tree_depth)).collect())
+        };
 
         // Store data
-        self.emit_store_data(n_groups, &store_data_idxs, &store_data_vals);
+        self.emit_store_data(n_groups, store_data_idxs.as_deref(), &store_data_vals);
     }
 
     // =========================================================================
@@ -536,7 +539,8 @@ impl SsaTickTockKernelBuilder {
         let val_p = self.ctx.val_p.unwrap();
         // The mirrored index starts at n = 0 (`all_idx[g] = None`): the initial indices are
         // taken to be 0, as the root broadcast of round 0 already assumes, and not loaded.
-        let load_idx = !self.mirrored_index();
+        // prune_dead_index makes the same assumption for the zero-based form.
+        let load_idx = !self.mirrored_index() && !self.config.spec.prune_dead_index;
 
         for g in (0..n_groups).step_by(2) {
             let offset_a = (g * VLEN) as i64;
@@ -579,40 +583,41 @@ impl SsaTickTockKernelBuilder {
         }
     }
 
+    /// Emit the final stores.
+    ///
+    /// # Arguments
+    /// * `n_groups` - Number of groups.
+    /// * `store_data_idxs` - Per-group reference index vectors, or `None` to store no
+    ///   indices (`ProblemSpec::values_only`).
+    /// * `store_data_vals` - Per-group value vectors (true form).
     pub(super) fn emit_store_data(
         &mut self,
         n_groups: usize,
-        store_data_idxs: &[crate::types::VReg],
+        store_data_idxs: Option<&[crate::types::VReg]>,
         store_data_vals: &[crate::types::VReg],
     ) {
-        assert_eq!(store_data_idxs.len(), n_groups);
+        if let Some(idxs) = store_data_idxs {
+            assert_eq!(idxs.len(), n_groups);
+        }
         assert_eq!(store_data_vals.len(), n_groups);
 
         let idx_p = self.ctx.idx_p.unwrap();
         let val_p = self.ctx.val_p.unwrap();
 
-        for g in (0..n_groups).step_by(2) {
-            let offset_a = (g * VLEN) as i64;
+        for g in 0..n_groups {
+            let offset = (g * VLEN) as i64;
             self.emit.set_next_var_type(VarType::Constant);
-            let off_a = self.emit.emit_const_choice(offset_a);
-            self.emit.set_next_var_type(VarType::Address);
-            let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
-            self.emit.set_next_var_type(VarType::Address);
-            let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit.emit_vstore(idx_addr_a, store_data_idxs[g]);
-            self.emit.emit_vstore(val_addr_a, store_data_vals[g]);
-
-            if g + 1 < n_groups {
-                let offset_b = ((g + 1) * VLEN) as i64;
-                self.emit.set_next_var_type(VarType::Constant);
-                let off_b = self.emit.emit_const_choice(offset_b);
+            let off = self.emit.emit_const_choice(offset);
+            let idx_addr = store_data_idxs.map(|_| {
                 self.emit.set_next_var_type(VarType::Address);
-                let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
-                self.emit.set_next_var_type(VarType::Address);
-                let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
-                self.emit.emit_vstore(idx_addr_b, store_data_idxs[g + 1]);
-                self.emit.emit_vstore(val_addr_b, store_data_vals[g + 1]);
+                self.emit.emit_alu(Opcode::Add, idx_p, off)
+            });
+            self.emit.set_next_var_type(VarType::Address);
+            let val_addr = self.emit.emit_alu(Opcode::Add, val_p, off);
+            if let (Some(idxs), Some(idx_addr)) = (store_data_idxs, idx_addr) {
+                self.emit.emit_vstore(idx_addr, idxs[g]);
             }
+            self.emit.emit_vstore(val_addr, store_data_vals[g]);
         }
     }
 
@@ -1269,7 +1274,7 @@ impl SsaTickTockKernelBuilder {
                         self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, left, right));
                         continue;
                     }
-                    
+
                     // Debug: log Round N hash reading Round N-1 hash (or initial value)
                     if debug && hi == 0 && it == 0 && i == 0 {
                         eprintln!(
@@ -1398,8 +1403,6 @@ impl SsaTickTockKernelBuilder {
                     continue;
                 }
 
-                let idx = self.ctx.all_idx[g].unwrap();
-                
                 // Debug: log what VReg all_val[g] contains when branch runs
                 let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
                 if debug {
@@ -1410,11 +1413,23 @@ impl SsaTickTockKernelBuilder {
                     );
                 }
 
+                let prune = self.config.spec.prune_dead_index;
                 if is_wrap_round {
                     // Wrap to index 0
-                    self.ctx.all_idx[g] = Some(self.emit.emit_vbroadcast_force(zero));
+                    self.ctx.all_idx[g] = Some(if prune {
+                        // One shared vector of zeros for every group.
+                        self.v_constant(0)
+                    } else {
+                        self.emit.emit_vbroadcast_force(zero)
+                    });
+                } else if prune && tree_depth == 0 {
+                    // Every index is 0 at depth 0, so idx * 2 + offset is the offset
+                    // (R12-index-update-from-root).
+                    let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+                    self.ctx.all_idx[g] = Some(self.emit.emit_valu(Opcode::Sub, v_2, bit));
                 } else {
                     // Normal branching: idx = idx * 2 + (2 - (val & 1))
+                    let idx = self.ctx.all_idx[g].unwrap();
                     let bit = self.emit.emit_valu(Opcode::And, val, v_1);
                     let offset = self.emit.emit_valu(Opcode::Sub, v_2, bit);
                     let fma_result = self.emit.emit_fma(idx, v_2, offset);

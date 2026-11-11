@@ -130,6 +130,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "in the level from the right): index update in 2 vector ops instead of 3, none at "
                             "depth 0 and in the wrap round; initial indices are assumed 0 and not loaded "
                             "(proofs: R9 to R11 in verification/rewrites.py)")
+    group.add_argument("--prune-dead-index", action="store_true", default=False,
+                       help="Zero-based index form: do not emit index work whose result is known. At depth 0 "
+                            "every index is 0, so the update needs no multiply_add and the initial indices are "
+                            "not loaded; the wrap round shares one zero vector. Output unchanged (proof: "
+                            "R12-index-update-from-root). No effect with --index-form mirrored, which has none "
+                            "of this work")
+    group.add_argument("--values-only", action="store_true", default=False,
+                       help="CHANGES THE OUTPUT: do not store the final indices, only the values (which is all "
+                            "the upstream tests compare). The last round's index update and everything else "
+                            "that only fed the index store is then dead and removed. --validate checks values "
+                            "only under this flag")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -273,6 +284,8 @@ def args_to_build_kwargs(
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "merge_hash_stages": get("merge_hash_stages", False),
         "index_form": get("index_form", "zero-based"),
+        "prune_dead_index": get("prune_dead_index", False),
+        "values_only": get("values_only", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -319,6 +332,8 @@ def args_to_build_kwargs(
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "merge_hash_stages": get("merge_hash_stages", False),
         "index_form": get("index_form", "zero-based"),
+        "prune_dead_index": get("prune_dead_index", False),
+        "values_only": get("values_only", False),
     }
 
 

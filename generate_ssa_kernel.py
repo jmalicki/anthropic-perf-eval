@@ -74,6 +74,7 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
+            values_only=args.values_only,
         )
 
     use_cpsat = not args.use_greedy
@@ -171,6 +172,7 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
+            values_only=args.values_only,
         )
         print(f"\n  Kernel saved to {kernel_path} (rerun with --validate-only {kernel_path})")
 
@@ -191,9 +193,10 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
+            values_only=args.values_only,
         )
         if correct:
-            print(f"  PASSED - kernel produces correct output")
+            print(f"  {passed_message(args.values_only)}")
         else:
             print(f"  FAILED - kernel produces incorrect output")
             return 1
@@ -202,12 +205,25 @@ def main():
 
 
 # Emission options and their defaults (kernel_build_args.py "Emission options").
-EMISSION_DEFAULTS = {"merge_hash_stages": False, "index_form": "zero-based"}
+EMISSION_DEFAULTS = {
+    "merge_hash_stages": False,
+    "index_form": "zero-based",
+    "prune_dead_index": False,
+    "values_only": False,
+}
 
 
 def emission_options(build_kwargs):
     """Emission options that differ from their defaults, for the run header."""
     return {k: build_kwargs[k] for k, default in EMISSION_DEFAULTS.items() if build_kwargs.get(k, default) != default}
+
+
+def passed_message(values_only):
+    """The validation verdict line; says so when only the values were compared."""
+    if values_only:
+        return ("PASSED (values only) - kernel produces correct values; --values-only kernels do not "
+                "store the final indices, so indices were not compared")
+    return "PASSED - kernel produces correct output"
 
 
 def print_schedule_report(scheduler_json_path, full):
@@ -266,6 +282,7 @@ def load_kernel_from_json(path):
             "batch_size": data.get("batch_size"),
             "rounds": data.get("rounds"),
             "seed": data.get("seed"),
+            "values_only": bool(data.get("values_only", False)),
         }
     else:
         raw = data
@@ -293,7 +310,7 @@ def simulator_cycles(instrs):
     return counted, len(instrs) - counted
 
 
-def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed):
+def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed, values_only=False):
     """Save instruction list and problem params to JSON so --validate-only uses same params."""
     serializable = []
     for bundle in instrs:
@@ -306,13 +323,14 @@ def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed):
         "batch_size": batch_size,
         "rounds": rounds,
         "seed": seed,
+        "values_only": bool(values_only),
         "instrs": serializable,
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
 
-def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed):
+def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed, values_only=False):
     """Load kernel from JSON and run validation only (no build). Uses params from file if saved."""
     print(f"Loading kernel from {kernel_path}...")
     instrs, saved_params = load_kernel_from_json(kernel_path)
@@ -324,17 +342,25 @@ def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed):
         print(f"  Loaded {len(instrs)} instructions; params from file: forest_height={forest_height}, batch_size={batch_size}, rounds={rounds}, seed={seed}")
     else:
         print(f"  Loaded {len(instrs)} instructions; params from CLI: forest_height={forest_height}, batch_size={batch_size}, rounds={rounds}, seed={seed}")
+    # A kernel saved by a --values-only build says so; --values-only on the command line
+    # covers kernels saved without that field.
+    values_only = values_only or bool(saved_params and saved_params.get("values_only"))
     print("\nValidating against reference kernel...")
-    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed)
+    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=values_only)
     if correct:
-        print("  PASSED - kernel produces correct output")
+        print(f"  {passed_message(values_only)}")
         return 0
     print("  FAILED - kernel produces incorrect output")
     return 1
 
 
-def validate_kernel(instrs, forest_height, batch_size, rounds, seed):
-    """Validate kernel against reference implementation."""
+def validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=False):
+    """Validate kernel against reference implementation.
+
+    Compares the final values and the final indices with reference_kernel2. With
+    values_only (kernels built with --values-only, which do not store indices) only the
+    values are compared, which is what the upstream tests check.
+    """
     from problem import (
         Machine, Tree, Input, build_mem_image, reference_kernel2, N_CORES, DebugInfo
     )
@@ -387,7 +413,7 @@ def validate_kernel(instrs, forest_height, batch_size, rounds, seed):
     ref_indices = ref_mem[inp_indices_p : inp_indices_p + batch_size]
 
     values_correct = got_values == ref_values
-    indices_correct = got_indices == ref_indices
+    indices_correct = values_only or got_indices == ref_indices
 
     if not values_correct:
         first_bad = next(i for i in range(batch_size) if got_values[i] != ref_values[i])
