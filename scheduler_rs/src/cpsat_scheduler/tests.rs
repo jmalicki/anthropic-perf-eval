@@ -6124,3 +6124,75 @@ mod tuning_tests {
         assert_eq!(params.stop_after_first_solution, Some(true));
     }
 }
+
+// ============================================================================
+// CP-SAT tuning: objective
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_objective_tests {
+    use super::*;
+    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+    use crate::types::Opcode;
+
+    /// Four independent chains of shiftable vector adds behind a select: enough work that
+    /// the vector engine (one slot here) and the mode choices decide the makespan.
+    fn toy_ops() -> Vec<SsaOp> {
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let c1 = emit.emit_const(1);
+        let v0 = emit.emit_vbroadcast(c0);
+        let v1 = emit.emit_vbroadcast(c1);
+        let cond = emit.emit_valu(Opcode::Eq, v0, v1);
+        for _ in 0..4 {
+            let sel = emit.emit_select_choice(cond, v0, v1);
+            let a = emit.emit_valu(Opcode::Add, sel, v1);
+            let b = emit.emit_valu(Opcode::Xor, a, v0);
+            let _c = emit.emit_valu(Opcode::Add, b, v1);
+        }
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        emit.ops
+    }
+
+    fn solve(ops: &[SsaOp], objective: CpsatObjective) -> SsaCpsatResult {
+        let config = SsaCpsatConfig {
+            time_limit_secs: 30.0,
+            verbose: false,
+            enable_valu_shift: true,
+            machine: MachineConfig { valu_slots: 2, ..Default::default() },
+            asap_alap_tightening: AsapAlapTightening::None,
+            force_zero_gap: true,
+            tuning: CpsatTuning { objective, ..Default::default() },
+            ..Default::default()
+        };
+        schedule_ssa_cpsat(ops, config, SsaCpsatHints::default(), None)
+            .expect("post-solve validation")
+            .expect("a schedule")
+    }
+
+    /// Dropping the tie-breaker must not change the optimal makespan, and the bound the
+    /// solver reports must still be read as cycles (the objective has no scale factor then).
+    #[test]
+    fn test_makespan_only_objective_reaches_the_same_optimal_makespan() {
+        let ops = toy_ops();
+        let with_tie = solve(&ops, CpsatObjective::MakespanTiebreak);
+        let makespan_only = solve(&ops, CpsatObjective::Makespan);
+        assert_eq!(with_tie.status, CpsatStatus::Optimal);
+        assert_eq!(makespan_only.status, CpsatStatus::Optimal);
+        assert_eq!(makespan_only.makespan, with_tie.makespan);
+        assert_eq!(makespan_only.lb_cycles, Some(makespan_only.makespan));
+        assert_eq!(with_tie.lb_cycles, Some(with_tie.makespan));
+    }
+
+    #[test]
+    fn test_objective_json_names() {
+        let tuning = CpsatTuning::from_json(Some(r#"{"objective": "makespan"}"#)).unwrap();
+        assert_eq!(tuning.objective, CpsatObjective::Makespan);
+        let tuning = CpsatTuning::from_json(Some(r#"{"objective": "makespan+tiebreak"}"#)).unwrap();
+        assert_eq!(tuning.objective, CpsatObjective::MakespanTiebreak);
+        assert_eq!(CpsatTuning::default().objective, CpsatObjective::MakespanTiebreak);
+        assert!(CpsatTuning::default().to_json().contains(r#""objective":"makespan+tiebreak""#));
+        assert!(CpsatTuning::from_json(Some(r#"{"objective": "sum"}"#)).is_err());
+    }
+}

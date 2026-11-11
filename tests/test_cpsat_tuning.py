@@ -160,3 +160,43 @@ def test_explicit_defaults_build_the_default_kernel(tmp_path):
     _, same_model, _, same_kernel = _run(tmp_path, "explicit", ["--cpsat-workers", "8", "--cpsat-interleave"])
     assert not _model_diff(base_model, same_model)
     assert base_kernel.read_bytes() == same_kernel.read_bytes()
+
+
+def _variables(model):
+    """name -> (index, lower bound, upper bound) for the named variables of an exported model."""
+    return {v.name: (i, v.domain[0], v.domain[-1]) for i, v in enumerate(model.variables) if v.name}
+
+
+# ----------------------------------------------------------------------------
+# Objective
+# ----------------------------------------------------------------------------
+
+def test_default_objective_has_the_tie_breaker(tmp_path):
+    _, model_path, _, _ = _run(tmp_path, "base", [])
+    model = diff_cpsat_models.load(str(model_path))
+    variables = _variables(model)
+    assert len(model.objective.vars) > 1, "makespan plus one completion term per op"
+    assert any(name.startswith("shift_chosen_cycle_") for name in variables)
+    assert any(c.name == "tie_sum_completion" for c in model.constraints)
+
+
+def test_makespan_only_objective_reaches_the_solver(tmp_path):
+    output, model_path, sched, _ = _run(tmp_path, "makespan", ["--cpsat-objective", "makespan"], quiet=False)
+    model = diff_cpsat_models.load(str(model_path))
+    variables = _variables(model)
+    assert list(model.objective.vars) == [variables["makespan"][0]]
+    assert list(model.objective.coeffs) == [1]
+    assert not any("chosen_cycle" in name for name in variables), "tie-breaker auxiliaries must be gone"
+    assert not any(c.name == "tie_sum_completion" for c in model.constraints)
+    assert "absolute_gap_limit" not in _solver_parameters(output), "that limit is a fraction of the tie-breaker scale"
+    with open(sched) as f:
+        data = json.load(f)
+    assert data["run_options"]["cpsat_tuning"]["objective"] == "makespan"
+    # The bound is reported in cycles (no scale factor to divide out).
+    assert 0 < data["lb_cycles"] <= data["total_cycles"]
+
+
+def test_explicit_default_objective_is_the_default_model(tmp_path):
+    _, base, _, _ = _run(tmp_path, "base", [])
+    _, same, _, _ = _run(tmp_path, "explicit", ["--cpsat-objective", "makespan+tiebreak"])
+    assert not _model_diff(base, same)

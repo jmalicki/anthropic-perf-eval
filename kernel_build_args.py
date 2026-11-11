@@ -81,6 +81,7 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_subsolvers", "subsolvers"),
     ("cpsat_extra_subsolvers", "extra_subsolvers"),
     ("cpsat_ignore_subsolvers", "ignore_subsolvers"),
+    ("cpsat_objective", "objective"),
 ]
 
 
@@ -121,6 +122,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Add full-problem subsolvers, e.g. objective_lb_search,objective_shaving")
     group.add_argument("--cpsat-ignore-subsolvers", type=_name_list, default=None, metavar="NAME,...",
                        help="Remove subsolvers (full-problem or LNS) by name")
+    group.add_argument("--cpsat-objective", choices=["makespan+tiebreak", "makespan"], default=None,
+                       help="CP-SAT objective (default: makespan+tiebreak = scale*makespan + sum of op "
+                            "completion cycles). 'makespan' drops the tie-breaker: the solve stops once the "
+                            "makespan is proved, and the schedule returned is not left-packed.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",

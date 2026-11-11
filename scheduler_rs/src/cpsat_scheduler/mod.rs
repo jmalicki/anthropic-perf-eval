@@ -175,7 +175,7 @@ mod tests;
 
 // Re-exports: all public items from sub-modules
 pub use config::{
-    ConstChoiceMode, CpsatResult, CpsatStatus, CpsatTuning, OptionalConstraintGroup,
+    ConstChoiceMode, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning, OptionalConstraintGroup,
     SelectChoiceMode, ValuShiftMode,
 };
 pub use legacy::{compute_asap, compute_alap};
