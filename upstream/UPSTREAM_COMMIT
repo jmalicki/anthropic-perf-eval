@@ -1,0 +1,7 @@
+repo:   https://github.com/anthropics/original_performance_takehome
+commit: 5452f74bd977807ac2e74f3d29432b9df6f25197
+
+Vendored unchanged (hashes in SHA256SUMS): problem.py, tests/frozen_problem.py,
+tests/submission_tests.py. perf_takehome.py in this directory is a local shim, not
+the upstream file (upstream's hashes to
+af14cbb2e8666aaba375aa6875e731b176875cb89b6f870473ae05cda979c15d).

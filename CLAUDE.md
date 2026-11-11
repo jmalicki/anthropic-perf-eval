@@ -93,6 +93,10 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 # Python: submission tests (end-to-end pipeline)
 uv run tests/submission_tests.py
+
+# Upstream check: 16-round kernel on the unmodified upstream simulator and tests (vendored in upstream/)
+./scripts/check_upstream.sh                 # greedy smoke check; pass generate_ssa_kernel.py options for CP-SAT
+./scripts/check_upstream.sh --kernel kernel_to_validate.json   # test a saved kernel
 ```
 
 `uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
@@ -337,6 +341,8 @@ Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-
 ## Validation
 
 All kernels are validated against `reference_kernel2()` in `problem.py`. The kernel must produce identical outputs to be considered correct.
+
+`problem.py` here differs from upstream (8-word header instead of 7, rewritten `reference_kernel2`, extra debug ops), and the root `frozen_problem.py` re-exports it, so `tests/submission_tests.py` is **not** the upstream oracle. The upstream oracle is `./scripts/check_upstream.sh`: it runs the unmodified upstream `tests/submission_tests.py` and `frozen_problem.py` (vendored in `upstream/`, pinned by `upstream/UPSTREAM_COMMIT` and `upstream/SHA256SUMS`) on a saved kernel. Never edit the vendored files.
 
 ```bash
 # Validate (default uses KernelBuilder = SSA; --rust-builder calls build_tick_tock_kernel_ssa directly)

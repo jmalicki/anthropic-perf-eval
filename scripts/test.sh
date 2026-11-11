@@ -6,6 +6,7 @@
 #   ./scripts/test.sh python     # pytest: interface, dataflow replay, forced modes, proofs
 #   ./scripts/test.sh proofs     # Z3: liveness theorems and rewrite identities
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
+#   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
 #
 # Extra arguments after the suite name are passed through, e.g.
 #   ./scripts/test.sh rust -- test_vector_group
@@ -51,11 +52,16 @@ run_kernel() {
   done
 }
 
+run_upstream() {
+  ./scripts/check_upstream.sh "$@"
+}
+
 case "$suite" in
   rust) run_rust "$@" ;;
   python) run_python "$@" ;;
   proofs) run_proofs "$@" ;;
   kernel) run_kernel "$@" ;;
-  all) run_rust; run_python; run_proofs; run_kernel ;;
-  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | all)" >&2; exit 2 ;;
+  upstream) run_upstream "$@" ;;
+  all) run_rust; run_python; run_proofs; run_kernel; run_upstream ;;
+  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | all)" >&2; exit 2 ;;
 esac
