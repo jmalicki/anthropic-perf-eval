@@ -97,3 +97,6 @@ jobs:
 
       - name: Kernel builds (greedy 2-round and 16-round, replay + validation)
         run: ./scripts/test.sh kernel
+
+      - name: Upstream check (16-round greedy kernel on the unmodified upstream simulator and tests)
+        run: ./scripts/test.sh upstream

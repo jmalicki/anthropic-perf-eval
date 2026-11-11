@@ -77,7 +77,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 **Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). `tests/submission_tests.py` exercises the end-to-end pipeline.
 
-**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
+**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|upstream|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
 
 ```bash
 ./scripts/test.sh                 # everything
@@ -87,12 +87,17 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 ./scripts/test.sh python tests/test_kernel_dataflow.py -k lane
 ./scripts/test.sh proofs          # Z3: liveness theorems + rewrite identities
 ./scripts/test.sh kernel          # greedy 2r and 16r builds with dataflow replay + validation
+./scripts/test.sh upstream        # 16-round greedy kernel on the unmodified upstream simulator and tests
 
 # Rust: include optional/CI-only tests (slow proptest, minimal failing config, etc.)
 ./scripts/test.sh rust --features "cpsat ci-tests"
 
 # Python: submission tests (end-to-end pipeline)
 uv run tests/submission_tests.py
+
+# Upstream check: 16-round kernel on the unmodified upstream simulator and tests (vendored in upstream/)
+./scripts/check_upstream.sh                 # greedy smoke check; pass generate_ssa_kernel.py options for CP-SAT
+./scripts/check_upstream.sh --kernel kernel_to_validate.json   # test a saved kernel
 ```
 
 `uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
@@ -104,7 +109,7 @@ uv run tests/submission_tests.py
 GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on a macOS arm64 runner (`macos-latest`) with OR-Tools from Homebrew, the same setup as local development. Two jobs:
 
 - **Rust tests (scheduler_rs)** — `./scripts/test.sh rust` (debug profile, `--features cpsat`).
-- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, one step each.
+- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, `./scripts/test.sh upstream`, one step each.
 
 To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI installs whatever OR-Tools version Homebrew currently ships (printed by the "Install OR-Tools" step); if a failure does not reproduce, compare that against `brew list --versions or-tools`.
 
@@ -337,6 +342,8 @@ Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-
 ## Validation
 
 All kernels are validated against `reference_kernel2()` in `problem.py`. The kernel must produce identical outputs to be considered correct.
+
+`problem.py` here differs from upstream (8-word header instead of 7, rewritten `reference_kernel2`, extra debug ops), and the root `frozen_problem.py` re-exports it, so `tests/submission_tests.py` is **not** the upstream oracle. The upstream oracle is `./scripts/check_upstream.sh`: it runs the unmodified upstream `tests/submission_tests.py` and `frozen_problem.py` (vendored in `upstream/`, pinned by `upstream/UPSTREAM_COMMIT` and `upstream/SHA256SUMS`) on a saved kernel. Never edit the vendored files.
 
 ```bash
 # Validate (default uses KernelBuilder = SSA; --rust-builder calls build_tick_tock_kernel_ssa directly)
