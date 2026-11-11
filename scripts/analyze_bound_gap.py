@@ -294,6 +294,12 @@ def section_vload():
     print("(upstream has forest_values_p = 7, so the word is 6; one load slot, no address add)")
 
 
+# Checks that moved to verification/rewrites.py when the emission started to rely on them.
+MOVED_TO_REWRITES = (
+    "R8-hash-stage-merge",  # stages 2+3 in 3 ops (--merge-hash-stages)
+)
+
+
 def section_z3():
     hr("4b. Z3 bit-vector identities (UNSAT of the negation = proved for all 2^32 inputs)")
     import z3
@@ -330,9 +336,19 @@ def section_z3():
 
     lz, st4, e = lazy(x)
     a, b, c, d, s, t = z3.BitVecs("a b c d s t", 32)
+    # Identities the emission relies on live in verification/rewrites.py (one copy); run them
+    # from there. The checks below are candidates and negative results that nothing emits yet.
+    sys.path.insert(0, ROOT)
+    from verification import rewrites  # noqa: E402
+
+    for name, desc, fn in rewrites.REWRITE_CHECKS:
+        if name in MOVED_TO_REWRITES:
+            _, result, _, _ = fn()
+            want = "sat" if name in rewrites.EXPECT_SAT else "unsat"
+            print(f"  [{'PROVED' if result == want else 'NOT PROVED: ' + result}] {name}: {desc}  "
+                  f"(verification/rewrites.py)", flush=True)
+
     checks = [
-        ("stage 2 then 3 == (33a+C2+C3) ^ (16896a+(C2<<9))  [3 ops instead of 4]",
-         ref_stage(ref_stage(x, 2), 3) != (K(33) * x + K(C2 + C3)) ^ (K(16896) * x + K(C2 << 9)), []),
         # The whole-hash equivalence in one query times out (three nested multiplies), so it is
         # proved stage by stage; stages 1 and 5 are used unchanged, so composing is substitution.
         ("stage 0 == 4097a + C0  [1 multiply_add]", ref_stage(x, 0) != K(4097) * x + K(C0), []),

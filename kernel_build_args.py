@@ -120,6 +120,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        default="adaptive",
                        help="Scheduling pressure policy (default: adaptive)")
 
+    # Emission options (what ops the kernel contains). Defaults leave the emission unchanged;
+    # see docs/EMISSION_ABLATION.md.
+    group.add_argument("--merge-hash-stages", action="store_true", default=False,
+                       help="Emit hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per "
+                            "hash instead of 11 (proof: R8-hash-stage-merge in verification/rewrites.py)")
+
     # Constraint / CSE options
     import scheduler_rs
     _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
@@ -260,6 +266,7 @@ def args_to_build_kwargs(
         "enable_select_choice_hint_pass": get("hint_passes", False) or get("enable_select_choice_hint_pass", False),
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
+        "merge_hash_stages": get("merge_hash_stages", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -304,6 +311,7 @@ def args_to_build_kwargs(
         "enable_select_choice_hint_pass": get("hint_passes", False) or get("enable_select_choice_hint_pass", False),
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
+        "merge_hash_stages": get("merge_hash_stages", False),
     }
 
 

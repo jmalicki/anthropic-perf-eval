@@ -94,6 +94,56 @@ def check_hash_fma_fusion(ctx=None) -> tuple[str, str, float, dict]:
     return _refute("R1-hash-fma-fusion", *violations, ctx=ctx)
 
 
+def merged_stage_constants(first: int) -> tuple[int, int, int, int] | None:
+    """Constants (m1, c1, m2, c2) with stage[first+1](stage[first](a)) = (a*m1 + c1) ^ (a*m2 + c2).
+
+    Applies when stage `first` fuses to a*m + c (see fma_multiplier) and the next stage has
+    the form (x + d) ^ (x << k): then m1 = m, c1 = c + d, m2 = m << k, c2 = c << k, all
+    modulo 2^32. Returns None for any other pair of stages. Emission uses the pair (2, 3)
+    under --merge-hash-stages (config.rs merged_hash_stage_constants).
+    """
+    if first + 1 >= len(HASH_STAGES):
+        return None
+    mult = fma_multiplier(first)
+    op1, d, op2, op3, k = HASH_STAGES[first + 1]
+    if mult is None or (op1, op2, op3) != ("+", "^", "<<"):
+        return None
+    c = HASH_STAGES[first][1]
+    mask = (1 << WIDTH) - 1
+    return (mult, (c + d) & mask, (mult << k) & mask, (c << k) & mask)
+
+
+def check_hash_stage_merge(ctx=None) -> tuple[str, str, float, dict]:
+    """R8: stages 2 and 3 together equal (a*33 + C2+C3) ^ (a*16896 + (C2 << 9)).
+
+    Three ops (two multiply_adds and an XOR) instead of four (multiply_add, add, shift,
+    XOR). Stage 3 is (x + C3) ^ (x << 9) with x = 33a + C2; the left shift distributes over
+    the multiply_add modulo 2^32, so x << 9 = a*(33 << 9) + (C2 << 9).
+    """
+    a = _bv("a")
+    consts = merged_stage_constants(2)
+    assert consts is not None, "expected stages 2 and 3 to merge"
+    m1, c1, m2, c2 = consts
+    merged = (a * _const(m1) + _const(c1)) ^ (a * _const(m2) + _const(c2))
+    return _refute("R8-hash-stage-merge", merged != _reference_stage(_reference_stage(a, 2), 3), ctx=ctx)
+
+
+def check_hash_stage_merge_needs_left_shift(ctx=None) -> tuple[str, str, float, dict]:
+    """R8-needs-left-shift: the same merge is wrong when the second stage shifts right (SAT).
+
+    A right shift does not distribute over a*m + c modulo 2^32, which is why stages 0+1 and
+    4+5 (both followed by a right-shift stage) are not merged.
+    """
+    a = _bv("a")
+    m, c = _const(fma_multiplier(0)), _const(HASH_STAGES[0][1])
+    k = HASH_STAGES[1][4]
+    merged = (a * m + c + _const(HASH_STAGES[1][1])) ^ (a * LShR(m, k) + LShR(c, k))
+    reference = (a * m + c + _const(HASH_STAGES[1][1])) ^ LShR(a * m + c, k)
+    solver = Solver(ctx=ctx)
+    solver.add(merged != reference)
+    return ("R8-hash-stage-merge-needs-left-shift", str(solver.check()), 0.0, _stats(solver))
+
+
 def check_stage5_xor_deferral(ctx=None) -> tuple[str, str, float, dict]:
     """R2: the stage-5 constant can be left out and folded into the next round's node XOR.
 
@@ -234,10 +284,16 @@ REWRITE_CHECKS = [
     ("R5-delta-roundtrip", "(x-y)+y = x and (x+y)-y = x", check_delta_roundtrip),
     ("R6-boolean-forms", "Forms the dataflow checker accepts as 0/1 are 0/1", check_comparison_is_boolean),
     ("R7-index-range-by-depth", "Index range per depth: no bounds check before the last level, always wrap after", check_index_range_by_depth),
+    ("R8-hash-stage-merge", "Hash stages 2+3 equal two multiply_adds and an XOR", check_hash_stage_merge),
+    ("R8-hash-stage-merge-needs-left-shift", "Stage merge fails across a right shift (SAT)", check_hash_stage_merge_needs_left_shift),
 ]
 
 # Checks that are expected to find a counterexample.
-EXPECT_SAT = {"R3-branch-offset-needs-odd-constant", "R4-fma-select-needs-boolean"}
+EXPECT_SAT = {
+    "R3-branch-offset-needs-odd-constant",
+    "R4-fma-select-needs-boolean",
+    "R8-hash-stage-merge-needs-left-shift",
+}
 
 
 def main() -> int:
