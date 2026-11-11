@@ -154,6 +154,24 @@ pub enum CpsatObjective {
     Makespan,
 }
 
+/// Extra cumulative propagators CP-SAT can be asked to run (all off in CP-SAT by default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CumulativePropagator {
+    /// `use_overload_checker_in_cumulative`: energy-based overload checking.
+    OverloadChecker,
+    /// `use_timetable_edge_finding_in_cumulative`: energy plus mandatory parts. CP-SAT only
+    /// runs it on cumulatives with at most `max_num_intervals_for_timetable_edge_finding`
+    /// intervals (see `CpsatTuning::timetable_edge_finding_max_intervals`).
+    TimetableEdgeFinding,
+    /// `use_hard_precedences_in_cumulative`: constraints for variables that are after a set
+    /// of intervals of the same cumulative (direct precedences).
+    HardPrecedences,
+    /// `exploit_all_precedences`: with `HardPrecedences`, explore the full precedence graph
+    /// instead of direct precedences only (experimental in CP-SAT; needs a DAG).
+    AllPrecedences,
+}
+
 /// Full-problem subsolver names OR-Tools 9.15 defines (`GetNamedParameters` in
 /// `ortools/sat/cp_model_search.cc`). Naming any other one in `subsolvers` or
 /// `extra_subsolvers` makes the solver abort.
@@ -218,6 +236,13 @@ pub struct CpsatTuning {
     /// `push_all_tasks_toward_start` ("Experimental code: specify if the objective pushes all
     /// tasks toward the start of the schedule"; used by `rcpsp_sat.py`).
     pub push_all_tasks_toward_start: bool,
+    /// Extra cumulative propagators to switch on for every worker (default: none).
+    pub cumulative_propagators: Vec<CumulativePropagator>,
+    /// `max_num_intervals_for_timetable_edge_finding` (CP-SAT default 100; `None` leaves it).
+    /// Timetable edge finding is skipped on larger cumulatives, and the engine cumulatives
+    /// here have hundreds to tens of thousands of intervals, so the propagator does nothing
+    /// unless this is raised.
+    pub timetable_edge_finding_max_intervals: Option<i32>,
 }
 
 impl Default for CpsatTuning {
@@ -234,6 +259,8 @@ impl Default for CpsatTuning {
             horizon_at_least_num_ops: true,
             makespan_interval: false,
             push_all_tasks_toward_start: false,
+            cumulative_propagators: Vec::new(),
+            timetable_edge_finding_max_intervals: None,
         }
     }
 }
@@ -274,6 +301,12 @@ impl CpsatTuning {
         }
         if let Some(slack) = self.greedy_alap_slack.filter(|s| *s < 0) {
             return Err(format!("cpsat tuning: greedy_alap_slack must be 0 or more (or null), got {}", slack));
+        }
+        if let Some(max) = self.timetable_edge_finding_max_intervals.filter(|m| *m < 0) {
+            return Err(format!(
+                "cpsat tuning: timetable_edge_finding_max_intervals must be 0 or more, got {}",
+                max
+            ));
         }
         for (field, names) in [
             ("subsolvers", &self.subsolvers),

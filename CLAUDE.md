@@ -185,6 +185,8 @@ CP-SAT tuning switches (full-kernel solve only; per-section feasibility solves a
 - `--cpsat-horizon-num-ops` / `--no-cpsat-horizon-num-ops` - The horizon is `greedy makespan + 20`, raised to the number of ops by default. The op count (1,543 against a makespan of about 194 at 2 rounds) only widens the domains of auxiliary variables, and of ALAP when the cap is off. `--no-cpsat-horizon-num-ops` keeps the tight horizon; it relies on the greedy (plus per-section repair) schedule being feasible.
 - `--cpsat-makespan-interval` - Add one interval `[makespan, horizon)` with demand = capacity to each engine cumulative (ALU, VALU, Load, Store, Flow), the pattern of OR-Tools' `rcpsp_sat.py`, so CP-SAT's LP relaxation and energy cuts see the makespan. Excludes no schedule. Off by default.
 - `--cpsat-push-tasks-toward-start` - CP-SAT `push_all_tasks_toward_start` (experimental solver parameter, also from `rcpsp_sat.py`). Off by default.
+- `--cpsat-cumulative-propagators NAME,...` - Extra cumulative propagators for every worker: `all`, or any of `overload_checker` (`use_overload_checker_in_cumulative`), `timetable_edge_finding` (`use_timetable_edge_finding_in_cumulative`), `hard_precedences` (`use_hard_precedences_in_cumulative`), `all_precedences` (`exploit_all_precedences`). Default: none.
+- `--cpsat-ttef-max-intervals N` - `max_num_intervals_for_timetable_edge_finding` (CP-SAT default 100). Timetable edge finding is skipped on cumulatives with more intervals, which is every engine cumulative here, so raise it together with `timetable_edge_finding`.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.

@@ -341,3 +341,56 @@ def test_makespan_interval_off_is_the_default_model(tmp_path):
     _, same, _, _ = _run(tmp_path, "explicit",
                          ["--no-cpsat-makespan-interval", "--no-cpsat-push-tasks-toward-start"])
     assert not _model_diff(base, same)
+
+
+# ----------------------------------------------------------------------------
+# Extra cumulative propagators
+# ----------------------------------------------------------------------------
+
+PROPAGATOR_PARAMETERS = [
+    "use_overload_checker_in_cumulative", "use_timetable_edge_finding_in_cumulative",
+    "max_num_intervals_for_timetable_edge_finding", "use_hard_precedences_in_cumulative",
+    "exploit_all_precedences",
+]
+
+
+def test_cumulative_propagators_default_to_off(tmp_path):
+    output, _, _, _ = _run(tmp_path, "base", [], quiet=False)
+    params = _solver_parameters(output)
+    for name in PROPAGATOR_PARAMETERS:
+        assert name not in params
+
+
+def test_cumulative_propagators_reach_the_solver(tmp_path):
+    output, model_path, sched, _ = _run(
+        tmp_path, "props", ["--cpsat-cumulative-propagators", "all", "--cpsat-ttef-max-intervals", "100000"],
+        quiet=False)
+    params = _solver_parameters(output)
+    assert "use_overload_checker_in_cumulative: true" in params
+    assert "use_timetable_edge_finding_in_cumulative: true" in params
+    assert "max_num_intervals_for_timetable_edge_finding: 100000" in params
+    assert "use_hard_precedences_in_cumulative: true" in params
+    assert "exploit_all_precedences: true" in params
+    with open(sched) as f:
+        recorded = json.load(f)["run_options"]["cpsat_tuning"]
+    assert recorded["cumulative_propagators"] == kernel_build_args.CUMULATIVE_PROPAGATORS
+    assert recorded["timetable_edge_finding_max_intervals"] == 100000
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    assert not _model_diff(base_path, model_path), "solver parameters, not a model change"
+
+
+def test_one_propagator_sets_only_its_parameter(tmp_path):
+    output, _, _, _ = _run(tmp_path, "overload", ["--cpsat-cumulative-propagators", "overload_checker"], quiet=False)
+    params = _solver_parameters(output)
+    assert "use_overload_checker_in_cumulative: true" in params
+    assert "use_timetable_edge_finding_in_cumulative" not in params
+    assert "use_hard_precedences_in_cumulative" not in params
+
+
+def test_cli_rejects_unknown_propagators():
+    with pytest.raises(SystemExit):
+        _parse(["--cpsat-cumulative-propagators", "edge_finding"])
+    with pytest.raises(SystemExit):
+        _parse(["--cpsat-ttef-max-intervals", "-5"])
+    with pytest.raises(ValueError, match="cpsat"):
+        scheduler_rs.resolve_cpsat_tuning('{"cumulative_propagators": ["edge_finding"]}')
