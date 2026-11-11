@@ -109,7 +109,7 @@ uv run tests/submission_tests.py
 GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on a macOS arm64 runner (`macos-latest`) with OR-Tools from Homebrew, the same setup as local development. Two jobs:
 
 - **Rust tests (scheduler_rs)** — `./scripts/test.sh rust` (debug profile, `--features cpsat`).
-- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, one step each.
+- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, `./scripts/test.sh upstream`, one step each.
 
 To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI installs whatever OR-Tools version Homebrew currently ships (printed by the "Install OR-Tools" step); if a failure does not reproduce, compare that against `brew list --versions or-tools`.
 
