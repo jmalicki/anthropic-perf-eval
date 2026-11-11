@@ -363,6 +363,7 @@ def args_to_build_kwargs(
         "cpsat_time_limit": cpsat_time_limit,
         "cpsat_deterministic_time": cpsat_deterministic_time,
         "cpsat_tuning": cpsat_tuning_effective,
+        "disabled_cpsat_constraints": [group.name for group in optional_constraint_groups_to_disable or []],
         "per_section_optimize_secs": per_section_optimize,
         "enable_valu_shift": get("enable_valu_shift", True),
         "tree_reduce_max_depth": tree_reduce_max_depth,

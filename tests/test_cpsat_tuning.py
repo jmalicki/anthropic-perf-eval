@@ -394,3 +394,54 @@ def test_cli_rejects_unknown_propagators():
         _parse(["--cpsat-ttef-max-intervals", "-5"])
     with pytest.raises(ValueError, match="cpsat"):
         scheduler_rs.resolve_cpsat_tuning('{"cumulative_propagators": ["edge_finding"]}')
+
+
+# ----------------------------------------------------------------------------
+# Redundant rows as optional constraint groups
+# ----------------------------------------------------------------------------
+
+CONDITIONAL_MAKESPAN_ROW = re.compile(r"makespan_ge_(c|valu|shifted|select_fma|select_vselect)_\d+$")
+
+
+def _constraint_names(model):
+    return [c.name for c in model.constraints]
+
+
+def test_new_constraint_groups_are_listed():
+    names = scheduler_rs.optional_constraint_group_names()
+    assert "conditional_makespan" in names and "flow_cumulative" in names
+    assert scheduler_rs.OptionalConstraintGroup.from_str("conditional_makespan").name == "conditional_makespan"
+    assert scheduler_rs.OptionalConstraintGroup.flow_cumulative.name == "flow_cumulative"
+
+
+def test_conditional_makespan_rows_can_be_left_out(tmp_path):
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    _, lean_path, sched, _ = _run(tmp_path, "lean", ["--disable-cpsat-constraints", "conditional_makespan"])
+    base, lean = diff_cpsat_models.load(str(base_path)), diff_cpsat_models.load(str(lean_path))
+    base_rows = [n for n in _constraint_names(base) if CONDITIONAL_MAKESPAN_ROW.match(n)]
+    n_ops = sum(1 for name in _variables(base) if re.fullmatch(r"c\d+", name))
+    assert len(base_rows) >= n_ops, "at least one row per op by default"
+    lean_names = _constraint_names(lean)
+    assert not [n for n in lean_names if CONDITIONAL_MAKESPAN_ROW.match(n)]
+    assert len(lean.constraints) == len(base.constraints) - len(base_rows), "nothing else changes"
+    # What implies them stays.
+    assert "makespan_eq_max_cycle" in lean_names
+    assert sum(1 for n in lean_names if n.startswith("max_cycle_ge_c_")) == n_ops
+    assert len(lean.variables) == len(base.variables)
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["disabled_cpsat_constraints"] == ["conditional_makespan"]
+
+
+def test_flow_cumulative_can_be_left_out(tmp_path):
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    _, lean_path, _, _ = _run(tmp_path, "lean", ["--disable-cpsat-constraints", "flow_cumulative"])
+    base_names = _constraint_names(diff_cpsat_models.load(str(base_path)))
+    lean_names = _constraint_names(diff_cpsat_models.load(str(lean_path)))
+    assert "cumul_flow" in base_names and "no_overlap_flow" in base_names
+    assert "cumul_flow" not in lean_names and "no_overlap_flow" in lean_names
+    assert len(lean_names) == len(base_names) - 1
+
+
+def test_no_disabled_groups_is_recorded_as_empty():
+    kwargs = kernel_build_args.args_to_build_kwargs(_parse([]), use_git_sha=False)
+    assert json.loads(kwargs["run_options_json"])["disabled_cpsat_constraints"] == []
