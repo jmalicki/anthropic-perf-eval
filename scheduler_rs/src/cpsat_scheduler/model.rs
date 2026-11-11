@@ -23,6 +23,7 @@ use super::config::{
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
     validate_ssa_slot_limits, verify_all_raw_precedence, verify_cse_sub_precedence,
+    verify_scratch_budget_all_readers,
     verify_select_choice_fma_consumer_precedence,
 };
 
@@ -132,6 +133,98 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
     let mut entries: Vec<(&K, &V)> = map.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     entries
+}
+
+/// Readers of every defined VReg, with vector-group aliases resolved.
+///
+/// An op that reads a lane of a decomposed vector (read group) is a reader of that vector;
+/// an op that reads the alias of an assembled vector (write group) is a reader of each lane.
+/// A SelectChoice also reads its `delta_vreg`, and an op is a reader of every VReg in its
+/// `keep_live` list (a liveness-only use; it is timed like the op's operand reads, which is
+/// never earlier than the op's cycle).
+///
+/// Every op counts, including ones the greedy marked as dead stores (negative hint cycle):
+/// the solver still gives them a cycle and they read their operands then. With DCE enabled
+/// (the default) there are none.
+///
+/// # Arguments
+/// * `ops` - SSA ops
+/// * `vreg_def_op` - Defining op index per VReg
+/// * `vector_group_lanes` - Group key/alias → lanes (None = no groups)
+///
+/// # Returns
+/// Defined VReg → reader op indices (sorted, deduplicated). VRegs without readers are absent.
+#[cfg(feature = "cpsat")]
+pub(crate) fn scratch_readers_by_vreg(
+    ops: &[SsaOp],
+    vreg_def_op: &HashMap<VReg, usize>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+) -> HashMap<VReg, Vec<usize>> {
+    let mut lane_to_group: HashMap<VReg, VReg> = HashMap::new();
+    let mut alias_to_lanes: HashMap<VReg, &Vec<VReg>> = HashMap::new();
+    if let Some(groups) = vector_group_lanes {
+        for (group, lanes) in groups {
+            if vreg_def_op.contains_key(group) {
+                for lane in lanes {
+                    lane_to_group.insert(*lane, *group);
+                }
+            } else {
+                alias_to_lanes.insert(*group, lanes);
+            }
+        }
+    }
+    let mut readers: HashMap<VReg, Vec<usize>> = HashMap::new();
+    let mut add = |vreg: VReg, idx: usize| {
+        if vreg_def_op.contains_key(&vreg) {
+            readers.entry(vreg).or_default().push(idx);
+        }
+    };
+    for (idx, op) in ops.iter().enumerate() {
+        // `keep_live` entries are liveness-only uses: the value must stay allocated until this
+        // op runs even though it is not an operand (see `SsaOp::keep_live`).
+        let held = op.keep_live.iter().flatten().copied();
+        for vreg in op.reads().chain(op.delta_vreg).chain(held) {
+            if let Some(group) = lane_to_group.get(&vreg) {
+                add(*group, idx);
+            } else if let Some(lanes) = alias_to_lanes.get(&vreg) {
+                for lane in lanes.iter() {
+                    add(*lane, idx);
+                }
+            } else {
+                add(vreg, idx);
+            }
+        }
+    }
+    for list in readers.values_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+    readers
+}
+
+/// Extra cycles, beyond its own cycle, during which reader `idx` still reads its operands.
+///
+/// A SelectChoice lowered as FMA reads cond/false_val/delta in the multiply_add one cycle
+/// after the op's cycle. Returns 1 for that case (the "FMA chosen" Boolean in Optimize mode)
+/// and 0 for every other reader.
+#[cfg(feature = "cpsat")]
+fn select_read_extra_delay(
+    idx: usize,
+    ops: &[SsaOp],
+    select_choice_mode: SelectChoiceMode,
+    select_choice_vars: &HashMap<usize, BoolVar>,
+) -> LinearExpr {
+    let none = LinearExpr::default();
+    if ops[idx].opcode != Opcode::SelectChoice {
+        return none;
+    }
+    match select_choice_mode {
+        SelectChoiceMode::ForceVselect => none,
+        SelectChoiceMode::ForceFma => none + 1,
+        SelectChoiceMode::Optimize => select_choice_vars
+            .get(&idx)
+            .map_or(none, |&fma_chosen| LinearExpr::from(fma_chosen)),
+    }
 }
 
 /// Schedule SSA operations using CP-SAT solver.
@@ -1784,6 +1877,8 @@ pub fn schedule_ssa_cpsat(
     // Declared outside scratch_budget block so section 11 can hint them.
     let mut scratch_select_fma_end_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, last_use_idx)
     let mut scratch_shifted_start_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, def_idx)
+    // Readers per live VReg (def idx, reader idxs), kept for the post-solve scratch check.
+    let mut scratch_values: Vec<(VReg, usize, Vec<usize>)> = Vec::new();
 
     if scratch_budget > 0 {
         // Build VReg -> defining op index mapping
@@ -1884,6 +1979,40 @@ pub fn schedule_ssa_cpsat(
             }
         }
 
+        // Every reader of every value. The interval of a value must cover all of them: the
+        // reader that is last in the greedy hint need not be last in the solution, and values
+        // read only through a vector-group alias have no direct reader at all.
+        let scratch_readers =
+            scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes);
+        // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
+        let hinted_read_end = |idx: usize| -> Option<i32> {
+            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
+            let fma = ops[idx].opcode == Opcode::SelectChoice
+                && match select_choice_mode {
+                    SelectChoiceMode::ForceFma => true,
+                    SelectChoiceMode::ForceVselect => false,
+                    SelectChoiceMode::Optimize => {
+                        select_choice_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                    }
+                };
+            Some(cycle + 1 + i32::from(fma))
+        };
+        // Hinted end of each value's interval: the latest hinted read end over all readers.
+        let hinted_live_end: HashMap<VReg, i32> = scratch_readers
+            .iter()
+            .filter_map(|(vreg, readers)| {
+                readers.iter().filter_map(|&r| hinted_read_end(r)).max().map(|e| (*vreg, e))
+            })
+            .collect();
+        // `vreg_last_use` stays as the representative reader (latest in the hint) for segment
+        // bookkeeping and single-reader values; make it cover alias-only readers too.
+        for (vreg, readers) in &scratch_readers {
+            if let Some(&latest) = readers.iter().max_by_key(|&&r| (hinted_read_end(r), r)) {
+                vreg_last_use.insert(*vreg, latest);
+            }
+        }
+
         if verbose {
             // Count ops with dest
             let ops_with_dest = ops.iter().filter(|op| op.dest.is_some()).count();
@@ -1977,15 +2106,46 @@ pub fn schedule_ssa_cpsat(
 
                 // Live-out VRegs (defined here, last-used in a later section) must extend to segment end
                 // so the scratch constraint matches the full-kernel peak.
+                let readers: &[usize] = scratch_readers.get(vreg).map_or(&[], |r| r.as_slice());
+                if initial_live.is_none() {
+                    scratch_values.push((*vreg, def_idx, readers.to_vec()));
+                }
                 let (end_expr, end_for_interval) = if is_live_out {
                     let seg_end = segment_end_var.expect("segment_end when live_out");
                     let e = LinearExpr::from(seg_end) + 1;
                     (e.clone(), e)
+                } else if readers.len() > 1 {
+                    // Several readers: the value is live until the last of them has read it.
+                    // A shifted reader reads at its lane cycles, so use its completion cycle.
+                    let end_var = model.new_int_var_with_name(
+                        [(0, horizon + 2)],
+                        format!("live_end_{}", vreg.id),
+                    );
+                    let read_ends: Vec<LinearExpr> = readers
+                        .iter()
+                        .map(|&r| {
+                            let last_read = completion_cycle_vars.get(&r).copied().unwrap_or(cycle_vars[r]);
+                            LinearExpr::from(last_read)
+                                + 1
+                                + select_read_extra_delay(r, ops, select_choice_mode, &select_choice_vars)
+                        })
+                        .collect();
+                    let c = model.add_max_eq(end_var, read_ends);
+                    model.set_constraint_name(c, &format!("scratch_live_end_{}", vreg.id));
+                    if let Some(&end_hint) = hinted_live_end.get(vreg) {
+                        model.add_hint(end_var, end_hint as i64);
+                    }
+                    (LinearExpr::from(end_var), LinearExpr::from(end_var))
                 } else {
                     // Normal read at cycle C: interval end = C+1 (half-open: [start, end))
                     // SelectChoice FMA reads at cycle+1: if last_use is a SelectChoice op that chose FMA,
                     // the actual read happens at cycle+1, so end should be cycle+2.
-                    let base_cycle = cycle_vars[last_use_idx];
+                    // A shifted reader reads at its lane cycles: completion is the last of them
+                    // (and equals the op cycle when it is not shifted).
+                    let base_cycle = completion_cycle_vars
+                        .get(&last_use_idx)
+                        .copied()
+                        .unwrap_or(cycle_vars[last_use_idx]);
                     if select_choice_set.contains(&last_use_idx) {
                         match select_choice_mode {
                             SelectChoiceMode::ForceFma => {
@@ -2369,7 +2529,11 @@ pub fn schedule_ssa_cpsat(
                         if *last_use_idx >= hints.len() {
                             continue;
                         }
-                        (hints[*last_use_idx] - def_cycle + 1).max(1)
+                        let end = hinted_live_end
+                            .get(vreg)
+                            .copied()
+                            .unwrap_or(hints[*last_use_idx] + 1);
+                        (end - def_cycle).max(1)
                     };
                     model.add_hint(*size_var, expected_size as i64);
                 }
@@ -2410,14 +2574,17 @@ pub fn schedule_ssa_cpsat(
                     let def_idx = vreg_def_op[vreg];
                     let last_use_idx = vreg_last_use[vreg];
                     let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
-                    let last_use_cycle = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
-                        max_hint
+                    let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
+                        max_hint + 1
                     } else {
-                        hints.get(last_use_idx).copied().unwrap_or(def_cycle)
+                        hinted_live_end
+                            .get(vreg)
+                            .copied()
+                            .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1)
                     };
                     let size = vreg.size() as i64;
                     events.push((def_cycle, size)); // VReg becomes live
-                    events.push((last_use_cycle + 1, -size)); // VReg dies after last use
+                    events.push((live_end, -size)); // VReg dies after its last read
                 }
                 // Add live_out VRegs that are defined in segment but not used within segment
                 if let Some(lo) = live_out_vregs {
@@ -4247,6 +4414,18 @@ pub fn schedule_ssa_cpsat(
             );
             // SelectChoice FMA result visible at C+2 (redundant with verify_all_raw_precedence but kept for clarity).
             verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_choice_encoding);
+            // The scratch cumulative must have covered every reader of every value.
+            if scratch_budget > 0 && !scratch_values.is_empty() {
+                verify_scratch_budget_all_readers(
+                    ops,
+                    &scratch_values,
+                    &cycle_assignments,
+                    &shifted_ops,
+                    &shifted_alu_cycles,
+                    &select_choice_encoding,
+                    scratch_budget,
+                );
+            }
             // Shared CSE subs read true_val/false_val at sub_cycle; those must be visible by then.
             if let Some(groups) = cse_groups {
                 verify_cse_sub_precedence(

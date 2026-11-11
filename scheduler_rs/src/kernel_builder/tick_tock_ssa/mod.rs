@@ -1192,6 +1192,7 @@ impl SsaTickTockKernelBuilder {
                         live_out_vregs: if live_out.is_empty() { None } else { Some(&live_out) },
                         live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
                         cse_groups: None, // Per-section: no CSE (feasibility only)
+                        vector_group_lanes: Some(&ctx.vector_group_lanes),
                     },
                     Some(false),
                 ) {
@@ -1476,6 +1477,7 @@ impl SsaTickTockKernelBuilder {
                 live_out_vregs: None,
                 live_through_vregs: None,
                 cse_groups: cse_groups_ref,
+                vector_group_lanes: Some(&ctx.vector_group_lanes),
             },
             Some(!greedy_budget_exceeded),
         ) {

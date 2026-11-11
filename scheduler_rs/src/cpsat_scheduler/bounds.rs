@@ -577,6 +577,9 @@ pub struct SsaCpsatHints<'a> {
     pub eliminate_vbroadcast_hints: Option<&'a HashSet<usize>>,
     /// CSE groups for shared SUB. When set and non-empty, CP-SAT uses shared-SUB model for those groups.
     pub cse_groups: Option<&'a [super::cse_groups::CseGroup]>,
+    /// Vector group key/alias → lane VRegs. The scratch model needs it to see that reading a
+    /// lane keeps a decomposed vector live and reading an alias keeps its lanes live.
+    pub vector_group_lanes: Option<&'a HashMap<VReg, Vec<VReg>>>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions

@@ -2132,6 +2132,110 @@ mod ssa_tests {
         assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution: {:?}", result.err());
     }
 
+    /// Regression: a value's scratch interval must cover every reader, not one reader picked
+    /// before solving. `v` has two readers: `early` (emitted last, so the old model took it as
+    /// "the last use") can run at once, `late` must wait for a chain whose widest point holds
+    /// 32 words. With a 36-word budget `v` cannot be live across that point, but the old model
+    /// stopped counting `v` after `early`, accepted the schedule, and address assignment then
+    /// needed 40 words. `verify_scratch_budget_all_readers` panics inside the solve if the
+    /// model's intervals are too short.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_interval_covers_every_reader() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let s = emit.emit_const(3);
+        let v = emit.emit_vbroadcast(s);
+        let k = emit.emit_const(5);
+        let c0 = emit.emit_vbroadcast(k);
+        let c1 = emit.emit_valu(Opcode::Add, c0, c0);
+        let c2 = emit.emit_valu(Opcode::Add, c1, c1);
+        let c3 = emit.emit_valu(Opcode::Add, c2, c2);
+        // Widest point: c3 and three results live together (32 words).
+        let w1 = emit.emit_valu(Opcode::Add, c3, c3);
+        let w2 = emit.emit_valu(Opcode::Xor, c3, c3);
+        let w3 = emit.emit_valu(Opcode::Shl, c3, c3);
+        let m = emit.emit_valu(Opcode::Add, w1, w2);
+        let n = emit.emit_valu(Opcode::Add, m, w3);
+        let late = emit.emit_valu(Opcode::Xor, v, n);
+        emit.emit_vstore_imm(100, late);
+        let early = emit.emit_valu(Opcode::Add, v, v);
+        emit.emit_vstore_imm(108, early);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: 36,
+                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+        let solution = result.expect("solve").expect("a schedule that creates v late fits in 36 words");
+
+        // Independent recount: v is live from its definition to its last reader.
+        let idx_of = |vreg| emit.ops.iter().position(|o| o.dest == Some(vreg)).unwrap();
+        let cycle = |vreg| solution.cycle_assignments[idx_of(vreg)];
+        let wide = cycle(w1).max(cycle(w2)).max(cycle(w3));
+        assert!(
+            cycle(v) > wide.min(cycle(w1)) || cycle(late) < cycle(w1),
+            "v (cycle {}) must not be live across the wide point (cycles {}..{}), late reader at {}",
+            cycle(v),
+            cycle(w1),
+            wide,
+            cycle(late)
+        );
+    }
+
+    /// The scratch model's reader lists must include liveness-only uses (`keep_live`) and
+    /// must resolve vector-group aliases in both directions, for operands and for `keep_live`.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_readers_include_keep_live_and_group_aliases() {
+        use crate::cpsat_scheduler::model::scratch_readers_by_vreg;
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+
+        let mut emit = SsaEmitContext::new();
+        let c = emit.emit_const(7);
+        let held = emit.emit_vbroadcast(c);
+        let base = emit.emit_vload_imm(200);
+        let v_addr = emit.emit_valu(Opcode::Add, base, base);
+        let addr_lanes = emit.decompose_vector(v_addr);
+        let (v_loaded, loaded_lanes) = emit.fresh_vector_group();
+        for (addr, dest) in addr_lanes.iter().zip(loaded_lanes.iter()) {
+            emit.emit_load_into(*addr, *dest);
+        }
+        // `user` reads the assembled alias and holds `held` and a lane of `v_addr` live.
+        emit.set_next_keep_live(vec![held, addr_lanes[3]]);
+        let user = emit.emit_valu(Opcode::Xor, v_loaded, base);
+        emit.emit_vstore_imm(300, user);
+
+        let groups = emit.take_vector_group_lanes();
+        let vreg_def_op: HashMap<VReg, usize> =
+            emit.ops.iter().enumerate().filter_map(|(i, op)| op.dest.map(|d| (d, i))).collect();
+        let readers = scratch_readers_by_vreg(&emit.ops, &vreg_def_op, Some(&groups));
+        let user_idx = vreg_def_op[&user];
+
+        // keep_live: `held` has no operand reader at all, only the liveness-only use.
+        assert_eq!(readers.get(&held), Some(&vec![user_idx]), "keep_live must count as a reader");
+        // Read group: the eight loads read lanes of v_addr; keep_live on a lane reaches the group.
+        let addr_readers = &readers[&v_addr];
+        assert_eq!(addr_readers.len(), 9, "8 loads + the keep_live holder: {:?}", addr_readers);
+        assert!(addr_readers.contains(&user_idx));
+        // Write group: reading the alias is a read of every loaded lane.
+        for lane in &loaded_lanes {
+            assert_eq!(readers.get(lane), Some(&vec![user_idx]));
+        }
+    }
+
     /// The post-solve precedence validator must check the lane cycles of shifted consumers.
     #[cfg(feature = "cpsat")]
     #[test]
@@ -3551,6 +3655,7 @@ mod tests {
                 live_out_vregs: None,
                 live_through_vregs: None,
                 cse_groups: None,
+                vector_group_lanes: None,
             },
             Some(true), // valid hints, within scratch
         );

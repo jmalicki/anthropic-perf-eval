@@ -786,6 +786,70 @@ pub(crate) fn verify_cse_sub_precedence(
     }
 }
 
+/// Verify that the solution's live values fit the scratch budget, counting every reader.
+///
+/// Recomputes each value's live interval from the solution alone: from its first write (the
+/// earliest lane of a shifted definer) until the last read by any reader (the latest lane of
+/// a shifted reader; one cycle later for a SelectChoice lowered as FMA). This is the quantity
+/// the scratch cumulative is meant to bound; temporaries of the FMA lowering are not
+/// included, so it is a lower bound on what address assignment will need. Panics if the peak
+/// exceeds the budget (the model's liveness intervals are too short: model bug).
+///
+/// # Arguments
+/// * `values` - (VReg, defining op index, reader op indices) for every value in the model
+/// * `cycle_assignments` - Solution cycle per op index
+/// * `scratch_budget` - Words available
+#[cfg(feature = "cpsat")]
+pub(crate) fn verify_scratch_budget_all_readers(
+    ops: &[SsaOp],
+    values: &[(crate::types::VReg, usize, Vec<usize>)],
+    cycle_assignments: &[i32],
+    shifted_ops: &HashSet<usize>,
+    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
+    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
+    scratch_budget: usize,
+) {
+    let lanes = |idx: usize| shifted_alu_cycles.get(&ops[idx].id).filter(|_| shifted_ops.contains(&ops[idx].id));
+    let mut events: Vec<(i32, i64)> = Vec::new();
+    for (vreg, def_idx, readers) in values {
+        let start = lanes(*def_idx)
+            .and_then(|l| l.iter().min().copied())
+            .unwrap_or(cycle_assignments[*def_idx]);
+        let end = readers
+            .iter()
+            .map(|&r| {
+                let last_read = lanes(r).and_then(|l| l.iter().max().copied()).unwrap_or(cycle_assignments[r]);
+                let fma = ops[r].opcode == Opcode::SelectChoice
+                    && matches!(select_choice_encoding.get(&ops[r].id), Some(SelectChoiceEncoding::Fma));
+                last_read + 1 + i32::from(fma)
+            })
+            .max();
+        let Some(end) = end else {
+            continue;
+        };
+        let words = vreg.size() as i64;
+        events.push((start, words));
+        events.push((end.max(start + 1), -words));
+    }
+    // Frees before allocations at the same cycle: intervals are half-open.
+    events.sort_unstable();
+    let mut live = 0i64;
+    let mut peak = (0i64, 0i32);
+    for (cycle, delta) in events {
+        live += delta;
+        if live > peak.0 {
+            peak = (live, cycle);
+        }
+    }
+    assert!(
+        peak.0 <= scratch_budget as i64,
+        "BUG: CP-SAT solution has {} live words at cycle {} (budget {}) when every reader is counted; the scratch model's intervals are too short",
+        peak.0,
+        peak.1,
+        scratch_budget
+    );
+}
+
 /// Verify that every consumer of a SelectChoice FMA (no-delta) result is scheduled at cycle >= dep_cycle + 2.
 /// SelectChoice FMA emits sub at C and fma at C+1; result is visible at C+2. Panics if violated (model bug).
 #[cfg(feature = "cpsat")]
