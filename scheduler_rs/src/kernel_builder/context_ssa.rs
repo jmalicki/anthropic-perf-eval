@@ -75,7 +75,9 @@ pub struct SsaScratchContext {
     // Per-Group Vectors
     // These are dynamically sized based on n_groups
     // =========================================================================
-    pub all_idx: Vec<Option<VReg>>,   // [n_groups] - idx vectors
+    /// [n_groups] - index vectors. With `IndexForm::Mirrored` this holds `n = L_d - idx`,
+    /// and `None` means `n = 0` (depth 0: before the first round and after the wrap).
+    pub all_idx: Vec<Option<VReg>>,
     pub all_val: Vec<Option<VReg>>,   // [n_groups] - val vectors
     pub v_nv: Vec<Vec<Option<VReg>>>, // [n_iters][UNROLL] - tree value vectors
     pub v_t: Vec<Vec<Option<VReg>>>,  // [n_iters][UNROLL] - temp vectors

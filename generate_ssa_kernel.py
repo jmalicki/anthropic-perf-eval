@@ -202,7 +202,7 @@ def main():
 
 
 # Emission options and their defaults (kernel_build_args.py "Emission options").
-EMISSION_DEFAULTS = {"merge_hash_stages": False}
+EMISSION_DEFAULTS = {"merge_hash_stages": False, "index_form": "zero-based"}
 
 
 def emission_options(build_kwargs):

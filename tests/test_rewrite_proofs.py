@@ -52,3 +52,15 @@ def test_stage5_proof_rejects_a_wrong_constant(monkeypatch):
     monkeypatch.setattr(rewrites, "STAGE5_XOR_CONST", rewrites.STAGE5_XOR_CONST ^ 4)
     _, result, _, _ = rewrites.check_stage5_xor_deferral()
     assert result == "sat"
+
+
+def test_level_last_index_matches_emission():
+    """scheduler_rs uses the same per-level constants (config.rs level_last_index)."""
+    assert [rewrites.level_last_index(d) for d in range(6)] == [0, 2, 6, 14, 30, 62]
+
+
+def test_mirrored_step_proof_rejects_a_wrong_constant(monkeypatch):
+    """With an even deferred constant the parity is not inverted and the mirrored update is wrong."""
+    monkeypatch.setattr(rewrites, "STAGE5_XOR_CONST", rewrites.STAGE5_XOR_CONST ^ 1)
+    _, result, _, _ = rewrites.check_mirrored_index_step()
+    assert result == "sat"

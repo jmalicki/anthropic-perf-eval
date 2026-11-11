@@ -68,3 +68,45 @@ def test_merge_hash_stages_saves_one_op_per_hash(tmp_path, rounds):
     # Two multiply_adds and an XOR replace multiply_add, add, shift, XOR: no shift by 9 is left.
     assert len(phase_ops(merged_sched, "hash", "multiply_add")) == 4 * groups * rounds
     assert len(phase_ops(base_sched, "hash", "multiply_add")) == 3 * groups * rounds
+
+
+# ---------------------------------------------------------------------------
+# --index-form mirrored
+# ---------------------------------------------------------------------------
+def test_mirrored_index_updates_in_two_ops(tmp_path):
+    """6 rounds visit depths 0 to 5: root, three cached levels, two gathers."""
+    rounds, groups = 6, BATCH // 8
+    base, base_sched = build(tmp_path, rounds)
+    mirrored, mirrored_sched = build(tmp_path, rounds, index_form="mirrored")
+    # Zero-based: AND, SUB, multiply_add every round. Mirrored: AND every round, plus one
+    # multiply_add except at depth 0, where n is the bit itself.
+    assert len(phase_ops(base_sched, "branch")) == 3 * groups * rounds
+    assert len(phase_ops(mirrored_sched, "branch")) == groups * (rounds + rounds - 1)
+    assert not phase_ops(mirrored_sched, "branch", "-")
+    # The initial indices are not loaded (taken to be 0); the final ones are still stored.
+    assert len(phase_ops(base_sched, "load_data", "vload")) == 2 * groups
+    assert len(phase_ops(mirrored_sched, "load_data", "vload")) == groups
+    assert len(phase_ops(mirrored_sched, "store_data", "vstore")) == 2 * groups
+    assert vector_op_equivalents(mirrored) < vector_op_equivalents(base)
+
+
+@pytest.mark.parametrize("rounds", [1, 3, 11, 12, 13])
+def test_mirrored_index_stores_reference_indices(tmp_path, rounds):
+    """Final depth 1 and 3; the wrap round last (11), and one and two rounds after it."""
+    build(tmp_path, rounds, index_form="mirrored")  # PROVED, and PASSED compares the stored indices
+
+
+def test_mirrored_index_has_no_wrap_broadcast(tmp_path):
+    """After the bottom level every index is 0: zero-based broadcasts 0 per group, mirrored emits nothing."""
+    rounds, groups = 11, BATCH // 8
+    _, base_sched = build(tmp_path, rounds)
+    _, mirrored_sched = build(tmp_path, rounds, index_form="mirrored")
+    wrap_round = [o for o in phase_ops(base_sched, "branch") if o["source_info"]["round"] == 10]
+    assert [o["opcode"] for o in wrap_round] == ["vbroadcast"] * groups
+    assert not [o for o in phase_ops(mirrored_sched, "branch") if o["source_info"]["round"] == 10]
+
+
+def test_index_form_rejects_unknown_value(tmp_path):
+    with pytest.raises(ValueError, match="index_form"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=2, verbose=False, index_form="one-based")

@@ -125,6 +125,11 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--merge-hash-stages", action="store_true", default=False,
                        help="Emit hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per "
                             "hash instead of 11 (proof: R8-hash-stage-merge in verification/rewrites.py)")
+    group.add_argument("--index-form", choices=["zero-based", "mirrored"], default="zero-based",
+                       help="Tree index representation between rounds. mirrored tracks n = L_d - idx (position "
+                            "in the level from the right): index update in 2 vector ops instead of 3, none at "
+                            "depth 0 and in the wrap round; initial indices are assumed 0 and not loaded "
+                            "(proofs: R9 to R11 in verification/rewrites.py)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -267,6 +272,7 @@ def args_to_build_kwargs(
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "merge_hash_stages": get("merge_hash_stages", False),
+        "index_form": get("index_form", "zero-based"),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -312,6 +318,7 @@ def args_to_build_kwargs(
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "merge_hash_stages": get("merge_hash_stages", False),
+        "index_form": get("index_form", "zero-based"),
     }
 
 
