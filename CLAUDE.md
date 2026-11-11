@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+[![CI](https://github.com/jmalicki/anthropic-perf-eval/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jmalicki/anthropic-perf-eval/actions/workflows/ci.yml)
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
@@ -96,6 +98,17 @@ uv run tests/submission_tests.py
 `uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
 
 **Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, use a pytest marker (e.g. `@pytest.mark.ci_only`) and run default with `-m "not ci_only"`; document in `pyproject.toml`.
+
+### CI
+
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on a macOS arm64 runner (`macos-latest`) with OR-Tools from Homebrew, the same setup as local development. Two jobs:
+
+- **Rust tests (scheduler_rs)** — `./scripts/test.sh rust` (debug profile, `--features cpsat`).
+- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, one step each.
+
+To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI installs whatever OR-Tools version Homebrew currently ships (printed by the "Install OR-Tools" step); if a failure does not reproduce, compare that against `brew list --versions or-tools`.
+
+Not run in CI: the `ci-tests` Cargo feature, `tests/submission_tests.py`, and any full CP-SAT kernel build (the kernel suite is greedy-only).
 
 ### Generating Kernels
 
