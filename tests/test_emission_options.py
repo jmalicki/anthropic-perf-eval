@@ -280,3 +280,42 @@ def test_cached_select_rejects_unknown_values(option, value):
     with pytest.raises(ValueError, match=option):
         scheduler_rs.build_tick_tock_kernel_ssa(
             forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=2, verbose=False, **{option: value})
+
+
+# ---------------------------------------------------------------------------
+# --depth4-select-rounds after-wrap (with --tree-reduce-max-depth 4)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("options", [
+    {},
+    {"cached_select": "bits", "index_form": "mirrored"},
+    {"cached_select": "mobius", "index_form": "mirrored", "merge_hash_stages": True},
+], ids=["standard", "bits-mirrored", "mobius-mirrored-merged"])
+def test_depth4_select_after_wrap_gathers_round_4_and_selects_round_15(tmp_path, options):
+    rounds, groups = 16, BATCH // 8
+    _, every = build(tmp_path, rounds, tree_reduce_max_depth=4, **options)
+    rep, after = build(tmp_path, rounds, tree_reduce_max_depth=4, depth4_select_rounds="after-wrap", **options)
+    _, never = build(tmp_path, rounds, **options)
+
+    def loads(sched, rnd):
+        return tree_access(sched, rnd).get("load", 0)
+
+    assert (loads(every, 4), loads(every, 15)) == (0, 0)
+    assert (loads(after, 4), loads(after, 15)) == (8 * groups, 0)
+    assert (loads(never, 4), loads(never, 15)) == (8 * groups, 8 * groups)
+    assert tree_access(after, 4) == tree_access(never, 4), "first pass gathers exactly as without depth-4 caching"
+    assert tree_access(after, 15) == tree_access(every, 15), "after the wrap it selects exactly as with it"
+    never_rep = sr.analyze(never)
+    assert rep["engines"]["load"]["ops"] < never_rep["engines"]["load"]["ops"]
+
+
+def test_depth4_select_rounds_is_ignored_without_depth4_caching(tmp_path):
+    _, default = build(tmp_path, 6)
+    _, after = build(tmp_path, 6, depth4_select_rounds="after-wrap")
+    assert [(o["opcode"], o["engine"]) for o in default["ssa_ops"]] == \
+           [(o["opcode"], o["engine"]) for o in after["ssa_ops"]]
+
+
+def test_depth4_select_rounds_rejects_unknown_value():
+    with pytest.raises(ValueError, match="depth4_select_rounds"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=2, verbose=False, depth4_select_rounds="last")
