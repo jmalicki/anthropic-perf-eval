@@ -251,6 +251,36 @@ def test_greedy_priority_wavefront():
         )
 
 
+def _alu_slots_per_cycle(instrs):
+    return [len(bundle.get("alu", [])) for bundle in instrs]
+
+
+def test_greedy_split_shift():
+    """PyO3: greedy_split_shift=True is accepted, fills scalar slots past 8, and the kernel is correct."""
+    import scheduler_rs
+
+    builds = {}
+    for split in (False, True):
+        forest = Tree.generate(FOREST_HEIGHT)
+        inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+        mem = build_mem_image(forest, inp)
+        instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+            verbose=False,
+            use_cpsat=False,
+            greedy_barriers="none",
+            greedy_priority="wavefront",
+            greedy_split_shift=split,
+        )
+        assert not stats.get("budget_exceeded", False)
+        _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+        builds[split] = (list(instrs), stats)
+    assert max(_alu_slots_per_cycle(builds[True][0])) <= 12
+    assert sum(_alu_slots_per_cycle(builds[True][0])) > sum(_alu_slots_per_cycle(builds[False][0])), \
+        "split shifts move more vector work onto the scalar slots"
+    assert builds[True][1]["cycles"] <= builds[False][1]["cycles"]
+
+
 def test_depth3_validates():
     """Depth 3 tree-reduce: kernel with tree_reduce_max_depth=3 must match reference.
 

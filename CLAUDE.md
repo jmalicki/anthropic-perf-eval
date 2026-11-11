@@ -182,6 +182,7 @@ Greedy schedule shape options (ablation switches, defaults unchanged):
   - `--greedy-stagger-cycles N` - Stagger between consecutive groups in cycles (default 12, about three quarters of one round's critical path; 0 = all groups abreast).
   - `--greedy-groups-in-flight N` - Groups allowed to run at once (default 16; 0 = no limit). Bounds scratch: a group that has not started holds nothing, a finished group has stored its results.
   - 16 rounds, greedy: `uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate --greedy-barriers none --greedy-priority wavefront` gives 1,398 cycles (1,400 on the simulator) against 2,007 (1,994) by default.
+- `--greedy-split-shift` - Greedy-only. A vector op run as 8 scalar ops may straddle two consecutive cycles (first lanes in the leftover scalar slots of one cycle, the rest in the next), so all 12 scalar slots carry shifted work: 3 shifted ops per 2 cycles instead of 2, i.e. 7.5 vector-op equivalents per cycle instead of 7. The op's cycle is its last lane's; per-lane cycles go to `shifted_alu_cycles` as for CP-SAT. Ignored when CP-SAT follows (its hints carry one cycle per op). With the wavefront priority at 16 rounds: 1,314 cycles (1,316 on the simulator), 43 above the 1,271 floor.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
