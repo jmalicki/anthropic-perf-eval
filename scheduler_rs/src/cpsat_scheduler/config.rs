@@ -210,6 +210,14 @@ pub struct CpsatTuning {
     /// ALAP when the greedy cap is off. False drops it; the horizon then relies on the greedy
     /// schedule being feasible.
     pub horizon_at_least_num_ops: bool,
+    /// Add an interval `[makespan, horizon)` with demand = capacity to each engine cumulative
+    /// (the pattern of OR-Tools' `rcpsp_sat.py`). CP-SAT's linear relaxation then recognises
+    /// the makespan of each cumulative (`DetectMakespan` in `linear_relaxation.cc`) and uses
+    /// it in the energy relaxation and cuts. Adds no restriction: every task ends by `makespan`.
+    pub makespan_interval: bool,
+    /// `push_all_tasks_toward_start` ("Experimental code: specify if the objective pushes all
+    /// tasks toward the start of the schedule"; used by `rcpsp_sat.py`).
+    pub push_all_tasks_toward_start: bool,
 }
 
 impl Default for CpsatTuning {
@@ -224,6 +232,8 @@ impl Default for CpsatTuning {
             greedy_alap_slack: Some(15),
             horizon_at_least_max_latency_path: true,
             horizon_at_least_num_ops: true,
+            makespan_interval: false,
+            push_all_tasks_toward_start: false,
         }
     }
 }
