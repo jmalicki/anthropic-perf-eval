@@ -1,6 +1,6 @@
-"""Theorems T1–T14 from LIVENESS_SPECIFICATION.md."""
+"""Theorems T1–T16 from LIVENESS_SPECIFICATION.md."""
 
-from z3 import And, Ints, Not, Or, Solver
+from z3 import And, Bool, If, Int, Ints, Not, Or, Solver, Sum
 
 from .fixtures import overlaps_closed
 
@@ -754,3 +754,91 @@ def check_t15_optional_capacity_redundant(ctx=None) -> tuple[str, str, float, di
     result = solver.check()
     stats = _get_stats(solver)
     return ("T15", "unsat" if str(result) == "unsat" else str(result), 0.0, stats)
+
+
+# ---------------------------------------------------------------------------
+# T16: the greedy scheduler's live-word counter against interval liveness
+# ---------------------------------------------------------------------------
+
+_T16_READERS = 3
+
+
+def _t16_value_model(per_operand_decrement: bool):
+    """One value defined at cycle d with up to three reader ops.
+
+    Reader k is present or not, runs at cycle r[k] > d unless it is a skipped dead store
+    (never runs), and names the value in m[k] of its operands (1 or 2).
+
+    Returns (constraints, counter_live, interval_live) at a symbolic cycle t, where
+    counter_live follows the scheduler's rule and interval_live is A4 with T1's reuse rule
+    (occupied for start <= t < end).
+    """
+    d, t = Ints("d t")
+    present = [Bool(f"present_{k}") for k in range(_T16_READERS)]
+    dead = [Bool(f"dead_{k}") for k in range(_T16_READERS)]
+    r = [Int(f"r_{k}") for k in range(_T16_READERS)]
+    m = [Int(f"m_{k}") for k in range(_T16_READERS)]
+    runs = [And(present[k], Not(dead[k])) for k in range(_T16_READERS)]
+    constraints = [d >= 0, t >= 0]
+    for k in range(_T16_READERS):
+        constraints += [r[k] >= d + 1, m[k] >= 1, m[k] <= 2]
+
+    # Interval liveness: [d, last read) if some reader runs, else [d, d + 1) (A4 case 2).
+    interval_live = If(
+        Or(*runs),
+        And(d <= t, Or(*[And(runs[k], r[k] > t) for k in range(_T16_READERS)])),
+        t == d,
+    )
+
+    # Counter: remaining readers start at the number of readers that will run; each reader
+    # that has run by the end of cycle t has decremented it. The value is counted from its
+    # write until the count reaches zero; a value with no reader is dropped a cycle later.
+    readers = Sum([If(runs[k], 1, 0) for k in range(_T16_READERS)])
+    step = (lambda k: m[k]) if per_operand_decrement else (lambda k: 1)
+    decremented = Sum([If(And(runs[k], r[k] <= t), step(k), 0) for k in range(_T16_READERS)])
+    counter_live = If(readers > 0, And(d <= t, readers - decremented > 0), t == d)
+    return constraints, counter_live, interval_live
+
+
+def check_t16_counter_agreement(ctx=None) -> tuple[str, str, float, dict]:
+    """T16: counting a value from its write until its last scheduled reader has run (one
+    decrement per reader op, skipped dead stores not counted as readers, an unread value
+    dropped one cycle after its write) is interval liveness. Negation: some cycle where the
+    two differ. UNSAT = they agree for every schedule of the bounded pattern."""
+    constraints, counter_live, interval_live = _t16_value_model(per_operand_decrement=False)
+    solver = Solver(ctx=ctx)
+    solver.add(*constraints)
+    solver.add(counter_live != interval_live)
+    result = solver.check()
+    return ("T16", str(result), 0.0, _get_stats(solver))
+
+
+def check_t16_per_operand_decrement_counterexample(ctx=None) -> tuple[str, str, float, dict]:
+    """The rule the scheduler used before: one decrement per operand. Ask for a cycle where
+    counter and interval differ. SAT = counterexample (x + x followed by a later reader of x
+    releases x early); this is the bug the agreement check found in the 4-round kernel."""
+    constraints, counter_live, interval_live = _t16_value_model(per_operand_decrement=True)
+    solver = Solver(ctx=ctx)
+    solver.add(*constraints)
+    solver.add(counter_live != interval_live)
+    result = solver.check()
+    return ("T16-per-operand-decrement", str(result), 0.0, _get_stats(solver))
+
+
+def check_t16_write_group_per_lane_counterexample(ctx=None) -> tuple[str, str, float, dict]:
+    """A write group of L lanes written at cycles w[i] and read as a vector at R. Interval
+    liveness holds the L-word block for min(w) <= t < R. The rule the scheduler used before
+    added one word per lane as it was written. SAT = a cycle where the per-lane count is
+    below the block (lanes written in different cycles)."""
+    lanes = 4
+    t, big_r = Ints("t R")
+    w = [Int(f"w_{i}") for i in range(lanes)]
+    solver = Solver(ctx=ctx)
+    solver.add(t >= 0)
+    for wi in w:
+        solver.add(wi >= 0, big_r >= wi + 1)
+    block = If(And(Or(*[wi <= t for wi in w]), t < big_r), lanes, 0)
+    per_lane = Sum([If(And(wi <= t, t < big_r), 1, 0) for wi in w])
+    solver.add(per_lane != block)
+    result = solver.check()
+    return ("T16-write-group-per-lane", str(result), 0.0, _get_stats(solver))

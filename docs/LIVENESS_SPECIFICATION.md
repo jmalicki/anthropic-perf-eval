@@ -223,6 +223,39 @@ for any fixed-point ALAP assignment. *Derives from A3.*
 
 *Verification*: The key implication (N ≤ C·M ⇒ M ≥ ⌈N/C⌉) is proven by Z3 in T14 (refutation: N ≤ M·C and M·C < N ⇒ UNSAT). The optional constraints in the CP-SAT model use the same formulas as in `compute_capacity_lower_bound_global` so that for any fixed (s,y,z), the optional inequality is exactly makespan ≥ ⌈N/C⌉ for that engine; T14 guarantees it holds whenever the cumulative holds.
 
+<a id="t16"></a>
+### T16. Greedy Counter Agreement
+
+The greedy scheduler (`ssa_greedy/mod.rs`) does not compute intervals. It keeps a running count of live words while it places ops, and uses that count for the budget check, for pressure throttling and for the peak it reports. T16 says the count is interval liveness.
+
+**Definition (interval liveness at a cycle)**: `L(t) = Σ size(v)` over values with `start(v) ≤ t < end(v)`, with `start` and `end` per A4. This is what is held once cycle `t`'s writes are done: a value last read at `t` is already released (A2), a value written at `t` and never read is still held (A4 case 2). `max_t L(t)` is the peak address assignment reports (`compute_peak_liveness`).
+
+**Counter rule**:
+1. A value is added when its producer is placed.
+2. Each value has a count of the ops that will read it. A reader counts once however many of its operands name the value. `keep_live` entries count as reads. Readers that are skipped dead stores do not count.
+3. Placing a reader decrements the count of each value it reads; at zero the value is removed in the same cycle.
+4. A value with no reader is removed at the next cycle.
+5. Vector groups: a read group (`decompose_vector`) is the decomposed vector, read by every reader of its lanes. A write group (`fresh_vector_group`) is one VLEN-word block added at its first lane write, read by every reader of the group VReg or of a lane, and held at least until the cycle after its last lane write if that lane is never read.
+
+**Theorem**: For every schedule the greedy produces, the counter after the last op of cycle `t` equals `L(t)`, for every `t`. Hence the counter's cycle-end peak equals the allocator's peak. The peak the scheduler reports is sampled after every op, so it is ≥ that peak (an op placed early in a cycle can add its result before a later op in the same cycle releases an operand).
+
+**How it is checked**:
+- *Every run.* `schedule_ssa_greedy_with_liveness_agreement` recomputes `L(t)` from the finished schedule with `address_assign::compute_live_intervals` and compares it with the counter cycle by cycle. A difference is an error that names the kinds of value that differ, with an example. `SCHEDULER_LIVENESS_AGREEMENT=1` prints the comparison; `SCHEDULER_LIVENESS_AGREEMENT=warn` turns the error into a warning.
+- *Property test.* `test_liveness_agreement_property` (400 random programs; 10,000 more with `ci-tests`) covers repeated operands, `keep_live`, both group kinds, direct lane readers, unread values and chains of dead stores, under tight budgets (force-schedule path), with and without VALU shift, under three pressure policies.
+- *Z3.* `T16` proves the rule for one value with up to three readers (present or not, dead or not, one or two operands each). `T16-per-operand-decrement` and `T16-write-group-per-lane` are the two old rules; Z3 returns SAT, a counterexample to each.
+
+**Scope**: The comparison uses the greedy's own view of the schedule: one cycle per op. Effects that exist only after later passes are outside it: the FMA path of a SelectChoice (dest written at `cycle+1`, `sub_temp`), per-lane cycles of shifted VALU ops chosen by CP-SAT, and the reserved zero word. Those are still covered only by address assignment.
+
+**What the check found** (November 2026, all fixed in the same change):
+
+| Disagreement | Effect on the counter | Seen in |
+|---|---|---|
+| `keep_live` values not counted as read | 256 words low while the last round runs | 2- and 4-round kernels (peak 1016 reported, 1112 real; 1265 vs 1408) |
+| Write group counted lane by lane | up to 28 words low during gathers | every kernel with gather rounds |
+| One decrement per operand (`x + x`) | value released while another reader is pending | 1 word, every kernel with 4+ rounds |
+| Dead-store readers counted | operand never released | random programs only (kernels are DCE'd first) |
+| `keep_live` on a group or lane ignored by `compute_live_intervals` | interval too short (allocator side) | random programs only |
+
 ---
 
 ## Part III: Definitions and Supporting Detail
@@ -439,13 +472,14 @@ The encoding of conditional constraints (Part II "Constraint scope") uses the fo
 
 - `scheduler_rs/src/types.rs`: LiveInterval struct, overlaps()
 - `scheduler_rs/src/address_assign.rs`: **Allocator** — compute_live_intervals (A4), assign_addresses (T1 expiration, T2 overlap). Uses T1/T2/T9; CP-SAT does not.
+- `scheduler_rs/src/kernel_builder/ssa_greedy/mod.rs`: **Greedy** — live-word counter (`count_written_dest`, `release_read_values`) and its comparison with interval liveness after every run (T16)
 - `scheduler_rs/src/cpsat_scheduler/model.rs`: **CP-SAT** — Scratch cumulative constraint (not allocator; no T1 expiration); Flow cumulative and NoOverlap (§9); choice encoding — optional intervals, only_enforce_if (§10)
 - `scheduler_rs/src/cpsat_scheduler/bounds.rs`: ASAP/ALAP computation (T3, T4), horizon and max-latency critical path (§4a), slot-aware tightening (T7) with optional-interval exclusions, scratch-aware tightening (T8), precedence fixpoint after tightening, domain consistency check (ASAP ≤ ALAP), capacity lower bound (T14), ordering pairs for symmetry
 - `scheduler_rs/src/cpsat_scheduler/cse_groups.rs`: CSE group construction
 - `docs/ISA_REFERENCE.md`: VLIW timing, read-before-write
 - `docs/SUB_CSE_ALU_SHIFT_DESIGN.md`: CSE shared SUB model and capacity
 
-**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition; that instance also proves domain consistency (ASAP ≤ ALAP for both ops: 0 ≤ K−1 and 1 ≤ K). All of T1–T15 are checked by refutation. T15 proves that the optional propagation constraints (direct capacity inequalities) are redundant with the cumulative constraints.
+**Z3 verification** (`verification/verify.py`, `verification/theorems.py`): Encode the negation of each theorem (and any axioms used); if UNSAT, the theorem follows. Use **integer** cycle indices and half-open intervals; no need to model within-cycle read/write order explicitly. Scope of what is proven: **T3/T4** use a symbolic `offset ≥ 1`, so the precedence bounds are proven for any minimum delay (normal, FMA, shifted). **T5** uses a 2-op chain with symbolic makespan `K ≥ 2`; soundness for arbitrary DAGs follows from T3, T4, and the ASAP/ALAP fixpoint definition; that instance also proves domain consistency (ASAP ≤ ALAP for both ops: 0 ≤ K−1 and 1 ≤ K). All of T1–T16 are checked by refutation (the two `T16-…` counterexample checks expect SAT). T15 proves that the optional propagation constraints (direct capacity inequalities) are redundant with the cumulative constraints.
 
 ---
 

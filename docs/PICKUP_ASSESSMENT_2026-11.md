@@ -186,6 +186,9 @@ Ordered by value. The first two would have prevented most of BUGS.md.
    every greedy run that its peak equals the interval-based peak. The leak fixed here is
    exactly a counterexample to that equality, and a bounded Z3 model over small op
    patterns (vector groups, shifted ops, FMA selects) would have found it.
+   *Done for the greedy counter (spec T16): checked after every run, with a property test
+   and a bounded Z3 statement. The first runs found three more undercounts (up to 256
+   words) in real kernels; see BUGS.md.*
 5. **Per-instance certificates for tightening.** T7 showed that composing individually
    valid exclusions is unsound. Emit, for every excluded (op, cycle), the overloaded
    interval that justifies it, and check those independently. Checking instances is easier

@@ -492,6 +492,22 @@ pub fn compute_live_intervals(
     // independent intervals to each new scalar (lane) VReg, so we can more tightly
     // pack chains of ALU ops that consume lanes at different times. See emit_ssa.rs
     // decompose_vector doc comment and docs/UNIFY_SCRATCH_LIVENESS_PLAN.md.
+    // Latest cycle at which each VReg is read (operand or `keep_live`), computed once so
+    // the group loop below is a lookup per group and lane, not a scan of every op.
+    let mut max_read_cycle: HashMap<VReg, i32> = HashMap::new();
+    for op in ops {
+        let reads = op
+            .srcs
+            .iter()
+            .filter_map(|s| s.as_vreg())
+            .chain(op.keep_live.iter().flatten().copied());
+        for vreg in reads {
+            max_read_cycle
+                .entry(vreg)
+                .and_modify(|c| *c = (*c).max(op.cycle))
+                .or_insert(op.cycle);
+        }
+    }
     for (group_vreg, lane_vregs) in &config.vector_group_lanes {
         // Existing interval for the group key (present for read groups / decomposition)
         let existing_start = intervals.get(group_vreg).map(|i| i.start);
@@ -507,28 +523,15 @@ pub fn compute_live_intervals(
                 .filter_map(|lv| intervals.get(lv).map(|i| i.end))
             .max();
 
-        // Consumer reads of the group alias VReg (ops that use the vector group)
-        let consumer_end = ops
-                .iter()
-                .filter(|op| {
-                    op.srcs
-                        .iter()
-                        .any(|s| matches!(s, Operand::VReg(v) if *v == *group_vreg))
-                })
-                .map(|op| op.cycle)
-            .max();
+        // Consumer reads of the group alias VReg (ops that use the vector group or hold
+        // it through `keep_live`)
+        let consumer_end = max_read_cycle.get(group_vreg).copied();
 
-        // Lane VReg uses: ops that read any lane VReg directly.
+        // Lane VReg uses: ops that read any lane VReg directly or hold one through `keep_live`.
         // Critical for read groups where lane VRegs have no intervals.
-        let lane_vreg_set: HashSet<VReg> = lane_vregs.iter().copied().collect();
-        let lane_use_end = ops
-                .iter()
-                .filter(|op| {
-                    op.srcs
-                        .iter()
-                        .any(|s| matches!(s, Operand::VReg(v) if lane_vreg_set.contains(v)))
-                })
-                .map(|op| op.cycle)
+        let lane_use_end = lane_vregs
+            .iter()
+            .filter_map(|lv| max_read_cycle.get(lv).copied())
             .max();
 
         // Combine all sources for start and end

@@ -3377,3 +3377,337 @@ fn test_vector_group_vregs_released_after_last_use() {
         peak_live
     );
 }
+
+// =========================================================================
+// Liveness agreement: the scheduler's counter against interval liveness
+//
+// The greedy's live-word counter and `address_assign::compute_live_intervals` are two
+// implementations of one definition (docs/LIVENESS_SPECIFICATION.md, "Greedy counter
+// agreement"). The scheduler compares them after every run and returns Err when they
+// differ, so each test below fails with the per-value differences if the counter is wrong.
+// =========================================================================
+
+/// Schedule with the default policy and return the counter/interval comparison.
+fn schedule_for_agreement(
+    emit: &mut SsaEmitContext,
+    groups: &HashMap<VReg, Vec<VReg>>,
+    enable_valu_shift: bool,
+    scratch_budget: usize,
+    strategy: &dyn PressurePolicy,
+) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    let groups_opt = if groups.is_empty() { None } else { Some(groups) };
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, groups_opt);
+    let mut shifted_ops = HashSet::new();
+    schedule_ssa_greedy_with_liveness_agreement(
+        &mut emit.ops,
+        enable_valu_shift,
+        &mut shifted_ops,
+        scratch_budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        strategy,
+        groups_opt,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Regression: an op naming one value in both operands is one reader, not two.
+///
+/// `d = x + x` used to decrement x's remaining-reader count twice, so x was released
+/// while `e`'s producer still had to read it.
+#[test]
+fn test_liveness_agreement_duplicate_operand() {
+    let mut emit = SsaEmitContext::new();
+    let a = emit.emit_const(1);
+    let b = emit.emit_const(2);
+    let x = emit.emit_alu(Opcode::Add, a, b);
+    let d = emit.emit_alu(Opcode::Add, x, x);
+    let d2 = emit.emit_alu(Opcode::Add, d, b);
+    let e = emit.emit_alu(Opcode::Add, d2, x); // reads x two cycles after `d` does
+    emit.emit_store_imm(100, e);
+
+    let (_, agreement) =
+        schedule_for_agreement(&mut emit, &HashMap::new(), false, 1536, &GreedyPolicy)
+            .expect("counter must agree with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+    assert_eq!(agreement.counter_cycle_end_peak, agreement.interval_peak);
+}
+
+/// Regression: a `keep_live` value is held until the op that names it.
+///
+/// Address assignment extends such a value's interval to that op; the counter released it
+/// at its last operand read (256 words too early in the 2- and 4-round kernels).
+#[test]
+fn test_liveness_agreement_keep_live() {
+    let mut emit = SsaEmitContext::new();
+    let v = emit.emit_vload_imm(200);
+    let w = emit.emit_vload_imm(208);
+    let kept = emit.emit_valu(Opcode::Xor, v, w);
+    let mut chain = emit.emit_valu(Opcode::Add, kept, w); // last operand read of `kept`
+    for _ in 0..4 {
+        chain = emit.emit_valu(Opcode::Add, chain, w);
+    }
+    emit.set_next_keep_live(vec![kept]);
+    let last = emit.emit_valu(Opcode::Xor, chain, w);
+    emit.emit_vstore_imm(300, last);
+
+    let (_, agreement) =
+        schedule_for_agreement(&mut emit, &HashMap::new(), false, 1536, &GreedyPolicy)
+            .expect("counter must agree with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+    // v/w loads, then `kept` (8) + w (8) + the chain value (8) are held together.
+    assert_eq!(agreement.interval_peak, 24);
+    assert_eq!(agreement.counter_cycle_end_peak, 24);
+}
+
+/// Regression: a write group is one 8-word block from its first lane write.
+///
+/// Two loads fit per cycle, so the lanes of a gather arrive over four cycles. The counter
+/// used to add one word per loaded lane; address assignment reserves the block at once.
+#[test]
+fn test_liveness_agreement_write_group_block() {
+    let mut emit = SsaEmitContext::new();
+    let base = emit.emit_const(100);
+    let v_base = emit.emit_vbroadcast(base);
+    let idx = emit.emit_vload_imm(200);
+    let v_addr = emit.emit_valu(Opcode::Add, idx, v_base);
+    let addr_lanes = emit.decompose_vector(v_addr);
+    let (v_loaded, loaded_lanes) = emit.fresh_vector_group();
+    for (addr, dest) in addr_lanes.iter().zip(loaded_lanes.iter()) {
+        emit.emit_load_into(*addr, *dest);
+    }
+    let out = emit.emit_valu(Opcode::Xor, idx, v_loaded);
+    emit.emit_vstore_imm(300, out);
+    let groups = emit.take_vector_group_lanes();
+
+    let (_, agreement) = schedule_for_agreement(&mut emit, &groups, false, 1536, &GreedyPolicy)
+        .expect("counter must agree with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
+/// Regression: a reader that is a skipped dead store does not hold its operands.
+///
+/// `dead = x + b` has no reader and is never scheduled, but it used to count as a reader
+/// of x, so x stayed in the counter to the end of the schedule.
+#[test]
+fn test_liveness_agreement_dead_reader() {
+    let mut emit = SsaEmitContext::new();
+    let a = emit.emit_const(1);
+    let b = emit.emit_const(2);
+    let x = emit.emit_alu(Opcode::Add, a, b);
+    let _dead = emit.emit_alu(Opcode::Sub, x, b);
+    let only_dead_reader = emit.emit_alu(Opcode::Mul, a, b);
+    let _dead2 = emit.emit_alu(Opcode::Sub, only_dead_reader, b);
+    let mut y = emit.emit_alu(Opcode::Add, x, a);
+    for _ in 0..6 {
+        y = emit.emit_alu(Opcode::Add, y, a);
+    }
+    emit.emit_store_imm(100, y);
+
+    let (_, agreement) =
+        schedule_for_agreement(&mut emit, &HashMap::new(), false, 1536, &GreedyPolicy)
+            .expect("counter must agree with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
+/// Deterministic generator for the property test (xorshift64*).
+struct TestRng(u64);
+
+impl TestRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn chance(&mut self, percent: usize) -> bool {
+        self.below(100) < percent
+    }
+}
+
+/// Build a random SSA program covering the patterns the counter has to get right:
+/// repeated operands, `keep_live`, read groups, write groups (with and without direct lane
+/// readers), values read many cycles later, and values nobody reads.
+fn random_liveness_program(rng: &mut TestRng) -> (SsaEmitContext, HashMap<VReg, Vec<VReg>>) {
+    let mut emit = SsaEmitContext::new();
+    let mut scalars: Vec<VReg> = Vec::new();
+    let mut vectors: Vec<VReg> = Vec::new();
+    // For keep_live: a value the listed value was computed from (so it is defined earlier).
+    let mut ancestor: HashMap<VReg, VReg> = HashMap::new();
+    // A vector is decomposed at most once (a second call would replace its lanes).
+    let mut decomposed: HashMap<VReg, Vec<VReg>> = HashMap::new();
+    let mut next_const = 1_000i64;
+
+    for _ in 0..(2 + rng.below(3)) {
+        next_const += 1;
+        scalars.push(emit.emit_const_force(next_const));
+    }
+    for i in 0..(1 + rng.below(3)) {
+        vectors.push(emit.emit_vload_imm(2_000 + 8 * i as i64));
+    }
+
+    let alu_ops = [Opcode::Add, Opcode::Sub, Opcode::Xor, Opcode::Mul];
+    let n_steps = 5 + rng.below(40);
+    for _ in 0..n_steps {
+        match rng.below(100) {
+            0..=29 => {
+                let a = scalars[rng.below(scalars.len())];
+                let b = if rng.chance(20) { a } else { scalars[rng.below(scalars.len())] };
+                if rng.chance(15) {
+                    if let Some(&keep) = ancestor.get(&a) {
+                        emit.set_next_keep_live(vec![keep]);
+                    }
+                }
+                let d = emit.emit_alu(alu_ops[rng.below(alu_ops.len())], a, b);
+                ancestor.insert(d, a);
+                scalars.push(d);
+            }
+            30..=64 => {
+                let a = vectors[rng.below(vectors.len())];
+                let b = if rng.chance(20) { a } else { vectors[rng.below(vectors.len())] };
+                if rng.chance(15) {
+                    if let Some(&keep) = ancestor.get(&a) {
+                        emit.set_next_keep_live(vec![keep]);
+                    }
+                }
+                let d = emit.emit_valu(alu_ops[rng.below(alu_ops.len())], a, b);
+                ancestor.insert(d, a);
+                vectors.push(d);
+            }
+            65..=74 => {
+                let a = scalars[rng.below(scalars.len())];
+                let d = emit.emit_vbroadcast_force(a);
+                ancestor.insert(d, a);
+                vectors.push(d);
+            }
+            75..=89 => {
+                // Gather: read group (address lanes) feeding a write group (loaded lanes).
+                let v_addr = vectors[rng.below(vectors.len())];
+                let addr_lanes = decomposed
+                    .entry(v_addr)
+                    .or_insert_with(|| emit.decompose_vector(v_addr))
+                    .clone();
+                let (v_loaded, loaded_lanes) = emit.fresh_vector_group();
+                for (addr, dest) in addr_lanes.iter().zip(loaded_lanes.iter()) {
+                    emit.emit_load_into(*addr, *dest);
+                }
+                let d = emit.emit_valu(Opcode::Xor, v_addr, v_loaded);
+                ancestor.insert(d, v_addr);
+                vectors.push(d);
+                if rng.chance(30) {
+                    // A scalar op reads one loaded lane directly.
+                    scalars.push(loaded_lanes[rng.below(VLEN)]);
+                }
+            }
+            _ => {
+                // Read group whose lanes feed scalar ops.
+                let v = vectors[rng.below(vectors.len())];
+                let lanes =
+                    decomposed.entry(v).or_insert_with(|| emit.decompose_vector(v)).clone();
+                for _ in 0..(1 + rng.below(3)) {
+                    scalars.push(lanes[rng.below(VLEN)]);
+                }
+            }
+        }
+    }
+
+    // Sinks: store some values; the rest stay unread (dead stores, possibly in chains).
+    for (i, v) in vectors.clone().into_iter().enumerate() {
+        if rng.chance(50) {
+            emit.emit_vstore_imm(4_000 + 8 * i as i64, v);
+        }
+    }
+    for (i, s) in scalars.clone().into_iter().enumerate() {
+        if rng.chance(50) {
+            emit.emit_store_imm(8_000 + i as i64, s);
+        }
+    }
+    let groups = emit.take_vector_group_lanes();
+    (emit, groups)
+}
+
+/// Run the agreement property over `cases` random programs.
+fn check_liveness_agreement_property(seed: u64, cases: usize) {
+    let mut rng = TestRng(seed);
+    for case in 0..cases {
+        let (mut emit, groups) = random_liveness_program(&mut rng);
+        // Tight budgets exercise deferral and the force-schedule path.
+        let budget = [1536, 96, 40, 16][rng.below(4)];
+        let enable_valu_shift = rng.chance(50);
+        let policies: [Box<dyn PressurePolicy>; 3] = [
+            Box::new(GreedyPolicy),
+            Box::new(pressure_policy::AdaptivePolicy::default()),
+            Box::new(pressure_policy::PressureGatedPolicy::default()),
+        ];
+        let policy = &*policies[rng.below(policies.len())];
+
+        let result = schedule_for_agreement(&mut emit, &groups, enable_valu_shift, budget, policy);
+        let ((_cycles, _exceeded, peak), agreement) = result.unwrap_or_else(|e| {
+            panic!("seed {} case {} (budget {}, shift {}): {}", seed, case, budget, enable_valu_shift, e)
+        });
+        let context = format!("seed {} case {} (budget {}): {}", seed, case, budget, agreement);
+        // 1. Cycle by cycle, the counter is interval liveness.
+        assert!(agreement.agrees(), "{}", context);
+        // 2. Hence the cycle-end peak is the allocator's peak.
+        assert_eq!(agreement.counter_cycle_end_peak, agreement.interval_peak, "{}", context);
+        // 3. The reported peak is sampled after each op, so it can only be higher.
+        assert_eq!(peak, agreement.counter_peak, "{}", context);
+        assert!(agreement.counter_peak >= agreement.interval_peak, "{}", context);
+    }
+}
+
+/// Property: on random programs the greedy's counter equals interval liveness every cycle.
+#[test]
+fn test_liveness_agreement_property() {
+    check_liveness_agreement_property(0x9E37_79B9_7F4A_7C15, 400);
+}
+
+/// Same property, more programs and seeds (CI only).
+#[cfg(feature = "ci-tests")]
+#[test]
+fn test_liveness_agreement_property_extended() {
+    for seed in 1..=10u64 {
+        check_liveness_agreement_property(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93), 1_000);
+    }
+}
+
+/// Regression: a force-schedule candidate that finds no free slot stays queued.
+///
+/// With budget 2, cycle 0 places the two constants on both Load slots. The ConstChoice
+/// would still fit on Flow, so it is deferred for budget, not for slots. The force path
+/// then tries it on its Load engine, finds Load full, and used to drop it: the run ended
+/// with "Scheduling failed: only scheduled 5/6 ops ... Ready but unscheduled".
+#[test]
+fn test_force_schedule_without_slot_keeps_op() {
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const_force(200); // op 0
+    let c2 = emit.emit_const_force(300); // op 1
+    let k = emit.emit_const_choice(5); // op 2
+    let s = emit.emit_alu(Opcode::Add, c1, c2);
+    let t = emit.emit_alu(Opcode::Add, s, k);
+    emit.emit_store(k, t);
+
+    let (_, agreement) =
+        schedule_for_agreement(&mut emit, &HashMap::new(), false, 2, &GreedyPolicy)
+            .expect("the deferred ConstChoice must not be dropped");
+
+    assert!(agreement.agrees(), "{}", agreement);
+    assert!(emit.ops.iter().all(|op| op.cycle >= 0), "every op must be scheduled");
+    // The scenario the test is about: Load was full in cycle 0, and the ConstChoice,
+    // deferred there, was placed in a later cycle.
+    assert_eq!((emit.ops[0].cycle, emit.ops[1].cycle), (0, 0), "constants fill Load in cycle 0");
+    assert_eq!(emit.ops[2].opcode, Opcode::ConstChoice);
+    assert!(emit.ops[2].cycle > 0, "ConstChoice placed after cycle 0");
+}
