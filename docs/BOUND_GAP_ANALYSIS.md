@@ -67,7 +67,7 @@ Reading of the code (`scheduler_rs/src/cpsat_scheduler/bounds.rs`,
 | `capacity_valu` | `6*makespan + s - select_contrib >= valu_count`: consistent with the cumulative. | V (by reading) |
 | Looseness | The bound ignores precedence (dependency floor is passed as 0 on purpose), scratch, and ramp-up and tail effects. Critical path is 264, so precedence alone is far from binding. The 720-cycle gap between 1,271 and the 1,994 schedule is schedule structure (rounds run back to back), as the pickup assessment says. | V for the numbers, I for the attribution |
 | Other engines | Load floor 1,065 to 1,088, flow 448, store 32: none binds today. Load becomes the binding engine as soon as ALU work drops below about 8,000 equivalents. | V |
-| `n_nodes=1023` in `run_options` | The CLI derives `n_nodes = 2^height - 1`; the harness passes 2,047. Emission keys off `forest_height`, so the JSON still shows 11 levels and 8 gather rounds, and the counts above are unaffected. | V (round/level table below) |
+| `n_nodes=1023` in `run_options` | The CLI derived `n_nodes = 2^height - 1` (fixed since: 2^(height+1) - 1 = 2,047, as the harness passes). Emission keys off `forest_height`, so the JSON still shows 11 levels and 8 gather rounds, and the counts above are unaffected. | V (round/level table below) |
 
 So the bound is not wrong. It is conditional, and the condition is where the gap lives.
 

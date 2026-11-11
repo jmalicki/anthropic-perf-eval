@@ -1232,7 +1232,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
             })?
     } else {
-        builder.build_and_schedule().map_err(|e| {
+        let enable_valu_shift = builder.config.compiler.enable_valu_shift;
+        builder.build_and_schedule_greedy(enable_valu_shift, None, verbose).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
         })?
     };

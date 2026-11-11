@@ -69,7 +69,8 @@ uv run python -m scripts.scratch_vs_ref kernel_4r_8b_d3_no_cse.json --rounds 4 -
   --addr 13 21 --cycles 68 69 70 71 72 --ref-key hashed_val --ref-round 3 --group 0
 
 # Who wrote addr
-uv run python -m scripts.who_wrote_addr kernel_4r_8b_d3_no_cse.json --addr 13 --before-cycle 72
+# who_wrote_addr.py was replaced by inspect_schedule.py (needs the scheduler JSON of the same build):
+uv run python -m scripts.inspect_schedule sched_4r_8b_d3_no_cse.json addr 13 --cycle 72 --bundle
 
 # Compare depth-3 (use forest_height=10)
 uv run python -m scripts.compare_depth3_tree_value --kernel kernel_4r_8b_d3_no_cse.json \

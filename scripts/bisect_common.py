@@ -51,8 +51,8 @@ def parse_solver_status(stdout: str, stderr: str) -> Optional[str]:
 
 
 def n_nodes(forest_height: int) -> int:
-    """Return tree node count for a given forest height."""
-    return (1 << forest_height) - 1
+    """Return tree node count for a given forest height (levels 0..height, as problem.Tree.generate)."""
+    return (1 << (forest_height + 1)) - 1
 
 
 def run_one(

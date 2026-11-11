@@ -186,7 +186,7 @@ fn engine_capacity(e: Engine) -> i64 {
 // ============================================================================
 
 /// Tracks ASAP inflation activity during a greedy scheduling run.
-/// Printed as a summary after scheduling completes (via eprintln).
+/// Printed as a summary after scheduling completes (via eprintln, verbose only).
 #[derive(Default)]
 struct InflationStats {
     /// Ops deferred by inflation
@@ -310,21 +310,141 @@ impl SlotTracker {
     }
 }
 
-/// Dump usage breakdown for currently live VRegs when budget is exceeded.
+// ============================================================================
+// GreedyDiagnostics: what the greedy scheduler reports about budget overflow
+// ============================================================================
+
+/// Diagnostics for one greedy scheduling run.
+///
+/// The caller sets `verbose`; the scheduler fills in the rest. A run that is
+/// force-scheduled past the scratch budget can stay over budget for thousands
+/// of cycles, so the detailed liveness breakdown is emitted for the first
+/// over-budget cycle and (if different) the worst one only, and never when
+/// `verbose` is false. The one-line summary from [`GreedyDiagnostics::summary`]
+/// is always printed.
+#[derive(Debug, Default)]
+pub(crate) struct GreedyDiagnostics {
+    /// Print detailed diagnostics (liveness breakdown dumps, ASAP inflation stats) to stderr.
+    pub verbose: bool,
+    /// Number of distinct cycles in which an op was force-scheduled past the budget.
+    pub over_budget_cycles: usize,
+    /// `(cycle, live_words)` of the first over-budget cycle.
+    pub first_over_budget: Option<(usize, usize)>,
+    /// `(cycle, live_words)` of the over-budget cycle with the most live words.
+    pub worst_over_budget: Option<(usize, usize)>,
+    /// Number of detailed breakdown dumps written to stderr (0 unless `verbose`; at most 2).
+    pub dumps_emitted: usize,
+    /// Breakdown for the worst cycle so far, printed by `finish` (only kept when `verbose`).
+    worst_dump: Option<String>,
+    /// Last cycle recorded, so several force-schedules in one cycle count once.
+    last_cycle: Option<usize>,
+}
+
+impl GreedyDiagnostics {
+    /// Diagnostics with the given verbosity and nothing recorded yet.
+    pub(crate) fn new(verbose: bool) -> Self {
+        GreedyDiagnostics {
+            verbose,
+            ..Default::default()
+        }
+    }
+
+    /// Record that an op was force-scheduled past the budget at `cycle`.
+    ///
+    /// # Arguments
+    /// * `cycle` - Cycle of the force-schedule
+    /// * `live_words` - Words live at that point
+    /// * `render` - Produces the detailed breakdown; only called when `verbose` and this
+    ///   is the first over-budget cycle or a new worst one
+    fn record_over_budget(
+        &mut self,
+        cycle: usize,
+        live_words: usize,
+        render: impl FnOnce() -> String,
+    ) {
+        if self.last_cycle == Some(cycle) {
+            return;
+        }
+        self.last_cycle = Some(cycle);
+        self.over_budget_cycles += 1;
+        if self.first_over_budget.is_none() {
+            self.first_over_budget = Some((cycle, live_words));
+            self.worst_over_budget = Some((cycle, live_words));
+            if self.verbose {
+                eprint!("{}", render());
+                self.dumps_emitted += 1;
+            }
+        } else if self.worst_over_budget.map_or(true, |(_, w)| live_words > w) {
+            self.worst_over_budget = Some((cycle, live_words));
+            if self.verbose {
+                self.worst_dump = Some(render());
+            }
+        }
+    }
+
+    /// Print the breakdown of the worst over-budget cycle, if it is not the first one
+    /// (which was already printed). Does nothing unless `verbose`.
+    fn finish(&mut self) {
+        if let Some(dump) = self.worst_dump.take() {
+            eprint!("{}", dump);
+            self.dumps_emitted += 1;
+        }
+    }
+
+    /// One-line summary of the budget overflow.
+    ///
+    /// # Arguments
+    /// * `peak_live` - Peak live words over the whole run (the scheduler's own counter)
+    /// * `scratch_budget` - Scratch budget in words
+    ///
+    /// # Returns
+    /// `None` if the run never went over budget, otherwise a single line (no newline).
+    pub(crate) fn summary(&self, peak_live: usize, scratch_budget: usize) -> Option<String> {
+        let (first_cycle, first_words) = self.first_over_budget?;
+        let (worst_cycle, worst_words) = self.worst_over_budget.unwrap_or((first_cycle, first_words));
+        Some(format!(
+            "Greedy scheduler force-scheduled past the scratch budget in {} cycle(s) to break deadlock: \
+             budget={} words, first at cycle {} ({} words live), worst at cycle {} ({} words live), \
+             greedy peak_live={}",
+            self.over_budget_cycles,
+            scratch_budget,
+            first_cycle,
+            first_words,
+            worst_cycle,
+            worst_words,
+            peak_live
+        ))
+    }
+}
+
+/// Format a usage breakdown of the currently live VRegs when the budget is exceeded.
 ///
 /// This helps diagnose which rounds/var_types are consuming the most scratch
 /// when the scheduler is forced to exceed the budget.
-pub(super) fn dump_live_usage_breakdown(
+///
+/// # Arguments
+/// * `ops` - All SSA ops (used to find the definer of each live VReg)
+/// * `live_vregs` - VRegs live at `cycle`
+/// * `cycle` - Cycle at which an op was force-scheduled past the budget
+/// * `live_words` - Words live at `cycle`
+/// * `scratch_budget` - Scratch budget in words
+///
+/// # Returns
+/// The multi-line breakdown text (by round, var_type and phase), newline-terminated.
+pub(super) fn format_live_usage_breakdown(
     ops: &[SsaOp],
     live_vregs: &HashSet<VReg>,
     cycle: usize,
     live_words: usize,
     scratch_budget: usize,
-) {
+) -> String {
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
-    eprintln!("\n=== Budget Exceeded at Cycle {} ===", cycle);
-    eprintln!(
+    let mut out = String::new();
+
+    let _ = writeln!(out, "\n=== Budget Exceeded at Cycle {} ===", cycle);
+    let _ = writeln!(out, 
         "Live: {} words / {} budget ({} VRegs)",
         live_words,
         scratch_budget,
@@ -381,36 +501,37 @@ pub(super) fn dump_live_usage_breakdown(
     }
 
     // Print by round
-    eprintln!("\nLive by Round:");
+    let _ = writeln!(out, "\nLive by Round:");
     for (round, (count, words)) in &by_round {
         let round_str = if *round < 0 {
             "init".to_string()
         } else {
             format!("{}", round)
         };
-        eprintln!(
+        let _ = writeln!(out, 
             "  Round {:>4}: {:>4} vregs, {:>5} words",
             round_str, count, words
         );
     }
 
     // Print by var_type
-    eprintln!("\nLive by VarType:");
+    let _ = writeln!(out, "\nLive by VarType:");
     let mut type_vec: Vec<_> = by_type.iter().collect();
     type_vec.sort_by(|a, b| b.1 .1.cmp(&a.1 .1)); // Sort by words descending
     for (var_type, (count, words)) in type_vec {
-        eprintln!("  {:>15}: {:>4} vregs, {:>5} words", var_type, count, words);
+        let _ = writeln!(out, "  {:>15}: {:>4} vregs, {:>5} words", var_type, count, words);
     }
 
     // Print by phase
-    eprintln!("\nLive by Phase:");
+    let _ = writeln!(out, "\nLive by Phase:");
     let mut phase_vec: Vec<_> = by_phase.iter().collect();
     phase_vec.sort_by(|a, b| b.1 .1.cmp(&a.1 .1)); // Sort by words descending
     for (phase, (count, words)) in phase_vec {
-        eprintln!("  {:>20}: {:>4} vregs, {:>5} words", phase, count, words);
+        let _ = writeln!(out, "  {:>20}: {:>4} vregs, {:>5} words", phase, count, words);
     }
 
-    eprintln!("=== End Budget Exceeded Dump ===\n");
+    let _ = writeln!(out, "=== End Budget Exceeded Dump ===\n");
+    out
 }
 
 /// VRegs whose remaining-user count drops when an op is scheduled.
@@ -886,20 +1007,11 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget(
     )
 }
 
-/// Schedule SSA ops with SelectChoice expansion support.
-/// Returns (cycles, budget_exceeded, peak_live)
+/// Schedule SSA ops with SelectChoice expansion support, without detailed diagnostics.
 ///
-/// **VALU→ALU shifting (design choice):** We do not prefer shifting in greedy. We only shift
-/// when VALU slots are full (6/6); otherwise we keep the op on VALU. Shift decisions are left
-/// to CP-SAT, which optimizes them globally. Greedy provides cycle hints; CP-SAT decides which
-/// ops to shift.
-///
-/// SelectChoice tracking is self-contained: ops report their relationship via methods.
-/// The sub and fma ops know they belong to a SelectChoice op through `select_choice_parent`.
-///
-/// When hint passes are enabled, the pipeline passes fixed-default flags so the hint pass
-/// "owns" the decision: const_choice_fixed_to_load (all ConstChoice use Load), 
-/// select_choice_fixed_to_vselect (no FMA), valu_shift_fixed_to_none (no shifts).
+/// Same as [`schedule_ssa_greedy_with_diagnostics`] with a non-verbose, discarded
+/// [`GreedyDiagnostics`]. Returns (cycles, budget_exceeded, peak_live).
+#[allow(dead_code)]
 pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -923,6 +1035,69 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
     // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
     fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
 ) -> Result<(usize, bool, usize), String> {
+    schedule_ssa_greedy_with_diagnostics(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops,
+        select_sub_cycles,
+        select_fma_cycles,
+        const_add_imm_ops,
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+        &mut GreedyDiagnostics::new(false),
+    )
+}
+
+/// Schedule SSA ops with SelectChoice expansion support.
+/// Returns (cycles, budget_exceeded, peak_live); `diagnostics` records how often and how far
+/// the run went over budget (see [`GreedyDiagnostics`]).
+///
+/// **VALU→ALU shifting (design choice):** We do not prefer shifting in greedy. We only shift
+/// when VALU slots are full (6/6); otherwise we keep the op on VALU. Shift decisions are left
+/// to CP-SAT, which optimizes them globally. Greedy provides cycle hints; CP-SAT decides which
+/// ops to shift.
+///
+/// SelectChoice tracking is self-contained: ops report their relationship via methods.
+/// The sub and fma ops know they belong to a SelectChoice op through `select_choice_parent`.
+///
+/// When hint passes are enabled, the pipeline passes fixed-default flags so the hint pass
+/// "owns" the decision: const_choice_fixed_to_load (all ConstChoice use Load), 
+/// select_choice_fixed_to_vselect (no FMA), valu_shift_fixed_to_none (no shifts).
+pub(super) fn schedule_ssa_greedy_with_diagnostics(
+    ops: &mut [SsaOp],
+    enable_valu_shift: bool,
+    shifted_ops: &mut HashSet<usize>,
+    scratch_budget: usize,
+    select_choice_fma_ops: Option<&mut HashSet<usize>>,
+    select_sub_cycles: Option<&mut HashMap<usize, i32>>,
+    select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+    const_add_imm_ops: Option<&mut HashSet<usize>>,
+    bounds_usage: &GreedyBoundsUsage,
+    strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    // When Some, use these encodings for ConstChoice (engine from map); do not write to const_add_imm_ops.
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    // When Some, use this set for shift decisions (op in set => place as shifted); do not add to shifted_ops.
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+    // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+    // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
+    diagnostics: &mut GreedyDiagnostics,
+) -> Result<(usize, bool, usize), String> {
     schedule_ssa_greedy_with_liveness_agreement(
         ops,
         enable_valu_shift,
@@ -942,11 +1117,12 @@ pub(super) fn schedule_ssa_greedy_with_shift_budget_and_selectchoice(
         fixed_const_choice_encoding,
         fixed_shifted_ops,
         fixed_select_choice_encoding,
+        diagnostics,
     )
     .map(|(result, _agreement)| result)
 }
 
-/// Same as [`schedule_ssa_greedy_with_shift_budget_and_selectchoice`], and also returns the
+/// Same as [`schedule_ssa_greedy_with_diagnostics`], and also returns the
 /// comparison of the scheduler's live-word counter with interval liveness of the schedule it
 /// produced (see [`LivenessAgreement`]).
 ///
@@ -976,6 +1152,8 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
     fixed_shifted_ops: Option<&HashSet<usize>>,
     // When Some (e.g. ScheduleWithFixedChoices), use these encodings for SelectChoice (Fma => VALU, Vselect => Flow).
     fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+    // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
+    diagnostics: &mut GreedyDiagnostics,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
     let mut trace = CounterTrace::default();
     let result = schedule_ssa_greedy_core(
@@ -998,6 +1176,7 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
         fixed_shifted_ops,
         fixed_select_choice_encoding,
         &mut trace,
+        diagnostics,
     )?;
     let agreement = compare_counter_with_intervals(ops, vector_group_lanes, &trace, result.2)?;
     // SCHEDULER_LIVENESS_AGREEMENT: any value prints the comparison; `warn` also turns a
@@ -1045,6 +1224,8 @@ fn schedule_ssa_greedy_core(
     fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
     // Out: what the live-word counter did, for the comparison with interval liveness.
     trace: &mut CounterTrace,
+    // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
+    diagnostics: &mut GreedyDiagnostics,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -1286,7 +1467,6 @@ fn schedule_ssa_greedy_core(
     // Budget tracking
     let mut peak_live_words: usize = 0;
     let mut budget_exceeded = false;
-    let mut last_budget_dump_cycle: Option<usize> = None;
 
     // Track when each VReg was defined (used for debugging/validation)
     let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
@@ -1938,17 +2118,12 @@ fn schedule_ssa_greedy_core(
                 // The force-schedule allows progress when retry loops fail to free enough
                 // VRegs. The budget_exceeded flag tracks this for reporting.
                 //
-                // Dump usage breakdown once per cycle with budget violation
-                if last_budget_dump_cycle != Some(cycle) {
-                    dump_live_usage_breakdown(
-                        ops,
-                        &live_vregs,
-                        cycle,
-                        live_words,
-                        scratch_budget,
-                    );
-                    last_budget_dump_cycle = Some(cycle);
-                }
+                // Count the over-budget cycle. The detailed breakdown is rendered only for
+                // the first such cycle and for a new worst one, and only when verbose: a run
+                // that stays over budget for thousands of cycles used to dump every cycle.
+                diagnostics.record_over_budget(cycle, live_words, || {
+                    format_live_usage_breakdown(ops, &live_vregs, cycle, live_words, scratch_budget)
+                });
                 budget_exceeded = true;
                 // When must_place_shifted use shift-only path; else try with strategy first.
                 let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
@@ -2188,10 +2363,11 @@ fn schedule_ssa_greedy_core(
         }
     }
 
-    // Print inflation stats if any inflation activity occurred
-    if inflation_stats.total_deferred > 0
-        || inflation_stats.net_liveness_blocks > 0
-        || inflation_stats.breaker_activations > 0
+    // Print inflation stats if any inflation activity occurred (verbose only)
+    if diagnostics.verbose
+        && (inflation_stats.total_deferred > 0
+            || inflation_stats.net_liveness_blocks > 0
+            || inflation_stats.breaker_activations > 0)
     {
         eprintln!(
             "ASAP inflation: deferred={}, total_cycles={}, max={}, net_liveness_blocks={}, \
@@ -2205,11 +2381,10 @@ fn schedule_ssa_greedy_core(
         );
     }
 
-    if budget_exceeded {
-        eprintln!(
-            "Greedy scheduler exceeded budget: peak_live={} > budget={} (force-scheduled to break deadlock)",
-            peak_live_words, scratch_budget
-        );
+    // Worst-cycle breakdown (verbose only), then the one-line summary (always).
+    diagnostics.finish();
+    if let Some(summary) = diagnostics.summary(peak_live_words, scratch_budget) {
+        eprintln!("{}", summary);
     }
 
     Ok((cycle, budget_exceeded, peak_live_words))

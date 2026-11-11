@@ -34,4 +34,4 @@ uv run python scripts/compare_kernel_scratch_cycle.py kernel_a.json kernel_b.jso
 - First line: `First scratch difference at cycle C, address A: a=<val> b=<val>`.
 - Then `s[lo..hi]` for both kernels at that cycle so you can see the divergence window.
 
-Use the reported **(cycle, address)** with `scripts/find_wrong_scratch_use.py` (with `--addrs A`) or `scripts/inspect_cycle_addr.py` on the scheduler JSON to find the incorrect use or allocation.
+Use the reported **(cycle, address)** with `scripts/find_wrong_scratch_use.py` (with `--addrs A`) or `uv run python -m scripts.inspect_schedule sched.json addr A --cycle C --bundle` on the scheduler JSON to find the incorrect use or allocation.

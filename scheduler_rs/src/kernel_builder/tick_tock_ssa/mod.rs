@@ -280,13 +280,73 @@ macro_rules! run_pass_with_error_export {
     };
 }
 
+/// Which liveness accounting reported that the scratch budget was exceeded.
+///
+/// The greedy scheduler counts live words while it schedules; address assignment recomputes
+/// live intervals from the final schedule and is the ground truth for the emitted kernel.
+/// The two can disagree (different budgets: the greedy one excludes the reserved zero word;
+/// different liveness rules), so an error must say which one tripped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetAccounting {
+    /// The greedy scheduler force-scheduled past its budget. `peak_live`/`budget` in the error
+    /// are the greedy scheduler's own counter and budget.
+    GreedyScheduler {
+        /// Number of cycles in which an op was force-scheduled past the budget.
+        over_budget_cycles: usize,
+        /// `(peak_live, budget)` measured by address assignment on the same schedule, if it ran.
+        address_assignment: Option<(usize, usize)>,
+    },
+    /// Address assignment measured more simultaneously-live words than the budget.
+    AddressLiveness,
+    /// Address assignment's live words fit the budget, but the allocator had to use an
+    /// address beyond the budgeted range (fragmentation or fixed addresses).
+    AddressRange {
+        /// Highest scratch address used.
+        max_addr: i64,
+    },
+}
+
+/// Build the `BudgetExceeded` error for an address assignment that reported `budget_exceeded`.
+///
+/// # Arguments
+/// * `ar` - Address assignment result with `budget_exceeded == true`
+///
+/// # Returns
+/// `BudgetExceeded` with `AddressLiveness` if live words exceed the budget, otherwise
+/// `AddressRange` (the flag was raised by the highest address used).
+fn address_budget_error(ar: &crate::address_assign::AddressAssignmentResult) -> KernelBuilderError {
+    let accounting = if ar.peak_live > ar.budget {
+        BudgetAccounting::AddressLiveness
+    } else {
+        BudgetAccounting::AddressRange { max_addr: ar.max_addr }
+    };
+    KernelBuilderError::BudgetExceeded {
+        peak_live: ar.peak_live,
+        budget: ar.budget,
+        accounting,
+    }
+}
+
+/// Comparison symbol that is true for `a` versus `b` (so messages never state a false inequality).
+fn cmp_symbol(a: usize, b: usize) -> &'static str {
+    if a > b {
+        ">"
+    } else if a == b {
+        "=="
+    } else {
+        "<"
+    }
+}
+
 /// Error types that can occur during kernel building.
 #[derive(Debug, Clone)]
 pub enum KernelBuilderError {
-    /// Scratch budget exceeded during address assignment.
+    /// Scratch budget exceeded. `peak_live` and `budget` are the numbers of the accounting
+    /// named by `accounting` (the one that raised the flag), never a mix of two accountings.
     BudgetExceeded {
         peak_live: usize,
         budget: usize,
+        accounting: BudgetAccounting,
     },
     /// Same-cycle scratch write conflict detected.
     SameCycleScratchConflict {
@@ -327,9 +387,45 @@ pub enum KernelBuilderError {
 impl std::fmt::Display for KernelBuilderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KernelBuilderError::BudgetExceeded { peak_live, budget } => {
-                write!(f, "scratch budget exceeded: peak_live={} > budget={}", peak_live, budget)
-            }
+            KernelBuilderError::BudgetExceeded { peak_live, budget, accounting } => match accounting {
+                BudgetAccounting::GreedyScheduler { over_budget_cycles, address_assignment } => {
+                    write!(
+                        f,
+                        "scratch budget exceeded in the greedy scheduler's own liveness count: \
+                         greedy peak_live={} {} greedy budget={} (force-scheduled past the budget in {} cycle(s))",
+                        peak_live,
+                        cmp_symbol(*peak_live, *budget),
+                        budget,
+                        over_budget_cycles
+                    )?;
+                    match address_assignment {
+                        Some((addr_peak, addr_budget)) => write!(
+                            f,
+                            "; address assignment of the same schedule measured peak_live={} {} budget={}",
+                            addr_peak,
+                            cmp_symbol(*addr_peak, *addr_budget),
+                            addr_budget
+                        ),
+                        None => write!(f, "; address assignment did not run"),
+                    }
+                }
+                BudgetAccounting::AddressLiveness => write!(
+                    f,
+                    "scratch budget exceeded in address assignment: peak_live={} {} budget={}",
+                    peak_live,
+                    cmp_symbol(*peak_live, *budget),
+                    budget
+                ),
+                BudgetAccounting::AddressRange { max_addr } => write!(
+                    f,
+                    "scratch budget exceeded in address assignment: highest address used ({}) is \
+                     beyond the budgeted range, although peak_live={} {} budget={}",
+                    max_addr,
+                    peak_live,
+                    cmp_symbol(*peak_live, *budget),
+                    budget
+                ),
+            },
             KernelBuilderError::SameCycleScratchConflict {
                 cycle,
                 op1_id,
@@ -548,6 +644,27 @@ impl SsaTickTockKernelBuilder {
         enable_valu_shift: bool,
         scratch_budget_override: Option<usize>,
     ) -> Result<SsaScheduleResult, KernelBuilderError> {
+        self.build_and_schedule_greedy(enable_valu_shift, scratch_budget_override, false)
+    }
+
+    /// Build and schedule with the greedy scheduler, with explicit verbosity.
+    ///
+    /// # Arguments
+    /// * `enable_valu_shift` - Allow VALU→ALU shifting
+    /// * `scratch_budget_override` - See `build_and_schedule_with_options`
+    /// * `verbose` - Print the greedy scheduler's detailed diagnostics to stderr (liveness
+    ///   breakdown for the first and worst over-budget cycle, ASAP inflation stats). When
+    ///   false only the one-line over-budget summary is printed.
+    ///
+    /// # Returns
+    /// The schedule, or `Err` if the scratch budget was exceeded (the error names the
+    /// accounting that tripped: greedy scheduler or address assignment).
+    pub fn build_and_schedule_greedy(
+        &mut self,
+        enable_valu_shift: bool,
+        scratch_budget_override: Option<usize>,
+        verbose: bool,
+    ) -> Result<SsaScheduleResult, KernelBuilderError> {
         use super::pipeline::{PipelineConfig, PipelineContext};
 
         let program = self.build();
@@ -560,6 +677,7 @@ impl SsaTickTockKernelBuilder {
             scratch_budget: scratch_budget_override
                 .unwrap_or_else(|| effective_scratch_budget(program.zero_vreg.is_some())),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
+            greedy_verbose: verbose,
             ..Default::default()
         };
         config.bounds.greedy_use_full_bounds = self.config.compiler.greedy_use_full_bounds;
@@ -582,17 +700,19 @@ impl SsaTickTockKernelBuilder {
             .unwrap_or(false);
 
         if sched_exceeded || addr_exceeded {
-            let peak = ctx
-                .address_result
-                .as_ref()
-                .map(|ar| ar.peak_live)
-                .unwrap_or(0);
-            let budget = ctx
-                .address_result
-                .as_ref()
-                .map(|ar| ar.budget)
-                .unwrap_or(SCRATCH_BUDGET_HW);
-            let error = KernelBuilderError::BudgetExceeded { peak_live: peak, budget };
+            // Report the accounting that tripped with its own numbers. Address assignment
+            // wins when both tripped (it describes the kernel that would be emitted).
+            let error = match ctx.address_result.as_ref() {
+                Some(ar) if ar.budget_exceeded => address_budget_error(ar),
+                ar => KernelBuilderError::BudgetExceeded {
+                    peak_live: ctx.greedy_metrics.peak_live,
+                    budget: ctx.greedy_metrics.budget,
+                    accounting: BudgetAccounting::GreedyScheduler {
+                        over_budget_cycles: ctx.greedy_metrics.over_budget_cycles,
+                        address_assignment: ar.map(|ar| (ar.peak_live, ar.budget)),
+                    },
+                },
+            };
             export_partial_result_on_error_safe(&ctx, &error);
             return Err(error);
         }
@@ -688,6 +808,7 @@ impl SsaTickTockKernelBuilder {
             },
             scratch_budget: SCRATCH_BUDGET_HW,
             verbose,
+            greedy_verbose: verbose,
             bounds: BoundsConfig {
                 asap_alap_tightening,
                 enable_scratch_tightening,
@@ -1511,15 +1632,9 @@ impl SsaTickTockKernelBuilder {
         // Budget exceeded check for CP-SAT path
         if let Some(ref ar) = ctx.address_result {
             if ar.budget_exceeded {
-                eprintln!(
-                    "Warning: CP-SAT address assignment exceeded budget: peak_live={} > budget={}",
-                    ar.peak_live, ar.budget
-                );
-                
-                let error = KernelBuilderError::BudgetExceeded {
-                    peak_live: ar.peak_live,
-                    budget: ar.budget,
-                };
+                let error = address_budget_error(ar);
+                eprintln!("Warning: CP-SAT schedule: {}", error);
+
                 export_partial_result_on_error_safe(&ctx, &error);
                 return Err(error);
             }

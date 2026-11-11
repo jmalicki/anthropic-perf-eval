@@ -147,8 +147,9 @@ impl Pass for GreedySchedulePass {
         // and their opposites) must be honoured here too: CP-SAT bounds its search with this
         // schedule, which is only valid if it uses the encodings the model will force.
         let forced = ForcedEncodings::from_context(ctx);
+        let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         let (cycles, budget_exceeded, peak_live) =
-            ssa_greedy::schedule_ssa_greedy_with_shift_budget_and_selectchoice(
+            ssa_greedy::schedule_ssa_greedy_with_diagnostics(
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut ctx.greedy_decisions.shifted_ops,
@@ -167,6 +168,7 @@ impl Pass for GreedySchedulePass {
                 forced.const_choice.as_ref(),
                 forced.shifted_ops.as_ref(),
                 forced.select_choice.as_ref(),
+                &mut diagnostics,
             )?;
         // With a fixed encoding the scheduler does not record its (non-)decisions; record them
         // here so hints and lowering see what was scheduled.
@@ -210,6 +212,8 @@ impl Pass for GreedySchedulePass {
             cycles,
             peak_live,
             budget_exceeded,
+            budget: ctx.config.scratch_budget,
+            over_budget_cycles: diagnostics.over_budget_cycles,
         };
 
         Ok(format!(

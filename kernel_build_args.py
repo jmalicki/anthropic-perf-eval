@@ -18,8 +18,15 @@ from typing import Any, Optional
 DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
 
 
-def _n_nodes(forest_height: int) -> int:
-    return (1 << forest_height) - 1
+def n_nodes_for_height(forest_height: int) -> int:
+    """Node count of the forest, matching problem.Tree.generate(height).
+
+    A tree of height h has levels 0..h, so 2**(h+1) - 1 nodes (2047 for height 10).
+    """
+    return (1 << (forest_height + 1)) - 1
+
+
+_n_nodes = n_nodes_for_height
 
 
 def _get_git_sha() -> Optional[str]:

@@ -3417,6 +3417,7 @@ fn schedule_for_agreement(
         None,
         None,
         None,
+        &mut GreedyDiagnostics::new(false),
     )
 }
 
@@ -3710,4 +3711,127 @@ fn test_force_schedule_without_slot_keeps_op() {
     assert_eq!((emit.ops[0].cycle, emit.ops[1].cycle), (0, 0), "constants fill Load in cycle 0");
     assert_eq!(emit.ops[2].opcode, Opcode::ConstChoice);
     assert!(emit.ops[2].cycle > 0, "ConstChoice placed after cycle 0");
+}
+
+// =========================================================================
+// GreedyDiagnostics: over-budget reporting must not flood
+//
+// A 16-round greedy run that stayed over budget used to print a liveness
+// breakdown for every over-budget cycle (about 253,000 lines), even with -q.
+// =========================================================================
+
+/// Many over-budget cycles produce one breakdown immediately, at most one more (the worst)
+/// at the end, and a one-line summary with the cycle count.
+#[test]
+fn test_greedy_diagnostics_dump_once_and_summarise() {
+    let mut diag = GreedyDiagnostics::new(true);
+    let mut renders = 0;
+    for cycle in 0..5000usize {
+        // Live words rise then fall, so the worst cycle is neither first nor last.
+        let live = 2000 + if cycle < 3000 { cycle } else { 6000 - cycle };
+        diag.record_over_budget(cycle, live, || {
+            renders += 1;
+            String::new()
+        });
+        // A second force-schedule in the same cycle is not a new over-budget cycle.
+        diag.record_over_budget(cycle, live + 8, || unreachable!("same cycle must not render"));
+    }
+    assert_eq!(diag.over_budget_cycles, 5000);
+    assert_eq!(diag.dumps_emitted, 1, "only the first over-budget cycle is dumped while scheduling");
+    diag.finish();
+    assert_eq!(diag.dumps_emitted, 2, "the worst cycle is dumped once at the end");
+    assert_eq!(diag.first_over_budget, Some((0, 2000)));
+    assert_eq!(diag.worst_over_budget, Some((3000, 5000)));
+    // Rendering happens for the first cycle and each new worst only (cycles 0..=3000).
+    assert_eq!(renders, 3001);
+
+    let summary = diag.summary(5010, 1535).expect("over budget => summary");
+    assert_eq!(summary.lines().count(), 1, "summary must be one line: {}", summary);
+    assert!(summary.contains("in 5000 cycle(s)"), "{}", summary);
+    assert!(summary.contains("budget=1535"), "{}", summary);
+    assert!(summary.contains("first at cycle 0 (2000 words live)"), "{}", summary);
+    assert!(summary.contains("worst at cycle 3000 (5000 words live)"), "{}", summary);
+    assert!(summary.contains("greedy peak_live=5010"), "{}", summary);
+}
+
+/// Non-verbose (the CLI's -q) never renders or prints a breakdown, but still counts.
+#[test]
+fn test_greedy_diagnostics_quiet_never_dumps() {
+    let mut diag = GreedyDiagnostics::new(false);
+    for cycle in 0..5000usize {
+        diag.record_over_budget(cycle, 2000 + cycle, || {
+            unreachable!("quiet mode must not render the breakdown")
+        });
+    }
+    diag.finish();
+    assert_eq!(diag.dumps_emitted, 0);
+    assert_eq!(diag.over_budget_cycles, 5000);
+    assert!(diag.summary(7000, 1535).is_some());
+    assert!(GreedyDiagnostics::new(false).summary(100, 1535).is_none(), "no overflow => no summary");
+}
+
+/// Schedule `pairs` independent (vbroadcast, vbroadcast, add, vstore) groups with an 8-word
+/// budget: every group needs 16 words live, so each one force-schedules past the budget.
+fn schedule_over_budget_groups(pairs: usize, verbose: bool) -> (GreedyDiagnostics, bool) {
+    let mut emit = SsaEmitContext::new();
+    for i in 0..pairs {
+        let s1 = emit.emit_const(2 * i as i64 + 1);
+        let s2 = emit.emit_const(2 * i as i64 + 2);
+        let v1 = emit.emit_vbroadcast(s1);
+        let v2 = emit.emit_vbroadcast(s2);
+        let v3 = emit.emit_valu(Opcode::Add, v1, v2);
+        let addr = emit.emit_const(1000 + 8 * i as i64);
+        emit.emit_vstore(addr, v3);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+
+    let mut shifted_ops = HashSet::new();
+    let mut diag = GreedyDiagnostics::new(verbose);
+    let (_cycles, budget_exceeded, _peak) = schedule_ssa_greedy_with_diagnostics(
+        &mut emit.ops,
+        false,
+        &mut shifted_ops,
+        8,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diag,
+    )
+    .expect("force-schedule keeps the scheduler going");
+    (diag, budget_exceeded)
+}
+
+/// End to end: a schedule that goes over budget in many cycles dumps at most twice when
+/// verbose and never when quiet, and reports how many cycles were over budget.
+#[test]
+fn test_greedy_over_budget_many_cycles_does_not_flood() {
+    let (verbose_diag, exceeded) = schedule_over_budget_groups(40, true);
+    assert!(exceeded);
+    assert!(
+        verbose_diag.over_budget_cycles >= 10,
+        "scenario must go over budget in many cycles, got {}",
+        verbose_diag.over_budget_cycles
+    );
+    assert!(
+        (1..=2).contains(&verbose_diag.dumps_emitted),
+        "verbose: first (and optionally worst) cycle only, got {} dumps for {} over-budget cycles",
+        verbose_diag.dumps_emitted,
+        verbose_diag.over_budget_cycles
+    );
+
+    let (quiet_diag, exceeded) = schedule_over_budget_groups(40, false);
+    assert!(exceeded);
+    assert_eq!(quiet_diag.dumps_emitted, 0, "quiet: no breakdown at all");
+    assert_eq!(quiet_diag.over_budget_cycles, verbose_diag.over_budget_cycles);
 }
