@@ -17,8 +17,8 @@ use super::bounds::{
 };
 use super::symmetry_ordering::SymmetryOrdering;
 use super::config::{
-    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, OptionalConstraintGroup,
-    SelectChoiceMode, ValuShiftMode,
+    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator,
+    OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::validation::{
@@ -192,6 +192,27 @@ pub(crate) fn build_sat_parameters(
     params.ignore_subsolvers = tuning.ignore_subsolvers.clone();
     if tuning.push_all_tasks_toward_start {
         params.push_all_tasks_toward_start = Some(true);
+    }
+    // Extra cumulative propagators: off in CP-SAT by default ("always better propagation, but
+    // usually slow"). Set on the top-level parameters, so every worker runs them.
+    for propagator in &tuning.cumulative_propagators {
+        match propagator {
+            CumulativePropagator::OverloadChecker => {
+                params.use_overload_checker_in_cumulative = Some(true);
+            }
+            CumulativePropagator::TimetableEdgeFinding => {
+                params.use_timetable_edge_finding_in_cumulative = Some(true);
+            }
+            CumulativePropagator::HardPrecedences => {
+                params.use_hard_precedences_in_cumulative = Some(true);
+            }
+            CumulativePropagator::AllPrecedences => {
+                params.exploit_all_precedences = Some(true);
+            }
+        }
+    }
+    if let Some(max_intervals) = tuning.timetable_edge_finding_max_intervals {
+        params.max_num_intervals_for_timetable_edge_finding = Some(max_intervals);
     }
 
     if stop_after_first_solution {
