@@ -175,8 +175,9 @@ Scheduler options:
 - `--const-choice-hint-pass`, `--select-choice-hint-pass`, `--valu-shift-hint-pass` - Enable hint passes individually.
 - `--schedule-with-fixed-choices` - After hint passes, re-run greedy with encodings fixed to assign cycles.
 
-Greedy schedule shape options (ablation switches, defaults unchanged; measurements in [docs/GREEDY_SHAPE_ABLATION.md](docs/GREEDY_SHAPE_ABLATION.md)):
+Greedy schedule shape options (ablation switches, defaults unchanged):
 - `--greedy-barriers {round,none}` - Round barriers in the greedy scheduler. `round` (default): every op of round r+1 waits for all of round r, so rounds run strictly one after another. `none`: the barrier pseudo-ops are dropped before dependencies are computed, the ready queue may mix rounds, and the kernel is a single section for the per-section budget check. On its own this does not help at 16 rounds (the ready queue stays round-major and the greedy exceeds the scratch budget); it is the prerequisite for the other shape options.
+  - The option also applies when CP-SAT follows the greedy (no `--use-greedy`). The CP-SAT model itself never contains barriers (they are always removed before it is built); what changes is the greedy schedule it gets as its warm start, which also caps every op's latest cycle (greedy cycle + 15) and sets the horizon, and the per-section repair, which then sees one section instead of one per round.
 
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
