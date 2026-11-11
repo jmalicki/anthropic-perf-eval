@@ -127,6 +127,12 @@ def main():
               f"groups_in_flight={args.greedy_groups_in_flight})")
     if getattr(args, "greedy_split_shift", False):
         print("  greedy_split_shift=True" + ("" if args.use_greedy else " (ignored: CP-SAT follows the greedy)"))
+    overrides = {name: getattr(args, name, None) for name in
+                 ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
+    if any(v is not None for v in overrides.values()):
+        print("  " + ", ".join(f"{k}={v}" for k, v in overrides.items() if v is not None))
+    if getattr(args, "greedy_budget_headroom", 0):
+        print(f"  greedy_budget_headroom={args.greedy_budget_headroom}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

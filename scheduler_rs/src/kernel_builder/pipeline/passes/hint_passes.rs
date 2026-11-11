@@ -234,23 +234,11 @@ impl Pass for ScheduleWithFixedChoicesPass {
     }
 
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
-        use crate::kernel_builder::config::PressurePolicyKind;
         use crate::kernel_builder::ssa_greedy;
         use crate::kernel_builder::ssa_greedy::GreedyBoundsUsage;
-        use crate::kernel_builder::ssa_greedy::pressure_policy::{
-            AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy,
-            PressureThrottledPolicy,
-        };
 
         let enable_valu_shift = ctx.config.compiler.enable_valu_shift;
-        let strategy: Box<dyn PressurePolicy> =
-            match ctx.config.compiler.scheduling_pressure_policy {
-                PressurePolicyKind::Greedy => Box::new(GreedyPolicy),
-                PressurePolicyKind::PressureThrottled => Box::new(PressureThrottledPolicy::default()),
-                PressurePolicyKind::PressureGated => Box::new(PressureGatedPolicy::default()),
-                PressurePolicyKind::Adaptive => Box::new(AdaptivePolicy::default()),
-                PressurePolicyKind::Cascade => Box::new(CascadePolicy::default()),
-            };
+        let strategy = ctx.config.compiler.pressure_policy();
 
         #[cfg(feature = "cpsat")]
         let is_cpsat_pipeline = ctx.config.cpsat.is_some();
@@ -295,7 +283,7 @@ impl Pass for ScheduleWithFixedChoicesPass {
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut dummy_shifted,
-                ctx.config.scratch_budget,
+                ctx.config.compiler.greedy_scratch_budget(ctx.config.scratch_budget),
                 Some(&mut dummy_select_fma),
                 Some(&mut ctx.greedy_decisions.select_sub_cycles),
                 Some(&mut ctx.greedy_decisions.select_fma_cycles),
