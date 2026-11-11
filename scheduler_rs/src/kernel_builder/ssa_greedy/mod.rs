@@ -1686,8 +1686,8 @@ fn schedule_ssa_greedy_core(
         && fixed_shifted_ops.is_none()
         && !valu_shift_fixed_to_none;
     // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
+    // It is not in `scheduled` until it completes, so the loop below keeps running for it.
     let mut split_carry: Option<SplitShift> = None;
-    let mut split_in_progress: usize = 0;
 
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
@@ -1707,10 +1707,7 @@ fn schedule_ssa_greedy_core(
         }
     }
 
-    while scheduled.len() + split_in_progress < ops.len() || split_carry.is_some() {
-        if cycle >= max_cycles {
-            break;
-        }
+    while scheduled.len() < ops.len() && cycle < max_cycles {
         // Note: scheduled includes dead stores (pre-marked), so we check against ops.len()
         // Free expired VRegs (O(log n) per VReg)
         // VRegs expire at the cycle AFTER their last use
@@ -1792,7 +1789,6 @@ fn schedule_ssa_greedy_core(
             shifted_ops.insert(ops[idx].id);
             ops[idx].cycle = cycle as i32;
             scheduled.insert(idx);
-            split_in_progress -= 1;
             scheduled_this_cycle += 1;
             if let Some(w) = wavefront.as_mut() {
                 w.on_scheduled(idx);
@@ -2157,7 +2153,6 @@ fn schedule_ssa_greedy_core(
                                     first_cycle: cycle as i32,
                                     first_lanes: free_alu,
                                 });
-                                split_in_progress += 1;
                                 made_progress = true;
                                 count_written_dest(
                                     d,
