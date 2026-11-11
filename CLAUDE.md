@@ -77,7 +77,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 **Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). `tests/submission_tests.py` exercises the end-to-end pipeline.
 
-**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
+**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|upstream|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
 
 ```bash
 ./scripts/test.sh                 # everything
@@ -87,6 +87,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 ./scripts/test.sh python tests/test_kernel_dataflow.py -k lane
 ./scripts/test.sh proofs          # Z3: liveness theorems + rewrite identities
 ./scripts/test.sh kernel          # greedy 2r and 16r builds with dataflow replay + validation
+./scripts/test.sh upstream        # 16-round greedy kernel on the unmodified upstream simulator and tests
 
 # Rust: include optional/CI-only tests (slow proptest, minimal failing config, etc.)
 ./scripts/test.sh rust --features "cpsat ci-tests"

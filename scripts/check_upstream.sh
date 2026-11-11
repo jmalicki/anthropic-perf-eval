@@ -33,6 +33,11 @@ echo "== Vendored upstream files =="
 if [ -z "$kernel" ]; then
   kernel="kernel_upstream_check.json"
   [ $# -eq 0 ] && set -- --use-greedy
+  # uv run does not install scheduler_rs; fail here with the fix rather than in an import.
+  if ! uv run python -c "import scheduler_rs" 2>/dev/null; then
+    echo "scheduler_rs is not installed in the project venv; run ./scripts/build_scheduler_rs.sh first" >&2
+    exit 1
+  fi
   echo "== Building kernel: generate_ssa_kernel.py --rounds 16 $* =="
   uv run generate_ssa_kernel.py --forest-height 10 --batch-size 256 --rounds 16 -q \
     --output-json scheduler_output_upstream_check.json --save-kernel "$kernel" "$@"
