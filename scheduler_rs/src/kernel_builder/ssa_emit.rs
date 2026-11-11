@@ -101,7 +101,12 @@ impl SsaTickTockKernelBuilder {
         self.config.spec.index_form == IndexForm::Mirrored
     }
 
-    /// Vector of a small constant: `ConstChoice` + `vbroadcast`, both deduplicated.
+    /// Vector of a constant, reusing what the kernel already has.
+    ///
+    /// The scalar is the init constant `c[value]` when there is one (0 to 15), else a
+    /// deduplicated `ConstChoice`; the vector is a deduplicated `vbroadcast` of it. For the
+    /// constants the default emission compares against (4 to 7) this returns the very
+    /// vectors it always used and emits nothing.
     ///
     /// # Arguments
     /// * `value` - The constant to broadcast.
@@ -109,13 +114,21 @@ impl SsaTickTockKernelBuilder {
     /// # Returns
     /// The vector VReg holding `value` in every lane.
     pub(super) fn v_constant(&mut self, value: i64) -> crate::types::VReg {
-        let scalar = if value == 0 {
-            self.zero_vreg.unwrap()
-        } else {
-            self.emit.set_next_var_type(VarType::Constant);
-            self.emit.emit_const_choice(value)
+        let known = usize::try_from(value)
+            .ok()
+            .and_then(|i| self.ctx.c.get(i).copied().flatten());
+        let scalar = match known {
+            Some(scalar) => scalar,
+            None => {
+                if !self.emit.const_cache.contains_key(&value) {
+                    self.emit.set_next_var_type(VarType::Constant);
+                }
+                self.emit.emit_const_choice(value)
+            }
         };
-        self.emit.set_next_var_type(VarType::Constant);
+        if !self.emit.broadcast_cache.contains_key(&scalar) {
+            self.emit.set_next_var_type(VarType::Constant);
+        }
         self.emit.emit_vbroadcast(scalar)
     }
 
@@ -538,36 +551,25 @@ impl SsaTickTockKernelBuilder {
         // taken to be 0, as the root broadcast of round 0 already assumes, and not loaded.
         let load_idx = !self.mirrored_index();
 
-        for g in (0..n_groups).step_by(2) {
-            let offset_a = (g * VLEN) as i64;
+        // Op order per group (constant, index address, value address, index load, value
+        // load) is the same with and without the index load, so the default emission is
+        // unchanged op for op.
+        for g in 0..n_groups {
+            let offset = (g * VLEN) as i64;
             self.emit.set_next_var_type(VarType::Constant);
-            let off_a = self.emit.emit_const_choice(offset_a);
-            if load_idx {
+            let off = self.emit.emit_const_choice(offset);
+            let idx_addr = load_idx.then(|| {
                 self.emit.set_next_var_type(VarType::Address);
-                let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
-                self.emit.set_next_var_type(VarType::BatchData);
-                self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr_a));
-            }
+                self.emit.emit_alu(Opcode::Add, idx_p, off)
+            });
             self.emit.set_next_var_type(VarType::Address);
-            let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit.set_next_var_type(VarType::BatchData);
-            self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr_a));
-
-            if g + 1 < n_groups {
-                let offset_b = ((g + 1) * VLEN) as i64;
-                self.emit.set_next_var_type(VarType::Constant);
-                let off_b = self.emit.emit_const_choice(offset_b);
-                if load_idx {
-                    self.emit.set_next_var_type(VarType::Address);
-                    let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
-                    self.emit.set_next_var_type(VarType::BatchData);
-                    self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
-                }
-                self.emit.set_next_var_type(VarType::Address);
-                let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
+            let val_addr = self.emit.emit_alu(Opcode::Add, val_p, off);
+            if let Some(idx_addr) = idx_addr {
                 self.emit.set_next_var_type(VarType::BatchData);
-                self.ctx.all_val[g + 1] = Some(self.emit.emit_vload(val_addr_b));
+                self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr));
             }
+            self.emit.set_next_var_type(VarType::BatchData);
+            self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr));
         }
 
         // Convert initial values to optimized form
