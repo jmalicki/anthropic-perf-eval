@@ -1081,9 +1081,14 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// one shared zero vector in the wrap round. Output unchanged.
 /// values_only: do not store the final indices (dead index work is then eliminated). CHANGES
 /// THE OUTPUT: only the values are correct; validate with values only.
+/// cached_select: node selection on the cached levels: "standard" (default), "bits" (select
+/// tree driven by the branch bits; leaf selects are multiply_adds, the rest SelectChoices),
+/// "bits-flow" (leaf selects are SelectChoices too) or "mobius" (2^d - 1 multiply_adds, no flow).
+/// select_bit_source: "index" (default; older bits extracted from the index, no bit vectors
+/// live across rounds) or "path" (all bits kept live, no extraction ops, more scratch).
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
-    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false,
+    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index",
     cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_model="words"))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
@@ -1106,6 +1111,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     index_form: &str,
     prune_dead_index: bool,
     values_only: bool,
+    cached_select: &str,
+    select_bit_source: &str,
     // Scheduler, solver and output options.
     cpsat_tuning_json: Option<&str>,
     liveness_detail: Option<String>,
@@ -1194,6 +1201,11 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     // Emission options.
     let index_form = crate::kernel_builder::config::IndexForm::from_str(index_form)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let cached_select = crate::kernel_builder::config::CachedSelect::from_str(cached_select)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let select_bit_source =
+        crate::kernel_builder::config::SelectBitSource::from_str(select_bit_source)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let config = KernelConfig {
         spec: ProblemSpec {
@@ -1216,6 +1228,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             index_form,
             prune_dead_index,
             values_only,
+            cached_select,
+            select_bit_source,
         },
         compiler: CompilerConfig {
             enable_valu_shift,
