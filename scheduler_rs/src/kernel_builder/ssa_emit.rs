@@ -11,9 +11,10 @@
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{
-    level_last_index, merged_hash_stage_constants, IndexForm, HASH_STAGES, MERGED_HASH_STAGE,
-    STAGE5_XOR_CONST,
+    level_last_index, merged_hash_stage_constants, CachedSelect, IndexForm, SelectBitSource,
+    HASH_STAGES, MAX_TREE_REDUCE_DEPTH, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
 };
+use super::context_ssa::{CachedLevelTable, CachedSelectPair};
 use super::tick_tock_ssa::{
     SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL,
 };
@@ -30,6 +31,7 @@ impl SsaTickTockKernelBuilder {
 
         self.emit.set_phase(EmissionPhase::ValuSelectionInit);
         self.emit_valu_selection_init();
+        self.emit_cached_select_init();
 
         // Load data
         self.emit.set_phase(EmissionPhase::LoadData);
@@ -635,7 +637,10 @@ impl SsaTickTockKernelBuilder {
     ) {
         // Tree access based on depth
         self.emit.set_phase(EmissionPhase::TreeAccess);
+        let select_from_bits = self.config.spec.cached_select != CachedSelect::Standard
+            && self.config.use_tree_reduce_at_depth(tree_depth);
         match tree_depth {
+            _ if select_from_bits => self.emit_cached_level_select(tree_depth, n_iters, n_groups),
             0 => self.emit_depth0_access(n_iters, n_groups),
             1 => self.emit_depth1_access(n_iters, n_groups),
             2 => self.emit_depth2_access(n_iters, n_groups),
@@ -841,6 +846,238 @@ impl SsaTickTockKernelBuilder {
         let result = self.select_2way(bit2, q47, q03);
         self.emit.clear_symmetry_hint();
         result
+    }
+
+    // =========================================================================
+    // Cached-Level Selection from Path Bits
+    // =========================================================================
+    //
+    // At depth d the node is tree[L_d - n], n = b_0 b_1 .. b_(d-1) in binary, b_r the branch
+    // bit of the round at depth r (R9, R13). The node table, already XORed with C, is built
+    // once from scalars; every group then selects with its own bits, with no compare,
+    // per-group root broadcast or XOR with C.
+    //
+    // The select tree consumes the bits oldest first: b_0 selects within the leaf pairs and
+    // the newest bit b_(d-1), the only one that depends on the previous round's hash, drives
+    // the single select at the root. So the table is indexed by m = b_(d-1) .. b_1 b_0, the
+    // bit reversal of n: U[m] = tree[L_d - reverse_d(m)] ^ C.
+
+    /// Scalar VReg of a cached tree node (levels 0 to 4, loaded at init).
+    ///
+    /// # Arguments
+    /// * `tree_index` - Reference tree index, `0..=30`.
+    ///
+    /// # Returns
+    /// The scalar VReg holding `tree[tree_index]`.
+    fn cached_node(&self, tree_index: usize) -> crate::types::VReg {
+        match tree_index {
+            0..=6 => self.ctx.tc[tree_index].unwrap(),
+            7..=14 => self.ctx.tc_r3[tree_index - 7].unwrap(),
+            15..=30 => self.ctx.tc_r4[tree_index - 15].unwrap(),
+            _ => panic!("tree[{}] is not a cached node", tree_index),
+        }
+    }
+
+    /// Build the select constants of every cached level some round visits (nothing for
+    /// `CachedSelect::Standard`).
+    pub(super) fn emit_cached_select_init(&mut self) {
+        let mode = self.config.spec.cached_select;
+        if mode == CachedSelect::Standard {
+            return;
+        }
+        let stage5 = self.ctx.stage5_xor_s.unwrap();
+        let tree_height = self.config.spec.tree_height();
+        let rounds = self.config.spec.rounds;
+        let max_depth = MAX_TREE_REDUCE_DEPTH as usize;
+        self.ctx.cached_tables = vec![None; max_depth + 1];
+
+        for depth in 0..=max_depth {
+            let visited = (0..rounds).any(|r| r % tree_height == depth);
+            if !visited || !self.config.use_tree_reduce_at_depth(depth) {
+                continue;
+            }
+            // U[m] = tree[L_d - n] ^ C, where n (the position in the level from the right)
+            // is m with its `depth` bits reversed.
+            let last = level_last_index(depth) as usize;
+            let mut table = Vec::with_capacity(1 << depth);
+            for m in 0..1usize << depth {
+                let n = (0..depth).fold(0, |n, i| (n << 1) | ((m >> i) & 1));
+                let node = self.cached_node(last - n);
+                self.emit.set_next_var_type(VarType::TreeCache);
+                table.push(self.emit.emit_alu(Opcode::Xor, node, stage5));
+            }
+
+            let level = if depth == 0 {
+                self.emit.set_next_var_type(VarType::TreeCache);
+                CachedLevelTable::Root(self.emit.emit_vbroadcast(table[0]))
+            } else if mode != CachedSelect::Mobius {
+                // Leaf pairs: entries 2j and 2j+1 differ in the oldest branch bit only.
+                let mut pairs = Vec::with_capacity(table.len() / 2);
+                for j in 0..table.len() / 2 {
+                    self.emit.set_next_var_type(VarType::TreeCache);
+                    let delta_s = self.emit.emit_alu(Opcode::Sub, table[2 * j + 1], table[2 * j]);
+                    self.emit.set_next_var_type(VarType::TreeCache);
+                    let base = self.emit.emit_vbroadcast(table[2 * j]);
+                    self.emit.set_next_var_type(VarType::TreeCache);
+                    let delta = self.emit.emit_vbroadcast(delta_s);
+                    let high = (mode == CachedSelect::BitsFlow).then(|| {
+                        self.emit.set_next_var_type(VarType::TreeCache);
+                        self.emit.emit_valu(Opcode::Add, base, delta)
+                    });
+                    pairs.push(CachedSelectPair { base, delta, high });
+                }
+                CachedLevelTable::Pairs(pairs)
+            } else {
+                // Mobius transform: a[m] = sum over subsets s of m of (-1)^(|m| - |s|) U[s], so
+                // that U[m] = sum of a[s] over the subsets s of m (R14).
+                let mut coeff = table.clone();
+                for bit in 0..depth {
+                    for m in 0..coeff.len() {
+                        if m & (1 << bit) != 0 {
+                            self.emit.set_next_var_type(VarType::TreeCache);
+                            coeff[m] =
+                                self.emit.emit_alu(Opcode::Sub, coeff[m], coeff[m ^ (1 << bit)]);
+                        }
+                    }
+                }
+                let mut vectors = Vec::with_capacity(coeff.len());
+                for scalar in coeff {
+                    self.emit.set_next_var_type(VarType::TreeCache);
+                    vectors.push(self.emit.emit_vbroadcast(scalar));
+                }
+                CachedLevelTable::Coefficients(vectors)
+            };
+            self.ctx.cached_tables[depth] = Some(level);
+        }
+    }
+
+    /// The branch bits `b_0 .. b_(d-1)` group `g` selects with at `tree_depth = d`.
+    ///
+    /// `SelectBitSource::Path` returns the recorded bits. `SelectBitSource::Index` returns
+    /// the newest recorded bit and extracts the older `d - 1` from the index before the last
+    /// update, `n = b_0 .. b_(d-2)` in binary (`R15-bits-from-index`): AND and shift per bit,
+    /// the top bit needing no AND because `n < 2^(d-1)` (`R11`). A zero-based index is first
+    /// mirrored with one SUB. For `d <= 2` nothing is extracted: the one older bit is `b_0`,
+    /// which is what the mirrored index holds at depth 1.
+    ///
+    /// # Arguments
+    /// * `g` - Group.
+    /// * `tree_depth` - Depth the indices are at.
+    ///
+    /// # Returns
+    /// `tree_depth` 0/1 vectors, oldest first.
+    fn emit_select_bits(&mut self, g: usize, tree_depth: usize) -> Vec<crate::types::VReg> {
+        let path = self.ctx.path_bits[g].clone();
+        if self.config.spec.select_bit_source == SelectBitSource::Path || tree_depth <= 2 {
+            return path;
+        }
+        let older = tree_depth - 1;
+        let prev = self.ctx.prev_idx[g].unwrap();
+        let v_1 = self.ctx.v_1.unwrap();
+        let mut cur = if self.mirrored_index() {
+            prev
+        } else {
+            let v_last = self.v_constant(level_last_index(older));
+            self.emit.set_next_var_type(VarType::Temporary);
+            self.emit.emit_valu(Opcode::Sub, v_last, prev)
+        };
+        // Lowest bit of n is the newest of the older bits, b_(d-2); the top bit is b_0.
+        let mut bits = vec![cur; tree_depth];
+        for k in (1..older).rev() {
+            self.emit.set_next_var_type(VarType::Temporary);
+            bits[k] = self.emit.emit_valu(Opcode::And, cur, v_1);
+            self.emit.set_next_var_type(VarType::Temporary);
+            cur = self.emit.emit_valu(Opcode::Shr, cur, v_1);
+        }
+        bits[0] = cur;
+        bits[older] = path[older];
+        bits
+    }
+
+    /// Tree access on a cached level, selecting with the branch bits (`CachedSelect` other
+    /// than `Standard`). Sets `v_nv` to the node value already XORed with the deferred
+    /// stage-5 constant.
+    ///
+    /// Per group: nothing at depth 0 (one shared root vector); otherwise `2^d - 1` selects
+    /// (see `CachedSelect` for their encoding) plus the bit extraction of
+    /// `emit_select_bits`. The oldest bit selects within leaf pairs, newer bits higher up.
+    ///
+    /// # Arguments
+    /// * `tree_depth` - Depth the indices are at; `path_bits[g]` holds that many bits.
+    /// * `n_iters`, `n_groups` - Loop bounds as in the other access emitters.
+    pub(super) fn emit_cached_level_select(
+        &mut self,
+        tree_depth: usize,
+        n_iters: usize,
+        n_groups: usize,
+    ) {
+        let table = self.ctx.cached_tables[tree_depth]
+            .clone()
+            .unwrap_or_else(|| panic!("no select constants for cached depth {}", tree_depth));
+
+        for it in 0..n_iters {
+            let base_g = it * UNROLL;
+            for i in 0..UNROLL {
+                let g = base_g + i;
+                if g >= n_groups {
+                    continue;
+                }
+                self.emit.set_iter_group(it, g);
+                let bits = self.emit_select_bits(g, tree_depth);
+                assert_eq!(bits.len(), tree_depth, "one branch bit per level above depth {}", tree_depth);
+                // Bit that selects at level `level` of the select tree (0 = leaves): oldest first.
+                let bit_at = |level: usize| bits[level];
+
+                let node = match &table {
+                    CachedLevelTable::Root(root) => *root,
+                    CachedLevelTable::Pairs(pairs) => {
+                        self.emit.set_symmetry_hint(0);
+                        let mut cur: Vec<crate::types::VReg> = Vec::with_capacity(pairs.len());
+                        for pair in pairs {
+                            self.emit.set_next_var_type(VarType::Temporary);
+                            cur.push(match pair.high {
+                                // BitsFlow: vselect(bit, high, base) or bit * delta + base.
+                                Some(high) => self.emit.emit_select_choice_shared_delta(
+                                    bit_at(0),
+                                    high,
+                                    pair.delta,
+                                    pair.base,
+                                ),
+                                // Bits: bit * delta + base (R4-fma-select).
+                                None => self.emit.emit_fma(bit_at(0), pair.delta, pair.base),
+                            });
+                        }
+                        for level in 1..tree_depth {
+                            self.emit.set_symmetry_hint(level as u8);
+                            let mut next = Vec::with_capacity(cur.len() / 2);
+                            for k in 0..cur.len() / 2 {
+                                self.emit.set_next_var_type(VarType::Temporary);
+                                next.push(self.select_2way(bit_at(level), cur[2 * k + 1], cur[2 * k]));
+                            }
+                            cur = next;
+                        }
+                        self.emit.clear_symmetry_hint();
+                        cur[0]
+                    }
+                    CachedLevelTable::Coefficients(coeff) => {
+                        let mut cur = coeff.clone();
+                        for level in 0..tree_depth {
+                            self.emit.set_symmetry_hint(level as u8);
+                            let mut next = Vec::with_capacity(cur.len() / 2);
+                            for k in 0..cur.len() / 2 {
+                                self.emit.set_next_var_type(VarType::Temporary);
+                                next.push(self.emit.emit_fma(bit_at(level), cur[2 * k + 1], cur[2 * k]));
+                            }
+                            cur = next;
+                        }
+                        self.emit.clear_symmetry_hint();
+                        cur[0]
+                    }
+                };
+                self.ctx.v_nv[it][i] = Some(node);
+            }
+        }
+        self.emit.clear_iter_group();
     }
 
     // =========================================================================
@@ -1355,6 +1592,26 @@ impl SsaTickTockKernelBuilder {
     // Branch Phase
     // =========================================================================
 
+    /// Emit the branch bit of group `g`, `val & 1` on the optimised-form value, and record
+    /// it in the group's path (`path_bits`), which restarts at depth 0.
+    ///
+    /// # Arguments
+    /// * `g` - Group.
+    /// * `tree_depth` - Depth of the round being emitted.
+    ///
+    /// # Returns
+    /// The 0/1 vector: 1 where the reference takes the left child (`R3`, `R9`).
+    fn emit_branch_bit(&mut self, g: usize, tree_depth: usize) -> crate::types::VReg {
+        let val = self.ctx.all_val[g].unwrap();
+        let v_1 = self.ctx.v_1.unwrap();
+        let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+        if tree_depth == 0 {
+            self.ctx.path_bits[g].clear();
+        }
+        self.ctx.path_bits[g].push(bit);
+        bit
+    }
+
     pub(super) fn emit_branch(
         &mut self,
         n_groups: usize,
@@ -1385,6 +1642,7 @@ impl SsaTickTockKernelBuilder {
                 }
 
                 let val = self.ctx.all_val[g].unwrap();
+                self.ctx.prev_idx[g] = self.ctx.all_idx[g];
 
                 if self.mirrored_index() {
                     // Mirrored index n = L_d - idx (R9-mirrored-index-step):
@@ -1392,9 +1650,10 @@ impl SsaTickTockKernelBuilder {
                     //   depth 0:    n' = bit (n = 0), one op;
                     //   otherwise:  n' = 2n + bit, two ops.
                     self.ctx.all_idx[g] = if is_wrap_round {
+                        self.ctx.path_bits[g].clear();
                         None
                     } else {
-                        let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+                        let bit = self.emit_branch_bit(g, tree_depth);
                         Some(match self.ctx.all_idx[g] {
                             None => bit,
                             Some(n) => self.emit.emit_fma(n, v_2, bit),
@@ -1416,6 +1675,7 @@ impl SsaTickTockKernelBuilder {
                 let prune = self.config.spec.prune_dead_index;
                 if is_wrap_round {
                     // Wrap to index 0
+                    self.ctx.path_bits[g].clear();
                     self.ctx.all_idx[g] = Some(if prune {
                         // One shared vector of zeros for every group.
                         self.v_constant(0)
@@ -1425,12 +1685,12 @@ impl SsaTickTockKernelBuilder {
                 } else if prune && tree_depth == 0 {
                     // Every index is 0 at depth 0, so idx * 2 + offset is the offset
                     // (R12-index-update-from-root).
-                    let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+                    let bit = self.emit_branch_bit(g, tree_depth);
                     self.ctx.all_idx[g] = Some(self.emit.emit_valu(Opcode::Sub, v_2, bit));
                 } else {
                     // Normal branching: idx = idx * 2 + (2 - (val & 1))
                     let idx = self.ctx.all_idx[g].unwrap();
-                    let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+                    let bit = self.emit_branch_bit(g, tree_depth);
                     let offset = self.emit.emit_valu(Opcode::Sub, v_2, bit);
                     let fma_result = self.emit.emit_fma(idx, v_2, offset);
                     if std::env::var("SCHEDULER_DEBUG").is_ok() {

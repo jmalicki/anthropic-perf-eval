@@ -300,6 +300,10 @@ MOVED_TO_REWRITES = (
     "R9-mirrored-index-step",  # mirrored index, 2-op update (--index-form mirrored)
     "R10-mirrored-index-uses",
     "R11-mirrored-index-range",
+    "R4-fma-select",  # arithmetic 2-way select
+    "R13-select-by-path-bits",  # selection driven by the branch bits (--cached-select)
+    "R14-mobius-select",  # 4-, 8- and 16-way select in 3, 7 and 15 multiply_adds
+    "R15-bits-from-index",
 )
 
 
@@ -365,11 +369,6 @@ def section_z3():
          (2 * (j - F) + 1 + (v & 1)) + F != 2 * j + (v & 1) + (1 - F), []),
         ("v | 0xFFFFFFFE == (v & 1) - 2  [bit plus constant in one op, only for -2]",
          (v | K(0xFFFFFFFE)) != (v & 1) - 2, []),
-        ("arithmetic 2-way select: f + c*(t-f) == If(c==1,t,f) for c in {0,1}",
-         b + s * (a - b) != z3.If(s == 1, a, b), [z3.ULE(s, 1)]),
-        ("4-way select in 3 multiply_adds (Mobius form)",
-         (a + s * (b - a)) + t * ((c - a) + s * (d - c - b + a))
-         != z3.If(t == 1, z3.If(s == 1, d, c), z3.If(s == 1, b, a)), [z3.ULE(s, 1), z3.ULE(t, 1)]),
         ("early branch bit: bit16(65545*y + C4) == NOT bit0(lazy hash), y = stage-4 input",
          z3.Extract(16, 16, K(65545) * st4 + K(C4)) != ~z3.Extract(0, 0, lz), []),
     ]

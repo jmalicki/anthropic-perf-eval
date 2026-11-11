@@ -210,6 +210,8 @@ EMISSION_DEFAULTS = {
     "index_form": "zero-based",
     "prune_dead_index": False,
     "values_only": False,
+    "cached_select": "standard",
+    "select_bit_source": "index",
 }
 
 

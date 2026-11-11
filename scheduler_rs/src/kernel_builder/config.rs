@@ -69,6 +69,91 @@ impl IndexForm {
     }
 }
 
+/// How the node value is selected on the cached tree levels (depth 0 up to
+/// `tree_reduce_max_depth`).
+///
+/// At depth `d` the node is `tree[L_d - n]` with `n = b_0 b_1 .. b_(d-1)` in binary, where
+/// `b_r` is the branch bit of the round at depth `r` (`R9`, `R13`). `Bits`, `BitsFlow` and
+/// `Mobius` select with those bits, from node constants that already carry the deferred
+/// stage-5 constant, so there is no per-group compare, root broadcast or XOR with the
+/// constant. Proofs: `R13`, `R14` in `verification/rewrites.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CachedSelect {
+    /// Compare or extract bits from the index, select, then XOR the deferred constant.
+    #[default]
+    Standard,
+    /// Binary tree of `2^d - 1` two-way selects driven by the branch bits. The `2^(d-1)`
+    /// leaf selects are multiply_adds with a precomputed delta; the selects above them are
+    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Uses the flow engine exactly
+    /// as much as `Standard` does.
+    Bits,
+    /// As `Bits`, but the leaf selects are `SelectChoice`s too (flow `vselect`, or one
+    /// multiply_add): every select can go to the flow engine, which gives the lowest
+    /// vector-op count but needs a scheduler that spreads the flow work.
+    BitsFlow,
+    /// `2^d - 1` multiply_adds evaluating the multilinear (Mobius) form of the node table
+    /// in the branch bits. No flow ops and no choice for the scheduler.
+    Mobius,
+}
+
+impl CachedSelect {
+    /// Parse the CLI / binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"standard"`, `"bits"`, `"bits-flow"` or `"mobius"`.
+    ///
+    /// # Returns
+    /// The mode, or an error message naming the valid spellings.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "standard" => Ok(CachedSelect::Standard),
+            "bits" => Ok(CachedSelect::Bits),
+            "bits-flow" => Ok(CachedSelect::BitsFlow),
+            "mobius" => Ok(CachedSelect::Mobius),
+            other => Err(format!(
+                "Invalid cached_select '{}': must be 'standard', 'bits', 'bits-flow' or 'mobius'",
+                other
+            )),
+        }
+    }
+}
+
+/// Where `CachedSelect::Bits` / `BitsFlow` / `Mobius` take the branch bits of earlier rounds from.
+///
+/// The newest bit (the round just before the select) always comes straight from the branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectBitSource {
+    /// Extract the older bits from the index as it was before the last update
+    /// (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth `d >= 2`
+    /// (one more to mirror a zero-based index at depth `d >= 3`), and no bit vector stays
+    /// live across rounds. Proof: `R15-bits-from-index`.
+    #[default]
+    Index,
+    /// Keep every branch bit live until the select: no extraction ops, but 8 scratch words
+    /// per group for each earlier round, which the schedulers may not be able to fit.
+    Path,
+}
+
+impl SelectBitSource {
+    /// Parse the CLI / binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"index"` or `"path"`.
+    ///
+    /// # Returns
+    /// The source, or an error message naming the valid spellings.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "index" => Ok(SelectBitSource::Index),
+            "path" => Ok(SelectBitSource::Path),
+            other => Err(format!(
+                "Invalid select_bit_source '{}': must be 'index' or 'path'",
+                other
+            )),
+        }
+    }
+}
+
 /// Largest tree index at depth `depth`: `L_d = 2^(d+1) - 2`.
 ///
 /// # Arguments
@@ -135,6 +220,11 @@ pub struct ProblemSpec {
     /// index chain after the last gather) is removed by dead code elimination. **Changes
     /// the output**: only the values are correct. Default false.
     pub values_only: bool,
+    /// Selection of the node value on the cached levels. Default `CachedSelect::Standard`.
+    pub cached_select: CachedSelect,
+    /// Source of the older branch bits for `CachedSelect::Bits` / `BitsFlow` / `Mobius`. Default
+    /// `SelectBitSource::Index`. Ignored for `CachedSelect::Standard`.
+    pub select_bit_source: SelectBitSource,
 }
 
 impl Default for ProblemSpec {
@@ -159,6 +249,8 @@ impl Default for ProblemSpec {
             index_form: IndexForm::ZeroBased,
             prune_dead_index: false,
             values_only: false,
+            cached_select: CachedSelect::Standard,
+            select_bit_source: SelectBitSource::Index,
         }
     }
 }
@@ -405,6 +497,24 @@ mod tests {
         for d in 0..11 {
             assert_eq!(level_last_index(d + 1), 2 * level_last_index(d) + 2);
         }
+    }
+
+    #[test]
+    fn test_cached_select_from_str() {
+        assert_eq!(CachedSelect::from_str("standard"), Ok(CachedSelect::Standard));
+        assert_eq!(CachedSelect::from_str("bits"), Ok(CachedSelect::Bits));
+        assert_eq!(CachedSelect::from_str("bits-flow"), Ok(CachedSelect::BitsFlow));
+        assert_eq!(CachedSelect::from_str("mobius"), Ok(CachedSelect::Mobius));
+        assert!(CachedSelect::from_str("flow").is_err());
+        assert_eq!(CachedSelect::default(), CachedSelect::Standard);
+    }
+
+    #[test]
+    fn test_select_bit_source_from_str() {
+        assert_eq!(SelectBitSource::from_str("index"), Ok(SelectBitSource::Index));
+        assert_eq!(SelectBitSource::from_str("path"), Ok(SelectBitSource::Path));
+        assert!(SelectBitSource::from_str("idx").is_err());
+        assert_eq!(SelectBitSource::default(), SelectBitSource::Index);
     }
 
     #[test]

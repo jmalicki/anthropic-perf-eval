@@ -8,6 +8,33 @@ use std::collections::HashMap;
 
 use crate::types::VReg;
 
+/// One leaf pair of a cached level's select tree (`CachedSelect::Bits` / `BitsFlow`): the
+/// two node values whose positions differ only in the oldest branch bit.
+#[derive(Debug, Clone, Copy)]
+pub struct CachedSelectPair {
+    /// Vector of the node value for bit = 0.
+    pub base: VReg,
+    /// Vector of (value for bit = 1) - (value for bit = 0).
+    pub delta: VReg,
+    /// Vector of the node value for bit = 1, emitted as `base + delta`. Only for
+    /// `CachedSelect::BitsFlow`, whose leaf selects may become `vselect`s.
+    pub high: Option<VReg>,
+}
+
+/// Constants for selecting the node value of one cached tree level from the branch bits.
+/// Every node value already carries the deferred stage-5 constant.
+#[derive(Debug, Clone)]
+pub enum CachedLevelTable {
+    /// Depth 0: the root value, shared by every group.
+    Root(VReg),
+    /// `CachedSelect::Bits` / `BitsFlow`: `2^(d-1)` leaf pairs, pair `j` holding table entries
+    /// `2j` and `2j+1` (table index = branch bits with the oldest bit lowest).
+    Pairs(Vec<CachedSelectPair>),
+    /// `CachedSelect::Mobius`: `2^d` vectors of multilinear coefficients, indexed by the
+    /// set of bits they multiply (oldest bit lowest).
+    Coefficients(Vec<VReg>),
+}
+
 /// SSA scratch context - holds VRegs for all kernel values.
 ///
 /// Unlike ScratchContext which pre-allocates concrete addresses, this struct
@@ -79,6 +106,14 @@ pub struct SsaScratchContext {
     /// and `None` means `n = 0` (depth 0: before the first round and after the wrap).
     pub all_idx: Vec<Option<VReg>>,
     pub all_val: Vec<Option<VReg>>,   // [n_groups] - val vectors
+    /// [n_groups] - branch bits (`val & 1` on the optimised-form value) of the rounds since
+    /// the indices were last at depth 0, oldest first. At depth `d` it has `d` entries.
+    pub path_bits: Vec<Vec<VReg>>,
+    /// [n_groups] - the tracked index as it was before the latest branch update, i.e. at the
+    /// depth of the round just emitted (same form and `None` convention as `all_idx`).
+    pub prev_idx: Vec<Option<VReg>>,
+    /// [depth] - select constants per cached level (`CachedSelect` other than `Standard`).
+    pub cached_tables: Vec<Option<CachedLevelTable>>,
     pub v_nv: Vec<Vec<Option<VReg>>>, // [n_iters][UNROLL] - tree value vectors
     pub v_t: Vec<Vec<Option<VReg>>>,  // [n_iters][UNROLL] - temp vectors
 
@@ -174,6 +209,8 @@ impl SsaScratchContext {
         SsaScratchContext {
             all_idx: vec![None; n_groups],
             all_val: vec![None; n_groups],
+            path_bits: vec![Vec::new(); n_groups],
+            prev_idx: vec![None; n_groups],
             v_nv: (0..n_iters).map(|_| vec![None; unroll]).collect(),
             v_t: (0..n_iters).map(|_| vec![None; unroll]).collect(),
             v_tr_s1: (0..n_iters).map(|_| vec![None; unroll]).collect(),

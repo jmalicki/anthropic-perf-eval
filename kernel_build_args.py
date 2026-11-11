@@ -141,6 +141,20 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "the upstream tests compare). The last round's index update and everything else "
                             "that only fed the index store is then dead and removed. --validate checks values "
                             "only under this flag")
+    group.add_argument("--cached-select", choices=["standard", "bits", "bits-flow", "mobius"], default="standard",
+                       help="Node selection on the cached tree levels (depth 0 to --tree-reduce-max-depth). bits: "
+                            "select tree driven by the branch bits over node constants that already carry the "
+                            "deferred hash constant (no compare, root broadcast or XOR per group); leaf selects "
+                            "are multiply_adds, the selects above them go to flow or the vector ALU as the "
+                            "scheduler chooses. bits-flow: the leaf selects are scheduler's choice too, so all "
+                            "2^d - 1 can use the flow engine. mobius: the same table as 2^d - 1 multiply_adds, "
+                            "no flow ops (proofs: R13, R14 in verification/rewrites.py)")
+    group.add_argument("--select-bit-source", choices=["index", "path"], default="index",
+                       help="With --cached-select bits|bits-flow|mobius: where the bits of earlier rounds come from. index "
+                            "(default) extracts them from the index (2 vector ops per group at depth 3, 4 at "
+                            "depth 4, none below; one more for a zero-based index). path keeps every bit live "
+                            "until the select: no ops, but 8 scratch words per group and earlier round, which "
+                            "can exceed the scratch budget (proof: R15-bits-from-index)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -286,6 +300,8 @@ def args_to_build_kwargs(
         "index_form": get("index_form", "zero-based"),
         "prune_dead_index": get("prune_dead_index", False),
         "values_only": get("values_only", False),
+        "cached_select": get("cached_select", "standard"),
+        "select_bit_source": get("select_bit_source", "index"),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -334,6 +350,8 @@ def args_to_build_kwargs(
         "index_form": get("index_form", "zero-based"),
         "prune_dead_index": get("prune_dead_index", False),
         "values_only": get("values_only", False),
+        "cached_select": get("cached_select", "standard"),
+        "select_bit_source": get("select_bit_source", "index"),
     }
 
 

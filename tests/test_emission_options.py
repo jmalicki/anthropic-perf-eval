@@ -24,15 +24,15 @@ SEED = 123
 
 
 def build(tmp_path, rounds, **options):
-    """Build with the greedy scheduler; require PROVED and PASSED.
+    """Build (greedy unless use_cpsat is passed); require PROVED and PASSED.
 
     Returns the schedule report (scripts.schedule_report.analyze) and the scheduler JSON.
     """
     path = tmp_path / ("sched_" + "_".join(f"{k}-{v}" for k, v in sorted(options.items())) + f"_{rounds}.json")
-    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
-        forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=rounds, enable_valu_shift=True,
-        verbose=False, use_cpsat=False, output_json=str(path), **options,
-    )
+    args = dict(forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=rounds, enable_valu_shift=True,
+                verbose=False, use_cpsat=False, output_json=str(path))
+    args.update(options)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(**args)
     assert not stats["budget_exceeded"]
     instrs = json.loads(json.dumps(list(instrs)))
     with open(path) as f:
@@ -185,3 +185,98 @@ def test_validate_only_remembers_values_only(tmp_path):
     assert params["values_only"] is True
     save_kernel_to_json([{"alu": [("+", 1, 2, 3)]}], str(path), 10, BATCH, 2, SEED)
     assert load_kernel_from_json(str(path))[1]["values_only"] is False
+
+
+# ---------------------------------------------------------------------------
+# --cached-select bits | bits-flow | mobius, --select-bit-source
+# ---------------------------------------------------------------------------
+def tree_access(sched, rnd):
+    """Opcode counts of one round's tree access, constants (emitted once, not per group) left out."""
+    counts = {}
+    for o in phase_ops(sched, "tree_access"):
+        if o["source_info"]["round"] == rnd and o["opcode"] not in ("const_choice", "vbroadcast"):
+            counts[o["opcode"]] = counts.get(o["opcode"], 0) + 1
+    return counts
+
+
+# Per group, by depth (= round): leaf selects, selects above the leaves, extraction ops.
+SELECTS = {1: (1, 0), 2: (2, 1), 3: (4, 3), 4: (8, 7)}
+
+
+@pytest.mark.parametrize("mode", ["bits", "bits-flow", "mobius"])
+@pytest.mark.parametrize("index_form", ["zero-based", "mirrored"])
+def test_cached_select_from_branch_bits(tmp_path, mode, index_form):
+    """5 rounds: root, the three cached levels and one gather round that reads the index."""
+    rounds, groups = 5, BATCH // 8
+    base, base_sched = build(tmp_path, rounds, index_form=index_form)
+    rep, sched = build(tmp_path, rounds, index_form=index_form, cached_select=mode)
+    assert tree_access(sched, 0) == {}, "one shared root vector, nothing per group"
+    for depth in (1, 2, 3):
+        leaves, upper = SELECTS[depth]
+        expected = {}
+        if mode == "bits":
+            expected = {"multiply_add": leaves * groups, "select_choice": upper * groups}
+        elif mode == "bits-flow":
+            expected = {"select_choice": (leaves + upper) * groups}
+        elif mode == "mobius":
+            expected = {"multiply_add": (leaves + upper) * groups}
+        if depth == 3:  # two older bits come out of the index: AND and shift (plus a SUB to mirror it)
+            expected.update({"&": groups, ">>": groups})
+            if index_form == "zero-based":
+                expected["-"] = groups
+        assert tree_access(sched, depth) == {k: v for k, v in expected.items() if v}, f"depth {depth}"
+    assert tree_access(sched, 4) == tree_access(base_sched, 4), "gather round unchanged"
+    assert vector_op_equivalents(rep) < vector_op_equivalents(base)
+    if mode == "mobius":
+        assert not any(o["opcode"] == "vselect" for o in sched["ops"])
+    if mode == "bits":
+        base_selects = sum(1 for o in base_sched["ssa_ops"] if o["opcode"] == "select_choice")
+        assert sum(1 for o in sched["ssa_ops"] if o["opcode"] == "select_choice") < base_selects
+
+
+@pytest.mark.parametrize("mode", ["bits", "mobius"])
+def test_select_bit_source_path_needs_no_extraction(tmp_path, mode):
+    rounds, groups = 4, BATCH // 8
+    index, index_sched = build(tmp_path, rounds, index_form="mirrored", cached_select=mode)
+    path, path_sched = build(tmp_path, rounds, index_form="mirrored", cached_select=mode, select_bit_source="path")
+    assert tree_access(index_sched, 3).get("&") == groups
+    assert "&" not in tree_access(path_sched, 3) and ">>" not in tree_access(path_sched, 3)
+    assert vector_op_equivalents(path) == vector_op_equivalents(index) - 2 * groups
+
+
+@pytest.mark.parametrize("mode", ["bits", "bits-flow", "mobius"])
+def test_cached_select_at_depth_4(tmp_path, mode):
+    """--tree-reduce-max-depth 4: 15 selects per group at depth 4, three older bits extracted."""
+    rounds, groups = 6, BATCH // 8
+    _, sched = build(tmp_path, rounds, index_form="mirrored", cached_select=mode, tree_reduce_max_depth=4)
+    counts = tree_access(sched, 4)
+    assert counts.get("multiply_add", 0) + counts.get("select_choice", 0) == 15 * groups
+    assert counts["&"] == 2 * groups and counts[">>"] == 2 * groups
+    assert "load" not in counts
+    assert tree_access(sched, 5)["load"] == 8 * groups
+
+
+@pytest.mark.parametrize("rounds", [12, 14])
+def test_cached_select_after_the_wrap(tmp_path, rounds):
+    """The path restarts after the wrap round: rounds 11 to 13 select with the new bits."""
+    build(tmp_path, rounds, cached_select="bits", index_form="mirrored")
+    build(tmp_path, rounds, cached_select="mobius")
+
+
+@pytest.mark.parametrize("select_choice", ["fma", "vselect", "optimize"])
+def test_cached_select_bits_flow_with_cpsat_select_modes(tmp_path, select_choice):
+    """Every select of bits-flow is a SelectChoice; CP-SAT must be able to encode it either way."""
+    _, sched = build(tmp_path, 3, cached_select="bits-flow", index_form="mirrored", use_cpsat=True,
+                     cpsat_time_limit=60.0, cpsat_deterministic_time=5.0, select_choice=select_choice)
+    lowered = sched["ops"]
+    if select_choice == "fma":
+        assert not any(op["opcode"] == "vselect" for op in lowered)
+    if select_choice == "vselect":
+        assert sum(1 for op in lowered if op["opcode"] == "vselect") == (1 + 3) * (BATCH // 8)
+
+
+@pytest.mark.parametrize("option, value", [("cached_select", "flow"), ("select_bit_source", "idx")])
+def test_cached_select_rejects_unknown_values(option, value):
+    with pytest.raises(ValueError, match=option):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=2, verbose=False, **{option: value})

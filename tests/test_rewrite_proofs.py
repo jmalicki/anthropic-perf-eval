@@ -64,3 +64,31 @@ def test_mirrored_step_proof_rejects_a_wrong_constant(monkeypatch):
     monkeypatch.setattr(rewrites, "STAGE5_XOR_CONST", rewrites.STAGE5_XOR_CONST ^ 1)
     _, result, _, _ = rewrites.check_mirrored_index_step()
     assert result == "sat"
+
+
+def test_select_table_is_indexed_by_bits_oldest_lowest():
+    """Depth 2: bits (b0, b1) address position n = 2*b0 + b1 from the right, i.e. tree[6 - n]."""
+    import z3
+
+    table = rewrites.select_table({k: rewrites._const(k) for k in range(3, 7)}, 2)
+    c = rewrites.STAGE5_XOR_CONST
+    # table index m = b0 + 2*b1  ->  n = 2*b0 + b1  ->  tree index 6 - n
+    assert [z3.simplify(e).as_long() ^ c for e in table] == [6, 4, 5, 3]
+
+
+def test_mobius_coefficients_of_a_concrete_table():
+    """U = [u0, u1, u2, u3] -> [u0, u1-u0, u2-u0, u3-u2-u1+u0]; evaluation returns the entry."""
+    coeff = rewrites.mobius_coefficients([5, 7, 11, 20])
+    assert coeff == [5, 2, 6, 7]
+    for m, want in enumerate([5, 7, 11, 20]):
+        assert rewrites.mobius_eval(coeff, [m & 1, m >> 1]) == want
+
+
+def test_select_proof_rejects_a_table_without_the_deferred_constant(monkeypatch):
+    """R13 must notice a table that is not XORed with the stage-5 constant."""
+    real = rewrites.select_table
+    monkeypatch.setattr(
+        rewrites, "select_table",
+        lambda nodes, depth: [e ^ rewrites._const(rewrites.STAGE5_XOR_CONST) for e in real(nodes, depth)])
+    _, result, _, _ = rewrites.check_select_by_path_bits()
+    assert result == "sat"
