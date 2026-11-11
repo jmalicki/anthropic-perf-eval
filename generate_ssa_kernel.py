@@ -204,18 +204,19 @@ def print_schedule_report(scheduler_json_path, full):
 
         with open(scheduler_json_path) as f:
             report = schedule_report.analyze(json.load(f))
-    except (OSError, KeyError, ValueError) as e:
-        print(f"\n  (schedule report skipped: {e})")
+        if full:
+            lines = schedule_report.format_report(report).splitlines()
+        else:
+            lines = schedule_report.summary_lines(report)
+    except Exception as e:  # advisory output: must never abort the build or skip the kernel save
+        print(f"\n  (schedule report skipped: {type(e).__name__}: {e})")
         return
     if full:
-        print("\nSchedule report (uv run python -m scripts.schedule_report "
-              f"{scheduler_json_path}):")
-        for line in schedule_report.format_report(report).splitlines():
-            print(f"  {line}")
+        print(f"\nSchedule report (uv run python -m scripts.schedule_report {scheduler_json_path}):")
     else:
         print()
-        for line in schedule_report.summary_lines(report):
-            print(f"  {line}")
+    for line in lines:
+        print(f"  {line}")
 
 
 def check_kernel_dataflow(instrs, scheduler_json_path):

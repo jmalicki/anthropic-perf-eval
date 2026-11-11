@@ -10,7 +10,7 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 **Performance Status:**
 - Baseline: 147,734 cycles
-- Current best (16 rounds, the benchmark size): 2,007 cycles (73.6x speedup; greedy via the CLI, validated). Whole-program CP-SAT did not improve on the greedy schedule in 600 s.
+- 16 rounds (the benchmark size): no recorded CP-SAT result yet. Greedy reference, not a recorded result (see "Scheduler Selection Guide"): 2,007 cycles (73.6x speedup; `--use-greedy` via the CLI, validated). Whole-program CP-SAT did not improve on the greedy schedule in 600 s.
 - 4 rounds (development size, not comparable with the 16-round baseline): 485 cycles (CP-SAT 1800s, no VALU shift)
 - Capacity floor for the ops we emit today (16 rounds): 1,271 cycles. This is a floor for this emission (9,526 vector-op equivalents), not a bound on the problem: public kernels emit fewer ops and reach 863. See [docs/BOUND_GAP_ANALYSIS.md](docs/BOUND_GAP_ANALYSIS.md).
 - Target: 1,487 cycles (100x speedup)
