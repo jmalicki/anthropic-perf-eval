@@ -391,6 +391,20 @@ impl GreedyDiagnostics {
         }
     }
 
+    /// End-of-run output, for both the success and the failure exit of the scheduler: the
+    /// worst-cycle breakdown (verbose only), then the one-line summary (always, if the run
+    /// went over budget).
+    ///
+    /// # Arguments
+    /// * `peak_live` - Peak live words over the run (the scheduler's own counter)
+    /// * `scratch_budget` - Scratch budget in words
+    fn emit(&mut self, peak_live: usize, scratch_budget: usize) {
+        self.finish();
+        if let Some(summary) = self.summary(peak_live, scratch_budget) {
+            eprintln!("{}", summary);
+        }
+    }
+
     /// One-line summary of the budget overflow.
     ///
     /// # Arguments
@@ -2294,6 +2308,8 @@ fn schedule_ssa_greedy_core(
             .collect();
 
         let actually_scheduled = scheduled.len() - dead_store_indices.len();
+        // A run that went over budget and then failed still reports the overflow.
+        diagnostics.emit(peak_live_words, scratch_budget);
         return Err(format!(
             "Scheduling failed: only scheduled {}/{} ops in {} cycles (skipped {} dead stores). \
             Ready heap: {}, Blocked (deps>0): {}, Ready but unscheduled: {:?}, Sample blocked: {:?}, \
@@ -2381,11 +2397,7 @@ fn schedule_ssa_greedy_core(
         );
     }
 
-    // Worst-cycle breakdown (verbose only), then the one-line summary (always).
-    diagnostics.finish();
-    if let Some(summary) = diagnostics.summary(peak_live_words, scratch_budget) {
-        eprintln!("{}", summary);
-    }
+    diagnostics.emit(peak_live_words, scratch_budget);
 
     Ok((cycle, budget_exceeded, peak_live_words))
 }
