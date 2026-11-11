@@ -6001,3 +6001,126 @@ fn test_minimal_cumulative_optional_capacity_one() {
         status2
     );
 }
+
+// ============================================================================
+// CP-SAT tuning switches
+// ============================================================================
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::*;
+
+    #[test]
+    fn test_tuning_json_missing_keys_take_defaults() {
+        assert_eq!(CpsatTuning::from_json(None).unwrap(), CpsatTuning::default());
+        assert_eq!(CpsatTuning::from_json(Some("  ")).unwrap(), CpsatTuning::default());
+        assert_eq!(CpsatTuning::from_json(Some("{}")).unwrap(), CpsatTuning::default());
+        let tuned = CpsatTuning::from_json(Some(
+            r#"{"workers": 12, "interleave_search": false, "extra_subsolvers": ["objective_lb_search"]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tuned,
+            CpsatTuning {
+                workers: 12,
+                interleave_search: false,
+                extra_subsolvers: vec!["objective_lb_search".to_string()],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_tuning_json_round_trips_with_every_key_present() {
+        let tuned = CpsatTuning {
+            workers: 3,
+            interleave_search: false,
+            subsolvers: vec!["default_lp".to_string(), "no_lp".to_string()],
+            ignore_subsolvers: vec!["rnd_cst_lns".to_string()],
+            ..Default::default()
+        };
+        let json = tuned.to_json();
+        assert_eq!(CpsatTuning::from_json(Some(&json)).unwrap(), tuned);
+        let value: serde_json::Value = serde_json::from_str(&CpsatTuning::default().to_json()).unwrap();
+        assert_eq!(value["workers"], 8);
+        assert_eq!(value["interleave_search"], true);
+        assert_eq!(value["extra_subsolvers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_tuning_json_rejects_unknown_keys_and_bad_values() {
+        let err = CpsatTuning::from_json(Some(r#"{"wrokers": 4}"#)).unwrap_err();
+        assert!(err.contains("wrokers"), "{}", err);
+        assert!(CpsatTuning::from_json(Some(r#"{"workers": 0}"#)).unwrap_err().contains("workers"));
+        assert!(CpsatTuning::from_json(Some(r#"{"workers": "eight"}"#)).is_err());
+        assert!(CpsatTuning::from_json(Some(r#"{"extra_subsolvers": [" "]}"#))
+            .unwrap_err()
+            .contains("extra_subsolvers"));
+        assert!(CpsatTuning::from_json(Some("[]")).is_err());
+        // An unknown full-problem subsolver would abort inside CP-SAT; ignore_subsolvers is a filter.
+        let err = CpsatTuning::from_json(Some(r#"{"extra_subsolvers": ["objective_lb"]}"#)).unwrap_err();
+        assert!(err.contains("objective_lb") && err.contains("objective_lb_search"), "{}", err);
+        assert!(CpsatTuning::from_json(Some(r#"{"subsolvers": ["rnd_cst_lns"]}"#)).is_err());
+        assert!(CpsatTuning::from_json(Some(r#"{"ignore_subsolvers": ["rnd_cst_lns"]}"#)).is_ok());
+    }
+
+    /// The default tuning must hand the solver exactly what it was given before the
+    /// switches existed: 8 workers, interleaved search, CP-SAT's own subsolver lists.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_default_tuning_keeps_the_previous_solver_parameters() {
+        let params =
+            super::super::model::build_sat_parameters(60.0, Some(2.5), false, Some(33.0), &CpsatTuning::default());
+        // Everything that was set before, and nothing else.
+        let expected = cp_sat::proto::SatParameters {
+            max_time_in_seconds: Some(60.0),
+            max_deterministic_time: Some(2.5),
+            log_search_progress: Some(true),
+            num_workers: Some(8),
+            absolute_gap_limit: Some(33.0),
+            linearization_level: Some(2),
+            cp_model_presolve: Some(true),
+            cp_model_probing_level: Some(2),
+            randomize_search: Some(true),
+            interleave_search: Some(true),
+            // Set only when CPSAT_DEBUG_PRESOLVE_HINT is in the environment.
+            debug_crash_if_presolve_breaks_hint: params.debug_crash_if_presolve_breaks_hint,
+            ..Default::default()
+        };
+        assert_eq!(params, expected);
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_tuning_reaches_the_solver_parameters() {
+        let tuning = CpsatTuning {
+            workers: 12,
+            interleave_search: false,
+            subsolvers: vec!["default_lp".to_string()],
+            extra_subsolvers: vec!["objective_lb_search".to_string(), "reduced_costs".to_string()],
+            ignore_subsolvers: vec!["rnd_cst_lns".to_string()],
+            ..Default::default()
+        };
+        let params = super::super::model::build_sat_parameters(60.0, None, false, None, &tuning);
+        assert_eq!(params.num_workers, Some(12));
+        assert_eq!(params.interleave_search, Some(false));
+        assert_eq!(params.subsolvers, vec!["default_lp".to_string()]);
+        assert_eq!(
+            params.extra_subsolvers,
+            vec!["objective_lb_search".to_string(), "reduced_costs".to_string()]
+        );
+        assert_eq!(params.ignore_subsolvers, vec!["rnd_cst_lns".to_string()]);
+        assert_eq!(params.max_deterministic_time, None);
+        assert_eq!(params.absolute_gap_limit, None);
+    }
+
+    /// A feasibility-only solve needs one worker for `stop_after_first_solution` to hold.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_stop_after_first_solution_overrides_workers() {
+        let tuning = CpsatTuning { workers: 12, ..Default::default() };
+        let params = super::super::model::build_sat_parameters(60.0, None, true, None, &tuning);
+        assert_eq!(params.num_workers, Some(1));
+        assert_eq!(params.stop_after_first_solution, Some(true));
+    }
+}

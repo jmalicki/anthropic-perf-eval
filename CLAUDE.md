@@ -175,6 +175,11 @@ Scheduler options:
 - `--const-choice-hint-pass`, `--select-choice-hint-pass`, `--valu-shift-hint-pass` - Enable hint passes individually.
 - `--schedule-with-fixed-choices` - After hint passes, re-run greedy with encodings fixed to assign cycles.
 
+CP-SAT tuning switches (full-kernel solve only; per-section feasibility solves are unaffected). Each is off / unchanged by default, independent of the others, and recorded with its effective value under `run_options.cpsat_tuning` in the scheduler JSON. They travel to Rust as one JSON object (`cpsat_tuning_json` → `CpsatTuning` in `scheduler_rs/src/cpsat_scheduler/config.rs`, which owns the defaults):
+- `--cpsat-workers N` - `num_workers` (default: 8).
+- `--cpsat-interleave` / `--no-cpsat-interleave` - `interleave_search` (default: on). On = deterministic round-robin of subsolvers, so the same command gives the same kernel; OR-Tools 9.15 then starts no probing, shaving, `lb_tree_search` or `objective_lb_search` worker. **`--no-cpsat-interleave` makes the result non-reproducible** (ordinary parallel portfolio): report the spread over several runs, never a single run.
+- `--cpsat-subsolvers NAME,...` / `--cpsat-extra-subsolvers NAME,...` / `--cpsat-ignore-subsolvers NAME,...` - replace, extend or prune CP-SAT's subsolver list (e.g. `--cpsat-extra-subsolvers objective_lb_search,objective_shaving`). The solver log lists the subsolvers that actually run ("N full problem subsolvers: [...]").
+
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
 - `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.

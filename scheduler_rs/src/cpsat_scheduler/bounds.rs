@@ -5,8 +5,8 @@ use crate::types::{Engine, MachineConfig, Op, Opcode, PrecedenceOffset, SsaOp, V
 use super::cse_groups::CseGroup;
 
 use super::config::{
-    ConstChoiceMode, CpsatResult, CpsatStatus, OptionalConstraintGroup, SelectChoiceMode,
-    ValuShiftMode,
+    ConstChoiceMode, CpsatResult, CpsatStatus, CpsatTuning, OptionalConstraintGroup,
+    SelectChoiceMode, ValuShiftMode,
 };
 
 // ============================================================================
@@ -368,6 +368,9 @@ pub struct SsaCpsatConfig {
     /// When true (default) and select_choice_hints is None, hint each SelectChoice choice_var to 0 (vselect).
     /// When false, do not add that default hint (solver chooses freely). Used to debug presolve INFEASIBLE.
     pub hint_select_choice_vselect_by_default: bool,
+    /// Switchable solver configuration and modelling choices (workers, search mode, ...).
+    /// The default reproduces the model and parameters used before the switches existed.
+    pub tuning: CpsatTuning,
 }
 
 impl Default for SsaCpsatConfig {
@@ -395,6 +398,7 @@ impl Default for SsaCpsatConfig {
             debug_fix_precedence_bounds: false, // Default: disabled
             disable_optional_constraint_groups: HashSet::new(),
             hint_select_choice_vselect_by_default: true,
+            tuning: CpsatTuning::default(),
         }
     }
 }

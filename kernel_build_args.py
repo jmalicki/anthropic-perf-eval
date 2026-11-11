@@ -56,6 +56,34 @@ def _positive_finite_float(text: str) -> float:
     return value
 
 
+def _positive_int(text: str) -> int:
+    """argparse type: an integer greater than zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {text!r}")
+    return value
+
+
+def _name_list(text: str) -> list:
+    """argparse type: comma-separated names, e.g. subsolver names. Blank entries are dropped."""
+    return [name.strip() for name in text.split(",") if name.strip()]
+
+
+# CP-SAT tuning switches for the full-kernel solve: (argparse dest / override name, CpsatTuning key).
+# An option left at None is not sent, so the Rust default applies; scheduler_rs.resolve_cpsat_tuning
+# fills in the defaults for run_options. Defaults live in one place (CpsatTuning::default in Rust).
+CPSAT_TUNING_OPTIONS = [
+    ("cpsat_workers", "workers"),
+    ("cpsat_interleave", "interleave_search"),
+    ("cpsat_subsolvers", "subsolvers"),
+    ("cpsat_extra_subsolvers", "extra_subsolvers"),
+    ("cpsat_ignore_subsolvers", "ignore_subsolvers"),
+]
+
+
 def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
     """Add kernel build options to parser. Returns the argument group."""
     group = parser.add_argument_group("Kernel build")
@@ -79,6 +107,20 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "solve ends on this budget. --cpsat-time-limit remains as a wall-clock backstop; if "
                             "it fires first the result depends on load again (a warning is printed), so keep "
                             "it generous. Defaults to CPSAT_MAX_DETERMINISTIC_TIME if that is set.")
+    # CP-SAT tuning switches (full-kernel solve only). Unset = the default named in the help.
+    group.add_argument("--cpsat-workers", type=_positive_int, default=None, metavar="N",
+                       help="CP-SAT num_workers (default: 8)")
+    group.add_argument("--cpsat-interleave", action=argparse.BooleanOptionalAction, default=None,
+                       help="CP-SAT interleave_search (default: on). On = deterministic round-robin of "
+                            "subsolvers; OR-Tools 9.15 then starts no probing, shaving, lb_tree_search or "
+                            "objective_lb_search worker. --no-cpsat-interleave runs the usual parallel "
+                            "portfolio, whose result is NOT reproducible from run to run.")
+    group.add_argument("--cpsat-subsolvers", type=_name_list, default=None, metavar="NAME,...",
+                       help="Replace CP-SAT's list of full-problem subsolvers (default: CP-SAT's own list)")
+    group.add_argument("--cpsat-extra-subsolvers", type=_name_list, default=None, metavar="NAME,...",
+                       help="Add full-problem subsolvers, e.g. objective_lb_search,objective_shaving")
+    group.add_argument("--cpsat-ignore-subsolvers", type=_name_list, default=None, metavar="NAME,...",
+                       help="Remove subsolvers (full-problem or LNS) by name")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
@@ -224,6 +266,11 @@ def args_to_build_kwargs(
             if t:
                 optional_constraint_groups_to_disable.append(scheduler_rs.OptionalConstraintGroup.from_str(t))
 
+    # CP-SAT tuning: send only what was set; record the effective values (defaults filled in by Rust).
+    cpsat_tuning = {key: get(dest) for dest, key in CPSAT_TUNING_OPTIONS if get(dest) is not None}
+    cpsat_tuning_json = json.dumps(cpsat_tuning) if cpsat_tuning else None
+    cpsat_tuning_effective = json.loads(scheduler_rs.resolve_cpsat_tuning(cpsat_tuning_json))
+
     out_path = output_json if output_json is not None else get("output_json")
     if out_path is None:
         out_path = DEFAULT_SCHEDULER_JSON
@@ -236,6 +283,7 @@ def args_to_build_kwargs(
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
         "cpsat_deterministic_time": cpsat_deterministic_time,
+        "cpsat_tuning": cpsat_tuning_effective,
         "per_section_optimize_secs": per_section_optimize,
         "enable_valu_shift": get("enable_valu_shift", True),
         "tree_reduce_max_depth": tree_reduce_max_depth,
@@ -274,6 +322,7 @@ def args_to_build_kwargs(
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
         "cpsat_deterministic_time": cpsat_deterministic_time,
+        "cpsat_tuning_json": cpsat_tuning_json,
         "per_section_optimize_secs": per_section_optimize,
         "output_json": out_path,
         "tree_reduce_max_depth": tree_reduce_max_depth,
