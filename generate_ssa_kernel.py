@@ -125,6 +125,8 @@ def main():
     if getattr(args, "greedy_priority", "fifo") != "fifo":
         print(f"  greedy_priority={args.greedy_priority} (stagger_cycles={args.greedy_stagger_cycles}, "
               f"groups_in_flight={args.greedy_groups_in_flight})")
+    if getattr(args, "greedy_split_shift", False):
+        print("  greedy_split_shift=True" + ("" if args.use_greedy else " (ignored: CP-SAT follows the greedy)"))
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

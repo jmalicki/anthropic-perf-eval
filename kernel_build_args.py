@@ -150,6 +150,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        default=DEFAULT_GREEDY_GROUPS_IN_FLIGHT, metavar="N",
                        help="Wavefront: group chains allowed to run at once, which bounds scratch use "
                             f"(default: {DEFAULT_GREEDY_GROUPS_IN_FLIGHT}; 0 = no limit)")
+    group.add_argument("--greedy-split-shift", action="store_true", default=False,
+                       help="With --use-greedy: let a vector op run as 8 scalar ops spread over two cycles, so "
+                            "all 12 scalar slots carry shifted work (3 shifted ops per 2 cycles instead of 2). "
+                            "Ignored with CP-SAT, whose hints carry one cycle per op")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -295,6 +299,7 @@ def args_to_build_kwargs(
         "greedy_priority": get("greedy_priority", "fifo"),
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
+        "greedy_split_shift": get("greedy_split_shift", False),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -343,6 +348,7 @@ def args_to_build_kwargs(
         "greedy_priority": get("greedy_priority", "fifo"),
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
+        "greedy_split_shift": get("greedy_split_shift", False),
     }
 
 

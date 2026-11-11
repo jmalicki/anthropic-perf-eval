@@ -58,6 +58,45 @@ use super::ssa_lower::can_ssa_valu_shift_to_alu;
 pub struct GreedyShape {
     /// Order in which ready ops are tried each cycle.
     pub priority: GreedyPriority,
+    /// Let a shifted vector op straddle two cycles (see [`SplitShift`]). Without it the
+    /// greedy runs at most one shifted op per cycle (8 of the 12 scalar slots).
+    pub split_shift: bool,
+}
+
+// ============================================================================
+// SplitShift: a shifted vector op spread over two cycles
+// ============================================================================
+
+/// A shifted vector op whose scalar lanes are spread over two consecutive cycles.
+///
+/// A shifted op is VLEN = 8 scalar ops and the scalar ALU has 12 slots, so whole shifted
+/// ops use at most 8 slots per cycle. With split shifts the leftover slots take the first
+/// lanes of one more op and the next cycle takes the rest: three shifted ops per two cycles.
+///
+/// The op's `cycle` is the cycle of its last lane (its completion, as for CP-SAT's shifted
+/// ops). Its destination block is reserved from the first lane and its operands stay live
+/// until the last lane, exactly as `address_assign` models `shifted_alu_cycles`.
+#[derive(Debug, Clone, Copy)]
+struct SplitShift {
+    /// Index of the op.
+    idx: usize,
+    /// Cycle of the first lanes.
+    first_cycle: i32,
+    /// Lanes placed in `first_cycle` (lanes `0..first_lanes`); the rest run the cycle after.
+    first_lanes: usize,
+}
+
+impl SplitShift {
+    /// Fewest scalar slots worth starting a split for. With fewer, the op pays a cycle of
+    /// latency and holds its destination block early for little gain.
+    const MIN_FIRST_LANES: usize = 2;
+
+    /// Per-lane cycles in `shifted_alu_cycles` form, completing at `last_cycle`.
+    fn lane_cycles(&self, last_cycle: i32) -> Vec<i32> {
+        (0..VLEN)
+            .map(|lane| if lane < self.first_lanes { self.first_cycle } else { last_cycle })
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -788,6 +827,8 @@ impl CounterTrace {
 /// # Arguments
 /// * `ops` - Ops with assigned cycles; ops with a negative cycle (skipped dead stores) are ignored
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
+/// * `shifted_lane_cycles` - Per-lane cycles of shifted ops whose lanes are not all in the
+///   op's cycle (split shifts); empty otherwise
 ///
 /// # Returns
 /// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
@@ -795,6 +836,7 @@ impl CounterTrace {
 pub(super) fn interval_liveness_curve(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
@@ -806,7 +848,11 @@ pub(super) fn interval_liveness_curve(
         .filter(|(key, lanes)| written.contains(*key) || lanes.iter().any(|l| written.contains(l)))
         .map(|(key, lanes)| (*key, lanes.clone()))
         .collect();
-    let config = AddressAssignConfig { vector_group_lanes: groups, ..Default::default() };
+    let config = AddressAssignConfig {
+        vector_group_lanes: groups,
+        shifted_alu_cycles: shifted_lane_cycles.clone(),
+        ..Default::default()
+    };
     let intervals = compute_live_intervals(&config, &scheduled)?;
     let n_cycles = scheduled.iter().map(|op| op.cycle + 1).max().unwrap_or(0) as usize;
     // Difference array: +size at start, -size at end, prefix-summed.
@@ -832,6 +878,7 @@ pub(super) fn interval_liveness_curve(
 /// # Arguments
 /// * `ops` - Ops as scheduled by the greedy
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts (empty if there are none)
 /// * `trace` - What the counter did during the run
 /// * `counter_peak` - The peak the scheduler reports
 ///
@@ -840,11 +887,13 @@ pub(super) fn interval_liveness_curve(
 fn compare_counter_with_intervals(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     trace: &CounterTrace,
     counter_peak: usize,
 ) -> Result<LivenessAgreement, String> {
     let cycle_end_live = &trace.cycle_end_live;
-    let (curve, interval_peak, intervals) = interval_liveness_curve(ops, vector_group_lanes)?;
+    let (curve, interval_peak, intervals) =
+        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles)?;
     let mut agreement = LivenessAgreement {
         counter_peak,
         counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
@@ -1150,6 +1199,7 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
         fixed_select_choice_encoding,
         diagnostics,
         &GreedyShape::default(),
+        &mut HashMap::new(),
     )
     .map(|(result, _agreement)| result)
 }
@@ -1160,6 +1210,9 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 ///
 /// # Arguments
 /// * `shape` - Schedule-shape switches; `GreedyShape::default()` is the historical behaviour
+/// * `shifted_lane_cycles` - Out: per-lane cycles (`shifted_alu_cycles` form) of every
+///   shifted op whose lanes are not all in the op's cycle. Only split shifts
+///   (`shape.split_shift`) produce entries; lowering and address assignment need them.
 ///
 /// # Returns
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
@@ -1185,7 +1238,9 @@ pub(crate) fn schedule_ssa_greedy_shaped(
     fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
     diagnostics: &mut GreedyDiagnostics,
     shape: &GreedyShape,
+    shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    shifted_lane_cycles.clear();
     let mut trace = CounterTrace::default();
     let result = schedule_ssa_greedy_core(
         ops,
@@ -1209,8 +1264,9 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &mut trace,
         diagnostics,
         shape,
+        shifted_lane_cycles,
     )?;
-    check_liveness_agreement(ops, vector_group_lanes, &trace, result)
+    check_liveness_agreement(ops, vector_group_lanes, shifted_lane_cycles, &trace, result)
 }
 
 /// Same as [`schedule_ssa_greedy_with_diagnostics`], and also returns the
@@ -1267,6 +1323,7 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
         fixed_select_choice_encoding,
         diagnostics,
         &GreedyShape::default(),
+        &mut HashMap::new(),
     )
 }
 
@@ -1278,10 +1335,12 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
 fn check_liveness_agreement(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     trace: &CounterTrace,
     result: (usize, bool, usize),
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
-    let agreement = compare_counter_with_intervals(ops, vector_group_lanes, trace, result.2)?;
+    let agreement =
+        compare_counter_with_intervals(ops, vector_group_lanes, shifted_lane_cycles, trace, result.2)?;
     // SCHEDULER_LIVENESS_AGREEMENT: any value prints the comparison; `warn` also turns a
     // disagreement from an error into a warning.
     let mode = std::env::var("SCHEDULER_LIVENESS_AGREEMENT").ok();
@@ -1329,8 +1388,10 @@ fn schedule_ssa_greedy_core(
     trace: &mut CounterTrace,
     // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
     diagnostics: &mut GreedyDiagnostics,
-    // Schedule-shape switches (ready-queue priority).
+    // Schedule-shape switches (ready-queue priority, split shifts).
     shape: &GreedyShape,
+    // Out: per-lane cycles of split shifts.
+    shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -1619,6 +1680,15 @@ fn schedule_ssa_greedy_core(
     // Track consecutive cycles with no ops scheduled (for ASAP inflation breaker)
     let mut consecutive_empty: usize = 0;
 
+    // Split shifts: only when the scheduler itself decides shifts (not with fixed encodings).
+    let split_shift_enabled = shape.split_shift
+        && enable_valu_shift
+        && fixed_shifted_ops.is_none()
+        && !valu_shift_fixed_to_none;
+    // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
+    let mut split_carry: Option<SplitShift> = None;
+    let mut split_in_progress: usize = 0;
+
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
 
@@ -1637,7 +1707,10 @@ fn schedule_ssa_greedy_core(
         }
     }
 
-    while scheduled.len() < ops.len() && cycle < max_cycles {
+    while scheduled.len() + split_in_progress < ops.len() || split_carry.is_some() {
+        if cycle >= max_cycles {
+            break;
+        }
         // Note: scheduled includes dead stores (pre-marked), so we check against ops.len()
         // Free expired VRegs (O(log n) per VReg)
         // VRegs expire at the cycle AFTER their last use
@@ -1708,6 +1781,50 @@ fn schedule_ssa_greedy_core(
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
+
+        // Finish last cycle's split shift before anything else takes scalar slots: its
+        // remaining lanes run now and the op completes in this cycle.
+        if let Some(split) = split_carry.take() {
+            let idx = split.idx;
+            slots.alu_used += VLEN - split.first_lanes;
+            debug_assert!(slots.alu_used <= 12);
+            shifted_lane_cycles.insert(ops[idx].id, split.lane_cycles(cycle as i32));
+            shifted_ops.insert(ops[idx].id);
+            ops[idx].cycle = cycle as i32;
+            scheduled.insert(idx);
+            split_in_progress -= 1;
+            scheduled_this_cycle += 1;
+            if let Some(w) = wavefront.as_mut() {
+                w.on_scheduled(idx);
+            }
+            // Operands are read by every lane, so they are released only now.
+            release_read_values(
+                &ops[idx],
+                cycle,
+                &liveness_aliases,
+                &write_groups,
+                &mut vreg_remaining_users,
+                &mut live_vregs,
+                &mut live_words,
+                &mut vreg_expiry_heap,
+                trace,
+            );
+            peak_live_words = peak_live_words.max(live_words);
+            for &consumer_idx in &consumers[idx] {
+                let offset = ops[idx].precedence_offset_for_asap(shiftable_set.contains(&idx));
+                max_ready_cycle[consumer_idx] =
+                    max_ready_cycle[consumer_idx].max((cycle as i32) + offset);
+                remaining_deps[consumer_idx] -= 1;
+                if remaining_deps[consumer_idx] == 0 {
+                    let priority = bounds_usage
+                        .core_bounds()
+                        .and_then(|(a, _)| a.get(&ops[consumer_idx].id).copied())
+                        .map(|lb| max_ready_cycle[consumer_idx].max(lb))
+                        .unwrap_or(max_ready_cycle[consumer_idx]);
+                    ready_heap.push(Reverse((priority, consumer_idx)));
+                }
+            }
+        }
 
         // Helper: compute LUC (Last-Use-Count) for an op - count of source VRegs
         // where this op is their last reader. Higher LUC = frees more scratch space.
@@ -2016,6 +2133,48 @@ fn schedule_ssa_greedy_core(
                         continue;
                     }
                 } else if !slots.fits(engine, can_shift) {
+                    // Split shift: the vector slots are full and a whole shifted op does not
+                    // fit, but scalar slots are left. Run the first lanes now and the rest
+                    // next cycle. The destination block is reserved now; operands are
+                    // released when the op completes, so nothing is freed in this cycle.
+                    let free_alu = 12 - slots.alu_used;
+                    if split_shift_enabled
+                        && can_shift
+                        && engine == Engine::Valu
+                        && split_carry.is_none()
+                        && free_alu >= SplitShift::MIN_FIRST_LANES
+                        && free_alu < VLEN
+                        && strategy.allow_shift(live_words, slots.alu_used, scratch_budget)
+                    {
+                        if let Some(d) = dest {
+                            let counted = write_groups.counted(d);
+                            let words_added =
+                                if live_vregs.contains(&counted) { 0 } else { counted.size() };
+                            if live_words + words_added <= scratch_budget {
+                                slots.alu_used += free_alu;
+                                split_carry = Some(SplitShift {
+                                    idx,
+                                    first_cycle: cycle as i32,
+                                    first_lanes: free_alu,
+                                });
+                                split_in_progress += 1;
+                                made_progress = true;
+                                count_written_dest(
+                                    d,
+                                    cycle,
+                                    &mut write_groups,
+                                    &vreg_remaining_users,
+                                    &mut live_vregs,
+                                    &mut live_words,
+                                    &mut vreg_expiry_heap,
+                                    trace,
+                                );
+                                vreg_def_cycle.insert(d, cycle as i32);
+                                peak_live_words = peak_live_words.max(live_words);
+                                continue;
+                            }
+                        }
+                    }
                     // Reinsert to heap for next cycle
                     let next_priority = bounds_usage
                         .core_bounds()
@@ -2385,7 +2544,7 @@ fn schedule_ssa_greedy_core(
     let _ = vreg_def_cycle;
 
     if scheduled.len() < ops.len() {
-        // Diagnose why scheduling failed
+        // Diagnose why scheduling failed (a split shift still in progress counts as unscheduled)
         let unscheduled: Vec<usize> =
             (0..ops.len()).filter(|i| !scheduled.contains(i)).collect();
         let ready_count = ready_heap.len();
