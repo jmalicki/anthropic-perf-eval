@@ -5,14 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::kernel_builder::config::PressurePolicyKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::ssa_greedy;
 use crate::kernel_builder::ssa_greedy::GreedyBoundsUsage;
-use crate::kernel_builder::ssa_greedy::pressure_policy::{
-    AdaptivePolicy, CascadePolicy, GreedyPolicy, PressureGatedPolicy, PressurePolicy,
-    PressureThrottledPolicy,
-};
 use crate::types::{ConstChoiceEncoding, Opcode, SelectChoiceEncoding};
 
 /// Runs the greedy scheduler with VALU→ALU shifting and choice tracking.
@@ -100,14 +95,7 @@ impl Pass for GreedySchedulePass {
         let enable_valu_shift = ctx.config.compiler.enable_valu_shift;
 
         // Construct pressure policy from config
-        let strategy: Box<dyn PressurePolicy> =
-            match ctx.config.compiler.scheduling_pressure_policy {
-                PressurePolicyKind::Greedy => Box::new(GreedyPolicy),
-                PressurePolicyKind::PressureThrottled => Box::new(PressureThrottledPolicy::default()),
-                PressurePolicyKind::PressureGated => Box::new(PressureGatedPolicy::default()),
-                PressurePolicyKind::Adaptive => Box::new(AdaptivePolicy::default()),
-                PressurePolicyKind::Cascade => Box::new(CascadePolicy::default()),
-            };
+        let strategy = ctx.config.compiler.pressure_policy();
 
         // Determine bounds usage mode based on pipeline configuration.
         // CP-SAT pipeline → Full (deferral + inflation + clamping for solver domain compliance).
@@ -159,7 +147,7 @@ impl Pass for GreedySchedulePass {
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut ctx.greedy_decisions.shifted_ops,
-                ctx.config.scratch_budget,
+                ctx.config.compiler.greedy_scratch_budget(ctx.config.scratch_budget),
                 Some(&mut select_fma_ops),
                 Some(&mut ctx.greedy_decisions.select_sub_cycles),
                 Some(&mut ctx.greedy_decisions.select_fma_cycles),

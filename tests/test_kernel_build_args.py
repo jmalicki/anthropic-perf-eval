@@ -95,6 +95,34 @@ def test_greedy_split_shift_flag_reaches_kwargs_and_run_options():
     assert json.loads(kwargs["run_options_json"])["greedy_split_shift"] is True
 
 
+def test_pressure_threshold_flags_reach_kwargs_and_run_options():
+    """The threshold overrides default to None (policy built-ins), headroom to 0; all are passed on and recorded."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    names = ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    recorded = json.loads(default["run_options_json"])
+    for where in (default, recorded):
+        assert all(where[name] is None for name in names)
+        assert where["greedy_budget_headroom"] == 0
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    args = parser.parse_args(["--use-greedy", "--pressure-soft-threshold", "0.9", "--pressure-critical-threshold", "1",
+                              "--pressure-inflation-threshold", "0.95", "--greedy-budget-headroom", "16"])
+    kwargs = args_to_build_kwargs(args, use_git_sha=False)
+    recorded = json.loads(kwargs["run_options_json"])
+    for where in (kwargs, recorded):
+        assert [where[name] for name in names] == [0.9, 1.0, 0.95]
+        assert where["greedy_budget_headroom"] == 16
+    for bad in (["--pressure-inflation-threshold", "0"], ["--pressure-soft-threshold", "nan"],
+                ["--greedy-budget-headroom", "-1"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(bad)
+
+
 def _build(n_nodes, rounds=2, batch_size=16):
     instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
         forest_height=10, n_nodes=n_nodes, batch_size=batch_size, rounds=rounds, verbose=False, use_cpsat=False)
