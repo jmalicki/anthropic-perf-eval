@@ -11,7 +11,8 @@
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{
-    merged_hash_stage_constants, HASH_STAGES, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
+    level_last_index, merged_hash_stage_constants, IndexForm, HASH_STAGES, MERGED_HASH_STAGE,
+    STAGE5_XOR_CONST,
 };
 use super::tick_tock_ssa::{
     SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL,
@@ -82,12 +83,109 @@ impl SsaTickTockKernelBuilder {
         let store_data_vals: Vec<crate::types::VReg> = (0..n_groups)
             .map(|g| self.ctx.all_val[g].unwrap())
             .collect();
+        // `tree_depth` is now the depth the indices are at after the last round.
         let store_data_idxs: Vec<crate::types::VReg> = (0..n_groups)
-            .map(|g| self.ctx.all_idx[g].unwrap())
+            .map(|g| self.final_index(g, tree_depth))
             .collect();
 
         // Store data
         self.emit_store_data(n_groups, &store_data_idxs, &store_data_vals);
+    }
+
+    // =========================================================================
+    // Index Form
+    // =========================================================================
+
+    /// True when the kernel tracks the mirrored index `n = L_d - idx` (`IndexForm::Mirrored`).
+    pub(super) fn mirrored_index(&self) -> bool {
+        self.config.spec.index_form == IndexForm::Mirrored
+    }
+
+    /// Vector of a small constant: `ConstChoice` + `vbroadcast`, both deduplicated.
+    ///
+    /// # Arguments
+    /// * `value` - The constant to broadcast.
+    ///
+    /// # Returns
+    /// The vector VReg holding `value` in every lane.
+    pub(super) fn v_constant(&mut self, value: i64) -> crate::types::VReg {
+        let scalar = if value == 0 {
+            self.zero_vreg.unwrap()
+        } else {
+            self.emit.set_next_var_type(VarType::Constant);
+            self.emit.emit_const_choice(value)
+        };
+        self.emit.set_next_var_type(VarType::Constant);
+        self.emit.emit_vbroadcast(scalar)
+    }
+
+    /// Vector that cached-level selection compares the tracked index against to test
+    /// `idx == tree_index` at `tree_depth`.
+    ///
+    /// # Arguments
+    /// * `tree_depth` - Depth the indices are at.
+    /// * `tree_index` - Reference (zero-based) tree index to test for.
+    ///
+    /// # Returns
+    /// Vector of `tree_index` for `IndexForm::ZeroBased`, of `L_d - tree_index` for
+    /// `IndexForm::Mirrored` (`idx == k` iff `n == L_d - k`, `R10-mirrored-index-uses`).
+    pub(super) fn v_index_compare(
+        &mut self,
+        tree_depth: usize,
+        tree_index: usize,
+    ) -> crate::types::VReg {
+        let value = if self.mirrored_index() {
+            level_last_index(tree_depth) - tree_index as i64
+        } else {
+            tree_index as i64
+        };
+        self.v_constant(value)
+    }
+
+    /// Emit the position of group `g`'s indices from the left end of their level:
+    /// `idx - (2^d - 1)`, in `0..2^d`.
+    ///
+    /// # Arguments
+    /// * `g` - Group.
+    /// * `v_level_first` - Vector of `2^d - 1`, the first index of the level.
+    ///
+    /// # Returns
+    /// The vector VReg: `idx - first` for `IndexForm::ZeroBased`, `first - n` for
+    /// `IndexForm::Mirrored` (equal because `L_d = 2 * first`, `R10-mirrored-index-uses`).
+    pub(super) fn emit_level_position(
+        &mut self,
+        g: usize,
+        v_level_first: crate::types::VReg,
+    ) -> crate::types::VReg {
+        let idx = self.ctx.all_idx[g].unwrap();
+        if self.mirrored_index() {
+            self.emit.emit_valu(Opcode::Sub, v_level_first, idx)
+        } else {
+            self.emit.emit_valu(Opcode::Sub, idx, v_level_first)
+        }
+    }
+
+    /// The reference (zero-based) index vector of group `g` for the final index store.
+    ///
+    /// # Arguments
+    /// * `g` - Group.
+    /// * `tree_depth` - Depth the indices are at after the last round.
+    ///
+    /// # Returns
+    /// `all_idx[g]` for `IndexForm::ZeroBased`. For `IndexForm::Mirrored`, `L_d - n`
+    /// (one SUB per group), or a shared vector of zeros at depth 0.
+    fn final_index(&mut self, g: usize, tree_depth: usize) -> crate::types::VReg {
+        if !self.mirrored_index() {
+            return self.ctx.all_idx[g].unwrap();
+        }
+        match self.ctx.all_idx[g] {
+            None => self.v_constant(0),
+            Some(n) => {
+                let v_last = self.v_constant(level_last_index(tree_depth));
+                self.emit.set_next_var_type(VarType::BatchData);
+                self.emit.emit_valu(Opcode::Sub, v_last, n)
+            }
+        }
     }
 
     // =========================================================================
@@ -436,17 +534,22 @@ impl SsaTickTockKernelBuilder {
     pub(super) fn emit_load_data(&mut self, n_groups: usize) {
         let idx_p = self.ctx.idx_p.unwrap();
         let val_p = self.ctx.val_p.unwrap();
+        // The mirrored index starts at n = 0 (`all_idx[g] = None`): the initial indices are
+        // taken to be 0, as the root broadcast of round 0 already assumes, and not loaded.
+        let load_idx = !self.mirrored_index();
 
         for g in (0..n_groups).step_by(2) {
             let offset_a = (g * VLEN) as i64;
             self.emit.set_next_var_type(VarType::Constant);
             let off_a = self.emit.emit_const_choice(offset_a);
-            self.emit.set_next_var_type(VarType::Address);
-            let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
+            if load_idx {
+                self.emit.set_next_var_type(VarType::Address);
+                let idx_addr_a = self.emit.emit_alu(Opcode::Add, idx_p, off_a);
+                self.emit.set_next_var_type(VarType::BatchData);
+                self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr_a));
+            }
             self.emit.set_next_var_type(VarType::Address);
             let val_addr_a = self.emit.emit_alu(Opcode::Add, val_p, off_a);
-            self.emit.set_next_var_type(VarType::BatchData);
-            self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr_a));
             self.emit.set_next_var_type(VarType::BatchData);
             self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr_a));
 
@@ -454,12 +557,14 @@ impl SsaTickTockKernelBuilder {
                 let offset_b = ((g + 1) * VLEN) as i64;
                 self.emit.set_next_var_type(VarType::Constant);
                 let off_b = self.emit.emit_const_choice(offset_b);
-                self.emit.set_next_var_type(VarType::Address);
-                let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+                if load_idx {
+                    self.emit.set_next_var_type(VarType::Address);
+                    let idx_addr_b = self.emit.emit_alu(Opcode::Add, idx_p, off_b);
+                    self.emit.set_next_var_type(VarType::BatchData);
+                    self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
+                }
                 self.emit.set_next_var_type(VarType::Address);
                 let val_addr_b = self.emit.emit_alu(Opcode::Add, val_p, off_b);
-                self.emit.set_next_var_type(VarType::BatchData);
-                self.ctx.all_idx[g + 1] = Some(self.emit.emit_vload(idx_addr_b));
                 self.emit.set_next_var_type(VarType::BatchData);
                 self.ctx.all_val[g + 1] = Some(self.emit.emit_vload(val_addr_b));
             }
@@ -535,7 +640,7 @@ impl SsaTickTockKernelBuilder {
             4 if self.config.use_tree_reduce_at_depth(4) => {
                 self.emit_depth4_access(n_iters, n_groups)
             }
-            _ => self.emit_scattered_access(n_iters, n_groups),
+            _ => self.emit_scattered_access(n_iters, n_groups, tree_depth),
         }
 
         // XOR
@@ -614,34 +719,35 @@ impl SsaTickTockKernelBuilder {
     }
 
     /// 4-way selection via linear chain with first pair as (base, delta) to avoid materializing base+delta.
+    ///
+    /// # Arguments
+    /// * `idx` - The tracked index vector (in the kernel's index form).
+    /// * `compare` - Vectors the index equals when the 2nd, 3rd and 4th value is wanted
+    ///   (`v_index_compare`).
+    /// * `base`, `delta` - 1st value and (2nd - 1st).
+    /// * `v2`, `v3` - 3rd and 4th value.
+    ///
+    /// # Returns
+    /// The selected vector.
     fn select_4way_linear_first_delta(
         &mut self,
         idx: crate::types::VReg,
-        base_idx: usize,
+        compare: [crate::types::VReg; 3],
         base: crate::types::VReg,
         delta: crate::types::VReg,
         v2: crate::types::VReg,
         v3: crate::types::VReg,
     ) -> crate::types::VReg {
-        let c1 = base_idx + 1;
-        let c2 = base_idx + 2;
-        let c3 = base_idx + 3;
         self.emit.set_next_var_type(VarType::Condition);
-        let cond1 = self
-            .emit
-            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c1].unwrap());
+        let cond1 = self.emit.emit_valu(Opcode::Eq, idx, compare[0]);
         self.emit.set_next_var_type(VarType::Temporary);
         let mut result = self.select_2way_with_delta(cond1, delta, base);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond2 = self
-            .emit
-            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c2].unwrap());
+        let cond2 = self.emit.emit_valu(Opcode::Eq, idx, compare[1]);
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond2, v2, result);
         self.emit.set_next_var_type(VarType::Condition);
-        let cond3 = self
-            .emit
-            .emit_valu(Opcode::Eq, idx, self.ctx.v_const[c3].unwrap());
+        let cond3 = self.emit.emit_valu(Opcode::Eq, idx, compare[2]);
         self.emit.set_next_var_type(VarType::Temporary);
         result = self.select_2way(cond3, v3, result);
         result
@@ -759,7 +865,7 @@ impl SsaTickTockKernelBuilder {
 
     pub(super) fn emit_depth1_access(&mut self, n_iters: usize, n_groups: usize) {
         // Depth 1: 2-way selection (indices 1, 2) via select_2way_with_delta.
-        let v_1 = self.ctx.v_1.unwrap();
+        let v_is_1 = self.v_index_compare(1, 1);
         let v_td_1 = self.ctx.v_td_1.unwrap();
         let v_tc2 = self.ctx.v_tc2.unwrap();
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
@@ -773,7 +879,7 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_iter_group(it, base_g + i);
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
                 self.emit.set_next_var_type(VarType::Condition);
-                let cond = self.emit.emit_valu(Opcode::Eq, idx, v_1);
+                let cond = self.emit.emit_valu(Opcode::Eq, idx, v_is_1);
                 self.emit.set_next_var_type(VarType::Temporary);
                 let v_nv = self.select_2way_with_delta(cond, v_td_1, v_tc2);
                 self.emit.set_next_var_type(VarType::RoundState);
@@ -791,6 +897,8 @@ impl SsaTickTockKernelBuilder {
         let v_tc6 = self.ctx.v_tc6.unwrap();
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
         const BASE_IDX: usize = 3;
+        let compare: [crate::types::VReg; 3] =
+            std::array::from_fn(|k| self.v_index_compare(2, BASE_IDX + 1 + k));
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
@@ -802,7 +910,7 @@ impl SsaTickTockKernelBuilder {
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
                 self.emit.set_next_var_type(VarType::Temporary);
                 let v_nv =
-                    self.select_4way_linear_first_delta(idx, BASE_IDX, v_tc3, v_td_4, v_tc5, v_tc6);
+                    self.select_4way_linear_first_delta(idx, compare, v_tc3, v_td_4, v_tc5, v_tc6);
                 self.emit.set_next_var_type(VarType::RoundState);
                 self.ctx.v_nv[it][i] = Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
             }
@@ -845,11 +953,10 @@ impl SsaTickTockKernelBuilder {
                         continue;
                     }
                     self.emit.set_iter_group(it, base_g + i);
-                    let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                     // Bit extraction
                     self.emit.set_next_var_type(VarType::Temporary);
-                    let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_const_7);
+                    let idx_adj = self.emit_level_position(base_g + i, v_const_7);
                     let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
                     let idx_adj_shr = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
                     let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr, v_1);
@@ -886,7 +993,12 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         } else {
-            // Original FMA approach (16 VALU ops)
+            // Original FMA approach (16 VALU ops). Not reachable from emit_round, which only
+            // calls this function when tree-reduce is enabled at depth 3.
+            assert!(
+                !self.mirrored_index(),
+                "depth-3 selection without tree-reduce supports only the zero-based index form"
+            );
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
@@ -955,11 +1067,10 @@ impl SsaTickTockKernelBuilder {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
-                let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                 // Bit extraction: idx_adj = idx - 15, then extract bits 0-3
                 self.emit.set_next_var_type(VarType::Temporary);
-                let idx_adj = self.emit.emit_valu(Opcode::Sub, idx, v_c15);
+                let idx_adj = self.emit_level_position(base_g + i, v_c15);
                 let bit0 = self.emit.emit_valu(Opcode::And, idx_adj, v_1);
                 let idx_adj_shr1 = self.emit.emit_valu(Opcode::Shr, idx_adj, v_1);
                 let bit1 = self.emit.emit_valu(Opcode::And, idx_adj_shr1, v_1);
@@ -1021,7 +1132,12 @@ impl SsaTickTockKernelBuilder {
         self.emit.clear_iter_group();
     }
 
-    pub(super) fn emit_scattered_access(&mut self, n_iters: usize, n_groups: usize) {
+    pub(super) fn emit_scattered_access(
+        &mut self,
+        n_iters: usize,
+        n_groups: usize,
+        tree_depth: usize,
+    ) {
         // Scatter load via vector address computation + scalar decomposition.
         //
         // Each of the 8 batch items in a group has its own tree node index
@@ -1035,8 +1151,21 @@ impl SsaTickTockKernelBuilder {
         // across all groups and rounds. Each group costs 1 vadd (shiftable) +
         // 8 loads instead of 8 ALU adds + 8 loads.
 
+        //
+        // With the mirrored index n = L_d - idx the address is (forest_p + L_d) - n: still
+        // one vector op, against a per-level constant (R10-mirrored-index-uses).
+
         let forest_p = self.ctx.forest_p.unwrap();
-        let v_forest_p = self.emit.emit_vbroadcast(forest_p);
+        let mirrored = self.mirrored_index();
+        let v_base = if mirrored {
+            self.emit.set_next_var_type(VarType::Constant);
+            let last = self.emit.emit_const_choice(level_last_index(tree_depth));
+            self.emit.set_next_var_type(VarType::Pointer);
+            let level_end_p = self.emit.emit_alu(Opcode::Add, forest_p, last);
+            self.emit.emit_vbroadcast(level_end_p)
+        } else {
+            self.emit.emit_vbroadcast(forest_p)
+        };
         let v_stage5_xor = self.ctx.v_stage5_xor.unwrap();
 
         for it in 0..n_iters {
@@ -1050,7 +1179,11 @@ impl SsaTickTockKernelBuilder {
 
                 // Vector address computation: forest_p + idx[item] for all 8 items
                 self.emit.set_next_var_type(VarType::Address);
-                let v_addr = self.emit.emit_valu(Opcode::Add, idx, v_forest_p);
+                let v_addr = if mirrored {
+                    self.emit.emit_valu(Opcode::Sub, v_base, idx)
+                } else {
+                    self.emit.emit_valu(Opcode::Add, idx, v_base)
+                };
 
                 // Decompose address vector into 8 scalar addresses
                 let addr_elements = self.emit.decompose_vector(v_addr);
@@ -1247,6 +1380,24 @@ impl SsaTickTockKernelBuilder {
                 }
 
                 let val = self.ctx.all_val[g].unwrap();
+
+                if self.mirrored_index() {
+                    // Mirrored index n = L_d - idx (R9-mirrored-index-step):
+                    //   wrap round: every index becomes 0, so n = 0 (None), no op;
+                    //   depth 0:    n' = bit (n = 0), one op;
+                    //   otherwise:  n' = 2n + bit, two ops.
+                    self.ctx.all_idx[g] = if is_wrap_round {
+                        None
+                    } else {
+                        let bit = self.emit.emit_valu(Opcode::And, val, v_1);
+                        Some(match self.ctx.all_idx[g] {
+                            None => bit,
+                            Some(n) => self.emit.emit_fma(n, v_2, bit),
+                        })
+                    };
+                    continue;
+                }
+
                 let idx = self.ctx.all_idx[g].unwrap();
                 
                 // Debug: log what VReg all_val[g] contains when branch runs
@@ -1285,6 +1436,10 @@ impl SsaTickTockKernelBuilder {
 
         // Partition stores (tick-tock) - only if enabled
         if self.config.spec.enable_partition_stores {
+            assert!(
+                !self.mirrored_index(),
+                "partition stores support only the zero-based index form"
+            );
             if TICK_STORE_DEPTHS.contains(&tree_depth) {
                 if std::env::var("SCHEDULER_DEBUG").is_ok() && is_last_round {
                     eprintln!("[DEBUG emit_branch] About to emit partition stores for groups 0..{}, tree_depth={}", n_groups/2, tree_depth);
