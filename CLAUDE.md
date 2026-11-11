@@ -20,7 +20,7 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 **Current development: use 2 rounds** for kernel generation, CP-SAT debugging, bulk-move, and iteration (e.g. `uv run generate_ssa_kernel.py --rounds 2`). The script default is still 16 for benchmarking.
 
 Benchmark/default parameters:
-- `forest_height=10` - Tree depth (2^10 - 1 = 2047 nodes)
+- `forest_height=10` - Tree depth (levels 0..10, so 2^11 - 1 = 2047 nodes)
 - `batch_size=256` - Number of parallel traversals
 - `rounds=16` - Hash rounds per traversal (use `--rounds 2` for dev)
 
@@ -32,6 +32,7 @@ Benchmark/default parameters:
 
 When working in this repo, read and follow these project-specific skills when they apply:
 
+- **Inspect a schedule (what is at address A, which SSA op owns a slot)** — Read [.cursor/skills/use-inspect-schedule/SKILL.md](.cursor/skills/use-inspect-schedule/SKILL.md). `scripts/inspect_schedule.py` answers, lane-aware, from a scheduler JSON: `addr A [--cycle C]` (values covering A, who holds it, last write), `op ID` (operands, lowered ops incl. shifted lanes and select subtract/multiply_add, consumers), `slot CYCLE DEST` (SSA op behind a kernel slot), `value NAME`. Run as `uv run python -m scripts.inspect_schedule sched.json ...`.
 - **Kernel dataflow replay (first step for any wrong kernel)** — Read [.cursor/skills/use-kernel-dataflow/SKILL.md](.cursor/skills/use-kernel-dataflow/SKILL.md). `verification/kernel_dataflow.py` executes the emitted kernel symbolically and proves it equals its SSA program for all inputs, or names the first cycle, slot and operand where it does not. Runs automatically under `--validate`; standalone: `uv run python -m verification.kernel_dataflow --kernel kern.json --scheduler sched.json [--explain-cycle N]`.
 - **Reproducibility (same command, same kernel)** — Builds are deterministic: two runs with the same options hand CP-SAT byte-identical models and, with a `--cpsat-deterministic-time` budget that the solve ends on (not the wall-clock backstop), emit byte-identical kernels (`tests/test_determinism.py`). If two runs disagree, export each model with `CPSAT_EXPORT_MODEL=path.pb` and run `uv run python -m scripts.diff_cpsat_models a.pb b.pb`; it reports the first constraint, variable or hint that differs and whether it is only a reordering. New code that creates solver variables/constraints or allocates addresses must not iterate a `HashMap`/`HashSet` directly: use `sorted_by_key` (in `cpsat_scheduler/model.rs`), a `BTreeMap`/`BTreeSet`, or sort first.
 - **Debugging makespan / empty cycles** — Read [.cursor/skills/use-bulk-move/SKILL.md](.cursor/skills/use-bulk-move/SKILL.md). Use the bulk-move simulator to see if empty cycles can be compacted (ReachedEnd) or which constraint blocks (Blocked). Requires CP-SAT run with `--output-json`; run `uv run scripts/simulate_bulk_move.py` on that JSON.

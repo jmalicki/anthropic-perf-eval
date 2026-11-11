@@ -209,6 +209,95 @@ fn test_budget_exceeded_propagates() {
         "Error message must mention scratch budget exceeded: {}",
         err_msg
     );
+    // The message must name the accounting that tripped and report that accounting's numbers.
+    match &err {
+        KernelBuilderError::BudgetExceeded { peak_live, budget, accounting } => match accounting {
+            BudgetAccounting::AddressLiveness => {
+                assert!(peak_live > budget, "AddressLiveness must mean peak_live > budget: {}", err_msg);
+                assert!(err_msg.contains("in address assignment"), "{}", err_msg);
+                assert!(err_msg.contains(&format!("peak_live={} > budget={}", peak_live, budget)), "{}", err_msg);
+            }
+            BudgetAccounting::GreedyScheduler { .. } => {
+                assert!(err_msg.contains("greedy scheduler"), "{}", err_msg);
+            }
+            BudgetAccounting::AddressRange { .. } => {
+                assert!(peak_live <= budget, "{}", err_msg);
+                assert!(err_msg.contains("highest address used"), "{}", err_msg);
+            }
+        },
+        other => panic!("expected BudgetExceeded, got {:?}", other),
+    }
+}
+
+/// Every inequality in a budget-exceeded message must be true, and the message must say
+/// which accounting tripped. Regression: a greedy overflow (4552 > 1535 in the greedy
+/// scheduler's counter) was reported with address assignment's numbers as
+/// "peak_live=1268 > budget=1536".
+#[test]
+fn test_budget_exceeded_message_names_accounting_and_never_lies() {
+    /// Check each "peak_live=A <sym> ...budget=B" in the message against the numbers.
+    fn assert_inequalities_true(msg: &str) {
+        let mut rest = msg;
+        let mut checked = 0;
+        while let Some(pos) = rest.find("peak_live=") {
+            rest = &rest[pos + "peak_live=".len()..];
+            let mut parts = rest.split_whitespace();
+            let a: usize = parts.next().unwrap().parse().unwrap();
+            let sym = parts.next().unwrap();
+            let rhs = parts.find(|t| t.contains("budget=")).unwrap();
+            let b: usize = rhs
+                .split("budget=")
+                .nth(1)
+                .unwrap()
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .unwrap();
+            let holds = match sym {
+                ">" => a > b,
+                "==" => a == b,
+                "<" => a < b,
+                other => panic!("unexpected comparison '{}' in: {}", other, msg),
+            };
+            assert!(holds, "false inequality {} {} {} in: {}", a, sym, b, msg);
+            checked += 1;
+        }
+        assert!(checked > 0, "no inequality found in: {}", msg);
+    }
+
+    let greedy = KernelBuilderError::BudgetExceeded {
+        peak_live: 4552,
+        budget: 1535,
+        accounting: BudgetAccounting::GreedyScheduler {
+            over_budget_cycles: 1803,
+            address_assignment: Some((1268, 1536)),
+        },
+    }
+    .to_string();
+    assert_inequalities_true(&greedy);
+    assert!(greedy.contains("greedy scheduler"), "{}", greedy);
+    assert!(greedy.contains("greedy peak_live=4552 > greedy budget=1535"), "{}", greedy);
+    assert!(greedy.contains("1803 cycle(s)"), "{}", greedy);
+    assert!(greedy.contains("address assignment of the same schedule measured peak_live=1268 < budget=1536"), "{}", greedy);
+    assert!(!greedy.contains("1268 >"), "{}", greedy);
+
+    let addr = KernelBuilderError::BudgetExceeded {
+        peak_live: 1600,
+        budget: 1536,
+        accounting: BudgetAccounting::AddressLiveness,
+    }
+    .to_string();
+    assert_inequalities_true(&addr);
+    assert!(addr.contains("in address assignment: peak_live=1600 > budget=1536"), "{}", addr);
+
+    let range = KernelBuilderError::BudgetExceeded {
+        peak_live: 1500,
+        budget: 1536,
+        accounting: BudgetAccounting::AddressRange { max_addr: 1540 },
+    }
+    .to_string();
+    assert_inequalities_true(&range);
+    assert!(range.contains("highest address used (1540)"), "{}", range);
+    assert!(range.contains("peak_live=1500 < budget=1536"), "{}", range);
 }
 
 /// Test that greedy scheduler with generous budget allows parallel ops.

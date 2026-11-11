@@ -120,23 +120,20 @@ Use to inspect **exactly what ops** run at a cycle you identified from the trace
 
 When debugging **scratch reuse** or “vstore at cycle C reads address A”—use the **scheduler output JSON** (from `--output-json`), not the kernel.
 
-**Script:** `scripts/inspect_cycle_addr.py` — Ops at a given cycle that read a given scratch address (or vector range), plus VRegs at that address. With `--vregs`, shows intervals and whether each VReg is live at that cycle.
+**Script:** `scripts/inspect_schedule.py` (see [use-inspect-schedule](../use-inspect-schedule/SKILL.md)) — lane-aware: a vector at 27..34 is found when you ask about address 30. Cycles are schedule cycles; add `--bundle` to give a kernel bundle index (schedule cycle + 1).
 
 ```bash
-uv run python scripts/inspect_cycle_addr.py sched_4r8b_d3.json --cycle 785 --addr 19 --vregs
-```
+# Values covering address 19, which one a read in cycle 785 sees, the last write before it, ops touching it in 785
+uv run python -m scripts.inspect_schedule sched_4r8b_d3.json addr 19 --cycle 785
 
-**Script:** `scripts/inspect_vreg_at_addr.py` — Which VRegs were assigned a given scratch address; with `--vregs`, shows interval [start, end] from the JSON `vregs` array (requires `--liveness-detail full`).
+# A value (VReg): address, interval, defining SSA op, readers
+uv run python -m scripts.inspect_schedule sched_4r8b_d3.json value v213_v
 
-```bash
-uv run python scripts/inspect_vreg_at_addr.py scheduler_output.json --addr 10 --vregs
-```
+# An SSA op: operands, lowered ops with cycles (shifted lanes, select subtract/multiply_add), consumers
+uv run python -m scripts.inspect_schedule sched_4r8b_d3.json op 213
 
-**Script:** `scripts/inspect_vreg_definer.py` — Given a VReg id, prints the **defining op** (the op that writes to that VReg’s scratch address) and, if present, interval/metadata from the `vregs` array. Use to confirm the value at an address comes from the expected SSA op (e.g. depth-3 tree-select).
-
-```bash
-uv run python scripts/inspect_vreg_definer.py sched_4r8b_d3.json --vreg 213
-uv run python scripts/inspect_vreg_definer.py scheduler_output.json --vreg 213 --width vector
+# Which SSA op does the slot writing address 19 in cycle 785 belong to?
+uv run python -m scripts.inspect_schedule sched_4r8b_d3.json --kernel kernel.json slot 785 19
 ```
 
 Use these when you know the **cycle and address** from the trace (e.g. “vstore at 786 from scratch 19”) and want to see which SSA op reads that address and which VRegs share it with their intervals.
@@ -168,7 +165,7 @@ Use when debugging the "depth-3 (4r/8b): all 8 lanes wrong" failure to isolate t
 
 ## 7. Targeted debug tools (low-token, data-focused)
 
-Scripts like `scripts/scratch_vs_ref.py`, `scripts/who_wrote_addr.py`, and `scripts/addr_conflict_report.py` are best used when you already know the specific cycle or address (or suspect a particular location) and want concise raw data instead of higher-level analysis.
+Scripts like `scripts/scratch_vs_ref.py`, `scripts/inspect_schedule.py`, and `scripts/addr_conflict_report.py` are best used when you already know the specific cycle or address (or suspect a particular location) and want concise raw data instead of higher-level analysis.
 
 Use these when you need **specific data** without speculation:
 
@@ -180,13 +177,13 @@ uv run python scripts/scratch_vs_ref.py --kernel kernel.json --rounds 4 --batch-
 
 Output: at each cycle, `s[addr..addr+7]` GOT vs REF (round N hashed_val), lane-by-lane MISMATCH/OK. Pinpoints exactly when values diverge.
 
-**Script:** `scripts/who_wrote_addr.py` — Last instruction that wrote to an address before a cycle.
+**Script:** `scripts/inspect_schedule.py addr A --cycle C` — Last lowered op that wrote to an address before a cycle (needs the scheduler JSON).
 
 ```bash
-uv run python scripts/who_wrote_addr.py --kernel kernel.json --addr 13 --before-cycle 72
+uv run python -m scripts.inspect_schedule scheduler_output.json addr 13 --cycle 72 --bundle
 ```
 
-Output: the cycle and full instruction that last wrote to that address. Answers: "what produced the value we're reading?"
+Output: the values at that address, the last write before the cycle with its SSA op, and the ops touching it in that cycle. Answers: "what produced the value we're reading?"
 
 **Script:** `scripts/addr_conflict_report.py` — Detect problematic VReg interval overlaps at same address.
 
@@ -220,10 +217,10 @@ uv run python scripts/check_broadcast_overwrites.py
 | Depth-3: tree selection vs hash vs branch? | compare_depth3_tree_value.py | 4r/8b wrong value; compare got to ref node_val/val_after_xor/hashed_val. |
 | How does a scratch address change over time? | trace_scratch_addresses.py | When debugging scratch/register usage. |
 | What instructions run at cycle C? | dump_cycle_instrs.py | After trace_group20 gives you a cycle number. |
-| Ops at cycle C reading addr A / VRegs at addr? | inspect_cycle_addr.py, inspect_vreg_at_addr.py | Schedule JSON; debugging scratch reuse / vstore value interval. |
-| Which SSA op defines VReg X? | inspect_vreg_definer.py | Schedule JSON; confirm producer of value at an address (e.g. VReg 213). |
+| Ops at cycle C reading addr A / values at addr? | inspect_schedule.py addr A --cycle C | Schedule JSON; lane-aware; debugging scratch reuse / vstore value interval. |
+| Which SSA op defines VReg X / owns a slot? | inspect_schedule.py value X / slot C DEST / op ID | Schedule JSON; confirm producer of value at an address (e.g. VReg 213). |
 | Scratch at cycle C vs reference? | scratch_vs_ref.py | Got vs expected; lane-level mismatch. |
-| Who wrote addr before cycle C? | who_wrote_addr.py | Last instruction writing to that address. |
+| Who wrote addr before cycle C? | inspect_schedule.py addr A --cycle C | Last lowered op writing to that address, with its SSA op. |
 | Allocation conflicts at addr? | addr_conflict_report.py | Overlapping VReg intervals at same address. |
 | Compare passing vs failing kernel | diff_kernels.py | Instruction-level diff between two kernel JSONs. |
 | Broadcast overwrite analysis | check_broadcast_overwrites.py | vbroadcast/vector overwrites; see BUGS.md. |

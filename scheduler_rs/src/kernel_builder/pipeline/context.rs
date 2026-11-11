@@ -85,6 +85,10 @@ pub struct SchedulingMetrics {
     pub peak_live: usize,
     /// Whether the scratch budget was exceeded.
     pub budget_exceeded: bool,
+    /// Scratch budget the scheduler was given, in words (0 if no scheduler has run).
+    pub budget: usize,
+    /// Number of cycles in which the greedy scheduler force-scheduled past the budget.
+    pub over_budget_cycles: usize,
 }
 
 // ============================================================================
@@ -247,6 +251,10 @@ pub struct PipelineConfig {
     pub scratch_budget: usize,
     /// Whether to print verbose output.
     pub verbose: bool,
+    /// Whether the greedy scheduler prints its detailed diagnostics (liveness breakdown when
+    /// it goes over budget, ASAP inflation stats). Separate from `verbose`, which also turns
+    /// on per-pass pipeline logging. The one-line over-budget summary is printed regardless.
+    pub greedy_verbose: bool,
     /// Bounds computation configuration (used by both greedy and CP-SAT).
     pub bounds: BoundsConfig,
     /// CP-SAT specific configuration (None for greedy-only pipeline).
@@ -261,6 +269,7 @@ impl Default for PipelineConfig {
             machine: MachineConfig::default(),
             scratch_budget: 1536,
             verbose: true,
+            greedy_verbose: false,
             bounds: BoundsConfig::default(),
             #[cfg(feature = "cpsat")]
             cpsat: None,

@@ -18,8 +18,15 @@ from typing import Any, Optional
 DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
 
 
-def _n_nodes(forest_height: int) -> int:
-    return (1 << forest_height) - 1
+def n_nodes_for_height(forest_height: int) -> int:
+    """Node count of the forest, matching problem.Tree.generate(height).
+
+    A tree of height h has levels 0..h, so 2**(h+1) - 1 nodes (2047 for height 10).
+    """
+    return (1 << (forest_height + 1)) - 1
+
+
+_n_nodes = n_nodes_for_height
 
 
 def _get_git_sha() -> Optional[str]:
@@ -57,7 +64,7 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--forest-height", type=int, default=10,
                        help="Tree depth (default: 10, gives 2047 nodes)")
     group.add_argument("--n-nodes", type=int, default=None,
-                       help="Number of tree nodes (default: 2^forest_height - 1)")
+                       help="Number of tree nodes (default: 2^(forest_height+1) - 1, i.e. 2047 for height 10)")
     group.add_argument("--batch-size", type=int, default=256,
                        help="Parallel traversals; must be multiple of 8 (default: 256)")
     group.add_argument("--rounds", type=int, default=16,

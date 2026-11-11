@@ -139,6 +139,7 @@ impl Pass for CpSatSchedulePass {
             cycles,
             peak_live: 0, // Will be set by address assignment
             budget_exceeded: false,
+            ..Default::default()
         };
 
         // Capture CP-SAT-specific extra results

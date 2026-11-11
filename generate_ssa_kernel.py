@@ -36,6 +36,7 @@ from kernel_build_args import (
     add_kernel_build_args,
     args_to_build_kwargs,
     build_kernel_with_args,
+    n_nodes_for_height,
 )
 
 BASELINE = 147734
@@ -81,7 +82,7 @@ def main():
     # Derive n_nodes if not set
     n_nodes_val = getattr(args, "n_nodes", None)
     if n_nodes_val is None:
-        n_nodes_val = (1 << args.forest_height) - 1
+        n_nodes_val = n_nodes_for_height(args.forest_height)
     tree_reduce_max_depth = max(2, min(4, args.tree_reduce_max_depth))
     if tree_reduce_max_depth != args.tree_reduce_max_depth and verbose:
         print(f"  tree_reduce_max_depth clamped to {tree_reduce_max_depth} (allowed 2..4)")
@@ -139,6 +140,9 @@ def main():
     print(f"  Cycles: {cycles}")
     print(f"  Speedup: {speedup:.1f}x over baseline ({BASELINE})")
     print(f"  Instructions: {len(instrs)}")
+    sim_cycles, empty_bundles = simulator_cycles(instrs)
+    print(f"  Simulator cycles: {sim_cycles} (what problem.Machine and the test harness count: "
+          f"{len(instrs)} bundles including the 2 pause bundles, minus {empty_bundles} with no ops)")
     print(f"  VRegs: {stats.get('vreg_count', 'N/A')}")
     print(f"  Peak live: {stats.get('peak_live', 'N/A')} words")
     print(f"  Budget exceeded: {stats.get('budget_exceeded', False)}")
@@ -261,6 +265,20 @@ def load_kernel_from_json(path):
             restored[engine] = [tuple(op) for op in ops]
         instrs.append(restored)
     return instrs, params
+
+
+def simulator_cycles(instrs):
+    """Cycles problem.Machine counts for a kernel, and the number of bundles it does not count.
+
+    The scheduler's `cycles` is the schedule length. The simulator executes every bundle but
+    only counts those with at least one non-debug slot, and the kernel is wrapped in two
+    `pause` bundles (which count). So simulator cycles = schedule cycles + 2 - empty bundles;
+    e.g. the 16-round greedy kernel is 2007 schedule cycles and 1994 simulator cycles.
+
+    Returns (simulator_cycles, empty_bundles).
+    """
+    counted = sum(1 for bundle in instrs if any(engine != "debug" for engine in bundle))
+    return counted, len(instrs) - counted
 
 
 def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed):

@@ -95,7 +95,7 @@ def main():
     ref_mem = ref_results[-1]
 
     BATCH_IDX = args.batch_idx
-    n_nodes = (1 << args.forest_height) - 1
+    n_nodes = len(forest.values)  # 2**(height+1) - 1, as problem.Tree.generate
 
     print(f"\nReference kernel trace for batch index {BATCH_IDX}:")
     for h in range(args.rounds):

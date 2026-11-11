@@ -146,7 +146,7 @@ So the **semantic content** is “same algorithm, different placement (VALU vs A
 
 ### Investigation results (trace scripts)
 
-**Tools used:** `debug_validation_trace.py`, `trace_group20.py` (group 0), `diff_kernels.py`, `dump_cycle_instrs.py`, `who_wrote_addr.py`, `addr_conflict_report.py` on `artifacts/kernel_2r_16b_zero_gap.json` and `artifacts/scheduler_2r_16b_zero_gap.json` with `--rounds 2 --batch-size 16`.
+**Tools used:** `debug_validation_trace.py`, `trace_group20.py` (group 0), `diff_kernels.py`, `dump_cycle_instrs.py`, `who_wrote_addr.py` (now `inspect_schedule.py addr A --cycle C`), `addr_conflict_report.py` on `artifacts/kernel_2r_16b_zero_gap.json` and `artifacts/scheduler_2r_16b_zero_gap.json` with `--rounds 2 --batch-size 16`.
 
 **Mismatches:** All 16 batch indices fail (value and/or index wrong). Affected groups: 0 and 1.
 

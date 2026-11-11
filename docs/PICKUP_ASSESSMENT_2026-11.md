@@ -37,7 +37,11 @@ loaded lanes (8 words) were never released. That is 512 phantom words per gather
 The fix adds a lane/alias release map (`liveness_release_vregs`). The regression test
 `test_vector_group_vregs_released_after_last_use` fails without it (peak 4808) and passes
 with it. The CLI and harness differ by 13 cycles; the CLI prints `n_nodes=1023` for
-`forest_height=10` where the harness passes 2047. Not yet investigated.
+`forest_height=10` where the harness passes 2047. Investigated since: `n_nodes` is stored
+but never read by emission, so it changes nothing, and both paths build the same kernel.
+The CLI prints the schedule length (2007); the simulator counts bundles that contain an op
+(2007 schedule cycles + 2 pause bundles - 15 empty bundles, one per round barrier = 1994).
+The CLI now derives 2047 and prints both figures.
 
 ### 1.2 Whole-program CP-SAT on 16 rounds
 
