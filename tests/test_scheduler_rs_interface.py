@@ -198,6 +198,30 @@ def test_scheduling_pressure_policy_greedy():
     _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
 
 
+def test_greedy_barriers_none():
+    """PyO3: greedy_barriers='none' is accepted, produces correct output, and bad values are rejected."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        verbose=False,
+        use_cpsat=False,
+        greedy_barriers="none",
+    )
+    assert not stats.get("budget_exceeded", False)
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+    with pytest.raises(ValueError, match="greedy_barriers"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+            verbose=False,
+            use_cpsat=False,
+            greedy_barriers="sometimes",
+        )
+
+
 def test_depth3_validates():
     """Depth 3 tree-reduce: kernel with tree_reduce_max_depth=3 must match reference.
 
