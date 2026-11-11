@@ -141,14 +141,16 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
 /// an op that reads the alias of an assembled vector (write group) is a reader of each lane.
 /// A SelectChoice also reads its `delta_vreg`, and an op is a reader of every VReg in its
 /// `keep_live` list (a liveness-only use; it is timed like the op's operand reads, which is
-/// never earlier than the op's cycle). Ops with a negative hint cycle are dead stores and are
-/// skipped.
+/// never earlier than the op's cycle).
+///
+/// Every op counts, including ones the greedy marked as dead stores (negative hint cycle):
+/// the solver still gives them a cycle and they read their operands then. With DCE enabled
+/// (the default) there are none.
 ///
 /// # Arguments
 /// * `ops` - SSA ops
 /// * `vreg_def_op` - Defining op index per VReg
 /// * `vector_group_lanes` - Group key/alias → lanes (None = no groups)
-/// * `greedy_hints` - Hint cycles, used only to skip dead stores
 ///
 /// # Returns
 /// Defined VReg → reader op indices (sorted, deduplicated). VRegs without readers are absent.
@@ -157,7 +159,6 @@ pub(crate) fn scratch_readers_by_vreg(
     ops: &[SsaOp],
     vreg_def_op: &HashMap<VReg, usize>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
-    greedy_hints: Option<&[i32]>,
 ) -> HashMap<VReg, Vec<usize>> {
     let mut lane_to_group: HashMap<VReg, VReg> = HashMap::new();
     let mut alias_to_lanes: HashMap<VReg, &Vec<VReg>> = HashMap::new();
@@ -179,9 +180,6 @@ pub(crate) fn scratch_readers_by_vreg(
         }
     };
     for (idx, op) in ops.iter().enumerate() {
-        if greedy_hints.is_some_and(|h| h.get(idx).copied().unwrap_or(0) < 0) {
-            continue;
-        }
         // `keep_live` entries are liveness-only uses: the value must stay allocated until this
         // op runs even though it is not an operand (see `SsaOp::keep_live`).
         let held = op.keep_live.iter().flatten().copied();
@@ -1985,10 +1983,11 @@ pub fn schedule_ssa_cpsat(
         // reader that is last in the greedy hint need not be last in the solution, and values
         // read only through a vector-group alias have no direct reader at all.
         let scratch_readers =
-            scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes, greedy_hints);
+            scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes);
         // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
         let hinted_read_end = |idx: usize| -> Option<i32> {
-            let cycle = greedy_hints?.get(idx).copied()?;
+            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
             let fma = ops[idx].opcode == Opcode::SelectChoice
                 && match select_choice_mode {
                     SelectChoiceMode::ForceFma => true,

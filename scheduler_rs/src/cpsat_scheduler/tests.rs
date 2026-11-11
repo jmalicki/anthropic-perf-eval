@@ -2221,7 +2221,7 @@ mod ssa_tests {
         let groups = emit.take_vector_group_lanes();
         let vreg_def_op: HashMap<VReg, usize> =
             emit.ops.iter().enumerate().filter_map(|(i, op)| op.dest.map(|d| (d, i))).collect();
-        let readers = scratch_readers_by_vreg(&emit.ops, &vreg_def_op, Some(&groups), None);
+        let readers = scratch_readers_by_vreg(&emit.ops, &vreg_def_op, Some(&groups));
         let user_idx = vreg_def_op[&user];
 
         // keep_live: `held` has no operand reader at all, only the liveness-only use.
