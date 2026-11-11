@@ -23,7 +23,7 @@ jobs:
   # scheduler_rs unit tests (debug profile, --features cpsat).
   rust:
     name: Rust tests (scheduler_rs)
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +55,7 @@ jobs:
   # Release build of the extension, then everything that imports it.
   python:
     name: Python tests, proofs, kernel builds
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
