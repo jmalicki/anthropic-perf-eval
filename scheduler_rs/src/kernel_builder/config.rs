@@ -225,6 +225,11 @@ pub struct ProblemSpec {
     /// Source of the older branch bits for `CachedSelect::Bits` / `BitsFlow` / `Mobius`. Default
     /// `SelectBitSource::Index`. Ignored for `CachedSelect::Standard`.
     pub select_bit_source: SelectBitSource,
+    /// With `tree_reduce_max_depth = 4`: select among the 16 cached level-4 nodes only on
+    /// visits after the first wrap (round 15 of 16), and gather level 4 on the first pass
+    /// (round 4). Selecting costs 15 selects per group and saves 8 loads per group; after
+    /// the wrap the loads are what binds. Default false (select on every visit).
+    pub depth4_select_after_wrap_only: bool,
 }
 
 impl Default for ProblemSpec {
@@ -251,6 +256,7 @@ impl Default for ProblemSpec {
             values_only: false,
             cached_select: CachedSelect::Standard,
             select_bit_source: SelectBitSource::Index,
+            depth4_select_after_wrap_only: false,
         }
     }
 }
@@ -289,6 +295,22 @@ impl ProblemSpec {
     /// True if tree-reduce selection should be used at the given tree depth.
     pub fn use_tree_reduce_at_depth(&self, depth: usize) -> bool {
         depth <= self.tree_reduce_max_depth.min(MAX_TREE_REDUCE_DEPTH) as usize
+    }
+
+    /// True if round `rnd`, which visits `tree_depth`, selects its nodes among cached
+    /// values instead of gathering them.
+    ///
+    /// # Arguments
+    /// * `rnd` - Round number (0-based).
+    /// * `tree_depth` - Depth the indices are at in that round.
+    ///
+    /// # Returns
+    /// `use_tree_reduce_at_depth(tree_depth)`, except that depth 4 is gathered before the
+    /// first wrap when `depth4_select_after_wrap_only` is set.
+    pub fn selects_cached_level(&self, rnd: usize, tree_depth: usize) -> bool {
+        let first_pass = rnd < self.tree_height();
+        self.use_tree_reduce_at_depth(tree_depth)
+            && !(tree_depth == 4 && self.depth4_select_after_wrap_only && first_pass)
     }
 }
 
@@ -507,6 +529,29 @@ mod tests {
         assert_eq!(CachedSelect::from_str("mobius"), Ok(CachedSelect::Mobius));
         assert!(CachedSelect::from_str("flow").is_err());
         assert_eq!(CachedSelect::default(), CachedSelect::Standard);
+    }
+
+    #[test]
+    fn test_selects_cached_level() {
+        let spec = |max_depth, after_wrap_only| ProblemSpec {
+            tree_reduce_max_depth: max_depth,
+            depth4_select_after_wrap_only: after_wrap_only,
+            ..Default::default()
+        };
+        // Default: levels 0 to 3 are cached on every visit, level 4 never.
+        for rnd in [3, 14] {
+            assert!(spec(3, false).selects_cached_level(rnd, 3));
+        }
+        assert!(!spec(3, false).selects_cached_level(4, 4));
+        assert!(!spec(3, true).selects_cached_level(15, 4));
+        // Depth 4 cached: every visit, or only after the first wrap (round 11 for height 10).
+        assert!(spec(4, false).selects_cached_level(4, 4));
+        assert!(spec(4, false).selects_cached_level(15, 4));
+        assert!(!spec(4, true).selects_cached_level(4, 4));
+        assert!(spec(4, true).selects_cached_level(15, 4));
+        // The option only concerns depth 4.
+        assert!(spec(4, true).selects_cached_level(3, 3));
+        assert!(!spec(4, true).selects_cached_level(5, 5));
     }
 
     #[test]

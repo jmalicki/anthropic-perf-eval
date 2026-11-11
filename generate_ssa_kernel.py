@@ -212,6 +212,7 @@ EMISSION_DEFAULTS = {
     "values_only": False,
     "cached_select": "standard",
     "select_bit_source": "index",
+    "depth4_select_rounds": "all",
 }
 
 

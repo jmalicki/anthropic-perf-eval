@@ -629,7 +629,7 @@ impl SsaTickTockKernelBuilder {
 
     pub(super) fn emit_round(
         &mut self,
-        _rnd: usize,
+        rnd: usize,
         tree_depth: usize,
         n_groups: usize,
         n_iters: usize,
@@ -637,19 +637,15 @@ impl SsaTickTockKernelBuilder {
     ) {
         // Tree access based on depth
         self.emit.set_phase(EmissionPhase::TreeAccess);
-        let select_from_bits = self.config.spec.cached_select != CachedSelect::Standard
-            && self.config.use_tree_reduce_at_depth(tree_depth);
+        let cached = self.config.spec.selects_cached_level(rnd, tree_depth);
+        let select_from_bits = cached && self.config.spec.cached_select != CachedSelect::Standard;
         match tree_depth {
             _ if select_from_bits => self.emit_cached_level_select(tree_depth, n_iters, n_groups),
             0 => self.emit_depth0_access(n_iters, n_groups),
             1 => self.emit_depth1_access(n_iters, n_groups),
             2 => self.emit_depth2_access(n_iters, n_groups),
-            3 if self.config.use_tree_reduce_at_depth(3) => {
-                self.emit_depth3_access(n_iters, n_groups)
-            }
-            4 if self.config.use_tree_reduce_at_depth(4) => {
-                self.emit_depth4_access(n_iters, n_groups)
-            }
+            3 if cached => self.emit_depth3_access(n_iters, n_groups),
+            4 if cached => self.emit_depth4_access(n_iters, n_groups),
             _ => self.emit_scattered_access(n_iters, n_groups, tree_depth),
         }
 
@@ -892,8 +888,10 @@ impl SsaTickTockKernelBuilder {
         self.ctx.cached_tables = vec![None; max_depth + 1];
 
         for depth in 0..=max_depth {
-            let visited = (0..rounds).any(|r| r % tree_height == depth);
-            if !visited || !self.config.use_tree_reduce_at_depth(depth) {
+            let selected = (0..rounds).any(|r| {
+                r % tree_height == depth && self.config.spec.selects_cached_level(r, depth)
+            });
+            if !selected {
                 continue;
             }
             // U[m] = tree[L_d - n] ^ C, where n (the position in the level from the right)

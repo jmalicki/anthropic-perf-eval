@@ -1073,8 +1073,10 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// "bits-flow" (leaf selects are SelectChoices too) or "mobius" (2^d - 1 multiply_adds, no flow).
 /// select_bit_source: "index" (default; older bits extracted from the index, no bit vectors
 /// live across rounds) or "path" (all bits kept live, no extraction ops, more scratch).
+/// depth4_select_rounds: with tree_reduce_max_depth=4, "all" (default) selects level 4 on
+/// every visit; "after-wrap" gathers it on the first pass and selects only after the wrap.
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index"))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all"))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1123,7 +1125,18 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     values_only: bool,
     cached_select: &str,
     select_bit_source: &str,
+    depth4_select_rounds: &str,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+    let depth4_select_after_wrap_only = match depth4_select_rounds {
+        "all" => false,
+        "after-wrap" => true,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid depth4_select_rounds '{}': must be 'all' or 'after-wrap'",
+                other
+            )));
+        }
+    };
     let select_bit_source =
         crate::kernel_builder::config::SelectBitSource::from_str(select_bit_source)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1184,6 +1197,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             values_only,
             cached_select,
             select_bit_source,
+            depth4_select_after_wrap_only,
         },
         compiler: CompilerConfig {
             enable_valu_shift,

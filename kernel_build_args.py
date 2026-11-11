@@ -155,6 +155,11 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "depth 4, none below; one more for a zero-based index). path keeps every bit live "
                             "until the select: no ops, but 8 scratch words per group and earlier round, which "
                             "can exceed the scratch budget (proof: R15-bits-from-index)")
+    group.add_argument("--depth4-select-rounds", choices=["all", "after-wrap"], default="all",
+                       help="With --tree-reduce-max-depth 4: which visits of tree level 4 select among the 16 "
+                            "cached nodes instead of gathering. all (default): every visit (rounds 4 and 15 of "
+                            "16). after-wrap: only visits after the first wrap (round 15); round 4 gathers. "
+                            "Selecting costs 15 selects per group and saves 8 loads per group")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -302,6 +307,7 @@ def args_to_build_kwargs(
         "values_only": get("values_only", False),
         "cached_select": get("cached_select", "standard"),
         "select_bit_source": get("select_bit_source", "index"),
+        "depth4_select_rounds": get("depth4_select_rounds", "all"),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -352,6 +358,7 @@ def args_to_build_kwargs(
         "values_only": get("values_only", False),
         "cached_select": get("cached_select", "standard"),
         "select_bit_source": get("select_bit_source", "index"),
+        "depth4_select_rounds": get("depth4_select_rounds", "all"),
     }
 
 
