@@ -67,6 +67,19 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _slack_or_none(text: str):
+    """argparse type: a non-negative integer, or 'none' to switch the cap off."""
+    if text.strip().lower() in ("none", "off"):
+        return "none"
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer or 'none', got {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more (or 'none'), got {text!r}")
+    return value
+
+
 def _name_list(text: str) -> list:
     """argparse type: comma-separated names, e.g. subsolver names. Blank entries are dropped."""
     return [name.strip() for name in text.split(",") if name.strip()]
@@ -75,6 +88,7 @@ def _name_list(text: str) -> list:
 # CP-SAT tuning switches for the full-kernel solve: (argparse dest / override name, CpsatTuning key).
 # An option left at None is not sent, so the Rust default applies; scheduler_rs.resolve_cpsat_tuning
 # fills in the defaults for run_options. Defaults live in one place (CpsatTuning::default in Rust).
+# The string "none" is sent as JSON null (an option that is switched off rather than left unset).
 CPSAT_TUNING_OPTIONS = [
     ("cpsat_workers", "workers"),
     ("cpsat_interleave", "interleave_search"),
@@ -82,6 +96,9 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_extra_subsolvers", "extra_subsolvers"),
     ("cpsat_ignore_subsolvers", "ignore_subsolvers"),
     ("cpsat_objective", "objective"),
+    ("cpsat_greedy_alap_slack", "greedy_alap_slack"),
+    ("cpsat_horizon_max_latency", "horizon_at_least_max_latency_path"),
+    ("cpsat_horizon_num_ops", "horizon_at_least_num_ops"),
 ]
 
 
@@ -126,6 +143,18 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="CP-SAT objective (default: makespan+tiebreak = scale*makespan + sum of op "
                             "completion cycles). 'makespan' drops the tie-breaker: the solve stops once the "
                             "makespan is proved, and the schedule returned is not left-packed.")
+    group.add_argument("--cpsat-greedy-alap-slack", type=_slack_or_none, default=None, metavar="K|none",
+                       help="Cap each op's latest cycle at its greedy cycle + K (default: 15). The cap confines "
+                            "the search to a neighbourhood of the greedy schedule; 'none' removes it.")
+    group.add_argument("--cpsat-horizon-max-latency", action=argparse.BooleanOptionalAction, default=None,
+                       help="Raise the horizon (greedy makespan + 20) to the max-latency critical path, i.e. "
+                            "every shiftable op at its worst-case latency (default: on). "
+                            "--no-cpsat-horizon-max-latency drops the guard; it relies on the greedy schedule "
+                            "being feasible.")
+    group.add_argument("--cpsat-horizon-num-ops", action=argparse.BooleanOptionalAction, default=None,
+                       help="Raise the horizon (greedy makespan + 20) to the number of ops (default: on). "
+                            "--no-cpsat-horizon-num-ops keeps the tight horizon; it relies on the greedy "
+                            "schedule being feasible.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
@@ -272,7 +301,11 @@ def args_to_build_kwargs(
                 optional_constraint_groups_to_disable.append(scheduler_rs.OptionalConstraintGroup.from_str(t))
 
     # CP-SAT tuning: send only what was set; record the effective values (defaults filled in by Rust).
-    cpsat_tuning = {key: get(dest) for dest, key in CPSAT_TUNING_OPTIONS if get(dest) is not None}
+    cpsat_tuning = {
+        key: (None if get(dest) == "none" else get(dest))
+        for dest, key in CPSAT_TUNING_OPTIONS
+        if get(dest) is not None
+    }
     cpsat_tuning_json = json.dumps(cpsat_tuning) if cpsat_tuning else None
     cpsat_tuning_effective = json.loads(scheduler_rs.resolve_cpsat_tuning(cpsat_tuning_json))
 

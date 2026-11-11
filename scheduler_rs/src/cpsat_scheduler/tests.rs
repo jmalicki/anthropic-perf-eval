@@ -6196,3 +6196,70 @@ mod tuning_objective_tests {
         assert!(CpsatTuning::from_json(Some(r#"{"objective": "sum"}"#)).is_err());
     }
 }
+
+// ============================================================================
+// CP-SAT tuning: greedy ALAP cap and horizon
+// ============================================================================
+
+#[cfg(test)]
+mod tuning_alap_tests {
+    use super::*;
+
+    #[test]
+    fn test_greedy_alap_slack_json() {
+        let default = CpsatTuning::default();
+        assert_eq!(default.greedy_alap_slack, Some(15));
+        assert!(default.horizon_at_least_num_ops);
+        assert!(default.horizon_at_least_max_latency_path);
+        // null switches the cap off; a missing key keeps the default.
+        let off = CpsatTuning::from_json(Some(r#"{"greedy_alap_slack": null}"#)).unwrap();
+        assert_eq!(off.greedy_alap_slack, None);
+        let wide = CpsatTuning::from_json(Some(r#"{"greedy_alap_slack": 50, "horizon_at_least_num_ops": false}"#))
+            .unwrap();
+        assert_eq!(wide.greedy_alap_slack, Some(50));
+        assert!(!wide.horizon_at_least_num_ops);
+        assert_eq!(CpsatTuning::from_json(Some(&off.to_json())).unwrap(), off);
+        assert!(CpsatTuning::from_json(Some(r#"{"greedy_alap_slack": -1}"#))
+            .unwrap_err()
+            .contains("greedy_alap_slack"));
+    }
+
+    /// A chain a -> b on one vector slot with a greedy schedule [0, 1]. The solver may place
+    /// b anywhere up to its ALAP; with slack 0 that is its greedy cycle, so the schedule
+    /// cannot differ from the greedy one, whatever the horizon.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_zero_slack_pins_ops_at_or_before_their_greedy_cycle() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+        use crate::types::Opcode;
+
+        let mut emit = SsaEmitContext::new();
+        let c0 = emit.emit_const(0);
+        let v0 = emit.emit_vbroadcast(c0);
+        let a = emit.emit_valu(Opcode::Add, v0, v0);
+        let _b = emit.emit_valu(Opcode::Xor, a, v0);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let greedy: Vec<i32> = (0..emit.ops.len() as i32).collect();
+
+        for slack in [Some(0), Some(15), None] {
+            let config = SsaCpsatConfig {
+                time_limit_secs: 20.0,
+                verbose: false,
+                asap_alap_tightening: AsapAlapTightening::None,
+                tuning: CpsatTuning { greedy_alap_slack: slack, ..Default::default() },
+                ..Default::default()
+            };
+            let hints = SsaCpsatHints { greedy_hints: Some(&greedy), ..Default::default() };
+            let result = schedule_ssa_cpsat(&emit.ops, config, hints, Some(true))
+                .expect("post-solve validation")
+                .expect("a schedule");
+            assert_eq!(result.makespan, emit.ops.len(), "a chain has one schedule of minimum length");
+            if slack == Some(0) {
+                for (idx, &cycle) in result.cycle_assignments.iter().enumerate() {
+                    assert!(cycle <= greedy[idx], "op {} at {} is after its greedy cycle {}", idx, cycle, greedy[idx]);
+                }
+            }
+        }
+    }
+}

@@ -193,6 +193,23 @@ pub struct CpsatTuning {
     pub ignore_subsolvers: Vec<String>,
     /// Objective: makespan with the sum-of-cycles tie-breaker (default) or makespan alone.
     pub objective: CpsatObjective,
+    /// Cap every op's ALAP at `greedy cycle + slack` (default `Some(15)`). The cap is a search
+    /// restriction, not a valid bound: a schedule that runs some op more than `slack` cycles
+    /// later than the greedy did is outside the model. `None` (JSON `null`) removes the cap;
+    /// ALAP then comes from the horizon alone.
+    pub greedy_alap_slack: Option<i32>,
+    /// With a greedy schedule the horizon is also raised to the max-latency critical path
+    /// (every shiftable op taking its worst-case latency) when this is true (default). That
+    /// path is several times the makespan (183 against 43 at 2 rounds / batch 16). ALAP is
+    /// computed with minimum latencies, so a feasible greedy schedule already fits below
+    /// `greedy makespan + 20`; false drops the guard.
+    pub horizon_at_least_max_latency_path: bool,
+    /// With a greedy schedule the horizon is `greedy makespan + 20`, raised to the number of
+    /// ops when this is true (default). The op count is far above any makespan (12,356 against
+    /// about 2,000 at 16 rounds) and only widens the domains of auxiliary variables and of
+    /// ALAP when the greedy cap is off. False drops it; the horizon then relies on the greedy
+    /// schedule being feasible.
+    pub horizon_at_least_num_ops: bool,
 }
 
 impl Default for CpsatTuning {
@@ -204,6 +221,9 @@ impl Default for CpsatTuning {
             extra_subsolvers: Vec::new(),
             ignore_subsolvers: Vec::new(),
             objective: CpsatObjective::default(),
+            greedy_alap_slack: Some(15),
+            horizon_at_least_max_latency_path: true,
+            horizon_at_least_num_ops: true,
         }
     }
 }
@@ -241,6 +261,9 @@ impl CpsatTuning {
     pub fn validate(&self) -> Result<(), String> {
         if self.workers < 1 {
             return Err(format!("cpsat tuning: workers must be at least 1, got {}", self.workers));
+        }
+        if let Some(slack) = self.greedy_alap_slack.filter(|s| *s < 0) {
+            return Err(format!("cpsat tuning: greedy_alap_slack must be 0 or more (or null), got {}", slack));
         }
         for (field, names) in [
             ("subsolvers", &self.subsolvers),

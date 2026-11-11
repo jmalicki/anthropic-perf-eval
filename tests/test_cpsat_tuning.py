@@ -200,3 +200,85 @@ def test_explicit_default_objective_is_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", [])
     _, same, _, _ = _run(tmp_path, "explicit", ["--cpsat-objective", "makespan+tiebreak"])
     assert not _model_diff(base, same)
+
+
+def _hints(model):
+    return dict(zip(model.solution_hint.vars, model.solution_hint.values))
+
+
+def _cycle_slack(model):
+    """Upper bound minus greedy hint for every op cycle variable (c0, c1, ...)."""
+    hints = _hints(model)
+    return [ub - hints[i] for name, (i, _, ub) in _variables(model).items()
+            if re.fullmatch(r"c\d+", name) and i in hints]
+
+
+# ----------------------------------------------------------------------------
+# Greedy ALAP cap and horizon
+# ----------------------------------------------------------------------------
+
+def test_default_alap_cap_is_greedy_plus_15(tmp_path):
+    _, model_path, _, _ = _run(tmp_path, "base", [])
+    slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
+    assert slack and max(slack) == 15
+
+
+def test_alap_slack_reaches_the_model(tmp_path):
+    _, model_path, sched, _ = _run(tmp_path, "slack5", ["--cpsat-greedy-alap-slack", "5"])
+    slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
+    assert slack and max(slack) == 5
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["greedy_alap_slack"] == 5
+
+
+def test_alap_cap_can_be_switched_off(tmp_path):
+    _, model_path, sched, _ = _run(tmp_path, "nocap", ["--cpsat-greedy-alap-slack", "none"])
+    slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
+    assert max(slack) > 15, "without the cap ALAP comes from the horizon"
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["greedy_alap_slack"] is None
+
+
+def test_horizon_guards_can_be_dropped(tmp_path):
+    """The horizon is max(greedy makespan + 20, max-latency critical path, number of ops)."""
+    def horizon(tag, extra):
+        _, path, sched, _ = _run(tmp_path, tag, extra)
+        model = diff_cpsat_models.load(str(path))
+        index, _, upper = _variables(model)["makespan"]
+        with open(sched) as f:
+            recorded = json.load(f)["run_options"]["cpsat_tuning"]
+        return upper, _hints(model)[index], model, recorded
+
+    base, greedy_makespan, model, _ = horizon("base", [])
+    n_ops = sum(1 for name in _variables(model) if re.fullmatch(r"c\d+", name))
+    no_ops, _, _, recorded = horizon("no_ops", ["--no-cpsat-horizon-num-ops"])
+    assert recorded["horizon_at_least_num_ops"] is False and recorded["horizon_at_least_max_latency_path"] is True
+    no_latency, _, _, recorded = horizon("no_latency", ["--no-cpsat-horizon-max-latency"])
+    assert recorded["horizon_at_least_max_latency_path"] is False
+    tight, _, _, _ = horizon("tight", ["--no-cpsat-horizon-num-ops", "--no-cpsat-horizon-max-latency"])
+
+    assert base >= n_ops and base > greedy_makespan + 20, "by default one of the guards sets the horizon"
+    assert no_latency == max(greedy_makespan + 20, n_ops)
+    assert no_ops == base, "at this size the max-latency path is the larger guard"
+    assert tight == greedy_makespan + 20
+
+
+def test_explicit_default_slack_and_horizon_are_the_default_model(tmp_path):
+    _, base, _, _ = _run(tmp_path, "base", [])
+    _, same, _, _ = _run(tmp_path, "explicit", ["--cpsat-greedy-alap-slack", "15", "--cpsat-horizon-num-ops",
+                                                "--cpsat-horizon-max-latency"])
+    assert not _model_diff(base, same)
+
+
+@pytest.mark.parametrize("argv", [["--cpsat-greedy-alap-slack", "-1"], ["--cpsat-greedy-alap-slack", "wide"]])
+def test_cli_rejects_bad_slack(argv):
+    with pytest.raises(SystemExit):
+        _parse(argv)
+
+
+def test_slack_none_is_sent_as_null():
+    kwargs = kernel_build_args.args_to_build_kwargs(_parse(["--cpsat-greedy-alap-slack", "none"]), use_git_sha=False)
+    assert json.loads(kwargs["cpsat_tuning_json"]) == {"greedy_alap_slack": None}
+    assert json.loads(kwargs["run_options_json"])["cpsat_tuning"]["greedy_alap_slack"] is None
+    with pytest.raises(ValueError, match="greedy_alap_slack"):
+        scheduler_rs.resolve_cpsat_tuning('{"greedy_alap_slack": -3}')
