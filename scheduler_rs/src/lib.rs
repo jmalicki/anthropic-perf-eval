@@ -63,11 +63,9 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         let val = python::OptionalConstraintGroupPy { inner };
         cls.setattr(name, Py::new(py, val)?)
     };
-    set_attr("redundant_linear_bounds", OptionalConstraintGroup::RedundantLinearBounds)?;
-    set_attr("capacity_valu", OptionalConstraintGroup::CapacityValu)?;
-    set_attr("capacity_alu", OptionalConstraintGroup::CapacityAlu)?;
-    set_attr("capacity_flow", OptionalConstraintGroup::CapacityFlow)?;
-    set_attr("capacity_load", OptionalConstraintGroup::CapacityLoad)?;
+    for group in OptionalConstraintGroup::ALL {
+        set_attr(&group.to_string(), group)?;
+    }
     m.add_function(wrap_pyfunction!(python::run_bulk_move_simulator_from_json, m)?)?;
     Ok(())
 }

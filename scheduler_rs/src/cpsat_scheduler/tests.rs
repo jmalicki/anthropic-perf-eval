@@ -6399,3 +6399,62 @@ mod tuning_cumulative_propagator_tests {
         assert_eq!(tuned.makespan, base.makespan);
     }
 }
+
+// ============================================================================
+// Optional constraint groups: conditional makespan rows, Flow cumulative
+// ============================================================================
+
+#[cfg(test)]
+mod redundant_row_group_tests {
+    use super::*;
+
+    #[test]
+    fn test_every_group_name_round_trips() {
+        for group in OptionalConstraintGroup::ALL {
+            assert_eq!(group.to_string().parse::<OptionalConstraintGroup>(), Ok(group));
+        }
+        assert_eq!(
+            "conditional_makespan".parse::<OptionalConstraintGroup>(),
+            Ok(OptionalConstraintGroup::ConditionalMakespan)
+        );
+        assert_eq!("flow_cumulative".parse::<OptionalConstraintGroup>(), Ok(OptionalConstraintGroup::FlowCumulative));
+        let err = "makespan_rows".parse::<OptionalConstraintGroup>().unwrap_err();
+        assert!(err.contains("conditional_makespan") && err.contains("flow_cumulative"), "{}", err);
+    }
+
+    /// Both groups are implied by constraints that stay in the model, so leaving them out
+    /// must not change the proved optimum (selects here use the Flow slot or two vector slots).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_dropping_redundant_rows_keeps_the_optimal_makespan() {
+        use super::tuning_objective_tests::toy_ops;
+
+        let ops = toy_ops();
+        let solve = |disabled: &[OptionalConstraintGroup]| {
+            let config = SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: false,
+                enable_valu_shift: true,
+                machine: MachineConfig { valu_slots: 2, ..Default::default() },
+                asap_alap_tightening: AsapAlapTightening::None,
+                force_zero_gap: true,
+                disable_optional_constraint_groups: disabled.iter().copied().collect(),
+                ..Default::default()
+            };
+            schedule_ssa_cpsat(&ops, config, SsaCpsatHints::default(), None)
+                .expect("post-solve validation (includes per-cycle slot limits)")
+                .expect("a schedule")
+        };
+        let base = solve(&[]);
+        assert_eq!(base.status, CpsatStatus::Optimal);
+        for disabled in [
+            vec![OptionalConstraintGroup::ConditionalMakespan],
+            vec![OptionalConstraintGroup::FlowCumulative],
+            vec![OptionalConstraintGroup::ConditionalMakespan, OptionalConstraintGroup::FlowCumulative],
+        ] {
+            let result = solve(&disabled);
+            assert_eq!(result.status, CpsatStatus::Optimal, "{:?}", disabled);
+            assert_eq!(result.makespan, base.makespan, "{:?}", disabled);
+        }
+    }
+}

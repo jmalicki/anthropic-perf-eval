@@ -52,7 +52,7 @@ uv run python scripts/bisect.py --sweep-constraints all
 uv run python scripts/bisect.py --sweep-constraints capacity_valu capacity_alu "capacity_valu,capacity_alu"
 ```
 
-Valid constraint group names: `redundant_linear_bounds`, `capacity_valu`, `capacity_alu`, `capacity_flow`, `capacity_load` (from `generate_ssa_kernel.py --help` or `scheduler_rs.optional_constraint_group_names()`).
+Valid constraint group names: `redundant_linear_bounds`, `capacity_valu`, `capacity_alu`, `capacity_flow`, `capacity_load`, `conditional_makespan`, `flow_cumulative` (from `generate_ssa_kernel.py --help` or `scheduler_rs.optional_constraint_group_names()`).
 
 ### Sweep size (smallest config that fails?)
 
