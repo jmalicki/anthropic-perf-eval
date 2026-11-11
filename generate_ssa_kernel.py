@@ -122,6 +122,9 @@ def main():
         print(f"  scheduling_pressure_policy={args.scheduling_pressure_policy}")
     if getattr(args, "greedy_barriers", "round") != "round":
         print(f"  greedy_barriers={args.greedy_barriers}")
+    if getattr(args, "greedy_priority", "fifo") != "fifo":
+        print(f"  greedy_priority={args.greedy_priority} (stagger_cycles={args.greedy_stagger_cycles}, "
+              f"groups_in_flight={args.greedy_groups_in_flight})")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

@@ -16,6 +16,9 @@ import sys
 from typing import Any, Optional
 
 DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
+# Mirrors of DEFAULT_GREEDY_* in scheduler_rs/src/kernel_builder/config.rs.
+DEFAULT_GREEDY_STAGGER_CYCLES = 12
+DEFAULT_GREEDY_GROUPS_IN_FLIGHT = 16
 
 
 def n_nodes_for_height(forest_height: int) -> int:
@@ -53,6 +56,17 @@ def _positive_finite_float(text: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
     if not (math.isfinite(value) and value > 0):
         raise argparse.ArgumentTypeError(f"must be a positive finite number, got {text!r}")
+    return value
+
+
+def _non_negative_int(text: str) -> int:
+    """argparse type: an integer greater than or equal to zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be zero or more, got {text!r}")
     return value
 
 
@@ -124,6 +138,18 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Round barriers in the greedy scheduler: 'round' (default) runs rounds strictly one "
                             "after another; 'none' drops the barriers so the ready queue may mix rounds (the "
                             "kernel is then one section for the per-section budget check)")
+    group.add_argument("--greedy-priority", choices=["fifo", "wavefront"], default="fifo",
+                       help="Greedy ready-queue order: 'fifo' (default) or 'wavefront', which staggers the "
+                            "independent group chains so some gather while others hash or select. Use with "
+                            "--greedy-barriers none")
+    group.add_argument("--greedy-stagger-cycles", type=_non_negative_int, default=DEFAULT_GREEDY_STAGGER_CYCLES,
+                       metavar="CYCLES",
+                       help="Wavefront: virtual start delay between consecutive group chains in cycles "
+                            f"(default: {DEFAULT_GREEDY_STAGGER_CYCLES}; 0 = all chains abreast)")
+    group.add_argument("--greedy-groups-in-flight", type=_non_negative_int,
+                       default=DEFAULT_GREEDY_GROUPS_IN_FLIGHT, metavar="N",
+                       help="Wavefront: group chains allowed to run at once, which bounds scratch use "
+                            f"(default: {DEFAULT_GREEDY_GROUPS_IN_FLIGHT}; 0 = no limit)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -266,6 +292,9 @@ def args_to_build_kwargs(
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "greedy_barriers": get("greedy_barriers", "round"),
+        "greedy_priority": get("greedy_priority", "fifo"),
+        "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
+        "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -311,6 +340,9 @@ def args_to_build_kwargs(
         "enable_valu_shift_hint_pass": get("hint_passes", False) or get("enable_valu_shift_hint_pass", False),
         "enable_schedule_with_fixed_choices": get("enable_schedule_with_fixed_choices", False),
         "greedy_barriers": get("greedy_barriers", "round"),
+        "greedy_priority": get("greedy_priority", "fifo"),
+        "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
+        "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
     }
 
 

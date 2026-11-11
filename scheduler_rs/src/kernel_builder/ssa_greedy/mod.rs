@@ -29,6 +29,7 @@
 //! checking for negative cycle hints (-1) from the greedy scheduler.
 
 pub mod pressure_policy;
+pub mod wavefront;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -41,7 +42,23 @@ use crate::types::{
 use crate::address_assign::{compute_live_intervals, compute_peak_liveness, AddressAssignConfig};
 
 use self::pressure_policy::{GreedyPolicy, PressurePolicy};
+pub use self::wavefront::GreedyPriority;
+use self::wavefront::Wavefront;
 use super::ssa_lower::can_ssa_valu_shift_to_alu;
+
+// ============================================================================
+// GreedyShape: switches that change the shape of the greedy schedule
+// ============================================================================
+
+/// Options that change the shape of the schedule the greedy scheduler produces.
+///
+/// The default is the historical behaviour; every field is an ablation switch
+/// (docs/GREEDY_SHAPE_ABLATION.md).
+#[derive(Debug, Clone, Default)]
+pub struct GreedyShape {
+    /// Order in which ready ops are tried each cycle.
+    pub priority: GreedyPriority,
+}
 
 // ============================================================================
 // GreedyBoundsUsage: explicit control over how ASAP/ALAP bounds affect scheduling
@@ -1112,7 +1129,7 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
     // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
     diagnostics: &mut GreedyDiagnostics,
 ) -> Result<(usize, bool, usize), String> {
-    schedule_ssa_greedy_with_liveness_agreement(
+    schedule_ssa_greedy_shaped(
         ops,
         enable_valu_shift,
         shifted_ops,
@@ -1132,8 +1149,68 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
         fixed_shifted_ops,
         fixed_select_choice_encoding,
         diagnostics,
+        &GreedyShape::default(),
     )
     .map(|(result, _agreement)| result)
+}
+
+/// Same as [`schedule_ssa_greedy_with_diagnostics`] with explicit schedule-shape options,
+/// and also returns the liveness agreement (see
+/// [`schedule_ssa_greedy_with_liveness_agreement`]).
+///
+/// # Arguments
+/// * `shape` - Schedule-shape switches; `GreedyShape::default()` is the historical behaviour
+///
+/// # Returns
+/// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
+/// [`schedule_ssa_greedy_with_liveness_agreement`].
+pub(crate) fn schedule_ssa_greedy_shaped(
+    ops: &mut [SsaOp],
+    enable_valu_shift: bool,
+    shifted_ops: &mut HashSet<usize>,
+    scratch_budget: usize,
+    select_choice_fma_ops: Option<&mut HashSet<usize>>,
+    select_sub_cycles: Option<&mut HashMap<usize, i32>>,
+    select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+    const_add_imm_ops: Option<&mut HashSet<usize>>,
+    bounds_usage: &GreedyBoundsUsage,
+    strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+    diagnostics: &mut GreedyDiagnostics,
+    shape: &GreedyShape,
+) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    let mut trace = CounterTrace::default();
+    let result = schedule_ssa_greedy_core(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops,
+        select_sub_cycles,
+        select_fma_cycles,
+        const_add_imm_ops,
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+        &mut trace,
+        diagnostics,
+        shape,
+    )?;
+    check_liveness_agreement(ops, vector_group_lanes, &trace, result)
 }
 
 /// Same as [`schedule_ssa_greedy_with_diagnostics`], and also returns the
@@ -1169,8 +1246,7 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
     // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
     diagnostics: &mut GreedyDiagnostics,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
-    let mut trace = CounterTrace::default();
-    let result = schedule_ssa_greedy_core(
+    schedule_ssa_greedy_shaped(
         ops,
         enable_valu_shift,
         shifted_ops,
@@ -1189,10 +1265,23 @@ pub(super) fn schedule_ssa_greedy_with_liveness_agreement(
         fixed_const_choice_encoding,
         fixed_shifted_ops,
         fixed_select_choice_encoding,
-        &mut trace,
         diagnostics,
-    )?;
-    let agreement = compare_counter_with_intervals(ops, vector_group_lanes, &trace, result.2)?;
+        &GreedyShape::default(),
+    )
+}
+
+/// Compare the counter of a finished greedy run with interval liveness of its schedule.
+///
+/// # Returns
+/// `(result, agreement)`, or `Err` on disagreement (a bug in the counter, never a property
+/// of the input; set `SCHEDULER_LIVENESS_AGREEMENT=warn` to continue with a warning).
+fn check_liveness_agreement(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    trace: &CounterTrace,
+    result: (usize, bool, usize),
+) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    let agreement = compare_counter_with_intervals(ops, vector_group_lanes, trace, result.2)?;
     // SCHEDULER_LIVENESS_AGREEMENT: any value prints the comparison; `warn` also turns a
     // disagreement from an error into a warning.
     let mode = std::env::var("SCHEDULER_LIVENESS_AGREEMENT").ok();
@@ -1240,6 +1329,8 @@ fn schedule_ssa_greedy_core(
     trace: &mut CounterTrace,
     // Verbosity in, budget-overflow record out. Detailed dumps go to stderr only when `verbose`.
     diagnostics: &mut GreedyDiagnostics,
+    // Schedule-shape switches (ready-queue priority).
+    shape: &GreedyShape,
 ) -> Result<(usize, bool, usize), String> {
     if ops.is_empty() {
         return Ok((0, false, 0));
@@ -1432,6 +1523,25 @@ fn schedule_ssa_greedy_core(
         }
     }
 
+    // Wavefront priority: per-op keys and the window of chains allowed to run.
+    let mut wavefront: Option<Wavefront> = match shape.priority {
+        GreedyPriority::Fifo => None,
+        GreedyPriority::Wavefront { stagger_cycles, groups_in_flight } => Some(Wavefront::new(
+            ops,
+            &consumers,
+            &id_to_idx,
+            &shiftable_set,
+            &dead_store_indices,
+            stagger_cycles,
+            groups_in_flight,
+        )?),
+    };
+    if diagnostics.verbose {
+        if let Some(w) = wavefront.as_ref() {
+            eprintln!("Greedy wavefront priority: {} chains", w.chain_count());
+        }
+    }
+
     // Track remaining unscheduled dependencies per op
     // Only count deps that exist in the ops list and are not dead stores (dead stores are pre-satisfied).
     // Deps that don't exist in id_to_idx (e.g. external/phantom deps) are treated as satisfied.
@@ -1572,7 +1682,10 @@ fn schedule_ssa_greedy_core(
                     })
             });
 
-            if deps_ready {
+            // Wavefront window: a chain beyond the in-flight window waits for an earlier chain
+            // to finish.
+            let in_window = wavefront.as_ref().map_or(true, |w| w.in_window(idx));
+            if deps_ready && in_window {
                 ready_this_cycle.push(idx);
             } else {
                 // Not ready yet - reinsert with updated priority
@@ -1674,6 +1787,10 @@ fn schedule_ssa_greedy_core(
         };
         strategy.sort_ready(&mut ready_candidates, &sched_ctx);
         ready_this_cycle = ready_candidates.into_iter().map(|c| c.op_index).collect();
+        // Wavefront priority overrides the queue order; the policy's order breaks key ties.
+        if let Some(w) = wavefront.as_ref() {
+            ready_this_cycle.sort_by_key(|&idx| w.key(idx));
+        }
 
         // Keep retrying as long as we make progress (schedule something or free VRegs)
         while made_progress {
@@ -1990,6 +2107,9 @@ fn schedule_ssa_greedy_core(
                 // into the same cycle.
                 let assigned_cycle = cycle as i32;
                 ops[idx].cycle = assigned_cycle;
+                if let Some(w) = wavefront.as_mut() {
+                    w.on_scheduled(idx);
+                }
                 scheduled.insert(idx);
                 made_progress = true;
                 scheduled_this_cycle += 1;
@@ -2167,6 +2287,9 @@ fn schedule_ssa_greedy_core(
                 // Record the cycle we actually placed in (same as normal path).
                 let force_cycle = cycle as i32;
                 ops[force_idx].cycle = force_cycle;
+                if let Some(w) = wavefront.as_mut() {
+                    w.on_scheduled(force_idx);
+                }
                 scheduled.insert(force_idx);
                 scheduled_this_cycle += 1;
 
