@@ -941,6 +941,53 @@ impl SsaEmitContext {
         // Compute true_val = base + delta for operands (needed for dependency tracking and vselect path)
         // This is computed once per SelectChoice, not globally upfront
         let true_val = self.emit_valu(Opcode::Add, base, delta);
+        self.emit_select_choice_shared_delta(cond, true_val, delta, base)
+    }
+
+    /// Emit SelectChoice with a precomputed delta and an already emitted true value:
+    /// result = cond ? true_val : base, where `true_val` is the op `base + delta`.
+    ///
+    /// Unlike `emit_select_choice_with_delta` this emits one op: the caller emits
+    /// `true_val = base + delta` once and shares it between all selects of the same pair
+    /// (e.g. two tree-node constants selected by every group).
+    /// FMA path: `cond * delta + base` (1 VALU op). vselect path: `vselect(cond, true_val, base)`.
+    ///
+    /// `true_val` must be defined as `base + delta`: dependencies are computed from the
+    /// operands only, so the delta's producer is ordered before this op through `true_val`,
+    /// and the FMA lowering equals the select only for that delta.
+    ///
+    /// # Arguments
+    /// * `cond` - 0/1 condition vector.
+    /// * `true_val` - Vector defined by `Add(base, delta)`.
+    /// * `delta` - Vector of `true - base`.
+    /// * `base` - Vector selected when `cond` is 0.
+    ///
+    /// # Returns
+    /// The destination vector VReg.
+    #[track_caller]
+    pub fn emit_select_choice_shared_delta(
+        &mut self,
+        cond: VReg,
+        true_val: VReg,
+        delta: VReg,
+        base: VReg,
+    ) -> VReg {
+        assert!(cond.is_vector(), "SelectChoice cond must be vector");
+        assert!(true_val.is_vector(), "SelectChoice true_val must be vector");
+        assert!(delta.is_vector(), "SelectChoice delta must be vector");
+        assert!(base.is_vector(), "SelectChoice base must be vector");
+        let defined_as_sum = self
+            .get_def(true_val)
+            .and_then(|id| self.ops.iter().rev().find(|op| op.id == id))
+            .map_or(false, |op| {
+                op.opcode == Opcode::Add
+                    && op.srcs.iter().filter_map(|src| src.as_vreg()).eq([base, delta])
+            });
+        assert!(
+            defined_as_sum,
+            "SelectChoice true_val {:?} must be defined as Add(base {:?}, delta {:?})",
+            true_val, base, delta
+        );
 
         let dest = self.fresh_vector();
 
@@ -1518,6 +1565,57 @@ mod tests {
         );
         let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
         assert!(!has_dead_const, "const(99) should be removed by DCE");
+    }
+
+    #[test]
+    fn test_select_choice_shared_delta_emits_one_op_per_select() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond_a = ctx.emit_vbroadcast_force(s);
+        let cond_b = ctx.emit_vbroadcast_force(s);
+        let high = ctx.emit_valu(Opcode::Add, base, delta);
+        let before = ctx.len();
+        let a = ctx.emit_select_choice_shared_delta(cond_a, high, delta, base);
+        let b = ctx.emit_select_choice_shared_delta(cond_b, high, delta, base);
+        assert_eq!(ctx.len(), before + 2, "one SelectChoice per select, no extra Add");
+        assert_ne!(a, b);
+        let ops = ctx.take_ops();
+        for op in &ops[before..] {
+            assert_eq!(op.opcode, Opcode::SelectChoice);
+            assert_eq!(op.delta_vreg, Some(delta));
+            assert_eq!(op.sub_temp_vreg, None);
+            assert_eq!(op.reads().collect::<Vec<_>>()[1..], [high, base]);
+        }
+    }
+
+    #[test]
+    fn test_select_choice_with_delta_still_emits_its_own_add() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond = ctx.emit_vbroadcast_force(s);
+        let before = ctx.len();
+        ctx.emit_select_choice_with_delta(cond, delta, base);
+        let ops = ctx.take_ops();
+        assert_eq!(ops.len(), before + 2);
+        assert_eq!(ops[before].opcode, Opcode::Add);
+        assert_eq!(ops[before + 1].opcode, Opcode::SelectChoice);
+        assert_eq!(ops[before + 1].delta_vreg, Some(delta));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be defined as Add")]
+    fn test_select_choice_shared_delta_rejects_a_true_value_that_is_not_base_plus_delta() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond = ctx.emit_vbroadcast_force(s);
+        let not_the_sum = ctx.emit_valu(Opcode::Add, delta, base); // operands swapped
+        ctx.emit_select_choice_shared_delta(cond, not_the_sum, delta, base);
     }
 
     #[test]
