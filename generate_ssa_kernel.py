@@ -120,6 +120,9 @@ def main():
         print(f"  enable_scratch_tightening=True")
     if args.scheduling_pressure_policy != "adaptive":
         print(f"  scheduling_pressure_policy={args.scheduling_pressure_policy}")
+    emission = emission_options(build_kwargs)
+    if emission:
+        print("  emission options: " + ", ".join(f"{k}={v}" for k, v in emission.items()))
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 
@@ -196,6 +199,15 @@ def main():
             return 1
 
     return 0
+
+
+# Emission options and their defaults (kernel_build_args.py "Emission options").
+EMISSION_DEFAULTS = {"merge_hash_stages": False}
+
+
+def emission_options(build_kwargs):
+    """Emission options that differ from their defaults, for the run header."""
+    return {k: build_kwargs[k] for k, default in EMISSION_DEFAULTS.items() if build_kwargs.get(k, default) != default}
 
 
 def print_schedule_report(scheduler_json_path, full):

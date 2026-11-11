@@ -175,6 +175,9 @@ Scheduler options:
 - `--const-choice-hint-pass`, `--select-choice-hint-pass`, `--valu-shift-hint-pass` - Enable hint passes individually.
 - `--schedule-with-fixed-choices` - After hint passes, re-run greedy with encodings fixed to assign cycles.
 
+Emission options (change which ops the kernel contains; all off by default, each backed by a Z3 proof in `verification/rewrites.py`; measurements in [docs/EMISSION_ABLATION.md](docs/EMISSION_ABLATION.md)):
+- `--merge-hash-stages` - Hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per hash instead of 11 (proof `R8-hash-stage-merge`).
+
 Output options:
 - `--output-json PATH` - Write scheduler output JSON (default: `scheduler_output.json`). Use this file for summarization and slot/liveness analysis; see "Scheduler output JSON" above.
 - `--validate` - Validate against reference kernel. **The kernel is always saved before validation** (to `kernel_to_validate.json` unless `--save-kernel PATH` is set) so failed runs can be analyzed or re-validated without rebuilding.

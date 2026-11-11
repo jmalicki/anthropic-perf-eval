@@ -69,6 +69,10 @@ pub struct ProblemSpec {
     pub enable_const_alu: bool,
     /// Maximum derivation depth for ALU-based constant generation.
     pub max_alu_depth: Option<usize>,
+    /// Emit hash stages 2 and 3 as two multiply_adds and an XOR (3 vector ops) instead of
+    /// multiply_add, add, shift, XOR (4). Proved by `R8-hash-stage-merge` in
+    /// `verification/rewrites.py`. Default false.
+    pub merge_hash_stages: bool,
 }
 
 impl Default for ProblemSpec {
@@ -89,6 +93,7 @@ impl Default for ProblemSpec {
             enable_const_load: true,
             enable_const_alu: true,
             max_alu_depth: None,
+            merge_hash_stages: false,
         }
     }
 }
@@ -291,9 +296,51 @@ pub fn fma_multiplier(stage: usize) -> Option<i64> {
     }
 }
 
+/// First of the two adjacent hash stages that `ProblemSpec::merge_hash_stages` merges.
+pub const MERGED_HASH_STAGE: usize = 2;
+
+/// Constants of the merged form of hash stages `first` and `first + 1`.
+///
+/// When stage `first` fuses to `a * m + c` and the next stage is `(x + d) ^ (x << k)`,
+/// the two stages together equal `(a * m1 + c1) ^ (a * m2 + c2)` with `m1 = m`,
+/// `c1 = c + d`, `m2 = m << k`, `c2 = c << k`, all modulo 2^32 (the left shift distributes
+/// over the multiply_add). Proved for stages 2 and 3 by `R8-hash-stage-merge` in
+/// `verification/rewrites.py`, which derives the same constants.
+///
+/// # Arguments
+/// * `first` - Index of the first stage of the pair.
+///
+/// # Returns
+/// `Some((m1, c1, m2, c2))`, each in `0..2^32`, or `None` if the pair does not have this form.
+pub fn merged_hash_stage_constants(first: usize) -> Option<(i64, i64, i64, i64)> {
+    if first + 1 >= HASH_STAGES.len() {
+        return None;
+    }
+    let mult = fma_multiplier(first)?;
+    let (_, c, _, _, _) = HASH_STAGES[first];
+    let (op1, d, op2, op3, k) = HASH_STAGES[first + 1];
+    if !(op1 == '+' && op2 == '^' && op3 == '<') {
+        return None;
+    }
+    const MASK: i64 = 0xFFFF_FFFF;
+    Some((mult & MASK, (c + d) & MASK, (mult << k) & MASK, (c << k) & MASK))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same numbers as tests/test_rewrite_proofs.py checks for verification/rewrites.py.
+    #[test]
+    fn test_merged_hash_stage_constants_match_the_proof() {
+        assert_eq!(
+            merged_hash_stage_constants(MERGED_HASH_STAGE),
+            Some((33, 0xE9F8_CC1D, 16896, 0xACCF_6200))
+        );
+        for first in [0, 1, 3, 4, 5] {
+            assert_eq!(merged_hash_stage_constants(first), None, "stages {first}, {}", first + 1);
+        }
+    }
 
     /// n_iters must be ceiling(n_groups/8) so 1..7 groups get one iter.
     #[test]

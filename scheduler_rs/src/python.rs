@@ -1060,8 +1060,10 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// Defaults to true when not provided. Has no effect when use_cpsat is false.
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
+/// Emission options (keyword-only, default off; see docs/EMISSION_ABLATION.md):
+/// merge_hash_stages: emit hash stages 2 and 3 as two multiply_adds and an XOR (10-op hash).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, merge_hash_stages=false))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1104,6 +1106,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     enable_valu_shift_hint_pass: bool,
     enable_schedule_with_fixed_choices: bool,
     cpsat_deterministic_time: Option<f64>,
+    merge_hash_stages: bool,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     if let Some(dtime) = cpsat_deterministic_time {
         if !(dtime.is_finite() && dtime > 0.0) {
@@ -1152,6 +1155,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             enable_const_alu: true,
             max_alu_depth: None,
             tree_reduce_max_depth,
+            merge_hash_stages,
         },
         compiler: CompilerConfig {
             enable_valu_shift,
