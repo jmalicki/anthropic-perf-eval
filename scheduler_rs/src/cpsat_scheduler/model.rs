@@ -453,9 +453,21 @@ pub fn schedule_ssa_cpsat(
         // Greedy makespan is a proven upper bound — optimal is at most greedy_max.
         // Add small buffer (+20) for solver flexibility, but keep max_latency_critical_path
         // guard so ALAP backward propagation has enough room.
-        (greedy_max as i64 + 20)
-            .max(max_latency_critical_path as i64)
-            .max(n as i64)
+        // Both guards are bounds that need no greedy schedule; they are far above the greedy
+        // makespan and only widen domains. ALAP is computed with minimum latencies, so with a
+        // feasible greedy schedule every op's ALAP is at least its greedy cycle without them.
+        // tuning.horizon_at_least_max_latency_path / horizon_at_least_num_ops = false leave
+        // them out.
+        let greedy_horizon = if tuning.horizon_at_least_max_latency_path {
+            (greedy_max as i64 + 20).max(max_latency_critical_path as i64)
+        } else {
+            greedy_max as i64 + 20
+        };
+        if tuning.horizon_at_least_num_ops {
+            greedy_horizon.max(n as i64)
+        } else {
+            greedy_horizon
+        }
     } else {
         (critical_path_len * 2)
             .max(max_latency_critical_path * 2)
@@ -497,10 +509,11 @@ pub fn schedule_ssa_cpsat(
     let alap = compute_ssa_alap(ops, horizon as i32, &shiftable_set);
 
     // 1a. Warm-start ALAP from greedy schedule: intersect each op's ALAP with greedy_cycle + slack.
-    // The greedy schedule is a proven feasible solution, so greedy_cycle[op] + slack is a valid
-    // upper bound. This tightens domains before energetic reasoning for compounding benefit.
-    let alap = if let Some(hints) = bound_hints {
-        let slack = 15i32; // conservative slack to avoid excluding optimal
+    // This tightens domains before energetic reasoning for compounding benefit. It is a search
+    // restriction rather than a valid bound: only the greedy makespan bounds the optimum, not
+    // each op's greedy cycle, so schedules that move an op more than `slack` cycles later are
+    // cut off. tuning.greedy_alap_slack sets the slack (default 15); None leaves ALAP alone.
+    let alap = if let (Some(hints), Some(slack)) = (bound_hints, tuning.greedy_alap_slack) {
         let mut tighter_alap = alap;
         let mut tightened_count = 0usize;
         for (idx, &hint_cycle) in hints.iter().enumerate() {
