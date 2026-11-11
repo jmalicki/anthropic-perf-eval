@@ -43,13 +43,15 @@ The scheduler output JSON includes:
 - `peak_live` — Peak scratch usage (words)
 - `run_options.rounds` — Number of rounds
 - `run_options.batch_size` — Batch size
-- `lb_cycles` — Proven lower bound (CP-SAT only). When `lb_cycles == total_cycles`, status is OPTIMAL; otherwise FEASIBLE
+- `lb_cycles` — Solver lower bound for this emission and its encoding choices (CP-SAT only; `lb_scope` is `"emission"`). It is not a bound on the problem: emitting fewer ops lowers it. When `lb_cycles == total_cycles`, status is OPTIMAL; otherwise FEASIBLE
 - File modification date (for tracking when run occurred)
 
 **Solver status:** The JSON doesn't include an explicit `solver_status` field, but you can infer it:
-- **OPTIMAL:** `lb_cycles == total_cycles` (proven optimal)
-- **FEASIBLE:** `lb_cycles < total_cycles` or `lb_cycles` is null (found a solution but not proven optimal)
-- **Greedy:** No `lb_cycles` field (greedy scheduler doesn't prove optimality)
+- **OPTIMAL:** `lb_cycles == total_cycles` (optimal for the emitted ops, not for the problem)
+- **FEASIBLE:** `lb_cycles < total_cycles` (found a solution, not shown optimal for the emitted ops). A CP-SAT run with no solver bound omits `lb_cycles` (the JSON never contains a null); `run_options.use_cpsat` is true for it, which tells it apart from greedy.
+- **Greedy:** No `lb_cycles` field and `run_options.use_cpsat` is false (greedy scheduler doesn't prove optimality)
+
+For the capacity floor of an emission and the gap to it (any scheduler), run `uv run python -m scripts.schedule_report <json>`; see [use-schedule-report](../use-schedule-report/SKILL.md).
 
 Alternatively, check the command output for "status: OPTIMAL" or "status: FEASIBLE" in the CP-SAT solver summary.
 
@@ -65,8 +67,8 @@ After a validated run, add an entry to [docs/round-progress.md](docs/round-progr
 # Get SHA, cycles, batch size, peak live, solver status from scheduler JSON
 jq -r '.git_sha, .total_cycles, .run_options.batch_size, .peak_live, .lb_cycles' scheduler_output_3r_256b.json
 
-# Determine solver status: if lb_cycles == total_cycles, OPTIMAL; else FEASIBLE
-jq -r 'if .lb_cycles == .total_cycles then "OPTIMAL" elif .lb_cycles then "FEASIBLE" else "GREEDY" end' scheduler_output_3r_256b.json
+# Determine solver status: lb_cycles == total_cycles is OPTIMAL; any other CP-SAT run is FEASIBLE
+jq -r 'if .lb_cycles == .total_cycles then "OPTIMAL" elif (.lb_cycles or .run_options.use_cpsat) then "FEASIBLE" else "GREEDY" end' scheduler_output_3r_256b.json
 
 # Get file date
 stat -f "%Sm" -t "%Y-%m-%d" scheduler_output_3r_256b.json
@@ -82,7 +84,7 @@ stat -f "%Sm" -t "%Y-%m-%d" scheduler_output_3r_256b.json
    - **Command** — Exact command used (if notable config)
    - **Cycles** — `total_cycles` from JSON
    - **Peak live** — `peak_live` from JSON (or "N/A")
-   - **Status** — Solver status: "OPTIMAL" (if `lb_cycles == total_cycles`), "FEASIBLE" (if `lb_cycles < total_cycles`), or "GREEDY" (if no `lb_cycles`)
+   - **Status** — Solver status: "OPTIMAL" (if `lb_cycles == total_cycles`), "FEASIBLE" (if `lb_cycles < total_cycles`, or a CP-SAT run without `lb_cycles`), or "GREEDY" (if no `lb_cycles` and `run_options.use_cpsat` is false)
    - **Validation** — "PASSED" if validation succeeded
    - **Notes** — Any notable options or changes (e.g. "trait-based liveness refactor")
    - **Source** — JSON filename

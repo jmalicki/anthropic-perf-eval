@@ -169,7 +169,7 @@ def print_arm_detail(idx: int, result: Dict[str, Any], is_baseline: bool):
     print(f"   VALU shifted: {json_data.get('valu_shifted', 0)} ops")
     print(f"   Budget exceeded: {json_data.get('budget_exceeded', False)}")
     if json_data.get('lb_cycles') is not None:
-        print(f"   Lower bound cycles: {json_data['lb_cycles']}")
+        print(f"   Lower bound cycles (this emission): {json_data['lb_cycles']}")
 
     # Liveness analysis
     if 'liveness_curve' in json_data:

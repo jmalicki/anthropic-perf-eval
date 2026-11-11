@@ -6,7 +6,7 @@ Record git SHA, exact command, cycles, peak liveness, solver status, and validat
 
 Data sources: scheduler output JSON files (`scheduler_output*.json`) and manual runs.
 
-**Solver status:** OPTIMAL (proven optimal, `lb_cycles == total_cycles`), FEASIBLE (solution found but not proven optimal), or GREEDY (greedy scheduler, no optimality proof).
+**Solver status:** OPTIMAL (optimal for the ops that run emitted, `lb_cycles == total_cycles`), FEASIBLE (CP-SAT solution found, not shown optimal for that emission: `lb_cycles < total_cycles`, or `lb_cycles` absent with `run_options.use_cpsat` true), or GREEDY (greedy scheduler, no optimality proof). `lb_cycles` and OPTIMAL are statements about one emission and its encoding choices (`lb_scope: "emission"` in the JSON). They are not bounds on the problem: an emission with fewer ops can be faster.
 
 ---
 
@@ -93,7 +93,7 @@ Quick summary:
 ## Notes
 
 - **Batch size matters:** Cycles scale with batch size. Compare runs with the same batch size.
-- **Solver status:** OPTIMAL = proven optimal (`lb_cycles == total_cycles`), FEASIBLE = solution found but not proven optimal (`lb_cycles < total_cycles`), GREEDY = greedy scheduler (no `lb_cycles` field).
+- **Solver status:** OPTIMAL = optimal for that run's emitted ops (`lb_cycles == total_cycles`), FEASIBLE = CP-SAT solution found but not shown optimal for that emission (`lb_cycles < total_cycles`, or no `lb_cycles` field with `run_options.use_cpsat` true), GREEDY = greedy scheduler (no `lb_cycles` field and `run_options.use_cpsat` false). None of these bounds the problem; `uv run python -m scripts.schedule_report <json>` shows the floor for an emission and the gap to it.
 - Commands use default options unless specified (e.g. `--enable-valu-shift`, `--tree-reduce-max-depth`)
 - Validation = Python kernel verification against reference kernel
 - Peak live = peak simultaneous scratch words (budget = 1536)

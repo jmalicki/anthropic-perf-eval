@@ -252,7 +252,7 @@ def _parse_objective_scale(stdout_output):
 
 
 def _parse_lower_bound(json_data):
-    """Extract proven lower bound on cycles from scheduler output JSON."""
+    """Extract the solver lower bound on cycles (for that run's emission, not the problem) from scheduler output JSON."""
     if not json_data:
         return None
     return json_data.get('lb_cycles')
@@ -493,7 +493,7 @@ def print_summary(results):
         if r.get('optimality_gap') is not None:
             print(f"    Gap: {r['optimality_gap']:.4f}")
         if r.get('lb_cycles') is not None:
-            print(f"    Lower bound: {r['lb_cycles']} cycles")
+            print(f"    Lower bound for this emission: {r['lb_cycles']} cycles")
         if r.get('solver_iterations'):
             print(f"    Branches: {r['solver_iterations']}")
         if r.get('solution_count'):

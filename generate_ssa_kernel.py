@@ -150,6 +150,7 @@ def main():
         print("  Use CP-SAT scheduler (default) for correct results.")
 
     print(f"\n  Schedule JSON written to: {output_json_path}")
+    print_schedule_report(output_json_path, full=verbose)
 
     # Always save kernel before validating so failures can be analyzed without re-running.
     kernel_path = args.save_kernel
@@ -191,6 +192,31 @@ def main():
             return 1
 
     return 0
+
+
+def print_schedule_report(scheduler_json_path, full):
+    """Print the capacity floor for the ops this run emitted, what binds it and the gap.
+
+    Three lines with -q, the whole report (scripts/schedule_report.py) otherwise. The floor
+    is conditional on the emission; it is not a bound on the problem."""
+    try:
+        from scripts import schedule_report
+
+        with open(scheduler_json_path) as f:
+            report = schedule_report.analyze(json.load(f))
+        if full:
+            lines = schedule_report.format_report(report).splitlines()
+        else:
+            lines = schedule_report.summary_lines(report)
+    except Exception as e:  # advisory output: must never abort the build or skip the kernel save
+        print(f"\n  (schedule report skipped: {type(e).__name__}: {e})")
+        return
+    if full:
+        print(f"\nSchedule report (uv run python -m scripts.schedule_report {scheduler_json_path}):")
+    else:
+        print()
+    for line in lines:
+        print(f"  {line}")
 
 
 def check_kernel_dataflow(instrs, scheduler_json_path):

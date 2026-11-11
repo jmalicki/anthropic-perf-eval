@@ -361,9 +361,16 @@ struct SsaScheduleOutput {
     git_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
-    /// Proven lower bound on cycles (CP-SAT only). When optimal, equals total_cycles; when feasible, solver best_bound in cycles.
+    /// Solver lower bound on cycles for THIS emission (CP-SAT only): the fewest cycles in which
+    /// the ops this build emitted, under the encoding choices the model offers, can be scheduled.
+    /// When optimal, equals total_cycles; when feasible, solver best_bound in cycles. It is not a
+    /// bound on the problem: an emission with fewer ops has a lower bound (see `lb_scope`).
     #[serde(skip_serializing_if = "Option::is_none")]
     lb_cycles: Option<usize>,
+    /// What `lb_cycles` is a bound on. Always "emission" (written whenever `lb_cycles` is):
+    /// the emitted op set and its encoding choices, not the kernel problem itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lb_scope: Option<&'static str>,
     /// Vector group key/alias VReg id → lane VReg ids, in lane order. Always written (even
     /// when empty) so checkers can tell "no groups" from "JSON predates this field".
     vector_group_lanes: std::collections::BTreeMap<u32, Vec<u32>>,
@@ -670,6 +677,7 @@ pub fn write_ssa_schedule_json(
         git_sha,
         comment,
         lb_cycles: result.lb_cycles,
+        lb_scope: result.lb_cycles.map(|_| "emission"),
         vector_group_lanes: result
             .vector_group_lanes
             .iter()
