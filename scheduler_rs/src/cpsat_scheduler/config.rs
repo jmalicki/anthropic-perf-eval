@@ -140,6 +140,20 @@ impl std::fmt::Display for OptionalConstraintGroup {
 // Solver tuning (ablation switches)
 // ============================================================================
 
+/// What the full-kernel CP-SAT solve minimises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CpsatObjective {
+    /// `scale * makespan + sum(effective completion cycle of every op)` (default). The sum
+    /// is a tie-breaker that prefers schedules whose ops finish early.
+    #[default]
+    #[serde(rename = "makespan+tiebreak")]
+    MakespanTiebreak,
+    /// `makespan` alone: no tie-breaker term and none of its auxiliary "chosen cycle"
+    /// variables. The solve can stop as soon as the makespan is proved.
+    #[serde(rename = "makespan")]
+    Makespan,
+}
+
 /// Full-problem subsolver names OR-Tools 9.15 defines (`GetNamedParameters` in
 /// `ortools/sat/cp_model_search.cc`). Naming any other one in `subsolvers` or
 /// `extra_subsolvers` makes the solver abort.
@@ -177,6 +191,8 @@ pub struct CpsatTuning {
     pub extra_subsolvers: Vec<String>,
     /// `ignore_subsolvers`: removed from the list of subsolvers (full-problem and LNS).
     pub ignore_subsolvers: Vec<String>,
+    /// Objective: makespan with the sum-of-cycles tie-breaker (default) or makespan alone.
+    pub objective: CpsatObjective,
 }
 
 impl Default for CpsatTuning {
@@ -187,6 +203,7 @@ impl Default for CpsatTuning {
             subsolvers: Vec::new(),
             extra_subsolvers: Vec::new(),
             ignore_subsolvers: Vec::new(),
+            objective: CpsatObjective::default(),
         }
     }
 }

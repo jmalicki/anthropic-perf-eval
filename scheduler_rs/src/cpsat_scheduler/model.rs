@@ -17,8 +17,8 @@ use super::bounds::{
 };
 use super::symmetry_ordering::SymmetryOrdering;
 use super::config::{
-    ConstChoiceMode, CpsatStatus, CpsatTuning, OptionalConstraintGroup, SelectChoiceMode,
-    ValuShiftMode,
+    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, OptionalConstraintGroup,
+    SelectChoiceMode, ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::validation::{
@@ -3200,12 +3200,19 @@ pub fn schedule_ssa_cpsat(
     //   (4) ConstChoice: all encodings (Load, AddImm, ALU-derived) use cycle_vars[idx] as scheduled cycle.
     //   (5) SelectChoice: chosen path's last cycle (fma_last when FMA, cycle_var when vselect).
     //   (6) All other ops: cycle_vars[idx].
+    //
+    // tuning.objective = Makespan drops the tie-breaker: the objective is `makespan` alone and
+    // the "chosen cycle" variables below are not created. Nothing else in the model reads them.
+    // The schedule returned is then any schedule of that makespan, not the left-packed one.
     let mut objective_scale: Option<i64> = None;
+    let with_tie_breaker = tuning.objective == CpsatObjective::MakespanTiebreak;
+    let tie_shiftable: &[usize] = if with_tie_breaker { &shiftable_valu } else { &[] };
+    let tie_select: &[usize] = if with_tie_breaker { &select_choice_ops } else { &[] };
 
     // Tie-breaker should sum only the chosen path's cycle per op (same as makespan constraints).
     // Create auxiliary "chosen cycle" vars for shiftable and SelectChoice so the objective matches.
     let mut shiftable_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
-    for &idx in &shiftable_valu {
+    for &idx in tie_shiftable {
         let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
         let default_alap = (horizon - 1) as i32;
         let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
@@ -3229,7 +3236,7 @@ pub fn schedule_ssa_cpsat(
     // that was chosen (FMA path → fma_last; vselect path → cycle_vars[idx]). So the objective
     // tie-breaker uses the actual completion cycle of the chosen variant.
     let mut select_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
-    for &idx in &select_choice_ops {
+    for &idx in tie_select {
         if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
             let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
             let default_alap = (horizon - 1) as i32;
@@ -3273,17 +3280,17 @@ pub fn schedule_ssa_cpsat(
     let mut tie_breaker_vars: Vec<IntVar> = Vec::new();
 
     // Shiftable VALU: chosen path completion (completion_cycle when shifted, cycle_var when not)
-    for &idx in &shiftable_valu {
+    for &idx in tie_shiftable {
         tie_breaker_vars.push(*shiftable_chosen_cycle.get(&idx).unwrap());
     }
 
     // ConstChoice: all encodings (Load, AddImm, ALU-derived) schedule at cycle_vars[idx]
-    for &idx in &const_choice_ops {
+    for &idx in const_choice_ops.iter().filter(|_| with_tie_breaker) {
         tie_breaker_vars.push(cycle_vars[idx]);
     }
 
     // SelectChoice: chosen path last cycle (fma_last when FMA, cycle_var when vselect)
-    for &idx in &select_choice_ops {
+    for &idx in tie_select {
         if let Some(&chosen) = select_chosen_cycle.get(&idx) {
             tie_breaker_vars.push(chosen);
         } else {
@@ -3292,7 +3299,7 @@ pub fn schedule_ssa_cpsat(
     }
 
     // All other ops: execution cycle so every op contributes (reward earlier completion)
-    for (idx, _) in ops.iter().enumerate() {
+    for (idx, _) in ops.iter().enumerate().filter(|_| with_tie_breaker) {
         if !shiftable_set.contains(&idx)
             && !const_choice_set.contains(&idx)
             && !select_choice_set.contains(&idx)
@@ -3330,6 +3337,7 @@ pub fn schedule_ssa_cpsat(
         let objective = LinearExpr::from(makespan) * scale + sum_completion;
         model.minimize(objective);
     } else {
+        // Makespan-only objective (or no ops): no scale, the objective value is the makespan.
         model.minimize(makespan);
     }
 
@@ -4610,9 +4618,8 @@ pub fn schedule_ssa_cpsat(
             let lb_cycles = if status == CpsatStatus::Optimal {
                 Some(out_makespan)
             } else {
-                objective_scale.map(|scale| {
-                    (response.best_objective_bound / (scale as f64)).floor() as usize
-                })
+                // Without the tie-breaker the objective is the makespan itself (scale 1).
+                Some((response.best_objective_bound / (objective_scale.unwrap_or(1) as f64)).floor() as usize)
             };
 
             Ok(Some(SsaCpsatResult {
