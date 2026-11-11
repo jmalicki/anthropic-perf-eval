@@ -211,6 +211,9 @@ CP-SAT tuning switches (full-kernel solve only; per-section feasibility solves a
 - `--cpsat-ttef-max-intervals N` - `max_num_intervals_for_timetable_edge_finding` (CP-SAT default 100). Timetable edge finding is skipped on cumulatives with more intervals, which is every engine cumulative here, so raise it together with `timetable_edge_finding`.
 - `--disable-cpsat-constraints GROUP,...` - Leave out redundant constraint groups (recorded under `run_options.disabled_cpsat_constraints`). Besides the capacity rows (`redundant_linear_bounds`, `capacity_valu`, `capacity_alu`, `capacity_flow`, `capacity_load`) there are two groups that only remove duplicates: `conditional_makespan` (the per-op `makespan >= cycle + 1` rows, implied by `makespan = max_cycle + 1` and `max_cycle >= ...`; about 1.5 rows per op, most of them enforced) and `flow_cumulative` (the capacity-1 Flow cumulative, which repeats `no_overlap_flow`). All groups are on by default.
 
+Emission options (change which ops the kernel contains; all off by default, each backed by a Z3 proof in `verification/rewrites.py`; measurements in [docs/EMISSION_ABLATION.md](docs/EMISSION_ABLATION.md)):
+- `--merge-hash-stages` - Hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per hash instead of 11 (proof `R8-hash-stage-merge`).
+
 **Why SSA builder?**
 - Eliminates false dependencies between operations
 - Enables better scheduling with CP-SAT

@@ -23,6 +23,23 @@ def test_fma_multipliers_match_emission():
     assert [rewrites.fma_multiplier(i) for i in range(6)] == [4097, None, 33, None, 9, None]
 
 
+def test_merged_stage_constants_match_emission():
+    """scheduler_rs merges stages 2+3 with these constants (config.rs merged_hash_stage_constants)."""
+    assert [rewrites.merged_stage_constants(i) for i in range(6)] == [
+        None, None, (33, 0xE9F8CC1D, 16896, 0xACCF6200), None, None, None]
+
+
+def test_stage_merge_proof_rejects_a_wrong_constant(monkeypatch):
+    """Off-by-one in any of the four merged constants must make the proof fail."""
+    real = rewrites.merged_stage_constants
+    for k in range(4):
+        monkeypatch.setattr(
+            rewrites, "merged_stage_constants",
+            lambda first, k=k: tuple(v + (i == k) for i, v in enumerate(real(first))))
+        _, result, _, _ = rewrites.check_hash_stage_merge()
+        assert result == "sat", f"constant {k}"
+
+
 def test_fusion_proof_rejects_a_wrong_multiplier(monkeypatch):
     """The proof must fail if the multiplier is off by one, i.e. it really constrains the constants."""
     real = rewrites.fma_multiplier

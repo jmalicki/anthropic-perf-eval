@@ -10,7 +10,9 @@
 
 use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
-use super::config::{HASH_STAGES, STAGE5_XOR_CONST};
+use super::config::{
+    merged_hash_stage_constants, HASH_STAGES, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
+};
 use super::tick_tock_ssa::{
     SsaTickTockKernelBuilder, TICK_STORE_DEPTHS, TOCK_STORE_DEPTHS, UNROLL,
 };
@@ -162,7 +164,12 @@ impl SsaTickTockKernelBuilder {
         // - FMA stages (0, 2, 4): use v_hc, but not v_hs
         // - Stage 5: uses v_hs[5], but not v_hc[5] (special XOR path)
         // - General stages (1, 3): use both v_hc and v_hs
+        // With merged stages 2+3 neither stage's own constant nor the stage-3 shift is used.
+        let merge = self.config.spec.merge_hash_stages;
         for i in 0..6 {
+            if merge && (i == MERGED_HASH_STAGE || i == MERGED_HASH_STAGE + 1) {
+                continue;
+            }
             // v_hc needed for stages 0, 1, 2, 3, 4 (not 5)
             if i != 5 {
                 self.emit.set_next_var_type(VarType::HashState);
@@ -267,6 +274,21 @@ impl SsaTickTockKernelBuilder {
                 let v_mult = self.emit.emit_vbroadcast(mult_s);
                 self.ctx.v_hash_mult.insert(i, v_mult);
             }
+        }
+
+        // Merged stages 2+3: (a * m1 + c1) ^ (a * m2 + c2); m1 is the stage-2 multiplier above.
+        if merge {
+            let (_m1, c1, m2, c2) = merged_hash_stage_constants(MERGED_HASH_STAGE)
+                .expect("hash stages 2 and 3 have the mergeable form");
+            let mut v_merged = [None; 3];
+            for (slot, value) in v_merged.iter_mut().zip([c1, m2, c2]) {
+                self.emit.set_next_var_type(VarType::HashState);
+                let scalar = self.emit.emit_const_choice(value);
+                self.emit.set_next_var_type(VarType::HashState);
+                *slot = Some(self.emit.emit_vbroadcast(scalar));
+            }
+            self.ctx.v_hash_merged =
+                Some((v_merged[0].unwrap(), v_merged[1].unwrap(), v_merged[2].unwrap()));
         }
     }
 
@@ -1086,8 +1108,14 @@ impl SsaTickTockKernelBuilder {
         let enable_trace = self.config.spec.enable_trace_ids;
         let debug = std::env::var("SCHEDULER_DEBUG").is_ok();
 
+        let merge = self.config.spec.merge_hash_stages;
+
         for hi in 0..6 {
             let (op1, _, op2, op3, _) = HASH_STAGES[hi];
+            // Stage 3 is emitted together with stage 2 when the two are merged.
+            if merge && hi == MERGED_HASH_STAGE + 1 {
+                continue;
+            }
 
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
@@ -1097,6 +1125,17 @@ impl SsaTickTockKernelBuilder {
                         continue;
                     }
                     let val = self.ctx.all_val[g].unwrap();
+
+                    if merge && hi == MERGED_HASH_STAGE {
+                        // Stages 2+3 in 3 ops: (val * m1 + c1) ^ (val * m2 + c2)
+                        // (R8-hash-stage-merge in verification/rewrites.py).
+                        let v_m1 = *self.ctx.v_hash_mult.get(&hi).unwrap();
+                        let (v_c1, v_m2, v_c2) = self.ctx.v_hash_merged.unwrap();
+                        let left = self.emit.emit_fma(val, v_m1, v_c1);
+                        let right = self.emit.emit_fma(val, v_m2, v_c2);
+                        self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, left, right));
+                        continue;
+                    }
                     
                     // Debug: log Round N hash reading Round N-1 hash (or initial value)
                     if debug && hi == 0 && it == 0 && i == 0 {
