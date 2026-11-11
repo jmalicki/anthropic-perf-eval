@@ -154,6 +154,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="With --use-greedy: let a vector op run as 8 scalar ops spread over two cycles, so "
                             "all 12 scalar slots carry shifted work (3 shifted ops per 2 cycles instead of 2). "
                             "Ignored with CP-SAT, whose hints carry one cycle per op")
+    group.add_argument("--pressure-soft-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
+                       help="Pressure policy: fraction of the scratch budget above which the ready queue blends "
+                            "in net pressure and busy-ALU shifts are suppressed (policy default 0.85)")
+    group.add_argument("--pressure-critical-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
+                       help="Pressure policy: fraction of the scratch budget above which no vector op is "
+                            "shifted (policy default 0.95)")
+    group.add_argument("--pressure-inflation-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
+                       help="Pressure policy: fraction of the scratch budget above which producers with slack "
+                            "are deferred (policy default 0.80; 1.0 or more turns deferral off)")
+    group.add_argument("--greedy-budget-headroom", type=_non_negative_int, default=0, metavar="WORDS",
+                       help="Scratch words the greedy keeps free below the budget (default 0)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -300,6 +311,10 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "pressure_soft_threshold": get("pressure_soft_threshold"),
+        "pressure_critical_threshold": get("pressure_critical_threshold"),
+        "pressure_inflation_threshold": get("pressure_inflation_threshold"),
+        "greedy_budget_headroom": get("greedy_budget_headroom", 0),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -349,6 +364,10 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "pressure_soft_threshold": get("pressure_soft_threshold"),
+        "pressure_critical_threshold": get("pressure_critical_threshold"),
+        "pressure_inflation_threshold": get("pressure_inflation_threshold"),
+        "greedy_budget_headroom": get("greedy_budget_headroom", 0),
     }
 
 
