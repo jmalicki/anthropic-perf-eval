@@ -5,7 +5,7 @@
 //! has been run with emission that attaches those hints. See docs/ASAP_ALAP_SLOT_TIGHTENING.md
 //! and the plan "Symmetry as its own construct".
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::SsaOp;
 
@@ -18,7 +18,9 @@ use crate::types::SsaOp;
 pub struct SymmetryOrdering {
     /// Group key (from op.symmetry_hint.ordering_group) → sorted list of op indices.
     /// Only ops with non-empty ordering_group are included; ops without hints are not in any group.
-    groups: HashMap<Vec<i64>, Vec<usize>>,
+    /// Ordered map: groups are iterated to tighten bounds and to add ordering constraints,
+    /// and both must happen in the same order on every run.
+    groups: BTreeMap<Vec<i64>, Vec<usize>>,
 }
 
 impl SymmetryOrdering {
@@ -35,7 +37,7 @@ impl SymmetryOrdering {
         greedy_hints: Option<&[i32]>,
         precedence_integrated: bool,
     ) -> Self {
-        let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+        let mut groups: BTreeMap<Vec<i64>, Vec<usize>> = BTreeMap::new();
         for (idx, op) in ops.iter().enumerate() {
             let Some(ref hint) = op.symmetry_hint else {
                 continue;

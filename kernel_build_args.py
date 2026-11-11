@@ -54,6 +54,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     # Scheduler options
     group.add_argument("--cpsat-time-limit", type=float, default=3600.0,
                        help="CP-SAT time limit in seconds (default: 3600)")
+    group.add_argument("--cpsat-deterministic-time", type=float, default=None, metavar="DTIME",
+                       help="CP-SAT deterministic-time budget per solve. Unlike --cpsat-time-limit it does not "
+                            "depend on machine load, so the same command gives the same kernel. Use it for any "
+                            "comparison between runs; --cpsat-time-limit remains as a wall-clock backstop.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
@@ -205,6 +209,7 @@ def args_to_build_kwargs(
         "rounds": rounds,
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
+        "cpsat_deterministic_time": get("cpsat_deterministic_time"),
         "per_section_optimize_secs": per_section_optimize,
         "enable_valu_shift": get("enable_valu_shift", True),
         "tree_reduce_max_depth": tree_reduce_max_depth,
@@ -292,4 +297,11 @@ def build_kernel_with_args(
 
     kwargs = args_to_build_kwargs(args, output_json=output_json, use_git_sha=use_git_sha, **overrides)
     kwargs["verbose"] = verbose
+    # The deterministic-time budget reaches the solver through the environment (read in
+    # cpsat_scheduler/model.rs); it applies to every CP-SAT solve of the build.
+    dtime = overrides.get("cpsat_deterministic_time", getattr(args, "cpsat_deterministic_time", None))
+    if dtime is not None:
+        os.environ["CPSAT_MAX_DETERMINISTIC_TIME"] = str(dtime)
+    else:
+        os.environ.pop("CPSAT_MAX_DETERMINISTIC_TIME", None)
     return scheduler_rs.build_tick_tock_kernel_ssa(**kwargs)

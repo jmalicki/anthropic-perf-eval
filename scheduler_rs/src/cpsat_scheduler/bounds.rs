@@ -1496,7 +1496,8 @@ pub(crate) fn build_ordering_pairs_from_bounds(
     alap: &HashMap<usize, i32>,
     greedy_hints: Option<&[i32]>,
 ) -> Vec<(usize, usize)> {
-    let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+    // Ordered so the pairs come out in the same order on every run.
+    let mut groups: std::collections::BTreeMap<Vec<i64>, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, op) in ops.iter().enumerate() {
         let Some(ref hint) = op.symmetry_hint else {
             continue;

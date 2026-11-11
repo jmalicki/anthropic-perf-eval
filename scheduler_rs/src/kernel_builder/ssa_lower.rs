@@ -357,7 +357,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     engine: crate::types::Engine::Alu,
                     slot,
                     cycle: ssa_op.cycle,
-                    dep_ids: ssa_op.dep_ids.clone(),
+                    dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                     reads,
                     writes,
                     last_use_reads: HashSet::new(),
@@ -389,7 +389,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     engine: crate::types::Engine::Flow,
                     slot,
                     cycle: ssa_op.cycle,
-                    dep_ids: ssa_op.dep_ids.clone(),
+                    dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                     reads,
                     writes,
                     last_use_reads: HashSet::new(),
@@ -414,7 +414,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     engine: crate::types::Engine::Load,
                     slot,
                     cycle: ssa_op.cycle,
-                    dep_ids: ssa_op.dep_ids.clone(),
+                    dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                     reads: HashSet::new(),
                     writes,
                     last_use_reads: HashSet::new(),
@@ -512,7 +512,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                         engine: crate::types::Engine::Valu,
                         slot: fma_slot,
                         cycle: ssa_op.cycle,
-                        dep_ids: ssa_op.dep_ids.clone(),
+                        dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                         reads: fma_reads,
                         writes: fma_writes,
                         last_use_reads: HashSet::new(),
@@ -576,7 +576,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                             engine: crate::types::Engine::Valu,
                             slot: sub_slot,
                             cycle: ssa_op.cycle,
-                            dep_ids: ssa_op.dep_ids.clone(),
+                            dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                             reads: sub_reads,
                             writes: sub_writes,
                             last_use_reads: HashSet::new(),
@@ -615,7 +615,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                         slot: fma_slot,
                         cycle: ssa_op.cycle + 1, // FMA is at cycle + 1 (adjacent to sub)
                         dep_ids: {
-                            let mut deps = ssa_op.dep_ids.clone();
+                            let mut deps: HashSet<usize> = ssa_op.dep_ids.iter().copied().collect();
                             deps.insert(ssa_op.id); // FMA depends on sub
                             deps
                         },
@@ -659,7 +659,7 @@ pub fn lower_ssa_ops_with_shift(ctx: &LoweringContext<'_>) -> Result<Vec<Op>, St
                     engine: crate::types::Engine::Flow,
                     slot,
                     cycle: ssa_op.cycle,
-                    dep_ids: ssa_op.dep_ids.clone(),
+                    dep_ids: ssa_op.dep_ids.iter().copied().collect(),
                     reads,
                     writes,
                     last_use_reads: HashSet::new(),
@@ -857,7 +857,7 @@ pub fn expand_ssa_valu_to_alu(
             engine: Engine::Alu,
             slot,
             cycle,
-            dep_ids: ssa_op.dep_ids.clone(),
+            dep_ids: ssa_op.dep_ids.iter().copied().collect(),
             reads,
             writes,
             last_use_reads: HashSet::new(),
