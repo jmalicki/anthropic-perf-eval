@@ -2132,6 +2132,69 @@ mod ssa_tests {
         assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution: {:?}", result.err());
     }
 
+    /// Regression: a value's scratch interval must cover every reader, not one reader picked
+    /// before solving. `v` has two readers: `early` (emitted last, so the old model took it as
+    /// "the last use") can run at once, `late` must wait for a chain whose widest point holds
+    /// 32 words. With a 36-word budget `v` cannot be live across that point, but the old model
+    /// stopped counting `v` after `early`, accepted the schedule, and address assignment then
+    /// needed 40 words. `verify_scratch_budget_all_readers` panics inside the solve if the
+    /// model's intervals are too short.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_interval_covers_every_reader() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let s = emit.emit_const(3);
+        let v = emit.emit_vbroadcast(s);
+        let k = emit.emit_const(5);
+        let c0 = emit.emit_vbroadcast(k);
+        let c1 = emit.emit_valu(Opcode::Add, c0, c0);
+        let c2 = emit.emit_valu(Opcode::Add, c1, c1);
+        let c3 = emit.emit_valu(Opcode::Add, c2, c2);
+        // Widest point: c3 and three results live together (32 words).
+        let w1 = emit.emit_valu(Opcode::Add, c3, c3);
+        let w2 = emit.emit_valu(Opcode::Xor, c3, c3);
+        let w3 = emit.emit_valu(Opcode::Shl, c3, c3);
+        let m = emit.emit_valu(Opcode::Add, w1, w2);
+        let n = emit.emit_valu(Opcode::Add, m, w3);
+        let late = emit.emit_valu(Opcode::Xor, v, n);
+        emit.emit_vstore_imm(100, late);
+        let early = emit.emit_valu(Opcode::Add, v, v);
+        emit.emit_vstore_imm(108, early);
+
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        let result = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: 36,
+                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        );
+        let solution = result.expect("solve").expect("a schedule that creates v late fits in 36 words");
+
+        // Independent recount: v is live from its definition to its last reader.
+        let idx_of = |vreg| emit.ops.iter().position(|o| o.dest == Some(vreg)).unwrap();
+        let cycle = |vreg| solution.cycle_assignments[idx_of(vreg)];
+        let wide = cycle(w1).max(cycle(w2)).max(cycle(w3));
+        assert!(
+            cycle(v) > wide.min(cycle(w1)) || cycle(late) < cycle(w1),
+            "v (cycle {}) must not be live across the wide point (cycles {}..{}), late reader at {}",
+            cycle(v),
+            cycle(w1),
+            wide,
+            cycle(late)
+        );
+    }
+
     /// The post-solve precedence validator must check the lane cycles of shifted consumers.
     #[cfg(feature = "cpsat")]
     #[test]
@@ -3551,6 +3614,7 @@ mod tests {
                 live_out_vregs: None,
                 live_through_vregs: None,
                 cse_groups: None,
+                vector_group_lanes: None,
             },
             Some(true), // valid hints, within scratch
         );
