@@ -49,6 +49,35 @@ def test_greedy_barriers_flag_reaches_kwargs_and_run_options():
         parser.parse_args(["--greedy-barriers", "sometimes"])
 
 
+def test_greedy_priority_flags_reach_kwargs_and_run_options():
+    """--greedy-priority and its two parameters default to fifo/12/16 and are passed on and recorded."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    recorded = json.loads(default["run_options_json"])
+    for where in (default, recorded):
+        assert where["greedy_priority"] == "fifo"
+        assert where["greedy_stagger_cycles"] == 12
+        assert where["greedy_groups_in_flight"] == 16
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    args = parser.parse_args(["--use-greedy", "--greedy-barriers", "none", "--greedy-priority", "wavefront",
+                              "--greedy-stagger-cycles", "9", "--greedy-groups-in-flight", "0"])
+    kwargs = args_to_build_kwargs(args, use_git_sha=False)
+    recorded = json.loads(kwargs["run_options_json"])
+    for where in (kwargs, recorded):
+        assert where["greedy_priority"] == "wavefront"
+        assert where["greedy_stagger_cycles"] == 9
+        assert where["greedy_groups_in_flight"] == 0
+    for bad in (["--greedy-priority", "lifo"], ["--greedy-stagger-cycles", "-1"],
+                ["--greedy-groups-in-flight", "many"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(bad)
+
+
 def _build(n_nodes, rounds=2, batch_size=16):
     instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
         forest_height=10, n_nodes=n_nodes, batch_size=batch_size, rounds=rounds, verbose=False, use_cpsat=False)

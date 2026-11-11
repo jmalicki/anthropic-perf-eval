@@ -222,6 +222,35 @@ def test_greedy_barriers_none():
         )
 
 
+def test_greedy_priority_wavefront():
+    """PyO3: greedy_priority='wavefront' with its parameters is accepted and produces correct output."""
+    import scheduler_rs
+
+    for extra in ({}, {"greedy_stagger_cycles": 0, "greedy_groups_in_flight": 0},
+                  {"greedy_stagger_cycles": 30, "greedy_groups_in_flight": 2}):
+        # A fresh image per build: the reference kernel updates the image it is given.
+        forest = Tree.generate(FOREST_HEIGHT)
+        inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+        mem = build_mem_image(forest, inp)
+        instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+            verbose=False,
+            use_cpsat=False,
+            greedy_barriers="none",
+            greedy_priority="wavefront",
+            **extra,
+        )
+        assert not stats.get("budget_exceeded", False), extra
+        _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+    with pytest.raises(ValueError, match="greedy_priority"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+            verbose=False,
+            use_cpsat=False,
+            greedy_priority="lifo",
+        )
+
+
 def test_depth3_validates():
     """Depth 3 tree-reduce: kernel with tree_reduce_max_depth=3 must match reference.
 

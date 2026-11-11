@@ -148,8 +148,9 @@ impl Pass for GreedySchedulePass {
         // schedule, which is only valid if it uses the encodings the model will force.
         let forced = ForcedEncodings::from_context(ctx);
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
-        let (cycles, budget_exceeded, peak_live) =
-            ssa_greedy::schedule_ssa_greedy_with_diagnostics(
+        let shape = ctx.config.compiler.greedy_shape();
+        let ((cycles, budget_exceeded, peak_live), _agreement) =
+            ssa_greedy::schedule_ssa_greedy_shaped(
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut ctx.greedy_decisions.shifted_ops,
@@ -169,6 +170,7 @@ impl Pass for GreedySchedulePass {
                 forced.shifted_ops.as_ref(),
                 forced.select_choice.as_ref(),
                 &mut diagnostics,
+                &shape,
             )?;
         // With a fixed encoding the scheduler does not record its (non-)decisions; record them
         // here so hints and lowering see what was scheduled.
