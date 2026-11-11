@@ -190,6 +190,9 @@ Output options:
 - `--seed N` - Random seed for validation (default: 123)
 - `-q, --quiet` - Suppress verbose Rust scheduler output
 
+Emission options (change which ops the kernel contains; all off by default, each backed by a Z3 proof in `verification/rewrites.py`; measurements in [docs/EMISSION_ABLATION.md](docs/EMISSION_ABLATION.md)):
+- `--merge-hash-stages` - Hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per hash instead of 11 (proof `R8-hash-stage-merge`).
+
 **Why SSA builder?**
 - Eliminates false dependencies between operations
 - Enables better scheduling with CP-SAT

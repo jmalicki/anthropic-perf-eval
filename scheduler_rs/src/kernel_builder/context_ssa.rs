@@ -146,6 +146,9 @@ pub struct SsaScratchContext {
     pub hash_fma_mult: [Option<i64>; 6], // Pre-computed FMA multipliers
     pub hash_fma_mult_s: HashMap<usize, VReg>, // stage -> scalar VReg
     pub v_hash_mult: HashMap<usize, VReg>, // stage -> vector VReg
+    /// Merged hash stages 2+3 (`ProblemSpec::merge_hash_stages`): vectors of
+    /// `(c1, m2, c2)` in `(a * m1 + c1) ^ (a * m2 + c2)`; `m1` is `v_hash_mult[2]`.
+    pub v_hash_merged: Option<(VReg, VReg, VReg)>,
 
     // =========================================================================
     // Partition-specific (TickTock)

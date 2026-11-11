@@ -38,7 +38,8 @@ run_python() {
     set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_forced_modes.py tests/test_determinism.py \
       tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
       tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
-      tests/test_inspect_schedule.py tests/test_kernel_build_args.py solver/test_slot_utilization.py
+      tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_emission_options.py \
+      solver/test_slot_utilization.py
   fi
   uv run pytest -q "$@"
 }

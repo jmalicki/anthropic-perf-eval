@@ -56,8 +56,43 @@ def _positive_finite_float(text: str) -> float:
     return value
 
 
+# =============================================================================
+# Emission options
+# =============================================================================
+# What ops the kernel contains (docs/EMISSION_ABLATION.md). Kept apart from the scheduler
+# options: this dict is the single list of them (name -> default) for the CLI, run_options,
+# the binding kwargs and the run header, and add_emission_args is their only argparse block.
+EMISSION_DEFAULTS = {
+    "merge_hash_stages": False,
+}
+
+
+def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
+    """Add the emission options to parser. Returns the argument group."""
+    group = parser.add_argument_group(
+        "Emission options",
+        "Change which ops the kernel contains. Defaults leave the emission unchanged; each option is "
+        "backed by a proof in verification/rewrites.py. See docs/EMISSION_ABLATION.md.")
+    group.add_argument("--merge-hash-stages", action="store_true", default=EMISSION_DEFAULTS["merge_hash_stages"],
+                       help="Emit hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per "
+                            "hash instead of 11 (proof: R8-hash-stage-merge)")
+    return group
+
+
+def emission_options(get) -> dict:
+    """Every emission option with its value, read through `get(name, default)`."""
+    return {name: get(name, default) for name, default in EMISSION_DEFAULTS.items()}
+
+
+def non_default_emission_options(build_kwargs: dict) -> dict:
+    """Emission options in `build_kwargs` that differ from their defaults (for the run header)."""
+    return {name: build_kwargs[name] for name, default in EMISSION_DEFAULTS.items()
+            if build_kwargs.get(name, default) != default}
+
+
 def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
     """Add kernel build options to parser. Returns the argument group."""
+    add_emission_args(parser)
     group = parser.add_argument_group("Kernel build")
 
     # Problem parameters
@@ -234,6 +269,7 @@ def args_to_build_kwargs(
         out_path = DEFAULT_SCHEDULER_JSON
 
     run_options = {
+        **emission_options(get),
         "forest_height": forest_height,
         "n_nodes": n_nodes,
         "batch_size": batch_size,
@@ -271,6 +307,7 @@ def args_to_build_kwargs(
     enable_cse = False if get("no_cse_groups", False) else None
 
     return {
+        **emission_options(get),
         "forest_height": forest_height,
         "n_nodes": n_nodes,
         "batch_size": batch_size,
