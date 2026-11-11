@@ -64,7 +64,7 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--forest-height", type=int, default=10,
                        help="Tree depth (default: 10, gives 2047 nodes)")
     group.add_argument("--n-nodes", type=int, default=None,
-                       help="Number of tree nodes (default: 2^forest_height - 1)")
+                       help="Number of tree nodes (default: 2^(forest_height+1) - 1, i.e. 2047 for height 10)")
     group.add_argument("--batch-size", type=int, default=256,
                        help="Parallel traversals; must be multiple of 8 (default: 256)")
     group.add_argument("--rounds", type=int, default=16,
