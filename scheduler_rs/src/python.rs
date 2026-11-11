@@ -1061,7 +1061,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// If output_json is provided, writes schedule with usage accounting to the specified path.
 /// liveness_detail controls verbosity of liveness data in JSON: "none", "summary", or "full" (default).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1103,7 +1103,16 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     enable_select_choice_hint_pass: bool,
     enable_valu_shift_hint_pass: bool,
     enable_schedule_with_fixed_choices: bool,
+    cpsat_deterministic_time: Option<f64>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+    if let Some(dtime) = cpsat_deterministic_time {
+        if !(dtime.is_finite() && dtime > 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "cpsat_deterministic_time must be a positive finite number, got {}",
+                dtime
+            )));
+        }
+    }
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "batch_size must be a positive multiple of VLEN ({}) (got {}). Use e.g. 8, 16, 32.",
@@ -1158,6 +1167,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     };
 
     let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.cpsat_deterministic_time = cpsat_deterministic_time;
 
     if use_cpsat && !builder.config.compiler.enable_ssa_dce {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(

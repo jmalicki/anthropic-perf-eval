@@ -635,7 +635,8 @@ pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
 
     // Sort intervals by start cycle (same as linear scan)
     let mut sorted: Vec<(&VReg, &LiveInterval)> = intervals.iter().collect();
-    sorted.sort_by_key(|(_, interval)| (interval.start, interval.end));
+    // VReg breaks ties so the order does not depend on HashMap iteration order.
+    sorted.sort_by_key(|(vreg, interval)| (interval.start, interval.end, **vreg));
 
     // Simulate linear scan to track actual peak
     // Active set: (end_cycle, size)
@@ -749,7 +750,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 
     // Collect intervals with their VRegs, sorted by start cycle
     let mut sorted: Vec<(VReg, LiveInterval)> = intervals.into_iter().collect();
-    sorted.sort_by_key(|(_, interval)| (interval.start, interval.end));
+    // VReg breaks ties: values that start and end together would otherwise be allocated in
+    // HashMap iteration order, giving the same schedule different addresses on every run.
+    sorted.sort_by_key(|(vreg, interval)| (interval.start, interval.end, *vreg));
 
     // Handle fixed VRegs and build the set of used address ranges (for O(V²) gap-based allocation).
     let mut vreg_to_addr: HashMap<VReg, i64> = HashMap::new();
@@ -1275,7 +1278,7 @@ pub fn lower_ssa_op(ssa_op: &SsaOp, vreg_to_addr: &HashMap<VReg, i64>) -> Result
         engine: ssa_op.engine,
         slot,
         cycle: ssa_op.cycle,
-        dep_ids: ssa_op.dep_ids.clone(),
+        dep_ids: ssa_op.dep_ids.iter().copied().collect(),
         reads,
         writes,
         last_use_reads: HashSet::new(), // Will be computed by scheduler

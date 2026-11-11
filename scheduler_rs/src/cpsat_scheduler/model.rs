@@ -108,6 +108,32 @@ fn greedy_schedule_matches_forced_modes(
     shift_ok && const_ok && select_ok
 }
 
+/// Fallback deterministic-time budget for each CP-SAT solve, from the
+/// `CPSAT_MAX_DETERMINISTIC_TIME` environment variable. Used only when the config does not
+/// set `deterministic_time_limit` (e.g. for tests and tools that call the solver directly).
+///
+/// # Returns
+/// `Some(limit)` when the variable holds a positive number, else `None` (no limit).
+#[cfg(feature = "cpsat")]
+fn max_deterministic_time_from_env() -> Option<f64> {
+    std::env::var("CPSAT_MAX_DETERMINISTIC_TIME")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// Entries of `map` in ascending key order.
+///
+/// Anything that adds variables, constraints, hints or search-strategy entries must iterate
+/// maps through this: `HashMap` order is randomised per process, and a different creation
+/// order gives CP-SAT a different model (different fingerprint, different schedule).
+#[cfg(feature = "cpsat")]
+fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
+    let mut entries: Vec<(&K, &V)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+}
+
 /// Schedule SSA operations using CP-SAT solver.
 ///
 /// This operates on SsaOps BEFORE register allocation, using only RAW dependencies.
@@ -141,6 +167,7 @@ pub fn schedule_ssa_cpsat(
 
     let SsaCpsatConfig {
         time_limit_secs,
+        deterministic_time_limit,
         verbose,
         stop_after_first_solution,
         enable_valu_shift,
@@ -642,7 +669,12 @@ pub fn schedule_ssa_cpsat(
         }
         let n_streams = streams.len();
         let mut lex_constraints = 0usize;
-        for (stream_key, by_item) in &streams {
+        // Sorted: HashMap iteration order is randomised per process, and constraint order
+        // changes the model CP-SAT sees (and so the schedule it finds).
+        let mut stream_keys: Vec<&Vec<i64>> = streams.keys().collect();
+        stream_keys.sort();
+        for stream_key in stream_keys {
+            let by_item = &streams[stream_key];
             let mut ordered: Vec<Vec<usize>> = by_item.values().cloned().collect();
             if let Some(hints) = greedy_hints {
                 // Sort items by greedy cycle of their first op so lex constraints match the hint.
@@ -1874,11 +1906,13 @@ pub fn schedule_ssa_cpsat(
         // asserts no dead VRegs when DCE is enabled.
 
         // Collect VRegs that have both definition and use (all defined VRegs when DCE ran)
-        let live_vregs: Vec<VReg> = vreg_def_op
+        let mut live_vregs: Vec<VReg> = vreg_def_op
             .keys()
             .filter(|v| vreg_last_use.contains_key(v))
             .copied()
             .collect();
+        // Sorted so scratch intervals are created in the same order on every run.
+        live_vregs.sort();
 
         // Segment mode with live-out or live-through: need segment_end so we can model
         // VRegs live until end of segment (live-out = defined here, used later; live-through = defined in prev section, used later).
@@ -2073,6 +2107,8 @@ pub fn schedule_ssa_cpsat(
             // but they must be accounted for in scratch since they're live until segment end.
             if let Some(lo) = live_out_vregs {
                 if let Some(seg_end) = segment_end_var {
+                    let mut lo: Vec<&VReg> = lo.iter().collect();
+                    lo.sort();
                     for vreg in lo {
                         // Only add if not already processed (not in live_vregs)
                         if !live_vregs.contains(vreg) {
@@ -2140,6 +2176,8 @@ pub fn schedule_ssa_cpsat(
             // Segment mode: add [0, segment_end+1] intervals for live-through VRegs (defined in prev section, used in later section)
             if let (Some(lt), Some(seg_end)) = (live_through_vregs, segment_end_var) {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
+                let mut lt: Vec<&VReg> = lt.iter().collect();
+                lt.sort();
                 for vreg in lt {
                     let end_expr = LinearExpr::from(seg_end) + 1;
                     let size = model.new_int_var_with_name(
@@ -2712,11 +2750,11 @@ pub fn schedule_ssa_cpsat(
         let c = model.add_ge(max_cycle, LinearExpr::from(cv));
         model.set_constraint_name(c, &format!("max_cycle_ge_c_{}", cv_idx));
     }
-    for (idx, &completion_var) in completion_cycle_vars.iter() {
+    for (idx, &completion_var) in sorted_by_key(&completion_cycle_vars) {
         let c = model.add_ge(max_cycle, LinearExpr::from(completion_var));
         model.set_constraint_name(c, &format!("max_cycle_ge_completion_{}", idx));
     }
-    for (idx, &fma_last) in select_choice_fma_last_cycle.iter() {
+    for (idx, &fma_last) in sorted_by_key(&select_choice_fma_last_cycle) {
         let c = model.add_ge(max_cycle, LinearExpr::from(fma_last));
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
     }
@@ -3244,14 +3282,14 @@ pub fn schedule_ssa_cpsat(
         let use_fma = |idx: usize| -> bool {
             select_choice_hints.map_or(false, |h| h.contains(&ops[idx].id))
         };
-        for (&idx, &fma_last_var) in &select_choice_fma_last_cycle {
+        for (&idx, &fma_last_var) in sorted_by_key(&select_choice_fma_last_cycle) {
             let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
             if hint_cycle >= 0 {
                 model.add_hint(fma_last_var, (hint_cycle + 1) as i64);
             }
         }
         // Hint select_fma_extra vars (0 or 1 = same as choice_var) so hint is complete.
-        for (&(dep_idx, _idx), &extra_var) in &select_fma_extra_vars {
+        for (&(dep_idx, _idx), &extra_var) in sorted_by_key(&select_fma_extra_vars) {
             model.add_hint(extra_var, if use_fma(dep_idx) { 1 } else { 0 });
         }
 
@@ -3385,6 +3423,19 @@ pub fn schedule_ssa_cpsat(
     // 12. Configure solver
     let mut params = SatParameters::default();
     params.max_time_in_seconds = Some(time_limit_secs);
+    // Wall-clock limits make the result depend on machine load: the same command explores
+    // less on a busy machine and returns a different schedule. A deterministic-time budget
+    // (CP-SAT's own work counter) gives the same schedule every time. The wall-clock limit
+    // above stays as a backstop.
+    let deterministic_budget = deterministic_time_limit
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .or_else(max_deterministic_time_from_env);
+    if let Some(dtime) = deterministic_budget {
+        params.max_deterministic_time = Some(dtime);
+        if verbose {
+            eprintln!("  CP-SAT deterministic time limit: {}", dtime);
+        }
+    }
     // Optional: crash when presolve adjusts a hint. Not default: presolve can tighten domains and
     // clamp hints; that's expected and the solve still succeeds.
     if std::env::var("CPSAT_DEBUG_PRESOLVE_HINT").is_ok() {
@@ -3451,13 +3502,13 @@ pub fn schedule_ssa_cpsat(
 
         // Phase 1: Structural decisions (shift? FMA? Load?) — branch on these first
         let mut choice_var_indices: Vec<i32> = Vec::new();
-        for (_, &bv) in &shift_vars {
+        for (_, &bv) in sorted_by_key(&shift_vars) {
             choice_var_indices.push(bv.index());
         }
-        for (_, &bv) in &const_choice_vars {
+        for (_, &bv) in sorted_by_key(&const_choice_vars) {
             choice_var_indices.push(bv.index());
         }
-        for (_, &bv) in &select_choice_vars {
+        for (_, &bv) in sorted_by_key(&select_choice_vars) {
             choice_var_indices.push(bv.index());
         }
         if !choice_var_indices.is_empty() {
@@ -3511,9 +3562,32 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // Optional export of the exact model handed to the solver (CPSAT_EXPORT_MODEL=path), e.g.
+    // to diff two builds with scripts/diff_cpsat_models.py. Later solves in the same process
+    // (per-section runs come first) overwrite the file, so it holds the last model built.
+    if let Ok(path) = std::env::var("CPSAT_EXPORT_MODEL") {
+        let bytes = prost::Message::encode_to_vec(model.proto());
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => eprintln!("  CP-SAT model exported to {}", path),
+            Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path, e),
+        }
+    }
+
     // 14. Solve
     let response = model.solve_with_parameters(&params);
     let solve_time = start_time.elapsed().as_secs_f64();
+    // A deterministic budget only makes the run reproducible if the solve ended on it (or on
+    // optimality). If the wall-clock backstop fired first, how far the search got depended on
+    // machine load, so say so.
+    if let Some(dtime) = deterministic_budget {
+        if response.wall_time >= time_limit_secs * 0.999 && response.deterministic_time < dtime {
+            eprintln!(
+                "  WARNING: CP-SAT stopped on the wall-clock limit ({:.0}s) after {:.1} of {} deterministic time; \
+                 this result is not reproducible. Raise --cpsat-time-limit.",
+                time_limit_secs, response.deterministic_time, dtime
+            );
+        }
+    }
 
     let status: CpsatStatus = response.status().into();
 

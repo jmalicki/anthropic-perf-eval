@@ -103,7 +103,10 @@ pub fn build_cse_groups(ops: &[SsaOp]) -> Vec<CseGroup> {
 
     // Group SelectChoice ops by (true_val, false_val)
     // Only include: Opcode::SelectChoice, sub_temp_vreg.is_some(), delta_vreg.is_none()
-    let mut key_to_indices: HashMap<(VReg, VReg), Vec<usize>> = HashMap::new();
+    // Ordered map: sub_temp VReg ids are handed out in iteration order below, and they must be
+    // the same on every run (they break ties in address assignment).
+    let mut key_to_indices: std::collections::BTreeMap<(VReg, VReg), Vec<usize>> =
+        std::collections::BTreeMap::new();
 
     for (idx, op) in ops.iter().enumerate() {
         if op.opcode != Opcode::SelectChoice {

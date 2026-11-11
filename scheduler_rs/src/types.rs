@@ -1411,7 +1411,9 @@ pub struct SsaOp {
     pub srcs: Vec<Operand>,
 
     /// Op IDs this op depends on (RAW dependencies only)
-    pub dep_ids: HashSet<usize>,
+    /// Ordered: loops over an op's dependencies create solver constraints, and their order
+    /// must be the same on every run (HashSet order is randomised per process).
+    pub dep_ids: std::collections::BTreeSet<usize>,
 
     /// Scheduled cycle (-1 if unscheduled)
     pub cycle: i32,
@@ -1488,7 +1490,7 @@ impl SsaOp {
             opcode,
             dest,
             srcs,
-            dep_ids: HashSet::new(),
+            dep_ids: std::collections::BTreeSet::new(),
             cycle: -1,
             produces_constant: None,
             source: None,

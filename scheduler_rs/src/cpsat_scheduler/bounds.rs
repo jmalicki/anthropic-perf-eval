@@ -313,6 +313,11 @@ impl std::fmt::Display for AsapAlapTightening {
 pub struct SsaCpsatConfig {
     /// Maximum solving time in seconds (default: 60.0)
     pub time_limit_secs: f64,
+    /// Solve budget in CP-SAT deterministic time (the solver's own work counter). Unlike
+    /// `time_limit_secs` it does not depend on machine load, so results are reproducible.
+    /// `None` = no deterministic limit (the `CPSAT_MAX_DETERMINISTIC_TIME` environment
+    /// variable is used as a fallback if set).
+    pub deterministic_time_limit: Option<f64>,
     /// Print solver progress
     pub verbose: bool,
     /// If true, stop after finding the first feasible solution
@@ -369,6 +374,7 @@ impl Default for SsaCpsatConfig {
     fn default() -> Self {
         Self {
             time_limit_secs: 60.0,
+            deterministic_time_limit: None,
             verbose: true, // Default: show optimizer output
             stop_after_first_solution: false,
             enable_valu_shift: false,
@@ -1496,7 +1502,8 @@ pub(crate) fn build_ordering_pairs_from_bounds(
     alap: &HashMap<usize, i32>,
     greedy_hints: Option<&[i32]>,
 ) -> Vec<(usize, usize)> {
-    let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+    // Ordered so the pairs come out in the same order on every run.
+    let mut groups: std::collections::BTreeMap<Vec<i64>, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, op) in ops.iter().enumerate() {
         let Some(ref hint) = op.symmetry_hint else {
             continue;
