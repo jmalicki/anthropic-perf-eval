@@ -148,7 +148,12 @@ impl Pass for GreedySchedulePass {
         // schedule, which is only valid if it uses the encodings the model will force.
         let forced = ForcedEncodings::from_context(ctx);
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
-        let shape = ctx.config.compiler.greedy_shape();
+        let mut shape = ctx.config.compiler.greedy_shape();
+        // CP-SAT hints carry one cycle per op, so a split shift cannot be hinted.
+        if is_cpsat_pipeline {
+            shape.split_shift = false;
+        }
+        let mut shifted_lane_cycles = std::collections::HashMap::new();
         let ((cycles, budget_exceeded, peak_live), _agreement) =
             ssa_greedy::schedule_ssa_greedy_shaped(
                 &mut ctx.ops,
@@ -171,7 +176,9 @@ impl Pass for GreedySchedulePass {
                 forced.select_choice.as_ref(),
                 &mut diagnostics,
                 &shape,
+                &mut shifted_lane_cycles,
             )?;
+        ctx.greedy_decisions.shifted_alu_cycles = shifted_lane_cycles;
         // With a fixed encoding the scheduler does not record its (non-)decisions; record them
         // here so hints and lowering see what was scheduled.
         if let Some(shifted) = forced.shifted_ops {
