@@ -6137,7 +6137,7 @@ mod tuning_objective_tests {
 
     /// Four independent chains of shiftable vector adds behind a select: enough work that
     /// the vector engine (one slot here) and the mode choices decide the makespan.
-    fn toy_ops() -> Vec<SsaOp> {
+    pub(super) fn toy_ops() -> Vec<SsaOp> {
         let mut emit = SsaEmitContext::new();
         let c0 = emit.emit_const(0);
         let c1 = emit.emit_const(1);
@@ -6155,7 +6155,7 @@ mod tuning_objective_tests {
         emit.ops
     }
 
-    fn solve(ops: &[SsaOp], objective: CpsatObjective) -> SsaCpsatResult {
+    pub(super) fn solve(ops: &[SsaOp], tuning: CpsatTuning) -> SsaCpsatResult {
         let config = SsaCpsatConfig {
             time_limit_secs: 30.0,
             verbose: false,
@@ -6163,7 +6163,7 @@ mod tuning_objective_tests {
             machine: MachineConfig { valu_slots: 2, ..Default::default() },
             asap_alap_tightening: AsapAlapTightening::None,
             force_zero_gap: true,
-            tuning: CpsatTuning { objective, ..Default::default() },
+            tuning,
             ..Default::default()
         };
         schedule_ssa_cpsat(ops, config, SsaCpsatHints::default(), None)
@@ -6176,8 +6176,9 @@ mod tuning_objective_tests {
     #[test]
     fn test_makespan_only_objective_reaches_the_same_optimal_makespan() {
         let ops = toy_ops();
-        let with_tie = solve(&ops, CpsatObjective::MakespanTiebreak);
-        let makespan_only = solve(&ops, CpsatObjective::Makespan);
+        let with_tie = solve(&ops, CpsatTuning::default());
+        let makespan_only =
+            solve(&ops, CpsatTuning { objective: CpsatObjective::Makespan, ..Default::default() });
         assert_eq!(with_tie.status, CpsatStatus::Optimal);
         assert_eq!(makespan_only.status, CpsatStatus::Optimal);
         assert_eq!(makespan_only.makespan, with_tie.makespan);
@@ -6261,5 +6262,45 @@ mod tuning_alap_tests {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// CP-SAT tuning: makespan interval
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_makespan_interval_tests {
+    use super::tuning_objective_tests::{solve, toy_ops};
+    use super::*;
+
+    /// The interval [makespan, horizon) with full demand on every engine excludes no schedule:
+    /// the proved optimum is the same with and without it, under both objectives.
+    #[test]
+    fn test_makespan_interval_keeps_the_optimal_makespan() {
+        let ops = toy_ops();
+        let base = solve(&ops, CpsatTuning::default());
+        assert_eq!(base.status, CpsatStatus::Optimal);
+        for objective in [CpsatObjective::MakespanTiebreak, CpsatObjective::Makespan] {
+            let tuned = solve(
+                &ops,
+                CpsatTuning { makespan_interval: true, objective, ..Default::default() },
+            );
+            assert_eq!(tuned.status, CpsatStatus::Optimal, "{:?}", objective);
+            assert_eq!(tuned.makespan, base.makespan, "{:?}", objective);
+        }
+    }
+
+    #[test]
+    fn test_push_all_tasks_toward_start_reaches_the_solver_parameters() {
+        let default =
+            super::super::model::build_sat_parameters(60.0, None, false, None, &CpsatTuning::default());
+        assert_eq!(default.push_all_tasks_toward_start, None);
+        let tuning = CpsatTuning { push_all_tasks_toward_start: true, ..Default::default() };
+        let params = super::super::model::build_sat_parameters(60.0, None, false, None, &tuning);
+        assert_eq!(params.push_all_tasks_toward_start, Some(true));
+        // makespan_interval is a model change, not a solver parameter.
+        let tuning = CpsatTuning { makespan_interval: true, ..Default::default() };
+        assert_eq!(super::super::model::build_sat_parameters(60.0, None, false, None, &tuning), default);
     }
 }

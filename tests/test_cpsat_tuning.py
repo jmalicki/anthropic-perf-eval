@@ -282,3 +282,62 @@ def test_slack_none_is_sent_as_null():
     assert json.loads(kwargs["run_options_json"])["cpsat_tuning"]["greedy_alap_slack"] is None
     with pytest.raises(ValueError, match="greedy_alap_slack"):
         scheduler_rs.resolve_cpsat_tuning('{"greedy_alap_slack": -3}')
+
+
+# ----------------------------------------------------------------------------
+# Makespan interval in the engine cumulatives
+# ----------------------------------------------------------------------------
+
+ENGINE_CUMULATIVES = ["cumul_valu", "cumul_alu", "cumul_load", "cumul_store", "cumul_flow"]
+
+
+def _cumulatives(model):
+    return {c.name: c.cumulative for c in model.constraints if c.WhichOneof("constraint") == "cumulative"}
+
+
+def test_makespan_interval_reaches_the_model(tmp_path):
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    output, tuned_path, sched, _ = _run(tmp_path, "tail", ["--cpsat-makespan-interval"], quiet=False)
+    base, tuned = diff_cpsat_models.load(str(base_path)), diff_cpsat_models.load(str(tuned_path))
+    assert "makespan_tail_size" not in _variables(base)
+    variables = _variables(tuned)
+    makespan_index, _, horizon = variables["makespan"]
+    size_index = variables["makespan_tail_size"][0]
+
+    base_cumulatives, tuned_cumulatives = _cumulatives(base), _cumulatives(tuned)
+    present = [name for name in ENGINE_CUMULATIVES if name in base_cumulatives]
+    assert present, "the model has engine cumulatives"
+    tails = set()
+    for name in present:
+        before, after = base_cumulatives[name], tuned_cumulatives[name]
+        assert len(after.intervals) == len(before.intervals) + 1, name
+        assert not after.demands[-1].vars and after.demands[-1].offset == after.capacity.offset, \
+            f"{name}: the makespan interval takes the whole capacity"
+        tails.add(after.intervals[-1])
+    assert len(tails) == 1, "one interval shared by all engine cumulatives"
+    tail = tuned.constraints[tails.pop()].interval
+    assert list(tail.start.vars) == [makespan_index] and tail.start.offset == 0
+    assert list(tail.size.vars) == [size_index]
+    assert not tail.end.vars and tail.end.offset == horizon, "the interval ends at the horizon"
+    # The scratch cumulative is not touched: live intervals may end after the makespan.
+    assert len(tuned_cumulatives["cumul_scratch"].intervals) == len(base_cumulatives["cumul_scratch"].intervals)
+    # The hint stays complete.
+    assert size_index in _hints(tuned)
+    assert "solution hint is complete and is feasible" in output
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["makespan_interval"] is True
+
+
+def test_push_tasks_toward_start_reaches_the_solver(tmp_path):
+    output, model_path, _, _ = _run(tmp_path, "push", ["--cpsat-push-tasks-toward-start"], quiet=False)
+    assert "push_all_tasks_toward_start: true" in _solver_parameters(output)
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    assert not _model_diff(base_path, model_path), "a solver parameter, not a model change"
+
+
+def test_makespan_interval_off_is_the_default_model(tmp_path):
+    output, base, _, _ = _run(tmp_path, "base", [], quiet=False)
+    assert "push_all_tasks_toward_start" not in _solver_parameters(output)
+    _, same, _, _ = _run(tmp_path, "explicit",
+                         ["--no-cpsat-makespan-interval", "--no-cpsat-push-tasks-toward-start"])
+    assert not _model_diff(base, same)

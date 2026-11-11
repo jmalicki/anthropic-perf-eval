@@ -99,6 +99,8 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_greedy_alap_slack", "greedy_alap_slack"),
     ("cpsat_horizon_max_latency", "horizon_at_least_max_latency_path"),
     ("cpsat_horizon_num_ops", "horizon_at_least_num_ops"),
+    ("cpsat_makespan_interval", "makespan_interval"),
+    ("cpsat_push_tasks_toward_start", "push_all_tasks_toward_start"),
 ]
 
 
@@ -155,6 +157,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Raise the horizon (greedy makespan + 20) to the number of ops (default: on). "
                             "--no-cpsat-horizon-num-ops keeps the tight horizon; it relies on the greedy "
                             "schedule being feasible.")
+    group.add_argument("--cpsat-makespan-interval", action=argparse.BooleanOptionalAction, default=None,
+                       help="Add an interval [makespan, horizon) with demand = capacity to each engine "
+                            "cumulative, as OR-Tools' rcpsp_sat.py does, so the LP relaxation and energy cuts "
+                            "see the makespan (default: off)")
+    group.add_argument("--cpsat-push-tasks-toward-start", action=argparse.BooleanOptionalAction, default=None,
+                       help="CP-SAT push_all_tasks_toward_start (experimental solver parameter; default: off)")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
