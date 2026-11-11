@@ -2195,6 +2195,47 @@ mod ssa_tests {
         );
     }
 
+    /// The scratch model's reader lists must include liveness-only uses (`keep_live`) and
+    /// must resolve vector-group aliases in both directions, for operands and for `keep_live`.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_scratch_readers_include_keep_live_and_group_aliases() {
+        use crate::cpsat_scheduler::model::scratch_readers_by_vreg;
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+
+        let mut emit = SsaEmitContext::new();
+        let c = emit.emit_const(7);
+        let held = emit.emit_vbroadcast(c);
+        let base = emit.emit_vload_imm(200);
+        let v_addr = emit.emit_valu(Opcode::Add, base, base);
+        let addr_lanes = emit.decompose_vector(v_addr);
+        let (v_loaded, loaded_lanes) = emit.fresh_vector_group();
+        for (addr, dest) in addr_lanes.iter().zip(loaded_lanes.iter()) {
+            emit.emit_load_into(*addr, *dest);
+        }
+        // `user` reads the assembled alias and holds `held` and a lane of `v_addr` live.
+        emit.set_next_keep_live(vec![held, addr_lanes[3]]);
+        let user = emit.emit_valu(Opcode::Xor, v_loaded, base);
+        emit.emit_vstore_imm(300, user);
+
+        let groups = emit.take_vector_group_lanes();
+        let vreg_def_op: HashMap<VReg, usize> =
+            emit.ops.iter().enumerate().filter_map(|(i, op)| op.dest.map(|d| (d, i))).collect();
+        let readers = scratch_readers_by_vreg(&emit.ops, &vreg_def_op, Some(&groups), None);
+        let user_idx = vreg_def_op[&user];
+
+        // keep_live: `held` has no operand reader at all, only the liveness-only use.
+        assert_eq!(readers.get(&held), Some(&vec![user_idx]), "keep_live must count as a reader");
+        // Read group: the eight loads read lanes of v_addr; keep_live on a lane reaches the group.
+        let addr_readers = &readers[&v_addr];
+        assert_eq!(addr_readers.len(), 9, "8 loads + the keep_live holder: {:?}", addr_readers);
+        assert!(addr_readers.contains(&user_idx));
+        // Write group: reading the alias is a read of every loaded lane.
+        for lane in &loaded_lanes {
+            assert_eq!(readers.get(lane), Some(&vec![user_idx]));
+        }
+    }
+
     /// The post-solve precedence validator must check the lane cycles of shifted consumers.
     #[cfg(feature = "cpsat")]
     #[test]

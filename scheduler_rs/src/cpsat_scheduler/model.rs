@@ -139,8 +139,10 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
 ///
 /// An op that reads a lane of a decomposed vector (read group) is a reader of that vector;
 /// an op that reads the alias of an assembled vector (write group) is a reader of each lane.
-/// A SelectChoice also reads its `delta_vreg`. Ops with a negative hint cycle are dead stores
-/// and are skipped.
+/// A SelectChoice also reads its `delta_vreg`, and an op is a reader of every VReg in its
+/// `keep_live` list (a liveness-only use; it is timed like the op's operand reads, which is
+/// never earlier than the op's cycle). Ops with a negative hint cycle are dead stores and are
+/// skipped.
 ///
 /// # Arguments
 /// * `ops` - SSA ops
@@ -151,7 +153,7 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
 /// # Returns
 /// Defined VReg → reader op indices (sorted, deduplicated). VRegs without readers are absent.
 #[cfg(feature = "cpsat")]
-fn scratch_readers_by_vreg(
+pub(crate) fn scratch_readers_by_vreg(
     ops: &[SsaOp],
     vreg_def_op: &HashMap<VReg, usize>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
@@ -180,7 +182,10 @@ fn scratch_readers_by_vreg(
         if greedy_hints.is_some_and(|h| h.get(idx).copied().unwrap_or(0) < 0) {
             continue;
         }
-        for vreg in op.reads().chain(op.delta_vreg) {
+        // `keep_live` entries are liveness-only uses: the value must stay allocated until this
+        // op runs even though it is not an operand (see `SsaOp::keep_live`).
+        let held = op.keep_live.iter().flatten().copied();
+        for vreg in op.reads().chain(op.delta_vreg).chain(held) {
             if let Some(group) = lane_to_group.get(&vreg) {
                 add(*group, idx);
             } else if let Some(lanes) = alias_to_lanes.get(&vreg) {
