@@ -22,10 +22,14 @@ KERNEL_JSON_ENV = "UPSTREAM_KERNEL_JSON"
 
 
 class KernelBuilder:
+    """The interface upstream's submission test expects, backed by a saved kernel."""
+
     def __init__(self):
+        """Start with an empty program; build_kernel fills it."""
         self.instrs = []
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
+        """Load the kernel named by UPSTREAM_KERNEL_JSON; refuse one saved for other parameters."""
         path = os.environ.get(KERNEL_JSON_ENV)
         if not path:
             raise RuntimeError(
@@ -44,4 +48,5 @@ class KernelBuilder:
         ]
 
     def debug_info(self):
+        """Return an empty scratch map; the submission test runs with debug disabled."""
         return DebugInfo(scratch_map={})

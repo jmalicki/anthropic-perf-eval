@@ -38,6 +38,17 @@ if [ -z "$kernel" ]; then
     echo "scheduler_rs is not installed in the project venv; run ./scripts/build_scheduler_rs.sh first" >&2
     exit 1
   fi
+  # The test below must run the kernel this build writes: refuse options that redirect or
+  # skip the save or change the problem size, and remove any kernel left by an earlier run.
+  for arg in "$@"; do
+    case "$arg" in
+      --save-kernel|--save-kernel=*|--validate-only|--validate-only=*|--output-json|--output-json=*|\
+      --forest-height|--forest-height=*|--batch-size|--batch-size=*|--rounds|--rounds=*|--n-nodes|--n-nodes=*)
+        echo "check_upstream.sh sets ${arg%%=*} itself; use --kernel PATH to test a kernel built elsewhere" >&2
+        exit 2 ;;
+    esac
+  done
+  rm -f "$kernel"
   echo "== Building kernel: generate_ssa_kernel.py --rounds 16 $* =="
   uv run generate_ssa_kernel.py --forest-height 10 --batch-size 256 --rounds 16 -q \
     --output-json scheduler_output_upstream_check.json --save-kernel "$kernel" "$@"
