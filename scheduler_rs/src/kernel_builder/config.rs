@@ -31,6 +31,55 @@ pub const SCRATCH_SIZE: usize = 1536;
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
 pub const MAX_TREE_REDUCE_DEPTH: u32 = 4;
 
+/// How the kernel represents each lane's tree index between rounds.
+///
+/// The reference index `idx` at tree depth `d` lies in `[2^d - 1, 2^(d+1) - 2]`
+/// (`R7-index-range-by-depth`). `Mirrored` tracks `n = L_d - idx` with
+/// `L_d = 2^(d+1) - 2` (`level_last_index`): the node's position in its level counted from
+/// the right. Proofs: `R9` to `R11` in `verification/rewrites.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexForm {
+    /// The reference index. Update per round: AND, SUB, multiply_add (3 vector ops).
+    #[default]
+    ZeroBased,
+    /// `n = L_d - idx`. Update per round: AND, multiply_add (2 vector ops); none of the
+    /// two at depth 0, where `n` is the branch bit itself, and nothing in the wrap round.
+    /// The initial indices are taken to be 0 (as the root broadcast in round 0 already
+    /// assumes), so they are not loaded; the final indices are stored as `L_d - n`.
+    Mirrored,
+}
+
+impl IndexForm {
+    /// Parse the CLI / binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"zero-based"` or `"mirrored"`.
+    ///
+    /// # Returns
+    /// The form, or an error message naming the valid spellings.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "zero-based" => Ok(IndexForm::ZeroBased),
+            "mirrored" => Ok(IndexForm::Mirrored),
+            other => Err(format!(
+                "Invalid index_form '{}': must be 'zero-based' or 'mirrored'",
+                other
+            )),
+        }
+    }
+}
+
+/// Largest tree index at depth `depth`: `L_d = 2^(d+1) - 2`.
+///
+/// # Arguments
+/// * `depth` - Tree depth (0 = root).
+///
+/// # Returns
+/// `L_d`; `L_0 = 0` and `L_(d+1) = 2 L_d + 2` (`R11-mirrored-index-range`).
+pub fn level_last_index(depth: usize) -> i64 {
+    (1i64 << (depth + 1)) - 2
+}
+
 /// Emission concern: what program to generate.
 ///
 /// Controls problem dimensions and emission behavior — which ops are
@@ -73,6 +122,8 @@ pub struct ProblemSpec {
     /// multiply_add, add, shift, XOR (4). Proved by `R8-hash-stage-merge` in
     /// `verification/rewrites.py`. Default false.
     pub merge_hash_stages: bool,
+    /// Representation of the tree index between rounds. Default `IndexForm::ZeroBased`.
+    pub index_form: IndexForm,
 }
 
 impl Default for ProblemSpec {
@@ -94,6 +145,7 @@ impl Default for ProblemSpec {
             enable_const_alu: true,
             max_alu_depth: None,
             merge_hash_stages: false,
+            index_form: IndexForm::ZeroBased,
         }
     }
 }
@@ -329,6 +381,26 @@ pub fn merged_hash_stage_constants(first: usize) -> Option<(i64, i64, i64, i64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same values as verification/rewrites.py level_last_index (tests/test_rewrite_proofs.py).
+    #[test]
+    fn test_level_last_index() {
+        assert_eq!(
+            (0..6).map(level_last_index).collect::<Vec<_>>(),
+            vec![0, 2, 6, 14, 30, 62]
+        );
+        for d in 0..11 {
+            assert_eq!(level_last_index(d + 1), 2 * level_last_index(d) + 2);
+        }
+    }
+
+    #[test]
+    fn test_index_form_from_str() {
+        assert_eq!(IndexForm::from_str("zero-based"), Ok(IndexForm::ZeroBased));
+        assert_eq!(IndexForm::from_str("mirrored"), Ok(IndexForm::Mirrored));
+        assert!(IndexForm::from_str("one-based").is_err());
+        assert_eq!(IndexForm::default(), IndexForm::ZeroBased);
+    }
 
     /// Same numbers as tests/test_rewrite_proofs.py checks for verification/rewrites.py.
     #[test]

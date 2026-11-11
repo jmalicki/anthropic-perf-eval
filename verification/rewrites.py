@@ -274,6 +274,99 @@ def check_index_range_by_depth(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+# =============================================================================
+# Mirrored index (--index-form mirrored)
+# =============================================================================
+#
+# The kernel may track n = L_d - idx instead of idx, where L_d = 2^(d+1) - 2 is the last
+# index of tree level d: n is the node's position in its level counted from the right.
+
+
+def level_last_index(depth: int) -> int:
+    """L_d = 2^(d+1) - 2, the largest index at tree depth d (config.rs level_last_index)."""
+    return (1 << (depth + 1)) - 2
+
+
+def _reference_next_index(idx, v):
+    """The reference update before the wrap: child 1 when the hashed value is even, else 2."""
+    return _const(2) * idx + If(URem(v, _const(2)) == _const(0), _const(1), _const(2))
+
+
+def check_mirrored_index_step(ctx=None) -> tuple[str, str, float, dict]:
+    """R9: with n = L - idx, the reference update becomes n' = 2n + (v' & 1), L' = 2L + 2.
+
+    v' = v ^ C is the optimised-form value and C is odd, so v' & 1 is 1 exactly when the
+    reference takes child 1. Mirroring the index absorbs that inversion: two ops (AND,
+    multiply_add) instead of three (AND, SUB, multiply_add; R3). Holds for every L, so in
+    particular for L_d = 2^(d+1) - 2, whose successor 2 L_d + 2 is L_(d+1). At depth 0
+    (n = 0) the update is the bit itself, so that round needs no multiply_add.
+    """
+    v, idx, level = _bv("v"), _bv("idx"), _bv("L")
+    bit = (v ^ _const(STAGE5_XOR_CONST)) & _const(1)
+    n = level - idx
+    return _refute(
+        "R9-mirrored-index-step",
+        (_const(2) * level + _const(2)) - _reference_next_index(idx, v) != _const(2) * n + bit,
+        # Depth 0: idx = 0 and L = 0, so n = 0 and the next n is the bit.
+        (_const(2) - _reference_next_index(_const(0), v)) != bit,
+        ctx=ctx,
+    )
+
+
+def check_mirrored_index_step_needs_odd_constant(ctx=None) -> tuple[str, str, float, dict]:
+    """R9-needs-odd: with an even deferred constant the mirrored update is wrong (SAT)."""
+    v, idx, level, c = _bv("v"), _bv("idx"), _bv("L"), _bv("c")
+    bit = (v ^ c) & _const(1)
+    solver = Solver(ctx=ctx)
+    solver.add(
+        c & _const(1) == _const(0),
+        (_const(2) * level + _const(2)) - _reference_next_index(idx, v) != _const(2) * (level - idx) + bit,
+    )
+    return ("R9-mirrored-index-step-needs-odd-constant", str(solver.check()), 0.0, _stats(solver))
+
+
+def check_mirrored_index_uses(ctx=None) -> tuple[str, str, float, dict]:
+    """R10: every use of idx can be written with n = L - idx at the same op count.
+
+    Gather address: forest_p + idx = (forest_p + L) - n, one SUB against a per-level constant.
+    Cached-level compare: idx == k iff n == L - k. Position from the left end of the level:
+    idx - c = c - n when L = 2c (c = 2^d - 1, the first index of the level). Final index
+    store: idx = L - n.
+    """
+    idx, level, p, k, c = _bv("idx"), _bv("L"), _bv("p"), _bv("k"), _bv("c")
+    n = level - idx
+    return _refute(
+        "R10-mirrored-index-uses",
+        (p + level) - n != p + idx,
+        (idx == k) != (n == level - k),
+        And(level == _const(2) * c, idx - c != c - n),
+        level - n != idx,
+        ctx=ctx,
+    )
+
+
+def check_mirrored_index_range(ctx=None) -> tuple[str, str, float, dict]:
+    """R11: at depth d, n lies in [0, 2^d - 1] and L_d - n is the index range of R7.
+
+    Induction with p = 2^d as an unbounded integer and L = 2p - 2. So n is 0 at depth 0
+    (and again after the wrap), 0 or 1 at depth 1, and the level constants never overflow.
+    """
+    p, n, bit, level = Int("p"), Int("n"), Int("bit"), Int("L")
+    in_range = And(p >= 1, n >= 0, n <= p - 1, level == 2 * p - 2)
+    return _refute(
+        "R11-mirrored-index-range",
+        # Base: depth 0 (p = 1) is n = 0, idx = L - n = 0.
+        And(p == 1, n >= 0, n <= p - 1, level == 2 * p - 2, Or(n != 0, level - n != 0)),
+        # Step: 2n + bit stays in the next level's range.
+        And(in_range, Or(bit == 0, bit == 1), Not(And(2 * n + bit >= 0, 2 * n + bit <= 2 * p - 1))),
+        # The level constant follows L' = 2L + 2.
+        And(in_range, 2 * level + 2 != 2 * (2 * p) - 2),
+        # idx = L - n covers exactly [p - 1, 2p - 2], the range R7 proves for depth d.
+        And(in_range, Not(And(level - n >= p - 1, level - n <= 2 * p - 2))),
+        ctx=ctx,
+    )
+
+
 REWRITE_CHECKS = [
     ("R1-hash-fma-fusion", "Hash stages 0/2/4 equal one multiply_add", check_hash_fma_fusion),
     ("R2-stage5-xor-deferral", "Stage-5 constant deferred into the next round's node XOR", check_stage5_xor_deferral),
@@ -286,6 +379,10 @@ REWRITE_CHECKS = [
     ("R7-index-range-by-depth", "Index range per depth: no bounds check before the last level, always wrap after", check_index_range_by_depth),
     ("R8-hash-stage-merge", "Hash stages 2+3 equal two multiply_adds and an XOR", check_hash_stage_merge),
     ("R8-hash-stage-merge-needs-left-shift", "Stage merge fails across a right shift (SAT)", check_hash_stage_merge_needs_left_shift),
+    ("R9-mirrored-index-step", "Mirrored index n = L - idx updates as 2n + (v' & 1)", check_mirrored_index_step),
+    ("R9-mirrored-index-step-needs-odd-constant", "Mirrored update fails for an even deferred constant (SAT)", check_mirrored_index_step_needs_odd_constant),
+    ("R10-mirrored-index-uses", "Gather address, compares and the final store written with the mirrored index", check_mirrored_index_uses),
+    ("R11-mirrored-index-range", "Mirrored index range per depth and the level constants", check_mirrored_index_range),
 ]
 
 # Checks that are expected to find a counterexample.
@@ -293,6 +390,7 @@ EXPECT_SAT = {
     "R3-branch-offset-needs-odd-constant",
     "R4-fma-select-needs-boolean",
     "R8-hash-stage-merge-needs-left-shift",
+    "R9-mirrored-index-step-needs-odd-constant",
 }
 
 

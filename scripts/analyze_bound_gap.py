@@ -297,6 +297,9 @@ def section_vload():
 # Checks that moved to verification/rewrites.py when the emission started to rely on them.
 MOVED_TO_REWRITES = (
     "R8-hash-stage-merge",  # stages 2+3 in 3 ops (--merge-hash-stages)
+    "R9-mirrored-index-step",  # mirrored index, 2-op update (--index-form mirrored)
+    "R10-mirrored-index-uses",
+    "R11-mirrored-index-range",
 )
 
 
@@ -358,9 +361,6 @@ def section_z3():
         ("parity(reference hash) == 1 - parity(lazy hash)", (ref_hash(x) & 1) != 1 - (lz & 1), []),
         ("1-based index: j=idx+1, next j == 2j + bit  [2 ops: and, multiply_add]",
          (2 * (j - 1) + 1 + (v & 1)) + 1 != 2 * j + (v & 1), []),
-        ("mirrored 1-based index m (j = c - m, c = 3*2^d - 1): next m == 2m + lazy bit, c' = 2c+1"
-         "  [2 ops with the inverted parity of the lazy hash]",
-         2 * (F - j) + (1 - (v & 1)) != (2 * F + 1) - (2 * j + (v & 1)), []),
         ("pointer form: p=idx+F, next p == 2p + bit + (1-F)  [3 ops, no address add]",
          (2 * (j - F) + 1 + (v & 1)) + F != 2 * j + (v & 1) + (1 - F), []),
         ("v | 0xFFFFFFFE == (v & 1) - 2  [bit plus constant in one op, only for -2]",
