@@ -75,3 +75,62 @@ def test_diff_reports_reordered_constraints(tmp_path):
     assert diffs and "different order" in diffs[0] and "index 0" in diffs[0]
     del b.constraints[5]
     assert "different entries" in "\n".join(diff_cpsat_models.compare(a, b))
+
+
+def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkeypatch):
+    """The documented API is scheduler_rs.build_tick_tock_kernel_ssa(**args_to_build_kwargs(...)).
+
+    The budget must travel in those kwargs (not through a side channel), be recorded in
+    run_options, and stop the solve.
+    """
+    import json
+
+    import kernel_build_args
+    import scheduler_rs
+
+    monkeypatch.delenv("CPSAT_MAX_DETERMINISTIC_TIME", raising=False)
+    sched = tmp_path / "sched.json"
+    kwargs = kernel_build_args.args_to_build_kwargs(
+        None, output_json=str(sched), use_git_sha=False,
+        rounds=4, batch_size=64, cpsat_time_limit=300.0, cpsat_deterministic_time=0.5,
+    )
+    assert kwargs["cpsat_deterministic_time"] == 0.5
+    kwargs["verbose"] = False
+    scheduler_rs.build_tick_tock_kernel_ssa(**kwargs)
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_deterministic_time"] == 0.5
+
+
+def test_environment_budget_is_recorded_when_no_option_is_given(monkeypatch):
+    import json
+
+    import kernel_build_args
+
+    monkeypatch.setenv("CPSAT_MAX_DETERMINISTIC_TIME", "3.5")
+    kwargs = kernel_build_args.args_to_build_kwargs(None, use_git_sha=False, rounds=2, batch_size=16)
+    assert kwargs["cpsat_deterministic_time"] == 3.5
+    assert json.loads(kwargs["run_options_json"])["cpsat_deterministic_time"] == 3.5
+    assert os.environ["CPSAT_MAX_DETERMINISTIC_TIME"] == "3.5", "the inherited value must be left in place"
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "abc"])
+def test_cli_rejects_invalid_deterministic_budget(bad):
+    import argparse
+
+    import kernel_build_args
+
+    parser = argparse.ArgumentParser()
+    kernel_build_args.add_kernel_build_args(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--cpsat-deterministic-time", bad])
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_binding_rejects_invalid_deterministic_budget(bad):
+    import scheduler_rs
+
+    with pytest.raises(ValueError, match="cpsat_deterministic_time"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=10, n_nodes=2047, batch_size=16, rounds=2, verbose=False,
+            use_cpsat=True, cpsat_deterministic_time=bad,
+        )

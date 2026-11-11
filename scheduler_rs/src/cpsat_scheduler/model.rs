@@ -108,7 +108,9 @@ fn greedy_schedule_matches_forced_modes(
     shift_ok && const_ok && select_ok
 }
 
-/// Deterministic-time budget for each CP-SAT solve, from `CPSAT_MAX_DETERMINISTIC_TIME`.
+/// Fallback deterministic-time budget for each CP-SAT solve, from the
+/// `CPSAT_MAX_DETERMINISTIC_TIME` environment variable. Used only when the config does not
+/// set `deterministic_time_limit` (e.g. for tests and tools that call the solver directly).
 ///
 /// # Returns
 /// `Some(limit)` when the variable holds a positive number, else `None` (no limit).
@@ -165,6 +167,7 @@ pub fn schedule_ssa_cpsat(
 
     let SsaCpsatConfig {
         time_limit_secs,
+        deterministic_time_limit,
         verbose,
         stop_after_first_solution,
         enable_valu_shift,
@@ -3424,10 +3427,13 @@ pub fn schedule_ssa_cpsat(
     // less on a busy machine and returns a different schedule. A deterministic-time budget
     // (CP-SAT's own work counter) gives the same schedule every time. The wall-clock limit
     // above stays as a backstop.
-    if let Some(dtime) = max_deterministic_time_from_env() {
+    let deterministic_budget = deterministic_time_limit
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .or_else(max_deterministic_time_from_env);
+    if let Some(dtime) = deterministic_budget {
         params.max_deterministic_time = Some(dtime);
         if verbose {
-            eprintln!("  CP-SAT deterministic time limit: {} (CPSAT_MAX_DETERMINISTIC_TIME)", dtime);
+            eprintln!("  CP-SAT deterministic time limit: {}", dtime);
         }
     }
     // Optional: crash when presolve adjusts a hint. Not default: presolve can tighten domains and
@@ -3570,6 +3576,18 @@ pub fn schedule_ssa_cpsat(
     // 14. Solve
     let response = model.solve_with_parameters(&params);
     let solve_time = start_time.elapsed().as_secs_f64();
+    // A deterministic budget only makes the run reproducible if the solve ended on it (or on
+    // optimality). If the wall-clock backstop fired first, how far the search got depended on
+    // machine load, so say so.
+    if let Some(dtime) = deterministic_budget {
+        if response.wall_time >= time_limit_secs * 0.999 && response.deterministic_time < dtime {
+            eprintln!(
+                "  WARNING: CP-SAT stopped on the wall-clock limit ({:.0}s) after {:.1} of {} deterministic time; \
+                 this result is not reproducible. Raise --cpsat-time-limit.",
+                time_limit_secs, response.deterministic_time, dtime
+            );
+        }
+    }
 
     let status: CpsatStatus = response.status().into();
 

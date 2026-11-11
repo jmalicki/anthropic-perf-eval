@@ -119,6 +119,9 @@ pub struct SsaTickTockKernelBuilder {
     pub(crate) uses_depth4: bool,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
+    /// Per-solve CP-SAT budget in deterministic time (None = wall-clock limit only). Set
+    /// before `build_and_schedule_cpsat`; applies to the per-section and full-kernel solves.
+    pub cpsat_deterministic_time: Option<f64>,
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
@@ -497,6 +500,7 @@ impl SsaTickTockKernelBuilder {
             depth4_broadcasts_initialized: false,
             uses_depth4,
             zero_vreg: None,
+            cpsat_deterministic_time: None,
         }
     }
 
@@ -696,6 +700,7 @@ impl SsaTickTockKernelBuilder {
             },
             cpsat: Some(CpSatPipelineConfig {
                 time_limit_secs,
+                deterministic_time_limit: self.cpsat_deterministic_time,
                 verbose,
                 enable_vbroadcast_elimination,
                 per_section_optimize_secs,
@@ -1022,6 +1027,11 @@ impl SsaTickTockKernelBuilder {
                 };
                 let config_feasibility = SsaCpsatConfig {
                     time_limit_secs: section_time_limit,
+                    deterministic_time_limit: ctx
+                        .config
+                        .cpsat
+                        .as_ref()
+                        .and_then(|c| c.deterministic_time_limit),
                     verbose,
                     stop_after_first_solution: section_stop_first,
                     enable_valu_shift: false,
@@ -1218,6 +1228,7 @@ impl SsaTickTockKernelBuilder {
         let cpsat_cfg = ctx.config.cpsat.as_ref().unwrap();
         let cpsat_config = SsaCpsatConfig {
             time_limit_secs,
+            deterministic_time_limit: cpsat_cfg.deterministic_time_limit,
             verbose,
             stop_after_first_solution: false,
             enable_valu_shift,

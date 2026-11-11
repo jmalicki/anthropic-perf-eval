@@ -9,6 +9,7 @@ Rust rejects unknown kwargs via PyO3. Both generate_ssa_kernel.py and bisection 
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -37,6 +38,17 @@ def _get_git_sha() -> Optional[str]:
     return None
 
 
+def _positive_finite_float(text: str) -> float:
+    """argparse type: a float that is finite and greater than zero."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"must be a positive finite number, got {text!r}")
+    return value
+
+
 def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
     """Add kernel build options to parser. Returns the argument group."""
     group = parser.add_argument_group("Kernel build")
@@ -54,10 +66,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     # Scheduler options
     group.add_argument("--cpsat-time-limit", type=float, default=3600.0,
                        help="CP-SAT time limit in seconds (default: 3600)")
-    group.add_argument("--cpsat-deterministic-time", type=float, default=None, metavar="DTIME",
+    group.add_argument("--cpsat-deterministic-time", type=_positive_finite_float, default=None, metavar="DTIME",
                        help="CP-SAT deterministic-time budget per solve. Unlike --cpsat-time-limit it does not "
-                            "depend on machine load, so the same command gives the same kernel. Use it for any "
-                            "comparison between runs; --cpsat-time-limit remains as a wall-clock backstop.")
+                            "depend on machine load, so the same command gives the same kernel as long as the "
+                            "solve ends on this budget. --cpsat-time-limit remains as a wall-clock backstop; if "
+                            "it fires first the result depends on load again (a warning is printed), so keep "
+                            "it generous. Defaults to CPSAT_MAX_DETERMINISTIC_TIME if that is set.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
@@ -181,6 +195,11 @@ def args_to_build_kwargs(
     rounds = get("rounds", 16)
     use_cpsat = not get("use_greedy", False)
     cpsat_time_limit = get("cpsat_time_limit", 3600.0)
+    # Effective deterministic budget: option/override first, else the environment variable
+    # the solver would fall back to, so run_options records what was actually applied.
+    cpsat_deterministic_time = get("cpsat_deterministic_time")
+    if cpsat_deterministic_time is None and os.environ.get("CPSAT_MAX_DETERMINISTIC_TIME"):
+        cpsat_deterministic_time = _positive_finite_float(os.environ["CPSAT_MAX_DETERMINISTIC_TIME"])
     # force_zero_gap defaults to 2h time limit, but allow explicit override
     force_zero_gap = get("force_zero_gap", False)
     if force_zero_gap and cpsat_time_limit == 3600.0:  # Only auto-set if using default
@@ -209,7 +228,7 @@ def args_to_build_kwargs(
         "rounds": rounds,
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
-        "cpsat_deterministic_time": get("cpsat_deterministic_time"),
+        "cpsat_deterministic_time": cpsat_deterministic_time,
         "per_section_optimize_secs": per_section_optimize,
         "enable_valu_shift": get("enable_valu_shift", True),
         "tree_reduce_max_depth": tree_reduce_max_depth,
@@ -247,6 +266,7 @@ def args_to_build_kwargs(
         "verbose": True,  # caller can override
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
+        "cpsat_deterministic_time": cpsat_deterministic_time,
         "per_section_optimize_secs": per_section_optimize,
         "output_json": out_path,
         "tree_reduce_max_depth": tree_reduce_max_depth,
@@ -297,11 +317,4 @@ def build_kernel_with_args(
 
     kwargs = args_to_build_kwargs(args, output_json=output_json, use_git_sha=use_git_sha, **overrides)
     kwargs["verbose"] = verbose
-    # The deterministic-time budget reaches the solver through the environment (read in
-    # cpsat_scheduler/model.rs); it applies to every CP-SAT solve of the build.
-    dtime = overrides.get("cpsat_deterministic_time", getattr(args, "cpsat_deterministic_time", None))
-    if dtime is not None:
-        os.environ["CPSAT_MAX_DETERMINISTIC_TIME"] = str(dtime)
-    else:
-        os.environ.pop("CPSAT_MAX_DETERMINISTIC_TIME", None)
     return scheduler_rs.build_tick_tock_kernel_ssa(**kwargs)

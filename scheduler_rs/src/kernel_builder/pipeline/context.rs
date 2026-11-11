@@ -138,6 +138,8 @@ impl Default for BoundsConfig {
 pub struct CpSatPipelineConfig {
     /// Time limit for the full-kernel CP-SAT solve.
     pub time_limit_secs: f64,
+    /// Per-solve budget in CP-SAT deterministic time (None = wall-clock limit only).
+    pub deterministic_time_limit: Option<f64>,
     /// Whether to print verbose solver output.
     pub verbose: bool,
     /// Enable vbroadcast elimination optimization.
@@ -181,6 +183,7 @@ impl Default for CpSatPipelineConfig {
     fn default() -> Self {
         CpSatPipelineConfig {
             time_limit_secs: 3600.0,
+            deterministic_time_limit: None,
             verbose: true,
             enable_vbroadcast_elimination: false,
             per_section_optimize_secs: None,
@@ -208,6 +211,7 @@ impl CpSatPipelineConfig {
     pub fn to_full_kernel_config(&self, scratch_budget: usize) -> SsaCpsatConfig {
         SsaCpsatConfig {
             time_limit_secs: self.time_limit_secs,
+            deterministic_time_limit: self.deterministic_time_limit,
             verbose: self.verbose,
             stop_after_first_solution: false,
             enable_valu_shift: false, // set by caller from pipeline config
