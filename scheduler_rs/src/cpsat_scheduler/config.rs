@@ -104,6 +104,26 @@ pub enum OptionalConstraintGroup {
     CapacityFlow,
     /// Linear constraint: 2*makespan + y >= load_count.
     CapacityLoad,
+    /// Per-op rows `makespan >= cycle + 1`, enforced by the op's mode literal where it has one
+    /// (`makespan_ge_c_*`, `makespan_ge_valu_*`, `makespan_ge_shifted_*`, `makespan_ge_select_*`).
+    /// Implied by `makespan = max_cycle + 1` and the unconditional `max_cycle >= ...` rows.
+    ConditionalMakespan,
+    /// The capacity-1 Flow cumulative (`cumul_flow`), when the machine has one Flow slot:
+    /// `no_overlap_flow` over the same intervals states the same thing.
+    FlowCumulative,
+}
+
+impl OptionalConstraintGroup {
+    /// Every group, in the order the names are listed to users.
+    pub const ALL: [OptionalConstraintGroup; 7] = [
+        Self::RedundantLinearBounds,
+        Self::CapacityValu,
+        Self::CapacityAlu,
+        Self::CapacityFlow,
+        Self::CapacityLoad,
+        Self::ConditionalMakespan,
+        Self::FlowCumulative,
+    ];
 }
 
 impl FromStr for OptionalConstraintGroup {
@@ -115,8 +135,10 @@ impl FromStr for OptionalConstraintGroup {
             "capacity_alu" => Ok(Self::CapacityAlu),
             "capacity_flow" => Ok(Self::CapacityFlow),
             "capacity_load" => Ok(Self::CapacityLoad),
+            "conditional_makespan" => Ok(Self::ConditionalMakespan),
+            "flow_cumulative" => Ok(Self::FlowCumulative),
             _ => Err(format!(
-                "invalid optional constraint group '{}', expected: redundant_linear_bounds, capacity_valu, capacity_alu, capacity_flow, capacity_load",
+                "invalid optional constraint group '{}', expected: redundant_linear_bounds, capacity_valu, capacity_alu, capacity_flow, capacity_load, conditional_makespan, flow_cumulative",
                 s
             )),
         }
@@ -131,6 +153,8 @@ impl std::fmt::Display for OptionalConstraintGroup {
             Self::CapacityAlu => "capacity_alu",
             Self::CapacityFlow => "capacity_flow",
             Self::CapacityLoad => "capacity_load",
+            Self::ConditionalMakespan => "conditional_makespan",
+            Self::FlowCumulative => "flow_cumulative",
         };
         write!(f, "{}", s)
     }
