@@ -2947,6 +2947,96 @@ fn test_wavefront_window_limits_chains_in_flight() {
     assert!(emit.ops[level_ops[1][0]].cycle <= emit.ops[*level_ops[0].last().unwrap()].cycle);
 }
 
+/// Wavefront state for an emitted program (no shiftable ops, no skipped ops).
+fn wavefront_for(
+    ops: &[SsaOp],
+    stagger_cycles: u32,
+    groups_in_flight: Option<usize>,
+) -> wavefront::Wavefront {
+    let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    let mut consumers: Vec<Vec<usize>> = vec![vec![]; ops.len()];
+    for (idx, op) in ops.iter().enumerate() {
+        for dep in &op.dep_ids {
+            consumers[id_to_idx[dep]].push(idx);
+        }
+    }
+    wavefront::Wavefront::new(
+        ops,
+        &consumers,
+        &id_to_idx,
+        &HashSet::new(),
+        &HashSet::new(),
+        stagger_cycles,
+        groups_in_flight,
+    )
+    .unwrap()
+}
+
+/// The window admits the first N unfinished chains, whichever have finished: when chain 1
+/// finishes before chain 0, chain 2 becomes eligible although chain 0 is still running.
+#[test]
+fn test_wavefront_window_refills_when_a_later_chain_finishes() {
+    let (emit, level_ops) = emit_independent_chains(3, 2);
+    let mut wavefront = wavefront_for(&emit.ops, 0, Some(2));
+    let chain_ops = |chain: usize| -> Vec<usize> {
+        (0..emit.ops.len()).filter(|&i| wavefront_for(&emit.ops, 0, None).chain(i) == Some(chain)).collect()
+    };
+    assert!(wavefront.in_window(level_ops[0][0]) && wavefront.in_window(level_ops[1][0]));
+    assert!(!wavefront.in_window(level_ops[2][0]), "two chains in flight: chain 2 waits");
+
+    // Finish chain 1 only.
+    for idx in chain_ops(1) {
+        wavefront.on_scheduled(idx);
+    }
+    assert!(wavefront.in_window(level_ops[0][0]), "chain 0 is still running");
+    assert!(wavefront.in_window(level_ops[2][0]), "chain 1 finished: chain 2 takes its place");
+
+    // With a window of one, chain 2 must still wait for chain 0.
+    let mut single = wavefront_for(&emit.ops, 0, Some(1));
+    for idx in chain_ops(1) {
+        single.on_scheduled(idx);
+    }
+    assert!(single.in_window(level_ops[0][0]) && !single.in_window(level_ops[2][0]));
+    for idx in chain_ops(0) {
+        single.on_scheduled(idx);
+    }
+    assert!(single.in_window(level_ops[2][0]));
+}
+
+/// An op that every chain reads but that reaches only one of each chain's two sinks (such
+/// as an initial index common to all chains) reaches exactly half of the sinks. It is
+/// shared: it must not join the chains into one.
+#[test]
+fn test_wavefront_op_reaching_half_the_sinks_is_shared() {
+    let chains = 4;
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(scalar);
+    let addr = emit.emit_const(100);
+    let common_index = emit.emit_valu(Opcode::Add, shared, shared);
+    let common_index_op = emit.ops.len() - 1;
+    let mut first_ops = Vec::new();
+    for _ in 0..chains {
+        let mut value = emit.emit_valu(Opcode::Add, shared, shared);
+        first_ops.push(emit.ops.len() - 1);
+        for _ in 0..4 {
+            value = emit.emit_valu(Opcode::Add, value, shared);
+        }
+        let out_value = emit.emit_valu(Opcode::Xor, value, shared);
+        let out_index = emit.emit_valu(Opcode::Add, common_index, value);
+        emit.emit_vstore(addr, out_value);
+        emit.emit_vstore(addr, out_index);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+
+    let wavefront = wavefront_for(&emit.ops, 10, None);
+    assert_eq!(wavefront.chain_count(), chains);
+    assert_eq!(wavefront.chain(common_index_op), None, "the common index is shared");
+    for (chain, &idx) in first_ops.iter().enumerate() {
+        assert_eq!(wavefront.chain(idx), Some(chain));
+    }
+}
+
 /// The default shape is the first-come-first-served queue: same schedule as the entry
 /// points that take no shape.
 #[test]

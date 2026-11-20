@@ -23,9 +23,12 @@
 //! that has not started holds no scratch (its initial loads are private to it) and a finished
 //! chain has stored its results.
 //!
-//! Chains are found structurally, not from emission metadata: an op is *shared* when it
-//! reaches more than half of the program's sinks (ops nothing depends on, i.e. the final
-//! stores), otherwise *private*; chains are the connected components of private ops. Shared
+//! Chains are found structurally, not from emission metadata. Every op reaches some number
+//! of the program's sinks (ops nothing depends on, i.e. the final stores). The typical op
+//! belongs to one chain and reaches that chain's sinks only, so the median of that number is
+//! the number of sinks of one chain. An op that reaches more sinks than the median is
+//! *shared* (a constant, a cached tree vector, an initial value common to all chains);
+//! the others are *private*, and chains are the connected components of private ops. Shared
 //! ops take the key of their most urgent consumer.
 
 use std::collections::{HashMap, HashSet};
@@ -56,9 +59,9 @@ pub(super) struct Wavefront {
     chain: Vec<Option<usize>>,
     /// Ops still to be scheduled per chain.
     remaining: Vec<usize>,
-    /// Lowest chain rank with ops still to be scheduled.
-    front: usize,
-    /// Chains allowed to run at once.
+    /// Chains with a rank below this may run: it is one past the `window`-th unfinished chain.
+    admit_below: usize,
+    /// Unfinished chains allowed to run at once.
     window: usize,
 }
 
@@ -114,15 +117,21 @@ impl Wavefront {
                 }
             }
         }
-        // Shared: reaches more than half of the sinks (never with one or two sinks).
-        let shared_above = (sinks.len() / 2).max(2);
-        let private: Vec<bool> = (0..n)
+        // Shared: reaches more sinks than the typical (median) op, which reaches the sinks of
+        // its own chain only.
+        let reached: Vec<usize> = (0..n)
             .map(|i| {
-                let reached: usize =
-                    (0..words).map(|w| reach[i * words + w].count_ones() as usize).sum();
-                !skipped.contains(&i) && reached > 0 && reached <= shared_above
+                if skipped.contains(&i) {
+                    0
+                } else {
+                    (0..words).map(|w| reach[i * words + w].count_ones() as usize).sum()
+                }
             })
             .collect();
+        let mut counts: Vec<usize> = reached.iter().copied().filter(|&r| r > 0).collect();
+        counts.sort_unstable();
+        let shared_above = counts.get(counts.len().saturating_sub(1) / 2).copied().unwrap_or(0);
+        let private: Vec<bool> = reached.iter().map(|&r| r > 0 && r <= shared_above).collect();
 
         // Chains: connected components of private ops, ranked by their first op.
         let mut parent: Vec<usize> = (0..n).collect();
@@ -172,10 +181,10 @@ impl Wavefront {
             key,
             chain,
             remaining,
-            front: 0,
+            admit_below: 0,
             window: groups_in_flight.unwrap_or(usize::MAX).max(1),
         };
-        wavefront.advance_front();
+        wavefront.refresh_window();
         Ok(wavefront)
     }
 
@@ -199,7 +208,7 @@ impl Wavefront {
     /// the first `groups_in_flight` unfinished chains.
     pub(super) fn in_window(&self, idx: usize) -> bool {
         match self.chain[idx] {
-            Some(rank) => rank < self.front.saturating_add(self.window),
+            Some(rank) => rank < self.admit_below,
             None => true,
         }
     }
@@ -208,13 +217,25 @@ impl Wavefront {
     pub(super) fn on_scheduled(&mut self, idx: usize) {
         if let Some(rank) = self.chain[idx] {
             self.remaining[rank] -= 1;
-            self.advance_front();
+            if self.remaining[rank] == 0 {
+                self.refresh_window();
+            }
         }
     }
 
-    fn advance_front(&mut self) {
-        while self.front < self.remaining.len() && self.remaining[self.front] == 0 {
-            self.front += 1;
+    /// Admit the first `window` unfinished chains, whichever chains have finished: a chain
+    /// that finishes out of order makes room for the next one.
+    fn refresh_window(&mut self) {
+        let mut unfinished = 0;
+        self.admit_below = self.remaining.len();
+        for (rank, &left) in self.remaining.iter().enumerate() {
+            if left > 0 {
+                unfinished += 1;
+                if unfinished == self.window {
+                    self.admit_below = rank + 1;
+                    break;
+                }
+            }
         }
     }
 }
