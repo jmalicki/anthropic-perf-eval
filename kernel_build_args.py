@@ -103,6 +103,7 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_push_tasks_toward_start", "push_all_tasks_toward_start"),
     ("cpsat_cumulative_propagators", "cumulative_propagators"),
     ("cpsat_ttef_max_intervals", "timetable_edge_finding_max_intervals"),
+    ("cpsat_seed", "random_seed"),
 ]
 
 CUMULATIVE_PROPAGATORS = ["overload_checker", "timetable_edge_finding", "hard_precedences", "all_precedences"]
@@ -196,6 +197,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--cpsat-ttef-max-intervals", type=_non_negative_int, default=None, metavar="N",
                        help="max_num_intervals_for_timetable_edge_finding (CP-SAT default: 100). Timetable edge "
                             "finding is skipped on larger cumulatives, i.e. on all of ours unless this is raised.")
+    group.add_argument("--cpsat-seed", type=_non_negative_int, default=None, metavar="N",
+                       help="CP-SAT random_seed for the full-kernel solve (CP-SAT default: 1). Use several "
+                            "seeds with --cpsat-deterministic-time to report a distribution; each seed is "
+                            "reproducible on its own.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",

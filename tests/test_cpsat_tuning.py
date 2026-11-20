@@ -168,6 +168,37 @@ def _variables(model):
 
 
 # ----------------------------------------------------------------------------
+# Solver seed and parameter export
+# ----------------------------------------------------------------------------
+
+def test_seed_defaults_to_the_solver_default_and_reaches_the_solver(tmp_path):
+    output, base_path, _, _ = _run(tmp_path, "base", [], quiet=False)
+    assert "random_seed" not in _solver_parameters(output)
+    output, seeded_path, sched, _ = _run(tmp_path, "seeded", ["--cpsat-seed", "7"], quiet=False)
+    assert "random_seed: 7" in _solver_parameters(output)
+    assert not _model_diff(base_path, seeded_path), "a solver parameter, not a model change"
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["random_seed"] == 7
+
+
+def test_seed_is_validated():
+    with pytest.raises(SystemExit):
+        _parse(["--cpsat-seed", "-1"])
+    with pytest.raises(ValueError, match="random_seed"):
+        scheduler_rs.resolve_cpsat_tuning('{"random_seed": -1}')
+
+
+def test_model_export_writes_the_solver_parameters_next_to_it(tmp_path):
+    from ortools.sat import sat_parameters_pb2
+
+    output, model_path, _, _ = _run(tmp_path, "seeded", ["--cpsat-seed", "7"], quiet=False)
+    params = sat_parameters_pb2.SatParameters()
+    params.ParseFromString((tmp_path / (model_path.name + ".params")).read_bytes())
+    assert params.random_seed == 7 and params.num_workers == 8 and params.interleave_search
+    assert params.max_deterministic_time == 0.3
+
+
+# ----------------------------------------------------------------------------
 # Objective
 # ----------------------------------------------------------------------------
 

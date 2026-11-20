@@ -215,6 +215,10 @@ pub(crate) fn build_sat_parameters(
         params.max_num_intervals_for_timetable_edge_finding = Some(max_intervals);
     }
 
+    if let Some(seed) = tuning.random_seed {
+        params.random_seed = Some(seed);
+    }
+
     if stop_after_first_solution {
         params.stop_after_first_solution = Some(true);
     }
@@ -3877,6 +3881,12 @@ pub fn schedule_ssa_cpsat(
         match std::fs::write(&path, &bytes) {
             Ok(()) => eprintln!("  CP-SAT model exported to {}", path),
             Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path, e),
+        }
+        // The solver parameters of the same solve, next to the model (path + ".params"), so
+        // the solve can be replayed outside this process with exactly what it was given.
+        let params_path = format!("{}.params", path);
+        if let Err(e) = std::fs::write(&params_path, prost::Message::encode_to_vec(&params)) {
+            eprintln!("  CP-SAT parameter export to {} failed: {}", params_path, e);
         }
     }
 

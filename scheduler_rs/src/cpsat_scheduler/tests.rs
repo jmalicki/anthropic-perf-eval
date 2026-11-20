@@ -6114,6 +6114,18 @@ mod tuning_tests {
         assert_eq!(params.absolute_gap_limit, None);
     }
 
+    /// `random_seed` is left to CP-SAT unless set, and a negative seed is rejected.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_random_seed_reaches_the_solver_parameters() {
+        let params = super::super::model::build_sat_parameters(60.0, None, false, None, &CpsatTuning::default());
+        assert_eq!(params.random_seed, None);
+        let tuning = CpsatTuning::from_json(Some(r#"{"random_seed": 7}"#)).unwrap();
+        let params = super::super::model::build_sat_parameters(60.0, None, false, None, &tuning);
+        assert_eq!(params.random_seed, Some(7));
+        assert!(CpsatTuning::from_json(Some(r#"{"random_seed": -1}"#)).unwrap_err().contains("random_seed"));
+    }
+
     /// A feasibility-only solve needs one worker for `stop_after_first_solution` to hold.
     #[cfg(feature = "cpsat")]
     #[test]

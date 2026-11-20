@@ -267,6 +267,10 @@ pub struct CpsatTuning {
     /// here have hundreds to tens of thousands of intervals, so the propagator does nothing
     /// unless this is raised.
     pub timetable_edge_finding_max_intervals: Option<i32>,
+    /// `random_seed` (CP-SAT default 1; `None` leaves it). A different seed gives a different
+    /// search on the same model, which is what a study needs to report a distribution
+    /// instead of one run. Each seed is still reproducible under a deterministic-time budget.
+    pub random_seed: Option<i32>,
 }
 
 impl Default for CpsatTuning {
@@ -285,6 +289,7 @@ impl Default for CpsatTuning {
             push_all_tasks_toward_start: false,
             cumulative_propagators: Vec::new(),
             timetable_edge_finding_max_intervals: None,
+            random_seed: None,
         }
     }
 }
@@ -331,6 +336,9 @@ impl CpsatTuning {
                 "cpsat tuning: timetable_edge_finding_max_intervals must be 0 or more, got {}",
                 max
             ));
+        }
+        if let Some(seed) = self.random_seed.filter(|s| *s < 0) {
+            return Err(format!("cpsat tuning: random_seed must be 0 or more, got {}", seed));
         }
         for (field, names) in [
             ("subsolvers", &self.subsolvers),
