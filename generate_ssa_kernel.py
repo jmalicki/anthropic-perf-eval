@@ -37,6 +37,7 @@ from kernel_build_args import (
     args_to_build_kwargs,
     build_kernel_with_args,
     n_nodes_for_height,
+    non_default_emission_options,
 )
 
 BASELINE = 147734
@@ -110,6 +111,9 @@ def main():
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
     build_kwargs = args_to_build_kwargs(args)
+    emission = non_default_emission_options(build_kwargs)
+    if emission:
+        print("  emission options: " + ", ".join(f"{k}={v}" for k, v in emission.items()))
     if build_kwargs.get("optional_constraint_groups_to_disable"):
         names = [g.name for g in build_kwargs["optional_constraint_groups_to_disable"]]
         print(f"  disable_optional_constraint_groups={names}")
