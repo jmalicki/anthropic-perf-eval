@@ -398,6 +398,178 @@ def check_index_update_from_root_needs_zero(ctx=None) -> tuple[str, str, float, 
     return ("R12-index-update-from-root-needs-zero", str(solver.check()), 0.0, _stats(solver))
 
 
+# =============================================================================
+# Cached-level selection from the branch bits (--cached-select bits|bits-flow|mobius)
+# =============================================================================
+#
+# Mirrors ssa_emit.rs emit_cached_select_init / emit_cached_level_select / emit_select_bits.
+
+MAX_CACHED_DEPTH = 4  # config.rs MAX_TREE_REDUCE_DEPTH
+
+
+def _bit_vars(depth: int):
+    """Branch bits b_0 .. b_(d-1), oldest first, and the constraint that each is 0 or 1."""
+    bits = [_bv(f"b{i}") for i in range(depth)]
+    return bits, And(*[Or(b == _const(0), b == _const(1)) for b in bits])
+
+
+def _position(bits):
+    """n after the rounds that produced `bits`: n' = 2n + bit from n = 0 (R9)."""
+    n = _const(0)
+    for bit in bits:
+        n = _const(2) * n + bit
+    return n
+
+
+def _reference_node(nodes, depth: int, n):
+    """tree[idx] ^ C for idx = L_d - n, as a chain of compares on the reference index."""
+    idx = _const(level_last_index(depth)) - n
+    first = (1 << depth) - 1
+    out = nodes[first]
+    for k in range(first + 1, 2 * first + 1):
+        out = If(idx == _const(k), nodes[k], out)
+    return out ^ _const(STAGE5_XOR_CONST)
+
+
+def select_table(nodes, depth: int):
+    """U[m] = tree[L_d - reverse_d(m)] ^ C: the node table indexed by the bits, oldest lowest."""
+    table = []
+    for m in range(1 << depth):
+        n = 0
+        for i in range(depth):
+            n = (n << 1) | ((m >> i) & 1)
+        table.append(nodes[level_last_index(depth) - n] ^ _const(STAGE5_XOR_CONST))
+    return table
+
+
+def select_tree(table, bits):
+    """The select tree: bits[0] selects within leaf pairs, bits[-1] at the root."""
+    cur = list(table)
+    for bit in bits:
+        cur = [If(bit != _const(0), cur[2 * k + 1], cur[2 * k]) for k in range(len(cur) // 2)]
+    return cur[0]
+
+
+def mobius_coefficients(table):
+    """a[m] = sum over subsets s of m of (-1)^(|m|-|s|) U[s] (in-place subset transform)."""
+    coeff = list(table)
+    depth = len(coeff).bit_length() - 1
+    for bit in range(depth):
+        for m in range(len(coeff)):
+            if m & (1 << bit):
+                coeff[m] = coeff[m] - coeff[m ^ (1 << bit)]
+    return coeff
+
+
+def mobius_eval(coeff, bits):
+    """2^d - 1 multiply_adds: fold the coefficients pairwise, one bit per level."""
+    cur = list(coeff)
+    for bit in bits:
+        cur = [bit * cur[2 * k + 1] + cur[2 * k] for k in range(len(cur) // 2)]
+    return cur[0]
+
+
+def _nodes(depth: int):
+    first = (1 << depth) - 1
+    return {k: _bv(f"tree{k}") for k in range(first, 2 * first + 1)}
+
+
+def check_select_by_path_bits(ctx=None) -> tuple[str, str, float, dict]:
+    """R13: the select tree over the pre-XORed node table, driven by the branch bits oldest
+    first, yields tree[idx] ^ C for the reference index idx = L_d - n (depths 1 to 4).
+
+    n is built from the bits by the mirrored update (R9), so this ties the selection to the
+    reference index in either index form. Depth 0 is the root for every lane (R7). Each
+    two-way select is a SelectChoice (vselect, or multiply_add by R4).
+    """
+    violations = []
+    for depth in range(1, MAX_CACHED_DEPTH + 1):
+        bits, boolean = _bit_vars(depth)
+        nodes = _nodes(depth)
+        selected = select_tree(select_table(nodes, depth), bits)
+        violations.append(And(boolean, selected != _reference_node(nodes, depth, _position(bits))))
+    return _refute("R13-select-by-path-bits", *violations, ctx=ctx)
+
+
+def check_select_by_path_bits_needs_bit_order(ctx=None) -> tuple[str, str, float, dict]:
+    """R13-needs-bit-order: feeding the bits newest first into the same table is wrong (SAT)."""
+    depth = 2
+    bits, boolean = _bit_vars(depth)
+    nodes = _nodes(depth)
+    selected = select_tree(select_table(nodes, depth), list(reversed(bits)))
+    solver = Solver(ctx=ctx)
+    solver.add(boolean, selected != _reference_node(nodes, depth, _position(bits)))
+    return ("R13-select-by-path-bits-needs-bit-order", str(solver.check()), 0.0, _stats(solver))
+
+
+def check_mobius_select(ctx=None) -> tuple[str, str, float, dict]:
+    """R14: 2^d - 1 multiply_adds over the Mobius coefficients equal the table entry the
+    bits address, for every 0/1 assignment of the bits (depths 1 to 4).
+
+    The bits are enumerated (that they are 0 or 1 is the precondition), which leaves an
+    identity that is linear in the table entries; together with R13 the result is
+    tree[idx] ^ C.
+    """
+    violations = []
+    for depth in range(1, MAX_CACHED_DEPTH + 1):
+        table = [_bv(f"u{m}") for m in range(1 << depth)]
+        coeff = mobius_coefficients(table)
+        for m in range(1 << depth):
+            bits = [_const((m >> i) & 1) for i in range(depth)]
+            violations.append(mobius_eval(coeff, bits) != table[m])
+            violations.append(mobius_eval(coeff, bits) != select_tree(table, bits))
+    return _refute("R14-mobius-select", *violations, ctx=ctx)
+
+
+def check_mobius_select_needs_boolean(ctx=None) -> tuple[str, str, float, dict]:
+    """R14-needs-boolean: for a bit outside {0, 1} the multiply_add form is not the select (SAT)."""
+    bit = _bv("b0")
+    table = [_bv("u0"), _bv("u1")]
+    solver = Solver(ctx=ctx)
+    solver.add(mobius_eval(mobius_coefficients(table), [bit]) != select_tree(table, [bit]))
+    return ("R14-mobius-select-needs-boolean", str(solver.check()), 0.0, _stats(solver))
+
+
+def extract_bits(n, count: int):
+    """The `count` older bits from n = b_0 .. b_(count-1) in binary, as emit_select_bits does:
+    AND 1 and shift right for all but the top bit, which is what remains."""
+    bits = [None] * count
+    cur = n
+    for k in range(count - 1, 0, -1):
+        bits[k] = cur & _const(1)
+        cur = LShR(cur, 1)
+    bits[0] = cur
+    return bits
+
+
+def check_bits_from_index(ctx=None) -> tuple[str, str, float, dict]:
+    """R15: the older branch bits can be read back from the index (1 to 3 bits).
+
+    With n = b_0 .. b_(k-1) in binary (the mirrored index after k rounds, R9), AND/shift
+    extraction returns exactly those bits; the top bit needs no AND because n < 2^k (R11).
+    A zero-based index is mirrored first: n = L - idx (R10).
+    """
+    violations = []
+    for count in range(1, MAX_CACHED_DEPTH):
+        bits, boolean = _bit_vars(count)
+        n = _position(bits)
+        extracted = extract_bits(n, count)
+        violations.append(And(boolean, Or(*[e != b for e, b in zip(extracted, bits)])))
+        idx = _const(level_last_index(count)) - n
+        from_zero_based = extract_bits(_const(level_last_index(count)) - idx, count)
+        violations.append(And(boolean, Or(*[e != b for e, b in zip(from_zero_based, bits)])))
+    return _refute("R15-bits-from-index", *violations, ctx=ctx)
+
+
+def check_bits_from_index_needs_range(ctx=None) -> tuple[str, str, float, dict]:
+    """R15-needs-range: for n >= 2^k the unmasked top "bit" is not 0 or 1 (SAT)."""
+    n = _bv("n")
+    top = extract_bits(n, 2)[0]
+    solver = Solver(ctx=ctx)
+    solver.add(And(top != _const(0), top != _const(1)))
+    return ("R15-bits-from-index-needs-range", str(solver.check()), 0.0, _stats(solver))
+
+
 REWRITE_CHECKS = [
     ("R1-hash-fma-fusion", "Hash stages 0/2/4 equal one multiply_add", check_hash_fma_fusion),
     ("R2-stage5-xor-deferral", "Stage-5 constant deferred into the next round's node XOR", check_stage5_xor_deferral),
@@ -416,6 +588,12 @@ REWRITE_CHECKS = [
     ("R11-mirrored-index-range", "Mirrored index range per depth and the level constants", check_mirrored_index_range),
     ("R12-index-update-from-root", "From idx = 0 the index update is its offset", check_index_update_from_root),
     ("R12-index-update-from-root-needs-zero", "The offset alone is wrong for a nonzero index (SAT)", check_index_update_from_root_needs_zero),
+    ("R13-select-by-path-bits", "Select tree driven by the branch bits yields the reference node", check_select_by_path_bits),
+    ("R13-select-by-path-bits-needs-bit-order", "Select tree with the bits in the wrong order is wrong (SAT)", check_select_by_path_bits_needs_bit_order),
+    ("R14-mobius-select", "2^d - 1 multiply_adds over Mobius coefficients equal the select tree", check_mobius_select),
+    ("R14-mobius-select-needs-boolean", "Mobius form is wrong for a non-0/1 bit (SAT)", check_mobius_select_needs_boolean),
+    ("R15-bits-from-index", "Older branch bits read back from the index", check_bits_from_index),
+    ("R15-bits-from-index-needs-range", "Unmasked top bit is not 0/1 outside the index range (SAT)", check_bits_from_index_needs_range),
 ]
 
 # Checks that are expected to find a counterexample.
@@ -425,6 +603,9 @@ EXPECT_SAT = {
     "R8-hash-stage-merge-needs-left-shift",
     "R9-mirrored-index-step-needs-odd-constant",
     "R12-index-update-from-root-needs-zero",
+    "R13-select-by-path-bits-needs-bit-order",
+    "R14-mobius-select-needs-boolean",
+    "R15-bits-from-index-needs-range",
 }
 
 
