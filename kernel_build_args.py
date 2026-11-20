@@ -64,6 +64,7 @@ def _positive_finite_float(text: str) -> float:
 # the binding kwargs and the run header, and add_emission_args is their only argparse block.
 EMISSION_DEFAULTS = {
     "merge_hash_stages": False,
+    "index_form": "zero-based",
 }
 
 
@@ -76,6 +77,11 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
     group.add_argument("--merge-hash-stages", action="store_true", default=EMISSION_DEFAULTS["merge_hash_stages"],
                        help="Emit hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per "
                             "hash instead of 11 (proof: R8-hash-stage-merge)")
+    group.add_argument("--index-form", choices=["zero-based", "mirrored"], default=EMISSION_DEFAULTS["index_form"],
+                       help="Tree index representation between rounds. mirrored tracks n = L_d - idx (position "
+                            "in the level from the right): index update in 2 vector ops instead of 3, none at "
+                            "depth 0 and in the wrap round; initial indices are assumed 0 and not loaded "
+                            "(proofs: R9 to R11)")
     return group
 
 
