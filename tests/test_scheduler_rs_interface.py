@@ -281,6 +281,35 @@ def test_greedy_split_shift():
     assert builds[True][1]["cycles"] <= builds[False][1]["cycles"]
 
 
+def test_pressure_thresholds_and_headroom():
+    """PyO3: threshold overrides and budget headroom are accepted, give a correct kernel, and bad values raise."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        verbose=False,
+        use_cpsat=False,
+        pressure_soft_threshold=0.9,
+        pressure_critical_threshold=1.0,
+        pressure_inflation_threshold=0.95,
+        greedy_budget_headroom=16,
+    )
+    assert not stats.get("budget_exceeded", False)
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+    for bad in ({"pressure_inflation_threshold": 0.0}, {"pressure_soft_threshold": float("nan")},
+                {"pressure_critical_threshold": -1.0}):
+        with pytest.raises(ValueError, match="must be a positive finite number"):
+            scheduler_rs.build_tick_tock_kernel_ssa(
+                FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+                verbose=False,
+                use_cpsat=False,
+                **bad,
+            )
+
+
 def test_depth3_validates():
     """Depth 3 tree-reduce: kernel with tree_reduce_max_depth=3 must match reference.
 
