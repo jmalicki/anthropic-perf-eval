@@ -1978,6 +1978,119 @@ fn test_greedy_real_kernel_full_scale() {
 }
 
 // =========================================================================
+// Greedy schedule shape: barrier mode
+// =========================================================================
+
+/// Assert that no cycle of the lowered kernel uses more slots than an engine has.
+fn assert_slot_limits_hold(result: &SsaScheduleResult) {
+    let mut used: HashMap<(i32, Engine), usize> = HashMap::new();
+    for op in &result.ops {
+        *used.entry((op.cycle, op.engine)).or_default() += 1;
+    }
+    for ((cycle, engine), count) in used {
+        assert!(
+            count <= engine.slot_limit(),
+            "cycle {} uses {} {:?} slots (limit {})",
+            cycle,
+            count,
+            engine,
+            engine.slot_limit()
+        );
+    }
+}
+
+/// First and last scheduled cycle of each round's SSA ops, indexed by round.
+fn round_cycle_spans(result: &SsaScheduleResult, rounds: usize) -> Vec<(i32, i32)> {
+    let mut spans = vec![(i32::MAX, i32::MIN); rounds];
+    for op in result.ssa_ops.as_ref().expect("greedy result carries SSA ops") {
+        let Some(round) = op.source_info.as_ref().and_then(|s| s.round) else {
+            continue;
+        };
+        if op.cycle >= 0 {
+            spans[round].0 = spans[round].0.min(op.cycle);
+            spans[round].1 = spans[round].1.max(op.cycle);
+        }
+    }
+    spans
+}
+
+/// Greedy-schedule the benchmark kernel (height 10, batch 256) with the given configuration.
+fn schedule_shape_kernel(rounds: usize, configure: impl FnOnce(&mut KernelConfig)) -> SsaScheduleResult {
+    let mut config = KernelConfig::new(10, 2047, 256, rounds);
+    configure(&mut config);
+    let compiler = config.compiler.clone();
+    SsaTickTockKernelBuilder::new(config)
+        .build_and_schedule()
+        .unwrap_or_else(|e| panic!("{}-round greedy with {:?} failed: {:?}", rounds, compiler, e))
+}
+
+/// Default barrier mode: every op of round r+1 runs after the last op of round r.
+#[test]
+fn test_greedy_barriers_round_runs_rounds_one_after_another() {
+    let rounds = 4;
+    let result = schedule_shape_kernel(rounds, |_| {});
+    let spans = round_cycle_spans(&result, rounds);
+    for r in 1..rounds {
+        assert!(
+            spans[r].0 > spans[r - 1].1,
+            "round {} starts at cycle {} but round {} ends at cycle {}",
+            r,
+            spans[r].0,
+            r - 1,
+            spans[r - 1].1
+        );
+    }
+    assert_slot_limits_hold(&result);
+}
+
+/// Without barriers, ops of a later round are scheduled before the previous round has
+/// finished, and the schedule still respects the slot limits and the scratch budget.
+#[test]
+fn test_greedy_barriers_none_lets_rounds_overlap() {
+    use crate::kernel_builder::config::GreedyBarrierMode;
+    let rounds = 4;
+    let result = schedule_shape_kernel(rounds, |c| c.compiler.greedy_barriers = GreedyBarrierMode::None);
+    let spans = round_cycle_spans(&result, rounds);
+    let overlapping: Vec<usize> = (1..rounds).filter(|&r| spans[r].0 < spans[r - 1].1).collect();
+    assert!(
+        !overlapping.is_empty(),
+        "no round starts before the previous one ends: spans {:?}",
+        spans
+    );
+    assert_slot_limits_hold(&result);
+    assert!(!result.budget_exceeded, "budget exceeded without barriers");
+    assert!(
+        result.address_result.peak_live <= SCRATCH_BUDGET_HW,
+        "peak_live {} over the scratch budget",
+        result.address_result.peak_live
+    );
+    assert!(
+        result.ssa_ops.as_ref().unwrap().iter().all(|op| op.opcode != Opcode::Barrier),
+        "barrier ops must not survive"
+    );
+    let with_barriers = schedule_shape_kernel(rounds, |_| {});
+    assert!(
+        result.cycles <= with_barriers.cycles,
+        "dropping barriers lengthened the 4-round schedule: {} > {}",
+        result.cycles,
+        with_barriers.cycles
+    );
+}
+
+/// The barrier mode spellings accepted by the CLI and the Python binding.
+#[test]
+fn test_greedy_barrier_mode_spellings() {
+    use crate::kernel_builder::config::GreedyBarrierMode;
+    assert_eq!(GreedyBarrierMode::from_str("round"), Ok(GreedyBarrierMode::Round));
+    assert_eq!(GreedyBarrierMode::from_str("none"), Ok(GreedyBarrierMode::None));
+    assert!(GreedyBarrierMode::from_str("rounds").is_err());
+    assert_eq!(GreedyBarrierMode::default(), GreedyBarrierMode::Round);
+    for mode in [GreedyBarrierMode::Round, GreedyBarrierMode::None] {
+        assert_eq!(GreedyBarrierMode::from_str(mode.as_str()), Ok(mode));
+    }
+}
+
+// =========================================================================
 // Hint pass tests (ConstChoice, SelectChoice, VALU shift)
 // =========================================================================
 

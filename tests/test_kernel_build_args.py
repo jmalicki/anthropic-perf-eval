@@ -29,6 +29,26 @@ def test_cli_kwargs_default_n_nodes_is_2047():
     assert args_to_build_kwargs(None, n_nodes=31, use_git_sha=False)["n_nodes"] == 31
 
 
+def test_greedy_barriers_flag_reaches_kwargs_and_run_options():
+    """--greedy-barriers defaults to 'round' and is passed to the binding and recorded."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    assert default["greedy_barriers"] == "round"
+    assert json.loads(default["run_options_json"])["greedy_barriers"] == "round"
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    args = parser.parse_args(["--use-greedy", "--greedy-barriers", "none"])
+    kwargs = args_to_build_kwargs(args, use_git_sha=False)
+    assert kwargs["greedy_barriers"] == "none"
+    assert json.loads(kwargs["run_options_json"])["greedy_barriers"] == "none"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--greedy-barriers", "sometimes"])
+
+
 def _build(n_nodes, rounds=2, batch_size=16):
     instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
         forest_height=10, n_nodes=n_nodes, batch_size=batch_size, rounds=rounds, verbose=False, use_cpsat=False)

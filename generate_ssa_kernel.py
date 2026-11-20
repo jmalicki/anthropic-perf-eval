@@ -120,6 +120,8 @@ def main():
         print(f"  enable_scratch_tightening=True")
     if args.scheduling_pressure_policy != "adaptive":
         print(f"  scheduling_pressure_policy={args.scheduling_pressure_policy}")
+    if getattr(args, "greedy_barriers", "round") != "round":
+        print(f"  greedy_barriers={args.greedy_barriers}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

@@ -158,6 +158,50 @@ pub enum PressurePolicyKind {
     Cascade,
 }
 
+/// How round barriers constrain the greedy scheduler.
+///
+/// Emission puts a barrier pseudo-op between rounds. With `Round`, every op of round r+1
+/// depends on the barrier and the barrier depends on every op of round r, so the greedy
+/// schedule runs rounds strictly one after another (and per-section CP-SAT repair can work
+/// on one round at a time). With `None`, the barriers are dropped before dependencies are
+/// computed and the ready queue may mix rounds; the kernel is then a single section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GreedyBarrierMode {
+    /// Hard barrier between rounds (default).
+    #[default]
+    Round,
+    /// No barriers: only data dependencies order the ops.
+    None,
+}
+
+impl GreedyBarrierMode {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"round"` or `"none"`
+    ///
+    /// # Returns
+    /// The mode, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "round" => Ok(GreedyBarrierMode::Round),
+            "none" => Ok(GreedyBarrierMode::None),
+            other => Err(format!(
+                "Invalid greedy_barriers '{}': must be 'round' or 'none'",
+                other
+            )),
+        }
+    }
+
+    /// The CLI/binding spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GreedyBarrierMode::Round => "round",
+            GreedyBarrierMode::None => "none",
+        }
+    }
+}
+
 /// Compilation concern: how to optimize and schedule.
 ///
 /// Controls scheduling and optimization passes — these don't affect
@@ -191,6 +235,8 @@ pub struct CompilerConfig {
     pub enable_valu_shift_hint_pass: bool,
     /// When true, run schedule-with-fixed-choices pass after hint passes: re-run greedy with encodings fixed.
     pub enable_schedule_with_fixed_choices: bool,
+    /// Whether round barriers constrain the greedy scheduler (default: `Round`).
+    pub greedy_barriers: GreedyBarrierMode,
 }
 
 impl Default for CompilerConfig {
@@ -205,6 +251,7 @@ impl Default for CompilerConfig {
             enable_select_choice_hint_pass: false,
             enable_valu_shift_hint_pass: false,
             enable_schedule_with_fixed_choices: false,
+            greedy_barriers: GreedyBarrierMode::default(),
         }
     }
 }
