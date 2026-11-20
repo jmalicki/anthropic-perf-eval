@@ -2785,6 +2785,273 @@ fn test_cascade_asap_tiebreak() {
 }
 
 // =========================================================================
+// Wavefront priority (GreedyPriority::Wavefront)
+// =========================================================================
+
+/// `chains` independent chains of `levels` vector adds each, emitted level by level (all
+/// chains' level 0, then all chains' level 1, ...) the way the kernel emits rounds. The
+/// chains share one broadcast constant and one store address.
+///
+/// # Returns
+/// `(emit, level_ops)` where `level_ops[chain][level]` is the op index of that add.
+fn emit_independent_chains(chains: usize, levels: usize) -> (SsaEmitContext, Vec<Vec<usize>>) {
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(scalar);
+    let addr = emit.emit_const(100);
+    let mut value: Vec<VReg> = Vec::new();
+    let mut level_ops: Vec<Vec<usize>> = vec![Vec::new(); chains];
+    for level in 0..levels {
+        for chain in 0..chains {
+            let input = if level == 0 { shared } else { value[chain] };
+            let next = emit.emit_valu(Opcode::Add, input, shared);
+            if level == 0 {
+                value.push(next);
+            } else {
+                value[chain] = next;
+            }
+            level_ops[chain].push(emit.ops.len() - 1);
+        }
+    }
+    for chain in 0..chains {
+        emit.emit_vstore(addr, value[chain]);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, level_ops)
+}
+
+/// Schedule `ops` with the given shape, no shifting, the hardware budget and the plain policy.
+fn schedule_with_shape(ops: &mut [SsaOp], shape: &GreedyShape) -> (usize, bool, usize) {
+    let mut shifted = HashSet::new();
+    let (result, agreement) = schedule_ssa_greedy_shaped(
+        ops,
+        false,
+        &mut shifted,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        shape,
+    )
+    .expect("greedy schedules the chains");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    result
+}
+
+fn wavefront_shape(stagger_cycles: u32, groups_in_flight: Option<usize>) -> GreedyShape {
+    GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles, groups_in_flight },
+    }
+}
+
+/// Chains are the connected components of ops that reach few sinks; ops that reach most
+/// sinks are shared and take the key of their most urgent consumer.
+#[test]
+fn test_wavefront_finds_chains_and_keys() {
+    let (emit, level_ops) = emit_independent_chains(4, 3);
+    let ops = &emit.ops;
+    let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    let mut consumers: Vec<Vec<usize>> = vec![vec![]; ops.len()];
+    for (idx, op) in ops.iter().enumerate() {
+        for dep in &op.dep_ids {
+            consumers[id_to_idx[dep]].push(idx);
+        }
+    }
+    let stagger = 10;
+    let wavefront = wavefront::Wavefront::new(
+        ops,
+        &consumers,
+        &id_to_idx,
+        &HashSet::new(),
+        &HashSet::new(),
+        stagger,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(wavefront.chain_count(), 4);
+    // Ops 0..3 are the shared scalar, its broadcast and the store address.
+    for shared_idx in 0..3 {
+        assert_eq!(wavefront.chain(shared_idx), None, "op {} is shared", shared_idx);
+    }
+    for (chain, levels) in level_ops.iter().enumerate() {
+        for (level, &idx) in levels.iter().enumerate() {
+            assert_eq!(wavefront.chain(idx), Some(chain), "chain of op {}", idx);
+            // Depth: const at 0, broadcast at 1, level 0 at 2.
+            assert_eq!(wavefront.key(idx), (2 + level) as i64 + stagger as i64 * chain as i64);
+        }
+    }
+    // The broadcast is needed by chain 0's first add; the scalar just before the broadcast.
+    assert_eq!(wavefront.key(1), wavefront.key(level_ops[0][0]) - 1);
+    assert_eq!(wavefront.key(0), wavefront.key(1) - 1);
+    assert!((0..ops.len()).all(|idx| wavefront.in_window(idx)), "no window: everything may run");
+}
+
+/// A large stagger finishes the first chains at full speed; stagger 0 keeps all chains
+/// abreast, as the first-come-first-served queue does.
+#[test]
+fn test_wavefront_stagger_lets_leading_chains_run_ahead() {
+    let (chains, levels) = (12, 5);
+    let last_cycle = |shape: &GreedyShape| -> (Vec<i32>, usize) {
+        let (mut emit, level_ops) = emit_independent_chains(chains, levels);
+        let (cycles, budget_exceeded, _) = schedule_with_shape(&mut emit.ops, shape);
+        assert!(!budget_exceeded);
+        (level_ops.iter().map(|l| emit.ops[*l.last().unwrap()].cycle).collect(), cycles)
+    };
+    let (abreast, abreast_cycles) = last_cycle(&wavefront_shape(0, None));
+    let (staggered, staggered_cycles) = last_cycle(&wavefront_shape(100, None));
+
+    // 12 chains on 6 vector slots: abreast, a level takes two cycles; staggered, chain 0
+    // runs a level per cycle from cycle 2 on.
+    assert_eq!(staggered[0], 2 + levels as i32 - 1);
+    assert!(abreast[0] > staggered[0], "abreast {:?} staggered {:?}", abreast, staggered);
+    assert!(staggered.windows(2).all(|w| w[0] <= w[1]), "chains finish in order: {:?}", staggered);
+    // Staggered, the stores (two per cycle) start earlier, so the schedule is no longer.
+    assert!(staggered_cycles <= abreast_cycles);
+}
+
+/// With one chain in flight, no op of a chain runs before the previous chain has finished.
+#[test]
+fn test_wavefront_window_limits_chains_in_flight() {
+    let (chains, levels) = (4, 3);
+    let (mut emit, level_ops) = emit_independent_chains(chains, levels);
+    schedule_with_shape(&mut emit.ops, &wavefront_shape(0, Some(1)));
+    for chain in 1..chains {
+        let previous_end = emit.ops[*level_ops[chain - 1].last().unwrap()].cycle;
+        let start = emit.ops[level_ops[chain][0]].cycle;
+        assert!(
+            start > previous_end,
+            "chain {} starts at {} before chain {} ends at {}",
+            chain,
+            start,
+            chain - 1,
+            previous_end
+        );
+    }
+
+    // Unlimited window: the chains overlap.
+    let (mut emit, level_ops) = emit_independent_chains(chains, levels);
+    schedule_with_shape(&mut emit.ops, &wavefront_shape(0, None));
+    assert!(emit.ops[level_ops[1][0]].cycle <= emit.ops[*level_ops[0].last().unwrap()].cycle);
+}
+
+/// Wavefront state for an emitted program (no shiftable ops, no skipped ops).
+fn wavefront_for(
+    ops: &[SsaOp],
+    stagger_cycles: u32,
+    groups_in_flight: Option<usize>,
+) -> wavefront::Wavefront {
+    let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    let mut consumers: Vec<Vec<usize>> = vec![vec![]; ops.len()];
+    for (idx, op) in ops.iter().enumerate() {
+        for dep in &op.dep_ids {
+            consumers[id_to_idx[dep]].push(idx);
+        }
+    }
+    wavefront::Wavefront::new(
+        ops,
+        &consumers,
+        &id_to_idx,
+        &HashSet::new(),
+        &HashSet::new(),
+        stagger_cycles,
+        groups_in_flight,
+    )
+    .unwrap()
+}
+
+/// The window admits the first N unfinished chains, whichever have finished: when chain 1
+/// finishes before chain 0, chain 2 becomes eligible although chain 0 is still running.
+#[test]
+fn test_wavefront_window_refills_when_a_later_chain_finishes() {
+    let (emit, level_ops) = emit_independent_chains(3, 2);
+    let mut wavefront = wavefront_for(&emit.ops, 0, Some(2));
+    let chain_ops = |chain: usize| -> Vec<usize> {
+        (0..emit.ops.len()).filter(|&i| wavefront_for(&emit.ops, 0, None).chain(i) == Some(chain)).collect()
+    };
+    assert!(wavefront.in_window(level_ops[0][0]) && wavefront.in_window(level_ops[1][0]));
+    assert!(!wavefront.in_window(level_ops[2][0]), "two chains in flight: chain 2 waits");
+
+    // Finish chain 1 only.
+    for idx in chain_ops(1) {
+        wavefront.on_scheduled(idx);
+    }
+    assert!(wavefront.in_window(level_ops[0][0]), "chain 0 is still running");
+    assert!(wavefront.in_window(level_ops[2][0]), "chain 1 finished: chain 2 takes its place");
+
+    // With a window of one, chain 2 must still wait for chain 0.
+    let mut single = wavefront_for(&emit.ops, 0, Some(1));
+    for idx in chain_ops(1) {
+        single.on_scheduled(idx);
+    }
+    assert!(single.in_window(level_ops[0][0]) && !single.in_window(level_ops[2][0]));
+    for idx in chain_ops(0) {
+        single.on_scheduled(idx);
+    }
+    assert!(single.in_window(level_ops[2][0]));
+}
+
+/// An op that every chain reads but that reaches only one of each chain's two sinks (such
+/// as an initial index common to all chains) reaches exactly half of the sinks. It is
+/// shared: it must not join the chains into one.
+#[test]
+fn test_wavefront_op_reaching_half_the_sinks_is_shared() {
+    let chains = 4;
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(scalar);
+    let addr = emit.emit_const(100);
+    let common_index = emit.emit_valu(Opcode::Add, shared, shared);
+    let common_index_op = emit.ops.len() - 1;
+    let mut first_ops = Vec::new();
+    for _ in 0..chains {
+        let mut value = emit.emit_valu(Opcode::Add, shared, shared);
+        first_ops.push(emit.ops.len() - 1);
+        for _ in 0..4 {
+            value = emit.emit_valu(Opcode::Add, value, shared);
+        }
+        let out_value = emit.emit_valu(Opcode::Xor, value, shared);
+        let out_index = emit.emit_valu(Opcode::Add, common_index, value);
+        emit.emit_vstore(addr, out_value);
+        emit.emit_vstore(addr, out_index);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+
+    let wavefront = wavefront_for(&emit.ops, 10, None);
+    assert_eq!(wavefront.chain_count(), chains);
+    assert_eq!(wavefront.chain(common_index_op), None, "the common index is shared");
+    for (chain, &idx) in first_ops.iter().enumerate() {
+        assert_eq!(wavefront.chain(idx), Some(chain));
+    }
+}
+
+/// The default shape is the first-come-first-served queue: same schedule as the entry
+/// points that take no shape.
+#[test]
+fn test_default_shape_is_fifo() {
+    assert_eq!(GreedyShape::default().priority, GreedyPriority::Fifo);
+    let (mut a, _) = emit_independent_chains(12, 5);
+    let (mut b, _) = emit_independent_chains(12, 5);
+    schedule_with_shape(&mut a.ops, &GreedyShape::default());
+    let mut shifted = HashSet::new();
+    schedule_ssa_greedy_with_shift_budget(&mut b.ops, false, &mut shifted, 1536).unwrap();
+    let cycles = |ops: &[SsaOp]| ops.iter().map(|op| op.cycle).collect::<Vec<_>>();
+    assert_eq!(cycles(&a.ops), cycles(&b.ops));
+}
+
+// =========================================================================
 // SlotTracker unit tests — shared slot-capacity invariants
 //
 // These tests verify the SlotTracker abstraction in isolation, ensuring that:

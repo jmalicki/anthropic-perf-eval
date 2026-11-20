@@ -286,8 +286,9 @@ impl Pass for ScheduleWithFixedChoicesPass {
         let mut dummy_shifted = std::collections::HashSet::new();
 
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
-        let (cycles, budget_exceeded, peak_live) =
-            ssa_greedy::schedule_ssa_greedy_with_diagnostics(
+        let shape = ctx.config.compiler.greedy_shape();
+        let ((cycles, budget_exceeded, peak_live), _agreement) =
+            ssa_greedy::schedule_ssa_greedy_shaped(
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut dummy_shifted,
@@ -307,8 +308,8 @@ impl Pass for ScheduleWithFixedChoicesPass {
                 Some(&fixed_shifted),
                 Some(&fixed_select),
                 &mut diagnostics,
-            )
-            .map_err(|e| e)?;
+                &shape,
+            )?;
 
         ctx.greedy_metrics = crate::kernel_builder::pipeline::SchedulingMetrics {
             cycles,
