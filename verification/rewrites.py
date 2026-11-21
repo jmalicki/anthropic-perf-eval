@@ -367,6 +367,37 @@ def check_mirrored_index_range(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+# =============================================================================
+# Index work with a known result (--prune-dead-index)
+# =============================================================================
+
+
+def check_index_update_from_root(ctx=None) -> tuple[str, str, float, dict]:
+    """R12: from idx = 0 the zero-based update idx*2 + (2 - (v' & 1)) is 2 - (v' & 1).
+
+    At depth 0 every index is 0 (R7: before the first round by assumption, and again after
+    the wrap), so the multiply_add of the update has a known first operand and the offset
+    is the new index. The result is the reference child (R3 with idx = 0).
+    """
+    v = _bv("v")
+    offset = _const(2) - ((v ^ _const(STAGE5_XOR_CONST)) & _const(1))
+    return _refute(
+        "R12-index-update-from-root",
+        _const(0) * _const(2) + offset != offset,
+        offset != _reference_next_index(_const(0), v),
+        ctx=ctx,
+    )
+
+
+def check_index_update_from_root_needs_zero(ctx=None) -> tuple[str, str, float, dict]:
+    """R12-needs-zero: for a nonzero index the offset alone is not the new index (SAT)."""
+    v, idx = _bv("v"), _bv("idx")
+    offset = _const(2) - ((v ^ _const(STAGE5_XOR_CONST)) & _const(1))
+    solver = Solver(ctx=ctx)
+    solver.add(idx != _const(0), idx * _const(2) + offset != offset)
+    return ("R12-index-update-from-root-needs-zero", str(solver.check()), 0.0, _stats(solver))
+
+
 REWRITE_CHECKS = [
     ("R1-hash-fma-fusion", "Hash stages 0/2/4 equal one multiply_add", check_hash_fma_fusion),
     ("R2-stage5-xor-deferral", "Stage-5 constant deferred into the next round's node XOR", check_stage5_xor_deferral),
@@ -383,6 +414,8 @@ REWRITE_CHECKS = [
     ("R9-mirrored-index-step-needs-odd-constant", "Mirrored update fails for an even deferred constant (SAT)", check_mirrored_index_step_needs_odd_constant),
     ("R10-mirrored-index-uses", "Gather address, compares and the final store written with the mirrored index", check_mirrored_index_uses),
     ("R11-mirrored-index-range", "Mirrored index range per depth and the level constants", check_mirrored_index_range),
+    ("R12-index-update-from-root", "From idx = 0 the index update is its offset", check_index_update_from_root),
+    ("R12-index-update-from-root-needs-zero", "The offset alone is wrong for a nonzero index (SAT)", check_index_update_from_root_needs_zero),
 ]
 
 # Checks that are expected to find a counterexample.
@@ -391,6 +424,7 @@ EXPECT_SAT = {
     "R4-fma-select-needs-boolean",
     "R8-hash-stage-merge-needs-left-shift",
     "R9-mirrored-index-step-needs-odd-constant",
+    "R12-index-update-from-root-needs-zero",
 }
 
 
