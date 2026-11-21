@@ -71,7 +71,10 @@ def test_only_parallel_search_without_interleave_is_nondeterministic():
 @pytest.mark.parametrize("argv", [
     ["--config", "base:", "--config", "b:--cpsat-deterministic-time 5"],
     ["--config", "base:", "--config", "b:--cpsat-time-limit=10"],
+    ["--config", "base:", "--config", "b:--cpsat-deterministic-t 5"],
+    ["--config", "base:", "--config", "b:--round 3"],
     ["--config", "a/b:", "--config", "a_b:--cpsat-workers 2"],
+    ["--config", "foo:--no-cpsat-interleave", "--config", "foo__run1:"],
     ["--instances", "2x16@10,2x16@20"],
 ])
 def test_conflicting_studies_are_rejected_before_running(tmp_path, argv):

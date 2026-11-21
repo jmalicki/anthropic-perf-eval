@@ -124,13 +124,25 @@ RUNNER_OWNED_OPTIONS = ["--cpsat-deterministic-time", "--cpsat-time-limit", "--r
 
 
 def runner_owned_options(options: str) -> list:
-    """The runner-owned options a configuration string sets (empty when it sets none)."""
+    """The runner-owned options a configuration string sets (empty when it sets none).
+
+    argparse accepts unambiguous abbreviations (`--cpsat-deterministic-t 5`), so any long
+    option that is a prefix of a runner-owned one counts as setting it.
+    """
     found = []
     for arg in shlex.split(options):
         name = arg.split("=", 1)[0]
-        if name in RUNNER_OWNED_OPTIONS and name not in found:
-            found.append(name)
+        if not name.startswith("--") or len(name) <= 2:
+            continue
+        for owned in RUNNER_OWNED_OPTIONS:
+            if owned.startswith(name) and owned not in found:
+                found.append(owned)
     return found
+
+
+def cell_stem(instance: dict, config_name: str, repeat: int) -> str:
+    """File stem of one run: instance, configuration and (for repeats after the first) the run number."""
+    return f"{instance['name']}__{safe(config_name)}" + (f"__run{repeat}" if repeat else "")
 
 
 def safe(name: str) -> str:
@@ -265,7 +277,7 @@ def analyse_run(log: str, schedule_path: Path, returncode: int, elapsed: float) 
 def run_cell(instance: dict, config_name: str, options: str, repeat: int, out_dir: Path,
              time_limit: float, force: bool, build: str = "") -> dict:
     """Run one (instance, configuration, repeat), or reuse its saved result."""
-    stem = f"{instance['name']}__{safe(config_name)}" + (f"__run{repeat}" if repeat else "")
+    stem = cell_stem(instance, config_name, repeat)
     paths = {
         "schedule": out_dir / f"{stem}.schedule.json",
         "kernel": out_dir / f"{stem}.kernel.json",
@@ -506,10 +518,6 @@ def main(argv=None) -> int:
     if len(set(instance_names)) != len(instance_names):
         parser.error("each ROUNDSxBATCH may appear once in --instances (results are filed by rounds and batch; "
                      "use separate --out-dir for different budgets)")
-    stems = [safe(name) for name, _ in configs]
-    if len(set(stems)) != len(stems):
-        parser.error("configuration names must stay distinct after replacing characters other than "
-                     "letters, digits, '.', '_' and '-' (they name the output files)")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -520,13 +528,17 @@ def main(argv=None) -> int:
             repeats = args.nondeterministic_repeats if is_nondeterministic(options) else 1
             for repeat in range(repeats):
                 cells.append((instance, name, options, repeat))
+    stems = [cell_stem(instance, name, repeat) for instance, name, _, repeat in cells]
+    if len(set(stems)) != len(stems):
+        parser.error("two runs would write the same output files: configuration names must stay distinct after "
+                     "replacing characters other than letters, digits, '.', '_' and '-', and must not end in "
+                     "'__runN' (the suffix of repeated runs)")
 
     build = "" if args.report_only else extension_fingerprint()
     results = []
     if args.report_only:
         for instance, name, options, repeat in cells:
-            stem = f"{instance['name']}__{safe(name)}" + (f"__run{repeat}" if repeat else "")
-            path = out_dir / f"{stem}.result.json"
+            path = out_dir / f"{cell_stem(instance, name, repeat)}.result.json"
             if path.exists():
                 with open(path) as f:
                     saved = json.load(f)
