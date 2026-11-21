@@ -140,6 +140,13 @@ def runner_owned_options(options: str) -> list:
     return found
 
 
+def is_valid_measurement(result: dict) -> bool:
+    """A run counts as a measurement only if it exited cleanly, its kernel was PROVED and
+    PASSED, and the solve did not stop on the wall-clock backstop (then it depends on load)."""
+    return bool(result.get("returncode") == 0 and result.get("proved") and result.get("passed")
+                and not result.get("wall_clock_limit_hit"))
+
+
 def cell_stem(instance: dict, config_name: str, repeat: int) -> str:
     """File stem of one run: instance, configuration and (for repeats after the first) the run number."""
     return f"{instance['name']}__{safe(config_name)}" + (f"__run{repeat}" if repeat else "")
@@ -290,9 +297,8 @@ def run_cell(instance: dict, config_name: str, options: str, repeat: int, out_di
             saved = json.load(f)
         # A run that stopped on the wall clock or did not validate is not a measurement:
         # solve it again rather than reuse it.
-        reusable = (saved.get("returncode") == 0 and saved.get("proved") and saved.get("passed")
-                    and not saved.get("wall_clock_limit_hit"))
-        if saved.get("key") == key and reusable:
+        same_cell = saved.get("key") == key and saved.get("config") == config_name and saved.get("repeat") == repeat
+        if same_cell and is_valid_measurement(saved):
             return saved
     cmd = build_command(instance, options, time_limit, paths)
     start = time.time()
@@ -357,8 +363,9 @@ def summarise(cells: list) -> dict:
         "deterministic_time": [c.get("deterministic_time") for c in cells],
         "solver_walltime": [c.get("solver_walltime") for c in cells],
         "peak_live_words": [c.get("peak_live_words") for c in ok],
-        "all_valid": bool(ok) and len(ok) == len(cells) and all(c["proved"] and c["passed"] for c in cells),
+        "all_valid": bool(ok) and len(ok) == len(cells) and all(is_valid_measurement(c) for c in cells),
         "failed_runs": len(cells) - len(ok),
+        "invalid_runs": sum(1 for c in cells if not is_valid_measurement(c)),
         "wall_clock_limit_hit": any(c.get("wall_clock_limit_hit") for c in cells),
     }
 
@@ -427,7 +434,7 @@ def markdown(results: list, instances: list, configs: list) -> str:
             if baseline is not None and row["cycles"]:
                 deltas = [c - baseline for c in row["cycles"]]
                 delta = "0" if set(deltas) == {0} else _spread(deltas, "{:+d}")
-            valid = "PROVED, PASSED" if row["all_valid"] else f"NO ({row['failed_runs']} failed)"
+            valid = "PROVED, PASSED" if row["all_valid"] else f"NO ({row['invalid_runs']} of {row['runs']} not valid)"
             notes = " (wall-clock limit hit: invalid)" if row["wall_clock_limit_hit"] else ""
             name = row["config"] + ("" if row["deterministic"] else " (not reproducible)")
             lines.append(
@@ -542,16 +549,17 @@ def main(argv=None) -> int:
             if path.exists():
                 with open(path) as f:
                     saved = json.load(f)
-                if saved.get("options") != options or saved.get("budget") != instance["budget"]:
-                    parser.error(f"{path} was measured with options {saved.get('options')!r} and budget "
-                                 f"{saved.get('budget')}, not {options!r} and {instance['budget']}; "
-                                 "rerun it or use another --out-dir")
+                if (saved.get("config") != name or saved.get("options") != options
+                        or saved.get("budget") != instance["budget"]):
+                    parser.error(f"{path} holds configuration {saved.get('config')!r} with options "
+                                 f"{saved.get('options')!r} and budget {saved.get('budget')}, not {name!r} with "
+                                 f"{options!r} and {instance['budget']}; rerun it or use another --out-dir")
                 results.append(saved)
     else:
         def run(cell):
             instance, name, options, repeat = cell
             result = run_cell(instance, name, options, repeat, out_dir, args.time_limit, args.force, build)
-            valid = "ok" if result.get("proved") and result.get("passed") else "NOT VALIDATED"
+            valid = "ok" if is_valid_measurement(result) else "NOT A VALID MEASUREMENT"
             print(f"{result['instance']:>9} {name:<32} run {repeat}: cycles={result.get('cycles')} "
                   f"status={result.get('status')} lb={result.get('lb_cycles')} "
                   f"dtime={result.get('deterministic_time')} wall={result.get('solver_walltime')} {valid}",
@@ -575,7 +583,7 @@ def main(argv=None) -> int:
     print()
     print(table)
     print(f"Wrote {json_path} and {md_path}")
-    invalid = [r for r in results if not (r.get("proved") and r.get("passed"))]
+    invalid = [r for r in results if not is_valid_measurement(r)]
     if invalid:
         print(f"{len(invalid)} run(s) did not produce a validated kernel:")
         for r in invalid:

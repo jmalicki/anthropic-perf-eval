@@ -117,7 +117,7 @@ def _cell(config, cycles, repeat=0, deterministic=True, **extra):
             "cycles": cycles, "status": "FEASIBLE", "lb_cycles": 164, "capacity_floor": 163, "greedy_cycles": 194,
             "final_incumbent_dtime_estimate": 2.1, "final_incumbent_wall": 2.8, "deterministic_time": 60.0,
             "solver_walltime": 80.0, "peak_live_words": 1129, "proved": True, "passed": True,
-            "wall_clock_limit_hit": False}
+            "wall_clock_limit_hit": False, "returncode": 0}
     cell.update(extra)
     return cell
 
@@ -209,3 +209,34 @@ def test_invalid_saved_cells_are_solved_again(tmp_path, monkeypatch):
     assert len(calls) == 1 and not first["passed"]
     ablation.run_cell(instance, "base", "", 0, tmp_path, 100.0, False, "build")
     assert len(calls) == 2, "an unvalidated cell must be solved again"
+
+
+def test_one_validity_rule_everywhere():
+    """Proved, passed, clean exit and no wall-clock stop: anything else is not a measurement."""
+    good = {"returncode": 0, "proved": True, "passed": True, "wall_clock_limit_hit": False}
+    assert ablation.is_valid_measurement(good)
+    for key, value in [("returncode", 1), ("proved", False), ("passed", False), ("wall_clock_limit_hit", True)]:
+        assert not ablation.is_valid_measurement(dict(good, **{key: value})), key
+    instances = [ablation.parse_instance("2x256", 20.0)]
+    cell = _cell("baseline", 193, returncode=0, wall_clock_limit_hit=True)
+    table = ablation.markdown([cell], instances, [("baseline", "")])
+    assert "193 INVALID" in table and "NO (1 of 1 not valid)" in table
+
+
+def test_saved_cell_of_another_configuration_is_not_reused(tmp_path, monkeypatch):
+    """`a/b` and `a_b` share a file; a saved `a/b` result must not stand in for `a_b`."""
+    instance = ablation.parse_instance("2x16@0.3", 20.0)
+    calls = []
+
+    def fake_run(cmd, cwd, stdout, stderr, text):
+        calls.append(cmd)
+        stdout.write("Starting CP-SAT solver\n")
+        return type("P", (), {"returncode": 0})()
+
+    monkeypatch.setattr(ablation.subprocess, "run", fake_run)
+    monkeypatch.setattr(ablation, "is_valid_measurement", lambda result: True)
+    ablation.run_cell(instance, "a/b", "", 0, tmp_path, 100.0, False, "build")
+    ablation.run_cell(instance, "a/b", "", 0, tmp_path, 100.0, False, "build")
+    assert len(calls) == 1, "the same cell is reused"
+    result = ablation.run_cell(instance, "a_b", "", 0, tmp_path, 100.0, False, "build")
+    assert len(calls) == 2 and result["config"] == "a_b", "another configuration is solved, not reused"
