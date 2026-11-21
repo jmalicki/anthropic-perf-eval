@@ -21,11 +21,7 @@ pub const HASH_STAGES: [(char, i64, char, char, i64); 6] = [
 /// Stage 5 XOR constant used for optimization
 pub const STAGE5_XOR_CONST: i64 = 0xB55A4F09;
 
-/// Vector length for SIMD operations
-pub const VLEN: usize = 8;
-
-/// Maximum scratch space available
-pub const SCRATCH_SIZE: usize = 1536;
+pub use crate::architecture::anthropic_perf_eval::{SCRATCH_SIZE, VLEN};
 
 /// Maximum tree depth for which we have tree-reduce emission (depth 4 = 16-way).
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
