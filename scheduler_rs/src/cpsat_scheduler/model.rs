@@ -3479,10 +3479,12 @@ pub fn schedule_ssa_cpsat(
     let hint_debug_ssa = std::env::var("CPSAT_HINT_DEBUG").is_ok();
     if let Some(hints) = greedy_hints {
         let mut skipped_cycle_hints = 0usize;
-        // When ForceLoad, greedy scheduled ConstChoice as add_imm; hinting those cycles would pack
-        // too many Load ops at the same cycle (Load capacity 2). Skip cycle hints for ConstChoice ops.
-        let skip_const_cycle_hints =
-            matches!(const_choice_mode, ConstChoiceMode::ForceLoad);
+        // Under ForceLoad, a greedy schedule that used add_imm for some ConstChoice ops would pack
+        // too many Load ops into a cycle once they are forced to Load (Load capacity 2), so their
+        // cycle hints are skipped then. A greedy that already honoured the forced encodings
+        // (`greedy_matches_forced_modes`) is a feasible schedule and is hinted in full.
+        let skip_const_cycle_hints = matches!(const_choice_mode, ConstChoiceMode::ForceLoad)
+            && !greedy_matches_forced_modes;
         if skip_const_cycle_hints && verbose {
             eprintln!(
                 "  Skipping cycle hints for {} ConstChoice ops (ForceLoad: greedy hint would violate Load capacity)",
@@ -3624,9 +3626,11 @@ pub fn schedule_ssa_cpsat(
     // Hint shiftable_chosen_cycle and select_chosen_cycle so "solution hint is complete" (no unhinted vars).
     // These tie-breaker vars are equal to the effective cycle (completion_cycle when shifted, cycle when not;
     // fma_last when FMA, cycle when vselect). Greedy gives one cycle per op -> use that for chosen.
-    // When ForceAlu, skip shiftable_chosen_cycle hints (same reason as completion/alu_cycle above).
+    // When ForceAlu and the greedy did not shift every shiftable op, skip shiftable_chosen_cycle
+    // hints (same reason as completion/alu_cycle above).
     if let Some(hints) = greedy_hints {
-        let skip_shifted_chosen = matches!(valu_shift_mode, ValuShiftMode::ForceAlu);
+        let skip_shifted_chosen =
+            matches!(valu_shift_mode, ValuShiftMode::ForceAlu) && !greedy_matches_forced_modes;
         for &idx in &shiftable_valu {
             if skip_shifted_chosen {
                 continue;
