@@ -2326,9 +2326,11 @@ mod ssa_tests {
             assert!(op.cycle >= 0, "Op {} should be scheduled", op.id);
         }
 
-        // Address assignment needs budget of 1 with same-cycle reuse
+        // Address assignment needs a 2-word scratch with same-cycle reuse: address 0 is reserved
+        // (start_addr 1), which leaves exactly one assignable word, address 1. `budget` is the
+        // size of the scratch memory, not the number of words above start_addr.
         let config = AddressAssignConfig {
-            budget: 1,
+            budget: 2,
             start_addr: 1, // Reserve 0 for ZERO_REG
             ..Default::default()
         };
@@ -2350,10 +2352,10 @@ mod ssa_tests {
             assign_result.peak_live
         );
 
-        // Should not exceed budget of 1
+        // Should fit in the 2-word scratch (one assignable word)
         assert!(
             !assign_result.budget_exceeded,
-            "Should fit in budget of 1: peak_live={}, budget={}",
+            "Should fit in a 2-word scratch: peak_live={}, budget={}",
             assign_result.peak_live, assign_result.budget
         );
     }
