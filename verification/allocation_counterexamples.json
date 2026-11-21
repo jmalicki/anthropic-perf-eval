@@ -1,0 +1,123 @@
+{
+ "format": "values are rows [start, end, size, count]: count values of size words, live over the closed interval [start, end]. budget = words 0..budget-1. align (default 1) applies to values wider than one word. Checked by verification/allocation_conjectures.py (A1-stored, A7-greedy-witnesses); see docs/ALLOCATION_CONJECTURES.md.",
+ "c1_counterexamples": [
+  {
+   "name": "pinning-k8-B16-unaligned",
+   "demonstrates": "Per-cycle load <= 16 at every step, yet no layout with vectors at any offset: two vectors fill steps 0 and 4, so the scalars of steps 1-3 are pinned into one 8-word half, and 9 are live at step 2.",
+   "budget": 16,
+   "values": [[0, 0, 8, 1], [0, 1, 8, 1], [1, 2, 1, 7], [1, 3, 1, 1], [2, 3, 1, 1], [3, 4, 8, 1], [4, 4, 8, 1]]
+  },
+  {
+   "name": "pinning-k8-B16-aligned",
+   "demonstrates": "Same with 8-aligned vector slots: the slots are the halves, so 3 steps and 2 vectors suffice.",
+   "budget": 16,
+   "align": 8,
+   "values": [[0, 0, 8, 1], [0, 1, 1, 7], [0, 2, 1, 1], [1, 2, 1, 1], [2, 2, 8, 1]]
+  },
+  {
+   "name": "pinning-k8-B16-real",
+   "demonstrates": "The unaligned witness as real address_assign intervals [def, last_read] (abstract [s, e] -> [2s, 2e+1]); the closed per-cycle count is <= 16 at every cycle and no layout exists under the same-cycle-reuse rule.",
+   "budget": 16,
+   "values": [[0, 1, 8, 1], [0, 3, 8, 1], [2, 5, 1, 7], [2, 7, 1, 1], [4, 7, 1, 1], [6, 9, 8, 1], [8, 9, 8, 1]]
+  },
+  {
+   "name": "minimal-k2-B4-unaligned",
+   "demonstrates": "Smallest counterexample in time steps for sizes {1, 2} (found by the exhaustive search: none within 4 steps, this one at 5).",
+   "budget": 4,
+   "values": [[0, 0, 2, 1], [0, 1, 2, 1], [1, 2, 1, 1], [1, 3, 1, 1], [2, 3, 1, 1], [3, 4, 2, 1], [4, 4, 2, 1]]
+  },
+  {
+   "name": "sizes-2-3-B7",
+   "demonstrates": "Sizes that do not divide each other ({2, 3}) fail too, at B = 7 (exhaustive search: none at B = 6 within 6 steps).",
+   "budget": 7,
+   "values": [[0, 0, 3, 1], [0, 1, 3, 1], [1, 2, 2, 1], [1, 3, 2, 1], [2, 3, 2, 1], [3, 4, 3, 1], [4, 4, 3, 1]]
+  }
+ ],
+ "greedy_failures": [
+  {
+   "allocator": "start_order_lowest",
+   "budget": 9,
+   "demonstrates": "First fit puts the step-0 scalars at words 0 and 1; the vector at step 2 then has no 8 contiguous words, although putting the long scalar at word 8 works.",
+   "values": [[0, 1, 1, 1], [0, 5, 1, 1], [2, 5, 8, 1]]
+  },
+  {
+   "allocator": "start_order_lowest",
+   "align": 8,
+   "budget": 9,
+   "demonstrates": "Lowest free 8-aligned slot: the scalar takes word 0 and blocks the only slot.",
+   "values": [[0, 5, 1, 1], [2, 5, 8, 1]]
+  },
+  {
+   "allocator": "start_order_lowest",
+   "budget": 16,
+   "demonstrates": "First fit with two vector-widths of room: the step-3 scalar reuses the dead vector's word 0 and splits the free space into 7 + 7 words.",
+   "values": [[1, 1, 8, 1], [1, 7, 1, 1], [3, 7, 1, 1], [4, 4, 8, 1]]
+  },
+  {
+   "allocator": "start_order_lowest",
+   "align": 8,
+   "budget": 16,
+   "demonstrates": "Lowest free slot, aligned: the two scalars land in different slots, so no slot is free for the step-4 vector.",
+   "values": [[0, 0, 8, 1], [0, 5, 1, 1], [2, 6, 1, 1], [4, 7, 8, 1]]
+  },
+  {
+   "allocator": "start_order_most_recently_freed",
+   "budget": 9,
+   "demonstrates": "Most-recently-freed choice degenerates to first fit when nothing has been freed yet.",
+   "values": [[0, 1, 1, 1], [0, 5, 1, 1], [2, 5, 8, 1]]
+  },
+  {
+   "allocator": "start_order_most_recently_freed",
+   "align": 8,
+   "budget": 9,
+   "demonstrates": "Same, aligned.",
+   "values": [[0, 5, 1, 1], [2, 5, 8, 1]]
+  },
+  {
+   "allocator": "start_order_most_recently_freed",
+   "budget": 16,
+   "demonstrates": "Reusing the most recently freed words (the dead vector's) fragments the space the step-4 vector needs.",
+   "values": [[1, 1, 8, 1], [1, 7, 1, 1], [3, 7, 1, 1], [4, 4, 8, 1]]
+  },
+  {
+   "allocator": "start_order_most_recently_freed",
+   "align": 8,
+   "budget": 16,
+   "demonstrates": "Same, aligned: the second scalar goes to the slot vacated last instead of next to the first.",
+   "values": [[0, 0, 8, 1], [0, 5, 1, 1], [2, 6, 1, 1], [4, 7, 8, 1]]
+  },
+  {
+   "allocator": "longest_lifetime_first",
+   "budget": 9,
+   "demonstrates": "Scalars by lifetime from the top: the long scalar takes word 8, the only word the short one can use while the step-0 vector is live; swapping them works.",
+   "values": [[0, 0, 8, 1], [0, 2, 1, 1], [2, 5, 1, 1]]
+  },
+  {
+   "allocator": "longest_lifetime_first",
+   "align": 8,
+   "budget": 9,
+   "demonstrates": "Same, aligned.",
+   "values": [[0, 0, 8, 1], [0, 2, 1, 1], [2, 5, 1, 1]]
+  },
+  {
+   "allocator": "longest_lifetime_first",
+   "budget": 16,
+   "demonstrates": "The vector goes to words 0-7 and the scalars fill 8-15 from the top, leaving the last short scalar no word; the vector at words 6-13 leaves room for all.",
+   "values": [[0, 3, 1, 2], [0, 5, 1, 1], [0, 6, 1, 2], [1, 7, 1, 1], [2, 2, 8, 1], [2, 3, 1, 1], [2, 4, 1, 1], [3, 6, 1, 1]]
+  },
+  {
+   "allocator": "longest_lifetime_first",
+   "align": 8,
+   "budget": 16,
+   "demonstrates": "Vectors by lifetime: the step-2 vector takes slot 0 and the step-3 vector holds slot 1, so the scalar live over steps 2-3 has no word; the step-2 vector in slot 1 works.",
+   "values": [[2, 2, 8, 1], [2, 3, 1, 1], [3, 4, 8, 1], [4, 6, 8, 1]]
+  },
+  {
+   "allocator": "vectors_then_scalars",
+   "align": 8,
+   "budget": 16,
+   "demonstrates": "C3's two-pass allocator outside its hypothesis (8 * 2 + 1 > 16): the step-5 vector takes the lowest slot without looking at scalars, so no word is free for the scalar over steps 2-7; slot 1 for it works.",
+   "values": [[1, 1, 8, 1], [1, 3, 8, 1], [2, 7, 1, 1], [5, 5, 8, 1]]
+  }
+ ]
+}
