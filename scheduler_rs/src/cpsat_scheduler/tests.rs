@@ -6307,3 +6307,98 @@ mod tuning_makespan_interval_tests {
         assert_eq!(super::super::model::build_sat_parameters(60.0, None, false, None, &tuning), default);
     }
 }
+
+// ============================================================================
+// CP-SAT tuning: extra cumulative propagators
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_cumulative_propagator_tests {
+    use super::tuning_objective_tests::{solve, toy_ops};
+    use super::*;
+    use crate::cpsat_scheduler::CumulativePropagator;
+
+    fn params(tuning: &CpsatTuning) -> cp_sat::proto::SatParameters {
+        super::super::model::build_sat_parameters(60.0, None, false, None, tuning)
+    }
+
+    #[test]
+    fn test_default_leaves_the_cumulative_propagators_alone() {
+        let default = params(&CpsatTuning::default());
+        assert_eq!(default.use_overload_checker_in_cumulative, None);
+        assert_eq!(default.use_timetable_edge_finding_in_cumulative, None);
+        assert_eq!(default.max_num_intervals_for_timetable_edge_finding, None);
+        assert_eq!(default.use_hard_precedences_in_cumulative, None);
+        assert_eq!(default.exploit_all_precedences, None);
+    }
+
+    #[test]
+    fn test_each_propagator_sets_its_own_parameter() {
+        let one = |p: CumulativePropagator| {
+            params(&CpsatTuning { cumulative_propagators: vec![p], ..Default::default() })
+        };
+        let overload = one(CumulativePropagator::OverloadChecker);
+        assert_eq!(overload.use_overload_checker_in_cumulative, Some(true));
+        assert_eq!(overload.use_timetable_edge_finding_in_cumulative, None);
+        let ttef = one(CumulativePropagator::TimetableEdgeFinding);
+        assert_eq!(ttef.use_timetable_edge_finding_in_cumulative, Some(true));
+        assert_eq!(ttef.max_num_intervals_for_timetable_edge_finding, None);
+        assert_eq!(ttef.use_overload_checker_in_cumulative, None);
+        let hard = one(CumulativePropagator::HardPrecedences);
+        // One switch, both parameters: OR-Tools 9.15 ignores the first without the second.
+        assert_eq!(hard.use_hard_precedences_in_cumulative, Some(true));
+        assert_eq!(hard.exploit_all_precedences, Some(true));
+        assert_eq!(hard.use_overload_checker_in_cumulative, None);
+        let raised = params(&CpsatTuning {
+            timetable_edge_finding_max_intervals: Some(100_000),
+            ..Default::default()
+        });
+        assert_eq!(raised.max_num_intervals_for_timetable_edge_finding, Some(100_000));
+        assert_eq!(raised.use_timetable_edge_finding_in_cumulative, None);
+    }
+
+    #[test]
+    fn test_propagator_json_names() {
+        let tuning = CpsatTuning::from_json(Some(
+            r#"{"cumulative_propagators": ["overload_checker", "timetable_edge_finding", "hard_precedences"],
+                "timetable_edge_finding_max_intervals": 5000}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tuning.cumulative_propagators,
+            vec![
+                CumulativePropagator::OverloadChecker,
+                CumulativePropagator::TimetableEdgeFinding,
+                CumulativePropagator::HardPrecedences,
+            ]
+        );
+        assert_eq!(tuning.timetable_edge_finding_max_intervals, Some(5000));
+        assert_eq!(CpsatTuning::from_json(Some(&tuning.to_json())).unwrap(), tuning);
+        assert!(CpsatTuning::from_json(Some(r#"{"cumulative_propagators": ["edge_finding"]}"#)).is_err());
+        // exploit_all_precedences is not a propagator of its own: it is part of hard_precedences.
+        assert!(CpsatTuning::from_json(Some(r#"{"cumulative_propagators": ["all_precedences"]}"#)).is_err());
+        assert!(CpsatTuning::from_json(Some(r#"{"timetable_edge_finding_max_intervals": -1}"#)).is_err());
+    }
+
+    /// Propagators only prune: the proved optimum must not move.
+    #[test]
+    fn test_extra_propagators_keep_the_optimal_makespan() {
+        let ops = toy_ops();
+        let base = solve(&ops, CpsatTuning::default());
+        let tuned = solve(
+            &ops,
+            CpsatTuning {
+                cumulative_propagators: vec![
+                    CumulativePropagator::OverloadChecker,
+                    CumulativePropagator::TimetableEdgeFinding,
+                    CumulativePropagator::HardPrecedences,
+                ],
+                timetable_edge_finding_max_intervals: Some(100_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(base.status, CpsatStatus::Optimal);
+        assert_eq!(tuned.status, CpsatStatus::Optimal);
+        assert_eq!(tuned.makespan, base.makespan);
+    }
+}

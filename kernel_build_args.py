@@ -90,7 +90,23 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_horizon_num_ops", "horizon_at_least_num_ops"),
     ("cpsat_makespan_interval", "makespan_interval"),
     ("cpsat_push_tasks_toward_start", "push_all_tasks_toward_start"),
+    ("cpsat_cumulative_propagators", "cumulative_propagators"),
+    ("cpsat_ttef_max_intervals", "timetable_edge_finding_max_intervals"),
 ]
+
+CUMULATIVE_PROPAGATORS = ["overload_checker", "timetable_edge_finding", "hard_precedences"]
+
+
+def _propagator_list(text: str) -> list:
+    """argparse type: comma-separated cumulative propagator names; 'all' means every one."""
+    names = _name_list(text)
+    if names == ["all"]:
+        return list(CUMULATIVE_PROPAGATORS)
+    unknown = [name for name in names if name not in CUMULATIVE_PROPAGATORS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown cumulative propagator(s) {unknown}; valid: all, {', '.join(CUMULATIVE_PROPAGATORS)}")
+    return names
 
 
 # ----------------------------------------------------------------------------
@@ -192,6 +208,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "see the makespan (default: off)")
     group.add_argument("--cpsat-push-tasks-toward-start", action=argparse.BooleanOptionalAction, default=None,
                        help="CP-SAT push_all_tasks_toward_start (experimental solver parameter; default: off)")
+    group.add_argument("--cpsat-cumulative-propagators", type=_propagator_list, default=None, metavar="NAME,...",
+                       help="Extra CP-SAT cumulative propagators for every worker: all, or a list of "
+                            + ", ".join(CUMULATIVE_PROPAGATORS) + " (default: none)")
+    group.add_argument("--cpsat-ttef-max-intervals", type=_non_negative_int, default=None, metavar="N",
+                       help="max_num_intervals_for_timetable_edge_finding (CP-SAT default: 100). Timetable edge "
+                            "finding is skipped on larger cumulatives, i.e. on all of ours unless this is raised.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
