@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::cse_groups::{CseGroup, CseGroupResult};
+use super::op_times::ScheduledTimes;
 use crate::types::{ConstChoiceEncoding, Engine, MachineConfig, Opcode, SelectChoiceEncoding, SsaOp, VLEN};
 
 /// One row of the Flow audit: an op that contributes to the Flow engine at a given cycle.
@@ -651,8 +652,8 @@ pub(crate) fn try_validate_ssa_slot_limits(
     Ok(())
 }
 
-/// Verify that every RAW dependency satisfies cycle[consumer] >= producer_visible_cycle.
-/// Producer visible cycle: SelectChoice FMA => producer_cycle+2; shifted => completion_cycle+1; else producer_cycle+1.
+/// Verify that every RAW dependency satisfies cycle[consumer] >= the producer's visible cycle
+/// ([`ScheduledTimes::visible`]: SelectChoice FMA => cycle+2; shifted => last lane+1; else cycle+1).
 ///
 /// A shifted consumer executes as VLEN scalar ops at `shifted_alu_cycles[consumer]`, so each of
 /// those lane cycles is checked as well: against the producer's visible cycle, or lane by lane
@@ -665,26 +666,20 @@ pub(crate) fn verify_all_raw_precedence(
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) {
+    let times = ScheduledTimes::new(ops, cycle_assignments, shifted_ops, shifted_alu_cycles, select_choice_encoding);
     let id_to_idx: HashMap<usize, usize> = ops
         .iter()
         .enumerate()
         .map(|(idx, op)| (op.id, idx))
         .collect();
     for (consumer_idx, op) in ops.iter().enumerate() {
-        let consumer_cycle = cycle_assignments.get(consumer_idx).copied().unwrap_or(-1);
+        let consumer_cycle = times.cycle(consumer_idx);
         for &dep_id in &op.dep_ids {
             let Some(&producer_idx) = id_to_idx.get(&dep_id) else {
                 continue;
             };
             let producer = &ops[producer_idx];
-            let producer_cycle = cycle_assignments.get(producer_idx).copied().unwrap_or(-1);
-            let producer_visible_cycle = producer_visible_cycle(
-                producer,
-                producer_cycle,
-                shifted_ops,
-                shifted_alu_cycles,
-                select_choice_encoding,
-            );
+            let producer_visible_cycle = times.visible(producer_idx);
             assert!(
                 consumer_cycle >= producer_visible_cycle,
                 "BUG: RAW precedence violation: op id={} (consumer) at cycle {} depends on op id={} (producer), result visible at cycle {}",
@@ -693,19 +688,11 @@ pub(crate) fn verify_all_raw_precedence(
                 producer.id,
                 producer_visible_cycle
             );
-            if !shifted_ops.contains(&op.id) {
-                continue;
-            }
-            let Some(consumer_lanes) = shifted_alu_cycles.get(&op.id) else {
+            let Some(consumer_lanes) = times.lanes(consumer_idx) else {
                 continue;
             };
-            let producer_lanes = shifted_alu_cycles
-                .get(&producer.id)
-                .filter(|_| shifted_ops.contains(&producer.id));
             for (lane, &lane_cycle) in consumer_lanes.iter().enumerate() {
-                let lane_visible = producer_lanes
-                    .and_then(|lanes| lanes.get(lane))
-                    .map_or(producer_visible_cycle, |&c| c + 1);
+                let lane_visible = times.lane_visible(producer_idx, lane);
                 assert!(
                     lane_cycle >= lane_visible,
                     "BUG: RAW precedence violation: shifted op id={} lane {} at cycle {} depends on op id={} (producer), result visible at cycle {}",
@@ -717,32 +704,6 @@ pub(crate) fn verify_all_raw_precedence(
                 );
             }
         }
-    }
-}
-
-/// Cycle from which the result of `producer` can be read.
-/// SelectChoice FMA => cycle+2; shifted => last lane cycle+1; else cycle+1.
-#[cfg(feature = "cpsat")]
-pub(crate) fn producer_visible_cycle(
-    producer: &SsaOp,
-    producer_cycle: i32,
-    shifted_ops: &HashSet<usize>,
-    shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
-    select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
-) -> i32 {
-    if producer.opcode == Opcode::SelectChoice
-        && producer.sub_temp_vreg.is_some()
-        && matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
-    {
-        producer_cycle + 2
-    } else if shifted_ops.contains(&producer.id) {
-        shifted_alu_cycles
-            .get(&producer.id)
-            .and_then(|v| v.iter().max().copied())
-            .unwrap_or(producer_cycle)
-            + 1
-    } else {
-        producer_cycle + 1
     }
 }
 
@@ -758,6 +719,7 @@ pub(crate) fn verify_cse_sub_precedence(
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) {
+    let times = ScheduledTimes::new(ops, cycle_assignments, shifted_ops, shifted_alu_cycles, select_choice_encoding);
     for (g, (group, res)) in groups.iter().zip(results.iter()).enumerate() {
         if !res.sub_active {
             continue;
@@ -766,13 +728,7 @@ pub(crate) fn verify_cse_sub_precedence(
             let Some(idx) = producer_idx else {
                 continue;
             };
-            let visible = producer_visible_cycle(
-                &ops[idx],
-                cycle_assignments.get(idx).copied().unwrap_or(-1),
-                shifted_ops,
-                shifted_alu_cycles,
-                select_choice_encoding,
-            );
+            let visible = times.visible(idx);
             assert!(
                 res.sub_cycle >= visible,
                 "BUG: CSE group {} shared SUB at cycle {} reads {} from op id={}, result visible at cycle {}",
@@ -809,21 +765,11 @@ pub(crate) fn verify_scratch_budget_all_readers(
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     scratch_budget: usize,
 ) {
-    let lanes = |idx: usize| shifted_alu_cycles.get(&ops[idx].id).filter(|_| shifted_ops.contains(&ops[idx].id));
+    let times = ScheduledTimes::new(ops, cycle_assignments, shifted_ops, shifted_alu_cycles, select_choice_encoding);
     let mut events: Vec<(i32, i64)> = Vec::new();
     for (vreg, def_idx, readers) in values {
-        let start = lanes(*def_idx)
-            .and_then(|l| l.iter().min().copied())
-            .unwrap_or(cycle_assignments[*def_idx]);
-        let end = readers
-            .iter()
-            .map(|&r| {
-                let last_read = lanes(r).and_then(|l| l.iter().max().copied()).unwrap_or(cycle_assignments[r]);
-                let fma = ops[r].opcode == Opcode::SelectChoice
-                    && matches!(select_choice_encoding.get(&ops[r].id), Some(SelectChoiceEncoding::Fma));
-                last_read + 1 + i32::from(fma)
-            })
-            .max();
+        let start = times.first_write(*def_idx);
+        let end = readers.iter().map(|&r| times.last_read_end(r)).max();
         let Some(end) = end else {
             continue;
         };
@@ -858,31 +804,31 @@ pub(crate) fn verify_select_choice_fma_consumer_precedence(
     cycle_assignments: &[i32],
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
 ) {
+    let no_shifts = HashSet::new();
+    let no_lanes = HashMap::new();
+    let times = ScheduledTimes::new(ops, cycle_assignments, &no_shifts, &no_lanes, select_choice_encoding);
     let id_to_idx: HashMap<usize, usize> = ops
         .iter()
         .enumerate()
         .map(|(idx, op)| (op.id, idx))
         .collect();
     for (consumer_idx, op) in ops.iter().enumerate() {
-        let consumer_cycle = cycle_assignments.get(consumer_idx).copied().unwrap_or(-1);
+        let consumer_cycle = times.cycle(consumer_idx);
         for &dep_id in &op.dep_ids {
             let Some(&producer_idx) = id_to_idx.get(&dep_id) else {
                 continue;
             };
             let producer = &ops[producer_idx];
-            if producer.opcode != Opcode::SelectChoice
-                || !matches!(select_choice_encoding.get(&producer.id), Some(SelectChoiceEncoding::Fma))
-                || producer.sub_temp_vreg.is_none()
-            {
+            if times.result_latency(producer_idx) == 0 {
                 continue;
             }
-            let producer_cycle = cycle_assignments.get(producer_idx).copied().unwrap_or(-1);
+            let producer_cycle = times.cycle(producer_idx);
             assert!(
-                consumer_cycle >= producer_cycle + 2,
+                consumer_cycle >= times.visible(producer_idx),
                 "BUG: consumer of SelectChoice FMA (op.id={}) at cycle {} but result not visible until cycle {} (dep at {})",
                 producer.id,
                 consumer_cycle,
-                producer_cycle + 2,
+                times.visible(producer_idx),
                 producer_cycle
             );
         }
