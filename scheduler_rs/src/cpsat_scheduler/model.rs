@@ -1023,7 +1023,8 @@ pub fn schedule_ssa_cpsat(
         alu_optional_intervals.insert(idx, alu_intervals);
 
         // completion >= issue cycle and every lane (op_times.rs states the mode invariants)
-        times[idx].add_shift_invariants(&mut model, idx, valu_shift_mode);
+        // and, with tuning.lane_model, the lane order and the pinned lanes of an unshifted op
+        times[idx].add_shift_invariants(&mut model, idx, valu_shift_mode, tuning.lane_model);
     }
 
     // 5a. Element-wise dependency map for shifted VALU -> shifted VALU: op lane i depends on dep lane j.
@@ -1056,16 +1057,16 @@ pub fn schedule_ssa_cpsat(
                         .map(|v| v[lane_i])
                         .unwrap_or(lane_i);
                     // Shiftable dep: lane j + 1 when shifted ("on"), its cycle + 1 when not
-                    // ("off"); other deps: cycle + 1 ("valu").
-                    for ready in times[dep_idx].lane_ready(j) {
+                    // ("off"); other deps: cycle + 1 ("valu"). With pinned lanes a shiftable
+                    // dep gives one unconditional row (no label).
+                    for ready in times[dep_idx].lane_ready(j, tuning.lane_model.pinned()) {
                         let c = model.add_ge(alu_cycle, ready.value);
                         if let Some(when) = ready.when {
                             model.only_enforce_if(c, [when]);
                         }
-                        model.set_constraint_name(
-                            c,
-                            &format!("shift_alu_prec_{}_{}_dep_{}_{}", idx, lane_i, dep_idx, ready.label),
-                        );
+                        let name = format!("shift_alu_prec_{}_{}_dep_{}", idx, lane_i, dep_idx);
+                        let name = if ready.label.is_empty() { name } else { format!("{}_{}", name, ready.label) };
+                        model.set_constraint_name(c, &name);
                     }
                 }
             }

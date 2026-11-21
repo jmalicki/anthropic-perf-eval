@@ -178,6 +178,48 @@ pub enum CpsatObjective {
     Makespan,
 }
 
+/// How the eight lane variables of a shiftable vector op's scalar alternative are modelled
+/// (`alu_c{op}_{lane}`: the cycle of each scalar op when the vector op is shifted).
+///
+/// Both restrictions keep an optimal schedule of the free model: every feasible schedule
+/// maps to one of the restricted model with the same cycle variables, mode literals,
+/// completions and per-cycle slot usage (Z3: `verification/lane_model.py`; the shapes of the
+/// rows that mention lanes are checked on exported models by `tests/test_cpsat_lane_model.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CpsatLaneModel {
+    /// Lanes are free variables in the op's domain (default): lane precedences are enforced
+    /// by the producer's shift literal, and an unshifted op's lanes take any value its rows
+    /// allow.
+    #[default]
+    #[serde(rename = "free")]
+    Free,
+    /// `lane_0 <= lane_1 <= ... <= lane_7` for every shiftable op: removes the 8! lane
+    /// permutations of each op. Valid because every row that mentions lanes either uses the
+    /// same lane index on both sides or bounds all lanes of an op alike.
+    #[serde(rename = "sorted")]
+    Sorted,
+    /// `!shift => lane_i = cycle` for every lane, and each lane precedence is one
+    /// unconditional row `lane_i(op) >= lane_i(dep) + 1` instead of a pair enforced by the
+    /// producer's shift literal.
+    #[serde(rename = "pinned")]
+    Pinned,
+    /// Both of the above.
+    #[serde(rename = "sorted-pinned")]
+    SortedPinned,
+}
+
+impl CpsatLaneModel {
+    /// Whether the lanes of each op are ordered.
+    pub fn sorted(self) -> bool {
+        matches!(self, Self::Sorted | Self::SortedPinned)
+    }
+
+    /// Whether an unshifted op's lanes equal its cycle (and lane precedences are unconditional).
+    pub fn pinned(self) -> bool {
+        matches!(self, Self::Pinned | Self::SortedPinned)
+    }
+}
+
 /// Extra cumulative propagators CP-SAT can be asked to run (all off in CP-SAT by default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -270,6 +312,8 @@ pub struct CpsatTuning {
     /// here have hundreds to tens of thousands of intervals, so the propagator does nothing
     /// unless this is raised.
     pub timetable_edge_finding_max_intervals: Option<i32>,
+    /// Lane variables of shiftable ops: free (default), sorted, pinned or both.
+    pub lane_model: CpsatLaneModel,
 }
 
 impl Default for CpsatTuning {
@@ -288,6 +332,7 @@ impl Default for CpsatTuning {
             push_all_tasks_toward_start: false,
             cumulative_propagators: Vec::new(),
             timetable_edge_finding_max_intervals: None,
+            lane_model: CpsatLaneModel::default(),
         }
     }
 }

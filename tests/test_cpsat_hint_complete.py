@@ -93,3 +93,42 @@ def test_cse_groups_are_present_in_the_three_round_model(tmp_path):
     names = [var.name for var in model.variables]
     assert any(name.startswith("cse_sub_end_") for name in names)
     assert any(name.startswith("cse_sub_size_") for name in names)
+
+
+def hint_is_feasible(model):
+    """Whether the hint satisfies every constraint: fix each hinted variable and solve.
+
+    Returns the CP-SAT status name of that solve (FEASIBLE or OPTIMAL = the hint is a solution).
+    """
+    from google.protobuf import text_format
+    from ortools.sat.python import cp_model
+
+    fixed = type(model)()
+    fixed.CopyFrom(model)
+    for var, value in zip(fixed.solution_hint.vars, fixed.solution_hint.values):
+        del fixed.variables[var].domain[:]
+        fixed.variables[var].domain.extend([value, value])
+    fixed.ClearField("solution_hint")
+    fixed.ClearField("search_strategy")
+    solver_model = cp_model.CpModel()
+    solver_model.proto.parse_text_format(text_format.MessageToString(fixed))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 60
+    solver.parameters.num_workers = 1
+    return solver.StatusName(solver.Solve(solver_model))
+
+
+LANE_MODEL_CASES = [
+    [*rounds, "--cpsat-lane-model", lane_model]
+    for rounds in (["--rounds", "3"], ["--rounds", "5"])
+    for lane_model in ("free", "sorted", "pinned", "sorted-pinned")
+]
+
+
+@pytest.mark.parametrize("extra", LANE_MODEL_CASES, ids=lambda extra: " ".join(extra).replace("--", ""))
+def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):
+    """Sorted lanes and pinned lanes must not cut off the greedy schedule: the greedy hints
+    all eight lanes of an op at the op's cycle, which is sorted and pinned."""
+    model = _export_model(tmp_path, extra)
+    assert not unhinted_variables(model)
+    assert hint_is_feasible(model) in ("FEASIBLE", "OPTIMAL")

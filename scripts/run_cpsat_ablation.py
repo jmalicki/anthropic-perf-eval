@@ -78,6 +78,10 @@ STANDARD_CONFIGS = [
     ("propagators-all", "--cpsat-cumulative-propagators all --cpsat-ttef-max-intervals 1000000"),
     # 6. Redundant rows
     ("no-redundant-rows", "--disable-cpsat-constraints conditional_makespan,flow_cumulative"),
+    # 7. Lane model of shiftable ops
+    ("lane-sorted", "--cpsat-lane-model sorted"),
+    ("lane-pinned", "--cpsat-lane-model pinned"),
+    ("lane-sorted-pinned", "--cpsat-lane-model sorted-pinned"),
 ]
 
 
