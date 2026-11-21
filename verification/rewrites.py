@@ -119,13 +119,37 @@ def check_hash_stage_merge(ctx=None) -> tuple[str, str, float, dict]:
     Three ops (two multiply_adds and an XOR) instead of four (multiply_add, add, shift,
     XOR). Stage 3 is (x + C3) ^ (x << 9) with x = 33a + C2; the left shift distributes over
     the multiply_add modulo 2^32, so x << 9 = a*(33 << 9) + (C2 << 9).
+
+    Proved operand by operand: asked as one query over the whole expression, Z3 needs 25 to
+    90 s on a loaded machine (more than `verification.verify`'s 60 s timeout), while the four
+    obligations below take milliseconds. Together they give the identity by substitution:
+
+        stage3(stage2(a)) = (x + C3) ^ (x << 9)                      [stage 3, x = stage2(a)]
+                          = ((a*m + C2) + C3) ^ ((a*m + C2) << 9)    [stage 2 is a*m + C2, R1]
+                          = (a*m1 + c1) ^ (a*m2 + c2)                [left and right operands]
     """
-    a = _bv("a")
+    a, x = _bv("a"), _bv("x")
     consts = merged_stage_constants(2)
     assert consts is not None, "expected stages 2 and 3 to merge"
     m1, c1, m2, c2 = consts
-    merged = (a * _const(m1) + _const(c1)) ^ (a * _const(m2) + _const(c2))
-    return _refute("R8-hash-stage-merge", merged != _reference_stage(_reference_stage(a, 2), 3), ctx=ctx)
+    mult, c = fma_multiplier(2), HASH_STAGES[2][1]
+    op1, d, op2, op3, k = HASH_STAGES[3]
+    assert (op1, op2, op3) == ("+", "^", "<<"), "stage 3 must be (x + d) ^ (x << k)"
+    stage2 = a * _const(mult) + _const(c)
+    # Same theorem as the single query stage3(stage2(a)) == merged, split for speed. Sound:
+    # the four obligations below together imply it by substitution (the chain in the
+    # docstring), so proving them proves the original equality; nothing is weakened.
+    return _refute(
+        "R8-hash-stage-merge",
+        # Stage 3 has the form (x + d) ^ (x << k) for every x.
+        _reference_stage(x, 3) != (x + _const(d)) ^ (x << k),
+        # Stage 2 is the multiply_add a*m + c (as in R1).
+        _reference_stage(a, 2) != stage2,
+        # The two operands of the XOR.
+        stage2 + _const(d) != a * _const(m1) + _const(c1),
+        (stage2 << k) != a * _const(m2) + _const(c2),
+        ctx=ctx,
+    )
 
 
 def check_hash_stage_merge_needs_left_shift(ctx=None) -> tuple[str, str, float, dict]:
