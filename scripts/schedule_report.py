@@ -369,12 +369,17 @@ TABLE_HEADER = ("| Run | Rounds | Cycles | Simulator | Floor | Gap | Peak words 
                 "| Round overlap |")
 
 
+def markdown_cell(text):
+    """Text for one Markdown table cell: a literal `|` would start a new column."""
+    return str(text).replace("|", "\\|")
+
+
 def table_row(rep, label):
     """One Markdown table row for a run (columns as in TABLE_HEADER)."""
     run, e = rep["run"], rep["engines"]
     overlap = "-" if rep["round_overlap"] is None else str(rep["round_overlap"]["total_overlap"])
     peak = "-" if run["peak_live_words"] is None else str(run["peak_live_words"])
-    cells = [label, str(run["rounds"]), str(run["cycles"]), str(run["simulator_cycles"]), str(rep["floor"]["cycles"]),
+    cells = [markdown_cell(label), str(run["rounds"]), str(run["cycles"]), str(run["simulator_cycles"]), str(rep["floor"]["cycles"]),
              f"{rep['gap']['cycles']} ({rep['gap']['pct_of_floor']:.1f}%)", peak]
     cells += [f"{e[name]['utilisation_pct']:.1f}" for name in ("valu", "alu", "load", "flow")]
     return "| " + " | ".join(cells + [overlap]) + " |"
@@ -412,7 +417,12 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.table:
-        labelled = [(label, analyze(load(path), args.buckets)) for label, path in map(parse_table_arg, args.table)]
+        pairs = [parse_table_arg(arg) for arg in args.table]
+        labels = [label for label, _ in pairs]
+        duplicates = sorted({label for label in labels if labels.count(label) > 1})
+        if duplicates:
+            p.error("--table labels must be unique; give LABEL=PATH for: " + ", ".join(duplicates))
+        labelled = [(label, analyze(load(path), args.buckets)) for label, path in pairs]
         if args.json:
             json.dump({label: rep for label, rep in labelled}, sys.stdout, indent=2)
             print()

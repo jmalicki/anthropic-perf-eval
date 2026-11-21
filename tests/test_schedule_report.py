@@ -258,3 +258,22 @@ def test_table_mode(greedy, cpsat, capsys):
     assert json.loads(capsys.readouterr().out)["x"]["run"]["cycles"] == rep_a["run"]["cycles"]
     assert sr.parse_table_arg("name=/tmp/a=b.json") == ("name", "/tmp/a=b.json")
     assert sr.parse_table_arg("dir/run1.json") == ("run1", "dir/run1.json")
+
+
+def test_table_escapes_pipes_in_labels(greedy):
+    _, path = greedy
+    rep = sr.analyze(sr.load(path))
+    row = sr.table_row(rep, "base|wavefront")
+    assert row.startswith("| base\\|wavefront |")
+    assert row.count("|") - row.count("\\|") == sr.TABLE_HEADER.count("|")
+
+
+def test_table_rejects_duplicate_labels(greedy, cpsat, capsys):
+    (_, a), (_, b) = greedy, cpsat
+    assert a.endswith("sched.json") and b.endswith("sched.json")
+    with pytest.raises(SystemExit) as exit_info:
+        sr.main(["--table", a, b])
+    assert exit_info.value.code == 2
+    assert "labels must be unique" in capsys.readouterr().err
+    assert sr.main(["--table", f"greedy={a}", f"cpsat={b}", "--json"]) == 0
+    assert set(json.loads(capsys.readouterr().out)) == {"greedy", "cpsat"}

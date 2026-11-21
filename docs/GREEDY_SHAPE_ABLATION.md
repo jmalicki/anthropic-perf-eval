@@ -22,7 +22,7 @@ uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate \
 
 Rails for that command: PROVED, PASSED, greedy counter agrees with interval liveness, slot
 limits hold, address assignment peak 1,244 of 1,536, two runs give the same kernel, and
-`./scripts/check_upstream.sh` with the same options passes upstream's CorrectnessTests and
+`./scripts/check_upstream.sh --strict` with the same options passes upstream's CorrectnessTests and
 every speed threshold at 1,315 cycles.
 
 **This is a greedy-only result.** Split shift is switched off whenever CP-SAT follows the
@@ -204,34 +204,45 @@ Reading the tables:
 
 ## 5. Parameter sweeps (16 rounds)
 
+All sweeps in this section were re-run on the current scheduler (after the #29 review
+fixes and the #32 review fixes), one `generate_ssa_kernel.py --use-greedy --validate` run per
+cell; every cell with numbers is PROVED and PASSED.
+
 Wavefront stagger and window, without split shift, default pressure policy. Schedule
 cycles, scratch peak in parentheses:
 
 | stagger \ in flight | 12 | 14 | 16 | 18 | 20 | 24 | no limit |
 |---|---|---|---|---|---|---|---|
-| 8 | 1538 | | | | | | |
-| 10 | 1483 | 1434 | 1395 (1196) | | 1745 (1372) | | |
-| 12 | 1460 | 1409 | 1398 (1156) | 1398 (1232) | 1398 (1268) | 2135 (1388) | 2808 (1360) |
-| 14 | 1438 | 1405 | 1404 (1108) | | 1404 (1220) | | |
+| 8 | 1538 (1012) | 1487 (1112) | 1441 (1228) | 2687 (1334) | 2777 (1398) | 2844 (1413) | 2834 (1378) |
+| 10 | 1483 (988) | 1434 (1088) | 1395 (1196) | 1563 (1288) | 2796 (1388) | 2826 (1396) | 2840 (1354) |
+| 12 | 1460 (980) | 1409 (1088) | 1398 (1156) | 1398 (1232) | 1398 (1268) | 2737 (1388) | 2808 (1360) |
+| 14 | 1438 (980) | 1405 (1056) | 1404 (1108) | 1404 (1152) | 1404 (1220) | 1411 (1268) | 2813 (1394) |
 
-The cliff on the right is the throttle of section 2. With split shift the peak is higher
-and the cliff is closer: 18 groups in flight gives 1,549. With
-`--pressure-inflation-threshold 0.95` the cliff is gone:
+The cliff on the right is the throttle of section 2: once about 1,280 words are live
+(80% of the budget plus what is in flight) almost every op has enough slack to be
+deferred, and the schedule roughly doubles. A smaller stagger reaches that peak with fewer
+groups in flight. With split shift the peak is higher and the cliff is closer; with
+`--pressure-inflation-threshold 0.95` it is gone:
 
 | Wavefront + split shift | built-in 0.80 | inflation 0.95 |
 |---|---|---|
-| stagger 12, 14 in flight | 1347 (1128) | |
+| stagger 12, 14 in flight | 1347 (1128) | 1347 (1128) |
 | stagger 12, 16 in flight | 1314 (1260) | 1313 (1244) |
-| stagger 12, 18 in flight | 1549 (1352) | |
-| stagger 12, 20 in flight | 1770 (1444) | 1313 (1276) |
-| stagger 12, 24 in flight | | 1313 (1330) |
-| stagger 12, no limit | | 1313 (1336) |
-| stagger 10, 18 in flight | | 1309 (1296) |
-| stagger 10, 20 in flight | | 1308 (1364) |
-| stagger 11 / 13 / 14, 16 in flight | 1314 / 1317 / 1323 | |
+| stagger 12, 18 in flight | 2885 (1352) | 1313 (1262) |
+| stagger 12, 20 in flight | 2800 (1444) | 1313 (1276) |
+| stagger 12, 24 in flight | 2793 (1448) | 1313 (1330) |
+| stagger 12, no limit | 2816 (1434) | 1313 (1336) |
+| stagger 10, 18 in flight | 1453 (1298) | 1309 (1296) |
+| stagger 10, 20 in flight | 2749 (1398) | 1308 (1364) |
+| stagger 11 / 13 / 14, 16 in flight | 1314 / 1317 / 1323 | 1314 / 1317 / 1323 |
+
+The first version of this table (before the #29 review fixes) had 1,549 and 1,770 at 18
+and 20 in flight with the built-in threshold; on the current scheduler those cells are on
+the far side of the cliff (2,885 and 2,800). The conclusion is the same and stronger: with
+the built-in threshold the window must stay at 16 or below; with 0.95 it does not matter.
 
 Inflation threshold on the default shape (barriers on, first-come-first-served queue).
-Schedule cycles, scratch peak in parentheses:
+Schedule cycles, scratch peak in parentheses (re-run: identical to the first version):
 
 | Threshold | 3 rounds | 4 rounds | 16 rounds |
 |---|---|---|---|
@@ -378,7 +389,9 @@ and PASSED unless it says fails. The wavefront found 32 chains in every row.
    better at every size measured, on the default shape and with the wavefront, and it keeps
    46 words of budget. This PR stack does not change it.
 3. The wavefront should stay an option for now. It is the right start where there are
-   gather rounds (4 rounds and up), but at 3 rounds CP-SAT does better from the default
+   gather rounds (5 rounds and up; at 4 rounds it still wins, 30 cycles in section 6,
+   from running select rounds of some groups beside the hash of others), but at 3 rounds
+   CP-SAT does better from the default
    shape with the retuned threshold (section 6), and CP-SAT cannot yet take the split-shift
    schedule.
 4. The per-round barrier and the per-section repair it exists for are not needed by the
@@ -398,7 +411,7 @@ uv run python -m scripts.schedule_report --table default=base16.json best=best16
 uv run python -m scripts.schedule_report base16.json --compare best16.json
 
 # Upstream tests on the recommended kernel
-./scripts/check_upstream.sh --use-greedy --greedy-barriers none --greedy-priority wavefront \
+./scripts/check_upstream.sh --strict --use-greedy --greedy-barriers none --greedy-priority wavefront \
   --greedy-split-shift --pressure-inflation-threshold 0.95
 
 # The single-option rows
