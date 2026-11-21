@@ -1227,6 +1227,7 @@ impl SsaTickTockKernelBuilder {
                     SsaCpsatHints {
                         greedy_hints: Some(&segment_hints),
                         shift_hints: seg_shift,
+                        shifted_lane_cycle_hints: None,
                         forced_shifts: None,
                         select_choice_hints: seg_select,
                         const_add_imm_hints: seg_const_add_imm_hints,
@@ -1508,12 +1509,17 @@ impl SsaTickTockKernelBuilder {
             vec![]
         };
         let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
+        // Split shifts made by the greedy (only with --cpsat-split-shift-hint): hint each lane
+        // at its own cycle. Lanes of ops whose shift hint was dropped are ignored by the model.
+        let split_shift_lane_hints = Some(&ctx.greedy_decisions.shifted_alu_cycles)
+            .filter(|lanes| !lanes.is_empty());
         let cpsat_result = match schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),
                 shift_hints,
+                shifted_lane_cycle_hints: split_shift_lane_hints,
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
                 const_add_imm_hints,

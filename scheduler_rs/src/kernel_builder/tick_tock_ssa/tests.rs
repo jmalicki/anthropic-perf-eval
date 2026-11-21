@@ -2285,6 +2285,54 @@ fn test_split_shift_ignored_when_cpsat_follows() {
     assert_slot_limits_hold(&result);
 }
 
+/// With `cpsat_split_shift_hint` the greedy that feeds CP-SAT keeps its split shifts and
+/// hands them over lane by lane: the hint verifier accepts the schedule (it would panic on
+/// 16 scalar slots in a cycle if it counted a split op whole) and the kernel is valid.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_split_shift_hint_reaches_cpsat() {
+    use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+
+    // The greedy alone, same shape: it does make split shifts on this kernel.
+    let configure = |c: &mut KernelConfig| {
+        configure_wavefront(c);
+        c.compiler.greedy_split_shift = true;
+        c.compiler.cpsat_split_shift_hint = true;
+    };
+    let greedy_only = schedule_shape_kernel(2, configure);
+    assert!(!greedy_only.shifted_alu_cycles.is_empty(), "the greedy start contains split shifts");
+
+    let mut config = KernelConfig::new(10, 2047, 256, 2);
+    configure(&mut config);
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.cpsat_deterministic_time = Some(1.0);
+    let result = builder
+        .build_and_schedule_cpsat(
+            600.0, // time limit (backstop)
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,  // per_section_optimize_secs
+            None,  // forced_shifts
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false, // force_zero_gap
+            crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+            false, // enable_scratch_tightening
+            false, // symmetry_precedence_integrated
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
+            false, // precedence_neutral_horizon
+            None,  // disable_optional_constraint_groups
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        )
+        .expect("CP-SAT accepts the split-shift hint");
+    assert!(!result.budget_exceeded);
+    assert_slot_limits_hold(&result);
+}
+
 // =========================================================================
 // Greedy schedule shape: pressure thresholds and budget headroom
 // =========================================================================
@@ -3987,6 +4035,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
         SsaCpsatHints {
             greedy_hints: Some(&greedy_hints),
             shift_hints: None,
+            shifted_lane_cycle_hints: None,
             forced_shifts: None,
             select_choice_hints: None,
             const_add_imm_hints: None,
