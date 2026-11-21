@@ -87,6 +87,21 @@ def test_counts_cover_every_ssa_op(tmp_path):
     assert counts["select1"] > 0 and counts["select2"] > 0
 
 
+def test_what_ifs_adjust_the_table_and_are_labelled(table):
+    rows = es.flag_plan(CTX, "bits")
+    base = table.predict(rows)
+    no_address = es.what_if_gather_without_address_op(table).predict(rows)
+    gather_group_rounds = 14 * CTX.n_groups - 6 * CTX.n_groups  # rounds 1-10, 15 gather; 1-3, 12-14 select
+    assert base["vec_shiftable"] - no_address["vec_shiftable"] == gather_group_rounds
+    packets = es.what_if_packets(table, (5,))
+    assert table.predict(rows)["load"] - packets.predict(rows)["load"] == 8 * CTX.n_groups - 3 * 32 // 8
+    assert any("not calibrated" in n for n in packets.notes)
+    with pytest.raises(ValueError, match="deeper than the cached levels"):
+        es.what_if_packets(table, (3,))
+    with pytest.raises(ValueError, match="not both visited"):
+        es.what_if_packets(table, (10,))
+
+
 def test_cost_table_round_trips(table):
     again = es.CostTable.from_json(json.loads(json.dumps(table.to_json())))
     rows = es.flag_plan(CTX, "bits")

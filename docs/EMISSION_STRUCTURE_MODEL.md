@@ -8,12 +8,14 @@ model runs in **1,104 cycles (1,106 on the simulator)** against 1,153 / 1,155 fo
 flags. Every kernel here is proved equal to its SSA program, passes validation and passes the
 unmodified upstream tests with `--strict`. The floor ignores time, so it is a good guide only
 while the scheduler can approach it. Here every schedule lands 90 to 120 cycles above its floor,
-and two plans with the same floor can differ by 100 cycles (section 5).
+and two plans with the same floor can differ by 100 cycles (section 5). Estimated with the model,
+`vload` at the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles
+of floor on this structure: once loads stop binding, the vector work binds near 975 (section 6).
 
 November 2026. Code: `scripts/emission_structure.py` (model, calibration, solve, measurement),
 `solver/emission_plan.py` (plan format), `--emission-plan` (emitter). Skill:
 `.cursor/skills/use-emission-structure/SKILL.md`. All numbers: 16 rounds, batch 256, height 10,
-`--merge-hash-stages --index-form mirrored`, reproduced by the commands in section 8.
+`--merge-hash-stages --index-form mirrored`, reproduced by the commands in section 9.
 
 ## 1. Two levels
 
@@ -236,25 +238,48 @@ docs/EMISSION_ABLATION.md section 3.4.
 The model takes new encodings as rows of the cost table once the emitter has them. Before
 building one, `--what-if` gives an uncalibrated estimate with hand-adjusted coefficients:
 
-| What-if (not calibrated) | Floor-optimal | With `flow=0.9` |
+| What-if (not calibrated) | Floor-optimal plan | Binds |
 |---|---|---|
-| Today's encodings (calibrated) | 989 | 997 |
-| `gather-without-address-op`: every gather loses its vector address op, as `vload` at the 1-based index would (phase 2) | 971 | 977 |
+| Today's encodings (calibrated) | 989 | loads |
+| `gather-without-address-op`: every gather loses its vector address op, as `vload` at the 1-based index would (phase 2) | 971 | loads and ALUs |
+| `packets-5`: levels 5+6 from one per-lane `vload` of a 3-word packet (phase 3, one pair) | 981 | ALUs |
+| `packets-5-7`: levels 5+6 and 7+8 | 996 | ALUs |
+| `packets-5-7-9`: levels 5 to 10 | 1,054 | ALUs |
+| phase 2 + `packets-5` (the packet estimate removes the address ops again, so about 8 too low) | 947 | ALUs |
 
-Phase 2 is worth about 20 cycles of floor, because loads still bind: the gather's address op is
-ALU work, and the ALU saving can only become fewer loads through more level-4 selects. That is
-smaller than the scheduler's 107-cycle gap on the current best plan.
+The packet estimate per group and level pair (`what_if_packets`): 8 loads instead of 16; one
+multiply_add for the packet address instead of 2 address ops and 2 constant XORs; 8 scalar copies
+of the node word into the group vector and 16 scalar ops for the child (`left + bit * diff`).
+Setup per pair at level L: `3 * 2^L / 8` vloads and vector XORs, `2^L` scalar subtracts, and
+`3 * 2^L` scalar stores with their address adds, on the otherwise idle store engine. The setup
+grows as `2^L`, which is why deeper pairs make it worse.
 
-What lowers the load term is serving several rounds with one load per lane: subtree packets
-(phase 3, design D in docs/BOUND_GAP_ANALYSIS.md, floor 873), or reading cached nodes without
-selects. Leads from the leaderboard research, to verify:
+**Why packets pay little here.** As soon as loads stop binding, the ALUs do. The best plan's
+7,452 vector-op equivalents are 14.55 per group-round:
+
+| Phase | Vector-op equivalents | Per group-round |
+|---|---|---|
+| Hash | 5,120 | 10.00 |
+| Branch bit and index update | 896 | 1.75 |
+| Tree access (addresses, constant XOR, selects not on flow, bit extraction) | 743 | 1.45 |
+| Node XOR | 512 | 1.00 |
+| Setup, input and output | 181 | 0.35 |
+
+That alone is a floor of about 975 whatever the load count. The public 880-cycle kernel does
+all of its non-hash work in 2.58 per group-round (docs/BOUND_GAP_ANALYSIS.md section 3); here it
+is 4.55. That difference (about 1,000 equivalents, 135 cycles) is the larger part of its
+advantage, so a packet encoding pays only together with cheaper index, address and XOR work.
+Phase 2 and phase 3 together are worth about 35 cycles of floor on this structure, less than the
+scheduler's 107-cycle gap on the current best plan.
+
+Leads from the leaderboard research, to verify:
 
 | Lead | Mechanism | In this model |
 |---|---|---|
-| 899 cycles | 3-word two-level packets, 6 loads per lane, no address add | A packet encoding per level pair: per group 8 loads cover 2 visits; setup = the tree rewrite (stores) |
-| 913 cycles | Per-lane `jump_indirect` dispatch reading depth-4 nodes from scratch: rounds 4 and 15 need no gathers | A level-4 encoding that trades 8 loads for flow (jumps) per group, no select tree |
+| 899 cycles | 3-word two-level packets, 6 loads per lane, no address add | The `packets-*` what-ifs above; with this structure's vector work it does not reach the load floor |
+| 913 cycles | Per-lane `jump_indirect` dispatch reading depth-4 nodes from scratch: rounds 4 and 15 need no gathers | Needs control flow in a straight-line scheduled kernel, which the pipeline does not have |
 | 982 cycles | Level-4 caching for a searched subset of groups | What this model does (section 5) |
-| Estimate | 899-style packets for levels 4 to 7: about -480 loads, load floor about 822 | To be checked by calibrating the encoding |
+| Estimate | 899-style packets for levels 4 to 7: about -480 loads, load floor about 822 | The load floor falls, but the ALUs bind near 975 first |
 
 ## 7. Known limits of the model
 
@@ -298,7 +323,8 @@ $M measure --shaped --json flags.json --plan bits --plan bits-flow --plan mobius
   --plan bits-flow+depth4-after-wrap --plan bits+depth4 --plan bits-flow+depth4
 $M scatter --input "flag configurations=flags.json" --input "model plans=sweep.json" \
   --input "model plans, no lateness tie-break=nolate.json" --out docs/emission_plans/floor_vs_cycles.svg
-$M solve --what-if gather-without-address-op [--max-util flow=0.9]           # section 6
+$M solve --what-if gather-without-address-op                                 # section 6, also packets-5,
+                                                                              # packets-5-7, packets-5-7-9
 
 # One plan by hand
 uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate --merge-hash-stages --index-form mirrored \

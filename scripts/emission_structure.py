@@ -681,7 +681,40 @@ def what_if_gather_without_address_op(table: CostTable) -> CostTable:
                      table.notes + ["what-if: gather without the vector address op (not calibrated)"])
 
 
-WHAT_IFS = {"gather-without-address-op": what_if_gather_without_address_op}
+def what_if_packets(table: CostTable, pairs: Sequence[int] = (5, 7)) -> CostTable:
+    """The table as if levels L and L+1 were fetched with one per-lane `vload` of a 3-word
+    packet [node, left child, right - left] (pre-XORed with the hash constant, written in place
+    during setup), for every L in `pairs` (each level visited once, so the gather rounds of L
+    and L+1 are replaced). An estimate from docs/EMISSION_STRUCTURE_MODEL.md section 6, not
+    calibrated. Per group and pair: 8 loads instead of 16; 1 multiply_add for the packet address
+    instead of 2 address ops and 2 constant XORs; 8 scalar copies (level L) and 16 scalar ops
+    (level L+1: left + bit * diff). Setup per pair: 3 * 2^L / 8 vloads and vector XORs, 2^L
+    scalar subtracts, 3 * 2^L scalar stores and their address adds.
+    """
+    ctx = table.context
+    coef = {k: dict(v) for k, v in table.coefficients.items()}
+    b = coef["base"]
+    for level in pairs:
+        if not all(any(ctx.depth(r) == d for r in range(ctx.rounds)) for d in (level, level + 1)):
+            raise ValueError(f"levels {level} and {level + 1} are not both visited")
+        if level <= MAX_CACHED_DEPTH or level + 1 > ctx.forest_height:
+            raise ValueError(f"packet pair {level}+{level + 1} must be deeper than the cached levels")
+        g = ctx.n_groups
+        b["load"] += -8 * g + 3 * 2 ** level // 8
+        b["vec_shiftable"] += -4 * g + 3 * 2 ** level // 8
+        b["vec_fixed"] += g
+        b["alu"] += 24 * g + 2 ** level + 3 * 2 ** level
+        b["store"] += 3 * 2 ** level
+    return CostTable(ctx, coef, table.calibration_plans, table.checked_plans,
+                     table.notes + [f"what-if: packets for level pairs {list(pairs)} (not calibrated)"])
+
+
+WHAT_IFS = {
+    "gather-without-address-op": what_if_gather_without_address_op,
+    "packets-5-7": lambda t: what_if_packets(t, (5, 7)),
+    "packets-5-7-9": lambda t: what_if_packets(t, (5, 7, 9)),
+    "packets-5": lambda t: what_if_packets(t, (5,)),
+}
 
 
 # ----------------------------------------------------------------------------
