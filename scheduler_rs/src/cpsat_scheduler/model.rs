@@ -190,6 +190,9 @@ pub(crate) fn build_sat_parameters(
     params.subsolvers = tuning.subsolvers.clone();
     params.extra_subsolvers = tuning.extra_subsolvers.clone();
     params.ignore_subsolvers = tuning.ignore_subsolvers.clone();
+    if tuning.push_all_tasks_toward_start {
+        params.push_all_tasks_toward_start = Some(true);
+    }
 
     if stop_after_first_solution {
         params.stop_after_first_solution = Some(true);
@@ -3014,6 +3017,48 @@ pub fn schedule_ssa_cpsat(
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
     }
 
+    // 10b. Makespan interval (tuning.makespan_interval): one interval [makespan, horizon) that
+    // takes the whole capacity of every engine cumulative, as in OR-Tools' rcpsp_sat.py. It
+    // excludes nothing (every interval of those cumulatives is present only for work that runs
+    // at a cycle <= max_cycle, so it ends by makespan); it lets CP-SAT's linear relaxation find
+    // the makespan of each cumulative and tie the energy rows and cuts to it. The scratch
+    // cumulative is left alone: live intervals may end after the makespan.
+    let makespan_tail_size: Option<IntVar> = if tuning.makespan_interval {
+        let tail_size = model.new_int_var_with_name(
+            [(0, horizon - capacity_lower_bound)],
+            "makespan_tail_size".to_string(),
+        );
+        let tail = model.new_interval_var(makespan, tail_size, horizon);
+        let mut attached = 0usize;
+        for (name, cap) in [
+            ("cumul_valu", valu_cap),
+            ("cumul_alu", alu_cap),
+            ("cumul_load", load_cap),
+            ("cumul_store", store_cap),
+            ("cumul_flow", flow_cap),
+        ] {
+            for constraint in model.proto_mut().constraints.iter_mut().filter(|c| c.name == name) {
+                if let Some(cp_sat::proto::constraint_proto::Constraint::Cumulative(cumulative)) =
+                    constraint.constraint.as_mut()
+                {
+                    cumulative.intervals.push(tail.0);
+                    cumulative.demands.push(cp_sat::proto::LinearExpressionProto {
+                        vars: vec![],
+                        coeffs: vec![],
+                        offset: cap,
+                    });
+                    attached += 1;
+                }
+            }
+        }
+        if verbose {
+            eprintln!("  Makespan interval [makespan, {}) added to {} engine cumulatives", horizon, attached);
+        }
+        Some(tail_size)
+    } else {
+        None
+    };
+
     // Redundant linear capacity constraints: only add bounds that are valid for *any* choice.
     // capacity_lower_bound (makespan domain) is already the min over (x,y,z) from compute_capacity_lower_bound_global.
     // Do NOT add makespan >= ceil(alu_count+8*shiftable/12) or makespan >= ceil(valu_count-shiftable/6): those are
@@ -3422,6 +3467,9 @@ pub fn schedule_ssa_cpsat(
         let hint_makespan = hints.iter().max().copied().unwrap_or(0) + 1;
         model.add_hint(makespan, hint_makespan as i64);
         model.add_hint(max_cycle, (hint_makespan - 1) as i64);
+        if let Some(tail_size) = makespan_tail_size {
+            model.add_hint(tail_size, (horizon - hint_makespan as i64).max(0));
+        }
     }
 
     // Add shift hints - always hint ALL shift variables to avoid "unhinted variables" warnings.
