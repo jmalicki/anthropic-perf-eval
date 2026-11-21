@@ -2027,6 +2027,8 @@ pub fn schedule_ssa_cpsat(
     // Declared outside scratch_budget block so section 11 can hint them.
     let mut scratch_select_fma_end_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, last_use_idx)
     let mut scratch_shifted_start_vars: Vec<(IntVar, usize)> = Vec::new(); // (var, def_idx)
+    // Per CSE group: (end, size) of the shared SUB's scratch interval, for hinting.
+    let mut cse_sub_scratch_vars: Vec<(IntVar, IntVar)> = Vec::new();
     // Readers per live VReg (def idx, reader idxs), kept for the post-solve scratch check.
     let mut scratch_values: Vec<(VReg, usize, Vec<usize>)> = Vec::new();
 
@@ -2606,6 +2608,7 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(end_cycle_var),
                     );
                     model.set_constraint_name(c_size, &format!("cse_sub_size_eq_{}", g));
+                    cse_sub_scratch_vars.push((end_cycle_var, size_var));
                     // Only enforce size constraint when sub_active
                     model.only_enforce_if(c_size, [sub_active_var]);
                     
@@ -3721,6 +3724,20 @@ pub fn schedule_ssa_cpsat(
             });
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
             model.add_hint(cse_sub_cycle_vars[g], clamped);
+            // The shared SUB's scratch interval: it ends one cycle after the SUB, or two
+            // cycles after the last consumer hinted as FMA (which reads it at cycle + 1).
+            if let Some(&(end_var, size_var)) = cse_sub_scratch_vars.get(g) {
+                let last_fma_read_end = group
+                    .consumer_indices
+                    .iter()
+                    .filter(|&&c| select_choice_hints.is_some_and(|h| h.contains(&ops[c].id)))
+                    .filter_map(|&c| greedy_hints.and_then(|hints| hints.get(c).copied()))
+                    .map(|cycle| cycle as i64 + 2)
+                    .max();
+                let end_hint = last_fma_read_end.map_or(clamped + 1, |e| e.max(clamped + 1));
+                model.add_hint(end_var, end_hint);
+                model.add_hint(size_var, end_hint - clamped);
+            }
         }
     }
 
