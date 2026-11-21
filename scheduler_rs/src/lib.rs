@@ -53,6 +53,7 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // SSA kernel building functions
     m.add_function(wrap_pyfunction!(python::build_tick_tock_kernel_ssa, m)?)?;
     m.add_function(wrap_pyfunction!(python::optional_constraint_group_names, m)?)?;
+    m.add_function(wrap_pyfunction!(python::resolve_cpsat_tuning, m)?)?;
     m.add_class::<python::OptionalConstraintGroupPy>()?;
     // Expose each variant as a class attribute for Python (e.g. OptionalConstraintGroup.redundant_linear_bounds).
     let py = m.py();
