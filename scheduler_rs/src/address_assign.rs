@@ -45,7 +45,8 @@
 //! 1. Compute live intervals: [def_cycle, last_read_cycle] for live VRegs,
 //!    [def_cycle, def_cycle+1] for dead VRegs
 //! 2. Turn each interval into a span in half-cycle units (`interval_span`) that encodes the
-//!    expiration rule above; two values may share a word iff their spans are disjoint
+//!    expiration rule above, widened to the last write of values written over several cycles
+//!    (`compute_value_spans`); two values may share a word iff their spans are disjoint
 //! 3. Pass 1: 8-word values (vectors, vector groups) in start order, each in an 8-word slot
 //!    (the free slot freed most recently, else a new one): exactly max-live-vectors slots
 //! 4. Pass 2: scalars in start order, each in the lowest word free for its whole span, holes in
@@ -108,7 +109,10 @@ pub struct AddressAssignmentResult {
     pub live_intervals: HashMap<VReg, LiveInterval>,
     /// Peak liveness by pool (vectors, scalars, words) of the allocated values, fixed VRegs
     /// excluded, under the allocator's exact conflict rule (see `compute_pool_peaks`).
-    pub pool_peaks: PoolPeaks,
+    pub pool_peaks: Option<PoolPeaks>,
+    /// Non-fixed words from `start_addr` up to the highest word a non-fixed value uses;
+    /// fragmentation = `words_used - pool_peaks.words`. 0 when nothing was placed.
+    pub words_used: usize,
     /// First allocatable address (`AddressAssignConfig::start_addr`); `max_addr + 1 - start_addr`
     /// words are in use above the reserved ones.
     pub start_addr: i64,
@@ -795,28 +799,110 @@ fn colour_pool(values: &[(VReg, (i64, i64))], choice: SlotChoice) -> (Vec<(VReg,
     (out, n_slots)
 }
 
-/// Peak liveness by pool of the values the allocator places (fixed VRegs excluded), under the
-/// allocator's exact conflict rule. This is the quantity a scheduler must bound for
-/// `assign_addresses` to fit: the two-pool layout needs `split_words()` addresses above
-/// `start_addr`, and no layout needs fewer than `words`.
+/// Span of every value under the allocator's conflict rule: `interval_span`, widened to the
+/// write phase of the value's last write cycle when that cycle is the interval's end.
+///
+/// An interval records the first write and the last access. A value written over several
+/// cycles (a VALU op shifted to 8 ALU ops, or a vector group assembled from lane writes) can
+/// still be written in the cycle its interval ends, e.g. a shifted destination whose last lane
+/// is written at `e` and never read after. `interval_span` ends at the read phase of `e` (`2e`),
+/// which would let another value written at `e` share a word with it; the last write extends
+/// the span to `2e + 1`. Values whose last access is a read after their last write keep
+/// `interval_span` (a read at `e` still lets a value written at `e` reuse the word).
 ///
 /// # Arguments
 /// * `intervals` - Live intervals from `compute_live_intervals`
+/// * `last_writes` - Last write cycle of values written in more than one cycle
+///   (`last_write_cycles`); values not in the map are written once, at `interval.start`
+///
+/// # Returns
+/// `(lo, hi)` per VReg, inclusive.
+pub fn compute_value_spans(
+    intervals: &HashMap<VReg, LiveInterval>,
+    last_writes: &HashMap<VReg, i32>,
+) -> HashMap<VReg, (i64, i64)> {
+    intervals
+        .iter()
+        .map(|(vreg, iv)| {
+            let (lo, mut hi) = interval_span(iv);
+            if let Some(&w) = last_writes.get(vreg) {
+                hi = hi.max(2 * w as i64 + 1);
+            }
+            (*vreg, (lo, hi))
+        })
+        .collect()
+}
+
+/// Last write cycle of every value written in more than one cycle: destinations of VALU ops
+/// shifted to ALU (8 lane writes, possibly in different cycles) and vector groups assembled
+/// from lane writes. Values written in one cycle are not listed.
+///
+/// # Arguments
+/// * `ops` - Scheduled SSA operations
+/// * `config` - Shifted ALU cycles, SelectChoice FMA ops and vector groups
+///
+/// # Returns
+/// VReg (the group alias for lanes) to its last write cycle.
+pub fn last_write_cycles(ops: &[SsaOp], config: &AddressAssignConfig) -> HashMap<VReg, i32> {
+    let ctx = LivenessContext {
+        select_fma_ops: &config.select_fma_ops,
+        shifted_alu_cycles: &config.shifted_alu_cycles,
+        const_alu_derive_ops: &config.const_alu_derive_ops,
+        cse_consumer_op_ids: &config.cse_consumer_op_ids,
+        ops,
+    };
+    let mut lane_group: HashMap<VReg, VReg> = HashMap::new();
+    for (group, lanes) in &config.vector_group_lanes {
+        for lane in lanes {
+            lane_group.insert(*lane, *group);
+        }
+    }
+    let mut first_last: HashMap<VReg, (i32, i32)> = HashMap::new();
+    for op in ops {
+        let Some(dest) = op.dest else { continue };
+        if op.cycle < 0 {
+            continue;
+        }
+        let Some((first, last)) = (OpLiveness { op, ctx: &ctx }).dest_write_interval(op, &ctx) else {
+            continue;
+        };
+        let key = lane_group.get(&dest).copied().unwrap_or(dest);
+        first_last
+            .entry(key)
+            .and_modify(|(f, l)| {
+                *f = (*f).min(first);
+                *l = (*l).max(last);
+            })
+            .or_insert((first, last));
+    }
+    first_last
+        .into_iter()
+        .filter(|(_, (f, l))| l > f)
+        .map(|(v, (_, l))| (v, l))
+        .collect()
+}
+
+/// Peak liveness by pool of the values the allocator places (fixed VRegs excluded), under the
+/// allocator's exact conflict rule. This is the quantity a scheduler must bound for
+/// `assign_addresses` to fit: the two-pass layout needs at most `split_words()` non-fixed words
+/// above `start_addr`, and no layout needs fewer than `words`.
+///
+/// # Arguments
+/// * `spans` - Value spans from `compute_value_spans`
 /// * `fixed_vregs` - VRegs with preassigned addresses (not counted)
 ///
 /// # Returns
 /// `PoolPeaks` for the remaining values.
 pub fn compute_pool_peaks(
-    intervals: &HashMap<VReg, LiveInterval>,
+    spans: &HashMap<VReg, (i64, i64)>,
     fixed_vregs: &HashMap<VReg, i64>,
 ) -> PoolPeaks {
-    // Sweep events: +size at lo, -size after hi. Sorted, so HashMap order does not matter.
+    // Sweep events: +1 at lo, -1 after hi. Sorted, so HashMap order does not matter.
     let mut events: Vec<(i64, i64, i64)> = Vec::new(); // (time, d_vectors, d_scalars)
-    for (vreg, iv) in intervals {
+    for (vreg, &(lo, hi)) in spans {
         if fixed_vregs.contains_key(vreg) {
             continue;
         }
-        let (lo, hi) = interval_span(iv);
         let (dv, ds) = if vreg.is_vector() { (1, 0) } else { (0, 1) };
         events.push((lo, dv, ds));
         events.push((hi + 1, -dv, -ds));
@@ -894,7 +980,8 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // Calculate peak liveness
     let peak_live = compute_peak_liveness(&intervals);
     let budget_exceeded = peak_live > config.budget;
-    let pool_peaks = compute_pool_peaks(&intervals, &config.fixed_vregs);
+    let spans = compute_value_spans(&intervals, &last_write_cycles(ops, config));
+    let pool_peaks = compute_pool_peaks(&spans, &config.fixed_vregs);
 
     // Clone intervals for storage in result
     let live_intervals = intervals.clone();
@@ -905,17 +992,17 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             peak_live,
             budget_exceeded,
             live_intervals,
-            pool_peaks,
+            pool_peaks: Some(pool_peaks),
             start_addr: config.start_addr,
             ..Default::default()
         });
     }
 
-    // Collect intervals with their VRegs, sorted by start cycle
-    let mut sorted: Vec<(VReg, LiveInterval)> = intervals.into_iter().collect();
-    // VReg breaks ties: values that start and end together would otherwise be allocated in
-    // HashMap iteration order, giving the same schedule different addresses on every run.
-    sorted.sort_by_key(|(vreg, interval)| (interval.start, interval.end, *vreg));
+    // Spans in allocation order. VReg breaks ties: values that start and end together would
+    // otherwise be allocated in HashMap iteration order, giving the same schedule different
+    // addresses on every run.
+    let mut sorted: Vec<(VReg, (i64, i64))> = spans.into_iter().collect();
+    sorted.sort_by_key(|&(vreg, span)| (span, vreg));
 
     let mut vreg_to_addr = assign_two_pass(&sorted, config, SlotChoice::MostRecentlyFreed);
 
@@ -952,6 +1039,7 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
+    let words_used = movable_words_used(&vreg_to_addr, config);
 
     Ok(AddressAssignmentResult {
         vreg_to_addr,
@@ -962,7 +1050,8 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         budget_exceeded,
         budget: config.budget,
         live_intervals,
-        pool_peaks,
+        pool_peaks: Some(pool_peaks),
+        words_used,
         start_addr: config.start_addr,
     })
 }
@@ -975,14 +1064,17 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 /// new one when none is free. This uses exactly `PoolPeaks::vectors` slots (see `colour_pool`).
 ///
 /// Pass 2 places scalars in start order in the lowest word that is free for the scalar's whole
-/// span: first the words of the vector region that no vector holds during that span (a word can
-/// hold vectors at one time and scalars at another), then words above the region. Above the
-/// region only scalars live, and every scalar placed there that conflicts with the current one
-/// is live at the current one's start, so at most `PoolPeaks::scalars` words are used above it.
+/// span: first the non-fixed words below the end of the vector region (slot words no vector
+/// holds during that span, so a word can hold vectors at one time and scalars at another, and
+/// words skipped while stepping slots over fixed ranges), then words above the region. Above
+/// the region only scalars live, and every scalar placed there that conflicts with the current
+/// one is live at the current one's start, so at most `PoolPeaks::scalars` words are used there.
 ///
-/// What is guaranteed: at most `8 * PoolPeaks::vectors + PoolPeaks::scalars` words above
-/// `start_addr` (plus any fixed words the region has to step over), so the result fits whenever
-/// that sum fits. What is not: fitting whenever the per-cycle peak `PoolPeaks::words` fits.
+/// What is guaranteed: with no fixed VReg at or above `start_addr` (the kernels' only fixed
+/// VReg is the zero word at address 0), at most `8 * PoolPeaks::vectors + PoolPeaks::scalars`
+/// words above `start_addr`, so the result fits whenever that sum fits; each fixed range inside
+/// the region can add up to 7 skipped words to the vector region's span. What is not: fitting
+/// whenever the per-cycle peak `PoolPeaks::words` fits.
 /// Between the two bounds the result depends on which slot each vector gets, and some interval
 /// sets fit only with a vector off the 8-word grid or in an order other than start order
 /// (`test_two_pass_temporal_counterexample_most_recently_freed_slot`,
@@ -991,19 +1083,20 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 /// and finding one is NP-hard (see docs/ALLOCATION_CONJECTURES.md). On the kernels measured
 /// when this was written, `MostRecentlyFreed` used exactly `PoolPeaks::words`, the minimum.
 ///
-/// Conflicts use `interval_span` in both passes, which encodes the one-pass allocator's rules:
-/// same-cycle reuse after a read, point intervals, and two values written in the same cycle
-/// (whatever their sizes) never sharing a word. Fixed VRegs keep their addresses, and their
-/// words are never given to another value at any time.
+/// Conflicts use the value spans of `compute_value_spans` in both passes, which encode the
+/// one-pass allocator's rules (same-cycle reuse after a read, point intervals) and keep any two
+/// values written in the same cycle, whatever their sizes, off each other's words (including a
+/// shifted destination's last lane write). Fixed VRegs keep their addresses, and their words
+/// are never given to another value at any time.
 ///
 /// # Arguments
-/// * `sorted` - Live intervals of every value to place (fixed VRegs may be included)
+/// * `sorted` - Span of every value to place, sorted by (span, VReg) (fixed VRegs may be included)
 /// * `config` - Start address and fixed VRegs
 ///
 /// # Returns
 /// Address of every VReg in `sorted` and every fixed VReg.
 fn assign_two_pass(
-    sorted: &[(VReg, LiveInterval)],
+    sorted: &[(VReg, (i64, i64))],
     config: &AddressAssignConfig,
     choice: SlotChoice,
 ) -> HashMap<VReg, i64> {
@@ -1014,6 +1107,7 @@ fn assign_two_pass(
         fixed_ranges.push((addr, addr + vreg.size() as i64));
     }
     fixed_ranges.sort_unstable();
+    let is_fixed = |a: i64| fixed_ranges.iter().any(|&(s, e)| s <= a && a < e);
     // First address >= addr at which [addr, addr + size) avoids every fixed range.
     let next_usable = |mut addr: i64, size: i64| -> i64 {
         loop {
@@ -1025,16 +1119,10 @@ fn assign_two_pass(
     };
 
     let placed = |vreg: &VReg| !config.fixed_vregs.contains_key(vreg);
-    let vectors: Vec<(VReg, (i64, i64))> = sorted
-        .iter()
-        .filter(|(v, _)| placed(v) && v.size() == VLEN)
-        .map(|(v, iv)| (*v, interval_span(iv)))
-        .collect();
-    let mut scalars: Vec<(VReg, (i64, i64))> = sorted
-        .iter()
-        .filter(|(v, _)| placed(v) && v.size() != VLEN)
-        .map(|(v, iv)| (*v, interval_span(iv)))
-        .collect();
+    let vectors: Vec<(VReg, (i64, i64))> =
+        sorted.iter().copied().filter(|(v, _)| placed(v) && v.size() == VLEN).collect();
+    let mut scalars: Vec<(VReg, (i64, i64))> =
+        sorted.iter().copied().filter(|(v, _)| placed(v) && v.size() != VLEN).collect();
     assert!(
         scalars.iter().all(|(v, _)| v.size() == 1),
         "two-pass allocator handles 1- and {}-word values only",
@@ -1063,17 +1151,24 @@ fn assign_two_pass(
     }
 
     // Pass 2: scalars, in start order.
-    scalars.sort_by_key(|&(vreg, (lo, hi))| (lo, hi, vreg));
-    // Hole words: every word of every slot, ascending, with its slot.
-    let mut hole_words: Vec<(i64, usize)> = (0..n_slots)
-        .flat_map(|slot| (0..VLEN as i64).map(move |i| (slot, i)))
-        .map(|(slot, i)| (slot_addr[slot] + i, slot))
+    scalars.sort_by_key(|&(vreg, span)| (span, vreg));
+    // Region words: every non-fixed word below the region's end, ascending, with its slot when
+    // a vector slot covers it (words skipped while stepping over fixed ranges have none).
+    let mut word_slot: HashMap<i64, usize> = HashMap::new();
+    for (slot, &base) in slot_addr.iter().enumerate() {
+        for i in 0..VLEN as i64 {
+            word_slot.insert(base + i, slot);
+        }
+    }
+    let hole_words: Vec<(i64, Option<usize>)> = (config.start_addr..region_end)
+        .filter(|&a| !is_fixed(a))
+        .map(|a| (a, word_slot.get(&a).copied()))
         .collect();
-    hole_words.sort_unstable();
-    // Latest span end of the scalars placed in each hole word.
+    // Latest span end of the scalars placed in each region word.
     let mut hole_scalar_hi: Vec<i64> = vec![i64::MIN; hole_words.len()];
-    // Per slot: index of the first vector span that can still conflict (spans ending before the
-    // current scalar's start never conflict again, since starts only grow).
+    // Per slot: index of the first vector span that can still conflict. Spans ending before
+    // the current scalar's start never conflict again (starts only grow), so the cursor only
+    // moves forward; it is advanced when the search reaches the slot.
     let mut slot_cursor: Vec<usize> = vec![0; n_slots];
     // Words above the region: colour with a free list (lowest index first).
     let mut above_addr: Vec<i64> = Vec::new();
@@ -1081,23 +1176,27 @@ fn assign_two_pass(
     let mut above_free: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
 
     for &(vreg, (lo, hi)) in &scalars {
-        for slot in 0..n_slots {
-            let spans = &slot_spans[slot];
-            let c = &mut slot_cursor[slot];
-            while *c < spans.len() && spans[*c].1 < lo {
-                *c += 1;
-            }
-        }
-        let hole = hole_words.iter().enumerate().find(|&(k, &(_, slot))| {
+        let mut hole = None;
+        for (k, &(word, slot)) in hole_words.iter().enumerate() {
             if hole_scalar_hi[k] >= lo {
-                return false;
+                continue;
             }
-            let spans = &slot_spans[slot];
-            let c = slot_cursor[slot];
-            // spans[c] is the first span ending at or after lo; it conflicts iff it starts by hi.
-            !(c < spans.len() && spans[c].0 <= hi)
-        });
-        if let Some((k, &(word, _))) = hole {
+            if let Some(slot) = slot {
+                let spans = &slot_spans[slot];
+                let c = &mut slot_cursor[slot];
+                while *c < spans.len() && spans[*c].1 < lo {
+                    *c += 1;
+                }
+                // spans[c] is the first span ending at or after lo; it conflicts iff it
+                // starts by hi.
+                if *c < spans.len() && spans[*c].0 <= hi {
+                    continue;
+                }
+            }
+            hole = Some((k, word));
+            break;
+        }
+        if let Some((k, word)) = hole {
             hole_scalar_hi[k] = hi;
             vreg_to_addr.insert(vreg, word);
             continue;
@@ -1122,6 +1221,34 @@ fn assign_two_pass(
         vreg_to_addr.insert(vreg, above_addr[idx]);
     }
     vreg_to_addr
+}
+
+/// Non-fixed words from `start_addr` up to the highest word any non-fixed value uses: the
+/// allocator's footprint, comparable with `PoolPeaks::words` (which also excludes fixed VRegs).
+///
+/// # Arguments
+/// * `vreg_to_addr` - Assigned addresses (fixed VRegs and vector-group lanes may be included)
+/// * `config` - Start address and fixed VRegs
+///
+/// # Returns
+/// Words in `[start_addr, top)` that no fixed VReg occupies, `top` being one past the highest
+/// word of a non-fixed value; 0 when no non-fixed value was placed.
+fn movable_words_used(vreg_to_addr: &HashMap<VReg, i64>, config: &AddressAssignConfig) -> usize {
+    let top = vreg_to_addr
+        .iter()
+        .filter(|(v, _)| !config.fixed_vregs.contains_key(v))
+        .map(|(v, &a)| a + v.size() as i64)
+        .max();
+    let Some(top) = top else { return 0 };
+    let fixed_in_range: i64 = config
+        .fixed_vregs
+        .iter()
+        .map(|(v, &a)| {
+            let (s, e) = (a.max(config.start_addr), (a + v.size() as i64).min(top));
+            (e - s).max(0)
+        })
+        .sum();
+    (top - config.start_addr - fixed_in_range).max(0) as usize
 }
 
 /// An address conflict between two simultaneously-live VRegs.
@@ -2681,24 +2808,17 @@ mod tests {
     // Fragmentation: two-pass allocator (vectors by colouring, then scalars)
     // ========================================================================
 
-    /// True if two placed values may share a word: their `interval_span`s are disjoint.
-    fn spans_disjoint(a: &LiveInterval, b: &LiveInterval) -> bool {
-        let (alo, ahi) = interval_span(a);
-        let (blo, bhi) = interval_span(b);
-        ahi < blo || bhi < alo
-    }
-
     /// Every pair of values whose address ranges overlap must have disjoint spans (the
     /// allocator's own conflict rule, stricter than `LiveInterval::overlaps` for point intervals).
-    fn assert_no_span_conflicts(intervals: &[(VReg, LiveInterval)], addrs: &HashMap<VReg, i64>) {
-        for (i, (va, ia)) in intervals.iter().enumerate() {
-            for (vb, ib) in &intervals[i + 1..] {
-                let (a, b) = (addrs[va], addrs[vb]);
+    fn assert_no_span_conflicts(spans: &[(VReg, (i64, i64))], addrs: &HashMap<VReg, i64>) {
+        for (i, &(va, (alo, ahi))) in spans.iter().enumerate() {
+            for &(vb, (blo, bhi)) in &spans[i + 1..] {
+                let (a, b) = (addrs[&va], addrs[&vb]);
                 let overlap = a < b + vb.size() as i64 && b < a + va.size() as i64;
                 assert!(
-                    !overlap || spans_disjoint(ia, ib),
-                    "{:?} [{},{}] at {} and {:?} [{},{}] at {} share words while both live",
-                    va, ia.start, ia.end, a, vb, ib.start, ib.end, b
+                    !overlap || ahi < blo || bhi < alo,
+                    "{:?} span [{},{}] at {} and {:?} span [{},{}] at {} share words while both live",
+                    va, alo, ahi, a, vb, blo, bhi, b
                 );
             }
         }
@@ -2709,12 +2829,18 @@ mod tests {
         addrs.iter().map(|(v, &a)| a + v.size() as i64).max().unwrap_or(0)
     }
 
-    /// `(vreg, start, end)` triples as live intervals, in the allocator's order.
-    fn sorted_intervals(list: &[(VReg, i32, i32)]) -> Vec<(VReg, LiveInterval)> {
-        let mut v: Vec<(VReg, LiveInterval)> =
-            list.iter().map(|&(r, s, e)| (r, LiveInterval::new(s, e))).collect();
-        v.sort_by_key(|(r, iv)| (iv.start, iv.end, *r));
+    /// `(vreg, start, end)` triples as allocator spans (`interval_span`), in allocation order.
+    fn sorted_intervals(list: &[(VReg, i32, i32)]) -> Vec<(VReg, (i64, i64))> {
+        let mut v: Vec<(VReg, (i64, i64))> =
+            list.iter().map(|&(r, s, e)| (r, interval_span(&LiveInterval::new(s, e)))).collect();
+        v.sort_by_key(|&(r, span)| (span, r));
         v
+    }
+
+    /// Peaks of a span list, as `assign_addresses` computes them.
+    fn peaks_of(spans: &[(VReg, (i64, i64))], config: &AddressAssignConfig) -> PoolPeaks {
+        let map: HashMap<VReg, (i64, i64)> = spans.iter().copied().collect();
+        compute_pool_peaks(&map, &config.fixed_vregs)
     }
 
     /// Fragmentation of the one-pass first-fit allocator, end to end through `assign_addresses`.
@@ -2762,8 +2888,8 @@ mod tests {
         ];
         let config = AddressAssignConfig { budget: 10, ..Default::default() };
         let result = assign_addresses(&ops, &config).unwrap();
-        assert_eq!(result.pool_peaks.words, 9, "b and v are live together: 9 words");
-        assert_eq!(result.pool_peaks.split_words(), 10);
+        assert_eq!(result.pool_peaks.as_ref().unwrap().words, 9, "b and v are live together: 9 words");
+        assert_eq!(result.pool_peaks.as_ref().unwrap().split_words(), 10);
         assert!(
             !result.budget_exceeded,
             "liveness (9 words) fits the 9 assignable words, but addresses {:?} reach {}",
@@ -2793,8 +2919,7 @@ mod tests {
         let (v1, v2, v3, d) = (VReg::vector(1), VReg::vector(2), VReg::vector(3), VReg::scalar(4));
         let iv = sorted_intervals(&[(v1, 0, 1), (v2, 0, 10), (d, 2, 20), (v3, 12, 20)]);
         let config = AddressAssignConfig { budget: 16, start_addr: 0, ..Default::default() };
-        let map: HashMap<VReg, LiveInterval> = iv.iter().cloned().collect();
-        let peaks = compute_pool_peaks(&map, &config.fixed_vregs);
+        let peaks = peaks_of(&iv, &config);
         assert_eq!((peaks.vectors, peaks.scalars, peaks.words), (2, 1, 16));
 
         let lowest = assign_two_pass(&iv, &config, SlotChoice::Lowest);
@@ -2823,8 +2948,7 @@ mod tests {
         let (va, vb, vc) = (VReg::vector(3), VReg::vector(4), VReg::vector(5));
         let iv = sorted_intervals(&[(s1, 1, 7), (va, 4, 6), (vb, 5, 12), (s2, 6, 8), (vc, 7, 11)]);
         let config = AddressAssignConfig { budget: 17, start_addr: 0, ..Default::default() };
-        let map: HashMap<VReg, LiveInterval> = iv.iter().cloned().collect();
-        let peaks = compute_pool_peaks(&map, &config.fixed_vregs);
+        let peaks = peaks_of(&iv, &config);
         assert_eq!(peaks.words, 17, "live words fit the 17-word scratch");
         // The layout found by CP-SAT, checked under the allocator's own conflict rule.
         let exact: HashMap<VReg, i64> =
@@ -2919,9 +3043,8 @@ mod tests {
                 list.push((vreg, start, end));
             }
             let iv = sorted_intervals(&list);
-            let map: HashMap<VReg, LiveInterval> = iv.iter().cloned().collect();
             let config = AddressAssignConfig { budget: 100_000, start_addr: 1, ..Default::default() };
-            let peaks = compute_pool_peaks(&map, &config.fixed_vregs);
+            let peaks = peaks_of(&iv, &config);
             for choice in [SlotChoice::Lowest, SlotChoice::MostRecentlyFreed] {
                 let addrs = assign_two_pass(&iv, &config, choice);
                 assert_no_span_conflicts(&iv, &addrs);
@@ -2937,5 +3060,88 @@ mod tests {
                 assert_eq!((vector_top - config.start_addr) as usize, VLEN * peaks.vectors);
             }
         }
+    }
+
+    /// A VALU op shifted to 8 ALU ops writes its last lanes in the cycle its interval ends.
+    /// Another value written in that cycle must not share its words: two writers in one cycle.
+    /// `A` (lanes at 22 and 23, never read: interval [22,23]) and `B` (lanes at 23 and 24:
+    /// [23,24]) both write at 23. The interval alone ends at a "last access" of 23, which reads
+    /// as read-then-write reuse, and the one-pass allocator (and `interval_span` alone) gave
+    /// them the same block; `verify_no_same_cycle_scratch_write_conflict` then rejected the
+    /// kernel (BUGS.md, "Same-cycle scratch write conflict (shifted VALU adjacent intervals)").
+    #[test]
+    fn test_shifted_dest_last_lane_write_blocks_same_cycle_writer() {
+        let (a, b) = (VReg::vector(1), VReg::vector(2));
+        let shifted_op = |id: usize, cycle: i32, dest: VReg| {
+            let mut op = SsaOp::new(
+                id,
+                Engine::Valu,
+                Opcode::Add,
+                Some(dest),
+                vec![Operand::Imm(1), Operand::Imm(2)],
+            );
+            op.cycle = cycle;
+            op
+        };
+        let ops = vec![shifted_op(0, 22, a), shifted_op(1, 23, b)];
+        let mut config = AddressAssignConfig::default();
+        config.shifted_alu_cycles.insert(0, vec![22, 22, 22, 22, 23, 23, 23, 23]);
+        config.shifted_alu_cycles.insert(1, vec![23, 23, 23, 23, 24, 24, 24, 24]);
+        let result = assign_addresses(&ops, &config).unwrap();
+        assert_eq!(result.live_intervals[&a], LiveInterval::new(22, 23));
+        assert_eq!(result.live_intervals[&b], LiveInterval::new(23, 24));
+        let (aa, ba) = (result.vreg_to_addr[&a], result.vreg_to_addr[&b]);
+        assert!(
+            aa + 8 <= ba || ba + 8 <= aa,
+            "A (lanes written at 23) at {} and B (written at 23) at {} share words",
+            aa,
+            ba
+        );
+        assert_eq!(result.pool_peaks.as_ref().unwrap().vectors, 2);
+    }
+
+    /// Words skipped while stepping vector slots over a fixed range stay usable by scalars.
+    /// Fixed word 4 pushes the only vector slot to 5..=12; a scalar live at the same time must
+    /// take one of words 1..=3, not 13 (beyond a 13-word scratch).
+    #[test]
+    fn test_two_pass_scalars_use_words_skipped_around_fixed_ranges() {
+        let (fixed, v, s) = (VReg::scalar(100), VReg::vector(1), VReg::scalar(2));
+        let iv = sorted_intervals(&[(fixed, 0, 10), (v, 0, 10), (s, 0, 10)]);
+        let mut config = AddressAssignConfig { budget: 13, start_addr: 1, ..Default::default() };
+        config.fixed_vregs.insert(fixed, 4);
+        let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+        assert_eq!(addrs[&v], 5);
+        assert_eq!(addrs[&s], 1);
+        assert_no_span_conflicts(&iv, &addrs);
+        assert_eq!(movable_words_used(&addrs, &config), 11, "words 1..=12 except fixed 4");
+    }
+
+    /// Pool peaks at read/write boundaries: a value read at C and one written at C do not
+    /// overlap; two point intervals at the same cycle do.
+    #[test]
+    fn test_pool_peaks_at_cycle_boundaries() {
+        let config = AddressAssignConfig::default();
+        let (v1, v2) = (VReg::vector(1), VReg::vector(2));
+        let handoff = sorted_intervals(&[(v1, 0, 5), (v2, 5, 9)]);
+        assert_eq!(peaks_of(&handoff, &config).words, 8, "read at 5, then written at 5");
+        let points = sorted_intervals(&[(v1, 11, 11), (v2, 11, 11)]);
+        assert_eq!(peaks_of(&points, &config).words, 16, "both defined and read at 11");
+        let point_then_write = sorted_intervals(&[(v1, 11, 11), (v2, 11, 14)]);
+        assert_eq!(peaks_of(&point_then_write, &config).words, 16);
+    }
+
+    /// The footprint excludes fixed VRegs: a fixed word far above the allocated values is not
+    /// counted as words used (nor as fragmentation).
+    #[test]
+    fn test_words_used_excludes_fixed_vregs() {
+        let (fixed, s) = (VReg::scalar(100), VReg::scalar(1));
+        let iv = sorted_intervals(&[(fixed, 0, 3), (s, 0, 3)]);
+        let mut config = AddressAssignConfig::default();
+        config.fixed_vregs.insert(fixed, 500);
+        let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+        assert_eq!(addrs[&s], 1);
+        assert_eq!(movable_words_used(&addrs, &config), 1);
+        let empty: HashMap<VReg, i64> = [(fixed, 500)].into_iter().collect();
+        assert_eq!(movable_words_used(&empty, &config), 0, "nothing placed: 0 words");
     }
 }

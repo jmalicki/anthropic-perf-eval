@@ -169,16 +169,22 @@ def test_scratch_usage_is_between_liveness_and_pool_bound(fixture, request):
     assert sc is not None
     assert sc["peak_words"] <= sc["words_used"] <= sc["split_words"]
     assert sc["fragmentation_words"] == sc["words_used"] - sc["peak_words"]
-    # peak_live_words counts the reserved zero word as well.
-    assert sched["peak_live_words"] >= sc["peak_words"]
     assert "Scratch:" in sr.format_report(sr.analyze(sched))
 
 
 def test_scratch_usage_absent_in_older_json(greedy):
     sched, _ = greedy
-    old = {k: v for k, v in sched.items() if k != "scratch_pools"}
-    assert sr.scratch_usage(old) is None
-    assert "Scratch:" not in sr.format_report(sr.analyze(old))
+    for missing in ("scratch_pools", "scratch_words_used"):
+        old = {k: v for k, v in sched.items() if k != missing}
+        assert sr.scratch_usage(old) is None
+        assert "Scratch:" not in sr.format_report(sr.analyze(old))
+
+
+def test_scratch_usage_reports_empty_allocation_as_zero():
+    d = {"scratch_pools": {"vectors": 0, "scalars": 0, "words": 0}, "scratch_words_used": 0,
+         "scratch_start_addr": 1, "max_addr": 0}
+    sc = sr.scratch_usage(d)
+    assert (sc["words_used"], sc["fragmentation_words"], sc["split_words"]) == (0, 0, 0)
 
 
 def test_greedy_json_has_no_bound_fields(greedy):

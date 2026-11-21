@@ -31,7 +31,7 @@ Run it as a module from the project root. Started from inside `scripts/`, `scrip
 | Capacity floor for this emission | Fewest cycles the emitted ops fit in when vector ops may run as 8 scalar ops: minimise T with `vector - s <= 6T` and `scalar + 8s <= 12T` over the number shifted `s` (non-shiftable `multiply_add`/`vbroadcast` stay on `valu`), then the max with the load, flow and store floors. Names the binding engine |
 | Gap | Achieved minus floor, in cycles and as a percent of the floor |
 | CP-SAT bound | `lb_cycles` when present, labelled as a bound for this emission |
-| Scratch | Words the address allocator used above the reserved address 0; the per-cycle peak `max_t (8 v(t) + s(t))` (no layout can use fewer); fragmentation = used minus that peak; and `8 * max vectors + max scalars`, which the two-pass allocator never exceeds. From `scratch_pools`, `max_addr` and `scratch_start_addr` in the JSON (absent in older JSONs) |
+| Scratch | Non-fixed words the address allocator used above the reserved address 0 (fixed VRegs such as the zero word are neither use nor fragmentation); the per-cycle peak `max_t (8 v(t) + s(t))` (no layout can use fewer); fragmentation = used minus that peak; and `8 * max vectors + max scalars`, which the two-pass allocator never exceeds. From `scratch_pools` and `scratch_words_used` in the JSON (absent in older JSONs and in JSONs exported before address assignment ran) |
 | Round table | First/last cycle, span, vector/scalar/load/flow ops per round (`ssa_ops[*].source_info.round`), and cycles shared with the previous round. Overlap 0 on every row means rounds run strictly one after another |
 | Utilisation over time | Percent of slots used per engine in N equal slices of the schedule |
 
