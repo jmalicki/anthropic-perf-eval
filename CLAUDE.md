@@ -213,7 +213,7 @@ CP-SAT tuning switches (full-kernel solve only; per-section feasibility solves a
 
 Emission options (change which ops the kernel contains; all off by default, each backed by a Z3 proof in `verification/rewrites.py`; measurements in [docs/EMISSION_ABLATION.md](docs/EMISSION_ABLATION.md)):
 - `--merge-hash-stages` - Hash stages 2 and 3 as two multiply_adds and an XOR: 10 vector ops per hash instead of 11 (proof `R8-hash-stage-merge`).
-- `--index-form {zero-based,mirrored}` - Tree index representation between rounds (default: `zero-based`). `mirrored` tracks `n = L_d - idx` (position in the level from the right, `L_d = 2^(d+1) - 2`): index update in 2 vector ops instead of 3, none at depth 0 and in the wrap round. The initial indices are assumed 0 (as the root broadcast in round 0 already assumes) and not loaded; the final indices are still stored and validated (proofs `R9` to `R11`).
+- `--index-form {zero-based,mirrored}` - Tree index representation between rounds (default: `zero-based`). `mirrored` tracks `n = L_d - idx` (position in the level from the right, `L_d = 2^(d+1) - 2`): index update in 2 vector ops instead of 3: 1 at depth 0 (the AND; `n` is the branch bit itself, so no multiply_add) and none in the wrap round. The initial indices are assumed 0 (as the root broadcast in round 0 already assumes) and not loaded; the final indices are still stored and validated (proofs `R9` to `R11`).
 
 **Why SSA builder?**
 - Eliminates false dependencies between operations

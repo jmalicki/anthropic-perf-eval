@@ -42,8 +42,8 @@ pub enum IndexForm {
     /// The reference index. Update per round: AND, SUB, multiply_add (3 vector ops).
     #[default]
     ZeroBased,
-    /// `n = L_d - idx`. Update per round: AND, multiply_add (2 vector ops); none of the
-    /// two at depth 0, where `n` is the branch bit itself, and nothing in the wrap round.
+    /// `n = L_d - idx`. Update per round: AND, multiply_add (2 vector ops); only the AND
+    /// at depth 0, where `n` is the branch bit itself, and nothing in the wrap round.
     /// The initial indices are taken to be 0 (as the root broadcast in round 0 already
     /// assumes), so they are not loaded; the final indices are stored as `L_d - n`.
     Mirrored,

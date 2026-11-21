@@ -172,8 +172,9 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "hash instead of 11 (proof: R8-hash-stage-merge)")
     group.add_argument("--index-form", choices=["zero-based", "mirrored"], default=EMISSION_DEFAULTS["index_form"],
                        help="Tree index representation between rounds. mirrored tracks n = L_d - idx (position "
-                            "in the level from the right): index update in 2 vector ops instead of 3, none at "
-                            "depth 0 and in the wrap round; initial indices are assumed 0 and not loaded "
+                            "in the level from the right): index update in 2 vector ops instead of 3, 1 at depth 0 "
+                            "(no multiply_add) and none in the wrap round; initial indices are assumed 0 and "
+                            "not loaded "
                             "(proofs: R9 to R11)")
     return group
 
