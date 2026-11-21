@@ -1243,14 +1243,24 @@ fn movable_words_used(vreg_to_addr: &HashMap<VReg, i64>, config: &AddressAssignC
         .map(|(v, &a)| a + v.size() as i64)
         .max();
     let Some(top) = top else { return 0 };
-    let fixed_in_range: i64 = config
+    // Union of the fixed ranges clipped to [start_addr, top): fixed VRegs may overlap (a fixed
+    // group and its fixed lanes), and a word is either fixed or not.
+    let mut ranges: Vec<(i64, i64)> = config
         .fixed_vregs
         .iter()
-        .map(|(v, &a)| {
-            let (s, e) = (a.max(config.start_addr), (a + v.size() as i64).min(top));
-            (e - s).max(0)
-        })
-        .sum();
+        .map(|(v, &a)| (a.max(config.start_addr), (a + v.size() as i64).min(top)))
+        .filter(|(s, e)| s < e)
+        .collect();
+    ranges.sort_unstable();
+    let mut fixed_in_range = 0i64;
+    let mut covered_to = config.start_addr;
+    for (s, e) in ranges {
+        let s = s.max(covered_to);
+        if e > s {
+            fixed_in_range += e - s;
+            covered_to = e;
+        }
+    }
     (top - config.start_addr - fixed_in_range).max(0) as usize
 }
 
@@ -3179,5 +3189,19 @@ mod tests {
         let result = assign_addresses(&ops, &config).unwrap();
         assert_eq!(result.vreg_to_addr[&lanes[3]], 503);
         assert_eq!(result.words_used, 0, "only the fixed group and its lanes are placed");
+    }
+
+    /// Overlapping fixed ranges (a fixed group and its fixed lanes) are subtracted once.
+    #[test]
+    fn test_words_used_counts_overlapping_fixed_ranges_once() {
+        let group = VReg::vector(100);
+        let lane = VReg::scalar(101);
+        let s = VReg::scalar(1);
+        let mut config = AddressAssignConfig::default();
+        config.fixed_vregs.insert(group, 1);
+        config.fixed_vregs.insert(lane, 2);
+        // A placed value at 9 (just above the fixed block 1..=8): 9 words up to it, 8 fixed.
+        let addrs: HashMap<VReg, i64> = [(group, 1), (lane, 2), (s, 9)].into_iter().collect();
+        assert_eq!(movable_words_used(&addrs, &config), 1);
     }
 }
