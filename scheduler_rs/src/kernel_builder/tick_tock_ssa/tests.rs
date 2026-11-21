@@ -2384,6 +2384,66 @@ fn test_greedy_budget_headroom_lowers_peak() {
     assert!(reserved.address_result.peak_live <= SCRATCH_BUDGET_HW - headroom);
 }
 
+/// A greedy run that goes over its headroom-reduced budget reports that budget, the one the
+/// scheduler ran against, not the raw scratch budget.
+#[test]
+fn test_greedy_budget_error_reports_headroom_adjusted_budget() {
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    let headroom = 1500;
+    config.compiler.greedy_budget_headroom = headroom;
+    let raw_budget = effective_scratch_budget(true);
+    let error = SsaTickTockKernelBuilder::new(config)
+        .build_and_schedule()
+        .expect_err("35 words cannot hold this kernel");
+    match error {
+        KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::GreedyScheduler { .. }, .. } => {
+            assert_eq!(budget, raw_budget - headroom);
+        }
+        other => panic!("expected the greedy scheduler's budget error, got {:?}", other),
+    }
+}
+
+/// Invalid threshold overrides are rejected by both builder entry points, not only by the
+/// Python binding.
+#[test]
+fn test_invalid_pressure_threshold_rejected_by_builder() {
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    config.compiler.pressure_thresholds.inflation = Some(f64::NAN);
+    let error = SsaTickTockKernelBuilder::new(config.clone())
+        .build_and_schedule()
+        .expect_err("NaN threshold must be rejected");
+    assert!(format!("{:?}", error).contains("pressure_inflation_threshold"), "{:?}", error);
+
+    #[cfg(feature = "cpsat")]
+    {
+        use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+        let error = SsaTickTockKernelBuilder::new(config)
+            .build_and_schedule_cpsat(
+                10.0,
+                false,
+                true,
+                false,
+                None,
+                None,
+                ConstChoiceMode::Optimize,
+                SelectChoiceMode::Optimize,
+                ValuShiftMode::Optimize,
+                false,
+                crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+                false,
+                false,
+                false,
+                None,
+                false,
+                None,
+                true,
+                false,
+            )
+            .expect_err("NaN threshold must be rejected");
+        assert!(format!("{:?}", error).contains("pressure_inflation_threshold"), "{:?}", error);
+    }
+}
+
 // =========================================================================
 // Hint pass tests (ConstChoice, SelectChoice, VALU shift)
 // =========================================================================

@@ -308,7 +308,8 @@ impl Pass for ScheduleWithFixedChoicesPass {
             cycles,
             peak_live,
             budget_exceeded,
-            budget: ctx.config.scratch_budget,
+            // The budget the scheduler ran against (headroom already subtracted).
+            budget: ctx.config.compiler.greedy_scratch_budget(ctx.config.scratch_budget),
             over_budget_cycles: diagnostics.over_budget_cycles,
         };
 

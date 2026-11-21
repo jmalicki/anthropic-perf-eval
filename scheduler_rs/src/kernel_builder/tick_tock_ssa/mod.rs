@@ -671,6 +671,11 @@ impl SsaTickTockKernelBuilder {
     ) -> Result<SsaScheduleResult, KernelBuilderError> {
         use super::pipeline::{PipelineConfig, PipelineContext};
 
+        self.config
+            .compiler
+            .pressure_thresholds
+            .validate()
+            .map_err(KernelBuilderError::Other)?;
         let program = self.build();
 
         let mut config = PipelineConfig {
@@ -781,6 +786,11 @@ impl SsaTickTockKernelBuilder {
 
         #[cfg(feature = "cpsat")]
         {
+        self.config
+            .compiler
+            .pressure_thresholds
+            .validate()
+            .map_err(KernelBuilderError::Other)?;
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
             live_in_for_section_filtered, live_out_from_section, live_through_for_section,
