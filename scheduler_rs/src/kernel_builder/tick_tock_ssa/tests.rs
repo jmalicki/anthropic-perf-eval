@@ -2283,6 +2283,168 @@ fn test_split_shift_ignored_when_cpsat_follows() {
 }
 
 // =========================================================================
+// Greedy schedule shape: pressure thresholds and budget headroom
+// =========================================================================
+
+/// Threshold overrides reach the policies that have the threshold; unset ones keep the
+/// built-in values.
+#[test]
+fn test_pressure_threshold_overrides_reach_policy() {
+    use crate::kernel_builder::config::{CompilerConfig, PressurePolicyKind, PressureThresholds};
+    let mut compiler = CompilerConfig::default();
+    let built_in = format!("{:?}", compiler.pressure_policy());
+    for field in [
+        "soft_threshold_fraction: 0.85",
+        "critical_threshold_fraction: 0.95",
+        "inflation_threshold_fraction: 0.8",
+    ] {
+        assert!(built_in.contains(field), "{} not in {}", field, built_in);
+    }
+
+    compiler.pressure_thresholds =
+        PressureThresholds { soft: Some(0.9), critical: None, inflation: Some(0.97) };
+    for kind in [PressurePolicyKind::Adaptive, PressurePolicyKind::Cascade] {
+        compiler.scheduling_pressure_policy = kind;
+        let policy = format!("{:?}", compiler.pressure_policy());
+        for field in [
+            "soft_threshold_fraction: 0.9",
+            "critical_threshold_fraction: 0.95",
+            "inflation_threshold_fraction: 0.97",
+        ] {
+            assert!(policy.contains(field), "{:?}: {} not in {}", kind, field, policy);
+        }
+    }
+    compiler.scheduling_pressure_policy = PressurePolicyKind::PressureThrottled;
+    assert!(format!("{:?}", compiler.pressure_policy()).contains("soft_threshold_fraction: 0.9"));
+    compiler.scheduling_pressure_policy = PressurePolicyKind::Greedy;
+    assert_eq!(format!("{:?}", compiler.pressure_policy()), "GreedyPolicy");
+}
+
+/// Threshold overrides must be positive finite numbers.
+#[test]
+fn test_pressure_thresholds_validate() {
+    use crate::kernel_builder::config::PressureThresholds;
+    assert!(PressureThresholds::default().validate().is_ok());
+    assert!(PressureThresholds { soft: Some(0.9), critical: Some(1.0), inflation: Some(1.5) }
+        .validate()
+        .is_ok());
+    for bad in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+        let error = PressureThresholds { inflation: Some(bad), ..Default::default() }
+            .validate()
+            .unwrap_err();
+        assert!(error.contains("pressure_inflation_threshold"), "{}", error);
+        assert!(PressureThresholds { soft: Some(bad), ..Default::default() }.validate().is_err());
+        assert!(PressureThresholds { critical: Some(bad), ..Default::default() }.validate().is_err());
+    }
+}
+
+/// With the exact live-word counter, deferring producers from 95% of the budget instead of
+/// 80% shortens the default (round by round) 3-round schedule and still fits the budget.
+#[test]
+fn test_inflation_threshold_retune_shortens_default_schedule() {
+    let default = schedule_shape_kernel(3, |_| {});
+    let retuned = schedule_shape_kernel(3, |c| c.compiler.pressure_thresholds.inflation = Some(0.95));
+    assert_slot_limits_hold(&retuned);
+    assert!(!retuned.budget_exceeded);
+    assert!(retuned.address_result.peak_live <= SCRATCH_BUDGET_HW);
+    assert!(
+        retuned.cycles < default.cycles,
+        "inflation threshold 0.95 gave {} cycles, built-in 0.80 gave {}",
+        retuned.cycles,
+        default.cycles
+    );
+    assert!(
+        retuned.address_result.peak_live > default.address_result.peak_live,
+        "a later threshold should use more of the scratch budget"
+    );
+}
+
+/// Headroom lowers the budget the greedy schedules against, and with it the peak.
+#[test]
+fn test_greedy_budget_headroom_lowers_peak() {
+    use crate::kernel_builder::config::CompilerConfig;
+    let mut compiler = CompilerConfig::default();
+    assert_eq!(compiler.greedy_scratch_budget(1535), 1535);
+    compiler.greedy_budget_headroom = 100;
+    assert_eq!(compiler.greedy_scratch_budget(1535), 1435);
+    assert_eq!(compiler.greedy_scratch_budget(50), 0);
+
+    let headroom = 200;
+    let default = schedule_shape_kernel(3, |_| {});
+    let reserved = schedule_shape_kernel(3, |c| c.compiler.greedy_budget_headroom = headroom);
+    assert_slot_limits_hold(&reserved);
+    assert!(!reserved.budget_exceeded);
+    assert!(
+        reserved.address_result.peak_live < default.address_result.peak_live,
+        "headroom {} did not lower the peak: {} vs {}",
+        headroom,
+        reserved.address_result.peak_live,
+        default.address_result.peak_live
+    );
+    assert!(reserved.address_result.peak_live <= SCRATCH_BUDGET_HW - headroom);
+}
+
+/// A greedy run that goes over its headroom-reduced budget reports that budget, the one the
+/// scheduler ran against, not the raw scratch budget.
+#[test]
+fn test_greedy_budget_error_reports_headroom_adjusted_budget() {
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    let headroom = 1500;
+    config.compiler.greedy_budget_headroom = headroom;
+    let raw_budget = effective_scratch_budget(true);
+    let error = SsaTickTockKernelBuilder::new(config)
+        .build_and_schedule()
+        .expect_err("35 words cannot hold this kernel");
+    match error {
+        KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::GreedyScheduler { .. }, .. } => {
+            assert_eq!(budget, raw_budget - headroom);
+        }
+        other => panic!("expected the greedy scheduler's budget error, got {:?}", other),
+    }
+}
+
+/// Invalid threshold overrides are rejected by both builder entry points, not only by the
+/// Python binding.
+#[test]
+fn test_invalid_pressure_threshold_rejected_by_builder() {
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    config.compiler.pressure_thresholds.inflation = Some(f64::NAN);
+    let error = SsaTickTockKernelBuilder::new(config.clone())
+        .build_and_schedule()
+        .expect_err("NaN threshold must be rejected");
+    assert!(format!("{:?}", error).contains("pressure_inflation_threshold"), "{:?}", error);
+
+    #[cfg(feature = "cpsat")]
+    {
+        use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+        let error = SsaTickTockKernelBuilder::new(config)
+            .build_and_schedule_cpsat(
+                10.0,
+                false,
+                true,
+                false,
+                None,
+                None,
+                ConstChoiceMode::Optimize,
+                SelectChoiceMode::Optimize,
+                ValuShiftMode::Optimize,
+                false,
+                crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+                false,
+                false,
+                false,
+                None,
+                false,
+                None,
+                true,
+                false,
+            )
+            .expect_err("NaN threshold must be rejected");
+        assert!(format!("{:?}", error).contains("pressure_inflation_threshold"), "{:?}", error);
+    }
+}
+
+// =========================================================================
 // Hint pass tests (ConstChoice, SelectChoice, VALU shift)
 // =========================================================================
 
