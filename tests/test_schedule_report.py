@@ -177,10 +177,103 @@ def test_cli_json_and_compare(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert sr.main([a, "--json"]) == 0
     rep = json.loads(capsys.readouterr().out)
-    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "utilisation"}
+    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "round_overlap", "utilisation"}
     assert sr.main([a, "--compare", b]) == 0
     out = capsys.readouterr().out
     assert "emission floor" in out and "span A" in out and "not a bound on the problem" in out
     assert sr.main([a, "--compare", b, "--json"]) == 0
     both = json.loads(capsys.readouterr().out)
     assert both["a"]["run"]["rounds"] == 5 and both["b"]["run"]["rounds"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Simulator cycles, round overlap and the --table mode
+# ---------------------------------------------------------------------------
+def _simulated_cycles(rounds, batch_size, **kwargs):
+    """Build through the binding and run the kernel on the simulator: (machine cycles, schedule JSON)."""
+    import random
+    import tempfile
+
+    from problem import DebugInfo, Input, Machine, N_CORES, Tree, build_mem_image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sched.json")
+        instrs, _ = scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=10, n_nodes=2047, batch_size=batch_size, rounds=rounds, verbose=False,
+            use_cpsat=False, output_json=path, **kwargs)
+        with open(path) as f:
+            sched = json.load(f)
+    random.seed(123)
+    forest = Tree.generate(10)
+    mem = build_mem_image(forest, Input.generate(forest, batch_size, rounds))
+    machine = Machine(mem, json.loads(json.dumps(list(instrs))), DebugInfo(scratch_map={}), n_cores=N_CORES)
+    machine.enable_pause = False
+    machine.enable_debug = False
+    machine.run()
+    return machine.cycle, sched
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"greedy_barriers": "none", "greedy_priority": "wavefront"}],
+                         ids=["default", "wavefront"])
+def test_simulator_cycles_match_the_machine(kwargs):
+    """simulator_cycles = schedule cycles + pause bundles - empty cycles, for a schedule with
+    empty barrier cycles (default) and one without (no barriers)."""
+    machine_cycles, sched = _simulated_cycles(3, 32, **kwargs)
+    run = sr.analyze(sched)["run"]
+    assert run["simulator_cycles"] == machine_cycles
+    assert run["simulator_cycles"] == run["cycles"] + sr.PAUSE_BUNDLES - run["empty_cycles"]
+    if kwargs:
+        assert run["empty_cycles"] == 0
+    else:
+        assert run["empty_cycles"] == 2, "one empty cycle per round barrier"
+
+
+def test_round_overlap_is_zero_by_default_and_positive_without_barriers():
+    _, default = _simulated_cycles(3, 32)
+    _, wavefront = _simulated_cycles(3, 32, greedy_barriers="none", greedy_priority="wavefront")
+    assert sr.analyze(default)["round_overlap"]["total_overlap"] == 0
+    overlap = sr.analyze(wavefront)["round_overlap"]
+    assert overlap["total_overlap"] > 0
+    rounds = [r for r in sr.analyze(wavefront)["rounds"] if r["round"] is not None]
+    assert overlap["sum_of_spans"] == sum(r["span"] for r in rounds)
+    assert sr.round_overlap([r for r in rounds if r["round"] == 0]) is None
+
+
+def test_table_mode(greedy, cpsat, capsys):
+    (_, a), (_, b) = greedy, cpsat
+    assert sr.main(["--table", f"five rounds={a}", b]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == sr.TABLE_HEADER
+    assert set(lines[1]) == {"|", "-"} and lines[1].count("|") == lines[0].count("|")
+    rep_a = sr.analyze(sr.load(a))
+    first = [c.strip() for c in lines[2].strip("|").split("|")]
+    assert first[:5] == ["five rounds", "5", str(rep_a["run"]["cycles"]), str(rep_a["run"]["simulator_cycles"]),
+                         str(rep_a["floor"]["cycles"])]
+    assert first[-1] == str(rep_a["round_overlap"]["total_overlap"])
+    assert lines[3].startswith("| sched |"), "an unlabelled file is named after its stem"
+    assert all(line.count("|") == lines[0].count("|") for line in lines[2:4])
+    assert "not a bound on the problem" in lines[-1]
+
+    assert sr.main(["--table", f"x={a}", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["x"]["run"]["cycles"] == rep_a["run"]["cycles"]
+    assert sr.parse_table_arg("name=/tmp/a=b.json") == ("name", "/tmp/a=b.json")
+    assert sr.parse_table_arg("dir/run1.json") == ("run1", "dir/run1.json")
+
+
+def test_table_escapes_pipes_in_labels(greedy):
+    _, path = greedy
+    rep = sr.analyze(sr.load(path))
+    row = sr.table_row(rep, "base|wavefront")
+    assert row.startswith("| base\\|wavefront |")
+    assert row.count("|") - row.count("\\|") == sr.TABLE_HEADER.count("|")
+
+
+def test_table_rejects_duplicate_labels(greedy, cpsat, capsys):
+    (_, a), (_, b) = greedy, cpsat
+    assert a.endswith("sched.json") and b.endswith("sched.json")
+    with pytest.raises(SystemExit) as exit_info:
+        sr.main(["--table", a, b])
+    assert exit_info.value.code == 2
+    assert "labels must be unique" in capsys.readouterr().err
+    assert sr.main(["--table", f"greedy={a}", f"cpsat={b}", "--json"]) == 0
+    assert set(json.loads(capsys.readouterr().out)) == {"greedy", "cpsat"}

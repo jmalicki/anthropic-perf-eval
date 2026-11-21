@@ -16,6 +16,7 @@ uv run python -m scripts.schedule_report sched.json                       # text
 uv run python -m scripts.schedule_report sched.json --json                # same data, machine-readable
 uv run python -m scripts.schedule_report sched.json --compare other.json  # cycles, floors, per-round spans
 uv run python -m scripts.schedule_report sched.json --buckets 20          # finer utilisation over time
+uv run python -m scripts.schedule_report --table base=a.json new=b.json  # one Markdown row per run (ablation tables)
 ```
 
 Run it as a module from the project root. Started from inside `scripts/`, `scripts/bisect.py` shadows the standard library's `bisect`.

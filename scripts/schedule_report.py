@@ -4,9 +4,12 @@
     uv run python -m scripts.schedule_report sched.json
     uv run python -m scripts.schedule_report sched.json --json
     uv run python -m scripts.schedule_report sched.json --compare other.json
+    uv run python -m scripts.schedule_report --table base=a.json wavefront=b.json
 
 Prints cycles achieved, per-engine op counts and floors, the joint capacity floor for the
 ops THIS run emitted, the gap to it, per-round cycle spans and utilisation over time.
+`--table` prints one Markdown row per run instead (cycles, simulator cycles, floor, gap,
+scratch peak, utilisation, round overlap), for ablation tables.
 
 The floor is slot arithmetic over the emitted ops. It is conditional on the emission: a
 kernel that emits fewer ops has a lower floor. It is not a bound on the problem (see
@@ -31,6 +34,8 @@ ENGINES = ("valu", "alu", "load", "store", "flow")
 VLEN = 8
 NON_SHIFTABLE_OPCODES = ("multiply_add", "vbroadcast")
 SCOPE_NOTE = "Fewer emitted ops lower it; it is not a bound on the problem."
+# The kernel wraps the schedule in two pause bundles, which the simulator counts as cycles.
+PAUSE_BUNDLES = 2
 
 
 # ----------------------------------------------------------------------------
@@ -147,9 +152,12 @@ def analyze(d, buckets=10):
     # CP-SAT writes lb_cycles, and the rounds are visible in the SSA ops.
     use_cpsat = opts.get("use_cpsat", d.get("lb_cycles") is not None)
     n_rounds = opts.get("rounds", sum(1 for r in rounds if r["round"] is not None) or None)
+    empty = empty_cycles(d)
     return {
         "run": {
             "cycles": cycles,
+            "empty_cycles": empty,
+            "simulator_cycles": cycles + PAUSE_BUNDLES - empty,
             "scheduler": "cpsat" if use_cpsat else "greedy",
             "rounds": n_rounds,
             "batch_size": opts.get("batch_size"),
@@ -170,8 +178,25 @@ def analyze(d, buckets=10):
         "floor": floor,
         "gap": {"cycles": gap, "pct_of_floor": 100.0 * gap / floor["cycles"] if floor["cycles"] else 0.0},
         "rounds": rounds,
+        "round_overlap": round_overlap(rounds),
         "utilisation": utilisation_over_time(d, buckets),
     }
+
+
+def empty_cycles(d):
+    """Schedule cycles in which no op runs. The simulator counts only bundles that contain an
+    op, so its cycle count is the schedule length plus the pause bundles minus these."""
+    return d["total_cycles"] - len({o["cycle"] for o in d["ops"] if 0 <= o["cycle"] < d["total_cycles"]})
+
+
+def round_overlap(rounds):
+    """Sum of the round spans and of each round's overlap with the previous one, or None with
+    fewer than two rounds. Total overlap 0 means rounds run strictly one after another."""
+    timed = [r for r in rounds if r["round"] is not None]
+    if len(timed) < 2:
+        return None
+    return {"sum_of_spans": sum(r["span"] for r in timed),
+            "total_overlap": sum(r["overlap_prev"] or 0 for r in timed)}
 
 
 def per_round(d):
@@ -290,10 +315,8 @@ def format_report(rep, verbose_rounds=True):
             ov = "-" if r["overlap_prev"] is None else str(r["overlap_prev"])
             out.append(f"{name:>5} {r['first_cycle']:>6} {r['last_cycle']:>6} {r['span']:>5} {ov:>8} "
                        f"{r['vector_ops']:>7} {r['scalar_ops']:>7} {r['load_ops']:>6} {r['flow_ops']:>6}")
-        timed = [r for r in rep["rounds"] if r["round"] is not None]
-        if len(timed) > 1:
-            total_span = sum(r["span"] for r in timed)
-            total_ov = sum(r["overlap_prev"] or 0 for r in timed)
+        if rep["round_overlap"] is not None:
+            total_span, total_ov = rep["round_overlap"]["sum_of_spans"], rep["round_overlap"]["total_overlap"]
             out.append(f"  sum of round spans {total_span}, total overlap with the previous round {total_ov} cycles "
                        f"(0 = rounds run strictly one after another)")
     u = rep["utilisation"]
@@ -342,13 +365,70 @@ def format_compare(a, b, name_a, name_b):
     return "\n".join(out)
 
 
+TABLE_HEADER = ("| Run | Rounds | Cycles | Simulator | Floor | Gap | Peak words | valu % | alu % | load % | flow % "
+                "| Round overlap |")
+
+
+def markdown_cell(text):
+    """Text for one Markdown table cell: a literal `|` would start a new column."""
+    return str(text).replace("|", "\\|")
+
+
+def table_row(rep, label):
+    """One Markdown table row for a run (columns as in TABLE_HEADER)."""
+    run, e = rep["run"], rep["engines"]
+    overlap = "-" if rep["round_overlap"] is None else str(rep["round_overlap"]["total_overlap"])
+    peak = "-" if run["peak_live_words"] is None else str(run["peak_live_words"])
+    cells = [markdown_cell(label), str(run["rounds"]), str(run["cycles"]), str(run["simulator_cycles"]), str(rep["floor"]["cycles"]),
+             f"{rep['gap']['cycles']} ({rep['gap']['pct_of_floor']:.1f}%)", peak]
+    cells += [f"{e[name]['utilisation_pct']:.1f}" for name in ("valu", "alu", "load", "flow")]
+    return "| " + " | ".join(cells + [overlap]) + " |"
+
+
+def format_table(labelled_reports):
+    """Markdown table with one row per (label, report)."""
+    columns = TABLE_HEADER.count("|") - 1
+    lines = [TABLE_HEADER, "|" + "---|" * columns]
+    lines += [table_row(rep, label) for label, rep in labelled_reports]
+    lines.append("")
+    lines.append(f"Floor and gap are per emission. {SCOPE_NOTE} Simulator = cycles + {PAUSE_BUNDLES} pause bundles "
+                 "- cycles with no op. Round overlap = cycles each round shares with the previous one, summed "
+                 "(0 = rounds run strictly one after another).")
+    return "\n".join(lines)
+
+
+def parse_table_arg(arg):
+    """Split a --table argument `LABEL=PATH` (or just `PATH`, labelled by its file name)."""
+    label, sep, path = arg.partition("=")
+    if not sep:
+        path = arg
+        label = arg.rsplit("/", 1)[-1].removesuffix(".json")
+    return label, path
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Schedule quality report from a scheduler output JSON")
     p.add_argument("json_file", nargs="?", default="scheduler_output.json")
+    p.add_argument("--table", nargs="+", metavar="[LABEL=]JSON",
+                   help="Print one Markdown table row per scheduler JSON instead of the report")
     p.add_argument("--json", action="store_true", help="Emit the report as JSON")
     p.add_argument("--compare", metavar="OTHER_JSON", help="Diff against a second run (cycles, floors, per-round spans)")
     p.add_argument("--buckets", type=int, default=10, help="Time buckets for utilisation (default 10)")
     args = p.parse_args(argv)
+
+    if args.table:
+        pairs = [parse_table_arg(arg) for arg in args.table]
+        labels = [label for label, _ in pairs]
+        duplicates = sorted({label for label in labels if labels.count(label) > 1})
+        if duplicates:
+            p.error("--table labels must be unique; give LABEL=PATH for: " + ", ".join(duplicates))
+        labelled = [(label, analyze(load(path), args.buckets)) for label, path in pairs]
+        if args.json:
+            json.dump({label: rep for label, rep in labelled}, sys.stdout, indent=2)
+            print()
+        else:
+            print(format_table(labelled))
+        return 0
 
     rep = analyze(load(args.json_file), args.buckets)
     other = analyze(load(args.compare), args.buckets) if args.compare else None

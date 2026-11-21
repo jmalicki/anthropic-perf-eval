@@ -10,7 +10,7 @@ This is a **VLIW SIMD Kernel Optimization Challenge**. The goal is to minimize e
 
 **Performance Status:**
 - Baseline: 147,734 cycles
-- 16 rounds (the benchmark size): no recorded CP-SAT result yet. Greedy reference, not a recorded result (see "Scheduler Selection Guide"): 2,007 cycles (73.6x speedup; `--use-greedy` via the CLI, validated). Whole-program CP-SAT did not improve on the greedy schedule in 600 s.
+- 16 rounds (the benchmark size): no recorded CP-SAT result yet. Greedy reference, not a recorded result (see "Scheduler Selection Guide"): 2,007 cycles (73.6x speedup; `--use-greedy` via the CLI, validated). Whole-program CP-SAT did not improve on the greedy schedule in 600 s. With the non-default shape options (`--greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95`) the greedy gives 1,313 cycles (1,315 on the simulator), validated and passing `check_upstream.sh`; see [docs/GREEDY_SHAPE_ABLATION.md](docs/GREEDY_SHAPE_ABLATION.md).
 - 4 rounds (development size, not comparable with the 16-round baseline): 485 cycles (CP-SAT 1800s, no VALU shift)
 - Capacity floor for the ops we emit today (16 rounds): 1,271 cycles. This is a floor for this emission (9,526 vector-op equivalents), not a bound on the problem: public kernels emit fewer ops and reach 863. See [docs/BOUND_GAP_ANALYSIS.md](docs/BOUND_GAP_ANALYSIS.md).
 - Target: 1,487 cycles (100x speedup)
@@ -175,7 +175,7 @@ Scheduler options:
 - `--const-choice-hint-pass`, `--select-choice-hint-pass`, `--valu-shift-hint-pass` - Enable hint passes individually.
 - `--schedule-with-fixed-choices` - After hint passes, re-run greedy with encodings fixed to assign cycles.
 
-Greedy schedule shape options (ablation switches, defaults unchanged):
+Greedy schedule shape options (ablation switches, defaults unchanged; measurements, sweeps and the recommended combination in [docs/GREEDY_SHAPE_ABLATION.md](docs/GREEDY_SHAPE_ABLATION.md)):
 - `--greedy-barriers {round,none}` - Round barriers in the greedy scheduler. `round` (default): every op of round r+1 waits for all of round r, so rounds run strictly one after another. `none`: the barrier pseudo-ops are dropped before dependencies are computed, the ready queue may mix rounds, and the kernel is a single section for the per-section budget check. On its own this does not help at 16 rounds (the ready queue stays round-major and the greedy exceeds the scratch budget); it is the prerequisite for the other shape options.
   - The option also applies when CP-SAT follows the greedy (no `--use-greedy`). The CP-SAT model itself never contains barriers (they are always removed before it is built); what changes is the greedy schedule it gets as its warm start, which also caps every op's latest cycle (greedy cycle + 15) and sets the horizon, and the per-section repair, which then sees one section instead of one per round.
 - `--greedy-priority {fifo,wavefront}` - Order in which the greedy tries ready ops. `fifo` (default): by ready cycle, then emission order, which keeps all 32 groups in the same round. `wavefront`: key = dependency depth + stagger × group rank, so group g runs as if it started `stagger × g` cycles after group 0 and some groups gather while others hash or select (see `scheduler_rs/src/kernel_builder/ssa_greedy/wavefront.rs`; groups are found structurally: an op that reaches more final stores than the median op does is shared, and groups are the connected components of the rest). Use with `--greedy-barriers none`: with barriers every op reaches every store through the barrier chain, no groups are found, the key is plain dependency depth, and the schedule is longer than the default at every size (16 rounds: 2,150 cycles).
@@ -359,6 +359,7 @@ Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-
 | `docs/ASAP_ALAP_SLOT_TIGHTENING.md` | **Canonical design:** slot tightening rules (R_entailed, R_precedence_only), strong guarantee, tried-and-unsafe (R_precedence_demand), implementation flags |
 | `docs/SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md` | T7 investigation: 2r/16b counterexample, Z3 proofs, ablation; design lives in ASAP_ALAP_SLOT_TIGHTENING.md |
 | `docs/GREEDY_HINT_PASSES_ABLATION.md` | Hint-pass lowering (greedy-only uses greedy_decisions), ablation config, Phase 1/2 commands |
+| `docs/GREEDY_SHAPE_ABLATION.md` | Greedy schedule shape options (barriers, wavefront priority, split shift, pressure thresholds): what serialises rounds, ablation tables for 2 to 16 rounds, sweeps, CP-SAT from each greedy start, recommendation |
 | `verification/` | Z3 verification of liveness/slot-tightening theorems; see [verification/README.md](verification/README.md) (Z3 vs CP-SAT feasibility) |
 
 ## Important Constraints
