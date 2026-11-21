@@ -107,7 +107,8 @@ pub struct AddressAssignmentResult {
 /// Configuration for address assignment.
 #[derive(Clone, Debug)]
 pub struct AddressAssignConfig {
-    /// Scratch memory budget (default: 1536)
+    /// Size of the scratch memory in words (default: 1536). Valid addresses are
+    /// `start_addr..budget`, so with `start_addr = 1` there are `budget - 1` assignable words.
     pub budget: usize,
     /// Starting address (default: 1 to reserve 0 for ZERO_REG)
     pub start_addr: i64,
@@ -845,7 +846,10 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
             temp_used.insert(a..a + 1);
         }
         let budget_i64 = config.budget as i64;
-        let end_addr = config.start_addr + budget_i64; // valid range is [start_addr, end_addr)
+        // Scratch addresses are 0..budget, whatever start_addr is: `budget` is the size of the
+        // scratch memory, and start_addr only reserves the low addresses (address 0 holds zero).
+        // Using start_addr + budget here allowed address `budget` itself, one past the end.
+        let end_addr = budget_i64; // valid range is [start_addr, end_addr)
         let size_i64 = size as i64;
 
         // Try freed ranges first (same order as old allocator: reuse freed slots).
@@ -951,8 +955,10 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
         .max()
         .unwrap_or(0);
 
-    // Mark budget exceeded if we use any address at or above start_addr + budget (caller may still use result).
-    let budget_limit = config.start_addr + config.budget as i64;
+    // Mark budget exceeded if we use any address at or above `budget`, the size of the scratch
+    // memory (caller may still use result). Liveness alone cannot catch this: the peak can be
+    // within budget while fragmentation pushes one value to the top of the range.
+    let budget_limit = config.budget as i64;
     let budget_exceeded = budget_exceeded || (max_addr >= budget_limit);
 
     let vreg_count = vreg_to_addr.len();
@@ -1983,6 +1989,44 @@ mod tests {
 
         // With 3 vectors (24 words) + 1 scalar, should exceed budget of 20
         assert!(result.budget_exceeded);
+    }
+
+    /// Regression: with address 0 reserved (start_addr = 1) the allocator's range and the final
+    /// check were both `start_addr + budget`, so a value could be placed at address `budget`,
+    /// one past the end of scratch, with `budget_exceeded` false. Seen as a kernel that wrote
+    /// scratch word 1536 and crashed the simulator while every check passed.
+    #[test]
+    fn test_assign_never_uses_address_at_or_beyond_budget() {
+        let mut emit = SsaEmitContext::new();
+        let s1 = emit.emit_const(1);
+        let v1 = emit.emit_vbroadcast_force(s1);
+        let v2 = emit.emit_vbroadcast_force(s1);
+        let _sum = emit.emit_valu(Opcode::Add, v1, v2);
+        emit.ops[0].cycle = 0;
+        emit.ops[1].cycle = 1;
+        emit.ops[2].cycle = 1;
+        emit.ops[3].cycle = 2;
+
+        // 16 words of scratch, address 0 reserved: 15 usable. Two vectors are live together
+        // (16 words), so they cannot both fit below address 16.
+        let config = AddressAssignConfig {
+            budget: 16,
+            start_addr: 1,
+            ..Default::default()
+        };
+        let result = assign_addresses(&emit.ops, &config).unwrap();
+        let top = result
+            .vreg_to_addr
+            .iter()
+            .map(|(vreg, &addr)| addr + vreg.size() as i64 - 1)
+            .max()
+            .unwrap();
+        assert!(
+            result.budget_exceeded || top < 16,
+            "address {} is outside a 16-word scratch but budget_exceeded is false",
+            top
+        );
+        assert!(result.budget_exceeded, "two live vectors cannot fit in 15 usable words");
     }
 
     #[test]
