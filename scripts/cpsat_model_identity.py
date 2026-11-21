@@ -59,6 +59,8 @@ CONFIGS: list[tuple[str, str]] = [
     ("obj-makespan", "--cpsat-objective makespan"),
     ("makespan-interval", "--cpsat-makespan-interval"),
     ("shaped-greedy", "--greedy-barriers none --greedy-priority wavefront --greedy-split-shift"),
+    ("vb-elim", "--enable-eliminate-vbroadcast"),
+    ("no-cse", "--no-cse-groups"),
 ]
 
 
