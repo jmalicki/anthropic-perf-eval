@@ -1964,8 +1964,14 @@ pub fn schedule_ssa_cpsat(
                 max_demand,
                 flow_cap
             );
-            let c = model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
-            model.set_constraint_name(c, "cumul_flow");
+            // With one Flow slot the cumulative and the no-overlap state the same thing; the
+            // optional group FlowCumulative leaves the cumulative out in that case.
+            let cumulative_is_duplicate = flow_cap == 1
+                && disable_optional_constraint_groups.contains(&OptionalConstraintGroup::FlowCumulative);
+            if !cumulative_is_duplicate {
+                let c = model.add_cumulative(flow_intervals.clone(), flow_demands, flow_cap);
+                model.set_constraint_name(c, "cumul_flow");
+            }
             // Redundant with cumulative(1): no two Flow intervals overlap when present.
             let c = model.add_no_overlap(flow_intervals);
             model.set_constraint_name(c, "no_overlap_flow");
@@ -3210,7 +3216,12 @@ pub fn schedule_ssa_cpsat(
     // makespan >= max(chosen_cycle[i]) + 1: for each op use the cycle of the chosen execution path.
     // Shiftable: when shifted use completion_cycle, when not use cycle_vars[idx].
     // SelectChoice: when FMA (no-delta) use fma_cycle_var (last cycle), else use cycle_vars[idx]. ConstChoice: both paths use cycle_vars[idx].
-    for (idx, &cv) in cycle_vars.iter().enumerate() {
+    // Optional group ConditionalMakespan: every one of these rows is implied by
+    // makespan = max_cycle + 1 with max_cycle >= cycle_vars, completion and fma_last above
+    // (those are unconditional, so they are at least as strong as the enforced rows here).
+    let conditional_makespan_rows =
+        !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::ConditionalMakespan);
+    for (idx, &cv) in cycle_vars.iter().enumerate().filter(|_| conditional_makespan_rows) {
         if shiftable_set.contains(&idx) {
             let shift_var = *shift_vars.get(&idx).unwrap();
             if let Some(&completion_var) = completion_cycle_vars.get(&idx) {

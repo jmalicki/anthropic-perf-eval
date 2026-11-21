@@ -1033,13 +1033,7 @@ pub fn resolve_cpsat_tuning(tuning_json: Option<&str>) -> PyResult<String> {
 #[pyfunction]
 pub fn optional_constraint_group_names() -> Vec<String> {
     use crate::cpsat_scheduler::OptionalConstraintGroup;
-    [
-        OptionalConstraintGroup::RedundantLinearBounds,
-        OptionalConstraintGroup::CapacityValu,
-        OptionalConstraintGroup::CapacityAlu,
-        OptionalConstraintGroup::CapacityFlow,
-        OptionalConstraintGroup::CapacityLoad,
-    ]
+    OptionalConstraintGroup::ALL
     .iter()
     .map(|v| v.to_string())
     .collect()
