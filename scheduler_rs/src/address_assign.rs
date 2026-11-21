@@ -1005,6 +1005,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     sorted.sort_by_key(|&(vreg, span)| (span, vreg));
 
     let mut vreg_to_addr = assign_two_pass(&sorted, config, SlotChoice::MostRecentlyFreed);
+    // Footprint before lane aliases are added: a lane of a fixed group must not count as a
+    // placed value (lanes of placed groups lie inside their group anyway).
+    let words_used = movable_words_used(&vreg_to_addr, config);
 
     // Post-allocation: derive lane addresses from vector group base addresses.
     // Each lane VReg gets address = group_base + lane_index.
@@ -1039,7 +1042,6 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
 
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
-    let words_used = movable_words_used(&vreg_to_addr, config);
 
     Ok(AddressAssignmentResult {
         vreg_to_addr,
@@ -1227,7 +1229,8 @@ fn assign_two_pass(
 /// allocator's footprint, comparable with `PoolPeaks::words` (which also excludes fixed VRegs).
 ///
 /// # Arguments
-/// * `vreg_to_addr` - Assigned addresses (fixed VRegs and vector-group lanes may be included)
+/// * `vreg_to_addr` - Assigned addresses before vector-group lanes are derived (fixed VRegs
+///   may be included)
 /// * `config` - Start address and fixed VRegs
 ///
 /// # Returns
@@ -3143,5 +3146,38 @@ mod tests {
         assert_eq!(movable_words_used(&addrs, &config), 1);
         let empty: HashMap<VReg, i64> = [(fixed, 500)].into_iter().collect();
         assert_eq!(movable_words_used(&empty, &config), 0, "nothing placed: 0 words");
+    }
+
+    /// A fixed vector group's lanes get addresses too (base + i), but they are not placed
+    /// values: an allocation where everything is fixed uses 0 words.
+    #[test]
+    fn test_words_used_ignores_lanes_of_fixed_group() {
+        let group = VReg::vector(100);
+        let lanes: Vec<VReg> = (0..VLEN as u32).map(|i| VReg::scalar(i + 1)).collect();
+        let mut ops: Vec<SsaOp> = lanes
+            .iter()
+            .enumerate()
+            .map(|(i, &lane)| {
+                let mut op =
+                    SsaOp::new(i, Engine::Load, Opcode::Const, Some(lane), vec![Operand::Imm(i as i64)]);
+                op.cycle = 0;
+                op
+            })
+            .collect();
+        let mut store = SsaOp::new(
+            VLEN,
+            Engine::Store,
+            Opcode::Vstore,
+            None,
+            vec![Operand::Imm(64), Operand::VReg(group)],
+        );
+        store.cycle = 2;
+        ops.push(store);
+        let mut config = AddressAssignConfig::default();
+        config.fixed_vregs.insert(group, 500);
+        config.vector_group_lanes.insert(group, lanes.clone());
+        let result = assign_addresses(&ops, &config).unwrap();
+        assert_eq!(result.vreg_to_addr[&lanes[3]], 503);
+        assert_eq!(result.words_used, 0, "only the fixed group and its lanes are placed");
     }
 }
