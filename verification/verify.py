@@ -56,6 +56,7 @@ from .precedence_fixpoint import (
 )
 
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
+from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
 
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
@@ -196,6 +197,9 @@ THEOREM_CHECKS = [
 # Bit-vector identities behind emission rewrites and the dataflow checker (verification/rewrites.py).
 THEOREM_CHECKS += REWRITE_CHECKS
 
+# Scratch address allocation conjectures, fast checks (verification/allocation_conjectures.py).
+THEOREM_CHECKS += ALLOCATION_CHECKS
+
 
 def _spec_url(theorem_id: str) -> str:
     """Return file path with anchor for theorem (for terminal/file links)."""
@@ -249,6 +253,7 @@ def run_verification(
             "fixpoint-with-fanout",
             "fixpoint-iteration-bounded",
             *REWRITE_EXPECT_SAT,
+            *ALLOCATION_EXPECT_SAT,
         )
         # Special handling for multi-result theorems
         if name == "fixpoint-cascade-analysis":

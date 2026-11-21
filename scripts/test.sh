@@ -4,7 +4,7 @@
 #   ./scripts/test.sh            # everything below
 #   ./scripts/test.sh rust       # scheduler_rs unit tests (cargo, --features cpsat)
 #   ./scripts/test.sh python     # pytest: interface, dataflow replay, forced modes, proofs, inspect_schedule, CP-SAT tuning
-#   ./scripts/test.sh proofs     # Z3: liveness theorems and rewrite identities
+#   ./scripts/test.sh proofs     # Z3: liveness theorems, rewrite identities, allocation conjectures
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
 #   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
 #
@@ -35,7 +35,7 @@ run_rust() {
 }
 run_python() {
   if [ $# -eq 0 ]; then
-    set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
+    set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_allocation_conjectures.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
       tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
       tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
       tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
