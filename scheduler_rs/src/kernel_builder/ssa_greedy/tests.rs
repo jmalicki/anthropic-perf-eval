@@ -4284,3 +4284,93 @@ fn test_greedy_over_budget_many_cycles_does_not_flood() {
     assert_eq!(quiet_diag.dumps_emitted, 0, "quiet: no breakdown at all");
     assert_eq!(quiet_diag.over_budget_cycles, verbose_diag.over_budget_cycles);
 }
+
+// =========================================================================
+// Selects fixed to the multiply-add path (--select-choice fma)
+// =========================================================================
+
+/// A select fixed to the multiply-add path without a delta runs its subtract at its cycle and
+/// its multiply_add one cycle later. The greedy must (a) schedule its readers two cycles after
+/// it, as the CP-SAT model requires (`select_fma_extra_delay`), and (b) count a vector slot in
+/// both cycles. Before the fix it used the vselect latency and one slot, so the hint it gave
+/// CP-SAT under `--select-choice fma` was infeasible ("The solution hint is complete, but it is
+/// infeasible") and the 3-round / batch-64 build found no solution.
+#[test]
+fn test_fixed_fma_selects_get_their_latency_and_two_vector_slots() {
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const(1);
+    let c2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(c1);
+    let v2 = emit.emit_vbroadcast(c2);
+    let mut selects = Vec::new();
+    let mut readers = Vec::new();
+    // Twelve independent select chains: enough to fill the vector slots.
+    for _ in 0..12 {
+        let cond = emit.emit_valu(Opcode::Eq, v1, v2);
+        let sel = emit.emit_select_choice(cond, v1, v2);
+        selects.push(emit.ops.len() - 1);
+        let reader = emit.emit_valu(Opcode::Add, sel, v1);
+        readers.push(emit.ops.len() - 1);
+        emit.emit_vstore_imm(64 * readers.len() as i64, reader); // keeps the reader live
+    }
+    let vreg_def = std::mem::take(&mut emit.vreg_def);
+    compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+    let ops = &mut emit.ops;
+    assert!(selects.iter().all(|&i| ops[i].sub_temp_vreg.is_some()), "selects need a subtract");
+
+    let fixed: HashMap<usize, SelectChoiceEncoding> = selects
+        .iter()
+        .map(|&i| (ops[i].id, SelectChoiceEncoding::Fma))
+        .collect();
+    let mut shifted = HashSet::new();
+    let mut lane_cycles = HashMap::new();
+    let ((_, budget_exceeded, _), agreement) = schedule_ssa_greedy_shaped(
+        ops,
+        false,
+        &mut shifted,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        Some(&fixed),
+        &mut GreedyDiagnostics::new(false),
+        &GreedyShape::default(),
+        &mut lane_cycles,
+    )
+    .expect("greedy schedules the selects");
+    assert!(!budget_exceeded);
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+
+    for (&s, &r) in selects.iter().zip(&readers) {
+        assert!(
+            ops[r].cycle >= ops[s].cycle + 2,
+            "reader {} at {} reads select {} at {}: the multiply_add result is visible at +2",
+            ops[r].id,
+            ops[r].cycle,
+            ops[s].id,
+            ops[s].cycle
+        );
+    }
+    // Vector slots per cycle: one per vector op, plus the multiply_add of each select one
+    // cycle after its subtract.
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if selects.contains(&i) {
+            *valu.entry(op.cycle).or_default() += 1;
+            *valu.entry(op.cycle + 1).or_default() += 1;
+        } else if op.engine == Engine::Valu {
+            *valu.entry(op.cycle).or_default() += 1;
+        }
+    }
+    assert!(valu.values().all(|&n| n <= 6), "vector slots over capacity: {:?}", valu);
+}

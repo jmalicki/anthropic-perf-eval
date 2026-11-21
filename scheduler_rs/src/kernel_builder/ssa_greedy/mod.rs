@@ -1415,6 +1415,29 @@ fn schedule_ssa_greedy_core(
         HashSet::new()
     };
 
+    // A SelectChoice fixed to the multiply-add path without a precomputed delta (it has a
+    // sub_temp: subtract at its cycle, multiply_add one cycle later) makes its result visible
+    // one cycle later than the vselect path. The CP-SAT model requires that extra cycle
+    // (select_fma_extra_delay); without it the greedy hint violates the model's precedences.
+    let fma_extra_latency: HashSet<usize> = fixed_select_choice_encoding
+        .map(|fixed| {
+            ops.iter()
+                .enumerate()
+                .filter(|(_, op)| {
+                    op.opcode == Opcode::SelectChoice
+                        && op.sub_temp_vreg.is_some()
+                        && matches!(fixed.get(&op.id), Some(SelectChoiceEncoding::Fma))
+                })
+                .map(|(idx, _)| idx)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Cycles after a producer at which its result can be read.
+    let result_latency = |ops: &[SsaOp], idx: usize| -> i32 {
+        ops[idx].precedence_offset_for_asap(shiftable_set.contains(&idx))
+            + i32::from(fma_extra_latency.contains(&idx))
+    };
+
     // =========================================================================
     // Constant Alternative Detection
     //
@@ -1688,6 +1711,10 @@ fn schedule_ssa_greedy_core(
     // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
     // It is not in `scheduled` until it completes, so the loop below keeps running for it.
     let mut split_carry: Option<SplitShift> = None;
+    // Vector slots reserved in the next cycle for the multiply_add of a select placed on the
+    // multiply-add path in this cycle (see fma_extra_latency): the subtract runs at the
+    // select's cycle, the multiply_add one cycle later, one vector slot each.
+    let mut fma_carry: usize = 0;
 
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
@@ -1724,6 +1751,8 @@ fn schedule_ssa_greedy_core(
         }
 
         let mut slots = SlotTracker::new();
+        slots.valu_used += std::mem::take(&mut fma_carry);
+        debug_assert!(slots.valu_used <= 6);
 
         // Collect ready ops from heap
         // Ops in the heap may need to be deferred if their deps aren't truly ready
@@ -1746,8 +1775,7 @@ fn schedule_ssa_greedy_core(
                 };
                 dead_store_indices.contains(&dep_idx)
                     || (ops[dep_idx].cycle >= 0 && {
-                        let offset = ops[dep_idx]
-                            .precedence_offset_for_asap(shiftable_set.contains(&dep_idx));
+                        let offset = result_latency(ops, dep_idx);
                         ops[dep_idx].cycle + offset <= cycle as i32
                     })
             });
@@ -2232,6 +2260,9 @@ fn schedule_ssa_greedy_core(
                 };
                 match place_result {
                     SlotResult::Placed => {
+                        if engine == Engine::Valu && fma_extra_latency.contains(&idx) {
+                            fma_carry += 1;
+                        }
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
                             && !const_choice_fixed_to_load
@@ -2319,8 +2350,7 @@ fn schedule_ssa_greedy_core(
                 // Add newly-ready consumers to heap (O(log n) per consumer)
                 for &consumer_idx in &consumers[idx] {
                     // Update max ready cycle from this predecessor's offset
-                    let offset = ops[idx]
-                        .precedence_offset_for_asap(shiftable_set.contains(&idx));
+                    let offset = result_latency(ops, idx);
                     max_ready_cycle[consumer_idx] =
                         max_ready_cycle[consumer_idx].max((cycle as i32) + offset);
 
@@ -2428,7 +2458,11 @@ fn schedule_ssa_greedy_core(
                 };
                 #[allow(unused_assignments)]
                 match force_place_result {
-                    SlotResult::Placed => {}
+                    SlotResult::Placed => {
+                        if engine == Engine::Valu && fma_extra_latency.contains(&force_idx) {
+                            fma_carry += 1;
+                        }
+                    }
                     SlotResult::Shifted => {
                         if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
@@ -2491,8 +2525,7 @@ fn schedule_ssa_greedy_core(
                 peak_live_words = peak_live_words.max(live_words);
 
                 for &consumer_idx in &consumers[force_idx] {
-                    let offset = ops[force_idx]
-                        .precedence_offset_for_asap(shiftable_set.contains(&force_idx));
+                    let offset = result_latency(ops, force_idx);
                     max_ready_cycle[consumer_idx] =
                         max_ready_cycle[consumer_idx].max((cycle as i32) + offset);
 

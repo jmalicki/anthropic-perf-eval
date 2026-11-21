@@ -3649,11 +3649,21 @@ pub fn schedule_ssa_cpsat(
                 continue;
             }
             if let Some(&chosen) = select_chosen_cycle.get(&idx) {
-                // vselect path: chosen = cycle; FMA path: chosen = fma_last (often cycle+1). Use hint_cycle as hint.
+                // vselect path: chosen = cycle. FMA path without a delta: chosen = fma_last =
+                // cycle + 1 (chosen_cycle_select_fma_*), so the hint must say so or the hint is
+                // infeasible. The domain reaches alap + 1 in that case.
+                let hinted_fma = select_choice_fma_last_cycle.contains_key(&idx)
+                    && match select_choice_mode {
+                        SelectChoiceMode::ForceFma => true,
+                        SelectChoiceMode::ForceVselect => false,
+                        SelectChoiceMode::Optimize => select_choice_hints
+                            .map_or(false, |h| h.contains(&ops[idx].id)),
+                    };
+                let extra = i64::from(hinted_fma);
                 // Clamp to domain (defensive: after domain widening, greedy values should be in domain)
                 let lb = *final_asap.get(&ops[idx].id).unwrap_or(&0) as i64;
                 let ub = *final_alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
-                let clamped = (hint_cycle as i64).max(lb).min(ub);
+                let clamped = (hint_cycle as i64).max(lb).min(ub) + extra;
                 model.add_hint(chosen, clamped);
             }
         }
@@ -3709,18 +3719,42 @@ pub fn schedule_ssa_cpsat(
         }
         let horizon_i64 = horizon as i64;
         for (g, group) in groups.iter().enumerate() {
-            // sub_cycle hint: first cycle after both producers complete (max producer cycle + 1).
-            // Do not unwrap producer_true_idx/producer_false_idx; for complex_phi groups we use
-            // only present producer hints and fall back to 0 when none exist.
+            // sub_cycle hint: first cycle at which both producers' results are visible: producer
+            // cycle + 1, + 1 more for a producer that is itself a select on the multiply-add path
+            // (the same delay as the cse_sub_after_producer constraints). Do not unwrap
+            // producer_true_idx/producer_false_idx; for complex_phi groups we use only present
+            // producer hints and fall back to 0 when none exist.
+            let producer_on_fma_path = |idx: usize| -> bool {
+                select_choice_with_fma_delay.contains(&idx)
+                    && match select_choice_mode {
+                        SelectChoiceMode::ForceFma => true,
+                        SelectChoiceMode::ForceVselect => false,
+                        SelectChoiceMode::Optimize => {
+                            select_choice_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                        }
+                    }
+            };
             let sub_cycle_hint = greedy_hints.map_or(0, |hints| {
-                let producer_cycles = [group.producer_true_idx, group.producer_false_idx]
+                let visible_cycles = [group.producer_true_idx, group.producer_false_idx]
                     .into_iter()
-                    .filter_map(|opt_idx| opt_idx.and_then(|idx| hints.get(idx).copied()))
-                    .filter(|&t| t >= 0);
-                producer_cycles
-                    .max()
-                    .map(|max_c| max_c + 1)
-                    .unwrap_or(0)
+                    .flatten()
+                    .filter_map(|idx| hints.get(idx).copied().map(|t| (idx, t)))
+                    .filter(|&(_, t)| t >= 0)
+                    .map(|(idx, t)| t + 1 + i32::from(producer_on_fma_path(idx)));
+                let after_producers = visible_cycles.max().unwrap_or(0);
+                // When the greedy put consumers on the multiply-add path, it reserved a vector
+                // slot for each one's subtract at the consumer's own cycle. The shared subtract
+                // takes the earliest of those slots: it is free in the hint, it is after the
+                // producers (the consumer depends on them too), and the consumers' multiply_adds
+                // run one cycle later.
+                let earliest_fma_consumer = group
+                    .consumer_indices
+                    .iter()
+                    .filter(|&&c| select_choice_hints.is_some_and(|h| h.contains(&ops[c].id)))
+                    .filter_map(|&c| hints.get(c).copied())
+                    .filter(|&t| t >= 0)
+                    .min();
+                earliest_fma_consumer.map_or(after_producers, |t| t.max(after_producers))
             });
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
             model.add_hint(cse_sub_cycle_vars[g], clamped);
