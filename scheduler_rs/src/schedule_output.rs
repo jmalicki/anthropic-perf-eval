@@ -393,6 +393,15 @@ struct SsaOpDebugOut {
     cycle: i32,
     var_type: Option<String>,
     source_info: Option<SsaSourceInfoOut>,
+    /// SelectChoice only: vector ops of its multiply_add encoding, 1 (precomputed delta, or
+    /// false value 0: one multiply_add) or 2 (SUB + multiply_add). Its vselect encoding is 1
+    /// flow op either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    select_fma_vector_ops: Option<u8>,
+    /// ConstChoice only: true if one of its encodings is a scalar ALU op (besides load and
+    /// flow add_imm).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    const_alu_derivable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -594,6 +603,23 @@ pub fn write_ssa_schedule_json(
                     cycle: op.cycle,
                     var_type: op.var_type.as_ref().map(|vt| vt.as_str().to_string()),
                     source_info,
+                    select_fma_vector_ops: (op.opcode == crate::types::Opcode::SelectChoice).then(|| {
+                        if op.delta_vreg.is_some() || !op.needs_subtraction {
+                            1
+                        } else {
+                            2
+                        }
+                    }),
+                    const_alu_derivable: (op.opcode == crate::types::Opcode::ConstChoice).then(|| {
+                        op.const_alternatives.as_ref().map_or(false, |alts| {
+                            alts.iter().any(|a| {
+                                !matches!(
+                                    a,
+                                    crate::types::ConstEncoding::Load | crate::types::ConstEncoding::AddImm { .. }
+                                )
+                            })
+                        })
+                    }),
                 }
             })
             .collect()
