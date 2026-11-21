@@ -710,9 +710,14 @@ NB="--greedy-barriers none"
 uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --out-dir build/cpsat_ablation \
     --name nobarriers --config "nb-baseline:$NB" --config "nb-makespan-only:$NB $MK"
 
-# Default model unchanged: export and diff
+# A switch set to its default exports the default model: a.pb with no switch, b.pb with
+# every switch given its default value explicitly; the diff must be empty
 CPSAT_EXPORT_MODEL=a.pb uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 \
     --cpsat-deterministic-time 0.5 --no-validate -q
+CPSAT_EXPORT_MODEL=b.pb uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 \
+    --cpsat-deterministic-time 0.5 --no-validate -q --cpsat-objective makespan+tiebreak \
+    --cpsat-greedy-alap-slack 15 --cpsat-horizon-num-ops --cpsat-horizon-max-latency \
+    --no-cpsat-makespan-interval --no-cpsat-push-tasks-toward-start
 uv run python -m scripts.diff_cpsat_models a.pb b.pb
 ```
 

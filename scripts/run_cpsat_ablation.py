@@ -98,13 +98,39 @@ def parse_instance(text: str, default_budget: float) -> dict:
 
 
 def is_nondeterministic(options: str) -> bool:
-    """Parallel CP-SAT without interleaved search depends on thread timing (one worker does not)."""
+    """Parallel CP-SAT without interleaved search depends on thread timing (one worker does not).
+
+    Uses the effective settings: argparse keeps the last occurrence of an option, so a
+    configuration appended after --shared-args overrides it.
+    """
     args = shlex.split(options)
-    if "--no-cpsat-interleave" not in args:
-        return False
-    if "--cpsat-workers" in args:
-        return args[args.index("--cpsat-workers") + 1] != "1"
-    return True
+    interleave, workers = True, "8"
+    for i, arg in enumerate(args):
+        if arg == "--no-cpsat-interleave":
+            interleave = False
+        elif arg == "--cpsat-interleave":
+            interleave = True
+        elif arg == "--cpsat-workers" and i + 1 < len(args):
+            workers = args[i + 1]
+        elif arg.startswith("--cpsat-workers="):
+            workers = arg.split("=", 1)[1]
+    return not interleave and workers != "1"
+
+
+# Options the runner sets itself; a configuration may not override them (the budget it records
+# would then not be the one the solver used, and the outputs would go elsewhere).
+RUNNER_OWNED_OPTIONS = ["--cpsat-deterministic-time", "--cpsat-time-limit", "--rounds", "--batch-size",
+                        "--output-json", "--save-kernel", "--validate", "--no-validate"]
+
+
+def runner_owned_options(options: str) -> list:
+    """The runner-owned options a configuration string sets (empty when it sets none)."""
+    found = []
+    for arg in shlex.split(options):
+        name = arg.split("=", 1)[0]
+        if name in RUNNER_OWNED_OPTIONS and name not in found:
+            found.append(name)
+    return found
 
 
 def safe(name: str) -> str:
@@ -250,7 +276,11 @@ def run_cell(instance: dict, config_name: str, options: str, repeat: int, out_di
     if paths["result"].exists() and not force:
         with open(paths["result"]) as f:
             saved = json.load(f)
-        if saved.get("key") == key:
+        # A run that stopped on the wall clock or did not validate is not a measurement:
+        # solve it again rather than reuse it.
+        reusable = (saved.get("returncode") == 0 and saved.get("proved") and saved.get("passed")
+                    and not saved.get("wall_clock_limit_hit"))
+        if saved.get("key") == key and reusable:
             return saved
     cmd = build_command(instance, options, time_limit, paths)
     start = time.time()
@@ -459,6 +489,11 @@ def main(argv=None) -> int:
         configs = [c for i, c in enumerate(configs) if i == 0 or c[0] in wanted]
     if args.shared_args:
         configs = [(name, f"{args.shared_args} {options}".strip()) for name, options in configs]
+    for name, options in configs:
+        owned = runner_owned_options(options)
+        if owned:
+            parser.error(f"configuration {name!r} sets {', '.join(owned)}, which the runner sets itself "
+                         "(use --instances ROUNDSxBATCH@BUDGET and --time-limit)")
     if args.list_configs:
         for name, options in configs:
             print(f"{name}: {options or '(defaults)'}")
@@ -467,6 +502,14 @@ def main(argv=None) -> int:
         instances = [parse_instance(text, args.budget) for text in args.instances.split(",") if text.strip()]
     except argparse.ArgumentTypeError as err:
         parser.error(str(err))
+    instance_names = [instance["name"] for instance in instances]
+    if len(set(instance_names)) != len(instance_names):
+        parser.error("each ROUNDSxBATCH may appear once in --instances (results are filed by rounds and batch; "
+                     "use separate --out-dir for different budgets)")
+    stems = [safe(name) for name, _ in configs]
+    if len(set(stems)) != len(stems):
+        parser.error("configuration names must stay distinct after replacing characters other than "
+                     "letters, digits, '.', '_' and '-' (they name the output files)")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -486,7 +529,12 @@ def main(argv=None) -> int:
             path = out_dir / f"{stem}.result.json"
             if path.exists():
                 with open(path) as f:
-                    results.append(json.load(f))
+                    saved = json.load(f)
+                if saved.get("options") != options or saved.get("budget") != instance["budget"]:
+                    parser.error(f"{path} was measured with options {saved.get('options')!r} and budget "
+                                 f"{saved.get('budget')}, not {options!r} and {instance['budget']}; "
+                                 "rerun it or use another --out-dir")
+                results.append(saved)
     else:
         def run(cell):
             instance, name, options, repeat = cell

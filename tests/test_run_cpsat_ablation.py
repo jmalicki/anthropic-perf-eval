@@ -62,6 +62,22 @@ def test_only_parallel_search_without_interleave_is_nondeterministic():
     assert ablation.is_nondeterministic("--no-cpsat-interleave")
     assert ablation.is_nondeterministic("--no-cpsat-interleave --cpsat-workers 12")
     assert not ablation.is_nondeterministic("--no-cpsat-interleave --cpsat-workers 1")
+    # The last occurrence wins, as in argparse (shared args come first).
+    assert ablation.is_nondeterministic("--cpsat-workers 1 --no-cpsat-interleave --cpsat-workers 12")
+    assert not ablation.is_nondeterministic("--no-cpsat-interleave --cpsat-workers 12 --cpsat-workers=1")
+    assert not ablation.is_nondeterministic("--no-cpsat-interleave --cpsat-interleave --cpsat-workers 12")
+
+
+@pytest.mark.parametrize("argv", [
+    ["--config", "base:", "--config", "b:--cpsat-deterministic-time 5"],
+    ["--config", "base:", "--config", "b:--cpsat-time-limit=10"],
+    ["--config", "a/b:", "--config", "a_b:--cpsat-workers 2"],
+    ["--instances", "2x16@10,2x16@20"],
+])
+def test_conflicting_studies_are_rejected_before_running(tmp_path, argv):
+    with pytest.raises(SystemExit):
+        ablation.main(argv + ["--out-dir", str(tmp_path)])
+    assert not list(tmp_path.glob("*.log")), "nothing may run"
 
 
 def test_log_analysis_uses_the_last_solve(tmp_path):
@@ -170,3 +186,23 @@ def test_end_to_end_small_instance(tmp_path):
         ablation.extension_fingerprint = real
     assert (tmp_path / "2r_b16__baseline.log").stat().st_mtime_ns != stamp
     assert ablation.main(argv + ["--report-only"]) == 0
+    # A saved cell measured with another budget is refused, not relabelled.
+    with pytest.raises(SystemExit):
+        ablation.main(["--instances", "2x16@0.4"] + argv[2:] + ["--report-only"])
+
+
+def test_invalid_saved_cells_are_solved_again(tmp_path, monkeypatch):
+    """A saved cell that hit the wall clock or did not validate is not reused."""
+    instance = ablation.parse_instance("2x16@0.3", 20.0)
+    calls = []
+
+    def fake_run(cmd, cwd, stdout, stderr, text):
+        calls.append(cmd)
+        stdout.write("Starting CP-SAT solver\n")
+        return type("P", (), {"returncode": 0})()
+
+    monkeypatch.setattr(ablation.subprocess, "run", fake_run)
+    first = ablation.run_cell(instance, "base", "", 0, tmp_path, 100.0, False, "build")
+    assert len(calls) == 1 and not first["passed"]
+    ablation.run_cell(instance, "base", "", 0, tmp_path, 100.0, False, "build")
+    assert len(calls) == 2, "an unvalidated cell must be solved again"

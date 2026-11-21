@@ -69,7 +69,13 @@ the key does not cover. `--report-only` tabulates whatever is saved, whatever bu
 ## Rules
 
 - **Budget in deterministic time, never wall clock.** A run flagged `wall-clock limit hit`
-  is invalid: raise `--time-limit`.
+  is invalid: raise `--time-limit` and run the study again. Such cells (and cells that did not
+  validate) are never reused; they are solved again on the next invocation.
+- **The runner owns** `--cpsat-deterministic-time`, `--cpsat-time-limit`, `--rounds`,
+  `--batch-size`, `--output-json`, `--save-kernel` and `--validate`; a configuration that sets
+  one is rejected. Give budgets per instance (`4x64@10`). Each `ROUNDSxBATCH` may appear once
+  per invocation; use another `--out-dir` to compare budgets.
+- `--report-only` refuses a saved cell whose options or budget differ from what is requested.
 - **Same budget for baseline and variant.** Budgets are per instance (`@BUDGET`).
 - **Reproducible configurations may run in parallel** (`--jobs`): load does not change what
   they return, only how long they take.
