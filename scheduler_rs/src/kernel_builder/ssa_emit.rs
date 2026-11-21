@@ -552,8 +552,11 @@ impl SsaTickTockKernelBuilder {
         let val_p = self.ctx.val_p.unwrap();
         // The mirrored index starts at n = 0 (`all_idx[g] = None`): the initial indices are
         // taken to be 0, as the root broadcast of round 0 already assumes, and not loaded.
-        // prune_dead_index makes the same assumption for the zero-based form.
-        let load_idx = !self.mirrored_index() && !self.config.spec.prune_dead_index;
+        // prune_dead_index makes the same assumption for the zero-based form, which then reads
+        // no index before storing it; with no rounds the stored index is the loaded one, so
+        // the load stays.
+        let prune_load = self.config.spec.prune_dead_index && self.config.spec.rounds > 0;
+        let load_idx = !self.mirrored_index() && !prune_load;
 
         // Op order per group (constant, index address, value address, index load, value
         // load) is the same with and without the index load, so the default emission is

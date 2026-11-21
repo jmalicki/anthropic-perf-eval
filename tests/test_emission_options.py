@@ -150,6 +150,26 @@ def test_prune_dead_index_shares_one_zero_vector_when_the_wrap_round_is_last(tmp
     assert wrap(pruned_sched) == ["vbroadcast"]
 
 
+@pytest.mark.parametrize("options", [{}, {"prune_dead_index": True}], ids=["default", "prune"])
+def test_zero_rounds_keep_the_index_load(tmp_path, options):
+    """With no rounds the stored indices are the loaded ones, so --prune-dead-index must keep the
+    load (CodeRabbit on #33: pruning it left nothing to store and the build panicked).
+
+    Only PROVED is checked: reference_kernel2 does not support 0 rounds (it stores C instead of
+    the input values), so numeric validation fails for the default emission as well.
+    """
+    path = tmp_path / "sched.json"
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=0, verbose=False, use_cpsat=False,
+        output_json=str(path), **options)
+    with open(path) as f:
+        sched = json.load(f)
+    assert check({"instrs": json.loads(json.dumps(list(instrs)))}, sched).ok
+    groups = BATCH // 8
+    assert len(phase_ops(sched, "load_data", "vload")) == 2 * groups
+    assert len(phase_ops(sched, "store_data", "vstore")) == 2 * groups
+
+
 def test_prune_dead_index_is_a_no_op_for_the_mirrored_form(tmp_path):
     _, mirrored = build(tmp_path, 3, index_form="mirrored")
     _, both = build(tmp_path, 3, index_form="mirrored", prune_dead_index=True)
