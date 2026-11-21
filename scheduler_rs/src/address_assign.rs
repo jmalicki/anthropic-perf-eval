@@ -3181,32 +3181,97 @@ mod tests {
         assert_eq!(movable_words_used(&addrs, &config), 1);
     }
 
-    /// Why the scratch model `pools` exists: a per-cycle word check passes a schedule that no
-    /// 8-aligned layout fits, and the pool condition rejects it (allocation-proofs agent; see
-    /// docs/ALLOCATION_CONJECTURES.md). 16 words; in closed cycles, vectors [0,0] and [2,2],
-    /// scalars 4x[0,1], one [0,2], 4x[1,2]: per-cycle loads 13, 9, 13. The long scalar avoids
-    /// both vectors, so they must share a page; then the 9 scalars live at cycle 1 all avoid
-    /// that page and need 9 of the other page's 8 words. Pools: 8*1 + 9 = 17 > 16.
-    /// (Closed cycles `[s, e]` are allocator intervals `[s, e + 1]`: they conflict exactly
-    /// when the closed intervals share a cycle.)
-    #[test]
-    fn test_per_cycle_fit_without_layout_is_rejected_by_pools() {
-        let mut list = vec![(VReg::vector(1), 0, 0), (VReg::vector(2), 2, 2), (VReg::scalar(10), 0, 2)];
-        for i in 0..4u32 {
-            list.push((VReg::scalar(20 + i), 0, 1));
-            list.push((VReg::scalar(30 + i), 1, 2));
+    // ------------------------------------------------------------------------
+    // Shared counterexamples: verification/allocation_counterexamples.json
+    // (docs/ALLOCATION_CONJECTURES.md). Rows are [start, end, size, count] over closed steps;
+    // "abstract" values conflict when they share a step, which is allocator interval
+    // [start, end + 1]; "real" rows are allocator intervals already. budget = words
+    // 0..budget-1 (start_addr 0, so our 8-word slots are 8-aligned).
+    // ------------------------------------------------------------------------
+
+    /// `(budget, spans)` of one counterexample entry, or `None` if it has sizes other than 1
+    /// and VLEN (the file also covers {1, 2} and {2, 3}, which our allocator never sees).
+    fn counterexample_spans(entry: &serde_json::Value) -> Option<(usize, Vec<(VReg, (i64, i64))>)> {
+        let budget = entry["budget"].as_u64().unwrap() as usize;
+        let real = entry.get("semantics").and_then(|s| s.as_str()) == Some("real");
+        let mut list: Vec<(VReg, i32, i32)> = Vec::new();
+        let mut id = 0u32;
+        for row in entry["values"].as_array().unwrap() {
+            let r: Vec<i64> = row.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+            let (start, end, size, count) = (r[0] as i32, r[1] as i32, r[2] as usize, r[3]);
+            if size != 1 && size != VLEN {
+                return None;
+            }
+            for _ in 0..count {
+                id += 1;
+                let vreg = if size == VLEN { VReg::vector(id) } else { VReg::scalar(id) };
+                list.push((vreg, start, if real { end } else { end + 1 }));
+            }
         }
-        let closed_as_intervals: Vec<(VReg, i32, i32)> =
-            list.iter().map(|&(v, s, e)| (v, s, e + 1)).collect();
-        let iv = sorted_intervals(&closed_as_intervals);
-        let config = AddressAssignConfig { budget: 16, start_addr: 0, ..Default::default() };
-        let peaks = peaks_of(&iv, &config);
-        assert_eq!(peaks.words, 13, "the per-cycle word check passes");
-        assert_eq!((peaks.vectors, peaks.scalars), (1, 9));
-        assert_eq!(peaks.split_words(), 17, "the pool condition rejects it");
+        Some((budget, sorted_intervals(&list)))
+    }
+
+    fn counterexamples() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../verification/allocation_counterexamples.json"))
+            .expect("verification/allocation_counterexamples.json parses")
+    }
+
+    /// C1 is false: each counterexample passes the per-cycle word check, has no layout (proved
+    /// in the proofs PR), and is rejected by the pool condition `8*max_v + max_s <= budget`
+    /// (which the two-pass allocator meets whenever it holds, so it must fail here); our
+    /// allocator cannot fit it either.
+    #[test]
+    fn test_c1_counterexamples_pass_words_fail_pools() {
+        let file = counterexamples();
+        let mut checked = 0;
+        for entry in file["c1_counterexamples"].as_array().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            let Some((budget, iv)) = counterexample_spans(entry) else { continue };
+            let config = AddressAssignConfig { budget, start_addr: 0, ..Default::default() };
+            let peaks = peaks_of(&iv, &config);
+            assert!(peaks.words <= budget, "{}: per-cycle peak {} > {}", name, peaks.words, budget);
+            assert!(peaks.split_words() > budget, "{}: pools accepts ({:?})", name, peaks);
+            let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+            assert_no_span_conflicts(&iv, &addrs);
+            assert!(top_addr(&addrs) as usize > budget, "{}: fits, but no layout should exist", name);
+            checked += 1;
+        }
+        assert!(checked >= 3, "expected the {{1, 8}} counterexamples, checked {}", checked);
+    }
+
+    /// The greedy-allocator failures of the proofs PR, run through the two-pass allocator:
+    /// it never needs more than `8*max_v + max_s` words, so wherever that fits the budget it
+    /// places them (several of these defeat one-pass first fit).
+    #[test]
+    fn test_greedy_failure_cases_fit_two_pass_when_pools_fit() {
+        let file = counterexamples();
+        for entry in file["greedy_failures"].as_array().unwrap() {
+            let Some((budget, iv)) = counterexample_spans(entry) else { continue };
+            let config = AddressAssignConfig { budget, start_addr: 0, ..Default::default() };
+            let peaks = peaks_of(&iv, &config);
+            let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+            assert_no_span_conflicts(&iv, &addrs);
+            let used = top_addr(&addrs) as usize;
+            assert!(used <= peaks.split_words(), "{:?}: {} > split {}", entry["demonstrates"], used, peaks.split_words());
+            if peaks.split_words() <= budget {
+                assert!(used <= budget, "{:?}: pools fit but allocation does not", entry["demonstrates"]);
+            }
+        }
+    }
+
+    /// Finding 4 of docs/ALLOCATION_CONJECTURES.md (the one-pass scan stopped expiring at the
+    /// first entry it could not free, so a point interval at the heap head kept later-ending
+    /// words busy) does not apply to the two-pass allocator: its expiry condition is the same
+    /// for every entry (`span end < start`), so a min-heap pops exactly the expired ones. The
+    /// doc's two-word example, one-word intervals [0,0], [0,1], [1,1], [1,2], fits in 2 words.
+    #[test]
+    fn test_two_pass_expiry_is_not_blocked_by_point_interval_at_heap_head() {
+        let s: Vec<VReg> = (1..=4).map(VReg::scalar).collect();
+        let iv = sorted_intervals(&[(s[0], 0, 0), (s[1], 0, 1), (s[2], 1, 1), (s[3], 1, 2)]);
+        let config = AddressAssignConfig { budget: 2, start_addr: 0, ..Default::default() };
         let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
         assert_no_span_conflicts(&iv, &addrs);
-        assert!(top_addr(&addrs) > 16, "no 8-aligned layout fits in 16 words");
+        assert_eq!(top_addr(&addrs), 2);
     }
 
     /// `compute_peak_liveness` uses the allocator's rule: a point interval `[3,3]` and a value
