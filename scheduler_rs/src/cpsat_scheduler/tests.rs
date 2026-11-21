@@ -6513,3 +6513,84 @@ mod makespan_lower_bound_tests {
         assert_eq!(makespan_lower_bound(7.0, Some(0)), 7, "a zero scale is read as 1");
     }
 }
+
+// ============================================================================
+// Greedy ALAP cap with shifting and energetic tightening
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_alap_shift_tests {
+    use super::tuning_objective_tests::toy_ops;
+    use super::*;
+    use crate::types::SelectChoiceEncoding;
+
+    /// Slack 0 on a feasible warm start that shifts ops, with energetic tightening on: the
+    /// model must stay feasible (the warm start itself satisfies the cap) and no op may be
+    /// scheduled after its warm-start cycle. The warm start is a proven-optimal schedule of
+    /// the same ops, so the makespan must not change either.
+    #[test]
+    fn test_zero_slack_with_shifting_and_energetic_tightening() {
+        let ops = toy_ops();
+        let config = |tuning: CpsatTuning, tightening: AsapAlapTightening| SsaCpsatConfig {
+            time_limit_secs: 30.0,
+            verbose: false,
+            enable_valu_shift: true,
+            // Two vector slots make shifting worthwhile; 64 scalar slots let the warm start be
+            // read the way a greedy schedule is (all eight lanes of a shifted op in its cycle).
+            machine: MachineConfig { valu_slots: 2, alu_slots: 64, ..Default::default() },
+            asap_alap_tightening: tightening,
+            force_zero_gap: true,
+            tuning,
+            ..Default::default()
+        };
+        let warm = schedule_ssa_cpsat(
+            &ops,
+            config(CpsatTuning::default(), AsapAlapTightening::None),
+            SsaCpsatHints::default(),
+            None,
+        )
+        .expect("post-solve validation")
+        .expect("a warm-start schedule");
+        assert_eq!(warm.status, CpsatStatus::Optimal);
+        assert!(!warm.shifted_ops.is_empty(), "the warm start must shift ops for this test to mean anything");
+
+        let fma_ops: HashSet<usize> = warm
+            .select_choice_encoding
+            .iter()
+            .filter(|(_, encoding)| matches!(encoding, SelectChoiceEncoding::Fma))
+            .map(|(&id, _)| id)
+            .collect();
+        let hints = SsaCpsatHints {
+            greedy_hints: Some(&warm.cycle_assignments),
+            shift_hints: Some(&warm.shifted_ops),
+            select_choice_hints: Some(&fma_ops),
+            ..Default::default()
+        };
+        let capped = schedule_ssa_cpsat(
+            &ops,
+            config(
+                CpsatTuning { greedy_alap_slack: Some(0), ..Default::default() },
+                AsapAlapTightening::Energetic,
+            ),
+            hints,
+            Some(true),
+        )
+        .expect("post-solve validation")
+        .expect("slack 0 keeps the warm start feasible");
+        assert_eq!(capped.makespan, warm.makespan);
+        for (idx, (&cycle, &warm_cycle)) in capped.cycle_assignments.iter().zip(&warm.cycle_assignments).enumerate() {
+            assert!(cycle <= warm_cycle, "op {} at {} is after its warm-start cycle {}", idx, cycle, warm_cycle);
+        }
+        for (op_id, lanes) in &capped.shifted_alu_cycles {
+            let idx = ops.iter().position(|op| op.id == *op_id).expect("shifted op exists");
+            let last_lane = *lanes.iter().max().expect("eight lanes");
+            assert!(
+                last_lane <= warm.cycle_assignments[idx],
+                "a lane of op {} runs at {}, after its warm-start cycle {}",
+                op_id,
+                last_lane,
+                warm.cycle_assignments[idx]
+            );
+        }
+    }
+}
