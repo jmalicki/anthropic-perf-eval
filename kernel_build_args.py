@@ -210,7 +210,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="CP-SAT push_all_tasks_toward_start (experimental solver parameter; default: off)")
     group.add_argument("--cpsat-cumulative-propagators", type=_propagator_list, default=None, metavar="NAME,...",
                        help="Extra CP-SAT cumulative propagators for every worker: all, or a list of "
-                            + ", ".join(CUMULATIVE_PROPAGATORS) + " (default: none)")
+                            + ", ".join(CUMULATIVE_PROPAGATORS) + " (default: none). hard_precedences sets both "
+                            "use_hard_precedences_in_cumulative and exploit_all_precedences: OR-Tools 9.15 "
+                            "ignores the first without the second.")
     group.add_argument("--cpsat-ttef-max-intervals", type=_non_negative_int, default=None, metavar="N",
                        help="max_num_intervals_for_timetable_edge_finding (CP-SAT default: 100). Timetable edge "
                             "finding is skipped on larger cumulatives, i.e. on all of ours unless this is raised.")

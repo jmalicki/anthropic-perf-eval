@@ -124,6 +124,38 @@ fn max_deterministic_time_from_env() -> Option<f64> {
         .filter(|d| d.is_finite() && *d > 0.0)
 }
 
+/// Lower bound on the makespan, in cycles, implied by CP-SAT's bound on the objective.
+///
+/// The objective is `scale * makespan + tie_breaker` with `0 <= tie_breaker <= scale - 1`
+/// (the `tie_sum_completion` row), or the makespan itself when there is no tie-breaker
+/// (`objective_scale` is `None`, read as scale 1). All terms are integers, so:
+///
+/// * the objective is at least `ceil(bound)`: a fractional bound (from an LP) is rounded up
+///   first. A small epsilon keeps floating-point noise just above an integer from adding one;
+/// * `makespan >= (ceil(bound) - (scale - 1)) / scale`, i.e. `makespan >= floor(ceil(bound) / scale)`.
+///
+/// For an integral bound this is `floor(bound / scale)`, what was computed before; for a
+/// fractional one it is tighter by up to one cycle and still valid. Rounding the quotient up
+/// instead would not be valid with a tie-breaker: a bound of `12 * scale - 1` allows
+/// makespan 11 with a tie-breaker of `scale - 1`.
+///
+/// # Arguments
+/// * `best_objective_bound` - `CpSolverResponse::best_objective_bound` of a minimisation
+/// * `objective_scale` - The makespan's coefficient in the objective; `None` when the
+///   objective is the makespan alone
+///
+/// # Returns
+/// The smallest makespan the bound still allows (0 for a non-positive or non-finite bound).
+pub(crate) fn makespan_lower_bound(best_objective_bound: f64, objective_scale: Option<i64>) -> usize {
+    const EPSILON: f64 = 1e-6;
+    let scale = objective_scale.unwrap_or(1).max(1);
+    let objective_at_least = (best_objective_bound - EPSILON).ceil();
+    if !objective_at_least.is_finite() || objective_at_least <= 0.0 {
+        return 0;
+    }
+    ((objective_at_least as i64).div_euclid(scale)) as usize
+}
+
 /// Solver parameters for one CP-SAT solve.
 ///
 /// # Arguments
@@ -547,7 +579,7 @@ pub fn schedule_ssa_cpsat(
             let op_id = ops[idx].id;
             let op_asap = *asap.get(&op_id).unwrap_or(&0);
             if let Some(current) = tighter_alap.get_mut(&op_id) {
-                let new_alap = (hint_cycle + slack).min(*current);
+                let new_alap = hint_cycle.saturating_add(slack).min(*current);
                 // Never tighten below ASAP
                 if new_alap >= op_asap && new_alap < *current {
                     *current = new_alap;
@@ -4711,8 +4743,7 @@ pub fn schedule_ssa_cpsat(
             let lb_cycles = if status == CpsatStatus::Optimal {
                 Some(out_makespan)
             } else {
-                // Without the tie-breaker the objective is the makespan itself (scale 1).
-                Some((response.best_objective_bound / (objective_scale.unwrap_or(1) as f64)).floor() as usize)
+                Some(makespan_lower_bound(response.best_objective_bound, objective_scale))
             };
 
             Ok(Some(SsaCpsatResult {
