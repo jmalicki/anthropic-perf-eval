@@ -641,51 +641,19 @@ pub fn compute_live_intervals(
     Ok(intervals)
 }
 
-/// Compute peak liveness in words at any cycle using the same-cycle reuse model.
+/// Peak liveness in words: the most words live at one time, fixed VRegs included, under the
+/// allocator's own conflict rule (`interval_span`, the rule `assign_two_pass` uses).
 ///
-/// Uses the same expiration rule as linear scan allocation (see `types.rs`):
-/// - Expire VRegs where `end <= current_start`
-/// - Same-cycle reuse: [0,5] expires when [5,10] starts (5 <= 5)
-/// - Write conflict: [5,6] (dead) does NOT expire for [5,10] (6 > 5)
-///
-/// This correctly handles both live VRegs and dead VRegs with +1 extension.
+/// A value read at cycle C and one written at C do not overlap (same-cycle reuse). A point
+/// interval `[C, C]` overlaps every other value read or written at C; the previous sweep
+/// expired it like any interval ending at C and could undercount by the point intervals
+/// ending where another value starts (docs/ALLOCATION_CONJECTURES.md, side note 5). Without
+/// the ops, multi-cycle writes (`last_write_cycles`) are not seen here; `PoolPeaks::words`
+/// from `assign_addresses` includes them.
 pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
-    if intervals.is_empty() {
-        return 0;
-    }
-
-    // Sort intervals by start cycle (same as linear scan)
-    let mut sorted: Vec<(&VReg, &LiveInterval)> = intervals.iter().collect();
-    // VReg breaks ties so the order does not depend on HashMap iteration order.
-    sorted.sort_by_key(|(vreg, interval)| (interval.start, interval.end, **vreg));
-
-    // Simulate linear scan to track actual peak
-    // Active set: (end_cycle, size)
-    let mut active: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
-    let mut current_words: usize = 0;
-    let mut peak_words: usize = 0;
-
-    for (vreg, interval) in sorted {
-        // Expire intervals that ended at or before this one starts (same-cycle reuse)
-        while let Some(&Reverse((end_cycle, size))) = active.peek() {
-            if end_cycle <= interval.start {
-                active.pop();
-                current_words = current_words.saturating_sub(size);
-            } else {
-                break;
-            }
-        }
-
-        // Allocate this VReg
-        let size = vreg.size();
-        current_words += size;
-        peak_words = peak_words.max(current_words);
-
-        // Add to active set
-        active.push(Reverse((interval.end, size)));
-    }
-
-    peak_words
+    let spans: HashMap<VReg, (i64, i64)> =
+        intervals.iter().map(|(v, iv)| (*v, interval_span(iv))).collect();
+    compute_pool_peaks(&spans, &HashMap::new()).words
 }
 
 // ============================================================================
@@ -3239,5 +3207,19 @@ mod tests {
         let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
         assert_no_span_conflicts(&iv, &addrs);
         assert!(top_addr(&addrs) > 16, "no 8-aligned layout fits in 16 words");
+    }
+
+    /// `compute_peak_liveness` uses the allocator's rule: a point interval `[3,3]` and a value
+    /// written at 3 are both live at 3 (the old sweep expired the point first: 8, not 16).
+    #[test]
+    fn test_peak_liveness_counts_point_interval_with_same_cycle_writer() {
+        let (pt, w) = (VReg::vector(1), VReg::vector(2));
+        let intervals: HashMap<VReg, LiveInterval> =
+            [(pt, LiveInterval::new(3, 3)), (w, LiveInterval::new(3, 5))].into_iter().collect();
+        assert_eq!(compute_peak_liveness(&intervals), 16);
+        // Same-cycle reuse after a read still counts once.
+        let handoff: HashMap<VReg, LiveInterval> =
+            [(pt, LiveInterval::new(0, 3)), (w, LiveInterval::new(3, 5))].into_iter().collect();
+        assert_eq!(compute_peak_liveness(&handoff), 8);
     }
 }
