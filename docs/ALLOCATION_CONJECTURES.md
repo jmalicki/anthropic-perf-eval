@@ -27,7 +27,7 @@ The checks prove:
 
 So every abstract result below holds for the real allocator. Every abstract counterexample becomes a real one with cycles doubled.
 
-**Alignment.** Our allocator does not need vector alignment. `address_assign.rs` places vectors at any address, and the ISA only requires a vload/vstore block to be contiguous ([ISA_REFERENCE.md](ISA_REFERENCE.md), `problem.py`). Aligned variants are reported because an allocator might choose 8-aligned slots. With address 0 reserved, the slots sit at offset 1 (`Alignment(8, 1)`); that is the same problem as `B - 1` words at offset 0.
+**Alignment.** Our allocator does not need vector alignment. `address_assign.rs` places vectors at any address, and the ISA only requires a vload/vstore block to be contiguous ([ISA_REFERENCE.md](ISA_REFERENCE.md), `problem.py`). Aligned variants are reported because an allocator might choose 8-aligned slots. A reserved address 0 is the same problem as `B - 1` words starting at 0, with every address shifted by one; slots then sit at 1, 9, 17, .... The `offset` of `Alignment` only sets the slot phase. It does not reserve word 0, so scalars may still use word 0.
 
 Every check below follows the repo convention ([verification/README.md](../verification/README.md)). A soundness check encodes a violation, so **UNSAT means the statement holds**. A witness check wants **SAT**.
 
@@ -96,15 +96,16 @@ Its lemmas generalise poorly here: each learned layout covers about one maximal 
 | `A6-c1-bounded-sizes2-3-B6-T6-unaligned` | {2,3} | 6 | 6 | any | holds | 84,941 | 20 s | `--slow` |
 | `A6-c1-bounded-sizes2-3-B7-T5-unaligned` | {2,3} | 7 | 5 | any | **fails** | 25,223 | 4 s | `--slow` |
 | `A6-c1-bounded-sizes1-2-B4-T5-unaligned-slack1` | {1,2} | 4 (+1 word) | 5 | any | holds: one extra word always suffices | 41,734 | 41 s | `--slow` |
+| `A6-c1-bounded-sizes1-3-B6-T5-unaligned-slack1` | {1,3} | 6 (+1 word) | 5 | any | holds: one extra word always suffices | 232,769 | 168 s | `--slow` |
 
-Run the slow rows with `uv run python -m verification.allocation_conjectures --slow`. The whole slow run takes about 2.5 minutes. The times above are from one run on an M-series Mac.
+Run the slow rows with `uv run python -m verification.allocation_conjectures --slow`. The whole slow run takes about 5 minutes. The times above are from one run on an M-series Mac.
 
 What the bounded results say:
 - **The pinning witnesses are the shortest possible** in the bounds checked. Unaligned, no counterexample has 4 steps or fewer ({1,2} at B=4, {1,3} at B=6, {1,4} at B=8), and the witness has 5. Aligned, none has 2 steps, and the witness has 3.
 - **Two steps never fail, for any k and B, aligned or not** (hand proof). Write `B = m*k + r` (m slots, r < k spare words). Lay out the values live at both steps first: their v01 vectors in slots 0 .. v01-1, their s01 scalars at the top. Those scalars cover the r spare words first, then `ceil(max(0, s01 - r) / k)` slots. At step 0, the load bound `k*(v01 + v0) + s01 + s0 <= m*k + r` gives `v0 <= m - v01 - (s01 - r)/k`. Since v0 is an integer, v0 is at most the number of slots still whole, and the step-0 scalars fit in the words left. The same holds for step 1, independently. An aligned layout is also an unaligned one.
 - **Below B = 2k, C1 held everywhere we looked** (at most one vector is live at a time): {1,2} at B=3 up to 6 steps, {1,3} at B=4 and 5 up to 5 steps. This is bounded evidence only. It is irrelevant at B = 1536.
 - **The true theorem is about equal sizes.** The per-cycle check suffices for every instance only when all values have the same size. For equal sizes, start-order first fit is optimal on interval graphs: see A4 and the C3 proof with no scalars. Two different sizes fail: by the pinning construction when b >= 2a ({1, k}, {2, 5}, ...), and by exhaustive search for {2, 3} (B = 7; the stored `sizes-2-3-B7`). Three sizes such as {1, 2, 3} contain {1, 2}, so they fail too. We have not proved the pair case a < b < 2a in general.
-- **Gap.** Every counterexample found needs exactly one extra word. For {1,2}, one extra word always sufficed in the bound checked. We have no general additive bound for {1, 8} (see Literature).
+- **Gap.** Every counterexample found needs exactly one extra word. One extra word always sufficed in the bounds checked: {1,2} at B = 4 and {1,3} at B = 6, up to 5 steps each. We have no general additive bound for {1, 8} (see Literature).
 
 ## C2: is there a polynomial allocator that always succeeds? No.
 
@@ -153,7 +154,8 @@ This also proves the equal-size case: with no scalars, start-order first fit use
    - On failure, run an exact search: CP-SAT `NoOverlap2D` over (time, address), seeded with the greedy's partial layout. Or retry with a different order.
    - Report a genuine failure only when the exact search proves there is no layout. Then the scheduler must shorten some lifetimes or free more words.
    - If a guarantee is wanted up front instead, the schedulers can enforce C3's condition `8 * max_v + max_s <= B`, and then the two-pass allocator is guaranteed. That condition is much stronger than the per-cycle check, because max_v and max_s may come from different cycles. Whether it is affordable is an empirical question for the 16-round kernel.
-4. **Side note on peak counting.** `compute_peak_liveness` in `address_assign.rs` expires an interval with `end <= start` even when that interval is a point `[C, C]`. The allocator does not, since a point never shares with a value written at C. So the reported peak can undercount by the point intervals that end at a cycle where another value starts. The checks here do not depend on it.
+4. **The scan frees less than the pairwise rule allows.** A3 verifies the pairwise rule, which says when two intervals may share a word. The heap scan in `assign_addresses` stops expiring at the first heap entry it may not free. So a point interval at the head of the heap keeps the words of later-ending entries busy, even when the rule would let them be reused. Example with two words: the one-word intervals `[0,0]`, `[0,1]`, `[1,1]`, `[1,2]`, allocated in that order. `[1,1]` takes word 0 and becomes the heap head. When `[1,2]` is allocated, the scan stops at `[1,1]` and never frees `[0,1]`'s word 1, although `[1,2]` could use it. This loses layouts but never produces a wrong one. Every "no layout" result above is judged by the pairwise rule, so it holds for the scan too.
+5. **Side note on peak counting.** `compute_peak_liveness` in `address_assign.rs` expires an interval with `end <= start` even when that interval is a point `[C, C]`. The allocator does not, since a point never shares with a value written at C. So the reported peak can undercount by the point intervals that end at a cycle where another value starts. The checks here do not depend on it.
 
 ## Literature
 

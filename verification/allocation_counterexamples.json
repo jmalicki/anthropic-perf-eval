@@ -1,5 +1,5 @@
 {
- "format": "values are rows [start, end, size, count]: count values of size words, live over the closed interval [start, end]. budget = words 0..budget-1. align (default 1) applies to values wider than one word. Checked by verification/allocation_conjectures.py (A1-stored, A7-greedy-witnesses); see docs/ALLOCATION_CONJECTURES.md.",
+ "format": "values are rows [start, end, size, count]: count values of size words, live over the closed interval [start, end]. budget = words 0..budget-1. align (default 1) applies to values wider than one word. semantics (default \"abstract\": values sharing a step conflict) may be \"real\": address_assign.rs intervals [def, last_read] with same-cycle reuse. Checked by verification/allocation_conjectures.py (A1-stored, A7-greedy-witnesses); see docs/ALLOCATION_CONJECTURES.md.",
  "c1_counterexamples": [
   {
    "name": "pinning-k8-B16-unaligned",
@@ -18,6 +18,7 @@
    "name": "pinning-k8-B16-real",
    "demonstrates": "The unaligned witness as real address_assign intervals [def, last_read] (abstract [s, e] -> [2s, 2e+1]); the closed per-cycle count is <= 16 at every cycle and no layout exists under the same-cycle-reuse rule.",
    "budget": 16,
+   "semantics": "real",
    "values": [[0, 1, 8, 1], [0, 3, 8, 1], [2, 5, 1, 7], [2, 7, 1, 1], [4, 7, 1, 1], [6, 9, 8, 1], [8, 9, 8, 1]]
   },
   {

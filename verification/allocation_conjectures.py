@@ -102,8 +102,10 @@ class Alignment:
 
     ``Alignment()`` is what our allocator needs: address_assign.rs places vectors at any
     address and the ISA only asks vload/vstore blocks to be contiguous
-    (docs/ISA_REFERENCE.md). ``Alignment(8)`` models 8-aligned slots; ``Alignment(8, 1)`` the
-    same with address 0 reserved.
+    (docs/ISA_REFERENCE.md). ``Alignment(8)`` models 8-aligned slots. ``offset`` only sets
+    the slot phase: ``Alignment(8, 1)`` puts slots at 1, 9, 17, ... but scalars may still use
+    word 0. A reserved address 0 is modelled by a budget one word smaller (every address
+    shifted down by one), not by the offset.
     """
 
     align: int = 1
@@ -303,11 +305,15 @@ def pinning_counterexample(big: int, budget: int, alignment: Alignment = UNALIGN
 
 
 def real_conflict(s1, e1, s2, e2):
-    """Whether address_assign.rs keeps real intervals [s1, e1] and [s2, e2] apart (Z3 term).
+    """Whether two real intervals [s1, e1] and [s2, e2] may not share a word (Z3 term).
 
-    Mirrors its expiry rule: the earlier-starting value A frees its words for B when
-    A.end < B.start, or A.end == B.start and neither is a point interval (reads happen
-    before writes within a cycle). Accepts ints or Z3 integer terms.
+    This is the pairwise safety rule address_assign.rs's expiry test applies: the
+    earlier-starting value A frees its words for B when A.end < B.start, or A.end == B.start
+    and neither is a point interval (reads happen before writes within a cycle). It is not
+    a model of the scan itself, which can be more conservative: it stops expiring at the
+    first heap entry it may not free, so a point interval at the head keeps later-ending
+    entries' words busy. Layouts here are judged by the pairwise rule; a "no layout" result
+    under it is all the more true for the scan. Accepts ints or Z3 integer terms.
     """
 
     def frees(sa, ea, sb, eb):
@@ -320,10 +326,19 @@ def real_phase_interval(start, end):
     """Closed doubled-time interval of a real interval; phase 2C reads, 2C+1 writes.
 
     A non-point [s, e] holds its words from its write to its last read: [2s+1, 2e]. A point
-    [C, C] holds them for the whole cycle: [2C, 2C+1].
+    [C, C] holds them for the whole cycle: [2C, 2C+1]. Returns ints for int arguments and
+    Z3 terms otherwise.
     """
+    if isinstance(start, int) and isinstance(end, int):
+        return (2 * start, 2 * start + 1) if start == end else (2 * start + 1, 2 * end)
     point = start == end
     return If(point, 2 * start, 2 * start + 1), If(point, 2 * start + 1, 2 * end)
+
+
+def real_as_abstract(values: Sequence[Value]) -> list[Value]:
+    """Real intervals as abstract values on the doubled time line (A3-real-conflict-is-overlap),
+    so the layout search applies the real same-cycle-reuse rule."""
+    return [Value(*real_phase_interval(v.start, v.end), v.size) for v in values]
 
 
 def embed_in_real(values: Sequence[Value]) -> list[Value]:
@@ -587,8 +602,11 @@ def cegis_c1(sizes: Sequence[int], budget: int, steps: int, alignment: Alignment
     for t in range(steps):
         synth.add(Sum([n * v.size for n, v in zip(counts, types) if v.start <= t <= v.end]) <= budget)
     for iteration in range(1, max_iterations + 1):
-        if synth.check() != sat:
+        result = synth.check()
+        if result == unsat:
             return "unsat", None, iteration
+        if result != sat:
+            return f"unknown ({synth.reason_unknown()})", None, iteration
         model = synth.model()
         values = [v for n, v in zip(counts, types) for _ in range(model.eval(n).as_long())]
         layout = search_layout(values, budget, alignment)
@@ -601,15 +619,18 @@ def cegis_c1(sizes: Sequence[int], budget: int, steps: int, alignment: Alignment
 
 
 def _minimise(values: list[Value], keep: Callable[[list[Value]], bool]) -> list[Value]:
-    """Drop values one at a time (sorted order) while `keep` still holds."""
+    """Drop single values (sorted order) while `keep` still holds, rescanning from the start
+    after every drop, until no single drop keeps it: the result is 1-minimal even when `keep`
+    is not monotone (greedy failure is not)."""
     values = sorted(values)
-    i = 0
-    while i < len(values):
-        trial = values[:i] + values[i + 1:]
-        if trial and keep(trial):
-            values = trial
-        else:
-            i += 1
+    dropped = True
+    while dropped:
+        dropped = False
+        for i in range(len(values)):
+            trial = values[:i] + values[i + 1:]
+            if trial and keep(trial):
+                values, dropped = trial, True
+                break
     return values
 
 
@@ -667,18 +688,25 @@ def _tag(big: int, budget: int, alignment: Alignment, small: int = 1) -> str:
 
 def check_c1_refuted(big: int, budget: int, alignment: Alignment = UNALIGNED, *, small: int = 1,
                      real: bool = False) -> Callable[[], CheckResult]:
-    """A1: the pinning witness passes the per-cycle check and Z3 proves it has no layout (UNSAT)."""
+    """A1: the pinning witness passes the per-cycle check and Z3 proves it has no layout (UNSAT).
+
+    With `real`, the witness is embedded as real intervals: the per-cycle check is the closed
+    count on those, and layouts are judged by the real same-cycle-reuse rule.
+    """
     name = f"A1-c1-refuted-{_tag(big, budget, alignment, small)}{'-real' if real else ''}"
     values = pinning_counterexample(big, budget, alignment, small)
     if real:
         values = embed_in_real(values)
+    return lambda: _check_no_layout(name, values, budget, alignment, real)
 
-    def run() -> CheckResult:
-        if not fits_per_cycle(values, budget):
-            return (name, "load-exceeds-budget", 0.0, {})
-        return _solve(name, layout_solver(values, budget, alignment)[0])
 
-    return run
+def _check_no_layout(name: str, values: list[Value], budget: int, alignment: Alignment, real: bool) -> CheckResult:
+    """UNSAT when `values` passes the (closed) per-cycle check and Z3 proves no layout exists;
+    `real` values are laid out under the real rule (on the doubled time line)."""
+    if not fits_per_cycle(values, budget):
+        return (name, "load-exceeds-budget", 0.0, {})
+    laid_out = real_as_abstract(values) if real else values
+    return _solve(name, layout_solver(laid_out, budget, alignment)[0])
 
 
 def check_c1_tight(big: int, alignment: Alignment = UNALIGNED) -> Callable[[], CheckResult]:
@@ -689,14 +717,15 @@ def check_c1_tight(big: int, alignment: Alignment = UNALIGNED) -> Callable[[], C
 
 
 def check_stored_c1_counterexamples() -> CheckResult:
-    """A1-stored: each stored C1 counterexample passes the per-cycle check and has no layout."""
+    """A1-stored: each stored C1 counterexample passes the per-cycle check and has no layout
+    (entries with "semantics": "real" under the real same-cycle-reuse rule)."""
     t0 = time.perf_counter()
     for entry in load_counterexamples()["c1_counterexamples"]:
-        values = instance_from_rows(entry["values"])
-        if not fits_per_cycle(values, entry["budget"]):
-            return ("A1-stored", f"{entry['name']}:load-exceeds-budget", time.perf_counter() - t0, {})
-        if find_layout(values, entry["budget"], alignment_of(entry)) is not None:
-            return ("A1-stored", f"{entry['name']}:sat", time.perf_counter() - t0, {})
+        real = entry.get("semantics", "abstract") == "real"
+        _, result, _, _ = _check_no_layout(entry["name"], instance_from_rows(entry["values"]), entry["budget"],
+                                           alignment_of(entry), real)
+        if result != "unsat":
+            return ("A1-stored", f"{entry['name']}:{result}", time.perf_counter() - t0, {})
     return ("A1-stored", "unsat", time.perf_counter() - t0, {})
 
 
@@ -811,6 +840,7 @@ SLOW_ALLOCATION_CHECKS = [
     _bounded("A6-c1-bounded", (2, 3), 6, 6),
     _bounded("A6-c1-bounded", (2, 3), 7, 5),
     _bounded("A6-c1-bounded", (1, 2), 4, 5, slack=1),
+    _bounded("A6-c1-bounded", (1, 3), 6, 5, slack=1),
     ("A5-c3-exhaustive-k3-B8-T3-n6", "C3: two-pass succeeds, k=3, B=8, <= 3 steps, <= 6 values",
      check_c3_exhaustive(3, 8, 3, 6)),
 ]

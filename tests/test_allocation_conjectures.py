@@ -93,6 +93,24 @@ def test_c3_two_pass_bound_on_random_instances():
         assert addrs is not None and ac.is_valid_layout(values, budget, addrs, ac.Alignment(8)), values
 
 
+def test_real_entries_need_the_real_rule():
+    """The abstract witness read as real intervals has a layout, so A1-stored must apply the
+    real rule to "semantics": "real" entries rather than the abstract overlap."""
+    values = ac.pinning_counterexample(8, 16)
+    assert ac.search_layout(ac.real_as_abstract(values), 16) is not None
+    assert ac.search_layout(ac.real_as_abstract(ac.embed_in_real(values)), 16) is None
+
+
+def test_greedy_witnesses_reproduce_from_seeded_search():
+    """--search-greedy regenerates every stored greedy witness (deterministic search)."""
+    found = [{k: e[k] for k in ("allocator", "align", "budget", "values")}
+             for b in (8, 16) for e in ac.greedy_search(b)]
+    for entry in ac.load_counterexamples()["greedy_failures"]:
+        stored = {"allocator": entry["allocator"], "align": entry.get("align", 1),
+                  "budget": entry["budget"], "values": entry["values"]}
+        assert stored in found, entry["allocator"]
+
+
 def test_stored_counterexamples_are_documented():
     data = ac.load_counterexamples()
     for entry in data["c1_counterexamples"] + data["greedy_failures"]:
