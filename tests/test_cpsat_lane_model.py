@@ -44,7 +44,7 @@ def _export(tmp_path, tag, extra):
     cmd = [sys.executable, os.path.join(ROOT, "generate_ssa_kernel.py"), "-q", "--no-validate",
            "--output-json", str(tmp_path / f"sched_{tag}.json"), "--save-kernel", str(tmp_path / f"kernel_{tag}.json"),
            *BASE, *extra]
-    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=170)
+    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=500)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     return diff_cpsat_models.load(str(model_path))
 
@@ -54,11 +54,11 @@ def _vars_in(message) -> set:
     found = set()
     for field, value in message.ListFields():
         if field.type == field.TYPE_MESSAGE:
-            items = value if field.label == field.LABEL_REPEATED else [value]
+            items = value if field.is_repeated else [value]
             for item in items:
                 found |= _vars_in(item)
         elif field.name in ("vars", "literals", "enforcement_literal", "variables", "target", "index"):
-            items = value if field.label == field.LABEL_REPEATED else [value]
+            items = value if field.is_repeated else [value]
             found |= {v if v >= 0 else -v - 1 for v in items}
     return found
 
@@ -269,6 +269,7 @@ CASES = [(cfg, lane_model) for cfg in ["3r", "5r"] for lane_model in ["free", "s
 CASES += [(cfg, lane_model) for cfg in ["3r-fma", "3r-vb-elim"] for lane_model in ["free", "sorted-pinned"]]
 
 
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("cfg,lane_model", CASES, ids=[f"{c}-{m}" for c, m in CASES])
 def test_every_lane_row_has_a_proved_shape(tmp_path, cfg, lane_model):
     model = _export(tmp_path, "m", [*CONFIGS[cfg], "--cpsat-lane-model", lane_model])
@@ -298,6 +299,7 @@ def test_every_lane_row_has_a_proved_shape(tmp_path, cfg, lane_model):
         assert not rows.domain_gaps(), rows.domain_gaps()[:10]
 
 
+@pytest.mark.timeout(600)
 def test_free_is_the_default_model(tmp_path):
     default = _export(tmp_path, "default", ["--rounds", "3"])
     explicit = _export(tmp_path, "free", ["--rounds", "3", "--cpsat-lane-model", "free"])

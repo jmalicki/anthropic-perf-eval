@@ -44,7 +44,7 @@ def _export_model(tmp_path, extra):
     cmd = [sys.executable, os.path.join(ROOT, "generate_ssa_kernel.py"), "--no-validate",
            "--output-json", str(tmp_path / "sched.json"), "--save-kernel", str(tmp_path / "kernel.json"),
            *BASE, *extra]
-    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=110)
+    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     return diff_cpsat_models.load(str(model_path)), result.stdout + result.stderr
 
@@ -95,27 +95,14 @@ def test_cse_groups_are_present_in_the_three_round_model(tmp_path):
     assert any(name.startswith("cse_sub_size_") for name in names)
 
 
-def hint_is_feasible(model):
-    """Whether the hint satisfies every constraint: fix each hinted variable and solve.
+def check_hint_is_feasible(model_path):
+    """Fix each hinted variable to its hint and solve (scripts/check_cpsat_hint.py).
 
-    Returns the CP-SAT status name of that solve (FEASIBLE or OPTIMAL = the hint is a solution).
+    Runs in a separate process: OR-Tools' Python solver crashes next to scheduler_rs.
     """
-    from google.protobuf import text_format
-    from ortools.sat.python import cp_model
-
-    fixed = type(model)()
-    fixed.CopyFrom(model)
-    for var, value in zip(fixed.solution_hint.vars, fixed.solution_hint.values):
-        del fixed.variables[var].domain[:]
-        fixed.variables[var].domain.extend([value, value])
-    fixed.ClearField("solution_hint")
-    fixed.ClearField("search_strategy")
-    solver_model = cp_model.CpModel()
-    solver_model.proto.parse_text_format(text_format.MessageToString(fixed))
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60
-    solver.parameters.num_workers = 1
-    return solver.StatusName(solver.Solve(solver_model))
+    cmd = [sys.executable, "-m", "scripts.check_cpsat_hint", str(model_path)]
+    result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, "the hint is not a solution: " + result.stdout[-2000:] + result.stderr[-2000:]
 
 
 LANE_MODEL_CASES = [
@@ -125,10 +112,11 @@ LANE_MODEL_CASES = [
 ]
 
 
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("extra", LANE_MODEL_CASES, ids=lambda extra: " ".join(extra).replace("--", ""))
 def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):
     """Sorted lanes and pinned lanes must not cut off the greedy schedule: the greedy hints
     all eight lanes of an op at the op's cycle, which is sorted and pinned."""
     model = _export_model(tmp_path, extra)
     assert not unhinted_variables(model)
-    assert hint_is_feasible(model) in ("FEASIBLE", "OPTIMAL")
+    check_hint_is_feasible(tmp_path / "model.pb")

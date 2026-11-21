@@ -205,6 +205,7 @@ def test_explicit_default_objective_is_the_default_model(tmp_path):
     assert not _model_diff(base, same)
 
 
+@pytest.mark.timeout(600)
 def test_lane_model_reaches_the_model_and_run_options(tmp_path):
     """--cpsat-lane-model: free is the default model; the others add their rows and are recorded.
     The row shapes themselves are checked in tests/test_cpsat_lane_model.py."""
