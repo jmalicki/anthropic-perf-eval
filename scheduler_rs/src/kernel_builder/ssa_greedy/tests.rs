@@ -3164,6 +3164,33 @@ fn test_split_shift_fills_scalar_slots() {
     }
 }
 
+/// An op whose destination no scheduled op reads (its only reader is a skipped dead store)
+/// is never split: its destination is released the cycle after its write, which would be
+/// before a split's last lanes are written. It is still shifted whole.
+#[test]
+fn test_split_shift_skips_destinations_without_scheduled_readers() {
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(scalar);
+    let mut unread_producers = HashSet::new();
+    for _ in 0..40 {
+        let value = emit.emit_valu(Opcode::Add, shared, shared);
+        unread_producers.insert(emit.ops.last().unwrap().id);
+        // The only reader of `value`; nothing reads its result, so the scheduler skips it.
+        emit.emit_valu(Opcode::Xor, value, shared);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+
+    let split = GreedyShape { split_shift: true, ..Default::default() };
+    let (_, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &split);
+    assert!(
+        shifted.iter().any(|id| unread_producers.contains(id)),
+        "the producers saturate the vector slots, so some are shifted whole"
+    );
+    assert!(lanes.is_empty(), "no producer without a scheduled reader is split: {:?}", lanes);
+    assert!(emit.ops.iter().filter(|op| unread_producers.contains(&op.id)).all(|op| op.cycle >= 0));
+}
+
 /// Lane cycles of a split shift: the first lanes in the first cycle, the rest in the last.
 #[test]
 fn test_split_shift_lane_cycles() {

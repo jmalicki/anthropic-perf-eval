@@ -2146,7 +2146,12 @@ fn schedule_ssa_greedy_core(
                             let counted = write_groups.counted(d);
                             let words_added =
                                 if live_vregs.contains(&counted) { 0 } else { counted.size() };
-                            if live_words + words_added <= scratch_budget {
+                            // A destination no scheduled op reads is released the cycle
+                            // after its write, which for a split would be before its last
+                            // lanes are written: such an op is only placed whole.
+                            let has_reader =
+                                vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
+                            if has_reader && live_words + words_added <= scratch_budget {
                                 slots.alu_used += free_alu;
                                 split_carry = Some(SplitShift {
                                     idx,
