@@ -46,9 +46,12 @@ Options: `--instances ROUNDSxBATCH[@BUDGET],...`, `--budget` (default 20), `--co
 `--force`, `--report-only`, `--list-configs`.
 
 Finished cells are saved as `<instance>__<config>.result.json` next to their log, schedule
-JSON and kernel, and reused when the same instance, options and budget are requested again.
-So a study can be extended (more configurations, more instances) or resumed after an
-interruption. `--force` reruns.
+JSON and kernel, and reused when the same instance, options and budget are requested again
+with the same `scheduler_rs` build (the reuse key includes a hash of the installed extension,
+so rebuilding after a model change solves every cell again). So a study can be extended (more
+configurations, more instances) or resumed after an interruption. `--force` reruns anyway;
+use it after changing Python code that affects the build (e.g. `kernel_build_args.py`), which
+the key does not cover. `--report-only` tabulates whatever is saved, whatever build made it.
 
 ## Reading the table
 

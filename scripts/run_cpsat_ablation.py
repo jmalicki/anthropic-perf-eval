@@ -18,7 +18,9 @@ table as JSON and Markdown. See .cursor/skills/use-cpsat-ablation/SKILL.md.
 An instance is ROUNDSxBATCH, optionally with its own budget: 16x256@60.
 
 Finished cells are kept in the output directory and reused on the next invocation (same
-instance, configuration options and budget), so a study can be extended or resumed.
+instance, configuration options, budget and scheduler_rs build), so a study can be extended
+or resumed. Rebuilding scheduler_rs invalidates them: the key includes a hash of the installed
+extension.
 Configurations that switch interleaved search off with more than one worker are not
 reproducible; they are run --nondeterministic-repeats times and the spread is reported.
 
@@ -112,6 +114,21 @@ def safe(name: str) -> str:
 # ----------------------------------------------------------------------------
 # One run
 # ----------------------------------------------------------------------------
+
+def extension_fingerprint() -> str:
+    """SHA-256 prefix of the installed scheduler_rs extension (the code that builds the model).
+
+    Part of the reuse key, so results saved with another build are solved again. Read from
+    the environment the generator runs in (the same interpreter as this script).
+    """
+    code = ("import hashlib, pathlib, scheduler_rs; "
+            "d = pathlib.Path(scheduler_rs.__file__).parent; "
+            "h = hashlib.sha256(); "
+            "[h.update(p.read_bytes()) for p in sorted(d.glob('*.so')) + sorted(d.glob('*.pyd'))]; "
+            "print(h.hexdigest()[:16])")
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
 
 def build_command(instance: dict, options: str, time_limit: float, paths: dict) -> list:
     return [
@@ -220,7 +237,7 @@ def analyse_run(log: str, schedule_path: Path, returncode: int, elapsed: float) 
 
 
 def run_cell(instance: dict, config_name: str, options: str, repeat: int, out_dir: Path,
-             time_limit: float, force: bool) -> dict:
+             time_limit: float, force: bool, build: str = "") -> dict:
     """Run one (instance, configuration, repeat), or reuse its saved result."""
     stem = f"{instance['name']}__{safe(config_name)}" + (f"__run{repeat}" if repeat else "")
     paths = {
@@ -229,7 +246,7 @@ def run_cell(instance: dict, config_name: str, options: str, repeat: int, out_di
         "log": out_dir / f"{stem}.log",
         "result": out_dir / f"{stem}.result.json",
     }
-    key = hashlib.sha256(json.dumps([instance, options], sort_keys=True).encode()).hexdigest()[:16]
+    key = hashlib.sha256(json.dumps([instance, options, build], sort_keys=True).encode()).hexdigest()[:16]
     if paths["result"].exists() and not force:
         with open(paths["result"]) as f:
             saved = json.load(f)
@@ -461,6 +478,7 @@ def main(argv=None) -> int:
             for repeat in range(repeats):
                 cells.append((instance, name, options, repeat))
 
+    build = "" if args.report_only else extension_fingerprint()
     results = []
     if args.report_only:
         for instance, name, options, repeat in cells:
@@ -472,7 +490,7 @@ def main(argv=None) -> int:
     else:
         def run(cell):
             instance, name, options, repeat = cell
-            result = run_cell(instance, name, options, repeat, out_dir, args.time_limit, args.force)
+            result = run_cell(instance, name, options, repeat, out_dir, args.time_limit, args.force, build)
             valid = "ok" if result.get("proved") and result.get("passed") else "NOT VALIDATED"
             print(f"{result['instance']:>9} {name:<32} run {repeat}: cycles={result.get('cycles')} "
                   f"status={result.get('status')} lb={result.get('lb_cycles')} "

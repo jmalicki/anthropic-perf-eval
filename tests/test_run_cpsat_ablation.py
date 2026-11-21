@@ -161,4 +161,12 @@ def test_end_to_end_small_instance(tmp_path):
     stamp = (tmp_path / "2r_b16__baseline.log").stat().st_mtime_ns
     assert ablation.main(argv) == 0
     assert (tmp_path / "2r_b16__baseline.log").stat().st_mtime_ns == stamp
+    # A different scheduler_rs build invalidates the saved cells.
+    real = ablation.extension_fingerprint
+    try:
+        ablation.extension_fingerprint = lambda: "another-build"
+        assert ablation.main(argv[:2] + ["--config", "baseline:"] + argv[6:]) == 0
+    finally:
+        ablation.extension_fingerprint = real
+    assert (tmp_path / "2r_b16__baseline.log").stat().st_mtime_ns != stamp
     assert ablation.main(argv + ["--report-only"]) == 0

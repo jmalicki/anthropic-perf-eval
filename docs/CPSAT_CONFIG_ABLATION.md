@@ -701,7 +701,9 @@ uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64,2x256 --out-di
     --config "makespan+alap-none+tight-horizon:$MK --cpsat-greedy-alap-slack none $TIGHT" \
     --config "makespan+workers-16:$MK --cpsat-workers 16" \
     --config "makespan+push:$MK --cpsat-push-tasks-toward-start" \
-    --config "makespan+makespan-interval:$MK --cpsat-makespan-interval"
+    --config "makespan+makespan-interval:$MK --cpsat-makespan-interval" \
+    --config "no-interleave+makespan:$MK --no-cpsat-interleave" \
+    --config "no-interleave-w12-lb+makespan:$MK --no-cpsat-interleave --cpsat-workers 12 --cpsat-extra-subsolvers objective_lb_search,objective_shaving"
 
 # Better warm start (greedy without round barriers)
 NB="--greedy-barriers none"
