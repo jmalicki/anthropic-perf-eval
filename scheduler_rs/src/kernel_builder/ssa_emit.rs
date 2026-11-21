@@ -12,8 +12,7 @@ use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
 
 use super::config::{
     level_last_index, merged_hash_stage_constants, AccessEncoding, CachedSelect, IndexForm,
-    SelectBitSource,
-    HASH_STAGES, MAX_TREE_REDUCE_DEPTH, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
+    SelectBitSource, HASH_STAGES, MAX_TREE_REDUCE_DEPTH, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
 };
 use super::context_ssa::{CachedLevelTable, CachedSelectPair};
 use super::tick_tock_ssa::{

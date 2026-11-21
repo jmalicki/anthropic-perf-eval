@@ -573,11 +573,8 @@ impl SsaTickTockKernelBuilder {
     pub fn new(config: KernelConfig) -> Self {
         let n_groups = config.n_groups();
         let n_iters = config.n_iters();
-        let tree_height = config.spec.forest_height;
-        let uses_depth3 = (0..config.spec.rounds).any(|r| {
-            let tree_depth = r % tree_height;
-            tree_depth == 3
-        });
+        // Round r visits depth r % tree_height() (`ProblemSpec::round_depth`).
+        let uses_depth3 = (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 3);
         if let Err(e) = config.spec.check_access_plan() {
             panic!("invalid emission plan: {}", e);
         }
@@ -588,10 +585,7 @@ impl SsaTickTockKernelBuilder {
                 .any(|e| config.spec.uses_access(4, e))
         } else {
             config.spec.use_tree_reduce_at_depth(4)
-                && (0..config.spec.rounds).any(|r| {
-                    let tree_depth = r % tree_height;
-                    tree_depth == 4
-                })
+                && (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 4)
         };
 
         // Pre-compute FMA multipliers in config-compatible format

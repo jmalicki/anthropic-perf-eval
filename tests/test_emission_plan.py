@@ -102,6 +102,31 @@ def test_mixed_plan_zero_based_index(tmp_path):
     build(tmp_path, "zero", 16, 16, merge_hash_stages=True, emission_plan={"access": access})
 
 
+def test_plan_at_another_forest_height(tmp_path):
+    """Height 3, 4 rounds: round 3 visits depth 3 (rounds wrap at forest_height + 1). The level-3
+    nodes must be loaded for a plan that selects there (they were not when the depth schedule
+    used forest_height as its modulus, and the build panicked)."""
+    access = ["bits", {"gather": 1, "bits-flow": 1}, "mobius", {"bits": 1, "gather": 1}]
+    path = tmp_path / "sched_h3.json"
+    kwargs = args_to_build_kwargs(None, output_json=str(path), use_git_sha=False, use_greedy=True, rounds=4,
+                                  batch_size=16, forest_height=3, **SAFE, emission_plan={"access": access})
+    kwargs["verbose"] = False
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(**kwargs)
+    assert not stats["budget_exceeded"]
+    instrs = json.loads(json.dumps(list(instrs)))
+    with open(path) as f:
+        sched = json.load(f)
+    assert check({"instrs": instrs}, sched).ok
+    assert validate_kernel(instrs, 3, 16, 4, SEED)
+
+
+def test_huge_group_count_is_rejected_without_expanding():
+    with pytest.raises(ValueError, match="sum to 1000000000"):
+        expand_plan({"access": [{"bits": 10 ** 9}]}, 1, 2, 10)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        expand_plan({"access": [{"bits": True, "gather": 1}]}, 1, 2, 10)
+
+
 @pytest.mark.parametrize("access,message", [
     (["gather"] + ["bits"] * 15, "depth 0"),
     (["bits"] * 16, "depth 5"),

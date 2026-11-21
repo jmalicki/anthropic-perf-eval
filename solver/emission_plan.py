@@ -69,14 +69,13 @@ def expand_round(spec: RoundSpec, n_groups: int, rnd: int) -> list[str]:
     if isinstance(spec, str):
         return [spec] * n_groups
     if isinstance(spec, Mapping):
-        row = []
         for name, count in spec.items():
-            if not isinstance(count, int) or count < 0:
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise ValueError(f"round {rnd}: group count for {name!r} must be a non-negative integer, got {count!r}")
-            row += [name] * count
-        if len(row) != n_groups:
-            raise ValueError(f"round {rnd}: group counts sum to {len(row)}, the kernel has {n_groups} groups")
-        return row
+        total = sum(spec.values())
+        if total != n_groups:  # checked before expanding, so a huge count cannot allocate
+            raise ValueError(f"round {rnd}: group counts sum to {total}, the kernel has {n_groups} groups")
+        return [name for name, count in spec.items() for _ in range(count)]
     row = list(spec)
     if len(row) != n_groups:
         raise ValueError(f"round {rnd}: {len(row)} entries, the kernel has {n_groups} groups")
