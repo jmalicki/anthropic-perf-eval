@@ -6246,7 +6246,7 @@ mod tuning_alap_tests {
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
         let greedy: Vec<i32> = (0..emit.ops.len() as i32).collect();
 
-        for slack in [Some(0), Some(15), None] {
+        for slack in [Some(0), Some(15), Some(i32::MAX), None] {
             let config = SsaCpsatConfig {
                 time_limit_secs: 20.0,
                 verbose: false,
@@ -6459,5 +6459,57 @@ mod redundant_row_group_tests {
             assert_eq!(result.status, CpsatStatus::Optimal, "{:?}", disabled);
             assert_eq!(result.makespan, base.makespan, "{:?}", disabled);
         }
+    }
+}
+
+// ============================================================================
+// Makespan lower bound from the solver's objective bound
+// ============================================================================
+
+#[cfg(test)]
+mod makespan_lower_bound_tests {
+    use super::super::model::makespan_lower_bound;
+
+    const SCALE: i64 = 10_000_000;
+
+    #[test]
+    fn test_makespan_only_objective_reads_the_bound_directly() {
+        assert_eq!(makespan_lower_bound(12.0, None), 12);
+        assert_eq!(makespan_lower_bound(0.0, None), 0);
+        assert_eq!(makespan_lower_bound(164.0, Some(1)), 164);
+    }
+
+    #[test]
+    fn test_scaled_objective_divides_out_the_scale() {
+        // 12 cycles and no tie-breaker, and 12 cycles with any tie-breaker below one scale step.
+        assert_eq!(makespan_lower_bound((12 * SCALE) as f64, Some(SCALE)), 12);
+        assert_eq!(makespan_lower_bound((12 * SCALE + 345_678) as f64, Some(SCALE)), 12);
+        assert_eq!(makespan_lower_bound((13 * SCALE - 1) as f64, Some(SCALE)), 12);
+        // The value from a real 2-round run: 1,640,030,542 with scale 10^7 is 164 cycles.
+        assert_eq!(makespan_lower_bound(1_640_030_542.0, Some(SCALE)), 164);
+    }
+
+    /// A bound just below an integer. The objective is an integer, so it is at least the
+    /// bound rounded up; with a tie-breaker the quotient is then rounded down, because the
+    /// tie-breaker can make up the rest of a scale step.
+    #[test]
+    fn test_rounding_at_integer_boundaries() {
+        // Makespan-only: a fractional bound excludes every integer below its ceiling.
+        assert_eq!(makespan_lower_bound(11.5, None), 12);
+        assert_eq!(makespan_lower_bound(11.999_999_9, None), 12);
+        assert_eq!(makespan_lower_bound(11.000_000_1, None), 11, "noise above an integer does not add a cycle");
+        assert_eq!(makespan_lower_bound(11.01, None), 12);
+        // Scaled: half a unit below 12 scale steps still proves 12 cycles ...
+        assert_eq!(makespan_lower_bound((12 * SCALE) as f64 - 0.5, Some(SCALE)), 12);
+        // ... but a whole unit below does not: makespan 11 with tie-breaker SCALE - 1 reaches it.
+        assert_eq!(makespan_lower_bound((12 * SCALE - 1) as f64, Some(SCALE)), 11);
+    }
+
+    #[test]
+    fn test_degenerate_bounds_give_zero() {
+        assert_eq!(makespan_lower_bound(-5.0, None), 0);
+        assert_eq!(makespan_lower_bound(f64::NEG_INFINITY, Some(SCALE)), 0);
+        assert_eq!(makespan_lower_bound(f64::NAN, None), 0);
+        assert_eq!(makespan_lower_bound(7.0, Some(0)), 7, "a zero scale is read as 1");
     }
 }
