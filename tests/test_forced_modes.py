@@ -50,3 +50,29 @@ def test_forced_mode_builds_and_matches_ssa(mode, tmp_path):
         assert not any(op.get("from_select_choice") is not None and op["engine"] == "valu" for op in lowered)
     if mode.get("select_choice") == "fma":
         assert not any(op["opcode"] == "vselect" for op in lowered)
+
+
+def test_forced_fma_hint_is_feasible_at_3_rounds_batch_64(tmp_path):
+    """--select-choice fma at 3 rounds / batch 64 used to hand CP-SAT an infeasible hint.
+
+    The greedy scheduled readers of a multiply-add select one cycle after it (the vselect
+    latency) and counted one vector slot for it; the hint gave the select's chosen-cycle and
+    the CSE shared subtract the vselect timing too. CP-SAT reported "The solution hint is
+    complete, but it is infeasible" and found no solution within the budget (BUGS.md).
+    """
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    env.pop("CPSAT_MAX_DETERMINISTIC_TIME", None)
+    result = subprocess.run(
+        [sys.executable, os.path.join(root, "generate_ssa_kernel.py"), "--rounds", "3", "--batch-size", "64",
+         "--select-choice", "fma", "--cpsat-deterministic-time", "2", "--cpsat-time-limit", "300",
+         "--no-validate", "--output-json", str(tmp_path / "sched.json"),
+         "--save-kernel", str(tmp_path / "kernel.json")],
+        cwd=root, env=env, capture_output=True, text=True, timeout=600,
+    )
+    log = result.stdout + result.stderr
+    assert result.returncode == 0, log[-3000:]
+    hint_lines = [line for line in log.splitlines() if line.startswith("The solution hint is")]
+    assert hint_lines and "complete and is feasible" in hint_lines[-1], hint_lines
