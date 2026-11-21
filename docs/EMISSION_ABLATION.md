@@ -28,8 +28,10 @@ reduction behind a switch that is off by default and backed by a Z3 proof.
   section 3.5) the same emission goes from 1,313 to **1,153** schedule cycles (1,155 on the
   simulator), output unchanged, and passes every upstream speed threshold.
 - `--values-only` changes what the kernel writes (no final indices). It is worth 1 cycle of
-  floor once the other options are on, because the floor is then bound by loads. It needs a
-  decision from the user and is not part of any recommendation below.
+  floor once the other options are on, because the floor is then bound by loads (3 cycles
+  with the shaped greedy: 1,153 to 1,150). The user has approved it for recorded results
+  provided the unmodified upstream tests pass (`./scripts/check_upstream.sh`), and every
+  such number must say "values only" next to it.
 
 ## 2. The options
 
@@ -324,7 +326,7 @@ bound on the problem.
 | `--prune-dead-index` | Leave off | Subsumed by `mirrored` |
 | `--select-bit-source path` | Leave off | Does not fit the scratch budget at 16 rounds with the default greedy scheduler; fits under the wavefront but is worth 1 cycle there, because loads bind |
 | `--tree-reduce-max-depth 4`, `--depth4-select-rounds after-wrap` | Leave off; re-measure when CP-SAT or the greedy scheduler handles `bits-flow` well | Only `bits-flow` with a balanced division gets below the load-bound 1,057 (to 1,018) |
-| `--values-only` | **Needs a decision.** | It stops writing the final indices. Upstream tests and the leaderboard compare values only, the repository's own `--validate` compares indices too. Its gain is 1 cycle of floor with the other options on (the floor is then bound by loads), 14 cycles alone |
+| `--values-only` | **Allowed for recorded results** (user decision, November 2026), on two conditions: the unmodified upstream tests pass, and the number is labelled "values only" | It stops writing the final indices. Upstream tests and the leaderboard compare values only, the repository's own `--validate` compares indices too (it compares values only under this flag and says so). Its gain is 1 cycle of floor with the other options on (the floor is then bound by loads), 14 cycles alone; 3 cycles with the shaped greedy |
 
 Defaults were not changed by this work.
 

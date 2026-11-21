@@ -148,10 +148,9 @@ def best_select_split_floor(sched, rep):
         t += 1
 
 
-def run_config(name, options, args, workdir):
-    """Build, prove, validate and measure one configuration. Returns a row dict."""
-    sched_path = os.path.join(workdir, f"sched_{name}.json")
-    kernel_path = os.path.join(workdir, f"kernel_{name}.json")
+def effective_options(options, args):
+    """The build options a configuration is built with: its own, the command line's, then
+    every --build-option on top (so a --build-option can override anything, shape included)."""
     overrides = dict(options)
     overrides.update(rounds=args.rounds, batch_size=args.batch_size, forest_height=args.forest_height,
                      use_greedy=args.cpsat_deterministic_time is None)
@@ -162,6 +161,22 @@ def run_config(name, options, args, workdir):
         if getattr(args, key) != "optimize":
             overrides[key] = getattr(args, key)
     overrides.update(args.build_options)
+    return overrides
+
+
+def run_config(name, options, args, workdir):
+    """Build, prove, validate and measure one configuration. Returns a row dict.
+
+    Validation, the saved kernel and the row all use the effective options
+    (`effective_options`), so a --build-option that changes the shape or `values_only` is
+    validated as built. The kernel is always saved next to the scheduler JSON
+    (`kernel_<name>.json`, replayable with `generate_ssa_kernel.py --validate-only`).
+    """
+    sched_path = os.path.join(workdir, f"sched_{name}.json")
+    kernel_path = os.path.join(workdir, f"kernel_{name}.json")
+    overrides = effective_options(options, args)
+    height, batch, rounds = overrides["forest_height"], overrides["batch_size"], overrides["rounds"]
+    values_only = bool(overrides.get("values_only"))
     try:
         instrs, stats = build_kernel_with_args(None, verbose=False, output_json=sched_path, use_git_sha=False,
                                                **overrides)
@@ -172,17 +187,18 @@ def run_config(name, options, args, workdir):
         sched = json.load(f)
     rep = sr.analyze(sched)
     proved = check(instrs, sched).ok
-    values_only = bool(options.get("values_only"))
-    validate_kwargs = {"values_only": True} if values_only else {}
+    save_kernel_to_json(instrs, kernel_path, height, batch, rounds, SEED, values_only=values_only)
     try:
         passed = (not stats["budget_exceeded"]) and validate_kernel(
-            instrs, args.forest_height, args.batch_size, args.rounds, SEED, **validate_kwargs)
+            instrs, height, batch, rounds, SEED, values_only=values_only)
     except Exception as e:  # the simulator rejects the kernel, e.g. a write outside the scratch space
         print(f"  {name}: kernel crashed in the simulator: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         passed = False
     row = {
         "name": name,
         "options": options,
+        "build_options": {k: v for k, v in overrides.items() if k not in options},
+        "kernel": kernel_path if args.keep else None,
         "vector_op_equivalents": rep["emission"]["vector_op_equivalents"],
         "loads": rep["engines"]["load"]["ops"],
         "flow": rep["engines"]["flow"]["ops"],
@@ -198,9 +214,9 @@ def run_config(name, options, args, workdir):
         "passed": passed,
         "validated": "values only" if values_only else "values and indices",
         "upstream": None,
+        "shape": {"forest_height": height, "batch_size": batch, "rounds": rounds},
     }
     if args.upstream:
-        save_kernel_to_json(instrs, kernel_path, args.forest_height, args.batch_size, args.rounds, SEED)
         out = subprocess.run([os.path.join(ROOT, "scripts", "check_upstream.sh"), "--kernel", kernel_path],
                              cwd=ROOT, capture_output=True, text=True)
         row["upstream"] = out.returncode == 0
@@ -275,7 +291,8 @@ def main(argv=None):
     unknown = [n for n in names if n not in CONFIGS]
     if unknown:
         ap.error(f"unknown configuration(s) {unknown}; choose from {list(CONFIGS)}")
-    if args.upstream and (args.rounds, args.batch_size, args.forest_height) != (16, 256, 10):
+    shape = effective_options({}, args)
+    if args.upstream and (shape["rounds"], shape["batch_size"], shape["forest_height"]) != (16, 256, 10):
         ap.error("--upstream needs --rounds 16 --batch-size 256 --forest-height 10 (the only shape upstream tests)")
 
     rows = []

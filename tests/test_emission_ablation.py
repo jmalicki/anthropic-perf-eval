@@ -97,3 +97,23 @@ def test_cli_rejects_unknown_configuration_and_wrong_shape_for_upstream():
         ea.main(["--only", "no-such-config"])
     with pytest.raises(SystemExit):
         ea.main(["--rounds", "4", "--upstream"])
+
+
+def test_build_options_override_validation_and_saved_kernel(tmp_path):
+    """A --build-option that changes the shape or values_only is validated as built, and --keep
+    keeps the kernel (CodeRabbit on #48: validation used the configuration and args instead)."""
+    out = tmp_path / "rows.json"
+    status = ea.main(["--rounds", "3", "--batch-size", "16", "--json", str(out), "--keep", str(tmp_path),
+                      "--only", "baseline", "--build-option", "rounds=2", "--build-option", "values_only=true"])
+    assert status == 0
+    (row,) = json.loads(out.read_text())
+    assert row["shape"] == {"forest_height": 10, "batch_size": 16, "rounds": 2}
+    assert row["validated"] == "values only" and row["passed"]
+    kernel = json.loads((tmp_path / "kernel_baseline.json").read_text())
+    assert (kernel["rounds"], kernel["batch_size"], kernel["values_only"]) == (2, 16, True)
+    assert row["kernel"] == str(tmp_path / "kernel_baseline.json")
+
+
+def test_upstream_shape_check_uses_build_options():
+    with pytest.raises(SystemExit):
+        ea.main(["--upstream", "--build-option", "rounds=4"])
