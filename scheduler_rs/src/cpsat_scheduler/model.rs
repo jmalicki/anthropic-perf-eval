@@ -3965,6 +3965,18 @@ pub fn schedule_ssa_cpsat(
             Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path, e),
         }
     }
+    // CPSAT_EXPORT_MODEL_DIR=dir keeps every model built in this process, per-section solves
+    // included, as dir/model_000.pb, dir/model_001.pb, ... in build order.
+    if let Ok(dir) = std::env::var("CPSAT_EXPORT_MODEL_DIR") {
+        static EXPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = EXPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::path::Path::new(&dir).join(format!("model_{:03}.pb", n));
+        let bytes = prost::Message::encode_to_vec(model.proto());
+        match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes)) {
+            Ok(()) => eprintln!("  CP-SAT model exported to {}", path.display()),
+            Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path.display(), e),
+        }
+    }
 
     // 14. Solve
     let response = model.solve_with_parameters(&params);
