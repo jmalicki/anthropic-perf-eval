@@ -211,7 +211,7 @@ cell; every cell with numbers is PROVED and PASSED.
 Wavefront stagger and window, without split shift, default pressure policy. Schedule
 cycles, scratch peak in parentheses:
 
-| stagger \ in flight | 12 | 14 | 16 | 18 | 20 | 24 | no limit |
+| Stagger (rows), groups in flight (columns) | 12 | 14 | 16 | 18 | 20 | 24 | no limit |
 |---|---|---|---|---|---|---|---|
 | 8 | 1538 (1012) | 1487 (1112) | 1441 (1228) | 2687 (1334) | 2777 (1398) | 2844 (1413) | 2834 (1378) |
 | 10 | 1483 (988) | 1434 (1088) | 1395 (1196) | 1563 (1288) | 2796 (1388) | 2826 (1396) | 2840 (1354) |
