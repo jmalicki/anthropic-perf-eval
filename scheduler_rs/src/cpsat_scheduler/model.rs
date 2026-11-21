@@ -3363,8 +3363,11 @@ pub fn schedule_ssa_cpsat(
             let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
             let default_alap = (horizon - 1) as i32;
             let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+            // The FMA path ends one cycle after the op's own cycle, so the domain must reach
+            // alap + 1. With alap as the upper bound a select scheduled at its ALAP could not
+            // take the FMA path: an auxiliary of the tie-breaker was restricting the schedule.
             let chosen = model.new_int_var_with_name(
-                [(op_asap, op_alap)],
+                [(op_asap, op_alap + 1)],
                 format!("select_chosen_cycle_{}", idx),
             );
             if let Some(&choice_var) = select_choice_vars.get(&idx) {
