@@ -28,8 +28,8 @@ configuration. Defaults were not changed.
 - **The warm start matters far more than the solver configuration.** The greedy schedule
   without round barriers is better than anything CP-SAT reached from the round-barrier hint
   (119 against 127 to 139 cycles at 4 rounds / batch 64; 188 against 230 to 235 at 6 rounds /
-  batch 64), and on that warm start CP-SAT added 0 to 5 cycles. At 16 rounds the comparison
-  is deferred (section 2.3).
+  batch 64), and on that warm start CP-SAT added 0 to 5 cycles. At 16 rounds, on the wavefront
+  warm start, no configuration improved on the warm start within a budget of 60 (section 2.3).
 - **The bound never moved** beyond the capacity floor plus one or two cycles (or the critical
   path) in any configuration. OR-Tools 9.15 has no reproducible multi-worker configuration
   with bound workers (section 5).
@@ -54,7 +54,7 @@ configuration. Defaults were not changed.
   `reference_kernel2`.
 - Instances (forest height 10): 2 rounds / batch 256, 3 rounds / batch 256, 4 rounds /
   batch 64, 4 rounds / batch 256, 6 rounds / batch 64, and 16 rounds / batch 256 on the
-  wavefront warm start, deferred (section 2.3). At 4 rounds / batch 256 only the baseline,
+  wavefront warm start only, budget 60 (section 2.3). At 4 rounds / batch 256 only the baseline,
   the makespan-only objective and the ALAP cap off with the tight horizon were run.
 - **Code measured:** the switches as merged in PRs #23 to #28 and the code of #39 (the
   lower-bound conversion gives the same values for the integral bounds CP-SAT reports), on
@@ -295,16 +295,26 @@ batch 64 without barriers (143 and 240 with them), and 1,398 at 16 rounds with t
 priority (2,007 by default). `--greedy-barriers none` alone does not build at 16 rounds
 (peak liveness 2,113 words against a budget of 1,536 in address assignment).
 
-**16 rounds is deferred.** Three configurations were run at 16 rounds on the wavefront warm
-start with a budget of 60 (default objective; makespan-only; makespan-only with the ALAP cap
-off and the tight horizon). All three returned 1,399 cycles, the repaired warm start and one
-cycle more than the greedy schedule, with bound 1,271 (the capacity floor), after 2.2 to 2.5
-hours of wall time each on a loaded machine; the first solution arrived only after about 27
-minutes. The solver reported the hint as incomplete (114,988 of 115,628 variables hinted),
-which is why it had to repair it rather than accept it. A fix that hints the missing CSE
-shared-subtract scratch variables is in progress in another PR; the 16-round rows are
-deferred until it is on `main`, because measuring the solver switches against a warm start
-the solver cannot use says nothing about the switches.
+**16 rounds**, wavefront warm start (`--greedy-barriers none --greedy-priority wavefront`,
+greedy 1,398 cycles), budget 60, on `main` at `9f3bf40` (after #41, so the hint is complete:
+the solver reports "The solution hint is complete and is feasible" and starts from it):
+
+| Configuration | Cycles | Status | Bound | First solution at (wall s) | Solutions | Solver dtime | Solver wall s | Peak live |
+|---|---|---|---|---|---|---|---|---|
+| default (makespan+tiebreak) | 1399 | FEASIBLE | 1271 | 46 | 3 | 417 | 6625 | 1206 |
+| makespan-only | 1399 | FEASIBLE | 1271 | 45 | 1 | 386 | 5224 | 1156 |
+| makespan-only, ALAP cap off, tight horizon | 1399 | FEASIBLE | 1271 | 48 | 1 | 411 | 5014 | 1156 |
+
+No configuration improved on the warm start. The default objective's second and third
+solutions improved only the tie-breaker. The bound stayed at the capacity floor. Every kernel
+PROVED and PASSED. Wall times were taken with the three runs in parallel on a shared machine.
+
+Before #41 (same three configurations, same budget, measured build of this study): every run
+returned 1,399 cycles with bound 1,271, but the hint was incomplete (114,988 of 115,628
+variables hinted), so the solver had to repair it and the first solution arrived only after
+about 27 minutes; each run took 2.2 to 2.5 hours of wall time on a loaded machine. The warm
+start CP-SAT receives has makespan 1,399, one more than the greedy run alone reports (1,398);
+that difference was not investigated.
 
 #### Cycles by configuration and instance
 
@@ -651,13 +661,12 @@ tag `v9.15`, and confirmed in solver logs ("N full problem subsolvers: [...]").
    propagators, or the removal of the redundant rows.
 6. **Spend effort on the warm start and on the hint, not on solver parameters.** The greedy
    shape options moved the schedule by tens of percent; no solver switch moved it by more
-   than a few cycles. Once the hint is complete, rerun the 16-round rows (the comparison
-   that matters for the project).
+   than a few cycles.
 
 ## 7. Not measured
 
 - Budgets other than 20. Several runs were still improving at the end.
-- 16 rounds (deferred until the hint is complete; section 2.3).
+- 16 rounds beyond the three configurations of section 2.3, and budgets above 60 there.
 - Wall-clock-equal comparisons. Interleaved and non-interleaved runs with the same
   deterministic budget do very different amounts of work.
 - Non-interleaved search on anything but 4 rounds / batch 64 (three runs) and 2 rounds /
