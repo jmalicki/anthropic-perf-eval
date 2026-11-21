@@ -224,6 +224,9 @@ fn test_budget_exceeded_propagates() {
                 assert!(peak_live <= budget, "{}", err_msg);
                 assert!(err_msg.contains("highest address used"), "{}", err_msg);
             }
+            BudgetAccounting::AddressPools { .. } => {
+                assert!(err_msg.contains("scratch pools exceeded"), "{}", err_msg);
+            }
         },
         other => panic!("expected BudgetExceeded, got {:?}", other),
     }

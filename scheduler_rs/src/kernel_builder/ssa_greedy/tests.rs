@@ -4374,3 +4374,145 @@ fn test_fixed_fma_selects_get_their_latency_and_two_vector_slots() {
     }
     assert!(valu.values().all(|&n| n <= 6), "vector slots over capacity: {:?}", valu);
 }
+
+// =========================================================================
+// Scratch model `pools` (GreedyShape::scratch_pools)
+// =========================================================================
+
+/// A vector phase then a scalar phase: `k` broadcasts summed in a chain (many vectors live
+/// at once), the sum decomposed into lanes, `m` scalars derived from the lanes and summed in
+/// a chain (many scalars live at once). The vector peak and the scalar peak happen at
+/// different times, so live words can fit a budget that `8 * max_v + max_s` does not.
+fn emit_vector_then_scalar_phases(k: usize, m: usize) -> SsaEmitContext {
+    let mut emit = SsaEmitContext::new();
+    let s0 = emit.emit_const(1);
+    let vs: Vec<VReg> = (0..k).map(|_| emit.emit_vbroadcast_force(s0)).collect();
+    let mut acc = emit.emit_valu(Opcode::Add, vs[0], vs[1]);
+    for v in &vs[2..] {
+        acc = emit.emit_valu(Opcode::Add, acc, *v);
+    }
+    let lanes = emit.decompose_vector(acc);
+    let xs: Vec<VReg> = (0..m)
+        .map(|j| emit.emit_alu_imm(Opcode::Add, lanes[j % VLEN], j as i64 + 1))
+        .collect();
+    let mut y = emit.emit_alu(Opcode::Add, xs[0], xs[1]);
+    for x in &xs[2..] {
+        y = emit.emit_alu(Opcode::Add, y, *x);
+    }
+    let addr = emit.emit_const(200);
+    emit.emit_store(addr, y);
+    let lanes_map = emit.vector_group_lanes.clone();
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, Some(&lanes_map));
+    emit
+}
+
+/// Schedule with the given budget and scratch model, no shifting.
+///
+/// # Returns
+/// `(budget_exceeded, pool peaks of the schedule under address assignment's liveness)`.
+fn schedule_with_scratch_model(
+    emit: &mut SsaEmitContext,
+    budget: usize,
+    pools: bool,
+) -> (bool, crate::address_assign::PoolPeaks) {
+    let lanes = emit.vector_group_lanes.clone();
+    let shape = GreedyShape { scratch_pools: pools, ..Default::default() };
+    let mut shifted = HashSet::new();
+    let ((_, budget_exceeded, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut shifted,
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        Some(&lanes),
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the phases");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new()).unwrap();
+    (budget_exceeded, peaks)
+}
+
+/// With `--scratch-model pools` the greedy keeps `8 * max_v + max_s` within the budget even
+/// where the words schedule does not, and address assignment of the result fits. Fails if
+/// the flag is ignored: the words schedule breaks the pool condition at this budget.
+#[test]
+fn test_pools_greedy_keeps_split_within_budget_where_words_does_not() {
+    for (k, m) in [(12usize, 40usize), (20, 30), (8, 64), (30, 12)] {
+        // Unconstrained run: where the vector and scalar peaks are.
+        let mut probe = emit_vector_then_scalar_phases(k, m);
+        let (_, free) = schedule_with_scratch_model(&mut probe, 100_000, false);
+        // A budget between the per-point peak and the split: words accepts, pools must not.
+        let budget = free.split_words() - 1;
+        assert!(free.words <= budget, "{}x{}: phases overlap, pick other sizes", k, m);
+
+        let mut words = emit_vector_then_scalar_phases(k, m);
+        let (words_exceeded, words_peaks) = schedule_with_scratch_model(&mut words, budget, false);
+        assert!(!words_exceeded);
+        assert!(
+            words_peaks.split_words() > budget,
+            "{}x{}: words schedule already within the pools ({:?}); the test proves nothing",
+            k,
+            m,
+            words_peaks
+        );
+
+        let mut pools = emit_vector_then_scalar_phases(k, m);
+        let (pools_exceeded, pools_peaks) = schedule_with_scratch_model(&mut pools, budget, true);
+        assert!(!pools_exceeded, "{}x{}: pools greedy force-scheduled", k, m);
+        assert!(
+            pools_peaks.split_words() <= budget,
+            "{}x{}: pools schedule needs 8*{} + {} = {} > {}",
+            k,
+            m,
+            pools_peaks.vectors,
+            pools_peaks.scalars,
+            pools_peaks.split_words(),
+            budget
+        );
+
+        // And address assignment fits it: `budget` assignable words above address 0.
+        let config = crate::address_assign::AddressAssignConfig {
+            budget: budget + 1,
+            vector_group_lanes: pools.vector_group_lanes.clone(),
+            scratch_pools: true,
+            ..Default::default()
+        };
+        let scheduled: Vec<SsaOp> = pools.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+        let assigned = crate::address_assign::assign_addresses(&scheduled, &config).unwrap();
+        assert!(
+            !assigned.budget_exceeded,
+            "{}x{}: pools schedule did not get addresses: max_addr {} with budget {}",
+            k,
+            m,
+            assigned.max_addr,
+            budget + 1
+        );
+    }
+}
+
+/// Where the words schedule already keeps the pool condition, `pools` returns the same
+/// schedule (no second run, no cycle change).
+#[test]
+fn test_pools_greedy_same_schedule_when_pools_do_not_bind() {
+    let mut words = emit_vector_then_scalar_phases(12, 40);
+    let mut pools = emit_vector_then_scalar_phases(12, 40);
+    schedule_with_scratch_model(&mut words, 1535, false);
+    schedule_with_scratch_model(&mut pools, 1535, true);
+    let cycles = |ops: &[SsaOp]| ops.iter().map(|op| op.cycle).collect::<Vec<_>>();
+    assert_eq!(cycles(&words.ops), cycles(&pools.ops));
+}

@@ -149,6 +149,11 @@ pub struct AddressAssignConfig {
     pub cse_consumer_op_ids: HashSet<usize>,
     /// CSE shared sub_temp intervals: (sub_temp_vreg, sub_cycle, max_fma_cycle+1) per active group.
     pub cse_shared_sub_temp_intervals: Vec<(VReg, i32, i32)>,
+    /// Scratch model `pools`: the schedulers promised `8 * max_v + max_s <= budget - start_addr`
+    /// (`PoolPeaks::split_words`). When set, a schedule that breaks it is reported as over budget
+    /// even if this allocation happened to fit, so a scheduler/allocator disagreement is never
+    /// silent.
+    pub scratch_pools: bool,
 }
 
 impl Default for AddressAssignConfig {
@@ -165,6 +170,7 @@ impl Default for AddressAssignConfig {
             vreg_def: HashMap::new(),
             cse_consumer_op_ids: HashSet::new(),
             cse_shared_sub_temp_intervals: Vec::new(),
+            scratch_pools: false,
         }
     }
 }
@@ -1038,7 +1044,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // memory (caller may still use result). Liveness alone cannot catch this: the peak can be
     // within budget while fragmentation pushes one value to the top of the range.
     let budget_limit = config.budget as i64;
-    let budget_exceeded = budget_exceeded || (max_addr >= budget_limit);
+    let pools_capacity = (config.budget as i64 - config.start_addr).max(0) as usize;
+    let pools_exceeded = config.scratch_pools && pool_peaks.split_words() > pools_capacity;
+    let budget_exceeded = budget_exceeded || (max_addr >= budget_limit) || pools_exceeded;
 
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
@@ -3203,5 +3211,33 @@ mod tests {
         // A placed value at 9 (just above the fixed block 1..=8): 9 words up to it, 8 fixed.
         let addrs: HashMap<VReg, i64> = [(group, 1), (lane, 2), (s, 9)].into_iter().collect();
         assert_eq!(movable_words_used(&addrs, &config), 1);
+    }
+
+    /// Why the scratch model `pools` exists: a per-cycle word check passes a schedule that no
+    /// 8-aligned layout fits, and the pool condition rejects it (allocation-proofs agent; see
+    /// docs/ALLOCATION_CONJECTURES.md). 16 words; in closed cycles, vectors [0,0] and [2,2],
+    /// scalars 4x[0,1], one [0,2], 4x[1,2]: per-cycle loads 13, 9, 13. The long scalar avoids
+    /// both vectors, so they must share a page; then the 9 scalars live at cycle 1 all avoid
+    /// that page and need 9 of the other page's 8 words. Pools: 8*1 + 9 = 17 > 16.
+    /// (Closed cycles `[s, e]` are allocator intervals `[s, e + 1]`: they conflict exactly
+    /// when the closed intervals share a cycle.)
+    #[test]
+    fn test_per_cycle_fit_without_layout_is_rejected_by_pools() {
+        let mut list = vec![(VReg::vector(1), 0, 0), (VReg::vector(2), 2, 2), (VReg::scalar(10), 0, 2)];
+        for i in 0..4u32 {
+            list.push((VReg::scalar(20 + i), 0, 1));
+            list.push((VReg::scalar(30 + i), 1, 2));
+        }
+        let closed_as_intervals: Vec<(VReg, i32, i32)> =
+            list.iter().map(|&(v, s, e)| (v, s, e + 1)).collect();
+        let iv = sorted_intervals(&closed_as_intervals);
+        let config = AddressAssignConfig { budget: 16, start_addr: 0, ..Default::default() };
+        let peaks = peaks_of(&iv, &config);
+        assert_eq!(peaks.words, 13, "the per-cycle word check passes");
+        assert_eq!((peaks.vectors, peaks.scalars), (1, 9));
+        assert_eq!(peaks.split_words(), 17, "the pool condition rejects it");
+        let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+        assert_no_span_conflicts(&iv, &addrs);
+        assert!(top_addr(&addrs) > 16, "no 8-aligned layout fits in 16 words");
     }
 }
