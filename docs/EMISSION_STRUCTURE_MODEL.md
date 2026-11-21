@@ -224,6 +224,14 @@ What the numbers say:
   resolution alone accounts for 13 to 17 (consts on load: "scheduled floor" against "emitted
   floor").
 
+**Where the gap goes** (`scripts.schedule_report` on the 1,104-cycle schedule of `flow90.json`):
+the vector ALU is 100% busy from cycle 111 to about 994 and the loads nearly so, but the greedy
+ran only 1,039 vector ops as 8 scalar ops, while the floor's balance needs about 1,465. The scalar
+ALU is 64% used. The vector ALU's own term is then 6,387 / 6 = 1,065, only 39 below the schedule.
+So most of the gap is the greedy's VALU-to-ALU shifting (roughly 50 to 70 cycles), and the rest is
+ramp-up and tail (the first and last tenth run at 72% to 93% on the vector ALU, 47% to 75% on loads).
+This is recorded to keep the gap measured; scheduler work is out of scope here.
+
 CP-SAT on the best plan: section 5.1.
 
 ### 5.1 CP-SAT

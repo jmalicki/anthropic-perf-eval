@@ -56,6 +56,9 @@ def test_choice_floor_matches_brute_force():
 def test_choice_floor_reports_binding_engine():
     loads_only = dict.fromkeys(es.CATEGORIES, 0) | {"load": 100}
     assert es.choice_floor(loads_only) == {**es.choice_floor(loads_only), "cycles": 50, "binding": ["load"]}
+    flow_only = dict.fromkeys(es.CATEGORIES, 0) | {"flow": 100}
+    assert es.choice_floor(flow_only)["cycles"] == 100
+    assert es.choice_floor(flow_only)["binding"] == ["flow"]
     vector_only = dict.fromkeys(es.CATEGORIES, 0) | {"vec_shiftable": 75}
     assert es.choice_floor(vector_only)["cycles"] == 10  # 60 on the VALU, 15 x 8 on the ALU
     assert es.choice_floor(vector_only)["binding"] == ["valu+alu"]

@@ -110,13 +110,13 @@ def vector_op_equivalents(counts: Mapping[str, int], resolution: Mapping[str, in
 
 def _feasible_at(c: Mapping[str, int], t: int):
     """Best choice resolution with everything in `t` cycles, or None. See choice_floor."""
-    if c["load"] > CAP["load"] * t or c["store"] > CAP["store"] * t or c["flow"] > t:
+    if c["load"] > CAP["load"] * t or c["store"] > CAP["store"] * t or c["flow"] > CAP["flow"] * t:
         return None
     consts = c["const"] + c["const_alu"]
     off_load = max(0, c["load"] + consts - CAP["load"] * t)  # consts that must leave the load engine
     for on_alu in range(min(c["const_alu"], off_load) + 1):
         on_flow = off_load - on_alu
-        room = t - c["flow"] - on_flow
+        room = CAP["flow"] * t - c["flow"] - on_flow
         if room < 0:
             continue
         # A 2-op select moved to flow saves a fixed and a shiftable vector op, a 1-op select a
@@ -493,7 +493,7 @@ def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -
         log(f"  {path} is for another context; recalibrating")
     log(f"  calibrating the cost table for {asdict(ctx)} ...")
     table = calibrate(ctx, workdir, log=log)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(table.to_json(), f, indent=1)
     log(f"  cost table written to {path}")
@@ -785,7 +785,8 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
     }
     if upstream or keep_kernel:
         kernel_path = keep_kernel or os.path.join(workdir, f"kernel_{name}.json")
-        save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123)
+        save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123,
+                            values_only=ctx.values_only)
         if upstream:
             import subprocess
             out = subprocess.run([os.path.join(ROOT, "scripts", "check_upstream.sh"), "--strict", "--kernel", kernel_path],
@@ -836,6 +837,11 @@ def scatter_svg(series: Sequence[tuple[str, Sequence[Mapping]]], width: int = 64
                f'cycles = floor</text>')
     out.append("</svg>")
     return "\n".join(out) + "\n"
+
+
+def rows_ok(rows: Sequence[Mapping]) -> bool:
+    """Every measured row predicted exactly, PROVED, PASSED and (when run) upstream-clean."""
+    return all(r["counts_match"] and r["proved"] and r["passed"] and r["upstream"] is not False for r in rows)
 
 
 def format_rows(rows: list[dict]) -> str:
@@ -941,7 +947,7 @@ def main(argv=None):
         if args.command == "calibrate":
             path = args.table or default_table_path(ctx)
             table = calibrate(ctx, workdir)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w") as f:
                 json.dump(table.to_json(), f, indent=1)
             print(f"calibrated from {table.calibration_plans} plans (exact); written to {path}")
@@ -980,8 +986,9 @@ def main(argv=None):
             return 0
         if args.command == "solve":
             max_util = parse_max_util(args.max_util[0] if args.max_util else "none")
-            result = solve_plan(table, encodings=args.encodings.split(","), time_limit=args.time_limit,
-                                max_util=max_util, lateness=not args.no_lateness)
+            # Isolated: on a cold cache the calibration above has loaded scheduler_rs here.
+            result = solve_plan_isolated(table, encodings=args.encodings.split(","), time_limit=args.time_limit,
+                                         max_util=max_util, lateness=not args.no_lateness)
             capped = f", T under caps {result['capped_cycles']:,}" if max_util else ""
             _print_counts(f"best plan ({result['status']}{capped}) [{describe_plan(result['rows'])}]", result["counts"])
             if args.out:
@@ -1009,7 +1016,7 @@ def main(argv=None):
             if args.json:
                 with open(args.json, "w") as f:
                     json.dump(rows_out, f, indent=1)
-            return 0
+            return 0 if rows_ok(rows_out) else 1
         if args.command == "measure":
             rows_out = []
             for spec in args.plan or ["bits"]:
@@ -1021,8 +1028,7 @@ def main(argv=None):
             if args.json:
                 with open(args.json, "w") as f:
                     json.dump(rows_out, f, indent=1)
-            ok = all(r["counts_match"] and r["proved"] and r["passed"] and r["upstream"] is not False for r in rows_out)
-            return 0 if ok else 1
+            return 0 if rows_ok(rows_out) else 1
     return 0
 
 
