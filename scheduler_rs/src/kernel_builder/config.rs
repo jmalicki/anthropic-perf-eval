@@ -290,6 +290,10 @@ pub struct CompilerConfig {
     pub greedy_stagger_cycles: u32,
     /// Wavefront priority: group chains allowed to run at once; 0 = no limit.
     pub greedy_groups_in_flight: usize,
+    /// Greedy-only: let a shifted vector op straddle two cycles so all 12 scalar slots can
+    /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
+    /// carry one cycle per op.
+    pub greedy_split_shift: bool,
 }
 
 impl Default for CompilerConfig {
@@ -308,6 +312,7 @@ impl Default for CompilerConfig {
             greedy_priority: GreedyPriorityKind::default(),
             greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
+            greedy_split_shift: false,
         }
     }
 }
@@ -325,6 +330,7 @@ impl CompilerConfig {
                         .then_some(self.greedy_groups_in_flight),
                 },
             },
+            split_shift: self.greedy_split_shift,
         }
     }
 }
