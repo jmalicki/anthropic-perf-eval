@@ -14,12 +14,15 @@ happen at all:
    This costs nothing to try on OR-Tools 9.15.
 2. **Write our own windowed LNS around CP-SAT**, using the per-section repair machinery we
    already have: fix every op outside a window of cycles and solve the window. The built-in
-   scheduling neighbourhoods do not fix variables. They add precedences to a copy of the
-   whole 115,000-variable model, so each call costs minutes of wall time at 16 rounds.
+   scheduling neighbourhoods fix the presence literals of the intervals they do not relax,
+   but they keep those intervals' cycle variables and only add ordering constraints between
+   them. Each fragment is therefore still a copy of the whole 115,000-variable model, and each
+   call costs minutes of wall time at 16 rounds (section 3.2).
    Perron's own slides list "missing heuristics for large instances" as CP-SAT's weak spot in
    scheduling.
-3. **Tune the LNS sub-solves through `subsolver_params`** (for example the `lns_stalling`
-   linearization level) and **switch on violation local search with `num_violation_ls`**.
+3. **Tune the LNS sub-solves through `subsolver_params`** (for example `lns_initial_difficulty`
+   or the fragment presolve of `lns_base`) and **switch on violation local search with
+   `num_violation_ls`**.
    Our configuration gets zero violation-LS workers today, because 10 full-problem subsolvers
    leave none of the 8 threads free. Both parameters are in 9.15 and in our crate fork, but
    each needs a `CpsatTuning` field. Item 1 already brings violation local search back
@@ -65,11 +68,11 @@ and the proto tag number gives the rough age (tags are assigned in order).
 | # | Feature (parameter / API) | Since | In 9.15? | Why it might help here | Cost | Test (ablation row) and expected signal |
 |---|---|---|---|---|---|---|
 | 1 | `ignore_subsolvers` / `subsolvers`: drop the LP-heavy full-problem workers (`default_lp`, `fixed`, `max_lp`, `max_lp_sym`, `pseudo_costs`, `quick_restart`, `reduced_costs`) | before 9.15 | yes, fork, **flag** | Each of these spent 50 to 59 deterministic time in its first task at 16 rounds and gated every batch; the LNS ran once or twice each (section 2) | none | `lns-heavy: --cpsat-objective makespan --cpsat-ignore-subsolvers default_lp,fixed,max_lp,max_lp_sym,pseudo_costs,quick_restart,reduced_costs`. Signal: many more LNS calls per budget in the log's "LNS stats" table, and cycles below the warm start at 16 rounds |
-| 2 | `use_lns_only` (keeps only `fj*`, `fs*` and `*lns`) | before 9.15 | yes, fork, switch | Pure version of #1: no full-problem worker at all, so the batch holds only LNS and first-solution workers | small switch; an equivalent `ignore` list works today | `lns-only: --cpsat-ignore-subsolvers core,default_lp,fixed,max_lp,max_lp_sym,no_lp,pseudo_costs,quick_restart,quick_restart_no_lp,reduced_costs`. Signal as #1. The bound stays at its root value |
-| 3 | External windowed LNS (the CP-SAT primer's pattern; `fix_variables_to_their_hinted_value` for a quick prototype) | n/a | n/a | Fragments with fixed variables presolve down to the window; the built-in scheduling LNS keep all 115k variables (section 3.2) | medium: a Rust loop over windows, reusing the per-section solve | New mode, not an ablation row: 16 rounds, windows of 64 to 128 cycles sliding over the wavefront warm start. Signal: cycles below 1,398 within an hour |
-| 4 | `subsolver_params` with name `lns_base` / `lns_stalling` (e.g. `linearization_level`, `cp_model_presolve`) | before 9.15 | yes, fork (tag 210), switch | `lns_stalling` inherits our global `linearization_level: 2`; `lns_base` is forced to 0. Lighter LNS sub-solves could run more often | small switch (repeated message) | `lns-lin1`: `lns_stalling` with `linearization_level: 1`. Signal: lower wall time per LNS call, more calls |
-| 5 | `num_violation_ls` (violation-based local search on the feasibility jump code) | 9.7 | yes, fork (244), switch | Default is `(num_workers - full_subsolvers + 2) / 3` = `(8 - 10 + 2) / 3` = 0 for us. The local search supports `cumulative` and `no_overlap` | small switch; #2 turns it on with no switch (section 5) | `vls-2: num_violation_ls: 2` with and without #1. Signal: solutions credited to `ls`/`ls_lin` in the "Solutions" table |
-| 6 | Scheduling LNS neighbourhoods `scheduling_time_window_lns`, `scheduling_resource_windows_lns`, `scheduling_intervals_lns`, `scheduling_precedences_lns` | before 9.15 (`packing_precedences_lns` added in 9.8) | yes, already on | Already in our portfolio (log). At 16 rounds only the two window ones improved anything, and only the tie-breaker | nothing to enable; `ignore_subsolvers` can keep only the window ones | `windows-only: ... --cpsat-ignore-subsolvers 'graph_*,rnd_*,scheduling_intervals_lns,scheduling_precedences_lns'` on top of #1. Signal: calls per window neighbourhood up |
+| 2 | `use_lns_only` (keeps only `fj*`, `fs*` and `*lns`) | before 9.15 | yes, fork, switch | Pure version of #1: no full-problem worker at all. Note that its filter also drops the violation-LS workers `ls` and `ls_lin` (they do not match `*lns`) | small switch | `use_lns_only` itself needs a switch. The row that works today is not the same portfolio: `lns-only: --cpsat-ignore-subsolvers core,default_lp,fixed,max_lp,max_lp_sym,no_lp,pseudo_costs,quick_restart,quick_restart_no_lp,reduced_costs` drops the full-problem workers but keeps `ls`/`ls_lin` (section 5). Signal as #1. The bound stays at its root value |
+| 3 | External windowed LNS (the CP-SAT primer's pattern; `fix_variables_to_their_hinted_value` for a quick prototype) | n/a | n/a | Fragments with fixed variables presolve down to the window; the built-in scheduling LNS keep all 115k variables (section 3.2) | medium: a Rust loop over windows, reusing the per-section solve | New mode, not an ablation row: 16 rounds, windows of 64 to 128 cycles sliding over the wavefront warm start. Signal: cycles below the run's own warm start (the "SSA Greedy hint" line of its log; 1,398 for the default wavefront start, 1,314 with `--greedy-split-shift`) within an hour |
+| 4 | `subsolver_params` with name `lns_base` / `lns_stalling` (e.g. `linearization_level`, `cp_model_presolve`) | before 9.15 | yes, fork (tag 210), switch | `lns_base` (linearization 0) runs every call until a neighbourhood has had 10 consecutive non-improving calls; only then does `lns_stalling` (our global `linearization_level: 2`) take every other call. The 16-round calls all ran with `h=base`, so the linearization level is not what made them slow. What can be tuned is the fragment presolve (`lns_base`: `cp_model_presolve`, `max_presolve_iterations`) and, once stalling, `lns_stalling`'s linearization | small switch (repeated message) | `lns-nopresolve`: `lns_base` with `cp_model_presolve: false`. Signal: lower wall time per LNS call, more calls. An `lns_stalling` override matters only in runs long enough to stall |
+| 5 | `num_violation_ls` (violation-based local search on the feasibility jump code) | 9.7 | yes, fork (244), switch | Default is `(num_workers - full_subsolvers + 2) / 3` = `(8 - 10 + 2) / 3` = 0 for us. The local search supports `cumulative` and `no_overlap` | small switch; the `lns-only` ignore list of #2 turns it on with no switch (section 5), `use_lns_only` does not | `vls-2: num_violation_ls: 2` with and without #1. Signal: solutions credited to `ls`/`ls_lin` in the "Solutions" table |
+| 6 | Scheduling LNS neighbourhoods `scheduling_time_window_lns`, `scheduling_resource_windows_lns`, `scheduling_intervals_lns`, `scheduling_precedences_lns` | before 9.15 (`packing_precedences_lns` added in 9.8) | yes, already on | Already in our portfolio (log). At 16 rounds only the two window ones improved anything, and only the tie-breaker | nothing to enable; `ignore_subsolvers` can keep only the window ones | `windows-only: --cpsat-objective makespan --cpsat-ignore-subsolvers 'default_lp,fixed,max_lp,max_lp_sym,pseudo_costs,quick_restart,reduced_costs,graph_*,rnd_*,scheduling_intervals_lns,scheduling_precedences_lns'` (#1's list plus the other neighbourhoods, in one value). Signal: calls per window neighbourhood up |
 | 7 | `lns_initial_difficulty`, `lns_initial_deterministic_limit` (0.5, 0.1) | before 9.15 | yes, fork (307, 308), switch | The first LNS calls at 16 rounds ran at d=0.5 with t=0.10. Half the intervals relaxed with 0.1 deterministic time is a lot for a 115k-variable fragment | small | `lns-small: lns_initial_difficulty: 0.05`. Signal: more improving calls early |
 | 8 | Hint replay per worker; `repair_hint`, `hint_conflict_limit` | before 9.15 | yes, fork | Every full-problem worker replays the complete, already-accepted hint with `HINT_SEARCH` in its first task (section 3.1). `hint_conflict_limit` limits conflicts, not decisions, so it cannot shorten a conflict-free replay | none to try; no 9.15 parameter skips the replay | Covered by #1/#2: those workers go away. `repair_hint` changes nothing for a feasible hint **[I]** |
 | 9 | `try_hint_as_assumptions` (default true) | `main` only (tag 363) | **no** | Replaces the replay of #8 with assumptions: "This should be way faster if the hint is completable" | needs an OR-Tools build from `main` and a fork proto update | After an upgrade: the same 16-round run; signal: first full-problem chunk in seconds, not 50+ deterministic time |
@@ -163,7 +166,15 @@ From `cp_model_lns.h` v9.15 (lines 673 to 726):
 - `scheduling_resource_windows_lns`: one window per resource.
 
 The helper "Returns a full neighborhood enriched with the set or precedences passed to the
-generate method". The fragment keeps the variables and adds ordering constraints. In 9.15
+generate method". `GenerateSchedulingNeighborhoodFromIntervalPrecedences` and
+`...FromRelaxedIntervals` (`cp_model_lns.cc` 2105 to 2240) fix the presence literal of every
+interval that is not relaxed, then add ordering constraints between those intervals; their
+start variables stay free. Only with `push_all_tasks_toward_start` do the two window
+generators also fix the variables of the intervals before the window (lines 2301 and 2331).
+For us that means every shift and select mode outside the window is fixed, but the cycle
+variables of all 12,000 ops remain in the fragment **[I]**. So `--cpsat-push-tasks-toward-start`
+deserves one 16-round row on top of item 1: there it would freeze everything before the window.
+The ablation study measured it only up to 6 rounds, where it changed nothing. In 9.15
 the LNS fragment is copied from the full model and presolved inside the same 0.1
 deterministic-time limit as its search (`cp_model_solver.cc` 1401 to 1470) **[V]**. At
 115,000 variables and 390,000 constraints that explains minutes of wall time per call
@@ -263,21 +274,26 @@ No CP-SAT paper on VLIW instruction scheduling or modulo scheduling at our size 
 
 ## 5. Commands for the top items
 
-Items 1 and 2 need no code. These are the commands, not results. They should be run at 16
-rounds, where the problem is, with the ablation script
+Table rows 1 and 2 (row 2 as the `lns-only` ignore list) need no code. These are the commands,
+not results. They should be run at 16 rounds, where the problem is, with the ablation script
 ([use-cpsat-ablation](../.cursor/skills/use-cpsat-ablation/SKILL.md)):
 
 ```bash
 WF="--greedy-barriers none --greedy-priority wavefront --cpsat-objective makespan"
 LP_HEAVY="default_lp,fixed,max_lp,max_lp_sym,pseudo_costs,quick_restart,reduced_costs"
 ALL_FULL="core,default_lp,fixed,max_lp,max_lp_sym,no_lp,pseudo_costs,quick_restart,quick_restart_no_lp,reduced_costs"
-uv run python -m scripts.run_cpsat_ablation --instances 16x256@60 --out-dir build/cpsat_survey \
+# The 16-round run in section 2 took 5,410 s of wall time; the script's default backstop is
+# 3,600 s, so raise it.
+uv run python -m scripts.run_cpsat_ablation --instances 16x256@60 --time-limit 21600 \
+    --out-dir build/cpsat_survey \
     --name lns --config "baseline:$WF" \
     --config "lns-heavy:$WF --cpsat-ignore-subsolvers $LP_HEAVY" \
-    --config "lns-only:$WF --cpsat-ignore-subsolvers $ALL_FULL"
+    --config "lns-only:$WF --cpsat-ignore-subsolvers $ALL_FULL" \
+    --config "lns-heavy+push:$WF --cpsat-ignore-subsolvers $LP_HEAVY --cpsat-push-tasks-toward-start"
 ```
 
-What to read in each log: the "Task timing" rows of the LNS subsolvers (how many calls), the
+First check the results table: a row marked "(wall-clock limit hit: invalid)" stopped on the
+backstop, not the budget, and does not count. What to read in each log: the "Task timing" rows of the LNS subsolvers (how many calls), the
 "LNS stats" Improv/Calls column, and the "Solutions" table. A configuration that gives the
 LNS 10 times the calls without improving the makespan would show that the built-in
 neighbourhoods do not help at this size, and point to item 3.
