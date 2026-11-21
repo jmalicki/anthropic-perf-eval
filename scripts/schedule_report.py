@@ -180,6 +180,34 @@ def analyze(d, buckets=10):
         "rounds": rounds,
         "round_overlap": round_overlap(rounds),
         "utilisation": utilisation_over_time(d, buckets),
+        "scratch": scratch_usage(d),
+    }
+
+
+def scratch_usage(d):
+    """Scratch words in use versus what the schedule's liveness requires, or None for JSONs
+    written before address assignment reported pool peaks.
+
+    `words_used` counts addresses from the first allocatable one (address 0 is reserved) up to
+    `max_addr`. `peak_words` is max over time of 8 * live vectors + live scalars under the
+    allocator's own conflict rule (no layout can use fewer words); `split_words` is
+    8 * max vectors + max scalars, which the two-pass allocator never exceeds.
+    """
+    pools = d.get("scratch_pools")
+    if pools is None or d.get("max_addr") is None:
+        return None
+    start = d.get("scratch_start_addr", 1)
+    used = d["max_addr"] + 1 - start
+    split = VLEN * pools["vectors"] + pools["scalars"]
+    return {
+        "start_addr": start,
+        "max_addr": d["max_addr"],
+        "words_used": used,
+        "peak_vectors": pools["vectors"],
+        "peak_scalars": pools["scalars"],
+        "peak_words": pools["words"],
+        "split_words": split,
+        "fragmentation_words": used - pools["words"],
     }
 
 
@@ -307,6 +335,12 @@ def format_report(rep, verbose_rounds=True):
         lb = run["solver_bound_for_emission"]
         status = "optimal for this emission" if lb == run["cycles"] else "not proven optimal for this emission"
         out.append(f"CP-SAT bound for this emission (lb_cycles): {lb} ({status}; not a bound on the problem)")
+    sc = rep.get("scratch")
+    if sc is not None:
+        out.append(f"Scratch: {sc['words_used']} words used (addresses {sc['start_addr']}..{sc['max_addr']}); "
+                   f"liveness needs {sc['peak_words']} (peak of 8*vectors + scalars), "
+                   f"fragmentation {sc['fragmentation_words']}; "
+                   f"8*{sc['peak_vectors']} + {sc['peak_scalars']} = {sc['split_words']} (allocator's upper bound)")
     if rep["rounds"] and verbose_rounds:
         out.append("")
         out.append("Round  first   last  span  overlap  vector  scalar   load   flow")

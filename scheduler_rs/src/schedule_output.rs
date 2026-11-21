@@ -331,6 +331,11 @@ struct SsaScheduleOutput {
     vreg_count: u32,
     peak_live_words: usize,
     max_addr: i64,
+    /// Peak liveness of the allocated values by pool (vectors, scalars, words), fixed VRegs
+    /// excluded, under the address allocator's exact conflict rule.
+    scratch_pools: crate::address_assign::PoolPeaks,
+    /// First allocatable scratch address; words in use = `max_addr + 1 - scratch_start_addr`.
+    scratch_start_addr: i64,
     budget_exceeded: bool,
     valu_shifted: usize,
     usage_accounting: crate::types::UsageAccounting,
@@ -651,6 +656,8 @@ pub fn write_ssa_schedule_json(
         vreg_count: result.vreg_count,
         peak_live_words: result.address_result.peak_live,
         max_addr: result.address_result.max_addr,
+        scratch_pools: result.address_result.pool_peaks.clone(),
+        scratch_start_addr: result.address_result.start_addr,
         budget_exceeded: result.budget_exceeded,
         valu_shifted: result.valu_shifted,
         usage_accounting: result.usage_accounting.clone(),

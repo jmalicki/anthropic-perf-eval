@@ -514,6 +514,8 @@ pub fn export_partial_result_on_error(
                 total_words: 0,
                 budget: ctx.config.scratch_budget,
                 budget_exceeded: ctx.final_metrics.budget_exceeded,
+                pool_peaks: Default::default(),
+                start_addr: 1,
             }
         }),
         vreg_count: ctx.vreg_count,
