@@ -25,8 +25,10 @@ happen at all:
    `num_violation_ls`**.
    Our configuration gets zero violation-LS workers today, because 10 full-problem subsolvers
    leave none of the 8 threads free. Both parameters are in 9.15 and in our crate fork, but
-   each needs a `CpsatTuning` field. Item 1 already brings violation local search back
-   without one: a short run confirmed it (section 5).
+   each needs a `CpsatTuning` field. Item 1 done with the `--cpsat-ignore-subsolvers` list
+   already brings violation local search back without one; a short run confirmed it
+   (section 5). Done with `use_lns_only` it would not, because that filter drops `ls` and
+   `ls_lin`.
 4. **Upgrading past 9.15 is not available yet.** 9.15 (January 2026) is the newest release
    and the newest Homebrew bottle. The unreleased `main` branch has exactly the fixes for our
    symptoms: the hint is tried as assumptions instead of being replayed
