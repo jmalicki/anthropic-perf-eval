@@ -188,10 +188,13 @@ def compare(args: argparse.Namespace) -> int:
         models_a = sorted((a_root / name / "models").glob("*.pb"))
         models_b = sorted((b_root / name / "models").glob("*.pb"))
         problems: list[str] = []
-        for label, r in (("a", ra), ("b", rb)):
+        for label, r, models in (("a", ra, models_a), ("b", rb, models_b)):
             problem = _record_problem(r)
             if problem:
                 problems.append(f"invalid record in {label}: {problem}")
+            elif len(models) != r["models"]:
+                # An interrupted re-recording deletes the models but leaves the old record.
+                problems.append(f"invalid record in {label}: {len(models)} model files, record says {r['models']}")
         if len(models_a) != len(models_b):
             problems.append(f"{len(models_a)} vs {len(models_b)} models")
         for ma, mb in zip(models_a, models_b):
