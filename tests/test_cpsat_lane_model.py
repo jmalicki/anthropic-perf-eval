@@ -142,14 +142,17 @@ class LaneRows:
             if kind == "no_overlap":
                 self.unverified.append(f"no_overlap #{ci} {c.name!r} contains lane intervals")
                 return
-            demands = collections.defaultdict(set)
+            lanes_by_op = collections.defaultdict(collections.Counter)
             for p in lane_positions:
                 demand = c.cumulative.demands[p]
-                op = self.lane_intervals[intervals[p]][0]
-                demands[op].add((tuple(demand.vars), tuple(demand.coeffs), demand.offset))
-            for op, kinds in demands.items():
-                if len(kinds) != 1 or kinds != {((), (), 1)}:
-                    self.unverified.append(f"cumulative {c.name!r}: lane demands of op {op} are {kinds}")
+                op, lane, _ = self.lane_intervals[intervals[p]]
+                lanes_by_op[op][lane] += 1
+                if demand.vars or demand.coeffs or demand.offset != 1:
+                    self.unverified.append(f"cumulative {c.name!r}: non-unit demand for lane {lane} of op {op}")
+            expected = dict.fromkeys(range(LANES), 1)
+            for op, lanes in lanes_by_op.items():
+                if lanes != expected:
+                    self.unverified.append(f"cumulative {c.name!r}: lane counts of op {op} are {dict(lanes)}")
             self.by_kind["cumulative"] += 1
             return
         if not mentioned:
@@ -326,3 +329,28 @@ def test_lane_specific_producer_would_be_rejected():
     row.linear.domain.extend([1, 2**62])
     rows = LaneRows(model)
     assert any("lanes [0] only" in message for message in rows.unverified), rows.unverified
+
+
+def test_cumulative_with_missing_lane_would_be_rejected():
+    from ortools.sat import cp_model_pb2
+
+    model = cp_model_pb2.CpModelProto()
+    for i in range(LANES):
+        var = model.variables.add(name=f"alu_c7_{i}")
+        var.domain.extend([0, 10])
+        row = model.constraints.add()
+        row.enforcement_literal.append(LANES)
+        row.interval.start.vars.append(i)
+        row.interval.start.coeffs.append(1)
+        row.interval.size.offset = 1
+        row.interval.end.vars.append(i)
+        row.interval.end.coeffs.append(1)
+        row.interval.end.offset = 1
+    model.variables.add(name="shift_7").domain.extend([0, 1])
+    cumulative = model.constraints.add(name="missing_lane").cumulative
+    cumulative.capacity.offset = LANES
+    for i in range(LANES - 1):
+        cumulative.intervals.append(i)
+        cumulative.demands.add(offset=1)
+    rows = LaneRows(model)
+    assert any("lane counts of op 7" in message for message in rows.unverified), rows.unverified
