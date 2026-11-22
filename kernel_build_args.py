@@ -218,8 +218,9 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "Selecting costs 15 selects per group and saves 8 loads per group")
     group.add_argument("--emission-plan", default=EMISSION_DEFAULTS["emission_plan"], metavar="PATH",
                        help="JSON plan of the tree-access encoding (gather, bits, bits-flow, mobius) of every "
-                            "group in every round (format: solver/emission_plan.py). Replaces --cached-select, "
-                            "--tree-reduce-max-depth and --depth4-select-rounds for the tree access")
+                            "group in every round, as written by scripts/emission_structure.py (format: "
+                            "solver/emission_plan.py). Replaces --cached-select, --tree-reduce-max-depth and "
+                            "--depth4-select-rounds for the tree access. See docs/EMISSION_STRUCTURE_MODEL.md")
     return group
 
 
