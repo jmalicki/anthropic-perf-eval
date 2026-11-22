@@ -16,6 +16,42 @@ use crate::types::{Opcode, SsaOp, VReg};
 
 use super::barrier_elision::section_boundaries;
 
+/// Maps a scratch operand to the SSA values that own its words. A lane of a
+/// decomposed vector uses the vector's allocation. An assembled vector uses
+/// the individual lane definitions.
+#[derive(Default)]
+pub(crate) struct ScratchAliases {
+    owners: HashMap<VReg, Vec<VReg>>,
+}
+
+impl ScratchAliases {
+    pub(crate) fn new(groups: &HashMap<VReg, Vec<VReg>>, defined: impl Fn(&VReg) -> bool) -> Self {
+        let mut owners = HashMap::new();
+        for (&group, lanes) in groups {
+            if defined(&group) {
+                for &lane in lanes {
+                    owners.insert(lane, vec![group]);
+                }
+            } else {
+                owners.insert(group, lanes.clone());
+            }
+        }
+        Self { owners }
+    }
+
+    fn resolve<'a>(&'a self, value: &'a VReg) -> &'a [VReg] {
+        self.owners.get(value).map(Vec::as_slice).unwrap_or_else(|| std::slice::from_ref(value))
+    }
+
+    pub(crate) fn reads<'a>(&'a self, op: &'a SsaOp) -> impl Iterator<Item = VReg> + 'a {
+        op.srcs.iter().filter_map(|operand| match operand {
+            crate::types::Operand::VReg(v) => Some(v),
+            _ => None,
+        }).chain(op.delta_vreg.iter()).chain(op.keep_live.iter().flatten())
+            .flat_map(|v| self.resolve(v).iter().copied())
+    }
+}
+
 /// Result of per-section budget check.
 #[derive(Debug, Clone)]
 pub struct SectionBudgetResult {
@@ -75,6 +111,17 @@ pub fn sections_exceeding_budget_with(
     section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
     scratch_time: crate::cpsat_scheduler::ScratchTime,
 ) -> SectionBudgetResult {
+    section_budget(ops, scratch_budget, select_fma_op_ids, section_select_fma_overrides, scratch_time, &ScratchAliases::default())
+}
+
+pub(crate) fn section_budget(
+    ops: &[SsaOp],
+    scratch_budget: usize,
+    select_fma_op_ids: Option<&HashSet<usize>>,
+    section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
+    scratch_time: crate::cpsat_scheduler::ScratchTime,
+    aliases: &ScratchAliases,
+) -> SectionBudgetResult {
     let boundaries = section_boundaries(ops);
 
     // VReg -> defining op index (for cycle); only ops with cycle >= 0
@@ -94,7 +141,7 @@ pub fn sections_exceeding_budget_with(
             continue;
         }
         let c = op.cycle;
-        for vreg in op.reads() {
+        for vreg in aliases.reads(op) {
             vreg_last_use_cycle
                 .entry(vreg)
                 .and_modify(|m| *m = (*m).max(c))
@@ -143,7 +190,7 @@ pub fn sections_exceeding_budget_with(
                     }
                     // On the multiply-add path the operands (cond, true/false values, delta)
                     // are read again at cycle + 1, as address assignment counts them.
-                    for vreg in op.reads().chain(op.delta_vreg) {
+                    for vreg in aliases.reads(op) {
                         let e = section_last_use.entry(vreg).or_insert(op.cycle + 1);
                         *e = (*e).max(op.cycle + 1);
                     }
@@ -242,33 +289,7 @@ pub fn live_in_for_section(
         .filter(|&i| ops[i].opcode != Opcode::Barrier)
         .collect();
 
-    // VReg -> (segment_idx, cycle) for last use in this section
-    let mut last_use: HashMap<VReg, (usize, i32)> = HashMap::new();
-    for (seg_idx, &global_idx) in global_to_segment.iter().enumerate() {
-        let op = &ops[global_idx];
-        let c = op.cycle;
-        if c < 0 {
-            continue;
-        }
-        for vreg in op.reads() {
-            let def_sec = match vreg_def_section.get(&vreg) {
-                Some(&s) => s,
-                None => continue,
-            };
-            if def_sec >= section_k {
-                continue; // defined in this or later section, not live-in
-            }
-            let entry = last_use.entry(vreg).or_insert((seg_idx, c));
-            if c > entry.1 {
-                *entry = (seg_idx, c);
-            }
-        }
-    }
-
-    last_use
-        .into_iter()
-        .map(|(vreg, (seg_idx, _))| (vreg, seg_idx))
-        .collect()
+    live_in_for_section_filtered(ops, boundaries, section_k, vreg_def_section, &global_to_segment)
 }
 
 /// Live-in VRegs for a section when the segment is filtered (e.g. AddImm alternatives removed).
@@ -281,48 +302,61 @@ pub fn live_in_for_section_filtered(
     vreg_def_section: &HashMap<VReg, usize>,
     filtered_global_indices: &[usize],
 ) -> Vec<(VReg, usize)> {
-    let (_start, _end) = match boundaries.get(section_k) {
-        Some(&b) => b,
-        None => return vec![],
-    };
+    ScratchAliases::default().live_in(ops, boundaries, section_k, vreg_def_section, filtered_global_indices)
+}
 
-    // VReg -> (filtered_seg_idx, cycle) for last use in this section (only among filtered ops)
-    let mut last_use: HashMap<VReg, (usize, i32)> = HashMap::new();
-    for (filtered_idx, &global_idx) in filtered_global_indices.iter().enumerate() {
-        if global_idx >= ops.len() {
-            continue;
-        }
-        let op = &ops[global_idx];
-        if op.opcode == Opcode::Barrier {
-            continue;
-        }
-        let c = op.cycle;
-        if c < 0 {
-            continue;
-        }
-        for vreg in op.reads() {
-            let def_sec = match vreg_def_section.get(&vreg) {
-                Some(&s) => s,
-                None => continue,
-            };
-            if def_sec >= section_k {
+impl ScratchAliases {
+    pub(crate) fn live_in(
+        &self,
+        ops: &[SsaOp],
+        boundaries: &[(usize, usize)],
+        section_k: usize,
+        vreg_def_section: &HashMap<VReg, usize>,
+        filtered_global_indices: &[usize],
+    ) -> Vec<(VReg, usize)> {
+        let (_start, _end) = match boundaries.get(section_k) {
+            Some(&b) => b,
+            None => return vec![],
+        };
+
+        // VReg -> (filtered_seg_idx, cycle) for last use in this section (only among filtered ops)
+        let mut last_use: HashMap<VReg, (usize, i32)> = HashMap::new();
+        for (filtered_idx, &global_idx) in filtered_global_indices.iter().enumerate() {
+            if global_idx >= ops.len() {
                 continue;
             }
-            let entry = last_use.entry(vreg).or_insert((filtered_idx, c));
-            if c > entry.1 {
-                *entry = (filtered_idx, c);
+            let op = &ops[global_idx];
+            if op.opcode == Opcode::Barrier {
+                continue;
+            }
+            let c = op.cycle;
+            if c < 0 {
+                continue;
+            }
+            for vreg in self.reads(op) {
+                let def_sec = match vreg_def_section.get(&vreg) {
+                    Some(&s) => s,
+                    None => continue,
+                };
+                if def_sec >= section_k {
+                    continue;
+                }
+                let entry = last_use.entry(vreg).or_insert((filtered_idx, c));
+                if c > entry.1 {
+                    *entry = (filtered_idx, c);
+                }
             }
         }
-    }
 
-    // Sorted: the per-section CP-SAT model creates one interval per entry in this order, and
-    // HashMap order differs between processes (same options, different model).
-    let mut live_in: Vec<(VReg, usize)> = last_use
-        .into_iter()
-        .map(|(vreg, (filtered_idx, _))| (vreg, filtered_idx))
-        .collect();
-    live_in.sort();
-    live_in
+        // Sorted: the per-section CP-SAT model creates one interval per entry in this order, and
+        // HashMap order differs between processes (same options, different model).
+        let mut live_in: Vec<(VReg, usize)> = last_use
+            .into_iter()
+            .map(|(vreg, (filtered_idx, _))| (vreg, filtered_idx))
+            .collect();
+        live_in.sort();
+        live_in
+    }
 }
 
 /// VRegs defined in section `section_k` whose last use is in a later section.
@@ -337,36 +371,7 @@ pub fn live_out_from_section(
     section_k: usize,
     vreg_def_section: &HashMap<VReg, usize>,
 ) -> HashSet<VReg> {
-    // Build a map from vreg -> section of last use (by op index, not cycle)
-    let mut vreg_last_use_section: HashMap<VReg, usize> = HashMap::new();
-    for (sec_idx, &(start, end)) in boundaries.iter().enumerate() {
-        for op in &ops[start..end] {
-            if op.opcode == Opcode::Barrier {
-                continue;
-            }
-            for vreg in op.reads() {
-                vreg_last_use_section
-                    .entry(vreg)
-                    .and_modify(|s| *s = (*s).max(sec_idx))
-                    .or_insert(sec_idx);
-            }
-        }
-    }
-
-    let mut out = HashSet::new();
-    for (vreg, &def_sec) in vreg_def_section {
-        if def_sec != section_k {
-            continue;
-        }
-        let last_use_section = match vreg_last_use_section.get(vreg) {
-            Some(&s) => s,
-            None => continue,
-        };
-        if last_use_section > section_k {
-            out.insert(*vreg);
-        }
-    }
-    out
+    ScratchAliases::default().live_after(ops, boundaries, section_k, vreg_def_section).0
 }
 
 /// VRegs defined in ANY section before `section_k` (sections 0..section_k-1) whose last use
@@ -382,44 +387,33 @@ pub fn live_through_for_section(
     section_k: usize,
     vreg_def_section: &HashMap<VReg, usize>,
 ) -> HashSet<VReg> {
-    if section_k == 0 {
-        return HashSet::new();
-    }
+    ScratchAliases::default().live_after(ops, boundaries, section_k, vreg_def_section).1
+}
 
-    // Build a map from vreg -> section of last use (by op index, not cycle)
-    // This correctly handles interleaved ops where cycles don't correspond to sections
-    let mut vreg_last_use_section: HashMap<VReg, usize> = HashMap::new();
-    for (sec_idx, &(start, end)) in boundaries.iter().enumerate() {
-        for op in &ops[start..end] {
-            if op.opcode == Opcode::Barrier {
-                continue;
+impl ScratchAliases {
+    /// Values needed after the section, defined either in it (live-out) or before it (live-through).
+    pub(crate) fn live_after(
+        &self,
+        ops: &[SsaOp],
+        boundaries: &[(usize, usize)],
+        section_k: usize,
+        defs: &HashMap<VReg, usize>,
+    ) -> (HashSet<VReg>, HashSet<VReg>) {
+        let mut live_out = HashSet::new();
+        let mut live_through = HashSet::new();
+        for &(start, end) in boundaries.iter().skip(section_k + 1) {
+            for op in &ops[start..end] {
+                for value in self.reads(op) {
+                    match defs.get(&value) {
+                        Some(&sec) if sec == section_k => { live_out.insert(value); }
+                        Some(&sec) if sec < section_k => { live_through.insert(value); }
+                        _ => {}
+                    }
+                }
             }
-            for vreg in op.reads() {
-                // Update last use section to the max section index where vreg is used
-                vreg_last_use_section
-                    .entry(vreg)
-                    .and_modify(|s| *s = (*s).max(sec_idx))
-                    .or_insert(sec_idx);
-            }
         }
+        (live_out, live_through)
     }
-
-    let mut out = HashSet::new();
-    for (vreg, &def_sec) in vreg_def_section {
-        // VReg must be defined BEFORE section_k (in any earlier section)
-        if def_sec >= section_k {
-            continue;
-        }
-        let last_use_section = match vreg_last_use_section.get(vreg) {
-            Some(&s) => s,
-            None => continue,
-        };
-        // VReg is live-through if its last use is in a section AFTER section_k
-        if last_use_section > section_k {
-            out.insert(*vreg);
-        }
-    }
-    out
 }
 
 /// Build cycle hints for a single section in **local** cycle space (0-based).
@@ -690,6 +684,57 @@ mod tests {
         assert_eq!(live_in_1.len(), 2, "v0 and v1 are live-in for section 1");
         let seg_idxs: Vec<usize> = live_in_1.iter().map(|(_, i)| *i).collect();
         assert!(seg_idxs.contains(&0), "last use is segment op 0");
+    }
+
+    #[test]
+    fn test_section_boundaries_resolve_vector_group_aliases() {
+        use crate::kernel_builder::emit_ssa::SsaEmitContext;
+
+        let mut emit = SsaEmitContext::new();
+        let vector = emit.emit_vload_imm(0);
+        let parts = emit.decompose_vector(vector);
+        let addr = emit.emit_const(64);
+        let (assembled, lanes) = emit.fresh_vector_group();
+        for &lane in &lanes {
+            emit.emit_load_into(addr, lane);
+        }
+        emit.emit_barrier();
+        emit.emit_const(7);
+        emit.emit_barrier();
+        emit.emit_store_imm(0, parts[2]);
+        emit.emit_vstore_imm(8, assembled);
+        for (i, op) in emit.ops.iter_mut().enumerate() {
+            op.cycle = i as i32;
+        }
+        let ops = &emit.ops;
+        let boundaries = section_boundaries(ops);
+        let defs = vreg_def_section(ops, &boundaries);
+        let aliases = ScratchAliases::new(&emit.vector_group_lanes, |v| defs.contains_key(v));
+        let expected: HashSet<VReg> = lanes.iter().copied().chain([vector]).collect();
+        assert_eq!(aliases.live_after(ops, &boundaries, 0, &defs).0, expected);
+        assert_eq!(aliases.live_after(ops, &boundaries, 1, &defs).1, expected);
+        let (first, end) = boundaries[2];
+        let filtered: Vec<_> = (first..end).collect();
+        let incoming = aliases.live_in(ops, &boundaries, 2, &defs, &filtered);
+        let expected_in: HashMap<_,_> = lanes.iter().map(|&v| (v, 1)).chain([(vector, 0)]).collect();
+        assert_eq!(incoming.iter().copied().collect::<HashMap<_, _>>(), expected_in);
+        let measured = section_budget(ops, 15, None, None, crate::cpsat_scheduler::ScratchTime::Phase, &aliases);
+        assert!(measured.section_peaks[1] >= 16);
+        #[cfg(feature = "cpsat")]
+        for budget in [15, 16] {
+            use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+            let solution = schedule_ssa_cpsat(
+                &ops[first..end],
+                SsaCpsatConfig { scratch_budget: budget, verbose: false, ..Default::default() },
+                SsaCpsatHints {
+                    initial_live: Some(&incoming),
+                    vector_group_lanes: Some(&emit.vector_group_lanes),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve receiving section");
+            assert_eq!(solution.is_some(), budget == 16);
+        }
     }
 
     #[test]

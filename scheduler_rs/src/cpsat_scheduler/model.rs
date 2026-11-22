@@ -318,38 +318,15 @@ pub(crate) fn scratch_readers_by_vreg(
     vreg_def_op: &HashMap<VReg, usize>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) -> HashMap<VReg, Vec<usize>> {
-    let mut lane_to_group: HashMap<VReg, VReg> = HashMap::new();
-    let mut alias_to_lanes: HashMap<VReg, &Vec<VReg>> = HashMap::new();
-    if let Some(groups) = vector_group_lanes {
-        for (group, lanes) in groups {
-            if vreg_def_op.contains_key(group) {
-                for lane in lanes {
-                    lane_to_group.insert(*lane, *group);
-                }
-            } else {
-                alias_to_lanes.insert(*group, lanes);
-            }
-        }
-    }
+    use crate::kernel_builder::round_budget::ScratchAliases;
+    let aliases = vector_group_lanes.map_or_else(ScratchAliases::default, |groups| {
+        ScratchAliases::new(groups, |v| vreg_def_op.contains_key(v))
+    });
     let mut readers: HashMap<VReg, Vec<usize>> = HashMap::new();
-    let mut add = |vreg: VReg, idx: usize| {
-        if vreg_def_op.contains_key(&vreg) {
-            readers.entry(vreg).or_default().push(idx);
-        }
-    };
     for (idx, op) in ops.iter().enumerate() {
-        // `keep_live` entries are liveness-only uses: the value must stay allocated until this
-        // op runs even though it is not an operand (see `SsaOp::keep_live`).
-        let held = op.keep_live.iter().flatten().copied();
-        for vreg in op.reads().chain(op.delta_vreg).chain(held) {
-            if let Some(group) = lane_to_group.get(&vreg) {
-                add(*group, idx);
-            } else if let Some(lanes) = alias_to_lanes.get(&vreg) {
-                for lane in lanes.iter() {
-                    add(*lane, idx);
-                }
-            } else {
-                add(vreg, idx);
+        for vreg in aliases.reads(op) {
+            if vreg_def_op.contains_key(&vreg) {
+                readers.entry(vreg).or_default().push(idx);
             }
         }
     }
@@ -2403,31 +2380,18 @@ pub fn schedule_ssa_cpsat(
             // another reader later. The cycle timeline's same-cycle overcount used to hide this.
             if let Some(il) = initial_live {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
+                // Include external owners when resolving aliases. An incoming assembled
+                // lane may have several readers of the vector alias, while an incoming
+                // decomposed vector may have several independent scalar lane readers.
+                let mut known_defs = vreg_def_op.clone();
+                known_defs.extend(il.iter().copied());
+                let incoming_readers = scratch_readers_by_vreg(ops, &known_defs, hints.vector_group_lanes);
                 for (vreg, last_use_idx) in il {
                     if *last_use_idx >= times.len() {
                         continue;
                     }
-                    // Readers of the value, or of one of its lanes when it is a decomposed
-                    // vector (a lane read is a read of the vector's block).
-                    let lanes: &[VReg] = hints
-                        .vector_group_lanes
-                        .and_then(|g| g.get(vreg))
-                        .map_or(&[], |l| l.as_slice());
-                    let reads_it = |v: VReg| v == *vreg || lanes.contains(&v);
-                    let mut readers: Vec<usize> = ops
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, op)| {
-                            *i < times.len()
-                                && (op.reads().any(reads_it)
-                                    || op.delta_vreg.is_some_and(reads_it)
-                                    || op.keep_live.iter().flatten().any(|k| reads_it(*k)))
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    if readers.is_empty() {
-                        readers.push(*last_use_idx);
-                    }
+                    let fallback = [*last_use_idx];
+                    let readers = incoming_readers.get(vreg).map_or(fallback.as_slice(), Vec::as_slice);
                     // Exec end + 1 + read latency (multiply-add path), as for values defined here.
                     let read_end = |r: usize| times[r].last_read_end();
                     // Hinted end: the latest reader's hinted read + 1 (+1 on the FMA path).

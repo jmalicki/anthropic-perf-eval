@@ -824,8 +824,7 @@ impl SsaTickTockKernelBuilder {
             .map_err(KernelBuilderError::Other)?;
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
-            live_in_for_section_filtered, live_out_from_section, live_through_for_section,
-            sections_exceeding_budget_with, vreg_def_section,
+            section_budget, ScratchAliases, vreg_def_section,
         };
         use super::pipeline::{
             BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
@@ -992,18 +991,20 @@ impl SsaTickTockKernelBuilder {
         let boundaries = section_boundaries(&ctx.ops);
         let effective_budget = effective_scratch_budget(ctx.zero_vreg.is_some());
         // Which sections to repair: counted on the cycle timeline whatever the model's
-        // timeline. This count only sees operand reads (no shifted lanes, keep_live or group
-        // aliases), so on the phase timeline it can miss a section whose greedy schedule is
+        // timeline. This count has no per-lane shifted cycles, so on the
+        // phase timeline it can miss a section whose greedy schedule is
         // over budget (3x256 with the greedy pressure policy: the greedy force-scheduled, this
         // check said the section fits, and the full-kernel solve then started from an
         // infeasible hint). The cycle count's same-cycle overcount makes it the safe side; the
         // repair itself and the checks of its result use the model's timeline.
-        let budget_result = sections_exceeding_budget_with(
+        let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
+        let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
+        let budget_result = section_budget(
             &ctx.ops,
             effective_budget,
             Some(&greedy_select_fma_ops),
             None,
-            crate::cpsat_scheduler::ScratchTime::Cycle,
+            crate::cpsat_scheduler::ScratchTime::Cycle, &scratch_aliases,
         );
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
@@ -1050,7 +1051,6 @@ impl SsaTickTockKernelBuilder {
             }
             eprintln!();
         }
-        let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let mut section_offset: i32 = 0;
         let mut section_select_fma_overrides: Vec<Option<HashSet<usize>>> =
             vec![None; boundaries.len()];
@@ -1180,12 +1180,11 @@ impl SsaTickTockKernelBuilder {
                     actually_rescheduled_op_ids.insert(ctx.ops[gi].id);
                 }
 
-                let initial_live = live_in_for_section_filtered(
+                let initial_live = scratch_aliases.live_in(
                     &ctx.ops, &boundaries, k, &vreg_def_sec, &filtered_global_indices,
                 );
-                let live_out = live_out_from_section(&ctx.ops, &boundaries, k, &vreg_def_sec);
-                let live_through =
-                    live_through_for_section(&ctx.ops, &boundaries, k, &vreg_def_sec);
+                let (live_out, live_through) =
+                    scratch_aliases.live_after(&ctx.ops, &boundaries, k, &vreg_def_sec);
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false),
                     _ => {
@@ -1321,12 +1320,12 @@ impl SsaTickTockKernelBuilder {
                     (seg_result.makespan as i32).max(greedy_section_makespan),
                 );
                 if verbose {
-                    let after_budget = sections_exceeding_budget_with(
+                    let after_budget = section_budget(
                         &ctx.ops,
                         effective_scratch_budget(ctx.zero_vreg.is_some()),
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
-                        self.cpsat_scratch_time,
+                        self.cpsat_scratch_time, &scratch_aliases,
                     );
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
@@ -1354,11 +1353,11 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget
-        let post_merge_budget = sections_exceeding_budget_with(
+        let post_merge_budget = section_budget(
             &ctx.ops, SCRATCH_BUDGET_HW,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
-            self.cpsat_scratch_time,
+            self.cpsat_scratch_time, &scratch_aliases,
         );
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
@@ -1385,8 +1384,8 @@ impl SsaTickTockKernelBuilder {
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
         let effective_budget_hint = effective_scratch_budget(ctx.zero_vreg.is_some());
-        let hint_peak = sections_exceeding_budget_with(
-            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time,
+        let hint_peak = section_budget(
+            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &scratch_aliases,
         ).section_peaks.iter().copied().max().unwrap_or(0);
 
         if hint_peak > SCRATCH_BUDGET_HW {
