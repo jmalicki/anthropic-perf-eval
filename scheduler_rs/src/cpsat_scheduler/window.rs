@@ -61,6 +61,13 @@ pub struct WindowReference {
     pub const_choice_encoding: HashMap<usize, ConstChoiceEncoding>,
     /// Op ids of vbroadcasts that are eliminated.
     pub eliminated_vbroadcast_ops: HashSet<usize>,
+    /// Op indices the model must treat as dead stores: hinted with cycle -1, which leaves
+    /// them out of the scratch bookkeeping (as the greedy's hint does). They keep their
+    /// `cycles` entry when it is known, so they can be pinned like any other op.
+    pub dead: Vec<usize>,
+    /// Cycle of each CSE group's shared SUB (indexed like the model's CSE groups). Empty =
+    /// unknown: the SUBs are then left free and cumulative pruning is off.
+    pub cse_sub_cycles: Vec<i32>,
 }
 
 impl WindowReference {
@@ -139,9 +146,72 @@ pub struct CpsatWindow {
     pub fix_window_encodings: bool,
     /// The schedule held fixed outside the window.
     pub reference: WindowReference,
+    /// Leave far-away pinned ops out of the cumulatives (see [`CpsatWindow::pruned_ops`]).
+    pub prune: bool,
 }
 
 impl CpsatWindow {
+    /// Ops whose intervals can be left out of the engine and scratch cumulatives without
+    /// changing which schedules the model accepts.
+    ///
+    /// Nothing that can move ever reaches their cycles: ops inside stay in
+    /// `[start, start + len)`, the block after the window moves at most `len` cycles earlier,
+    /// and the CSE SUBs are pinned or kept in the window. So at those cycles every interval
+    /// is pinned (before the window: at its reference cycle; far after it: all shifted by the
+    /// same `delta`) and the reference schedule, which is feasible, already satisfies the
+    /// capacity there. The ops are:
+    /// - far before: every slot before `start - len - 1` (the earliest an op from after the
+    ///   window can move to is `start - len`);
+    /// - far after: every slot at or after `start + 2 * len + 2` and at least `len + 3`
+    ///   cycles after the last slot of any op before the window (shifted by up to `len`, they
+    ///   stay at least two cycles after every op inside or before the window).
+    ///
+    /// The margins also keep every dependency edge between a pruned and a non-pruned op at
+    /// least two cycles long, whatever the non-pruned op does: far-before ops end before
+    /// `start - len - 1` and nothing movable starts before `start - len`.
+    ///
+    /// Empty when pruning is off or the reference lacks cycles for some op or CSE SUB.
+    pub fn pruned_ops(&self, ops: &[SsaOp], num_cse_groups: usize) -> HashSet<usize> {
+        let mut pruned = HashSet::new();
+        if !self.prune || self.len <= 0 || self.reference.cse_sub_cycles.len() != num_cse_groups {
+            return pruned;
+        }
+        let spans: Vec<Option<(i32, i32)>> =
+            ops.iter().enumerate().map(|(idx, op)| self.reference.slot_span(idx, op)).collect();
+        if spans.iter().any(|s| s.is_none()) {
+            return pruned;
+        }
+        let before_last = ops
+            .iter()
+            .enumerate()
+            .filter(|(idx, op)| self.region(*idx, op) == WindowRegion::Before)
+            .filter_map(|(idx, _)| spans[idx].map(|(_, hi)| hi))
+            .max()
+            .unwrap_or(i32::MIN / 2);
+        let far_before = self.start - self.len - 1;
+        // Shifted by up to `len`, a far-after op is still two cycles (the largest latency)
+        // after every op before the window, and after every op inside it.
+        let far_after = (self.start + 2 * self.len + 2).max(before_last + self.len + 3);
+        for (idx, span) in spans.iter().enumerate() {
+            let (lo, hi) = span.expect("checked above");
+            if hi < far_before || lo >= far_after {
+                pruned.insert(idx);
+            }
+        }
+        pruned
+    }
+
+    /// Model hints for the cycle variables: the reference cycles, with dead stores at -1.
+    pub fn hint_cycles(&self) -> Vec<i32> {
+        let mut cycles = self.reference.cycles.clone();
+        for &idx in &self.reference.dead {
+            if let Some(c) = cycles.get_mut(idx) {
+                *c = -1;
+            }
+        }
+        cycles
+    }
+
     /// Region of op `idx` for this window.
     pub fn region(&self, idx: usize, op: &SsaOp) -> WindowRegion {
         let Some((lo, hi)) = self.reference.slot_span(idx, op) else {
@@ -171,6 +241,7 @@ pub(crate) struct WindowModelVars<'a> {
     pub const_choice_alu_encoding_info: &'a HashMap<usize, Vec<(usize, usize, Opcode)>>,
     pub select_choice_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
     pub eliminate_vb_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
+    pub cse_sub_cycle_vars: &'a [cp_sat::builder::IntVar],
 }
 
 /// Counts of ops per region, for logging and the probe report.
@@ -333,6 +404,20 @@ pub(crate) fn apply_window_constraints(
             WindowRegion::Free => {}
         }
     }
+
+    // CSE shared SUBs have no op of their own: place each by its reference cycle.
+    if reference.cse_sub_cycles.len() == vars.cse_sub_cycle_vars.len() {
+        let end = window.start + window.len;
+        for (g, (&var, &cycle)) in vars.cse_sub_cycle_vars.iter().zip(&reference.cse_sub_cycles).enumerate() {
+            if cycle < window.start {
+                pin(model, var, cycle, false, format!("window_before_cse_sub_{}", g));
+            } else if cycle < end {
+                keep_inside(model, var, &format!("window_cse_sub_{}", g));
+            } else {
+                pin(model, var, cycle, true, format!("window_after_cse_sub_{}", g));
+            }
+        }
+    }
     counts
 }
 
@@ -370,6 +455,18 @@ pub struct WindowProbeSpec {
     /// the window pins anyway, but symmetry-aware and energetic also add symmetry-breaking
     /// order constraints, which are only solution-preserving when every op is free.
     pub asap_alap_tightening: Option<String>,
+    /// Subsolvers to leave out of every window solve (added to the tuning's
+    /// `ignore_subsolvers`). Default: the max-LP workers `max_lp`, `max_lp_sym`,
+    /// `reduced_costs` and `pseudo_costs`. At 16 rounds the window model presolves to about
+    /// 6,000 variables, but its cumulatives keep about 11,000 intervals, and building the
+    /// maximal LP relaxation for them took these workers 10 to 13 minutes of wall time at
+    /// almost no deterministic time. Under interleaved search every batch waits for them, so
+    /// the deterministic budget never ran out and LNS never started. `[]` keeps them.
+    pub ignore_subsolvers: Vec<String>,
+    /// Leave pinned ops far from the window out of the cumulatives (default true; see
+    /// [`CpsatWindow::pruned_ops`]). Exact: it removes only intervals at cycles nothing can
+    /// move to, and the post-solve checks still validate the whole schedule.
+    pub prune: bool,
     /// Report path (JSON, rewritten after every window). Required.
     pub output: String,
 }
@@ -387,6 +484,11 @@ impl Default for WindowProbeSpec {
             time_limit_secs: 900.0,
             workers: None,
             asap_alap_tightening: None,
+            ignore_subsolvers: ["max_lp", "max_lp_sym", "reduced_costs", "pseudo_costs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            prune: true,
             output: String::new(),
         }
     }
@@ -508,18 +610,15 @@ impl WindowReference {
     ///
     /// # Arguments
     /// * `result` - The solution.
-    /// * `dead` - Op indices that have no reference cycle in the base (dead stores the greedy
-    ///   did not place); they stay free, so the model's liveness bookkeeping, which skips
-    ///   ops with a negative hint, is the same in every window.
+    /// * `dead` - Op indices that have no cycle in the greedy hint (dead stores it did not
+    ///   place). They are pinned at the solution's cycles but still hinted with -1, so the
+    ///   model's liveness bookkeeping, which skips ops with a negative hint, is the same in
+    ///   every window.
     pub fn from_result(result: &super::SsaCpsatResult, dead: &[usize]) -> Self {
-        let mut cycles = result.cycle_assignments.clone();
-        for &idx in dead {
-            if let Some(c) = cycles.get_mut(idx) {
-                *c = -1;
-            }
-        }
         Self {
-            cycles,
+            cycles: result.cycle_assignments.clone(),
+            dead: dead.to_vec(),
+            cse_sub_cycles: result.cse_group_results.iter().map(|g| g.sub_cycle).collect(),
             shifted_alu_cycles: result.shifted_alu_cycles.clone(),
             shifted_ops: result.shifted_ops.clone(),
             select_fma_ops: result
@@ -534,9 +633,270 @@ impl WindowReference {
     }
 }
 
-/// Solve one window against its reference with the full model.
+// ============================================================================
+// Restricting the model to the ops near the window
+// ============================================================================
+
+/// The window model restricted to the ops that can matter (see [`restrict_to_window`]).
+#[derive(Debug, Clone)]
+pub struct WindowSubproblem {
+    /// Ops kept, in their original order, with `dep_ids` cut to kept ops. Op ids unchanged.
+    pub ops: Vec<SsaOp>,
+    /// Kept op index -> index in the full op list.
+    pub global: Vec<usize>,
+    /// The window with its reference cut to the kept ops and CSE groups.
+    pub window: CpsatWindow,
+    /// CSE groups with at least one kept consumer, indices remapped to `ops`.
+    pub cse_groups: Vec<super::cse_groups::CseGroup>,
+    /// Kept CSE group index -> group index in the full list.
+    pub cse_global: Vec<usize>,
+}
+
+/// Cut a window model down to the ops that can affect it.
+///
+/// [`CpsatWindow::pruned_ops`] names the ops that sit at cycles nothing can move to. They
+/// stay in the model only where a constraint between them and a nearby op needs them:
+/// - for every value with a non-pruned def or reader: its def, its non-pruned readers and
+///   its latest pruned reader (so the value's scratch interval runs from its true def to its
+///   true last read);
+/// - the op with the last reference slot (it carries the makespan of the moving block).
+///
+/// A dependency edge between a non-pruned op and a dropped one always holds: the dropped op
+/// is at least two cycles (the largest latency) before or after anywhere the other can go.
+///
+/// The rest are dropped. They and everything between them are pinned (or move with the
+/// block), so every constraint among them holds as in the reference; constraints between a
+/// dropped op and a kept one hold too, because a dropped op only meets kept ops that are
+/// themselves pinned or are far enough away (see `pruned_ops`). Kept ops' `dep_ids` on
+/// dropped ops are removed.
+///
+/// # Returns
+/// `None` when nothing is pruned (solve the full model).
+#[cfg(feature = "cpsat")]
+pub fn restrict_to_window(
+    ops: &[SsaOp],
+    window: &CpsatWindow,
+    cse_groups: &[super::cse_groups::CseGroup],
+    vector_group_lanes: Option<&HashMap<crate::types::VReg, Vec<crate::types::VReg>>>,
+) -> Option<WindowSubproblem> {
+    let pruned = window.pruned_ops(ops, cse_groups.len());
+    if pruned.is_empty() {
+        return None;
+    }
+    let n = ops.len();
+    let near = |idx: usize| !pruned.contains(&idx);
+    let mut keep = vec![false; n];
+    for (idx, k) in keep.iter_mut().enumerate() {
+        *k = near(idx);
+    }
+    // The op holding the last slot carries the moving block's makespan.
+    if let Some(last) = (0..n).max_by_key(|&i| (window.reference.slot_span(i, &ops[i]).map_or(i32::MIN, |s| s.1), i)) {
+        keep[last] = true;
+    }
+    // Values touching a near op: keep their def and every reader.
+    let mut vreg_def_op: HashMap<crate::types::VReg, usize> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(dest) = op.dest {
+            vreg_def_op.insert(dest, idx);
+        }
+    }
+    let readers = super::model::scratch_readers_by_vreg(ops, &vreg_def_op, vector_group_lanes);
+    let mut values: Vec<(&crate::types::VReg, &Vec<usize>)> = readers.iter().collect();
+    values.sort_by_key(|(v, _)| **v);
+    for (vreg, rs) in values {
+        let def = vreg_def_op[vreg];
+        if near(def) || rs.iter().any(|&r| near(r)) {
+            // The interval runs from the def to the last reader. Pruned readers are pinned or
+            // move with the block, and the latest of them stays the latest (shifted, it is
+            // still after every op inside or before the window), so it is the only pruned
+            // reader the interval needs.
+            keep[def] = true;
+            let mut last_pruned: Option<(i32, usize)> = None;
+            for &r in rs {
+                if near(r) {
+                    keep[r] = true;
+                } else {
+                    let end = window.reference.slot_span(r, &ops[r]).map_or(i32::MIN, |s| s.1);
+                    if last_pruned.map_or(true, |(e, i)| (end, r) > (e, i)) {
+                        last_pruned = Some((end, r));
+                    }
+                }
+            }
+            if let Some((_, r)) = last_pruned {
+                keep[r] = true;
+            }
+        }
+    }
+    // Dependency edges between a near op and a dropped one need no op: the margins in
+    // `pruned_ops` make every such edge hold whatever the near op does (at least two cycles
+    // apart, the largest latency).
+
+    let global: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
+    let mut local_of = vec![usize::MAX; n];
+    for (local, &g) in global.iter().enumerate() {
+        local_of[g] = local;
+    }
+    let kept_ids: HashSet<usize> = global.iter().map(|&g| ops[g].id).collect();
+    let sub_ops: Vec<SsaOp> = global
+        .iter()
+        .map(|&g| {
+            let mut op = ops[g].clone();
+            op.dep_ids.retain(|id| kept_ids.contains(id));
+            op
+        })
+        .collect();
+
+    let mut sub_groups = Vec::new();
+    let mut cse_global = Vec::new();
+    for (g, group) in cse_groups.iter().enumerate() {
+        let consumers: Vec<usize> =
+            group.consumer_indices.iter().filter(|&&c| keep[c]).map(|&c| local_of[c]).collect();
+        if consumers.is_empty() {
+            continue;
+        }
+        let remap = |p: Option<usize>| p.filter(|&p| keep[p]).map(|p| local_of[p]);
+        let mut sub = group.clone();
+        sub.consumer_indices = consumers;
+        sub.producer_true_idx = remap(group.producer_true_idx);
+        sub.producer_false_idx = remap(group.producer_false_idx);
+        sub_groups.push(sub);
+        cse_global.push(g);
+    }
+
+    let reference = &window.reference;
+    let sub_reference = WindowReference {
+        cycles: global.iter().map(|&g| reference.cycles[g]).collect(),
+        dead: reference.dead.iter().filter(|&&d| keep[d]).map(|&d| local_of[d]).collect(),
+        cse_sub_cycles: cse_global.iter().map(|&g| reference.cse_sub_cycles[g]).collect(),
+        ..reference.clone()
+    };
+    Some(WindowSubproblem {
+        ops: sub_ops,
+        global,
+        window: CpsatWindow { reference: sub_reference, ..window.clone() },
+        cse_groups: sub_groups,
+        cse_global,
+    })
+}
+
+/// Expand a solution of a [`WindowSubproblem`] to the full op list: kept ops take the
+/// solution's cycles and encodings, dropped ops keep the reference's, moved by the block's
+/// shift when they are after the window.
+pub fn expand_window_solution(
+    ops: &[SsaOp],
+    window: &CpsatWindow,
+    sub: &WindowSubproblem,
+    result: super::SsaCpsatResult,
+    cse_groups: &[super::cse_groups::CseGroup],
+) -> super::SsaCpsatResult {
+    let num_cse_groups = cse_groups.len();
+    let reference = &window.reference;
+    // The block shift, read off a kept op after the window (all of them move by the same).
+    let delta = sub
+        .global
+        .iter()
+        .enumerate()
+        .find(|(_, &g)| window.region(g, &ops[g]) == WindowRegion::After && !reference.shifted_ops.contains(&ops[g].id))
+        .map_or(0, |(local, &g)| reference.cycles[g] - result.cycle_assignments[local]);
+    let mut local_of = vec![usize::MAX; ops.len()];
+    for (local, &g) in sub.global.iter().enumerate() {
+        local_of[g] = local;
+    }
+    let mut out = result.clone();
+    out.cycle_assignments = Vec::with_capacity(ops.len());
+    out.shifted_ops = HashSet::new();
+    out.shifted_alu_cycles = HashMap::new();
+    out.select_choice_encoding = HashMap::new();
+    out.const_choice_encoding = HashMap::new();
+    out.eliminated_vbroadcast_ops = HashSet::new();
+    for (g, op) in ops.iter().enumerate() {
+        let local = local_of[g];
+        if local != usize::MAX {
+            out.cycle_assignments.push(result.cycle_assignments[local]);
+            if result.shifted_ops.contains(&op.id) {
+                out.shifted_ops.insert(op.id);
+            }
+            if let Some(l) = result.shifted_alu_cycles.get(&op.id) {
+                out.shifted_alu_cycles.insert(op.id, l.clone());
+            }
+            if let Some(e) = result.select_choice_encoding.get(&op.id) {
+                out.select_choice_encoding.insert(op.id, e.clone());
+            }
+            if let Some(e) = result.const_choice_encoding.get(&op.id) {
+                out.const_choice_encoding.insert(op.id, e.clone());
+            }
+            if result.eliminated_vbroadcast_ops.contains(&op.id) {
+                out.eliminated_vbroadcast_ops.insert(op.id);
+            }
+            continue;
+        }
+        let shift = if window.region(g, op) == WindowRegion::After { delta } else { 0 };
+        out.cycle_assignments.push(reference.cycles[g] - shift);
+        if reference.shifted_ops.contains(&op.id) {
+            out.shifted_ops.insert(op.id);
+            let lanes = reference.lanes(g, op).unwrap_or_default();
+            out.shifted_alu_cycles.insert(op.id, lanes.iter().map(|c| c - shift).collect());
+        }
+        if op.opcode == Opcode::SelectChoice {
+            let enc = if reference.select_fma_ops.contains(&op.id) {
+                crate::types::SelectChoiceEncoding::Fma
+            } else {
+                crate::types::SelectChoiceEncoding::Vselect
+            };
+            out.select_choice_encoding.insert(op.id, enc);
+        }
+        if op.opcode == Opcode::ConstChoice {
+            let enc = reference.const_choice_encoding.get(&op.id).cloned().unwrap_or(ConstChoiceEncoding::Load);
+            out.const_choice_encoding.insert(op.id, enc);
+        }
+        if reference.eliminated_vbroadcast_ops.contains(&op.id) {
+            out.eliminated_vbroadcast_ops.insert(op.id);
+        }
+    }
+    // CSE groups: kept groups from the solution, the others from the reference.
+    let mut groups: Vec<super::cse_groups::CseGroupResult> = Vec::with_capacity(num_cse_groups);
+    for g in 0..num_cse_groups {
+        if let Some(local) = sub.cse_global.iter().position(|&x| x == g) {
+            groups.push(result.cse_group_results.get(local).cloned().unwrap_or_default());
+        } else {
+            let cycle = reference.cse_sub_cycles.get(g).copied().unwrap_or(0);
+            let shift = if cycle >= window.start + window.len { delta } else { 0 };
+            groups.push(super::cse_groups::CseGroupResult {
+                // Dropped groups have no kept consumer; their consumers keep their encodings.
+                sub_active: cse_groups[g].consumer_indices.iter().any(|&c| reference.select_fma_ops.contains(&ops[c].id)),
+                sub_cycle: cycle - shift,
+            });
+        }
+    }
+    out.cse_group_results = groups;
+    out
+}
+
+/// Solve one window against its reference: on the ops near it when pruning applies
+/// ([`restrict_to_window`]), otherwise on the full model.
 #[cfg(feature = "cpsat")]
 pub fn solve_window(
+    ops: &[SsaOp],
+    config: &super::SsaCpsatConfig,
+    ctx: &WindowProbeContext<'_>,
+    window: &CpsatWindow,
+) -> Result<Option<super::SsaCpsatResult>, String> {
+    let groups = ctx.cse_groups.unwrap_or(&[]);
+    let Some(sub) = restrict_to_window(ops, window, groups, ctx.vector_group_lanes) else {
+        return solve_window_model(ops, config, ctx, window);
+    };
+    let sub_ctx = WindowProbeContext {
+        cse_groups: if sub.cse_groups.is_empty() { None } else { Some(sub.cse_groups.as_slice()) },
+        ..*ctx
+    };
+    eprintln!("[window probe]   restricted to {} of {} ops", sub.ops.len(), ops.len());
+    let result = solve_window_model(&sub.ops, config, &sub_ctx, &sub.window)?;
+    Ok(result.map(|r| expand_window_solution(ops, window, &sub, r, groups)))
+}
+
+/// Solve one window model on exactly these ops.
+#[cfg(feature = "cpsat")]
+fn solve_window_model(
     ops: &[SsaOp],
     config: &super::SsaCpsatConfig,
     ctx: &WindowProbeContext<'_>,
@@ -549,8 +909,9 @@ pub fn solve_window(
         .filter(|(_, e)| matches!(e, ConstChoiceEncoding::AddImm))
         .map(|(&id, _)| id)
         .collect();
+    let hint_cycles = window.hint_cycles();
     let hints = super::SsaCpsatHints {
-        greedy_hints: Some(&reference.cycles),
+        greedy_hints: Some(&hint_cycles),
         shift_hints: Some(&reference.shifted_ops),
         forced_shifts: ctx.forced_shifts,
         select_choice_hints: Some(&reference.select_fma_ops),
@@ -632,7 +993,15 @@ pub fn run_window_probe(
     if let Some(mode) = &spec.asap_alap_tightening {
         config.asap_alap_tightening = mode.parse()?;
     }
+    for name in &spec.ignore_subsolvers {
+        if !config.tuning.ignore_subsolvers.contains(name) {
+            config.tuning.ignore_subsolvers.push(name.clone());
+        }
+    }
+    config.tuning.validate()?;
     let dead: Vec<usize> = base.cycles.iter().enumerate().filter(|(_, &c)| c < 0).map(|(i, _)| i).collect();
+    let mut base = base;
+    base.dead = dead.clone();
     let base_makespan = base.makespan(ops);
 
     let mut report = WindowProbeReport {
@@ -647,7 +1016,7 @@ pub fn run_window_probe(
     // All-fixed check: with an empty window every op is pinned, so the only solution is the
     // reference itself. If the model rejects it, no window result means anything.
     let started = std::time::Instant::now();
-    let all_fixed = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: base.clone() };
+    let all_fixed = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: base.clone(), prune: false };
     // Nothing to search: one worker suffices and each extra worker holds another model copy.
     let mut check_config = config.clone();
     check_config.tuning.workers = 1;
@@ -677,6 +1046,9 @@ pub fn run_window_probe(
         report.base_check_status
     );
     report.write()?;
+    // From here on the reference is the all-fixed solution: it gives every op a cycle (the
+    // dead stores too) and every CSE SUB a cycle, so everything outside a window is pinned.
+    let base = WindowReference::from_result(&base_result, &dead);
 
     let in_range = |start: i32| spec.cycle_range.map_or(true, |(lo, hi)| start >= lo && start < hi);
     let range_lo = spec.cycle_range.map_or(0, |(lo, _)| lo.max(0));
@@ -758,6 +1130,7 @@ pub fn run_window_probe(
                         len: w,
                         fix_window_encodings: encodings == "fixed",
                         reference: base.clone(),
+                        prune: spec.prune,
                     };
                     let t = std::time::Instant::now();
                     let outcome = solve_window(ops, &config, ctx, &window);
@@ -779,7 +1152,13 @@ pub fn run_window_probe(
             let mut improved: Option<super::SsaCpsatResult> = None;
             let mut start = range_lo;
             while start < makespan && in_range(start) {
-                let window = CpsatWindow { start, len: w, fix_window_encodings: false, reference: reference.clone() };
+                let window = CpsatWindow {
+                    start,
+                    len: w,
+                    fix_window_encodings: false,
+                    reference: reference.clone(),
+                    prune: spec.prune,
+                };
                 let t = std::time::Instant::now();
                 let outcome = solve_window(ops, &config, ctx, &window);
                 record(&mut report, "rolling", &window, makespan, &outcome, t.elapsed().as_secs_f64())?;
@@ -919,7 +1298,7 @@ mod tests {
         .expect("full model solution");
         assert_eq!(full.status, crate::cpsat_scheduler::CpsatStatus::Optimal);
 
-        let window = CpsatWindow { start: 0, len: reference.makespan(&ops), fix_window_encodings: false, reference };
+        let window = CpsatWindow { start: 0, len: reference.makespan(&ops), fix_window_encodings: false, reference, prune: false };
         let windowed = solve_window(&ops, &config, &ctx, &window).expect("window model").expect("window solution");
         assert_eq!(windowed.status, crate::cpsat_scheduler::CpsatStatus::Optimal);
         assert_eq!(windowed.makespan, full.makespan, "whole-schedule window must reach the full model's optimum");
@@ -932,7 +1311,7 @@ mod tests {
     fn empty_window_reproduces_reference() {
         let ops = small_program();
         let reference = loose_reference(&ops);
-        let window = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: reference.clone() };
+        let window = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: reference.clone(), prune: false };
         let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
             .expect("model")
             .expect("solution");
@@ -957,7 +1336,7 @@ mod tests {
         let lanes = vec![c - 1, c - 1, c - 1, c - 1, c, c, c, c];
         reference.shifted_ops.insert(ops[idx].id);
         reference.shifted_alu_cycles.insert(ops[idx].id, lanes.clone());
-        let window = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: reference.clone() };
+        let window = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: reference.clone(), prune: false };
         let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
             .expect("model")
             .expect("solution");
@@ -973,7 +1352,7 @@ mod tests {
         let ops = small_program();
         let reference = loose_reference(&ops);
         let base = reference.makespan(&ops);
-        let window = CpsatWindow { start: 6, len: 10, fix_window_encodings: false, reference: reference.clone() };
+        let window = CpsatWindow { start: 6, len: 10, fix_window_encodings: false, reference: reference.clone(), prune: false };
         let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
             .expect("model")
             .expect("solution");
@@ -993,6 +1372,45 @@ mod tests {
         }
     }
 
+    /// Leaving far-away pinned ops out of the cumulatives does not change the optimum, and
+    /// the full post-solve checks (slot counts, scratch over every reader) still pass.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn pruning_far_ops_keeps_the_window_optimum() {
+        let ops = small_program();
+        let reference = loose_reference(&ops);
+        for start in [10, 20, 30] {
+            let mut window =
+                CpsatWindow { start, len: 4, fix_window_encodings: false, reference: reference.clone(), prune: true };
+            let pruned = window.pruned_ops(&ops, 0);
+            assert!(!pruned.is_empty(), "window at {} should prune something", start);
+            for &idx in &pruned {
+                assert_ne!(window.region(idx, &ops[idx]), WindowRegion::Inside);
+            }
+            let with = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
+                .expect("pruned model")
+                .expect("pruned solution");
+            window.prune = false;
+            let without = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
+                .expect("full model")
+                .expect("full solution");
+            assert_eq!(with.makespan, without.makespan, "window at {}", start);
+            assert_eq!(with.status, crate::cpsat_scheduler::CpsatStatus::Optimal);
+            // The expanded schedule must be a solution of the full model.
+            let check = CpsatWindow {
+                start: 0,
+                len: 0,
+                fix_window_encodings: true,
+                reference: WindowReference::from_result(&with, &[]),
+                prune: false,
+            };
+            let again = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &check)
+                .expect("check model")
+                .expect("expanded schedule must satisfy the full model");
+            assert_eq!(again.makespan, with.makespan);
+        }
+    }
+
     /// With fixed encodings the ops inside the window keep the reference's choices.
     #[cfg(feature = "cpsat")]
     #[test]
@@ -1000,7 +1418,7 @@ mod tests {
         let ops = small_program();
         let reference = loose_reference(&ops);
         let len = reference.makespan(&ops);
-        let window = CpsatWindow { start: 0, len, fix_window_encodings: true, reference };
+        let window = CpsatWindow { start: 0, len, fix_window_encodings: true, reference, prune: false };
         let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
             .expect("model")
             .expect("solution");
