@@ -88,9 +88,12 @@ consistently along each chain; `tests/test_cpsat_lane_model.py` fails until then
 Measured with `scripts/run_cpsat_ablation.py` (skill
 [use-cpsat-ablation](../.cursor/skills/use-cpsat-ablation/SKILL.md)) at a budget of **20
 deterministic time** on the instances of [CPSAT_CONFIG_ABLATION.md](CPSAT_CONFIG_ABLATION.md),
-each lane model with the default objective and with `--cpsat-objective makespan`. Code: this
-branch on `main` at `ca5087a` (the rebase onto `50db776` brought only address-allocator and
-architecture changes, which do not touch the CP-SAT model). Every kernel below was **PROVED**
+each lane model with the default objective and with `--cpsat-objective makespan`. Code
+measured: this change on `main` at `ca5087a`. It was then rebased onto `808250f` (the
+`OpTimes` refactor #54, which keeps every model byte-identical, the forced-mode hints #56, and
+address-allocator changes); after the rebase `free` gives byte-identical models and kernels
+to that `main` on all 49 cells of `scripts/cpsat_model_identity.py`, and the other lane
+models were re-validated on 2r/b16 and 3r/b64. Every kernel below was **PROVED**
 by the dataflow replay and **PASSED** numeric validation. Wall times were taken on a machine
 shared with other jobs (load 130 to 300 on 12 cores) and are indicative only; deterministic
 times are not affected by load. "Bound" is the solver's bound for the emitted ops inside the

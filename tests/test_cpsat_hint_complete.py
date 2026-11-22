@@ -117,6 +117,7 @@ LANE_MODEL_CASES = [
 def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):
     """Sorted lanes and pinned lanes must not cut off the greedy schedule: the greedy hints
     all eight lanes of an op at the op's cycle, which is sorted and pinned."""
-    model = _export_model(tmp_path, extra)
+    model, log = _export_model(tmp_path, extra)
     assert not unhinted_variables(model)
+    assert "The solution hint is complete and is feasible" in log
     check_hint_is_feasible(tmp_path / "model.pb")
