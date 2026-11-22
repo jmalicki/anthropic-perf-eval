@@ -57,6 +57,7 @@ from .precedence_fixpoint import (
 
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
 from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
+from .memory_alias import MEMORY_ALIAS_CHECKS
 
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
@@ -199,6 +200,9 @@ THEOREM_CHECKS += REWRITE_CHECKS
 
 # Scratch address allocation conjectures, fast checks (verification/allocation_conjectures.py).
 THEOREM_CHECKS += ALLOCATION_CHECKS
+
+# Rules behind the exact memory-alias analysis of lifted kernels (verification/memory_alias.py).
+THEOREM_CHECKS += MEMORY_ALIAS_CHECKS
 
 
 def _spec_url(theorem_id: str) -> str:
