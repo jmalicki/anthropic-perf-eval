@@ -19,9 +19,11 @@ use super::symmetry_ordering::SymmetryOrdering;
 #[cfg(feature = "cpsat")]
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
-    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator,
+    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
     OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
 };
+#[cfg(feature = "cpsat")]
+use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
@@ -162,24 +164,14 @@ pub(crate) fn build_sat_parameters(
     };
     params.absolute_gap_limit = absolute_gap_limit;
 
-    // Optimize LP relaxation for tighter bounds and faster convergence
-    // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
-    //   - Cumulative constraints have weak LP relaxations by default
-    //   - Level 2 linearizes more constraints, giving tighter best_objective_bound
-    //   - Expected: Gap reduction from 10-15% to 3-8%, 20-40% faster convergence
-    // cp_model_presolve=true: Preprocessing to simplify model before solving
-    //   - Removes redundant variables/constraints, detects symmetries
-    //   - Usually <1% of solve time, but significantly speeds up search
-    // cp_model_probing_level=2: Aggressive probing to tighten variable domains
-    //   - Temporarily fixes variables and observes consequences
-    //   - Strengthens domains and adds binary clauses
-    //   - Expected: 5-15% tighter domains, 10-20% faster search
-    // randomize_search=true: Help escape local optima
-    //   - Adds randomization to search decisions
-    //   - Helps when solver gets stuck in suboptimal regions
-    params.linearization_level = Some(2);
+    // linearization_level (tuning, default 2): how much of the model enters the LP relaxation
+    // (2 adds the cumulative relaxations and cuts). cp_model_probing_level (tuning, default 2):
+    // presolve probing effort. Neither default was chosen by measurement; the measured effect
+    // of each level is in docs/CPSAT_CONFIG_ABLATION.md ("Linearization, probing and makespan
+    // rows"). randomize_search=true is likewise unmeasured.
+    params.linearization_level = Some(tuning.linearization_level);
     params.cp_model_presolve = Some(true);
-    params.cp_model_probing_level = Some(2);
+    params.cp_model_probing_level = Some(tuning.probing_level);
     params.randomize_search = Some(true);
     // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
     // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
@@ -390,6 +382,7 @@ pub fn schedule_ssa_cpsat(
         stop_after_first_solution,
         enable_valu_shift,
         scratch_budget,
+        scratch_pools,
         ref model_name,
         ref machine,
         const_choice_mode,
@@ -2034,6 +2027,28 @@ pub fn schedule_ssa_cpsat(
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
 
+            // Scratch model `pools`: a write group (alias with no definer, lanes written one by
+            // one) is one 8-word value for address assignment, so it is one vector here, live
+            // from its first lane write to its last lane's end. Lanes then contribute to the
+            // group's interval instead of having their own. (lane -> group; group -> lane
+            // (start, end, def_idx, end hint))
+            let mut pool_group_of_lane: HashMap<VReg, VReg> = HashMap::new();
+            let mut scratch_pool_vars: Option<(IntVar, IntVar)> = None;
+            if scratch_pools {
+                if let Some(groups) = hints.vector_group_lanes {
+                    for (group, lanes) in sorted_by_key(groups) {
+                        if vreg_def_op.contains_key(group) {
+                            continue; // read group: the group value itself is defined (a vector)
+                        }
+                        for lane in lanes {
+                            pool_group_of_lane.insert(*lane, *group);
+                        }
+                    }
+                }
+            }
+            let mut pool_group_lanes: std::collections::BTreeMap<VReg, Vec<(IntVar, LinearExpr, usize, Option<i32>)>> =
+                std::collections::BTreeMap::new();
+
             // =========================================================================
             // CP-SAT LIVENESS MODEL: Matches Address Assignment Logic
             // =========================================================================
@@ -2168,13 +2183,75 @@ pub fn schedule_ssa_cpsat(
                 let c = model.add_eq(LinearExpr::from(start) + LinearExpr::from(size), end_expr);
                 model.set_constraint_name(c, &format!("scratch_live_size_{}", vreg.id));
 
+                size_vars.push((size, def_idx, last_use_idx));
+                if let Some(group) = pool_group_of_lane.get(vreg) {
+                    // Pools: counted in the group's vector interval (built below).
+                    let end_hint = greedy_hints.map(|h| {
+                        hinted_live_end.get(vreg).copied().unwrap_or_else(|| {
+                            h.get(last_use_idx).copied().unwrap_or(0) + 1
+                        })
+                    });
+                    pool_group_lanes.entry(*group).or_default().push((
+                        start,
+                        end_for_interval,
+                        def_idx,
+                        end_hint,
+                    ));
+                    continue;
+                }
                 let interval = model.new_interval_var(start, size, end_for_interval);
                 scratch_intervals.push(interval);
-                size_vars.push((size, def_idx, last_use_idx));
 
                 // Demand = size of VReg (1 for scalar, VLEN for vector)
                 let demand = vreg.size() as i64;
                 scratch_demands.push(demand);
+            }
+
+            // Pools: one vector interval per write group, [min lane start, max lane end).
+            // (group, start hint, end hint) for the pool-peak hints below.
+            let mut pool_group_hints: Vec<(i32, i32)> = Vec::new();
+            for (group, lanes) in &pool_group_lanes {
+                let g_start = model.new_int_var_with_name(
+                    [(0, horizon)],
+                    format!("pool_group_start_{}", group.id),
+                );
+                let g_end = model.new_int_var_with_name(
+                    [(0, horizon + 2)],
+                    format!("pool_group_end_{}", group.id),
+                );
+                let g_size = model.new_int_var_with_name(
+                    [(1, horizon + 2)],
+                    format!("pool_group_size_{}", group.id),
+                );
+                let c = model.add_min_eq(g_start, lanes.iter().map(|(s, _, _, _)| LinearExpr::from(*s)));
+                model.set_constraint_name(c, &format!("pool_group_start_min_{}", group.id));
+                let c = model.add_max_eq(g_end, lanes.iter().map(|(_, e, _, _)| e.clone()));
+                model.set_constraint_name(c, &format!("pool_group_end_max_{}", group.id));
+                let c = model.add_eq(
+                    LinearExpr::from(g_start) + LinearExpr::from(g_size),
+                    LinearExpr::from(g_end),
+                );
+                model.set_constraint_name(c, &format!("pool_group_size_{}", group.id));
+                let interval = model.new_interval_var(g_start, g_size, g_end);
+                scratch_intervals.push(interval);
+                scratch_demands.push(VLEN as i64);
+                if let Some(h) = greedy_hints {
+                    let start_hint = lanes
+                        .iter()
+                        .map(|(_, _, d, _)| h.get(*d).copied().unwrap_or(0))
+                        .min()
+                        .unwrap_or(0);
+                    let end_hint = lanes
+                        .iter()
+                        .filter_map(|(_, _, _, e)| *e)
+                        .max()
+                        .unwrap_or(start_hint + 1)
+                        .max(start_hint + 1);
+                    model.add_hint(g_start, start_hint as i64);
+                    model.add_hint(g_end, end_hint as i64);
+                    model.add_hint(g_size, (end_hint - start_hint) as i64);
+                    pool_group_hints.push((start_hint, end_hint));
+                }
             }
 
             // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
@@ -2394,8 +2471,39 @@ pub fn schedule_ssa_cpsat(
                 max_demand,
                 scratch_budget
             );
-            let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
-            model.set_constraint_name(c, "cumul_scratch");
+            if scratch_pools {
+                // Two pools: vectors (demand VLEN) and scalars (demand 1), with capacities
+                // N_v and N_s and 8 * N_v + N_s <= budget. Address assignment needs at most
+                // 8 * (most live vectors) + (most live scalars) words.
+                let mut vec_intervals: Vec<IntervalVar> = Vec::new();
+                let mut scalar_intervals: Vec<IntervalVar> = Vec::new();
+                for (iv, d) in scratch_intervals.iter().zip(scratch_demands.iter()) {
+                    if *d == VLEN as i64 {
+                        vec_intervals.push(*iv);
+                    } else {
+                        debug_assert_eq!(*d, 1, "pools: demand {} is neither 1 nor {}", d, VLEN);
+                        scalar_intervals.push(*iv);
+                    }
+                }
+                let budget = scratch_budget as i64;
+                let n_v = model.new_int_var_with_name([(0, budget / VLEN as i64)], "scratch_pool_vectors");
+                let n_s = model.new_int_var_with_name([(0, budget)], "scratch_pool_scalars");
+                let ones_v = vec![1i64; vec_intervals.len()];
+                let ones_s = vec![1i64; scalar_intervals.len()];
+                let c = model.add_cumulative(vec_intervals, ones_v, n_v);
+                model.set_constraint_name(c, "cumul_scratch_vectors");
+                let c = model.add_cumulative(scalar_intervals, ones_s, n_s);
+                model.set_constraint_name(c, "cumul_scratch_scalars");
+                let c = model.add_le(
+                    LinearExpr::from(n_v) * VLEN as i64 + LinearExpr::from(n_s),
+                    LinearExpr::from(budget),
+                );
+                model.set_constraint_name(c, "scratch_pools_capacity");
+                scratch_pool_vars = Some((n_v, n_s));
+            } else {
+                let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
+                model.set_constraint_name(c, "cumul_scratch");
+            }
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
@@ -2540,6 +2648,88 @@ pub fn schedule_ssa_cpsat(
                     peak = peak.max(current);
                 }
 
+                if let Some((n_v, n_s)) = scratch_pool_vars {
+                    // Hint N_v, N_s with the hint schedule's pool maxima: the same intervals,
+                    // write-group lanes replaced by their group.
+                    let mut pool_events: Vec<(i32, i64, i64)> = Vec::new(); // (cycle, dv, ds)
+                    let mut push = |start: i32, end: i32, vector: bool| {
+                        let (dv, ds) = if vector { (1, 0) } else { (0, 1) };
+                        pool_events.push((start, dv, ds));
+                        pool_events.push((end, -dv, -ds));
+                    };
+                    if let Some(il) = initial_live {
+                        for (vreg, last_use_idx) in il.iter() {
+                            if *last_use_idx < hints.len() {
+                                push(0, hints[*last_use_idx] + 1, vreg.is_vector());
+                            }
+                        }
+                    }
+                    if let Some(lt) = live_through_vregs {
+                        for vreg in lt {
+                            push(0, max_hint + 1, vreg.is_vector());
+                        }
+                    }
+                    for vreg in &live_vregs {
+                        if pool_group_of_lane.contains_key(vreg) {
+                            continue;
+                        }
+                        let def_idx = vreg_def_op[vreg];
+                        let last_use_idx = vreg_last_use[vreg];
+                        let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                        let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
+                            max_hint + 1
+                        } else {
+                            hinted_live_end
+                                .get(vreg)
+                                .copied()
+                                .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1)
+                        };
+                        push(def_cycle, live_end, vreg.is_vector());
+                    }
+                    if let Some(lo) = live_out_vregs {
+                        for vreg in lo {
+                            if !live_vregs.contains(vreg) {
+                                if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                    push(hints.get(def_idx).copied().unwrap_or(0), max_hint + 1, vreg.is_vector());
+                                }
+                            }
+                        }
+                    }
+                    for &(s, e) in &pool_group_hints {
+                        push(s, e, true);
+                    }
+                    if let Some(fma_ids) = select_choice_hints {
+                        for (op_idx, op) in ops.iter().enumerate() {
+                            if op.opcode == Opcode::SelectChoice
+                                && fma_ids.contains(&op.id)
+                                && op.sub_temp_vreg.is_some()
+                                && op_idx < hints.len()
+                            {
+                                push(hints[op_idx], hints[op_idx] + 2, true);
+                            }
+                        }
+                    }
+                    pool_events.sort_by_key(|&(c, dv, ds)| (c, dv + ds));
+                    let (mut v, mut s, mut max_v, mut max_s) = (0i64, 0i64, 0i64, 0i64);
+                    for (_, dv, ds) in &pool_events {
+                        v += dv;
+                        s += ds;
+                        max_v = max_v.max(v);
+                        max_s = max_s.max(s);
+                    }
+                    let budget = scratch_budget as i64;
+                    model.add_hint(n_v, max_v.min(budget / VLEN as i64));
+                    model.add_hint(n_s, max_s.min(budget));
+                    if verbose || VLEN as i64 * max_v + max_s > budget {
+                        eprintln!(
+                            "  Scratch pools in the hint: 8*{} + {} = {} words (budget {})",
+                            max_v,
+                            max_s,
+                            VLEN as i64 * max_v + max_s,
+                            budget
+                        );
+                    }
+                }
                 if peak > scratch_budget as i64 {
                     // This is expected when greedy scheduler exceeded budget (force-scheduled).
                     // CP-SAT hints are "soft" - they're suggestions, not requirements.
@@ -3490,6 +3680,89 @@ pub fn schedule_ssa_cpsat(
                 model.add_hint(end_var, end_hint);
                 model.add_hint(size_var, end_hint - clamped);
             }
+        }
+    }
+
+    // 11b. Makespan rows (tuning.makespan_rows, makespan_rows.rs): head/tail rows from static
+    // longest-path heads and tails, and with Bucketed prefix/suffix variables that follow the
+    // solution. Added after the hints so their auxiliaries are hinted from them.
+    if tuning.makespan_rows != MakespanRows::None {
+        let eliminable_set: HashSet<usize> = eliminable_vbs.iter().map(|(vb, _, _)| *vb).collect();
+        let paths = static_paths(ops, &eliminable_set);
+        let hint_map: HashMap<i32, i64> = model
+            .proto()
+            .solution_hint
+            .as_ref()
+            .map(|h| h.vars.iter().copied().zip(h.values.iter().copied()).collect())
+            .unwrap_or_default();
+        let hint = |v: IntVar| hint_map.get(&v.index()).copied();
+        let ctx = WorkContext {
+            ops,
+            times,
+            classes: OpClasses { shiftable: &shiftable_set, eliminable_vbs: &eliminable_set },
+            const_choice: &op_vars.const_choice,
+            const_choice_mode,
+        };
+        let caps = RowCaps { valu: valu_cap, alu: alu_cap, load: load_cap, store: store_cap, flow: flow_cap };
+        let added = add_makespan_rows(
+            &mut model,
+            &ctx,
+            &paths,
+            &caps,
+            makespan,
+            horizon,
+            tuning.makespan_rows == MakespanRows::Bucketed,
+            &hint,
+        );
+        for &(var, value) in &added.hints {
+            model.add_hint(var, value);
+        }
+        if let Some(sb) = added.static_bound {
+            eprintln!(
+                "  Static head/tail bound: makespan >= {} ({} row, head >= {}, tail >= {}; capacity floor {})",
+                sb.bound,
+                sb.engine.name(),
+                sb.t,
+                sb.q,
+                capacity_lower_bound
+            );
+        }
+        if verbose {
+            eprintln!(
+                "  Makespan rows: {} rows ({} literal head/tail rows), {} buckets, {} new variables",
+                added.rows.len(),
+                added.literal_rows,
+                added.buckets,
+                added.new_vars
+            );
+        }
+        // Every row holds in every schedule (verification/makespan_rows.py), so a greedy
+        // schedule within the slot limits satisfies them; a violation is a bug in the rows.
+        let violations = if greedy_hints.is_some() { added.hint_violations(&hint) } else { Vec::new() };
+        if !violations.is_empty() {
+            let message = format!(
+                "makespan rows cut off the hint: {} row(s), first {:?}",
+                violations.len(),
+                &violations[..violations.len().min(5)]
+            );
+            // A greedy schedule that does not use the forced encodings is not a schedule of
+            // this model (its shift hints say ALU while its cycles were packed for VALU).
+            // Likewise for ops whose shift is forced (what-if runs) but which the greedy kept
+            // on VALU. (Checked here rather than in greedy_schedule_matches_forced_modes, which
+            // also decides the domains: changing it would change those models.)
+            let forced_shifts_honoured = forced_shifts.map_or(true, |forced| {
+                shiftable_valu.iter().all(|&idx| {
+                    !forced.contains(&ops[idx].id) || shift_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                })
+            });
+            if cfg!(debug_assertions)
+                && greedy_within_scratch_budget == Some(true)
+                && greedy_matches_forced_modes
+                && forced_shifts_honoured
+            {
+                panic!("{}", message);
+            }
+            eprintln!("  WARNING: {}", message);
         }
     }
 

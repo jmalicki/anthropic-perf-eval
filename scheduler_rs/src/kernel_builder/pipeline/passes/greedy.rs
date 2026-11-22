@@ -142,12 +142,13 @@ impl Pass for GreedySchedulePass {
             shape.split_shift = false;
         }
         let mut shifted_lane_cycles = std::collections::HashMap::new();
+        let greedy_budget = ctx.greedy_budget();
         let ((cycles, budget_exceeded, peak_live), _agreement) =
             ssa_greedy::schedule_ssa_greedy_shaped(
                 &mut ctx.ops,
                 enable_valu_shift,
                 &mut ctx.greedy_decisions.shifted_ops,
-                ctx.config.compiler.greedy_scratch_budget(ctx.config.scratch_budget),
+                greedy_budget,
                 Some(&mut select_fma_ops),
                 Some(&mut ctx.greedy_decisions.select_sub_cycles),
                 Some(&mut ctx.greedy_decisions.select_fma_cycles),
@@ -210,7 +211,7 @@ impl Pass for GreedySchedulePass {
             peak_live,
             budget_exceeded,
             // The budget the scheduler ran against (headroom already subtracted).
-            budget: ctx.config.compiler.greedy_scratch_budget(ctx.config.scratch_budget),
+            budget: greedy_budget,
             over_budget_cycles: diagnostics.over_budget_cycles,
         };
 
