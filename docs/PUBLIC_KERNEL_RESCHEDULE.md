@@ -28,8 +28,13 @@ ops (994 with the VALU→ALU split free). That breaks into two parts:
   and 377 cycles below 90% of the joint VALU+ALU peak, where the public kernels have 11 to
   28.
 
-How much of that a better schedule can recover, on our ops with the split free and addresses
-re-allocated: the CP-SAT lower bound is 1,009 cycles, so at least 15 cycles above the 994 floor are forced by the dependency structure, and at most about 90 of the 105 can be recovered by scheduling.
+How much of that a better schedule could recover, on our ops with the split free and the
+addresses re-allocated (value-dependency schedule, CP-SAT, dtime 200):
+- CP-SAT proves a lower bound of 1,009 cycles. So at least 15 cycles above the 994 floor are
+  forced by the dependency structure (start-up and tail), and at most 89 of the 105 are
+  recoverable by scheduling.
+- CP-SAT itself found no better schedule than the 1,098 it was warm-started from, so how many
+  of those 89 a real scheduler would recover is still open.
 
 The gap to the leaders' level is therefore mostly emission:
 
@@ -111,7 +116,7 @@ ops" (`scripts/reschedule_kernel.py`), not our Rust SSA pipeline.
 | 982 | fixed addresses | 982 | 996 | 982 | 982 (warm start 982, dtime 100) | 979 |
 | 982 | value deps | 982 | 1,524 | 982 | — | — |
 | ours | fixed addresses | 1,099 | 1,120 | 1,098 | — | — |
-| ours | value deps, VALU shift free | 1,099 | 1,546 | 1,098 | running | 1,009 (so far) |
+| ours | value deps, VALU shift free | 1,099 | 1,546 | 1,098 | 1,098 (warm start 1,098, dtime 200; 1 op shifted) | 1,009 |
 
 Notes:
 - The first 982 CP-SAT run started from the critical-path greedy (996). It ended on its
