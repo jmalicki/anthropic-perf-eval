@@ -6132,6 +6132,132 @@ mod capacity_lb_tests {
         assert!(r.capacity_lower_bound >= 5);
         assert!(r.capacity_lower_bound >= r.store_bound);
     }
+
+    /// The bound before the CSE VALU count was precomputed per z: the same triple loop with
+    /// the group sizes sorted again for every (x, y, z). Kept to check the fast path.
+    #[allow(clippy::too_many_arguments)]
+    fn capacity_lb_unmemoised(
+        valu_count: i64,
+        alu_count: i64,
+        load_count: i64,
+        store_count: i64,
+        flow_base: i64,
+        shiftable_count: i64,
+        const_choice_count: i64,
+        select_choice_count: i64,
+        enable_valu_shift: bool,
+        critical_path_len: i64,
+        group_sizes: Option<&[usize]>,
+    ) -> i64 {
+        let (valu_cap, alu_cap, load_cap, store_cap, _) = default_caps();
+        let cse_valu = |z: i64, sizes: &[usize]| -> i64 {
+            if z <= 0 {
+                return 0;
+            }
+            let mut sizes = sizes.to_vec();
+            sizes.sort_by(|a, b| b.cmp(a));
+            let mut sum = 0usize;
+            for (k, &s) in sizes.iter().enumerate() {
+                sum += s;
+                if sum >= z as usize {
+                    return (k + 1) as i64 + z;
+                }
+            }
+            sizes.len() as i64 + z
+        };
+        let mut lb = critical_path_len;
+        if !enable_valu_shift && valu_count > 0 {
+            lb = lb.max((valu_count + valu_cap - 1) / valu_cap);
+        }
+        let store_bound = if store_count > 0 { (store_count + store_cap - 1) / store_cap } else { 0 };
+        let mut global_min = i64::MAX;
+        for x in 0..=shiftable_count {
+            let valu_ops = if enable_valu_shift { (valu_count - shiftable_count + x).max(0) } else { valu_count };
+            let alu_ops = if enable_valu_shift { alu_count + 8 * (shiftable_count - x) } else { alu_count };
+            for y in 0..=const_choice_count {
+                let load_ops = (load_count - y).max(0);
+                for z in 0..=select_choice_count {
+                    let valu_select = match group_sizes {
+                        Some(sizes) if !sizes.is_empty() => cse_valu(z, sizes),
+                        _ => 2 * z,
+                    };
+                    let v = valu_ops + valu_select;
+                    let v = if v > 0 { (v + valu_cap - 1) / valu_cap } else { 0 };
+                    let a = if alu_ops > 0 { (alu_ops + alu_cap - 1) / alu_cap } else { 0 };
+                    let ld = if load_ops > 0 { (load_ops + load_cap - 1) / load_cap } else { 0 };
+                    let fl = flow_base + y - z;
+                    global_min = global_min.min(v.max(a).max(ld).max(fl).max(store_bound));
+                }
+            }
+        }
+        if global_min != i64::MAX {
+            lb = lb.max(global_min);
+        }
+        lb
+    }
+
+    fn cse_groups_of_sizes(sizes: &[usize]) -> Vec<crate::cpsat_scheduler::CseGroup> {
+        use crate::types::VReg;
+        let mut next = 0usize;
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(g, &n)| {
+                let consumer_indices: Vec<usize> = (next..next + n).collect();
+                next += n;
+                crate::cpsat_scheduler::CseGroup {
+                    true_val: VReg::vector(3 * g as u32),
+                    false_val: VReg::vector(3 * g as u32 + 1),
+                    consumer_indices,
+                    producer_true_idx: None,
+                    producer_false_idx: None,
+                    complex_phi: false,
+                    sub_temp_vreg: VReg::vector(3 * g as u32 + 2),
+                }
+            })
+            .collect()
+    }
+
+    /// Precomputing the CSE VALU count once per z must give exactly the old bound, with and
+    /// without CSE groups and with every mix of shift, ConstChoice and SelectChoice counts.
+    #[test]
+    fn test_capacity_lb_precomputed_cse_matches_unmemoised() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // (valu, alu, load, store, flow_base, shiftable, const_choice, select_choice, shift, cp)
+        let configs: [(i64, i64, i64, i64, i64, i64, i64, i64, bool, i64); 8] = [
+            (40, 30, 10, 4, 12, 20, 5, 9, true, 0),
+            (40, 30, 10, 4, 12, 20, 5, 9, false, 0),
+            (6, 0, 0, 0, 9, 0, 0, 9, true, 0),
+            (120, 60, 24, 8, 30, 80, 6, 24, true, 3),
+            (12, 200, 3, 0, 2, 4, 3, 2, true, 0),
+            (0, 0, 8, 0, 0, 0, 8, 0, true, 0),
+            (300, 10, 50, 16, 40, 250, 12, 30, true, 0),
+            (300, 10, 50, 16, 40, 250, 12, 30, true, 90),
+        ];
+        let group_layouts: [&[usize]; 4] = [&[], &[3, 3, 3], &[1, 4, 2, 2], &[9]];
+        for &(v, a, l, s, f, sh, cc, scc, shift, cp) in &configs {
+            for &sizes in &group_layouts {
+                // Groups cannot hold more consumers than there are SelectChoice ops.
+                if sizes.iter().sum::<usize>() > scc as usize {
+                    continue;
+                }
+                let groups = cse_groups_of_sizes(sizes);
+                let groups_arg = if sizes.is_empty() { None } else { Some(groups.as_slice()) };
+                let got = compute_capacity_lower_bound_global(
+                    v, a, l, s, f, sh, cc, scc, shift, vc, ac, lc, sc, fc, cp, groups_arg,
+                );
+                let want = capacity_lb_unmemoised(
+                    v, a, l, s, f, sh, cc, scc, shift, cp, if sizes.is_empty() { None } else { Some(sizes) },
+                );
+                assert_eq!(
+                    got.capacity_lower_bound, want,
+                    "config {:?} groups {:?}",
+                    (v, a, l, s, f, sh, cc, scc, shift, cp),
+                    sizes
+                );
+            }
+        }
+    }
 }
 
 /// Minimal CP-SAT reproducer for cumulative + optional intervals (capacity 1).

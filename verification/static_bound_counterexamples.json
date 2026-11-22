@@ -1,0 +1,316 @@
+{
+ "_doc": "Data for verification/static_bounds_proof.py. Instances are scheduler-JSON fragments (ssa_ops: id, engine, opcode, dep_ids) on a scaled-down machine (cap, vlen).",
+ "own_cycle_tail_counterexamples": [
+  {
+   "name": "one-alu-op",
+   "instance": {
+    "ssa_ops": [
+     {
+      "id": 0,
+      "engine": "alu",
+      "opcode": "+",
+      "dep_ids": []
+     }
+    ],
+    "ops": [],
+    "run_options": {}
+   },
+   "cap": {
+    "valu": 1,
+    "alu": 1,
+    "load": 1,
+    "store": 1,
+    "flow": 1
+   },
+   "vlen": 2,
+   "wrong_bound": 2,
+   "note": "tail counting its own cycle is 1; q + ceil(W/cap) = 1 + 1 = 2, but the op runs in one cycle. The sound row is q - 1 + ceil(W/cap), i.e. t + q + ceil(W/cap) with the tail that excludes the own cycle."
+  }
+ ],
+ "vbroadcast_latency_counterexamples": [
+  {
+   "name": "eliminated-broadcast-chain",
+   "instance": {
+    "ssa_ops": [
+     {
+      "id": 0,
+      "engine": "flow",
+      "opcode": "add_imm",
+      "dep_ids": []
+     },
+     {
+      "id": 1,
+      "engine": "valu",
+      "opcode": "vbroadcast",
+      "dep_ids": [
+       0
+      ]
+     },
+     {
+      "id": 2,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": [
+       0
+      ]
+     },
+     {
+      "id": 3,
+      "engine": "valu",
+      "opcode": "^",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 4,
+      "engine": "valu",
+      "opcode": "multiply_add",
+      "dep_ids": [
+       0,
+       2,
+       3
+      ]
+     }
+    ],
+    "ops": [],
+    "run_options": {}
+   },
+   "cap": {
+    "valu": 2,
+    "alu": 1,
+    "load": 1,
+    "store": 1,
+    "flow": 1
+   },
+   "vlen": 2,
+   "note": "With latency 1 out of the eliminable vbroadcast the bound is 4; a schedule of 3 cycles drops the broadcast and its shifted consumer reads the scalar directly. static_bounds uses latency 0 on that edge (bound 3).",
+   "wrong_bound": 4
+  }
+ ],
+ "tight_instances": [
+  {
+   "name": "pair-alu+valu-seed1-178",
+   "instance": {
+    "ssa_ops": [
+     {
+      "id": 0,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": []
+     },
+     {
+      "id": 1,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": []
+     },
+     {
+      "id": 2,
+      "engine": "valu",
+      "opcode": "^",
+      "dep_ids": [
+       0
+      ]
+     },
+     {
+      "id": 3,
+      "engine": "valu",
+      "opcode": "vbroadcast",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 4,
+      "engine": "flow",
+      "opcode": "select_choice",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 5,
+      "engine": "alu",
+      "opcode": "+",
+      "dep_ids": [
+       3
+      ]
+     },
+     {
+      "id": 6,
+      "engine": "flow",
+      "opcode": "select_choice",
+      "dep_ids": [
+       1,
+       2
+      ]
+     }
+    ],
+    "ops": [],
+    "run_options": {}
+   },
+   "cap": {
+    "valu": 1,
+    "alu": 1,
+    "load": 1,
+    "store": 1,
+    "flow": 1
+   },
+   "vlen": 2,
+   "bound": 4
+  },
+  {
+   "name": "pair-alu-seed1-270",
+   "instance": {
+    "ssa_ops": [
+     {
+      "id": 0,
+      "engine": "flow",
+      "opcode": "select_choice",
+      "dep_ids": []
+     },
+     {
+      "id": 1,
+      "engine": "alu",
+      "opcode": "+",
+      "dep_ids": [
+       0
+      ]
+     },
+     {
+      "id": 2,
+      "engine": "flow",
+      "opcode": "add_imm",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 3,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": [
+       1,
+       2
+      ]
+     },
+     {
+      "id": 4,
+      "engine": "valu",
+      "opcode": "^",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 5,
+      "engine": "valu",
+      "opcode": "^",
+      "dep_ids": [
+       2
+      ]
+     },
+     {
+      "id": 6,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": [
+       2,
+       3,
+       4,
+       5
+      ]
+     }
+    ],
+    "ops": [],
+    "run_options": {}
+   },
+   "cap": {
+    "valu": 1,
+    "alu": 1,
+    "load": 1,
+    "store": 1,
+    "flow": 1
+   },
+   "vlen": 2,
+   "bound": 5
+  },
+  {
+   "name": "pair-valu-seed1-355",
+   "instance": {
+    "ssa_ops": [
+     {
+      "id": 0,
+      "engine": "flow",
+      "opcode": "select_choice",
+      "dep_ids": []
+     },
+     {
+      "id": 1,
+      "engine": "load",
+      "opcode": "load",
+      "dep_ids": [
+       0
+      ]
+     },
+     {
+      "id": 2,
+      "engine": "valu",
+      "opcode": "vbroadcast",
+      "dep_ids": [
+       1
+      ]
+     },
+     {
+      "id": 3,
+      "engine": "alu",
+      "opcode": "+",
+      "dep_ids": [
+       0,
+       1
+      ]
+     },
+     {
+      "id": 4,
+      "engine": "valu",
+      "opcode": "vbroadcast",
+      "dep_ids": [
+       2
+      ]
+     },
+     {
+      "id": 5,
+      "engine": "store",
+      "opcode": "store",
+      "dep_ids": [
+       0,
+       2
+      ]
+     },
+     {
+      "id": 6,
+      "engine": "load",
+      "opcode": "const_choice",
+      "dep_ids": [
+       0,
+       2,
+       4
+      ]
+     }
+    ],
+    "ops": [],
+    "run_options": {}
+   },
+   "cap": {
+    "valu": 1,
+    "alu": 3,
+    "load": 1,
+    "store": 1,
+    "flow": 1
+   },
+   "vlen": 2,
+   "bound": 5
+  }
+ ]
+}

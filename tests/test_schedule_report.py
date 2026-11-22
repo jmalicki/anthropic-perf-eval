@@ -204,7 +204,7 @@ def test_cli_json_and_compare(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert sr.main([a, "--json"]) == 0
     rep = json.loads(capsys.readouterr().out)
-    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "round_overlap", "utilisation", "scratch"}
+    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "round_overlap", "utilisation", "scratch", "static_bound"}
     assert sr.main([a, "--compare", b]) == 0
     out = capsys.readouterr().out
     assert "emission floor" in out and "span A" in out and "not a bound on the problem" in out
