@@ -53,7 +53,15 @@ impl MemDepStats {
 /// Minimum latency the schedulers give a `dep_ids` edge out of `op`: the ASAP precedence
 /// offset, taken as the minimum over both values of the shift flag so the answer does not
 /// depend on which ops end up shiftable.
+///
+/// Out of a vbroadcast it is 0: when the vbroadcast is eliminated its shifted readers read
+/// the scalar producer directly (the makespan rows use the same rule). Only WAR edges
+/// (latency 0) can be implied, so this changes no decision; it keeps the filter sound if
+/// that ever changes.
 fn min_data_edge_latency(op: &SsaOp) -> i32 {
+    if op.opcode == Opcode::Vbroadcast {
+        return 0;
+    }
     op.precedence_offset_for_asap(false).min(op.precedence_offset_for_asap(true))
 }
 
@@ -555,6 +563,20 @@ mod tests {
         assert_eq!(alap[&id(ix.load_before)], 1, "WAR: load_before no later than store_word0");
         assert_eq!(alap[&id(ix.first_store)], 4, "WAW: first_store before last_store");
         assert_eq!(compute_max_latency_critical_path(&ops, &none), 6);
+    }
+
+    /// The static heads and tails behind the makespan rows follow memory edges too.
+    #[test]
+    fn test_static_paths_follow_memory_edges() {
+        use crate::cpsat_scheduler::makespan_rows::static_paths;
+        let (mut ops, ix) = store_load_same_word();
+        compute_memory_dependencies(&mut ops).unwrap();
+        let paths = static_paths(&ops, &HashSet::new());
+        assert_eq!(paths.head[ix.store_word0], 1, "WAR: same cycle as load_before");
+        assert_eq!(paths.head[ix.load_after], 2, "RAW: one after store_word0");
+        assert_eq!(paths.head[ix.last_store], 5);
+        assert_eq!(paths.tail[ix.store_word0], 4, "store_word0 -> load_after -> z1 -> z2 -> last_store");
+        assert_eq!(paths.tail[ix.load_before], 4, "load_before -> store_word0 (0) -> ...");
     }
 
     /// Memory edges carry no scratch value: live intervals are the same with and without them.
