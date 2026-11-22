@@ -79,7 +79,7 @@ Notes:
 - **Where.** W=25 windows improve at about the same rate in every decile of the schedule (improved/total per decile: 2/11, 6/11, 7/11, 1/11, 6/10, 6/11, 7/11, 5/11, 4/10, 5/10). Gains are not concentrated in the start-up or the tail. The fourth decile, around cycles 420 to 560, is the exception, with 1 window out of 11.
 - **Encodings.** Every improving window with free encodings changed the shift of some of its ops: a median of 10 ops at W=25 and 14 at W=50. Across all improving windows, SelectChoice changed on 10 ops at W=25 and 10 at W=50, and ConstChoice on 4 at W=25. With encodings fixed, reordering alone found one cycle in one window (W=25 at cycle 1,313). The greedy's order is close to optimal for its own encodings; the slack is in its VALU-shift decisions.
 - **Proofs.** At W=25, 87 of 107 free windows close to optimality, median 4 s. The open ones each found 1 cycle, with a bound of 2 to 8, and cluster around cycles 150 to 380 and 1,200 to 1,290. At W=50, 21 of 37 close, median 78 s for closed windows and 400 s for open ones.
-- **Infeasible windows.** 4 free and 5 fixed W=25 windows (starts 26, 481, 624, 793, 962) returned INFEASIBLE in presolve with the build used. The reference is a solution of the full model, so this was a model bug, not a scheduling result. The likely cause: dead stores pinned at their all-fixed cycles fell outside their domains, which came from bounds computed on the reduced op list, and the hint-widening step skipped them because their hint is -1. The probe now widens every domain to cover the reference (and the After block's reach) and prints when it does. These windows are counted as not improved above, and they need a rerun.
+- **Window boundary follow-up.** The original W=25 sweep reported four infeasible free windows and five infeasible fixed windows among starts 26, 481, 624, 793 and 962. In the saved fixed model at 481, the reference used a one-cycle vselect at 505. An unconditional constraint also required its unused FMA cycle (506) to fit before the window ended. The window now applies that constraint only when the FMA executes. With this change and the preceding reference-domain fix, all five starts solved to optimality at 1,399 cycles in both modes (one worker, deterministic budget 5). All five generator runs passed symbolic replay and numeric validation of the reference kernel. The table retains the original sweep counts and timings.
 
 ### Rolling pass (what rolling-horizon CP-SAT would get)
 
@@ -113,6 +113,6 @@ A sweep needs one model build per window. Before PR #60 that build alone took 45
 Partial, because the shared machine's CPU is reserved for higher-priority work:
 - complete: the W=25 sweep, both modes;
 - partial: W=50 with free encodings, 37 of 56 windows; the W=25 rolling pass, stopped at cycle 370;
-- not run: W=50 fixed, W=100, W=200, the W=50 rolling pass, the full-model re-check of a complete rolling pass, and a rerun of the 5 infeasible windows with the domain fix.
+- not run: W=50 fixed, W=100, W=200, the W=50 rolling pass, and the full-model re-check of a complete rolling pass.
 
 The reports are JSON files rewritten after every window: `uv run python -m scripts.window_optimality_probe --summarize REPORT...`.

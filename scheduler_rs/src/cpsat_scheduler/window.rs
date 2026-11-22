@@ -372,7 +372,13 @@ pub(crate) fn apply_window_constraints(
                     }
                 }
                 if let Some(&v) = vars.select_choice_fma_last_cycle.get(&idx) {
+                    // fma_cycle = cycle + 1 exists on both paths; only the multiply-add path
+                    // occupies it. Unconditional, this made a vselect in the window's last
+                    // cycle infeasible.
                     let c = model.add_le(LinearExpr::from(v), last);
+                    if let Some(&choice) = vars.select_choice_vars.get(&idx) {
+                        model.only_enforce_if(c, [choice]);
+                    }
                     model.set_constraint_name(c, &format!("window_fma_last_{}_le_end", idx));
                 }
             }
@@ -1350,6 +1356,20 @@ mod tests {
         assert_eq!(result.cycle_assignments, reference.cycles);
         assert_eq!(result.makespan as i32, reference.makespan(&ops));
         assert!(result.shifted_ops.is_empty());
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn vselect_can_use_the_last_cycle_of_a_window() {
+        let ops = small_program();
+        let reference = loose_reference(&ops);
+        let select = ops.iter().position(|op| op.opcode == Opcode::SelectChoice).unwrap();
+        let start = reference.cycles[select];
+        let window = CpsatWindow { start, len: 1, fix_window_encodings: true, reference, prune: false };
+        let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
+            .expect("model")
+            .expect("one-cycle vselect fits");
+        assert_eq!(result.cycle_assignments[select], start);
     }
 
     /// A reference from an earlier CP-SAT solution can run a shifted op's lanes at different
