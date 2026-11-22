@@ -1,8 +1,7 @@
 """Emission plans: which tree-access encoding each group of 8 lanes uses in each round.
 
 A plan is what `--emission-plan PATH` (generate_ssa_kernel.py) and the `emission_plan`
-argument of `scheduler_rs.build_tick_tock_kernel_ssa` take. The structure model
-(`scripts/emission_structure.py`, docs/EMISSION_STRUCTURE_MODEL.md) writes them.
+argument of `scheduler_rs.build_tick_tock_kernel_ssa` take.
 
 File format (JSON)::
 

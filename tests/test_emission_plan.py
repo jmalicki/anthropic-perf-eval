@@ -1,4 +1,4 @@
-"""Emission plans (solver/emission_plan.py, docs/EMISSION_STRUCTURE_MODEL.md): the tree-access
+"""Emission plans (solver/emission_plan.py): the tree-access
 encoding chosen per round and per group.
 
 - A plan that names, for every group, what the flags would choose emits exactly the SSA
