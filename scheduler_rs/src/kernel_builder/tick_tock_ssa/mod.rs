@@ -307,6 +307,15 @@ pub enum BudgetAccounting {
         /// Highest scratch address used.
         max_addr: i64,
     },
+    /// Scratch model `pools`: live words and addresses fit, but `8 * max_v + max_s` exceeds the
+    /// assignable words, so the schedulers' pool constraint was not kept (their counters
+    /// disagree with address assignment's liveness).
+    AddressPools {
+        /// Most vectors live at once.
+        vectors: usize,
+        /// Most scalars live at once.
+        scalars: usize,
+    },
 }
 
 /// Build the `BudgetExceeded` error for an address assignment that reported `budget_exceeded`.
@@ -320,6 +329,10 @@ pub enum BudgetAccounting {
 fn address_budget_error(ar: &crate::address_assign::AddressAssignmentResult) -> KernelBuilderError {
     let accounting = if ar.peak_live > ar.budget {
         BudgetAccounting::AddressLiveness
+    } else if ar.max_addr >= ar.budget as i64 {
+        BudgetAccounting::AddressRange { max_addr: ar.max_addr }
+    } else if let Some(p) = &ar.pool_peaks {
+        BudgetAccounting::AddressPools { vectors: p.vectors, scalars: p.scalars }
     } else {
         BudgetAccounting::AddressRange { max_addr: ar.max_addr }
     };
@@ -427,6 +440,17 @@ impl std::fmt::Display for KernelBuilderError {
                     peak_live,
                     cmp_symbol(*peak_live, *budget),
                     budget
+                ),
+                BudgetAccounting::AddressPools { vectors, scalars } => write!(
+                    f,
+                    "scratch pools exceeded (--scratch-model pools): 8*{} + {} = {} words of {} \
+                     assignable, although peak_live={} and the addresses fit; the schedulers' pool \
+                     counts disagree with address assignment's liveness",
+                    vectors,
+                    scalars,
+                    8 * vectors + scalars,
+                    budget.saturating_sub(1),
+                    peak_live
                 ),
             },
             KernelBuilderError::SameCycleScratchConflict {
@@ -1175,6 +1199,7 @@ impl SsaTickTockKernelBuilder {
                     stop_after_first_solution: section_stop_first,
                     enable_valu_shift: false,
                     scratch_budget: effective_budget,
+                    scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
                     model_name: Some(format!("section_{}_feasibility", k)),
                     ..Default::default()
                 };
@@ -1376,6 +1401,7 @@ impl SsaTickTockKernelBuilder {
             enable_valu_shift,
             enable_vbroadcast_elimination,
             scratch_budget: effective_scratch_budget(ctx.zero_vreg.is_some()),
+            scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
             model_name: Some("full_kernel_optimization".to_string()),
             machine: MachineConfig::default(),
             const_choice_mode,

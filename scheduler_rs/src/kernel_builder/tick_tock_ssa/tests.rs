@@ -224,6 +224,9 @@ fn test_budget_exceeded_propagates() {
                 assert!(peak_live <= budget, "{}", err_msg);
                 assert!(err_msg.contains("highest address used"), "{}", err_msg);
             }
+            BudgetAccounting::AddressPools { .. } => {
+                assert!(err_msg.contains("scratch pools exceeded"), "{}", err_msg);
+            }
         },
         other => panic!("expected BudgetExceeded, got {:?}", other),
     }
@@ -2359,6 +2362,33 @@ fn test_inflation_threshold_retune_shortens_default_schedule() {
     );
 }
 
+/// With `--scratch-model pools` the greedy budget is the assignable words (the zero word at
+/// address 0 is reserved), the same words address assignment checks the pools against; with
+/// `words` it stays the configured budget (default schedules unchanged).
+#[test]
+fn test_greedy_budget_pools_excludes_reserved_zero_word() {
+    use crate::kernel_builder::config::ScratchModel;
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+    use crate::kernel_builder::ssa_program::SsaProgram;
+    let make = |model: ScratchModel, headroom: usize| {
+        let mut config = PipelineConfig::default();
+        config.compiler.scratch_model = model;
+        config.compiler.greedy_budget_headroom = headroom;
+        let program = SsaProgram {
+            ops: vec![],
+            vreg_def: HashMap::new(),
+            vreg_count: 1,
+            const_alternatives: vec![],
+            zero_vreg: Some(VReg::scalar(0)),
+            vector_group_lanes: HashMap::new(),
+        };
+        PipelineContext::new(program, config)
+    };
+    assert_eq!(make(ScratchModel::Words, 0).greedy_budget(), 1536);
+    assert_eq!(make(ScratchModel::Pools, 0).greedy_budget(), 1535);
+    assert_eq!(make(ScratchModel::Pools, 35).greedy_budget(), 1500);
+}
+
 /// Headroom lowers the budget the greedy schedules against, and with it the peak.
 #[test]
 fn test_greedy_budget_headroom_lowers_peak() {
@@ -4245,4 +4275,49 @@ fn test_depth4_cpsat() {
         !result.budget_exceeded,
         "Depth 4 CP-SAT should not exceed budget"
     );
+}
+
+/// `--cpsat-makespan-rows bucketed` (which includes the static rows) never cuts off the
+/// greedy schedule. The model checks every new row against the hint and panics in debug
+/// builds when the greedy schedule is within budget and a row excludes it; six rounds give
+/// static heads up to more than two buckets, so the bucketed rows are exercised.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_makespan_rows_keep_the_greedy_hint() {
+    use crate::cpsat_scheduler::{
+        AsapAlapTightening, ConstChoiceMode, CpsatTuning, MakespanRows, SelectChoiceMode, ValuShiftMode,
+    };
+    use crate::kernel_builder::config::ProblemSpec;
+
+    for (rounds, batch) in [(2, 16), (6, 16)] {
+        let config = KernelConfig {
+            spec: ProblemSpec { rounds, batch_size: batch, ..Default::default() },
+            ..Default::default()
+        };
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+        builder.cpsat_tuning = CpsatTuning { makespan_rows: MakespanRows::Bucketed, ..Default::default() };
+        builder.cpsat_deterministic_time = Some(1.0);
+        let result = builder.build_and_schedule_cpsat(
+            20.0,  // time limit
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,
+            None,
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false,
+            AsapAlapTightening::Energetic,
+            false,
+            false,
+            false,
+            None,
+            false,
+            None,
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        );
+        assert!(result.is_ok(), "{}r/{}: {:?}", rounds, batch, result.err());
+    }
 }

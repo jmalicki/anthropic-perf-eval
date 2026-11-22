@@ -228,22 +228,6 @@ impl CpsatWindow {
     }
 }
 
-/// The model variables the window constraints act on (all keyed by op index).
-#[cfg(feature = "cpsat")]
-pub(crate) struct WindowModelVars<'a> {
-    pub cycle_vars: &'a [cp_sat::builder::IntVar],
-    pub alu_cycle_vars: &'a HashMap<usize, Vec<cp_sat::builder::IntVar>>,
-    pub completion_cycle_vars: &'a HashMap<usize, cp_sat::builder::IntVar>,
-    pub select_choice_fma_last_cycle: &'a HashMap<usize, cp_sat::builder::IntVar>,
-    pub shift_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
-    pub const_choice_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
-    pub const_choice_encoding_vars: &'a HashMap<usize, Vec<cp_sat::builder::BoolVar>>,
-    pub const_choice_alu_encoding_info: &'a HashMap<usize, Vec<(usize, usize, Opcode)>>,
-    pub select_choice_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
-    pub eliminate_vb_vars: &'a HashMap<usize, cp_sat::builder::BoolVar>,
-    pub cse_sub_cycle_vars: &'a [cp_sat::builder::IntVar],
-}
-
 /// Counts of ops per region, for logging and the probe report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowRegionCounts {
@@ -268,9 +252,11 @@ pub(crate) fn apply_window_constraints(
     model: &mut cp_sat::builder::CpModelBuilder,
     ops: &[SsaOp],
     window: &CpsatWindow,
-    vars: &WindowModelVars<'_>,
+    vars: &super::op_times::OpVariables,
+    const_choice_alu_encoding_info: &HashMap<usize, Vec<(usize, usize, Opcode)>>,
 ) -> WindowRegionCounts {
     use cp_sat::builder::{BoolVar, IntVar, LinearExpr};
+    use super::op_times::ConstChoiceVars;
 
     let reference = &window.reference;
     let start = window.start as i64;
@@ -314,13 +300,13 @@ pub(crate) fn apply_window_constraints(
         }
         let fix_encodings = region != WindowRegion::Inside || window.fix_window_encodings;
         if fix_encodings {
-            if let Some(&v) = vars.shift_vars.get(&idx) {
+            if let Some(v) = vars.times[idx].shift() {
                 fix_bool(model, v, reference.shifted_ops.contains(&op.id), format!("window_shift_{}", idx));
             }
-            if let Some(&v) = vars.select_choice_vars.get(&idx) {
+            if let Some(v) = vars.times[idx].fma_chosen() {
                 fix_bool(model, v, reference.select_fma_ops.contains(&op.id), format!("window_select_{}", idx));
             }
-            if let Some(&v) = vars.eliminate_vb_vars.get(&idx) {
+            if let Some(v) = vars.times[idx].eliminate() {
                 fix_bool(
                     model,
                     v,
@@ -329,20 +315,19 @@ pub(crate) fn apply_window_constraints(
                 );
             }
             let encoding = reference.const_choice_encoding.get(&op.id);
-            if let Some(&v) = vars.const_choice_vars.get(&idx) {
+            if let Some(ConstChoiceVars::AddImm(v)) = vars.const_choice.get(&idx) {
                 fix_bool(
                     model,
-                    v,
+                    *v,
                     matches!(encoding, Some(ConstChoiceEncoding::AddImm)),
                     format!("window_const_{}", idx),
                 );
             }
-            if let Some(use_vars) = vars.const_choice_encoding_vars.get(&idx) {
+            if let Some(ConstChoiceVars::Encoding(use_vars)) = vars.const_choice.get(&idx) {
                 let chosen = match encoding {
                     None | Some(ConstChoiceEncoding::Load) => Some(0),
                     Some(ConstChoiceEncoding::AddImm) => Some(1),
-                    Some(ConstChoiceEncoding::AluDerive(info)) => vars
-                        .const_choice_alu_encoding_info
+                    Some(ConstChoiceEncoding::AluDerive(info)) => const_choice_alu_encoding_info
                         .get(&idx)
                         .and_then(|alts| {
                             alts.iter().position(|&(l, r, opcode)| {
@@ -362,21 +347,19 @@ pub(crate) fn apply_window_constraints(
 
         match region {
             WindowRegion::Inside => {
-                keep_inside(model, vars.cycle_vars[idx], &format!("window_c{}", idx));
-                if let Some(&v) = vars.completion_cycle_vars.get(&idx) {
+                keep_inside(model, vars.times[idx].issue(), &format!("window_c{}", idx));
+                if let Some(v) = vars.times[idx].completion() {
                     keep_inside(model, v, &format!("window_completion_c{}", idx));
                 }
-                if let Some(lanes) = vars.alu_cycle_vars.get(&idx) {
-                    for (lane, &v) in lanes.iter().enumerate() {
-                        keep_inside(model, v, &format!("window_alu_c{}_{}", idx, lane));
-                    }
+                for (lane, &v) in vars.times[idx].lanes().iter().enumerate() {
+                    keep_inside(model, v, &format!("window_alu_c{}_{}", idx, lane));
                 }
-                if let Some(&v) = vars.select_choice_fma_last_cycle.get(&idx) {
+                if let Some(v) = vars.times[idx].fma_cycle() {
                     // fma_cycle = cycle + 1 exists on both paths; only the multiply-add path
                     // occupies it. Unconditional, this made a vselect in the window's last
                     // cycle infeasible.
                     let c = model.add_le(LinearExpr::from(v), last);
-                    if let Some(&choice) = vars.select_choice_vars.get(&idx) {
+                    if let Some(choice) = vars.times[idx].fma_chosen() {
                         model.only_enforce_if(c, [choice]);
                     }
                     model.set_constraint_name(c, &format!("window_fma_last_{}_le_end", idx));
@@ -389,19 +372,17 @@ pub(crate) fn apply_window_constraints(
                 match reference.lanes(idx, op) {
                     Some(lanes) => {
                         // Runs shifted: pin the eight lanes and the completion (the last lane).
-                        if let Some(alu) = vars.alu_cycle_vars.get(&idx) {
-                            for (lane, (&v, &c)) in alu.iter().zip(lanes.iter()).enumerate() {
-                                pin(model, v, c, moves, format!("window_{}_alu_c{}_{}", tag, idx, lane));
-                            }
+                        for (lane, (&v, &c)) in vars.times[idx].lanes().iter().zip(&lanes).enumerate() {
+                            pin(model, v, c, moves, format!("window_{}_alu_c{}_{}", tag, idx, lane));
                         }
-                        if let Some(&v) = vars.completion_cycle_vars.get(&idx) {
+                        if let Some(v) = vars.times[idx].completion() {
                             let done = lanes.iter().copied().max().unwrap_or(cycle);
                             pin(model, v, done, moves, format!("window_{}_completion_c{}", tag, idx));
                         }
                     }
                     None => {
-                        pin(model, vars.cycle_vars[idx], cycle, moves, format!("window_{}_c{}", tag, idx));
-                        if let Some(&v) = vars.completion_cycle_vars.get(&idx) {
+                        pin(model, vars.times[idx].issue(), cycle, moves, format!("window_{}_c{}", tag, idx));
+                        if let Some(v) = vars.times[idx].completion() {
                             pin(model, v, cycle, moves, format!("window_{}_completion_c{}", tag, idx));
                         }
                     }
@@ -412,9 +393,10 @@ pub(crate) fn apply_window_constraints(
     }
 
     // CSE shared SUBs have no op of their own: place each by its reference cycle.
-    if reference.cse_sub_cycles.len() == vars.cse_sub_cycle_vars.len() {
+    if reference.cse_sub_cycles.len() == vars.cse_subs.len() {
         let end = window.start + window.len;
-        for (g, (&var, &cycle)) in vars.cse_sub_cycle_vars.iter().zip(&reference.cse_sub_cycles).enumerate() {
+        for (g, (sub, &cycle)) in vars.cse_subs.iter().zip(&reference.cse_sub_cycles).enumerate() {
+            let var = sub.cycle();
             if cycle < window.start {
                 pin(model, var, cycle, false, format!("window_before_cse_sub_{}", g));
             } else if cycle < end {

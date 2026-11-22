@@ -149,6 +149,11 @@ pub struct AddressAssignConfig {
     pub cse_consumer_op_ids: HashSet<usize>,
     /// CSE shared sub_temp intervals: (sub_temp_vreg, sub_cycle, max_fma_cycle+1) per active group.
     pub cse_shared_sub_temp_intervals: Vec<(VReg, i32, i32)>,
+    /// Scratch model `pools`: the schedulers promised `8 * max_v + max_s <= budget - start_addr`
+    /// (`PoolPeaks::split_words`). When set, a schedule that breaks it is reported as over budget
+    /// even if this allocation happened to fit, so a scheduler/allocator disagreement is never
+    /// silent.
+    pub scratch_pools: bool,
 }
 
 impl Default for AddressAssignConfig {
@@ -165,6 +170,7 @@ impl Default for AddressAssignConfig {
             vreg_def: HashMap::new(),
             cse_consumer_op_ids: HashSet::new(),
             cse_shared_sub_temp_intervals: Vec::new(),
+            scratch_pools: false,
         }
     }
 }
@@ -635,51 +641,19 @@ pub fn compute_live_intervals(
     Ok(intervals)
 }
 
-/// Compute peak liveness in words at any cycle using the same-cycle reuse model.
+/// Peak liveness in words: the most words live at one time, fixed VRegs included, under the
+/// allocator's own conflict rule (`interval_span`, the rule `assign_two_pass` uses).
 ///
-/// Uses the same expiration rule as linear scan allocation (see `types.rs`):
-/// - Expire VRegs where `end <= current_start`
-/// - Same-cycle reuse: [0,5] expires when [5,10] starts (5 <= 5)
-/// - Write conflict: [5,6] (dead) does NOT expire for [5,10] (6 > 5)
-///
-/// This correctly handles both live VRegs and dead VRegs with +1 extension.
+/// A value read at cycle C and one written at C do not overlap (same-cycle reuse). A point
+/// interval `[C, C]` overlaps every other value read or written at C; the previous sweep
+/// expired it like any interval ending at C and could undercount by the point intervals
+/// ending where another value starts (docs/ALLOCATION_CONJECTURES.md, side note 5). Without
+/// the ops, multi-cycle writes (`last_write_cycles`) are not seen here; `PoolPeaks::words`
+/// from `assign_addresses` includes them.
 pub fn compute_peak_liveness(intervals: &HashMap<VReg, LiveInterval>) -> usize {
-    if intervals.is_empty() {
-        return 0;
-    }
-
-    // Sort intervals by start cycle (same as linear scan)
-    let mut sorted: Vec<(&VReg, &LiveInterval)> = intervals.iter().collect();
-    // VReg breaks ties so the order does not depend on HashMap iteration order.
-    sorted.sort_by_key(|(vreg, interval)| (interval.start, interval.end, **vreg));
-
-    // Simulate linear scan to track actual peak
-    // Active set: (end_cycle, size)
-    let mut active: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
-    let mut current_words: usize = 0;
-    let mut peak_words: usize = 0;
-
-    for (vreg, interval) in sorted {
-        // Expire intervals that ended at or before this one starts (same-cycle reuse)
-        while let Some(&Reverse((end_cycle, size))) = active.peek() {
-            if end_cycle <= interval.start {
-                active.pop();
-                current_words = current_words.saturating_sub(size);
-            } else {
-                break;
-            }
-        }
-
-        // Allocate this VReg
-        let size = vreg.size();
-        current_words += size;
-        peak_words = peak_words.max(current_words);
-
-        // Add to active set
-        active.push(Reverse((interval.end, size)));
-    }
-
-    peak_words
+    let spans: HashMap<VReg, (i64, i64)> =
+        intervals.iter().map(|(v, iv)| (*v, interval_span(iv))).collect();
+    compute_pool_peaks(&spans, &HashMap::new()).words
 }
 
 // ============================================================================
@@ -1038,7 +1012,9 @@ pub fn assign_addresses(ops: &[SsaOp], config: &AddressAssignConfig) -> Result<A
     // memory (caller may still use result). Liveness alone cannot catch this: the peak can be
     // within budget while fragmentation pushes one value to the top of the range.
     let budget_limit = config.budget as i64;
-    let budget_exceeded = budget_exceeded || (max_addr >= budget_limit);
+    let pools_capacity = (config.budget as i64 - config.start_addr).max(0) as usize;
+    let pools_exceeded = config.scratch_pools && pool_peaks.split_words() > pools_capacity;
+    let budget_exceeded = budget_exceeded || (max_addr >= budget_limit) || pools_exceeded;
 
     let vreg_count = vreg_to_addr.len();
     let total_words: usize = sorted.iter().map(|(vreg, _)| vreg.size()).sum();
@@ -3203,5 +3179,112 @@ mod tests {
         // A placed value at 9 (just above the fixed block 1..=8): 9 words up to it, 8 fixed.
         let addrs: HashMap<VReg, i64> = [(group, 1), (lane, 2), (s, 9)].into_iter().collect();
         assert_eq!(movable_words_used(&addrs, &config), 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Shared counterexamples: verification/allocation_counterexamples.json
+    // (docs/ALLOCATION_CONJECTURES.md). Rows are [start, end, size, count] over closed steps;
+    // "abstract" values conflict when they share a step, which is allocator interval
+    // [start, end + 1]; "real" rows are allocator intervals already. budget = words
+    // 0..budget-1 (start_addr 0, so our 8-word slots are 8-aligned).
+    // ------------------------------------------------------------------------
+
+    /// `(budget, spans)` of one counterexample entry, or `None` if it has sizes other than 1
+    /// and VLEN (the file also covers {1, 2} and {2, 3}, which our allocator never sees).
+    fn counterexample_spans(entry: &serde_json::Value) -> Option<(usize, Vec<(VReg, (i64, i64))>)> {
+        let budget = entry["budget"].as_u64().unwrap() as usize;
+        let real = entry.get("semantics").and_then(|s| s.as_str()) == Some("real");
+        let mut list: Vec<(VReg, i32, i32)> = Vec::new();
+        let mut id = 0u32;
+        for row in entry["values"].as_array().unwrap() {
+            let r: Vec<i64> = row.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+            let (start, end, size, count) = (r[0] as i32, r[1] as i32, r[2] as usize, r[3]);
+            if size != 1 && size != VLEN {
+                return None;
+            }
+            for _ in 0..count {
+                id += 1;
+                let vreg = if size == VLEN { VReg::vector(id) } else { VReg::scalar(id) };
+                list.push((vreg, start, if real { end } else { end + 1 }));
+            }
+        }
+        Some((budget, sorted_intervals(&list)))
+    }
+
+    fn counterexamples() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../verification/allocation_counterexamples.json"))
+            .expect("verification/allocation_counterexamples.json parses")
+    }
+
+    /// C1 is false: each counterexample passes the per-cycle word check, has no layout (proved
+    /// in the proofs PR), and is rejected by the pool condition `8*max_v + max_s <= budget`
+    /// (which the two-pass allocator meets whenever it holds, so it must fail here); our
+    /// allocator cannot fit it either.
+    #[test]
+    fn test_c1_counterexamples_pass_words_fail_pools() {
+        let file = counterexamples();
+        let mut checked = 0;
+        for entry in file["c1_counterexamples"].as_array().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            let Some((budget, iv)) = counterexample_spans(entry) else { continue };
+            let config = AddressAssignConfig { budget, start_addr: 0, ..Default::default() };
+            let peaks = peaks_of(&iv, &config);
+            assert!(peaks.words <= budget, "{}: per-cycle peak {} > {}", name, peaks.words, budget);
+            assert!(peaks.split_words() > budget, "{}: pools accepts ({:?})", name, peaks);
+            let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+            assert_no_span_conflicts(&iv, &addrs);
+            assert!(top_addr(&addrs) as usize > budget, "{}: fits, but no layout should exist", name);
+            checked += 1;
+        }
+        assert!(checked >= 3, "expected the {{1, 8}} counterexamples, checked {}", checked);
+    }
+
+    /// The greedy-allocator failures of the proofs PR, run through the two-pass allocator:
+    /// it never needs more than `8*max_v + max_s` words, so wherever that fits the budget it
+    /// places them (several of these defeat one-pass first fit).
+    #[test]
+    fn test_greedy_failure_cases_fit_two_pass_when_pools_fit() {
+        let file = counterexamples();
+        for entry in file["greedy_failures"].as_array().unwrap() {
+            let Some((budget, iv)) = counterexample_spans(entry) else { continue };
+            let config = AddressAssignConfig { budget, start_addr: 0, ..Default::default() };
+            let peaks = peaks_of(&iv, &config);
+            let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+            assert_no_span_conflicts(&iv, &addrs);
+            let used = top_addr(&addrs) as usize;
+            assert!(used <= peaks.split_words(), "{:?}: {} > split {}", entry["demonstrates"], used, peaks.split_words());
+            if peaks.split_words() <= budget {
+                assert!(used <= budget, "{:?}: pools fit but allocation does not", entry["demonstrates"]);
+            }
+        }
+    }
+
+    /// Finding 4 of docs/ALLOCATION_CONJECTURES.md (the one-pass scan stopped expiring at the
+    /// first entry it could not free, so a point interval at the heap head kept later-ending
+    /// words busy) does not apply to the two-pass allocator: its expiry condition is the same
+    /// for every entry (`span end < start`), so a min-heap pops exactly the expired ones. The
+    /// doc's two-word example, one-word intervals [0,0], [0,1], [1,1], [1,2], fits in 2 words.
+    #[test]
+    fn test_two_pass_expiry_is_not_blocked_by_point_interval_at_heap_head() {
+        let s: Vec<VReg> = (1..=4).map(VReg::scalar).collect();
+        let iv = sorted_intervals(&[(s[0], 0, 0), (s[1], 0, 1), (s[2], 1, 1), (s[3], 1, 2)]);
+        let config = AddressAssignConfig { budget: 2, start_addr: 0, ..Default::default() };
+        let addrs = assign_two_pass(&iv, &config, SlotChoice::MostRecentlyFreed);
+        assert_no_span_conflicts(&iv, &addrs);
+        assert_eq!(top_addr(&addrs), 2);
+    }
+
+    /// `compute_peak_liveness` uses the allocator's rule: a point interval `[3,3]` and a value
+    /// written at 3 are both live at 3 (the old sweep expired the point first: 8, not 16).
+    #[test]
+    fn test_peak_liveness_counts_point_interval_with_same_cycle_writer() {
+        let (pt, w) = (VReg::vector(1), VReg::vector(2));
+        let intervals: HashMap<VReg, LiveInterval> =
+            [(pt, LiveInterval::new(3, 3)), (w, LiveInterval::new(3, 5))].into_iter().collect();
+        assert_eq!(compute_peak_liveness(&intervals), 16);
+        // Same-cycle reuse after a read still counts once.
+        let handoff: HashMap<VReg, LiveInterval> =
+            [(pt, LiveInterval::new(0, 3)), (w, LiveInterval::new(3, 5))].into_iter().collect();
+        assert_eq!(compute_peak_liveness(&handoff), 8);
     }
 }

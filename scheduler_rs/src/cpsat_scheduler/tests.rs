@@ -2344,6 +2344,73 @@ mod ssa_tests {
             cse_group_results: None,
         }).unwrap();
     }
+
+    /// Scratch model `pools`: the CP-SAT solution keeps `8 * max_v + max_s` within the budget
+    /// under address assignment's own liveness, with write groups (gathers assembled lane by
+    /// lane) counted as one vector from their first lane write, so address assignment fits it.
+    /// With the hint from a greedy run the hint must be complete (every new variable hinted).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_scratch_pools_solution_allocates_within_budget() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+
+        let mut emit = SsaEmitContext::new();
+        let a = emit.emit_const(64);
+        let k = emit.emit_const(5);
+        let b = emit.emit_vbroadcast(k);
+        for g in 0..4 {
+            let (group, lanes) = emit.fresh_vector_group();
+            for lane in &lanes {
+                emit.emit_load_into(a, *lane);
+            }
+            let user = emit.emit_valu(Opcode::Xor, group, b);
+            emit.emit_vstore_imm(300 + 8 * g, user);
+        }
+        let groups = emit.take_vector_group_lanes();
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, Some(&groups));
+
+        let budget = 34usize;
+        let solution = schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                deterministic_time_limit: Some(0.5),
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: budget,
+                scratch_pools: true,
+                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                ..Default::default()
+            },
+            SsaCpsatHints { vector_group_lanes: Some(&groups), ..Default::default() },
+            None,
+        )
+        .expect("solve")
+        .expect("a schedule within the pools exists (one group at a time)");
+
+        let mut scheduled = emit.ops.clone();
+        for (op, &c) in scheduled.iter_mut().zip(&solution.cycle_assignments) {
+            op.cycle = c;
+        }
+        let config = AddressAssignConfig {
+            budget: budget + 1, // address 0 reserved: `budget` assignable words
+            vector_group_lanes: groups.clone(),
+            scratch_pools: true,
+            ..Default::default()
+        };
+        let assigned = assign_addresses(&scheduled, &config).unwrap();
+        let peaks = assigned.pool_peaks.clone().unwrap();
+        assert!(
+            peaks.split_words() <= budget && !assigned.budget_exceeded,
+            "pools solution needs 8*{} + {} = {} words of {} (max_addr {})",
+            peaks.vectors,
+            peaks.scalars,
+            peaks.split_words(),
+            budget,
+            assigned.max_addr
+        );
+    }
 }
 
 
