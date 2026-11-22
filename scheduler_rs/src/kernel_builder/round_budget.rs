@@ -267,10 +267,14 @@ pub fn live_in_for_section_filtered(
         }
     }
 
-    last_use
+    // Sorted: the per-section CP-SAT model creates one interval per entry in this order, and
+    // HashMap order differs between processes (same options, different model).
+    let mut live_in: Vec<(VReg, usize)> = last_use
         .into_iter()
         .map(|(vreg, (filtered_idx, _))| (vreg, filtered_idx))
-        .collect()
+        .collect();
+    live_in.sort();
+    live_in
 }
 
 /// VRegs defined in section `section_k` whose last use is in a later section.
