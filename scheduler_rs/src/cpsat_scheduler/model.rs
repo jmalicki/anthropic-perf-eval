@@ -460,9 +460,17 @@ pub fn schedule_ssa_cpsat(
     let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
     let eliminate_vbroadcast_hints = hints.eliminate_vbroadcast_hints;
-    let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
+    // An incoming value read here and again later is already charged for the entire
+    // section. Use only the other incoming values for last-reader intervals and hints.
+    // Preserve Some(empty) because it still identifies a section solve.
+    let entry_reads = hints.initial_live.map(|inputs| {
+        inputs.iter().copied()
+            .filter(|(vreg, _)| !live_through_vregs.is_some_and(|values| values.contains(vreg)))
+            .collect::<Vec<_>>()
+    });
+    let initial_live = entry_reads.as_deref();
     let cse_groups = hints.cse_groups;
     let start_time = std::time::Instant::now();
     let n = ops.len();
@@ -2098,6 +2106,12 @@ pub fn schedule_ssa_cpsat(
             let mut pool_group_lanes: std::collections::BTreeMap<VReg, Vec<(IntVar, LinearExpr, usize, Option<i32>)>> =
                 std::collections::BTreeMap::new();
 
+            // Group ends are expressed as last-read ends for scratch_interval. In phase
+            // mode it subtracts one from such ends; a lane held through the section keeps
+            // the final write slot, so compensate before taking the maximum over lanes.
+            let group_live_out_offset = i32::from(scratch_time == ScratchTime::Phase);
+            let hinted_segment_end = greedy_hints.map(|h| h.iter().copied().max().unwrap_or(0) + 1);
+
             // =========================================================================
             // CP-SAT LIVENESS MODEL: Matches Address Assignment Logic
             // =========================================================================
@@ -2235,18 +2249,13 @@ pub fn schedule_ssa_cpsat(
 
                 size_vars.push((size, def_idx, last_use_idx));
                 if let Some(group) = pool_group_of_lane.get(vreg) {
-                    // Pools: counted in the group's vector interval (built below).
-                    let end_hint = greedy_hints.map(|h| {
-                        hinted_live_end.get(vreg).copied().unwrap_or_else(|| {
-                            h.get(last_use_idx).copied().unwrap_or(0) + 1
-                        })
-                    });
-                    pool_group_lanes.entry(*group).or_default().push((
-                        start,
-                        end_for_interval,
-                        def_idx,
-                        end_hint,
-                    ));
+                    let (group_end, end_hint) = if is_live_out {
+                        (end_for_interval + i64::from(group_live_out_offset),
+                         hinted_segment_end.map(|e| e + group_live_out_offset))
+                    } else {
+                        (end_for_interval, hinted_live_end.get(vreg).copied())
+                    };
+                    pool_group_lanes.entry(*group).or_default().push((start, group_end, def_idx, end_hint));
                     continue;
                 }
                 let interval = scratch_interval(
@@ -2264,6 +2273,65 @@ pub fn schedule_ssa_cpsat(
                 // Demand = size of VReg (1 for scalar, VLEN for vector)
                 let demand = vreg.size() as i64;
                 scratch_demands.push(demand);
+            }
+
+            // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
+            // These VRegs are not in live_vregs (because vreg_last_use only includes uses within the segment),
+            // but they must be accounted for in scratch since they're live until segment end.
+            if let Some(lo) = live_out_vregs {
+                if let Some(seg_end) = segment_end_var {
+                    let mut lo: Vec<&VReg> = lo.iter().collect();
+                    lo.sort();
+                    for vreg in lo {
+                        // Only add if not already processed (not in live_vregs)
+                        if !live_vregs.contains(vreg) {
+                            // This VReg is defined in segment but only used after
+                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                let start = times[def_idx].issue();
+                                let end_expr = LinearExpr::from(seg_end) + 1;
+                                if let Some(group) = pool_group_of_lane.get(vreg) {
+                                    pool_group_lanes.entry(*group).or_default().push((
+                                        start,
+                                        end_expr + i64::from(group_live_out_offset),
+                                        def_idx,
+                                        hinted_segment_end.map(|e| e + group_live_out_offset),
+                                    ));
+                                    continue;
+                                }
+                                let size = model.new_int_var_with_name(
+                                    [(1, horizon + 1)],
+                                    format!("live_out_size_{}", vreg.id),
+                                );
+                                // Hint: size = seg_end - def_cycle + 1 (live until segment end)
+                                if let Some(hints) = greedy_hints {
+                                    if def_idx < hints.len() {
+                                        let def_cycle = hints[def_idx];
+                                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
+                                        let size_hint = (seg_end_hint - def_cycle + 1).max(1);
+                                        model.add_hint(size, size_hint as i64);
+                                    }
+                                }
+                                let c = model.add_eq(
+                                    LinearExpr::from(start) + LinearExpr::from(size),
+                                    end_expr.clone(),
+                                );
+                                model.set_constraint_name(c, &format!("scratch_live_out_size_{}", vreg.id));
+                                let interval = scratch_interval(
+                                    &mut model,
+                                    scratch_time,
+                                    LinearExpr::from(start),
+                                    LinearExpr::from(size),
+                                    end_expr,
+                                    ScratchFrom::Write,
+                                    ScratchTo::SegmentEnd,
+                                    None,
+                                );
+                                scratch_intervals.push(interval);
+                                scratch_demands.push(vreg.size() as i64);
+                            }
+                        }
+                    }
+                }
             }
 
             // Pools: one vector interval per write group, [min lane start, max lane end).
@@ -2319,56 +2387,6 @@ pub fn schedule_ssa_cpsat(
                     model.add_hint(g_end, end_hint as i64);
                     model.add_hint(g_size, (end_hint - start_hint) as i64);
                     pool_group_hints.push((start_hint, end_hint));
-                }
-            }
-
-            // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
-            // These VRegs are not in live_vregs (because vreg_last_use only includes uses within the segment),
-            // but they must be accounted for in scratch since they're live until segment end.
-            if let Some(lo) = live_out_vregs {
-                if let Some(seg_end) = segment_end_var {
-                    let mut lo: Vec<&VReg> = lo.iter().collect();
-                    lo.sort();
-                    for vreg in lo {
-                        // Only add if not already processed (not in live_vregs)
-                        if !live_vregs.contains(vreg) {
-                            // This VReg is defined in segment but only used after
-                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let start = times[def_idx].issue();
-                                let end_expr = LinearExpr::from(seg_end) + 1;
-                                let size = model.new_int_var_with_name(
-                                    [(1, horizon + 1)],
-                                    format!("live_out_size_{}", vreg.id),
-                                );
-                                // Hint: size = seg_end - def_cycle + 1 (live until segment end)
-                                if let Some(hints) = greedy_hints {
-                                    if def_idx < hints.len() {
-                                        let def_cycle = hints[def_idx];
-                                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
-                                        let size_hint = (seg_end_hint - def_cycle + 1).max(1);
-                                        model.add_hint(size, size_hint as i64);
-                                    }
-                                }
-                                let c = model.add_eq(
-                                    LinearExpr::from(start) + LinearExpr::from(size),
-                                    end_expr.clone(),
-                                );
-                                model.set_constraint_name(c, &format!("scratch_live_out_size_{}", vreg.id));
-                                let interval = scratch_interval(
-                                    &mut model,
-                                    scratch_time,
-                                    LinearExpr::from(start),
-                                    LinearExpr::from(size),
-                                    end_expr,
-                                    ScratchFrom::Write,
-                                    ScratchTo::SegmentEnd,
-                                    None,
-                                );
-                                scratch_intervals.push(interval);
-                                scratch_demands.push(vreg.size() as i64);
-                            }
-                        }
-                    }
                 }
             }
 
@@ -2867,7 +2885,7 @@ pub fn schedule_ssa_cpsat(
                     }
                     if let Some(lo) = live_out_vregs {
                         for vreg in lo {
-                            if !live_vregs.contains(vreg) {
+                            if !pool_group_of_lane.contains_key(vreg) && !live_vregs.contains(vreg) {
                                 if let Some(&def_idx) = vreg_def_op.get(vreg) {
                                     push(
                                         at_write(hints.get(def_idx).copied().unwrap_or(0)),

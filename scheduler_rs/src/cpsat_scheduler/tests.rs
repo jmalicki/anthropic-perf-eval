@@ -2243,6 +2243,145 @@ mod ssa_tests {
         }
     }
 
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_live_through_without_incoming_reads() {
+        let mut emit = SsaEmitContext::new();
+        let result = emit.emit_vload_imm(0);
+        let incoming = VReg::vector(200);
+        let live_out = [result].into_iter().collect();
+        let live_through = [incoming].into_iter().collect();
+        for pools in [false, true] {
+            for budget in [15, 16] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        verbose: false,
+                        scratch_budget: budget,
+                        scratch_pools: pools,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&[]),
+                        live_out_vregs: Some(&live_out),
+                        live_through_vregs: Some(&live_through),
+                        ..Default::default()
+                    },
+                    Some(false),
+                ).expect("solve");
+                assert_eq!(solution.is_some(), budget >= 16);
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_pooled_lane_live_out() {
+        let mut emit = SsaEmitContext::new();
+        let addr = emit.emit_const(64);
+        let (group, lanes) = emit.fresh_vector_group();
+        for lane in &lanes {
+            emit.emit_load_into(addr, *lane);
+        }
+        let result = emit.emit_valu(Opcode::Xor, group, group);
+        // The XOR reads the gathered vector at the last cycle and writes its result.
+        // A later section reads one of its lanes, so the whole contiguous block survives.
+        let live_out = [result, lanes[0]].into_iter().collect();
+        let groups = emit.take_vector_group_lanes();
+        let defs = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &defs, emit.zero_vreg, Some(&groups));
+        for budget in [9, 17] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: budget,
+                    scratch_pools: true,
+                    enable_valu_shift: false,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&[]),
+                    live_out_vregs: Some(&live_out),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert_eq!(solution.is_some(), budget >= 17);
+        }
+    }
+
+    /// With no local reads, eight lanes escaping together occupy one vector pool slot.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_unread_pooled_lanes() {
+        let mut emit = SsaEmitContext::new();
+        let addr = emit.emit_const(64);
+        let (_, lanes) = emit.fresh_vector_group();
+        for lane in &lanes {
+            emit.emit_load_into(addr, *lane);
+        }
+        let live_out = lanes.iter().copied().collect();
+        let groups = emit.take_vector_group_lanes();
+        let defs = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &defs, emit.zero_vreg, Some(&groups));
+        for budget in [8, 9] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: budget,
+                    scratch_pools: true,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    // One address load followed by four pairs of lane loads.
+                    greedy_hints: Some(&[0, 1, 1, 2, 2, 3, 3, 4, 4]),
+                    initial_live: Some(&[]),
+                    live_out_vregs: Some(&live_out),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert_eq!(solution.is_some(), budget >= 9);
+        }
+    }
+
+    /// A vector is loaded before the section and stored both within it and afterwards.
+    /// Its entry and exit metadata refer to one resident vector.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_reads_live_through_once() {
+        let mut emit = SsaEmitContext::new();
+        let value = emit.emit_vload_imm(16);
+        emit.emit_vstore_imm(32, value);
+        emit.emit_vstore_imm(48, value);
+        let live_through = [value].into_iter().collect();
+        for pools in [false, true] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops[1..2],
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: 8,
+                    scratch_pools: pools,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&[(value, 0)]),
+                    live_through_vregs: Some(&live_through),
+                    greedy_hints: Some(&[0]),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert!(solution.is_some(), "one 8-word vector fits the section budget");
+        }
+    }
+
     /// A live-in decomposed vector is live until the last reader of the vector or of any of
     /// its lanes: `early` reads `v`, `late` reads a lane of `v` after a chain whose widest
     /// point holds 24 words, so `v` (8 words) is live across it and 28 words do not suffice.
