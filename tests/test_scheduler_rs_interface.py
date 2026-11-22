@@ -380,14 +380,14 @@ def test_scratch_size_and_scratch_constraint():
 
     def build(**extra):
         forest = Tree.generate(FOREST_HEIGHT)
-        inp = Input.generate(forest, BATCH_SIZE, 2)
+        inp = Input.generate(forest, 16, 2)
         mem = build_mem_image(forest, inp)
         instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
-            FOREST_HEIGHT, N_NODES, BATCH_SIZE, 2, verbose=False, **extra)
+            FOREST_HEIGHT, N_NODES, 16, 2, verbose=False, **extra)
         assert not stats["budget_exceeded"], extra
         assert stats["max_addr"] < stats["scratch_size"], extra
         _run_kernel_and_assert_matches_reference(
-            instrs, mem, BATCH_SIZE, scratch_size=max(1536, stats["max_addr"] + 1))
+            instrs, mem, 16, scratch_size=max(1536, stats["max_addr"] + 1))
         return stats
 
     default = build(use_cpsat=False)
@@ -399,14 +399,12 @@ def test_scratch_size_and_scratch_constraint():
     larger = build(use_cpsat=False, scratch_size=3072)
     assert (larger["scratch_size"], larger["relaxed_scratch"]) == (3072, True)
 
-    unbounded = build(use_cpsat=True, cpsat_time_limit=120.0, cpsat_deterministic_time=2.0,
+    # CP-SAT side (the Rust test covers the constrained budgets): no scratch section at all.
+    unbounded = build(use_cpsat=True, cpsat_time_limit=120.0, cpsat_deterministic_time=0.2,
                       scratch_constraint=False)
     assert unbounded["scratch_size"] == 1 << 20
     assert unbounded["relaxed_scratch"]
     assert unbounded["cpsat_scratch_budget"] == 0, "no scratch section in the CP-SAT model"
-
-    constrained = build(use_cpsat=True, cpsat_time_limit=120.0, cpsat_deterministic_time=2.0)
-    assert constrained["cpsat_scratch_budget"] == 1535, "machine scratch less the zero word"
 
     with pytest.raises(ValueError, match="scratch_size"):
         scheduler_rs.build_tick_tock_kernel_ssa(

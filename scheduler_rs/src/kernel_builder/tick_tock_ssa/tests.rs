@@ -2437,7 +2437,7 @@ fn test_scratch_settings_budgets() {
 /// The greedy and address assignment use `scratch_size`. A headroom of 1,500 words leaves 35
 /// words of the machine's scratch and fails (`test_greedy_budget_error_reports_headroom_adjusted_budget`);
 /// on a 3,072-word scratch the same headroom leaves 1,571 and succeeds, and the allocator
-/// reports 3,072 as its budget. A smaller size is honoured too: the greedy fails against it.
+/// reports 3,072 as its budget. A smaller size is honoured too: the build fails against it.
 #[test]
 fn test_scratch_size_reaches_greedy_and_address_assignment() {
     let mut config = KernelConfig::new(10, 2047, 16, 2);
@@ -2456,11 +2456,15 @@ fn test_scratch_size_reaches_greedy_and_address_assignment() {
     let error = SsaTickTockKernelBuilder::new(config)
         .build_and_schedule()
         .expect_err("100 words cannot hold this kernel");
+    // Both accountings trip; address assignment's is reported, with the configured size.
     match error {
+        KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::AddressLiveness, .. } => {
+            assert_eq!(budget, 100);
+        }
         KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::GreedyScheduler { .. }, .. } => {
             assert_eq!(budget, effective_scratch_budget(100, true));
         }
-        other => panic!("expected the greedy scheduler's budget error, got {:?}", other),
+        other => panic!("expected a scratch budget error against 100 words, got {:?}", other),
     }
 }
 
