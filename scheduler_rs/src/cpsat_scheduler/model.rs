@@ -483,9 +483,17 @@ pub fn schedule_ssa_cpsat(
     let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
     let eliminate_vbroadcast_hints = hints.eliminate_vbroadcast_hints;
-    let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
+    // An incoming value read here and again later is already charged for the entire
+    // section. Use only the other incoming values for last-reader intervals and hints.
+    // Preserve Some(empty) because it still identifies a section solve.
+    let entry_reads = hints.initial_live.map(|inputs| {
+        inputs.iter().copied()
+            .filter(|(vreg, _)| !live_through_vregs.is_some_and(|values| values.contains(vreg)))
+            .collect::<Vec<_>>()
+    });
+    let initial_live = entry_reads.as_deref();
     let cse_groups = hints.cse_groups;
     let start_time = std::time::Instant::now();
     let n = ops.len();

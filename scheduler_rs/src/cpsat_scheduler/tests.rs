@@ -2351,6 +2351,37 @@ mod ssa_tests {
         }
     }
 
+    /// A vector is loaded before the section and stored both within it and afterwards.
+    /// Its entry and exit metadata refer to one resident vector.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_reads_live_through_once() {
+        let mut emit = SsaEmitContext::new();
+        let value = emit.emit_vload_imm(16);
+        emit.emit_vstore_imm(32, value);
+        emit.emit_vstore_imm(48, value);
+        let live_through = [value].into_iter().collect();
+        for pools in [false, true] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops[1..2],
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: 8,
+                    scratch_pools: pools,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&[(value, 0)]),
+                    live_through_vregs: Some(&live_through),
+                    greedy_hints: Some(&[0]),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert!(solution.is_some(), "one 8-word vector fits the section budget");
+        }
+    }
+
     /// A live-in decomposed vector is live until the last reader of the vector or of any of
     /// its lanes: `early` reads `v`, `late` reads a lane of `v` after a chain whose widest
     /// point holds 24 words, so `v` (8 words) is live across it and 28 words do not suffice.
