@@ -72,6 +72,8 @@ greedy_policy_*.json
 
 # Catch-all for JSON artifacts not covered above
 *.json
+# Checked-in data used by the proofs and tests
+!verification/*.json
 
 # Investigation / root-cause output
 artifacts/

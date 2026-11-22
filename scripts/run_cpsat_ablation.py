@@ -34,6 +34,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import re
 import shlex
 import statistics
@@ -78,6 +79,11 @@ STANDARD_CONFIGS = [
     ("propagators-all", "--cpsat-cumulative-propagators all --cpsat-ttef-max-intervals 1000000"),
     # 6. Redundant rows
     ("no-redundant-rows", "--disable-cpsat-constraints conditional_makespan,flow_cumulative"),
+    # 7. LP and presolve levels, makespan rows (section 9 of docs/CPSAT_CONFIG_ABLATION.md)
+    ("linearization-1", "--cpsat-linearization-level 1"),
+    ("probing-0", "--cpsat-probing-level 0"),
+    ("makespan-rows-static", "--cpsat-makespan-rows static"),
+    ("makespan-rows-bucketed", "--cpsat-makespan-rows bucketed"),
 ]
 
 
@@ -225,6 +231,66 @@ def parse_last_bound_time(solve_log: str) -> float | None:
     return float(times[-1]) if times else None
 
 
+# Full-problem subsolvers that run the LP. Those in LP_SUBSOLVERS_OWN_LEVEL set a nonzero
+# linearization level themselves; those in LP_SUBSOLVERS_INHERIT take the base
+# linearization_level (OR-Tools 9.15, cp_model_search.cc), so they run no LP at level 0.
+# "*_no_lp" variants are never LP workers. (pseudo_costs and reduced_costs are listed as
+# setting their own level without having been checked against the source.)
+LP_SUBSOLVERS_OWN_LEVEL = ("default_lp", "max_lp", "max_lp_sym", "reduced_costs", "pseudo_costs",
+                           "core_default_lp", "core_max_lp", "objective_lb_search", "objective_lb_search_max_lp",
+                           "objective_shaving", "objective_shaving_max_lp", "lb_tree_search", "probing",
+                           "probing_max_lp", "variables_shaving", "variables_shaving_max_lp", "fixed_max_lp",
+                           "quick_restart_max_lp")
+LP_SUBSOLVERS_INHERIT = ("fixed", "quick_restart")
+
+
+def lp_subsolvers(solve_log: str) -> tuple:
+    """LP subsolvers of a solve, given its base linearization level (from the Parameters line)."""
+    match = re.search(r"^Parameters:.*\blinearization_level: (\d+)", solve_log, re.MULTILINE)
+    level = int(match.group(1)) if match else 1  # CP-SAT's own default when not printed
+    return LP_SUBSOLVERS_OWN_LEVEL + (LP_SUBSOLVERS_INHERIT if level > 0 else ())
+
+
+def parse_bounds(solve_log: str, scale: int) -> dict:
+    """Makespan lower bounds from the '#Bound' lines: after presolve ('initial_domain'), the
+    first one an LP subsolver proved, and the last one.
+
+    Lines look like '#Bound  77.67s best:140054225 next:[94082342,140054224] max_lp_sym'. The
+    lower end of 'next' is an objective bound, read as a makespan the way the scheduler does
+    (floor(ceil(bound) / scale)).
+    """
+    out = {}
+    lp = lp_subsolvers(solve_log)
+    for match in re.finditer(r"^#Bound\s+([\d.]+)s\s+best:\S+\s+next:\[(-?[\d.e+]+),\S*\]\s+(\S+)", solve_log, re.MULTILINE):
+        wall, lower, worker = float(match.group(1)), float(match.group(2)), match.group(3)
+        makespan = int(math.ceil(lower - 1e-6)) // scale
+        if worker == "initial_domain":
+            out.setdefault("bound_presolve", makespan)
+        elif worker in lp and "bound_first_lp" not in out:
+            out["bound_first_lp"] = makespan
+            out["bound_first_lp_wall"] = wall
+        out["bound_last"] = makespan
+    return out
+
+
+_DURATION = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _seconds(text: str) -> float:
+    match = re.fullmatch(r"([\d.]+)(ns|us|ms|s|m|h)", text.strip())
+    return float(match.group(1)) * _DURATION[match.group(2)] if match else float("nan")
+
+
+def parse_task_dtime(solve_log: str) -> dict:
+    """Per subsolver of the 'Task timing' table: (tasks, longest task's deterministic time)."""
+    out = {}
+    block = solve_log[solve_log.rfind("Task timing"):] if "Task timing" in solve_log else ""
+    for match in re.finditer(r"^\s+'([\w]+)':\s+(\d+) \[.*?\]\s+\S+\s+\S+\s+\S+\s+(\d+) \[\s*(\S+),\s*(\S+)\]",
+                             block, re.MULTILINE):
+        out[match.group(1)] = (int(match.group(3)), _seconds(match.group(5)))
+    return out
+
+
 def parse_subsolvers(solve_log: str) -> list:
     match = re.search(r"^\d+ full problem subsolvers: \[(.*)\]$", solve_log, re.MULTILINE)
     return [name.strip() for name in match.group(1).split(",")] if match else []
@@ -238,6 +304,8 @@ def analyse_run(log: str, schedule_path: Path, returncode: int, elapsed: float) 
     scales = re.findall(r"Objective:\s*scale=(\d+)", solve_log)
     scale = int(scales[-1]) if scales else 1
     incumbents = parse_incumbents(solve_log, scale)
+    tasks = parse_task_dtime(solve_log)
+    lp_tasks = {name: dtime for name, (n, dtime) in tasks.items() if name in lp_subsolvers(solve_log)}
     result = {
         "returncode": returncode,
         "elapsed_secs": round(elapsed, 1),
@@ -252,6 +320,13 @@ def analyse_run(log: str, schedule_path: Path, returncode: int, elapsed: float) 
         "proved": "PROVED - every store matches the SSA program" in log,
         "passed": _parse_validation(log) is True,
         "hint_complete": "The solution hint is complete and is feasible" in solve_log,
+        "first_incumbent_wall": incumbents[0][0] if incumbents else None,
+        "first_improvement_wall": incumbents[1][0] if len(incumbents) > 1 else None,
+        # Longest single task of an LP subsolver (deterministic time); with one task per LP
+        # worker in a short solve this is its first task.
+        "lp_longest_task_dtime": round(max(lp_tasks.values()), 2) if lp_tasks else None,
+        "lp_longest_task_worker": max(lp_tasks, key=lp_tasks.get) if lp_tasks else None,
+        **parse_bounds(solve_log, scale),
     }
     greedy = re.search(r"\(greedy was (\d+)\)", log)
     result["greedy_cycles"] = int(greedy.group(1)) if greedy else None

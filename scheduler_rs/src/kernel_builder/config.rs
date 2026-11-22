@@ -21,11 +21,7 @@ pub const HASH_STAGES: [(char, i64, char, char, i64); 6] = [
 /// Stage 5 XOR constant used for optimization
 pub const STAGE5_XOR_CONST: i64 = 0xB55A4F09;
 
-/// Vector length for SIMD operations
-pub const VLEN: usize = 8;
-
-/// Maximum scratch space available
-pub const SCRATCH_SIZE: usize = 1536;
+pub use crate::architecture::anthropic_perf_eval::{SCRATCH_SIZE, VLEN};
 
 /// Maximum tree depth for which we have tree-reduce emission (depth 4 = 16-way).
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
@@ -84,8 +80,9 @@ pub enum CachedSelect {
     Standard,
     /// Binary tree of `2^d - 1` two-way selects driven by the branch bits. The `2^(d-1)`
     /// leaf selects are multiply_adds with a precomputed delta; the selects above them are
-    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Uses the flow engine exactly
-    /// as much as `Standard` does.
+    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Per group that is 0, 1, 3 and 7
+    /// `SelectChoice`s at depths 1 to 4, against `Standard`'s 1, 3, 3 and 7: fewer choices that
+    /// can go to the flow engine at depths 1 and 2, the same at depths 3 and 4.
     Bits,
     /// As `Bits`, but the leaf selects are `SelectChoice`s too (flow `vselect`, or one
     /// multiply_add): every select can go to the flow engine, which gives the lowest
@@ -123,10 +120,13 @@ impl CachedSelect {
 /// The newest bit (the round just before the select) always comes straight from the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectBitSource {
-    /// Extract the older bits from the index as it was before the last update
-    /// (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth `d >= 2`
-    /// (one more to mirror a zero-based index at depth `d >= 3`), and no bit vector stays
-    /// live across rounds. Proof: `R15-bits-from-index`.
+    /// Extract the older bits used at depths 3 and 4 from the index as it was before the
+    /// last update (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth
+    /// `d >= 3` (one more to mirror a zero-based index), so those bits are not kept live. Two
+    /// bits still are: the newest bit, from the branch until the next cached select, and at
+    /// depth 2 the depth-0 bit, which the select reads directly. With the mirrored index that
+    /// bit is the index itself (no extra scratch); with the zero-based index it is a separate
+    /// vector, live for one more round. Proof: `R15-bits-from-index`.
     #[default]
     Index,
     /// Keep every branch bit live until the select: no extraction ops, but 8 scratch words
@@ -498,6 +498,48 @@ pub enum PressurePolicyKind {
     Cascade,
 }
 
+/// What the schedulers' scratch budget bounds.
+///
+/// `Words` (default): live words at every point of the schedule (greedy counter, CP-SAT
+/// cumulative over all values). That does not guarantee addresses: for values of 1 and 8
+/// words, a per-point fit does not imply a layout exists (docs/ALLOCATION_CONJECTURES.md).
+/// `Pools`: `8 * max_v + max_s <= budget`, `max_v` / `max_s` the most vectors / scalars live
+/// at once over the schedule. Address assignment (`address_assign::assign_two_pass`) always
+/// fits such a schedule in `8 * max_v + max_s` words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScratchModel {
+    /// Live words at every point (default).
+    #[default]
+    Words,
+    /// Separate vector and scalar maxima, `8 * max_v + max_s <= budget`.
+    Pools,
+}
+
+impl ScratchModel {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"words"` or `"pools"`
+    ///
+    /// # Returns
+    /// The model, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "words" => Ok(ScratchModel::Words),
+            "pools" => Ok(ScratchModel::Pools),
+            other => Err(format!(
+                "Invalid scratch_model '{}': must be 'words' or 'pools'",
+                other
+            )),
+        }
+    }
+
+    /// True for `Pools`.
+    pub fn is_pools(self) -> bool {
+        self == ScratchModel::Pools
+    }
+}
+
 /// How round barriers constrain the greedy scheduler.
 ///
 /// Emission puts a barrier pseudo-op between rounds. With `Round`, every op of round r+1
@@ -678,6 +720,8 @@ pub struct CompilerConfig {
     /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
     /// carry one cycle per op.
     pub greedy_split_shift: bool,
+    /// What the scratch budget bounds in both schedulers (default: `Words`).
+    pub scratch_model: ScratchModel,
 }
 
 impl Default for CompilerConfig {
@@ -699,6 +743,7 @@ impl Default for CompilerConfig {
             greedy_split_shift: false,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
+            scratch_model: ScratchModel::default(),
         }
     }
 }
@@ -764,6 +809,8 @@ impl CompilerConfig {
                 },
             },
             split_shift: self.greedy_split_shift,
+            scratch_pools: self.scratch_model.is_pools(),
+            pool_caps: None,
         }
     }
 }
