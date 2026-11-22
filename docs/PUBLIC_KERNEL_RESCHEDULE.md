@@ -5,7 +5,205 @@ dependency graph and schedules those ops again. The point is to separate two que
 good is their emission (which ops, which encodings), and how good is their schedule
 (which cycle each op issues in).
 
-RESULTS_PLACEHOLDER
+## What this means
+
+**The public kernels' remaining advantage is emission, not scheduling.** All three public
+kernels sit 4 to 8 cycles (0.4 to 0.8%) above the capacity floor of their own ops. Their
+schedules are essentially optimal for their op sets: there is nothing left for a scheduler to
+win. Rescheduling their exact ops with fixed addresses, our tools reproduce their cycle
+counts but do not beat them. CP-SAT proves the 880 and 899 schedules optimal for their ops at
+their addresses (bounds 880 and 899). It proves 982 is within 3 cycles of the best possible
+schedule (bound 979). Their VALU/ALU splits are also already balanced: letting any VALU op
+move to the ALU lowers their floors by only 1 to 2 cycles (874 → 873, 895 → 893, 974 → 973).
+So the optional VALU-shift experiment on their ops has at most 2 cycles to find, and was not
+run.
+
+**Our 1,099-cycle kernel is the opposite case.** It sits 105 cycles above the floor of its own
+ops (994 with the VALU→ALU split free). That breaks into two parts:
+
+- 56 cycles of VALU/ALU imbalance. Our ALU/VALU split is fixed at emission, and with that
+  split the VALU floor is 1,050. They run far more work on the scalar ALU: 10,418 to 11,585
+  ALU ops against our 8,384, at about the same total work.
+- 49 cycles of schedule above that floor: 16 under-filled start-up cycles, a 62-cycle tail,
+  and 377 cycles below 90% of the joint VALU+ALU peak, where the public kernels have 11 to
+  28.
+
+How much of that a better schedule can recover, on our ops with the split free and addresses
+re-allocated: the CP-SAT lower bound is 1,009 cycles, so at least 15 cycles above the 994 floor are forced by the dependency structure, and at most about 90 of the 105 can be recovered by scheduling.
+
+The gap to the leaders' level is therefore mostly emission:
+
+| | ours (1,099) | 880 | difference |
+|---|---:|---:|---:|
+| vector-op equivalents | 7,343 | 6,541 | +802 (+12%) |
+| loads | 1,988 | 1,724 | +264 |
+| floor with free VALU→ALU split | 994 | 873 | +121 |
+| cycles above that floor | 105 | 7 | +98 |
+
+1,099 − 880 = 219 cycles: 121 from the floor (more ops, mostly loads and vector work) and
+98 from scheduling and the VALU/ALU split.
+
+**Does this make a CP-SAT-based design credible?** Partly.
+- As a source of proofs it works. It proved two hand-tuned 20,000-op leaderboard schedules
+  optimal: 880 in 10 s, and 899 within its budget. Its LP bound reached the capacity floor
+  for 982 (979) in a few minutes, so it can say how close a schedule is to optimal. It is also
+  exact about constraints: the same model carries exact memory aliasing, latency-0
+  anti-dependences and co-issue groups.
+- As a stand-alone improver of 20,000-op schedules at makespan granularity it is weak. It
+  never improved a warm start by a single cycle in these budgets: from the greedy's 996 for
+  982 it stayed at 996, and from 982 it stayed at 982. Construction has to come from
+  something like the public kernels' list schedulers. A plain critical-path list scheduler
+  is 4 to 5% worse (919 / 924 / 996). Replaying their issue order reproduces 880 / 899 / 982.
+- So the design that matches the evidence is: a good constructive scheduler and emission, then
+  CP-SAT for bounds, repair and local improvement.
+
+## Results
+
+### Op counts, floors, critical path
+
+Op counts are slots in the emitted kernel (our kernel's flow count includes its 2 `pause`
+bundles). Floors use `scripts/schedule_report.py`'s arithmetic, `emission_floor`:
+- "fixed": each engine on its own, with the kernel's own VALU/ALU split;
+- "shift": any VALU op other than `multiply_add` or `vbroadcast` may run as 8 ALU ops.
+
+The critical path is counted two ways:
+- "with addresses": the longest path of the full lifted graph, with the kernel's own scratch
+  addresses;
+- "values": value (read-after-write) edges only, scratch and memory.
+
+The gap is simulator cycles minus the fixed floor.
+
+| kernel | VALU | ALU | load | store | flow | vec-op eq. | floor fixed | floor shift | crit. path (addresses / values) | cycles | gap | start-up / tail | cycles < 90% fill |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 880 (Sakauma) | 5,239 | 10,418 | 1,724 | 1,591 | 843 | 6,541 | 874 | 873 | 873 / 441 | 880 | 6 | 3 / 6 | 28 |
+| 899 (Sakauma) | 5,365 | 10,655 | 1,756 | 832 | 862 | 6,697 | 895 | 893 | 866 / 195 | 899 | 4 | 5 / 3 | 11 |
+| 982 (BasicCoder) | 5,843 | 11,585 | 1,863 | 38 | 857 | 7,291 | 974 | 973 | 871 / 232 | 982 | 8 | 8 / 3 | 18 |
+| ours, PR #51 path bits | 6,295 | 8,384 | 1,988 | 64 | 866 | 7,343 | 1,050 | 994 | 1,068 / 206 | 1,099 | 49 | 16 / 62 | 377 |
+
+The binding engine is VALU+ALU for all four on the fixed floor; with the split free, ours is
+load-bound (1,988 / 2 = 994).
+
+What the critical-path columns show:
+- The 880 kernel is bound twice over. Its floor (874) and its critical path at its own
+  addresses (873) both sit within 7 cycles of its 880. Its value-only critical path (441) is
+  long because values flow through memory (store, then load).
+- Our 1,068 "with addresses" is an artifact of our pipeline: it assigns addresses after
+  scheduling, so its address reuse follows its own schedule order (see "Which treatment is
+  fair"). The relevant number for us is 206.
+
+### Rescheduling
+
+"Fixed addresses" keeps every op, encoding and scratch/memory address; the kernel is emitted
+and validated on the upstream simulator (8 random inputs, plus `./scripts/check_upstream.sh
+--kernel` for the CP-SAT and greedy outputs). "Value deps" is the value-dependency schedule
+with addresses re-allocated: a relaxation, not emitted; its CP-SAT bound holds for any
+re-allocation.
+
+Both greedy columns are our Python list scheduler; both CP-SAT columns are "CP-SAT on their
+ops" (`scripts/reschedule_kernel.py`), not our Rust SSA pipeline.
+
+| kernel | treatment | their cycles | greedy, critical-path priority | greedy, original-order priority | CP-SAT (warm start, dtime) | CP-SAT lower bound |
+|---|---|---:|---:|---:|---:|---:|
+| 880 | fixed addresses | 880 | 919 | 880 | 880 (warm start 880, dtime 100; proved optimal in 10 s) | 880 |
+| 880 | value deps | 880 | 919 | 880 | — | — |
+| 899 | fixed addresses | 899 | 924 | 899 | 899 (warm start 899, dtime 100; proved optimal, dtime 260) | 899 |
+| 899 | value deps | 899 | 1,264 | 899 | — | — |
+| 982 | fixed addresses | 982 | 996 | 982 | 982 (warm start 982, dtime 100) | 979 |
+| 982 | value deps | 982 | 1,524 | 982 | — | — |
+| ours | fixed addresses | 1,099 | 1,120 | 1,098 | — | — |
+| ours | value deps, VALU shift free | 1,099 | 1,546 | 1,098 | running | 1,009 (so far) |
+
+Notes:
+- The first 982 CP-SAT run started from the critical-path greedy (996). It ended on its
+  wall-clock backstop (5,400 s), so it is not deterministic. Its result, 996 with bound 979,
+  is reported only as context. All recorded rows use `interleave_search` and a
+  deterministic-time budget, and end on that budget.
+- The value-dependency greedy keeps the peak of live scratch words close to the kernel's own:
+  880 1,231 (own 1,230), 899 1,214 (own 1,241), 982 1,596 (own 1,503; over 1,536, so not
+  allocatable as is), ours 1,185 (own 1,033).
+
+### Memory dependencies
+
+| kernel | memory ops | ordered op pairs with a store | memory edges | word pairs Z3-proved disjoint | Z3 calls (rest decided by a sampled model) | aliasing pairs seen on 8 random inputs | of which ordered through a must-alias store | seen without ordering | edges never seen to alias |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 880 | 3,266 | 3,929,770 | 441,668 | 16 | 4,433 | 510,091 | 107,355 | 0 | 38,932 |
+| 899 | 2,480 | 1,716,832 | 23,077 | 0 | 1,828 | 23,103 | 9,483 | 0 | 9,457 |
+| 982 | 1,886 | 70,927 | 1,607 | 0 | 0 | 1,505 | 0 | 0 | 102 |
+| ours | 2,018 | 127,072 | 32 | 0 | 0 | 32 | 0 | 0 | 0 |
+
+How to read the table:
+- Pairs not listed as edges were proved disjoint, either by value sets (nearly all of them)
+  or by Z3, or they are ordered through a store that must alias both.
+- No address fell outside its value set, and every kernel's outputs matched the reference on
+  all inputs.
+- Edges never seen to alias are mostly pairs that alias only for particular branch-bit
+  combinations. In the 880 kernel many bit-addressed stores share one dead word, so they can
+  alias on any input whose bits send both there.
+
+### How the 880 and 899 kernels use main memory mid-kernel
+
+Main memory is the only place this ISA addresses by a register value. The patterns below come
+from the exact store-to-load flow of the alias analysis (`scripts/kernel_memory_use.py`). They
+are described at the level the authors describe them; no addresses or code are reproduced.
+
+1. **Tree repacking at start-up** (pattern (a)).
+   - What it does: early `vstore`s write tree values, XOR-adjusted by the deferred hash
+     constant, back into the tree region in a new layout. Later data-dependent `vload`s read
+     them.
+   - 880: 31 vstores in cycles 31 to 59, read by 771 vloads.
+   - 899: 30 vstores in cycles 52 to 109, read by 512 vloads, plus two mid-kernel vstores
+     read by 256 `load_offset`s.
+   - 982 does the same in place: 6 vstores read by its scalar gathers.
+   - Effect: one vload fetches a contiguous packet holding several candidate nodes, so one
+     load slot serves more than one round. The XOR is also folded in once, not per gather.
+   - Scratch-only equivalent: per-lane scalar gathers, one load slot per lane per level. For
+     the 880 kernel that is the difference between its 1,724 loads and the 2,000 or more a
+     scalar-gather design needs (docs/BOUND_GAP_ANALYSIS.md section 1).
+2. **Select through memory (lane bucketing by branch bit)**, the main pattern (a form of
+   (c)).
+   - What it does: for each lane, one scalar store writes a candidate value to a fixed bank
+     word. A second scalar store's address is chosen by the lane's branch bit: either the same
+     bank word (overwriting it) or a dead word. One `vload` of the bank then returns the
+     selected value for all 8 lanes as a vector. Store order within the bank decides which
+     candidate wins.
+   - 880: 464 fixed-address stores and 976 bit-addressed stores, read by 314 vloads, in cycles
+     68 to 868.
+   - 899: 384 and 384, read by 304 vloads, in cycles 66 to 525.
+   - Effect: a per-lane select, and the scalar-to-vector assembly, done by the store engine.
+     The store engine is otherwise idle (2 slots per cycle; the 880 kernel uses 90% of them).
+     The scratch-only alternative is a `vselect` on the flow engine, which is about 96% busy in
+     both kernels, or a `multiply_add` select on VALU, the binding engine.
+   - Accounting: at one vector select per 8 bit-addressed stores, about 122 selects (880) and
+     48 (899) are moved off flow and VALU, at the price of 16 store slots and one load slot
+     per vector. On the VALU that is about 16 and 6 cycles at the joint peak. The real saving
+     is larger where flow is the alternative, because flow has no slack left.
+3. **Broadcast through memory** (880 only).
+   - What it does: 8 scalar stores of one scalar (a constant or a tree value) to words 0 to 7,
+     then one vload: a `vbroadcast` without a VALU slot.
+   - Count: 76 stores, 13 vloads, all before cycle 90.
+4. **One lane permutation at the tail** (880 only; (c)).
+   - What it does: 8 stores of working values into header words and one vload realign one
+     group's lanes, as the author's notes describe.
+5. **Output stores** (all kernels): 32 `vstore`s of final values, never read back.
+
+**Spilling (pattern (b)) does not occur.** No working value is stored and reloaded long
+after.
+- The working values parked in memory at the peak are short-lived bank entries: 108 words
+  (880) and 50 (899).
+- The peak of live scratch words plus those parked working values is 1,301 (880) and 1,275
+  (899), well under 1,536. Both would fit in scratch without the round trips; the round trips
+  are there for addressing, not capacity.
+- The other parked words (260 and 256) are the repacked tree.
+
+**For our emitter:**
+- Overflow scratch is not what main memory buys here.
+- Two memory-movement primitives are worth having:
+  - a tree-repack plus packet-`vload` gather, the larger effect (loads);
+  - a store-select that uses the idle store engine for per-lane selects and lane-to-vector
+    assembly.
+- Our kernel today uses 64 store slots in 1,099 cycles, so the store engine is almost
+  entirely free.
+
 
 ## Sources and credit
 
