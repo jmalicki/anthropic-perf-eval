@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import collections
 import heapq
+from itertools import zip_longest
 import json
 import os
 import sys
@@ -132,10 +133,11 @@ def cpsat(g, hint: list[int], deterministic_time: float, time_limit: float, work
     for (s, d), lat in sorted(g.edges.items()):
         m.Add(start[d] >= start[s] + lat)
     makespan = m.NewIntVar(max(lo[i] + h[i] for i in range(g.n)), horizon, "makespan")
-    succ = g.succs()
-    for i in range(g.n):
-        if not succ[i]:
-            m.Add(makespan >= start[i] + 1)
+    # Every op reaches a sink in the condensed graph. Ops in a co-issue group
+    # have equal starts, even when each one has successors inside that group.
+    for group, successors in enumerate(c.succs):
+        if not successors:
+            m.Add(makespan >= start[c.members[group][0]] + 1)
     by_engine: dict[str, list] = collections.defaultdict(list)
     shift_vars = {}
     for i, op in enumerate(g.ops):
@@ -241,7 +243,18 @@ def main() -> int:
 
     data = json.load(open(args.kernel))
     bundles = data["instrs"] if isinstance(data, dict) else data
-    g = load_graph(args.graph) if args.graph else lift(bundles)
+    if args.graph:
+        g = load_graph(args.graph)
+        # A saved graph carries the instructions that will actually be scheduled.
+        # Verify the original cycles and slots before attributing it to this input.
+        source_ops = ((cycle, engine, slot) for cycle, bundle in enumerate(bundles)
+                      for engine, slots in bundle.items() if engine != "debug"
+                      for slot in slots)
+        cached_ops = ((op.cycle, op.engine, op.slot) for op in g.ops)
+        if any(source != cached for source, cached in zip_longest(source_ops, cached_ops)):
+            ap.error("saved graph does not match the supplied kernel's original cycles and slots")
+    else:
+        g = lift(bundles)
     original = [o.cycle for o in g.ops]
     if args.value_deps:
         if not args.graph:

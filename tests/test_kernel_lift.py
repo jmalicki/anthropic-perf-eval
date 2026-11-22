@@ -229,6 +229,42 @@ def test_swap_in_one_cycle_is_a_co_issue_group():
     assert s[2] == s[3] and check_schedule(g, s) == []
 
 
+def test_cpsat_makespan_includes_terminal_co_issue_groups(tmp_path):
+    # Seven independent swaps use 14 scalar slots. Their internal WAR edges are
+    # mutual, so no individual operation is a sink. Capacity 12 needs two cycles.
+    bundles = []
+    for base in range(0, 14, 2):
+        if base in (0, 12):
+            bundles.append({"alu": []})
+        bundles[-1]["alu"].extend([["+", base, base + 1, base + 1], ["+", base + 1, base, base]])
+    kernel = tmp_path / "swaps.json"
+    kernel.write_text(json.dumps(bundles))
+    summary = tmp_path / "summary.json"
+    subprocess.run(
+        [sys.executable, "-I", str(REPO / "scripts/reschedule_kernel.py"), str(kernel),
+         "--workers", "1", "--seeds", "0", "-q", "--json", str(summary)],
+        check=True, capture_output=True, timeout=60,
+    )
+    result = json.loads(summary.read_text())
+    assert result["cpsat"]["objective"] == result["cycles"] == 2
+
+
+def test_rescheduler_rejects_graph_for_another_kernel(tmp_path):
+    bundles = _chain_kernel()
+    path = tmp_path / "graph.json"
+    save_graph(lift(bundles), str(path))
+    kernel = tmp_path / "kernel.json"
+    command = [sys.executable, "-I", str(REPO / "scripts/reschedule_kernel.py"), str(kernel),
+               "--graph", str(path), "--scheduler", "greedy", "--seeds", "0"]
+    kernel.write_text(json.dumps(bundles))
+    subprocess.run(command, capture_output=True, check=True, timeout=60)
+    bundles[0]["load"][0][-1] += 1
+    kernel.write_text(json.dumps(bundles))
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2
+    assert "graph does not match" in result.stderr
+
+
 def test_valu_shift_emits_eight_alu_lanes():
     k = _kernel([("valu", ("vbroadcast", 16, 0))], [("valu", ("^", 24, 16, 16))])
     g = lift(k)
