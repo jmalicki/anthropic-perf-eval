@@ -2203,9 +2203,7 @@ mod ssa_tests {
         let b = emit.emit_vbroadcast_force(k0);
         emit.emit_vstore_imm(100, a);
         emit.emit_vstore_imm(108, b);
-        // A value defined in the segment, so the segment has a scratch model at all.
-        let x = emit.emit_const(1);
-        emit.emit_store_imm(116, x);
+        // Only stores remain in the section; both scratch values arrive from outside.
         let vreg_def = std::mem::take(&mut emit.vreg_def);
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
         let removed: Vec<usize> = emit
@@ -2222,7 +2220,7 @@ mod ssa_tests {
             emit.ops.iter().position(|o| o.srcs.iter().any(|s| s.as_vreg() == Some(v))).unwrap()
         };
         let initial_live = vec![(a, reader(a)), (b, reader(b))];
-        let solve = |budget: usize| {
+        let solve = |budget: usize, scratch_pools: bool| {
             schedule_ssa_cpsat(
                 &emit.ops,
                 SsaCpsatConfig {
@@ -2230,6 +2228,7 @@ mod ssa_tests {
                     verbose: false,
                     enable_valu_shift: false,
                     scratch_budget: budget,
+                    scratch_pools,
                     asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
                     ..Default::default()
                 },
@@ -2238,8 +2237,10 @@ mod ssa_tests {
             )
             .expect("solve")
         };
-        assert!(solve(15).is_none(), "both live-ins hold their words in cycle 0's read phase");
-        assert!(solve(16).is_some());
+        for pools in [false, true] {
+            assert!(solve(15, pools).is_none(), "both live-ins hold their words at entry");
+            assert!(solve(16, pools).is_some());
+        }
     }
 
     /// A live-in decomposed vector is live until the last reader of the vector or of any of

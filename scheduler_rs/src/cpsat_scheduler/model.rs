@@ -2092,7 +2092,9 @@ pub fn schedule_ssa_cpsat(
             None
         };
 
-        if !live_vregs.is_empty() {
+        // Section live-ins, live-through values and temporary intervals can consume scratch
+        // even when no locally produced value is read within the section.
+        {
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
