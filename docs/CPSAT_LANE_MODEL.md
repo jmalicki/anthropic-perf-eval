@@ -123,7 +123,8 @@ model's domains, not a bound on the problem.
 - **OPTIMAL** was reached only on the small instance (2 rounds / batch 16, budget 5): 36
   cycles in every lane model, solver work 10.7 to 11.0 (default objective) and 0.86 to 1.59
   (makespan-only; pinned 0.86, the others 1.56 to 1.59).
-- **16 rounds** (shaped greedy start, budget 60): see 2.4.
+- **16 rounds** (shaped greedy start, budget 60, 2.4): `sorted` and `free` both return the
+  warm start (1,399 cycles, bound 1,271); every lane model validates.
 
 **Recommendation**: keep `free` as the default for now. `sorted` is safe (proved), removes
 the lane symmetry and the work spent on it, and never cost a cycle here except within noise;
@@ -197,7 +198,27 @@ deterministic time summed over workers. Peak is the peak scratch liveness of the
 
 ### 2.4 16 rounds, shaped greedy start
 
-PENDING16
+16 rounds / batch 256 on the shaped greedy start (`--greedy-barriers none --greedy-priority
+wavefront --greedy-split-shift --pressure-inflation-threshold 0.95`; greedy 1,399 cycles; on
+`main` CP-SAT ignores `--greedy-split-shift`, so its hint has all eight lanes of a shifted op
+in one cycle). `sorted` was chosen as the lane model to run at budget 60, since it is the
+one that removes the lane symmetry; `free` was run alongside it, and `pinned` and
+`sorted-pinned` at budget 2 to validate them.
+
+| Lane model | Budget | Cycles | Status | Bound | Symmetry (presolve) | First solution (wall s) | Solver dtime | Solver wall s | Peak live | Valid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| free | 60 | 1399 | FEASIBLE | 1271 | 9,749 orbits on 62,374 vars (size 16) | 257 (complete_hint) | 391 | 20,036 (stopped on the 20,000 s wall-clock backstop) | 1206 | PROVED, PASSED |
+| sorted | 60 | 1399 | FEASIBLE | 1271 | 3,723 orbits on 7,446 vars (size 2) | 531 (complete_hint) | 417 | 21,172 | 1173 | PROVED, PASSED |
+| pinned | 2 | 1399 | FEASIBLE | 1271 | 9,749 orbits on 62,374 vars (size 16) | 420 (complete_hint) | 7.5 | 7,309 | 1224 | PROVED, PASSED |
+| sorted-pinned | 2 | 1399 | FEASIBLE | 1271 | 3,723 orbits on 7,446 vars (size 2) | 348 (complete_hint) | 7.5 | 9,378 | 1183 | PROVED, PASSED |
+
+No run improved on the warm start, as in [CPSAT_CONFIG_ABLATION.md](CPSAT_CONFIG_ABLATION.md)
+2.3. Sorting removes the orbits of size 16 (lane permutations combined with a symmetry
+between pairs of groups, by the sizes; not analysed further) and leaves orbits
+of 2. The `free` run stopped on the wall-clock backstop (machine load 120 to 300 on 12 cores)
+after 391 of its deterministic time, so it is not a reproducible result and its solver work
+cannot be compared with `sorted`'s; both returned the warm start. Wall times are
+load-dependent.
 
 ### 2.5 Validation runs
 
