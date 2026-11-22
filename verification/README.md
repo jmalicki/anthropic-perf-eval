@@ -71,6 +71,32 @@ The energetic slot tightening (`--energetic-slot-tightening`) uses **contributin
 - **T7-undercount-parallel-contributing-sound**: Contributing exclusion with 3 parallel ops, cap 2. All asap 0 → min_demand=3. Exclude O3 from 0. Prove (capacity ∧ ordering ∧ c3=0) UNSAT.
 - **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds. Symbolic link to general T7 soundness lemma.
 
+## Lane models of the CP-SAT scheduler (LANE-*)
+
+`verification/lane_model.py` proves that `--cpsat-lane-model sorted`, `pinned` and
+`sorted-pinned` lose no schedule (see [CPSAT_LANE_MODEL.md](../docs/CPSAT_LANE_MODEL.md)).
+Each check maps a feasible schedule of the free model to the restricted model and encodes a
+**violation** (some row broken), so **UNSAT = no schedule lost**. Variables are unbounded
+integers, so each UNSAT holds for all values. Sorting is done by a fixed compare-exchange
+network (Batcher, 19 comparators for 8 lanes) applied to every op at once:
+
+- **LANE-network-sorts** (UNSAT): the network sorts every input.
+- **LANE-sort-lanewise-precedence**, **LANE-sort-uniform-bounds** (UNSAT): sorting keeps
+  `a_o,i >= a_d,i + delta` (same lane index) and bounds equal for all lanes of an op
+  (including min and max).
+- **LANE-sort-cycle-counts** (UNSAT): each compare-exchange keeps the lanes per cycle.
+- **LANE-sort-dag**, **LANE-sorted-pinned-dag** (UNSAT for every comparator of the
+  network): one compare-exchange on every op of a DAG carrying every lane row shape of the
+  model keeps all rows, in the free and in the pinned model; by induction over the network,
+  the sorted schedule is feasible.
+- **LANE-pin-dag** (UNSAT): setting the lanes of unshifted ops to their cycle keeps every row
+  and satisfies the pinned model's unconditional lane precedences.
+- **LANE-pin-unconditional-precedence** (UNSAT): with pinned lanes, the unconditional lane
+  precedence and the free model's pair enforced by the producer's shift are equivalent.
+- **LANE-sort-lane-specific-producers** (**SAT**, a counterexample kept on purpose): a reader
+  whose lane i waits for its own scalar producer cannot be sorted on its own. The model has
+  no such row; `tests/test_cpsat_lane_model.py` fails if one appears.
+
 ## Theorems
 
 Each theorem links to its definition in [LIVENESS_SPECIFICATION.md](../docs/LIVENESS_SPECIFICATION.md):

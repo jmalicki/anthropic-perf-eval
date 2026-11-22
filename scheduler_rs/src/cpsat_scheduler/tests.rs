@@ -6922,3 +6922,81 @@ mod tuning_alap_shift_tests {
         }
     }
 }
+
+// ============================================================================
+// CP-SAT tuning: lane model of shiftable ops
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_lane_model_tests {
+    use super::tuning_objective_tests::{solve, toy_ops};
+    use super::*;
+    use crate::cpsat_scheduler::CpsatLaneModel;
+
+    const ALL: [CpsatLaneModel; 4] =
+        [CpsatLaneModel::Free, CpsatLaneModel::Sorted, CpsatLaneModel::Pinned, CpsatLaneModel::SortedPinned];
+
+    #[test]
+    fn test_lane_model_json_names() {
+        assert_eq!(CpsatTuning::default().lane_model, CpsatLaneModel::Free);
+        assert!(CpsatTuning::default().to_json().contains(r#""lane_model":"free""#));
+        for (name, model) in [("free", ALL[0]), ("sorted", ALL[1]), ("pinned", ALL[2]), ("sorted-pinned", ALL[3])] {
+            let tuning = CpsatTuning::from_json(Some(&format!(r#"{{"lane_model": "{}"}}"#, name))).unwrap();
+            assert_eq!(tuning.lane_model, model);
+            assert_eq!(CpsatTuning::from_json(Some(&tuning.to_json())).unwrap(), tuning);
+        }
+        assert!(CpsatTuning::from_json(Some(r#"{"lane_model": "sorted_pinned"}"#)).is_err());
+        assert!(ALL[1].sorted() && !ALL[1].pinned() && ALL[2].pinned() && !ALL[2].sorted());
+        assert!(ALL[3].sorted() && ALL[3].pinned() && !ALL[0].sorted() && !ALL[0].pinned());
+    }
+
+    /// Sorting and pinning are dominance restrictions: the proved optimum must not change,
+    /// under either objective.
+    #[test]
+    fn test_every_lane_model_reaches_the_same_optimal_makespan() {
+        let ops = toy_ops();
+        for objective in [CpsatObjective::MakespanTiebreak, CpsatObjective::Makespan] {
+            let free = solve(&ops, CpsatTuning { objective, ..Default::default() });
+            assert_eq!(free.status, CpsatStatus::Optimal);
+            for lane_model in ALL {
+                let tuned = solve(&ops, CpsatTuning { objective, lane_model, ..Default::default() });
+                assert_eq!(tuned.status, CpsatStatus::Optimal, "{:?} {:?}", lane_model, objective);
+                assert_eq!(tuned.makespan, free.makespan, "{:?} {:?}", lane_model, objective);
+            }
+        }
+    }
+
+    /// With every op shifted (13 ops x 8 lanes on 12 scalar slots) lanes must straddle
+    /// cycles; the sorted models return them in order.
+    #[test]
+    fn test_sorted_lane_models_return_ordered_lanes() {
+        let ops = toy_ops();
+        for lane_model in ALL {
+            let config = SsaCpsatConfig {
+                time_limit_secs: 60.0,
+                deterministic_time_limit: Some(2.0),
+                verbose: false,
+                enable_valu_shift: true,
+                valu_shift_mode: ValuShiftMode::ForceAlu,
+                machine: MachineConfig { valu_slots: 2, ..Default::default() },
+                asap_alap_tightening: AsapAlapTightening::None,
+                tuning: CpsatTuning { lane_model, ..Default::default() },
+                ..Default::default()
+            };
+            let result = schedule_ssa_cpsat(&ops, config, SsaCpsatHints::default(), None)
+                .expect("post-solve validation")
+                .expect("a schedule");
+            let straddling = result
+                .shifted_alu_cycles
+                .values()
+                .filter(|lanes| lanes.iter().min() != lanes.iter().max())
+                .count();
+            assert!(straddling > 0, "{:?}: no op has lanes in two cycles; the test checks nothing", lane_model);
+            if lane_model.sorted() {
+                for (op_id, lanes) in &result.shifted_alu_cycles {
+                    assert!(lanes.windows(2).all(|w| w[0] <= w[1]), "{:?}: op {} lanes {:?}", lane_model, op_id, lanes);
+                }
+            }
+        }
+    }
+}

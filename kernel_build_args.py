@@ -92,6 +92,7 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_push_tasks_toward_start", "push_all_tasks_toward_start"),
     ("cpsat_cumulative_propagators", "cumulative_propagators"),
     ("cpsat_ttef_max_intervals", "timetable_edge_finding_max_intervals"),
+    ("cpsat_lane_model", "lane_model"),
     ("cpsat_linearization_level", "linearization_level"),
     ("cpsat_probing_level", "probing_level"),
     ("cpsat_makespan_rows", "makespan_rows"),
@@ -99,6 +100,8 @@ CPSAT_TUNING_OPTIONS = [
 
 # Tuning keys whose value "none" is an enum variant, not "switched off" (JSON null).
 ENUM_TUNING_KEYS = {"makespan_rows"}
+
+CPSAT_LANE_MODELS = ["free", "sorted", "pinned", "sorted-pinned"]
 
 CUMULATIVE_PROPAGATORS = ["overload_checker", "timetable_edge_finding", "hard_precedences"]
 
@@ -295,6 +298,11 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--cpsat-ttef-max-intervals", type=_non_negative_int, default=None, metavar="N",
                        help="max_num_intervals_for_timetable_edge_finding (CP-SAT default: 100). Timetable edge "
                             "finding is skipped on larger cumulatives, i.e. on all of ours unless this is raised.")
+    group.add_argument("--cpsat-lane-model", choices=CPSAT_LANE_MODELS, default=None,
+                       help="Lane variables of a shiftable vector op's 8 scalar ops (default: free). sorted: "
+                            "lane_0 <= ... <= lane_7 (removes the 8! lane permutations of each op). pinned: an "
+                            "unshifted op's lanes equal its cycle, and lane precedences carry no shift literal. "
+                            "sorted-pinned: both. Neither loses a schedule (verification/lane_model.py).")
     group.add_argument("--cpsat-linearization-level", type=int, choices=[0, 1, 2], default=None,
                        help="CP-SAT linearization_level (default: 2; CP-SAT's own default is 1). 2 adds the "
                             "LP relaxations and cuts of cumulatives; see docs/CPSAT_CONFIG_ABLATION.md.")
