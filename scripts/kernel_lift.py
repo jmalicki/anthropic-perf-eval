@@ -413,8 +413,9 @@ def format_report(r: dict) -> str:
     ]
     if "concrete_check" in r:
         c = r["concrete_check"]
-        lines.append(f"  concrete check ({c['runs']} random inputs): {c['observed_alias_pairs']} aliasing pairs seen, "
-                     f"{c['observed_without_edge']} without an edge, {c['edges_never_observed']} memory edges never seen, "
+        lines.append(f"  concrete check ({c['runs']} random inputs): {c['observed_alias_pairs']} aliasing pairs seen "
+                     f"({c['observed_ordered_transitively']} ordered through a must-alias store), "
+                     f"{c['observed_without_edge']} not ordered, {c['edges_never_observed']} memory edges never seen, "
                      f"{c['addresses_outside_value_set']} addresses outside their value set, outputs ok={c['outputs_ok']}")
     if r["original_schedule_violations"]:
         lines.append(f"  WARNING: the kernel's own schedule violates {r['original_schedule_violations']} lifted constraints")
@@ -459,6 +460,7 @@ def main() -> int:
         if args.concrete_runs:
             c = concrete_check(lk.sym, args.concrete_runs)
             r["concrete_check"] = {"runs": c.runs, "observed_alias_pairs": c.observed_pairs,
+                                   "observed_ordered_transitively": c.ordered_transitively,
                                    "observed_without_edge": len(c.missing_edges),
                                    "edges_never_observed": c.unseen_edges,
                                    "addresses_outside_value_set": len(c.outside_value_set),

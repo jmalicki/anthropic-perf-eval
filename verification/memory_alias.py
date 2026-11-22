@@ -839,19 +839,23 @@ class ConcreteReport:
     unseen_edges: int  # memory edges never seen to alias in any run
     outside_value_set: list[tuple[int, int]]  # (op, word) not in the op's value set
     outputs_ok: bool
+    ordered_transitively: int = 0  # observed pairs ordered through a must-alias store
 
 
 def concrete_check(sym: SymbolicKernel, runs: int = 8, seed0: int = 1) -> ConcreteReport:
     """Run the kernel on random inputs with address tracing.
 
     * Every pair of memory ops that touched a common word (at least one a store) in some run
-      must have a direct edge: a missing one would mean the preconditions are wrong.
+      must be ordered: by a direct edge, or through stores that must alias both (where the
+      scan stops). An unordered pair would mean the preconditions are wrong.
     * Every concrete address must lie in its value set (soundness of the value-set filter).
     * Memory edges whose two ops never shared a word in any run are counted: aliasing the
       analysis proved possible but random inputs did not produce (Assumption A's slack, or
       rare inputs).
     """
-    observed: set[tuple[int, int]] = set()
+    observed: set[tuple[int, int]] = set()  # aliased and ordered by a direct edge
+    transitive: set[tuple[int, int]] = set()  # aliased and ordered through must-alias stores
+    missing_set: set[tuple[int, int]] = set()  # aliased and not ordered: a bug
     outside: list[tuple[int, int]] = []
     ok = True
     layout = sym.layout
@@ -871,16 +875,35 @@ def concrete_check(sym: SymbolicKernel, runs: int = 8, seed0: int = 1) -> Concre
             for w in set(words):
                 by_word.setdefault(w, []).append(i)
         for ops in by_word.values():
-            stores = [k for k, i in enumerate(ops) if sym.ops[i].mem == "store"]
-            for k in stores:
-                s = ops[k]
-                for i in ops[:k]:
-                    observed.add((i, s))
-                for i in ops[k + 1:]:
-                    observed.add((s, i))
-    missing = sorted(p for p in observed if p not in sym.mem_edges)
+            # Ordering may be direct or through a store that must alias both (the scan stops
+            # there): such a path runs through ops that touched this same word, so the
+            # closure is taken over this word's ops only. reach[k] = bitmask of later ops.
+            n = len(ops)
+            is_store = [sym.ops[i].mem == "store" for i in ops]
+            reach = [0] * n
+            for k in range(n - 1, -1, -1):
+                acc = 0
+                for m in range(k + 1, n):
+                    if (ops[k], ops[m]) in sym.mem_edges:
+                        acc |= (1 << m) | reach[m]
+                reach[k] = acc
+            for k in range(n):
+                for m in range(k + 1, n):
+                    if not (is_store[k] or is_store[m]):
+                        continue
+                    pair = (ops[k], ops[m])
+                    if pair in observed or pair in transitive or pair in missing_set:
+                        continue
+                    if pair in sym.mem_edges:
+                        observed.add(pair)
+                    elif reach[k] >> m & 1:
+                        transitive.add(pair)
+                    else:
+                        missing_set.add(pair)
+    missing = sorted(missing_set)
     unseen = sum(1 for p in sym.mem_edges if p not in observed)
-    return ConcreteReport(runs, len(observed), missing, unseen, outside, ok)
+    return ConcreteReport(runs, len(observed) + len(transitive) + len(missing), missing, unseen, outside, ok,
+                          len(transitive))
 
 
 # =============================================================================
