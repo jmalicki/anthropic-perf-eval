@@ -20,6 +20,10 @@ Two schedulers, both written for an arbitrary externally supplied op graph:
   ``--hint original``). This is "CP-SAT on their ops", the same solver and constraint
   form as our model, not our SSA pipeline (which needs SSA values, not fixed addresses).
 
+``--value-deps`` schedules on value dependencies only (addresses re-allocated): the
+write-after-read/write-after-write scratch edges are dropped, so no kernel is emitted; it is a
+relaxation whose CP-SAT bound holds for any re-allocation.
+
 ``--valu-shift`` lets CP-SAT run any VALU op except multiply_add/vbroadcast as 8 scalar ALU
 ops in the same cycle (our VALU->ALU shift): an encoding freedom, so off by default.
 
@@ -42,7 +46,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.kernel_lift import (  # noqa: E402
-    CAP, ENGINES, NON_SHIFTABLE, VLEN, asap, check_schedule, condense, heights, lift, load_graph, values_only,
+    CAP, ENGINES, NON_SHIFTABLE, VLEN, asap, check_schedule, condense, heights, lift, load_graph, value_dependency_graph,
 )
 from scripts.kernel_memory_use import peak_live_words, scratch_values  # noqa: E402
 from verification.memory_alias import MemLayout, load_bundles, trace_memory  # noqa: E402
@@ -154,6 +158,13 @@ def cpsat(g, hint: list[int], deterministic_time: float, time_limit: float, work
     p.num_workers = workers
     p.random_seed = seed
     p.log_search_progress = log
+    # Same search settings as our Rust model (cpsat_scheduler/model.rs build_sat_parameters):
+    # interleave_search makes the result independent of thread timing, so with a
+    # deterministic-time budget the same command gives the same schedule.
+    p.interleave_search = True
+    p.linearization_level = 2
+    p.cp_model_probing_level = 2
+    p.randomize_search = True
     t0 = time.perf_counter()
     status = solver.Solve(m)
     info = {
@@ -162,7 +173,8 @@ def cpsat(g, hint: list[int], deterministic_time: float, time_limit: float, work
         "bound": solver.BestObjectiveBound(),
         "deterministic_time": solver.deterministic_time,
         "wall_seconds": round(time.perf_counter() - t0, 1),
-        "hit_wall_clock": time.perf_counter() - t0 >= time_limit * 0.98,
+        "hit_wall_clock": (time.perf_counter() - t0 >= time_limit * 0.98
+                           and solver.deterministic_time < deterministic_time),
         "horizon": horizon,
     }
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -213,7 +225,7 @@ def main() -> int:
     ap.add_argument("--cpsat-time-limit", type=float, default=3600.0, help="wall-clock backstop")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--valu-shift", action="store_true", help="allow VALU->ALU shift (encoding change)")
-    ap.add_argument("--values-only", action="store_true",
+    ap.add_argument("--value-deps", action="store_true",
                     help="drop the write-after-read/write-after-write scratch edges (needs --graph): "
                          "a relaxation that would need new addresses, so no kernel is emitted; reports "
                          "cycles and the schedule's peak live scratch words")
@@ -227,10 +239,10 @@ def main() -> int:
     bundles = data["instrs"] if isinstance(data, dict) else data
     g = load_graph(args.graph) if args.graph else lift(bundles)
     original = [o.cycle for o in g.ops]
-    if args.values_only:
+    if args.value_deps:
         if not args.graph:
-            ap.error("--values-only needs --graph")
-        g = values_only(g)
+            ap.error("--value-deps needs --graph")
+        g = value_dependency_graph(g)
     if check_schedule(g, original):
         print("the kernel's own schedule violates its lifted graph; refusing to reschedule", file=sys.stderr)
         return 2
@@ -260,13 +272,14 @@ def main() -> int:
             return 1
         print(f"CP-SAT: {max(sched) + 1} cycles, bound {info['bound']:.0f}, status {info['status']}, "
               f"dtime {info['deterministic_time']:.0f}, {info['wall_seconds']}s, shifted {len(shifted)}"
-              + ("  WARNING: stopped on the wall-clock limit" if info["hit_wall_clock"] else ""))
+              + ("  WARNING: CP-SAT stopped on the wall-clock limit; result depends on machine load"
+                 if info["hit_wall_clock"] else ""))
     vals = scratch_values(g.ops)
     result["peak_live_words"] = peak_live_words(vals, sched)[0]
     result["original_peak_live_words"] = peak_live_words(vals, original)[0]
-    if args.values_only:
-        result.update(cycles=max(sched) + 1, values_only=True)
-        print(f"values only: {result['cycles']} cycles, peak live scratch words {result['peak_live_words']} "
+    if args.value_deps:
+        result.update(cycles=max(sched) + 1, value_dependency_schedule=True)
+        print(f"value-dependency schedule (addresses re-allocated): {result['cycles']} cycles, peak live scratch words {result['peak_live_words']} "
               f"(kernel's own schedule: {result['original_peak_live_words']}); not emitted (needs new addresses)")
         if args.json:
             json.dump(result, open(args.json, "w"), indent=1)

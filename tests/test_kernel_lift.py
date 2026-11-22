@@ -14,7 +14,7 @@ import pytest
 
 from scripts.capture_public_kernel import capture, check_bundles
 from scripts.kernel_memory_use import memory_use, peak_live_words, scratch_report, scratch_values
-from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges, values_only
+from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges, value_dependency_graph
 from scripts.reschedule_kernel import cpsat, emit, greedy
 from verification.memory_alias import MemLayout, SymbolicKernel
 
@@ -270,14 +270,14 @@ def test_graph_json_roundtrip_is_plain_data(tmp_path):
     assert g.raw == lk.raw and [o.reads for o in g.ops] == [o.reads for o in lk.ops]
 
 
-def test_values_only_keeps_value_and_memory_edges():
+def test_value_dependency_graph_keeps_value_and_memory_edges():
     # WAR 1->2 and WAW 0->2 on s10 disappear; RAW 0->1 stays.
     k = _kernel(
         [("load", ("const", 10, 5))],
         [("alu", ("+", 11, 10, 10))],
         [("load", ("const", 10, 6))],
     )
-    g = values_only(lift(k))
+    g = value_dependency_graph(lift(k))
     assert g.edges == {(0, 1): 1}
 
 

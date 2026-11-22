@@ -28,6 +28,11 @@ uv run python -I scripts/reschedule_kernel.py k880.json --graph graphs/k880.grap
 uv run python -I scripts/reschedule_kernel.py k880.json --graph graphs/k880.graph.json \
     --cpsat-deterministic-time 300 --hint greedy --save-kernel k880_cpsat.json
 ./scripts/check_upstream.sh --kernel k880_cpsat.json                  # unmodified upstream tests
+# Value-dependency schedule (addresses re-allocated): drop the WAR/WAW scratch edges. A relaxation:
+# no kernel is emitted; reports cycles, CP-SAT bound and the schedule's peak live scratch words.
+# Use it for kernels whose addresses were assigned after scheduling (ours).
+uv run python -I scripts/reschedule_kernel.py ours.json --graph graphs/ours.graph.json --value-deps \
+    --valu-shift --cpsat-deterministic-time 300
 
 # Memory-alias analysis on its own (edges, Z3 counts, concrete cross-check)
 uv run python -I verification/memory_alias.py k880.json --concrete-runs 8
@@ -54,7 +59,9 @@ Lifting a kernel that uses memory as scratch (880, 899) takes minutes: most of i
 - Scratch edges are exact per word: RAW latency 1, WAR latency 0 (reads precede the cycle's writes), WAW latency 1.
 - Memory edges only where Z3 finds the two addresses can be equal under the upstream preconditions; `unknown` is an error, never an edge.
 - Ops that must share a cycle (two ops each reading what the other overwrites) form co-issue groups; schedulers keep them together.
-- CP-SAT here is "CP-SAT on their ops" (same solver and cumulative form as our model), not our SSA pipeline. Quote its deterministic-time budget.
+- CP-SAT here is "CP-SAT on their ops" (same solver, cumulative form and search settings as our model, `interleave_search` on), not our SSA pipeline. Quote its deterministic-time budget; a run that prints `stopped on the wall-clock limit` is not reproducible.
+- The greedy runs two priorities (critical path, and original issue order) and keeps the better; both are printed.
+- Do not commit third-party kernels, their lifted graphs or reschedules (the take-home notice forbids publishing solutions). Keep them in the scratchpad or the git-ignored `build/`; commit aggregate numbers only.
 
 ## Tests
 

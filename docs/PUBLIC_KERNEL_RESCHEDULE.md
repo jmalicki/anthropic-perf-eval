@@ -119,7 +119,7 @@ change.
   warm-started from the greedy schedule (or, with `--hint original`, from the kernel's own).
   The budget is `max_deterministic_time` (quoted per row), with a wall-clock backstop. This is
   "CP-SAT on their ops": the same solver and constraint form as our model, not our SSA pipeline.
-- **Values only** (`--values-only`): the same schedulers on value edges and memory edges only,
+- **Value-dependency schedule, addresses re-allocated** (`--value-deps`): the same schedulers on value edges and memory edges only,
   without the edges that reusing scratch addresses adds. Such a schedule needs a new address
   assignment, so no kernel is emitted. It is a relaxation: its CP-SAT bound is a lower bound
   for any reschedule with re-allocated addresses. The schedule's peak live scratch words show
@@ -131,10 +131,9 @@ change.
 Which treatment is fair depends on when the author chose the addresses. Our pipeline assigns
 addresses after scheduling, so its address reuse follows its own schedule order: the
 "critical path with these addresses" of our kernel (1,068) is an artifact of that order and
-never constrained our scheduler. For our kernel the fair comparisons are the values-only
-rows. The 880 kernel ships fixed addresses and fixed cycles chosen together
-(`_SCRATCH_LAYOUT`, `_ISSUE_PLAN`); the 899 and 982 builders allocate during or after their
-own scheduling. Both treatments are reported for every kernel.
+never constrained our scheduler. For our kernel the fair comparisons are the value-dependency
+rows. By its author's description, the 880 kernel ships a fixed address table and a fixed issue
+plan chosen together; the 899 and 982 builders allocate during or after their own scheduling. Both treatments are reported for every kernel.
 
 ## Reproduce
 
@@ -148,7 +147,7 @@ uv run python -I scripts/kernel_lift.py k880=k/880.json k899=k/899.json k982=k/9
 uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json --scheduler greedy
 uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json \
     --cpsat-deterministic-time 300 --save-kernel k/982_cpsat.json
-uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json --values-only \
+uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json --value-deps \
     --cpsat-deterministic-time 300
 ./scripts/check_upstream.sh --kernel k/982_cpsat.json
 ```

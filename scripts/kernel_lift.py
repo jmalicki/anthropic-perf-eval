@@ -159,7 +159,7 @@ def load_graph(path: str) -> Graph:
                  {(s, d): lat for s, d, lat in data.get("memory", [])})
 
 
-def values_only(g) -> Graph:
+def value_dependency_graph(g) -> Graph:
     """The graph without the edges that come from reusing scratch addresses: value edges
     (read-after-write, latency 1) plus every memory edge. Its schedules need a fresh
     address assignment, so they are a relaxation (the scratch limit is not enforced)."""
@@ -398,7 +398,7 @@ def format_report(r: dict) -> str:
         + f"  -> fixed encoding {r['floor_fixed_encoding']} ({'+'.join(r['floor_fixed_binding'])}),"
         f" with VALU->ALU shift {r['floor_with_valu_shift']}",
         f"  critical path {r['critical_path']} cycles with these addresses, {r['dataflow_critical_path']} "
-        f"through values only; gap to fixed floor {r['gap_to_fixed_floor']}"
+        f"through value dependencies only; gap to fixed floor {r['gap_to_fixed_floor']}"
         f" ({100 * r['gap_to_fixed_floor'] / max(1, r['floor_fixed_encoding']):.1f}%)",
         f"  graph: {r['edges']} edges ({r['memory_edges']} through memory: {m['mem_ops']} memory ops, "
         f"{m['op_pairs_with_store']} ordered pairs with a store, Z3 word pairs: {m['z3_disjoint_word_pairs']} disjoint, "
