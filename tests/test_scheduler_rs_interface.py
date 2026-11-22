@@ -26,9 +26,14 @@ BATCH_SIZE = 64
 ROUNDS = 4
 
 
-def _run_kernel_and_assert_matches_reference(instrs, mem, batch_size):
-    """Run kernel on Machine and assert output matches reference_kernel2."""
-    machine = Machine(mem, list(instrs), DebugInfo(scratch_map={}), n_cores=N_CORES)
+def _run_kernel_and_assert_matches_reference(instrs, mem, batch_size, scratch_size=None):
+    """Run kernel on Machine and assert output matches reference_kernel2.
+
+    scratch_size: scratch words of the simulated machine (default: the real machine's); only
+    relaxed-scratch kernels pass more.
+    """
+    extra = {} if scratch_size is None else {"scratch_size": scratch_size}
+    machine = Machine(mem, list(instrs), DebugInfo(scratch_map={}), n_cores=N_CORES, **extra)
     machine.enable_pause = False
     machine.enable_debug = False
     machine.run()
@@ -366,3 +371,43 @@ def test_depth4_validates():
     )
     assert not stats.get("budget_exceeded", False), "depth4 small config should stay within budget"
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
+def test_scratch_size_and_scratch_constraint():
+    """PyO3: scratch_size / scratch_constraint reach the allocator, are reported in stats and
+    give correct kernels (relaxed ones on a simulator with that much scratch)."""
+    import scheduler_rs
+
+    def build(**extra):
+        forest = Tree.generate(FOREST_HEIGHT)
+        inp = Input.generate(forest, BATCH_SIZE, 2)
+        mem = build_mem_image(forest, inp)
+        instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, 2, verbose=False, **extra)
+        assert not stats["budget_exceeded"], extra
+        assert stats["max_addr"] < stats["scratch_size"], extra
+        _run_kernel_and_assert_matches_reference(
+            instrs, mem, BATCH_SIZE, scratch_size=max(1536, stats["max_addr"] + 1))
+        return stats
+
+    default = build(use_cpsat=False)
+    assert (default["scratch_size"], default["scratch_constraint"], default["relaxed_scratch"]) == (1536, True, False)
+
+    smaller = build(use_cpsat=False, scratch_size=1024)
+    assert (smaller["scratch_size"], smaller["relaxed_scratch"]) == (1024, False)
+
+    larger = build(use_cpsat=False, scratch_size=3072)
+    assert (larger["scratch_size"], larger["relaxed_scratch"]) == (3072, True)
+
+    unbounded = build(use_cpsat=True, cpsat_time_limit=120.0, cpsat_deterministic_time=2.0,
+                      scratch_constraint=False)
+    assert unbounded["scratch_size"] == 1 << 20
+    assert unbounded["relaxed_scratch"]
+    assert unbounded["cpsat_scratch_budget"] == 0, "no scratch section in the CP-SAT model"
+
+    constrained = build(use_cpsat=True, cpsat_time_limit=120.0, cpsat_deterministic_time=2.0)
+    assert constrained["cpsat_scratch_budget"] == 1535, "machine scratch less the zero word"
+
+    with pytest.raises(ValueError, match="scratch_size"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, 2, verbose=False, use_cpsat=False, scratch_size=4)

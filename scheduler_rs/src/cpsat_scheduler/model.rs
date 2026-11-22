@@ -657,7 +657,8 @@ pub fn schedule_ssa_cpsat(
         current_alap = slot_alap;
     }
 
-    if enable_scratch_tightening {
+    // scratch_budget == 0 means the model has no scratch constraint: nothing to tighten by.
+    if enable_scratch_tightening && scratch_budget > 0 {
         let (scratch_asap, scratch_alap) = tighten_asap_alap_by_scratch(
             ops,
             &current_asap,

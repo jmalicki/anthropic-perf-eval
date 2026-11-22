@@ -32,8 +32,9 @@ pub(crate) const TICK_STORE_DEPTHS: [usize; 6] = [0, 1, 2, 4, 5, 6];
 /// Depths where TOCK stores happen (second half of groups)
 pub(crate) const TOCK_STORE_DEPTHS: [usize; 4] = [3, 7, 8, 9];
 
-/// Hardware scratch size in words (addresses 0..SCRATCH_BUDGET_HW-1).
-pub(crate) const SCRATCH_BUDGET_HW: usize = 1536;
+/// Hardware scratch size in words (addresses 0..SCRATCH_BUDGET_HW-1). The default of
+/// `CompilerConfig::scratch_size`; the pipeline reads the configured size, never this constant.
+pub(crate) const SCRATCH_BUDGET_HW: usize = super::config::SCRATCH_SIZE;
 
 /// Minimum time (seconds) for per-section feasibility CP-SAT. We require a feasible schedule
 /// for each section that exceeds scratch budget; give the solver enough time to find one.
@@ -41,13 +42,18 @@ const PER_SECTION_FEASIBILITY_MIN_SECS: f64 = 600.0;
 /// Cap per-section feasibility time so one section cannot consume the whole run.
 const PER_SECTION_FEASIBILITY_MAX_SECS: f64 = 3600.0;
 
-/// When address 0 is reserved for zero, only 1535 words are assignable; use this as the scheduler
-/// scratch budget so we never schedule more than 1535 assignable words (peak_live then includes zero = 1536).
-pub(crate) fn effective_scratch_budget(zero_vreg_reserved: bool) -> usize {
+/// When address 0 is reserved for zero, only `scratch_size - 1` words are assignable; use this as
+/// the scheduler scratch budget so we never schedule more assignable words than that (peak_live
+/// then includes zero = `scratch_size`).
+///
+/// # Arguments
+/// * `scratch_size` - Scratch words available (`CompilerConfig::scratch_size`, 1,536 on the machine)
+/// * `zero_vreg_reserved` - Address 0 is reserved for the zero register
+pub(crate) fn effective_scratch_budget(scratch_size: usize, zero_vreg_reserved: bool) -> usize {
     if zero_vreg_reserved {
-        SCRATCH_BUDGET_HW - 1
+        scratch_size - 1
     } else {
-        SCRATCH_BUDGET_HW
+        scratch_size
     }
 }
 
@@ -91,6 +97,10 @@ pub struct SsaScheduleResult {
     /// When Optimal, equals cycles; when Feasible, solver best_bound in cycles. Not a bound on
     /// the problem: emitting fewer ops lowers it.
     pub lb_cycles: Option<usize>,
+    /// Scratch budget the full-kernel CP-SAT model was given (CP-SAT only; 0 = the model had no
+    /// scratch constraint, `--no-scratch-constraint`). The allocator's limit is
+    /// `address_result.budget`.
+    pub cpsat_scratch_budget: Option<usize>,
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
@@ -533,6 +543,7 @@ pub fn export_partial_result_on_error(
         ssa_ops: Some(ctx.ops.clone()), // Include SSA ops for debugging
         eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
         lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+        cpsat_scratch_budget: ctx.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
     };
 
@@ -687,7 +698,9 @@ impl SsaTickTockKernelBuilder {
                 ..self.config.compiler.clone()
             },
             scratch_budget: scratch_budget_override
-                .unwrap_or_else(|| effective_scratch_budget(program.zero_vreg.is_some())),
+                .unwrap_or_else(|| {
+                    self.config.compiler.effective_scratch_budget(program.zero_vreg.is_some())
+                }),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             greedy_verbose: verbose,
             ..Default::default()
@@ -823,7 +836,7 @@ impl SsaTickTockKernelBuilder {
                 enable_valu_shift,
                 ..self.config.compiler.clone()
             },
-            scratch_budget: SCRATCH_BUDGET_HW,
+            scratch_budget: self.config.compiler.scratch_size,
             verbose,
             greedy_verbose: verbose,
             bounds: BoundsConfig {
@@ -961,7 +974,8 @@ impl SsaTickTockKernelBuilder {
         // Phase 2: Per-section feasibility (stays as orchestration, not a pass)
         // ====================================================================
         let boundaries = section_boundaries(&ctx.ops);
-        let effective_budget = effective_scratch_budget(ctx.zero_vreg.is_some());
+        let effective_budget =
+            ctx.config.compiler.effective_scratch_budget(ctx.zero_vreg.is_some());
         let budget_result = sections_exceeding_budget(
             &ctx.ops,
             effective_budget,
@@ -980,7 +994,7 @@ impl SsaTickTockKernelBuilder {
             );
             eprintln!(
                 "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)",
-                SCRATCH_BUDGET_HW
+                ctx.config.compiler.scratch_size
             );
             eprintln!(
                 "  Sections that exceed budget will get a per-section CP-SAT run (feasibility)."
@@ -1284,7 +1298,7 @@ impl SsaTickTockKernelBuilder {
                 if verbose {
                     let after_budget = sections_exceeding_budget(
                         &ctx.ops,
-                        effective_scratch_budget(ctx.zero_vreg.is_some()),
+                        effective_budget,
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
                     );
@@ -1314,19 +1328,20 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget
+        let scratch_size = ctx.config.compiler.scratch_size;
         let post_merge_budget = sections_exceeding_budget(
-            &ctx.ops, SCRATCH_BUDGET_HW,
+            &ctx.ops, scratch_size,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
         );
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
-            .find(|(_, &p)| p > SCRATCH_BUDGET_HW)
+            .find(|(_, &p)| p > scratch_size)
         {
             let msg = format!(
                 "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget {}). \
                  This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
-                sec, *peak, SCRATCH_BUDGET_HW
+                sec, *peak, scratch_size
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);
@@ -1343,16 +1358,16 @@ impl SsaTickTockKernelBuilder {
         // Collect hints for full-kernel CP-SAT
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
-        let effective_budget_hint = effective_scratch_budget(ctx.zero_vreg.is_some());
+        let effective_budget_hint = effective_budget;
         let hint_peak = sections_exceeding_budget(
             &ctx.ops, effective_budget_hint, Some(&current_select_fma), None,
         ).section_peaks.iter().copied().max().unwrap_or(0);
 
-        if hint_peak > SCRATCH_BUDGET_HW {
+        if hint_peak > scratch_size {
             let msg = format!(
                 "Merged hint schedule exceeds scratch budget: peak {} words (budget {}). \
                  Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
-                hint_peak, SCRATCH_BUDGET_HW
+                hint_peak, scratch_size
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);
@@ -1374,7 +1389,8 @@ impl SsaTickTockKernelBuilder {
             stop_after_first_solution: false,
             enable_valu_shift,
             enable_vbroadcast_elimination,
-            scratch_budget: effective_scratch_budget(ctx.zero_vreg.is_some()),
+            // 0 = no scratch section in the model (--no-scratch-constraint).
+            scratch_budget: ctx.config.compiler.cpsat_scratch_budget(ctx.zero_vreg.is_some()),
             model_name: Some("full_kernel_optimization".to_string()),
             machine: MachineConfig::default(),
             const_choice_mode,
@@ -1390,6 +1406,8 @@ impl SsaTickTockKernelBuilder {
             disable_optional_constraint_groups: cpsat_cfg.disable_optional_constraint_groups.clone(),
             ..Default::default()
         };
+
+        let full_kernel_scratch_budget = cpsat_config.scratch_budget;
 
         // Shift hints: exclude ops rescheduled by per-section CP-SAT
         let full_kernel_shift_set: HashSet<usize> = if enable_valu_shift {
@@ -1643,6 +1661,7 @@ impl SsaTickTockKernelBuilder {
             ssa_cycle_assignments,
             ssa_ops_bulk_move,
             lb_cycles: cpsat_result.lb_cycles,
+            cpsat_scratch_budget: Some(full_kernel_scratch_budget),
         });
 
         // Final passes: Filter → Assign → Lower

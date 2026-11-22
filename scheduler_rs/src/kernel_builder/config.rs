@@ -404,7 +404,22 @@ pub struct CompilerConfig {
     /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
     /// carry one cycle per op.
     pub greedy_split_shift: bool,
+    // === Relaxed-scratch reference (analysis only) ===
+    /// Scratch words the greedy, the per-section repair, CP-SAT and address assignment may use
+    /// (default: the machine's `SCRATCH_SIZE`, 1,536). Smaller values are valid kernels; larger
+    /// ones are the relaxed-scratch reference and do not run on the real machine (see
+    /// `is_relaxed_scratch` and docs/RELAXED_SCRATCH_REFERENCE.md).
+    pub scratch_size: usize,
+    /// Whether the CP-SAT model contains the scratch cumulative and liveness intervals (default
+    /// true). False drops them, so the model has no scratch constraint at all; the greedy and the
+    /// allocator still use `scratch_size`, which should then be large
+    /// (`UNBOUNDED_SCRATCH_WORDS`).
+    pub cpsat_scratch_constraint: bool,
 }
+
+/// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
+/// no schedule of the benchmark kernel comes near it, small enough for the simulator to allocate.
+pub const UNBOUNDED_SCRATCH_WORDS: usize = 1 << 20;
 
 impl Default for CompilerConfig {
     fn default() -> Self {
@@ -425,11 +440,41 @@ impl Default for CompilerConfig {
             greedy_split_shift: false,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
+            scratch_size: SCRATCH_SIZE,
+            cpsat_scratch_constraint: true,
         }
     }
 }
 
 impl CompilerConfig {
+    /// True when the scratch limit is relaxed beyond the machine's: a kernel built this way is
+    /// an analysis reference, not a kernel for the real machine.
+    pub fn is_relaxed_scratch(&self) -> bool {
+        self.scratch_size > SCRATCH_SIZE || !self.cpsat_scratch_constraint
+    }
+
+    /// Scratch words the schedulers may count as live: `scratch_size`, less the word reserved
+    /// for the zero register when there is one.
+    ///
+    /// # Arguments
+    /// * `zero_vreg_reserved` - Address 0 is reserved for the zero register
+    pub fn effective_scratch_budget(&self, zero_vreg_reserved: bool) -> usize {
+        super::tick_tock_ssa::effective_scratch_budget(self.scratch_size, zero_vreg_reserved)
+    }
+
+    /// Scratch budget handed to a CP-SAT solve: `effective_scratch_budget`, or 0 (no scratch
+    /// section in the model) when `cpsat_scratch_constraint` is false.
+    ///
+    /// # Arguments
+    /// * `zero_vreg_reserved` - Address 0 is reserved for the zero register
+    pub fn cpsat_scratch_budget(&self, zero_vreg_reserved: bool) -> usize {
+        if self.cpsat_scratch_constraint {
+            self.effective_scratch_budget(zero_vreg_reserved)
+        } else {
+            0
+        }
+    }
+
     /// The configured pressure policy with any threshold overrides applied.
     pub fn pressure_policy(&self) -> Box<dyn super::ssa_greedy::pressure_policy::PressurePolicy> {
         use super::ssa_greedy::pressure_policy::{

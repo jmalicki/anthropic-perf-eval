@@ -88,6 +88,8 @@ pub struct CpSatExtra {
     pub ssa_ops_bulk_move: Vec<(usize, Vec<usize>)>,
     /// Proven lower bound on cycles.
     pub lb_cycles: Option<usize>,
+    /// Scratch budget the full-kernel CP-SAT model was given (0 = no scratch constraint).
+    pub cpsat_scratch_budget: Option<usize>,
 }
 
 // ============================================================================
@@ -208,7 +210,13 @@ impl PipelineContext {
 
     /// Effective scratch budget accounting for zero_vreg reservation.
     pub fn effective_scratch_budget(&self) -> usize {
-        super::tick_tock_ssa::effective_scratch_budget(self.zero_vreg.is_some())
+        self.config.compiler.effective_scratch_budget(self.zero_vreg.is_some())
+    }
+
+    /// Scratch budget for a CP-SAT solve: the effective budget, or 0 (no scratch section in
+    /// the model) when the configuration drops the CP-SAT scratch constraint.
+    pub fn cpsat_scratch_budget(&self) -> usize {
+        self.config.compiler.cpsat_scratch_budget(self.zero_vreg.is_some())
     }
 
     // ========================================================================
@@ -397,6 +405,7 @@ impl PipelineContext {
                 .into_iter()
                 .collect(),
             lb_cycles: self.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
+            cpsat_scratch_budget: self.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
             vector_group_lanes: self.vector_group_lanes,
         })
     }

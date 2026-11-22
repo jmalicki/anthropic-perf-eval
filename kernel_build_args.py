@@ -21,6 +21,30 @@ DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
 DEFAULT_GREEDY_STAGGER_CYCLES = 12
 DEFAULT_GREEDY_GROUPS_IN_FLIGHT = 16
 
+# Machine scratch size (problem.SCRATCH_SIZE) and the size used for --no-scratch-constraint
+# (UNBOUNDED_SCRATCH_WORDS in scheduler_rs/src/kernel_builder/config.rs).
+MACHINE_SCRATCH_SIZE = 1536
+UNBOUNDED_SCRATCH_WORDS = 1 << 20
+
+
+def scratch_settings(get) -> tuple:
+    """Effective (scratch_size, scratch_constraint) for the relaxed-scratch options.
+
+    get: option lookup (name, default) -> value, as in args_to_build_kwargs.
+
+    Returns (words the greedy and the allocator may use, whether CP-SAT models scratch).
+    """
+    constraint = get("scratch_constraint", True)
+    size = get("scratch_budget_override")
+    if size is None:
+        size = MACHINE_SCRATCH_SIZE if constraint else UNBOUNDED_SCRATCH_WORDS
+    return size, constraint
+
+
+def is_relaxed_scratch(scratch_size: int, scratch_constraint: bool) -> bool:
+    """True when the kernel would not be valid on the machine's 1,536-word scratch."""
+    return scratch_size > MACHINE_SCRATCH_SIZE or not scratch_constraint
+
 
 def n_nodes_for_height(forest_height: int) -> int:
     """Node count of the forest, matching problem.Tree.generate(height).
@@ -344,6 +368,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--greedy-budget-headroom", type=_non_negative_int, default=0, metavar="WORDS",
                        help="Scratch words the greedy keeps free below the budget (default 0)")
 
+    # Relaxed-scratch reference (analysis only; docs/RELAXED_SCRATCH_REFERENCE.md)
+    group.add_argument("--scratch-budget-override", type=_positive_int, default=None, metavar="WORDS",
+                       help="ANALYSIS ONLY: scratch words the greedy, the per-section repair, CP-SAT and "
+                            "address assignment may use instead of the machine's 1536. Above 1536 the kernel "
+                            "does not run on the real machine; it is saved as a marked relaxed-scratch kernel "
+                            "and validated on a simulator with that much scratch.")
+    group.add_argument("--no-scratch-constraint", action="store_false", dest="scratch_constraint", default=True,
+                       help="ANALYSIS ONLY: drop the scratch constraint from the CP-SAT model and give the greedy "
+                            f"and the allocator {UNBOUNDED_SCRATCH_WORDS} words (unless --scratch-budget-override "
+                            "is given). Measures what any scratch-saving technique could buy at most.")
+
     # Constraint / CSE options
     import scheduler_rs
     _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
@@ -457,6 +492,8 @@ def args_to_build_kwargs(
     cpsat_tuning_json = json.dumps(cpsat_tuning) if cpsat_tuning else None
     cpsat_tuning_effective = json.loads(scheduler_rs.resolve_cpsat_tuning(cpsat_tuning_json))
 
+    scratch_size, scratch_constraint = scratch_settings(get)
+
     out_path = output_json if output_json is not None else get("output_json")
     if out_path is None:
         out_path = DEFAULT_SCHEDULER_JSON
@@ -505,6 +542,9 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_size": scratch_size,
+        "scratch_constraint": scratch_constraint,
+        "relaxed_scratch": is_relaxed_scratch(scratch_size, scratch_constraint),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -560,6 +600,8 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_size": scratch_size,
+        "scratch_constraint": scratch_constraint,
     }
 
 
