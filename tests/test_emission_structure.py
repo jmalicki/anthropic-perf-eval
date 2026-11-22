@@ -175,6 +175,14 @@ def test_values_only_tail_patterns_make_the_fit_exact(tmp_path):
     assert es.emission_counts(sched) == fixed["counts"]
 
 
+def test_tail_pattern_enumeration_is_bounded():
+    """Height 4, 40 rounds: every non-root round is a tail round (2^32 patterns); refuse it
+    before enumerating instead of exhausting memory. The 16-round default (4 tail rounds) works."""
+    with pytest.raises(ValueError, match="2\\^32 tail patterns"):
+        es.Context(rounds=40, forest_height=4, values_only=True).tail_patterns()
+    assert len(es.Context(rounds=16, values_only=True).tail_patterns()) == 16
+
+
 def test_cost_table_round_trips(table):
     again = es.CostTable.from_json(json.loads(json.dumps(table.to_json())))
     rows = es.flag_plan(CTX, "bits")

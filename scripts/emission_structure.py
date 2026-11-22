@@ -76,6 +76,8 @@ VLEN = 8
 # Utilisation caps are used as exact ratios; at most 6 decimal places keeps CP-SAT's coefficients
 # within 64 bits.
 MAX_CAP_DENOMINATOR = 10 ** 6
+# values_only: the cost model has one feature per gather/select pattern over the tail rounds.
+MAX_TAIL_ROUNDS = 10
 FIXED_VECTOR_OPCODES = ("multiply_add", "vbroadcast")
 
 
@@ -222,10 +224,18 @@ class Context:
         return [r for r in self.choice_rounds() if r > last]
 
     def tail_patterns(self) -> list[str]:
-        """Per-group gather ('g') / select ('s') patterns over `tail_rounds`, when they matter."""
+        """Per-group gather ('g') / select ('s') patterns over `tail_rounds`, when they matter.
+
+        Raises:
+            ValueError: for more than MAX_TAIL_ROUNDS tail rounds (2^k patterns, each a feature).
+        """
         if not self.values_only:
             return []
-        return ["".join(p) for p in itertools.product("gs", repeat=len(self.tail_rounds()))]
+        k = len(self.tail_rounds())
+        if k > MAX_TAIL_ROUNDS:
+            raise ValueError(f"values_only with {k} rounds after the last forced gather: the model enumerates "
+                             f"2^{k} tail patterns; at most {MAX_TAIL_ROUNDS} rounds are supported")
+        return ["".join(p) for p in itertools.product("gs", repeat=k)]
 
     def choice_rounds(self) -> list[int]:
         """Rounds whose encoding can be chosen (depth 1 to 4); depth 0 is the shared root and
@@ -706,8 +716,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         raise RuntimeError(f"structure model: {solver.StatusName(status)}")
     best_t = solver.Value(t)
     proven = status == cp_model.OPTIMAL
+    # Snapshots of the solved values: rows are rebuilt only from these, so a tie-break that ends
+    # UNKNOWN (no incumbent) cannot leak into the plan.
     chosen = {key: solver.Value(var) for key, var in n.items()}
-    pattern_values = {}
+    pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
     tie_break_status = "not run"
     if tie_break:
         m.Add(t == best_t)
@@ -724,6 +736,7 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             chosen = {key: solver.Value(var) for key, var in n.items()}
+            pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
         elif status2 != cp_model.UNKNOWN:  # MODEL_INVALID / INFEASIBLE would be a bug
             raise RuntimeError(f"structure model tie-break: {tie_break_status}")
         # UNKNOWN (time limit without an incumbent): keep the first solve's plan.
@@ -740,9 +753,9 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     if patterns:
         # Give each group its pattern (in pattern order), then the select groups of each tail
         # round their bit-driven encodings in a fixed order with the solved counts.
-        group_pattern = [p for p in patterns for _ in range(solver.Value(pattern_count[p]))]
+        group_pattern = [p for p in patterns for _ in range(pattern_values[p])]
         for i, r in enumerate(tail):
-            selects = [e for e in BIT_DRIVEN if (r, e) in n for _ in range(solver.Value(n[r, e]))]
+            selects = [e for e in BIT_DRIVEN if (r, e) in n for _ in range(chosen[r, e])]
             row = []
             for p in group_pattern:
                 row.append("gather" if p[i] == "g" else selects.pop(0))
