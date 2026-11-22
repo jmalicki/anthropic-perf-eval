@@ -126,6 +126,43 @@ def test_eliminable_vbroadcast(elim, latency, work):
     assert ops[2].deps == ((1, latency),)
 
 
+def test_run_work_preserves_joint_work_for_an_ambiguous_shift_lane_id():
+    d = _json([("valu", "^", []), ("alu", "^", [0])])
+    d["ssa_ops"][1]["id"] = 3
+    d["ops"] = [
+        {"id": 3, "engine": "alu", "opcode": "^", "cycle": 2},
+        {"id": 3, "engine": "alu", "opcode": "^", "cycle": 1},
+        {"id": 4, "engine": "alu", "opcode": "^", "cycle": 2},
+    ]
+    d["valu_shifted"] = 1
+    # Old greedy output can report a shift without exporting lane cycles. Both id=3 slots
+    # could be either the scalar op or a lane of op 0, so their depth is unknown.
+    work = {o.id: o.work for o in sb.ops_from_schedule_json(d, "run")}
+    assert work == {0: {sb.JOINT: 1}, 3: {}, -1: {sb.JOINT: 2}}
+
+    # A non-matching lane cycle identifies the native scalar slot.
+    d["shifted_alu_cycles"] = {"0": [1, 1, 1, 1, 2, 2, 2, 2]}
+    work = {o.id: o.work for o in sb.ops_from_schedule_json(d, "run")}
+    assert work == {0: {sb.JOINT: 1}, 3: {"alu": 1, sb.JOINT: 1}, -1: {sb.JOINT: 1}}
+
+
+def test_run_work_keeps_choice_provenance_and_leaves_shared_sub_unattributed():
+    d = _json([("valu", "^", []), ("load", "const_choice", []), ("flow", "select_choice", [])])
+    d["ops"] = [
+        {"id": 1, "engine": "alu", "opcode": "^", "from_const_choice": 1},
+        {"id": 2, "engine": "valu", "opcode": "-", "from_select_choice": 2},
+        {"id": 1_000_002, "engine": "valu", "opcode": "multiply_add", "from_select_choice": 2},
+        {"id": 0xC5E0_0000, "engine": "valu", "opcode": "-"},
+    ]
+    work = {o.id: o.work for o in sb.ops_from_schedule_json(d, "run")}
+    assert work == {
+        0: {},
+        1: {"alu": 1, sb.JOINT: 1},
+        2: {"valu": 2, sb.JOINT: 16},
+        -1: {"valu": 1, sb.JOINT: 8},
+    }
+
+
 def test_json_without_ssa_ops_is_rejected():
     with pytest.raises(ValueError, match="ssa_ops"):
         sb.ops_from_schedule_json({"ops": []})

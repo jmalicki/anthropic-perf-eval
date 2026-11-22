@@ -69,6 +69,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from scripts.inspect_schedule import SHIFT_LANE_FACTOR
+
 VLEN = 8
 CAP = {"valu": 6, "alu": 12, "load": 2, "store": 2, "flow": 1}
 JOINT = "alu+valu"
@@ -235,20 +237,45 @@ def _min_work(o, shiftable, eliminable, vlen):
     return {e: 1}
 
 
+def _shift_lane_parent(lo, ssa, lane_cycles, all_shifts_known, vlen):
+    """Return a possible shifted parent, using explicit lane cycles when available."""
+    parent_id, lane = divmod(lo["id"], SHIFT_LANE_FACTOR)
+    parent = ssa.get(parent_id)
+    if lane >= vlen or parent is None or parent["engine"] != "valu":
+        return None
+    opcode = parent["opcode"]
+    if opcode not in SHIFTABLE_OPCODES or lo.get("opcode", opcode) != opcode:
+        return None
+    cycles = lane_cycles.get(parent_id)
+    if cycles is None:
+        return None if all_shifts_known else parent_id
+    if len(cycles) == vlen and lo.get("cycle", cycles[lane]) != cycles[lane]:
+        return None
+    return parent_id
+
+
 def _run_work(d, ssa, shiftable, vlen):
     """Slots per row each SSA op used in THIS run's encodings (lowered ops attributed to the
-    SSA op they came from), with the VALU->ALU shift still relaxed. Summed over all ops this
-    reproduces the counts behind schedule_report's emission floor."""
+    SSA op they came from), with the VALU->ALU shift still relaxed. The joint work sums to
+    the vector-equivalent count behind schedule_report's emission floor.
+    """
     work = collections.defaultdict(collections.Counter)
+    lane_cycles = {int(i): cycles for i, cycles in (d.get("shifted_alu_cycles") or {}).items()}
+    all_shifts_known = len(lane_cycles) == d.get("valu_shifted")
     for lo in d["ops"]:
-        sid = lo.get("from_select_choice", lo.get("from_const_choice", lo["id"]))
+        choice = lo.get("from_select_choice", lo.get("from_const_choice"))
+        sid = lo["id"] if choice is None else choice
         eng = lo["engine"]
-        # A vector op run as scalar lanes appears as `alu` ops with id = ssa_id * 1000 + lane
-        # (the same rule as schedule_report.lowered_with_ssa).
-        if eng == "alu" and (sid not in ssa or ssa[sid]["engine"] == "valu"):
-            parent = ssa.get(lo["id"] // 1000)
-            if parent is not None and parent["engine"] == "valu":
-                work[parent["id"]][JOINT] += 1  # one lane; vlen lanes = one vector op
+        if eng == "alu" and choice is None:
+            parent = _shift_lane_parent(lo, ssa, lane_cycles, all_shifts_known, vlen)
+            if parent is not None:
+                direct = ssa.get(sid)
+                ambiguous = direct is not None and direct["engine"] == "alu" and (
+                    direct["opcode"] == lo.get("opcode", direct["opcode"])
+                )
+                # Encoded lane IDs can coincide with native scalar IDs. Without reliable
+                # ownership, the slot contributes joint work to the whole schedule only.
+                work[None if ambiguous else parent][JOINT] += 1
                 continue
         if sid not in ssa:
             sid = None
