@@ -42,8 +42,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.kernel_lift import (  # noqa: E402
-    CAP, ENGINES, NON_SHIFTABLE, VLEN, asap, check_schedule, condense, heights, lift, load_graph,
+    CAP, ENGINES, NON_SHIFTABLE, VLEN, asap, check_schedule, condense, heights, lift, load_graph, values_only,
 )
+from scripts.kernel_memory_use import peak_live_words, scratch_values  # noqa: E402
 from verification.memory_alias import MemLayout, load_bundles, trace_memory  # noqa: E402
 
 
@@ -212,6 +213,10 @@ def main() -> int:
     ap.add_argument("--cpsat-time-limit", type=float, default=3600.0, help="wall-clock backstop")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--valu-shift", action="store_true", help="allow VALU->ALU shift (encoding change)")
+    ap.add_argument("--values-only", action="store_true",
+                    help="drop the write-after-read/write-after-write scratch edges (needs --graph): "
+                         "a relaxation that would need new addresses, so no kernel is emitted; reports "
+                         "cycles and the schedule's peak live scratch words")
     ap.add_argument("--seeds", type=int, default=8, help="random inputs to validate on")
     ap.add_argument("--save-kernel", help="write the rescheduled kernel JSON here")
     ap.add_argument("--json", help="write a result summary JSON here")
@@ -222,6 +227,10 @@ def main() -> int:
     bundles = data["instrs"] if isinstance(data, dict) else data
     g = load_graph(args.graph) if args.graph else lift(bundles)
     original = [o.cycle for o in g.ops]
+    if args.values_only:
+        if not args.graph:
+            ap.error("--values-only needs --graph")
+        g = values_only(g)
     if check_schedule(g, original):
         print("the kernel's own schedule violates its lifted graph; refusing to reschedule", file=sys.stderr)
         return 2
@@ -246,6 +255,16 @@ def main() -> int:
         print(f"CP-SAT: {max(sched) + 1} cycles, bound {info['bound']:.0f}, status {info['status']}, "
               f"dtime {info['deterministic_time']:.0f}, {info['wall_seconds']}s, shifted {len(shifted)}"
               + ("  WARNING: stopped on the wall-clock limit" if info["hit_wall_clock"] else ""))
+    vals = scratch_values(g.ops)
+    result["peak_live_words"] = peak_live_words(vals, sched)[0]
+    result["original_peak_live_words"] = peak_live_words(vals, original)[0]
+    if args.values_only:
+        result.update(cycles=max(sched) + 1, values_only=True)
+        print(f"values only: {result['cycles']} cycles, peak live scratch words {result['peak_live_words']} "
+              f"(kernel's own schedule: {result['original_peak_live_words']}); not emitted (needs new addresses)")
+        if args.json:
+            json.dump(result, open(args.json, "w"), indent=1)
+        return 0
     if not shifted:
         bad = check_schedule(g, sched)
         if bad:

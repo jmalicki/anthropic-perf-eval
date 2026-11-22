@@ -13,7 +13,8 @@ import shutil
 import pytest
 
 from scripts.capture_public_kernel import capture, check_bundles
-from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges
+from scripts.kernel_memory_use import memory_use, peak_live_words, scratch_report, scratch_values
+from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges, values_only
 from scripts.reschedule_kernel import cpsat, emit, greedy
 from verification.memory_alias import MemLayout, SymbolicKernel
 
@@ -264,5 +265,38 @@ def test_graph_json_roundtrip_is_plain_data(tmp_path):
     path = tmp_path / "g.json"
     save_graph(lk, str(path))
     data = json.loads(path.read_text())
-    assert set(data) == {"name", "ops", "edges", "memory_edges", "raw"}
-    assert load_graph(str(path)).raw == lk.raw
+    assert set(data) == {"name", "ops", "edges", "memory_edges", "raw", "memory"}
+    g = load_graph(str(path))
+    assert g.raw == lk.raw and [o.reads for o in g.ops] == [o.reads for o in lk.ops]
+
+
+def test_values_only_keeps_value_and_memory_edges():
+    # WAR 1->2 and WAW 0->2 on s10 disappear; RAW 0->1 stays.
+    k = _kernel(
+        [("load", ("const", 10, 5))],
+        [("alu", ("+", 11, 10, 10))],
+        [("load", ("const", 10, 6))],
+    )
+    g = values_only(lift(k))
+    assert g.edges == {(0, 1): 1}
+
+
+def test_memory_use_classifies_a_scatter_then_load():
+    # Store an input value to VAL_P + bit (data-dependent, 2 words), load it back.
+    k = _bit_kernel([("load", ("const", 5, VAL_P))],
+                    [("alu", ("+", 30, 5, 2)), ("alu", ("+", 31, 5, 2))])
+    sym = SymbolicKernel(k).run()
+    pats = memory_use(sym)["patterns"]
+    assert len(pats) == 1
+    p = pats[0]
+    assert p["address"].startswith("data-dependent (2 bases")
+    assert p["value"].startswith("working value") and p["readers"] == ["load"] and p["loads"] == 1
+
+
+def test_peak_live_words_counts_value_lifetimes():
+    k = _chain_kernel()
+    sym = SymbolicKernel(k).run()
+    vals = scratch_values(sym.ops)
+    # s10 is live from cycle 1 to 4 while s20 waits from cycle 2 to its first read at 5.
+    assert peak_live_words(vals, [o.cycle for o in sym.ops])[0] == 2
+    assert scratch_report(sym)["words_touched"] == 2

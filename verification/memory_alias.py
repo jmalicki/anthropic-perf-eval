@@ -468,7 +468,8 @@ class SymbolicKernel:
         self._events: list[_MemEvent] = []
         self._by_value: dict[int, list[int]] = {}  # concrete word -> event indices
         self._unbounded: list[int] = []  # events whose address set is unknown
-        self._pair_seen: set[tuple[int, int]] = set()
+        # Store-to-load data flow per word: (store op, store event, load op, lane, relation).
+        self.flows: list[tuple[int, int, int, int, str]] = []
         self._z3_cache: dict[tuple[int, int], str] = {}
 
     # -- initial memory --------------------------------------------------------
@@ -523,7 +524,12 @@ class SymbolicKernel:
         if old is None or latency > old:
             self.mem_edges[(src, dst)] = latency
 
-    def _load_word(self, op: int, addr: int) -> int:
+    @property
+    def events(self) -> list[_MemEvent]:
+        """Every memory word access in program order (loads of a cycle before its stores)."""
+        return self._events
+
+    def _load_word(self, op: int, addr: int, lane: int = 0) -> int:
         """Value of one loaded word; records store->load edges."""
         vset = self.vsets.get(addr)
         hits = []
@@ -536,6 +542,7 @@ class SymbolicKernel:
             if rel == "never":
                 continue
             self._add_edge(ev.op, op, 1)
+            self.flows.append((ev.op, e, op, lane, rel))
             hits.append((rel, ev))
             if rel == "must":
                 break
@@ -606,7 +613,7 @@ class SymbolicKernel:
                         op.mem, op.mem_addr, op.mem_width = "load", base, width
                         for k, d in enumerate(dests):
                             w = terms.binop("+", base, terms.const(k))
-                            writes.append((d, self._load_word(op.index, w)))
+                            writes.append((d, self._load_word(op.index, w, k)))
                             pending_events.append((op.index, "load", w, None))
                         continue
                     effect = _execute(terms, read, engine, slot)

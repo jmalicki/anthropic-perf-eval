@@ -35,6 +35,7 @@ from dataclasses import dataclass
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scripts.kernel_memory_use import format_memory_use, memory_use, scratch_report  # noqa: E402
 from scripts.schedule_report import emission_floor  # noqa: E402
 from verification.memory_alias import KOp, MemLayout, SymbolicKernel, concrete_check, load_bundles  # noqa: E402
 
@@ -55,6 +56,10 @@ class LiftedKernel:
     @property
     def n(self) -> int:
         return len(self.ops)
+
+    @property
+    def memory(self) -> dict[tuple[int, int], int]:
+        return self.sym.mem_edges
 
     def preds(self) -> list[list[tuple[int, int]]]:
         out: list[list[tuple[int, int]]] = [[] for _ in self.ops]
@@ -118,10 +123,12 @@ def save_graph(lk: LiftedKernel, path: str, name: str = "") -> None:
     rescheduler can read it without repeating the alias analysis."""
     data = {
         "name": name,
-        "ops": [{"cycle": o.cycle, "engine": o.engine, "slot": o.slot} for o in lk.ops],
+        "ops": [{"cycle": o.cycle, "engine": o.engine, "slot": o.slot, "reads": o.reads, "writes": o.writes}
+                for o in lk.ops],
         "edges": [[s, d, lat] for (s, d), lat in sorted(lk.edges.items())],
         "memory_edges": lk.mem_edges,
         "raw": sorted(lk.raw),
+        "memory": [[s, d, lat] for (s, d), lat in sorted(lk.sym.mem_edges.items())],
     }
     with open(path, "w") as f:
         json.dump(data, f)
@@ -135,6 +142,7 @@ class Graph:
     edges: dict[tuple[int, int], int]
     mem_edges: int
     raw: set[tuple[int, int]]
+    memory: dict[tuple[int, int], int]
 
     n = LiftedKernel.n
     preds = LiftedKernel.preds
@@ -144,9 +152,21 @@ class Graph:
 def load_graph(path: str) -> Graph:
     with open(path) as f:
         data = json.load(f)
-    ops = [KOp(i, o["cycle"], o["engine"], o["slot"]) for i, o in enumerate(data["ops"])]
+    ops = [KOp(i, o["cycle"], o["engine"], o["slot"], o.get("reads", []), o.get("writes", []))
+           for i, o in enumerate(data["ops"])]
     return Graph(ops, {(s, d): lat for s, d, lat in data["edges"]}, data["memory_edges"],
-                 {tuple(e) for e in data.get("raw", [])})
+                 {tuple(e) for e in data.get("raw", [])},
+                 {(s, d): lat for s, d, lat in data.get("memory", [])})
+
+
+def values_only(g) -> Graph:
+    """The graph without the edges that come from reusing scratch addresses: value edges
+    (read-after-write, latency 1) plus every memory edge. Its schedules need a fresh
+    address assignment, so they are a relaxation (the scratch limit is not enforced)."""
+    edges = {e: 1 for e in g.raw}
+    for e, lat in g.memory.items():
+        edges[e] = max(edges.get(e, 0), lat)
+    return Graph(g.ops, edges, len(g.memory), set(g.raw), dict(g.memory))
 
 
 # =============================================================================
@@ -431,6 +451,8 @@ def main() -> int:
         if args.save_graph_dir:
             save_graph(lk, os.path.join(args.save_graph_dir, f"{name}.graph.json"), name)
         r = report(lk, bundles, name)
+        r["memory_use"] = memory_use(lk.sym)
+        r["scratch"] = scratch_report(lk.sym)
         if args.concrete_runs:
             c = concrete_check(lk.sym, args.concrete_runs)
             r["concrete_check"] = {"runs": c.runs, "observed_alias_pairs": c.observed_pairs,
@@ -441,6 +463,7 @@ def main() -> int:
         reports.append(r)
         if not args.table:
             print(format_report(r), flush=True)
+            print(format_memory_use(name, r["memory_use"], r["scratch"]), flush=True)
         if args.json:  # rewritten after every kernel, so a long run keeps what it finished
             with open(args.json, "w") as f:
                 json.dump(reports, f, indent=1)
