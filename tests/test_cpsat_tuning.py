@@ -521,25 +521,21 @@ def test_makespan_rows_reach_the_model(tmp_path, mode, rounds):
 SYMMETRY = ["--rounds", "4", "--batch-size", "64"]
 
 
-def _constraint_names(model_path):
-    return [c.name for c in diff_cpsat_models.load(str(model_path)).constraints]
-
-
 def test_symmetry_rows_declared_is_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", SYMMETRY)
     _, explicit, sched, _ = _run(tmp_path, "declared", SYMMETRY + ["--cpsat-symmetry-rows", "declared"])
     assert not _model_diff(base, explicit)
-    assert any(n.startswith("sym_ord_") for n in _constraint_names(base)), "the instance has declared rows"
+    assert any(n.startswith("sym_ord_") for n in _constraint_names(diff_cpsat_models.load(str(base)))), "the instance has declared rows"
     with open(sched) as f:
         assert json.load(f)["run_options"]["cpsat_tuning"]["symmetry_rows"] == "declared"
 
 
 def test_symmetry_rows_none_and_checked(tmp_path):
     _, none_path, _, _ = _run(tmp_path, "none", SYMMETRY + ["--cpsat-symmetry-rows", "none"])
-    names = _constraint_names(none_path)
+    names = _constraint_names(diff_cpsat_models.load(str(none_path)))
     assert not any(n.startswith(("sym_ord_", "sym_lex_", "group_sym_")) for n in names)
     output, checked_path, _, _ = _run(tmp_path, "checked", SYMMETRY + ["--cpsat-symmetry-rows", "checked"], quiet=False)
-    names = _constraint_names(checked_path)
+    names = _constraint_names(diff_cpsat_models.load(str(checked_path)))
     assert not any(n.startswith(("sym_ord_", "sym_lex_")) for n in names)
     assert any(n.startswith("group_sym_") for n in names), "4x64 has an orbit of identical groups"
     assert "Group symmetry:" in output and "solution hint is complete and is feasible" in output
