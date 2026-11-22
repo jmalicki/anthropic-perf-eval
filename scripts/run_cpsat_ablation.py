@@ -79,6 +79,11 @@ STANDARD_CONFIGS = [
     ("propagators-all", "--cpsat-cumulative-propagators all --cpsat-ttef-max-intervals 1000000"),
     # 6. Redundant rows
     ("no-redundant-rows", "--disable-cpsat-constraints conditional_makespan,flow_cumulative"),
+    # 7. LP and presolve levels, makespan rows (section 9 of docs/CPSAT_CONFIG_ABLATION.md)
+    ("linearization-1", "--cpsat-linearization-level 1"),
+    ("probing-0", "--cpsat-probing-level 0"),
+    ("makespan-rows-static", "--cpsat-makespan-rows static"),
+    ("makespan-rows-bucketed", "--cpsat-makespan-rows bucketed"),
 ]
 
 
@@ -226,9 +231,24 @@ def parse_last_bound_time(solve_log: str) -> float | None:
     return float(times[-1]) if times else None
 
 
-# Full-problem subsolvers that run the LP (linearization_level >= 1 in their parameters).
-LP_SUBSOLVERS = ("default_lp", "max_lp", "max_lp_sym", "reduced_costs", "pseudo_costs", "quick_restart",
-                 "fixed", "core_default_lp", "core_max_lp")
+# Full-problem subsolvers that run the LP. Those in LP_SUBSOLVERS_OWN_LEVEL set a nonzero
+# linearization level themselves; those in LP_SUBSOLVERS_INHERIT take the base
+# linearization_level (OR-Tools 9.15, cp_model_search.cc), so they run no LP at level 0.
+# "*_no_lp" variants are never LP workers. (pseudo_costs and reduced_costs are listed as
+# setting their own level without having been checked against the source.)
+LP_SUBSOLVERS_OWN_LEVEL = ("default_lp", "max_lp", "max_lp_sym", "reduced_costs", "pseudo_costs",
+                           "core_default_lp", "core_max_lp", "objective_lb_search", "objective_lb_search_max_lp",
+                           "objective_shaving", "objective_shaving_max_lp", "lb_tree_search", "probing",
+                           "probing_max_lp", "variables_shaving", "variables_shaving_max_lp", "fixed_max_lp",
+                           "quick_restart_max_lp")
+LP_SUBSOLVERS_INHERIT = ("fixed", "quick_restart")
+
+
+def lp_subsolvers(solve_log: str) -> tuple:
+    """LP subsolvers of a solve, given its base linearization level (from the Parameters line)."""
+    match = re.search(r"^Parameters:.*\blinearization_level: (\d+)", solve_log, re.MULTILINE)
+    level = int(match.group(1)) if match else 1  # CP-SAT's own default when not printed
+    return LP_SUBSOLVERS_OWN_LEVEL + (LP_SUBSOLVERS_INHERIT if level > 0 else ())
 
 
 def parse_bounds(solve_log: str, scale: int) -> dict:
@@ -240,12 +260,13 @@ def parse_bounds(solve_log: str, scale: int) -> dict:
     (floor(ceil(bound) / scale)).
     """
     out = {}
+    lp = lp_subsolvers(solve_log)
     for match in re.finditer(r"^#Bound\s+([\d.]+)s\s+best:\S+\s+next:\[(-?[\d.e+]+),\S*\]\s+(\S+)", solve_log, re.MULTILINE):
         wall, lower, worker = float(match.group(1)), float(match.group(2)), match.group(3)
         makespan = int(math.ceil(lower - 1e-6)) // scale
         if worker == "initial_domain":
             out.setdefault("bound_presolve", makespan)
-        elif worker in LP_SUBSOLVERS and "bound_first_lp" not in out:
+        elif worker in lp and "bound_first_lp" not in out:
             out["bound_first_lp"] = makespan
             out["bound_first_lp_wall"] = wall
         out["bound_last"] = makespan
@@ -284,7 +305,7 @@ def analyse_run(log: str, schedule_path: Path, returncode: int, elapsed: float) 
     scale = int(scales[-1]) if scales else 1
     incumbents = parse_incumbents(solve_log, scale)
     tasks = parse_task_dtime(solve_log)
-    lp_tasks = {name: dtime for name, (n, dtime) in tasks.items() if name in LP_SUBSOLVERS}
+    lp_tasks = {name: dtime for name, (n, dtime) in tasks.items() if name in lp_subsolvers(solve_log)}
     result = {
         "returncode": returncode,
         "elapsed_secs": round(elapsed, 1),

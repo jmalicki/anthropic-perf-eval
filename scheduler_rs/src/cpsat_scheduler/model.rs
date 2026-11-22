@@ -3745,7 +3745,9 @@ pub fn schedule_ssa_cpsat(
                 violations.len(),
                 &violations[..violations.len().min(5)]
             );
-            if cfg!(debug_assertions) && greedy_within_scratch_budget == Some(true) {
+            // A greedy schedule that does not use the forced encodings is not a schedule of
+            // this model (its shift hints say ALU while its cycles were packed for VALU).
+            if cfg!(debug_assertions) && greedy_within_scratch_budget == Some(true) && greedy_matches_forced_modes {
                 panic!("{}", message);
             }
             eprintln!("  WARNING: {}", message);

@@ -31,7 +31,7 @@ from __future__ import annotations
 import random
 import time
 
-from z3 import And, Bool, If, Implies, Int, Not, Or, Solver, Sum, sat
+from z3 import And, Bool, If, Implies, Int, Not, Or, Solver, Sum, sat, unsat
 
 LANES = 2  # vector length in the proofs (the rows use VLEN; any value works)
 CAPS = {"valu": 1, "alu": 2, "load": 1, "store": 1, "flow": 1}
@@ -309,9 +309,14 @@ def _check(name, seeds, with_vb, tail_counts_own_cycle=False, bucket=2, vb_laten
         horizon = 2 * len(ops) + 3
         s, M, terms = _encode(ops, horizon)
         s.add(_row_violations(ops, M, terms, tail_counts_own_cycle, bucket, vb_latency))
-        if s.check() == sat:
+        outcome = s.check()
+        if outcome == sat:
             found = (seed, ops)
             break
+        if outcome != unsat:
+            # A timeout proves nothing: report it, and the runner fails the check.
+            return name, "unknown", time.time() - start, {"graphs": len(seeds), "unresolved_seed": seed,
+                                                           "reason": s.reason_unknown()}
     result = "sat" if found else "unsat"
     return name, result, time.time() - start, {"graphs": len(seeds), "counterexample": found}
 
