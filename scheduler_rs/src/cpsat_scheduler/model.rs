@@ -803,6 +803,40 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // 2d. Window probe: the reference must stay inside every domain, and so must each cycle
+    // the block after the window can move to. 2c covers ops with a hint; dead stores (hint
+    // -1) are pinned at the reference too but got no widening, and tightening computed on a
+    // reduced op list need not cover the moved block.
+    if let Some(window) = window {
+        let mut widened = 0usize;
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(&cycle) = window.reference.cycles.get(idx) else { continue };
+            if cycle < 0 {
+                continue;
+            }
+            let lowest = if window.region(idx, op) == super::window::WindowRegion::After {
+                cycle - window.len.max(0)
+            } else {
+                cycle
+            };
+            if let Some(a) = final_asap.get_mut(&op.id) {
+                if lowest < *a {
+                    *a = lowest.max(0);
+                    widened += 1;
+                }
+            }
+            if let Some(a) = final_alap.get_mut(&op.id) {
+                if cycle > *a {
+                    *a = cycle;
+                    widened += 1;
+                }
+            }
+        }
+        if widened > 0 {
+            eprintln!("[window probe]   widened {} domain bound(s) to cover the reference", widened);
+        }
+    }
+
     // 3. Build the CP model
     let mut model = CpModelBuilder::default();
     if let Some(name) = &model_name {

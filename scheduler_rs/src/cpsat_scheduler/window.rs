@@ -588,6 +588,9 @@ pub struct WindowProbeReport {
     pub entries: Vec<WindowProbeEntry>,
     /// Per W: (W, final makespan of the rolling pass).
     pub rolling_final: Vec<(i32, i32)>,
+    /// Per W whose rolling pass improved: (W, outcome of re-checking the final schedule on
+    /// the full model with every op pinned).
+    pub rolling_checks: Vec<(i32, String)>,
 }
 
 impl WindowProbeReport {
@@ -1011,6 +1014,7 @@ pub fn run_window_probe(
         base_check_status: String::new(),
         entries: Vec::new(),
         rolling_final: Vec::new(),
+        rolling_checks: Vec::new(),
     };
 
     // All-fixed check: with an empty window every op is pinned, so the only solution is the
@@ -1176,6 +1180,34 @@ pub fn run_window_probe(
             }
             eprintln!("[window probe] rolling W={}: {} -> {} cycles", w, base_makespan, makespan);
             report.rolling_final.push((w, makespan));
+            // Re-check the rolled schedule on the full, unreduced model: every op pinned.
+            if let Some(r) = &improved {
+                let check = CpsatWindow {
+                    start: 0,
+                    len: 0,
+                    fix_window_encodings: true,
+                    reference: WindowReference::from_result(r, &dead),
+                    prune: false,
+                };
+                let status = match solve_window(ops, &check_config, ctx, &check) {
+                    Ok(Some(c)) if c.makespan == r.makespan => format!("{} (makespan {})", c.status, c.makespan),
+                    Ok(Some(c)) => {
+                        return Err(format!(
+                            "window probe: rolling W={} schedule re-checks at makespan {} instead of {}",
+                            w, c.makespan, r.makespan
+                        ))
+                    }
+                    Ok(None) => {
+                        return Err(format!(
+                            "window probe: rolling W={} schedule is not a solution of the full model",
+                            w
+                        ))
+                    }
+                    Err(e) => return Err(format!("window probe: rolling W={} full-model check: {}", w, e)),
+                };
+                eprintln!("[window probe] rolling W={}: full-model check {}", w, status);
+                report.rolling_checks.push((w, status));
+            }
             report.write()?;
             if let Some(r) = improved {
                 if best.as_ref().map_or(true, |b| r.makespan < b.makespan) {
@@ -1409,6 +1441,78 @@ mod tests {
                 .expect("expanded schedule must satisfy the full model");
             assert_eq!(again.makespan, with.makespan);
         }
+    }
+
+    /// The reduced model with a CSE group: the shared SUB is pinned or kept in the window, the
+    /// groups are cut to kept consumers, and the expanded schedule satisfies the full model.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn reduced_model_with_cse_group_matches_full_model() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let c3 = emit.emit_const_choice(3);
+        let c5 = emit.emit_const_choice(5);
+        let v3 = emit.emit_vbroadcast(c3);
+        let v5 = emit.emit_vbroadcast(c5);
+        let mut a = emit.emit_valu(Opcode::Add, v3, v5);
+        let mut b = emit.emit_valu(Opcode::Xor, v5, v3);
+        for _ in 0..2 {
+            a = emit.emit_valu(Opcode::Mul, a, v3);
+            b = emit.emit_valu(Opcode::Add, b, v5);
+        }
+        // Two selects on the same (true, false) pair share one SUB.
+        let cond1 = emit.emit_valu(Opcode::And, a, v3);
+        let cond2 = emit.emit_valu(Opcode::And, b, v5);
+        let s1 = emit.emit_select_choice(cond1, a, b);
+        let s2 = emit.emit_select_choice(cond2, a, b);
+        let mut out = emit.emit_valu(Opcode::Add, s1, s2);
+        for _ in 0..4 {
+            out = emit.emit_valu(Opcode::Mul, out, v5);
+        }
+        emit.emit_vstore_imm(64, out);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let ops = emit.ops;
+        let groups = crate::cpsat_scheduler::build_cse_groups(&ops);
+        assert_eq!(groups.len(), 1, "the two selects form one CSE group");
+        let ctx = WindowProbeContext { cse_groups: Some(groups.as_slice()), ..Default::default() };
+
+        // Reference: the loose schedule with FMA selects, solved all-fixed so the SUB has a cycle.
+        let mut loose = loose_reference(&ops);
+        for op in &ops {
+            if op.opcode == Opcode::SelectChoice {
+                loose.select_fma_ops.insert(op.id);
+            }
+        }
+        let fixed = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: loose, prune: false };
+        let base = solve_window(&ops, &probe_config(), &ctx, &fixed).expect("model").expect("loose reference");
+        let reference = WindowReference::from_result(&base, &[]);
+        assert_eq!(reference.cse_sub_cycles.len(), 1);
+
+        let makespan = reference.makespan(&ops);
+        let mut pruned_somewhere = false;
+        for start in (2..makespan - 4).step_by(3) {
+            let mut window =
+                CpsatWindow { start, len: 4, fix_window_encodings: false, reference: reference.clone(), prune: true };
+            pruned_somewhere |= restrict_to_window(&ops, &window, &groups, None).is_some();
+            let with = solve_window(&ops, &probe_config(), &ctx, &window).expect("reduced").expect("reduced solution");
+            window.prune = false;
+            let without = solve_window(&ops, &probe_config(), &ctx, &window).expect("full").expect("full solution");
+            assert_eq!(with.makespan, without.makespan, "window at {}", start);
+            let check = CpsatWindow {
+                start: 0,
+                len: 0,
+                fix_window_encodings: true,
+                reference: WindowReference::from_result(&with, &[]),
+                prune: false,
+            };
+            let again = solve_window(&ops, &probe_config(), &ctx, &check)
+                .expect("check model")
+                .expect("expanded schedule must satisfy the full model");
+            assert_eq!(again.makespan, with.makespan, "window at {}", start);
+        }
+        assert!(pruned_somewhere, "some window must use the reduced model");
     }
 
     /// With fixed encodings the ops inside the window keep the reference's choices.

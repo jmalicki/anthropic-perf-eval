@@ -97,8 +97,15 @@ def summarize(report: dict) -> dict:
             "median_inside": statistics.median([e["inside"] for e in es]) if es else 0,
         })
     rolling_rows = []
-    for w, final in report.get("rolling_final", []):
+    finals = {w: final for w, final in report.get("rolling_final", [])}
+    checks = {w: status for w, status in report.get("rolling_checks", [])}
+    rolling_ws = sorted({e["w"] for e in report["entries"] if e["phase"] == "rolling"})
+    for w in rolling_ws:
         es = [e for e in report["entries"] if e["phase"] == "rolling" and e["w"] == w]
+        solved = [e for e in es if e["makespan"] is not None]
+        # An interrupted pass has no final entry: report where it got to.
+        final = finals.get(w, min((e["makespan"] for e in solved), default=base))
+        last = es[-1] if es else None
         rolling_rows.append({
             "w": w,
             "windows": len(es),
@@ -106,6 +113,9 @@ def summarize(report: dict) -> dict:
             "optimal": sum(1 for e in es if e["status"] == "optimal"),
             "final": final,
             "saved": base - final,
+            "complete": w in finals,
+            "reached_cycle": (last["start"] + w) if last else 0,
+            "full_model_check": checks.get(w),
             "median_secs": statistics.median([e["wall_secs"] for e in es]) if es else 0.0,
         })
     return {"base_makespan": base, "sweep": sweep_rows, "rolling": rolling_rows}
@@ -127,12 +137,14 @@ def markdown(summary: dict) -> str:
             f"| {r['max_secs']:.1f} |"
         )
     if summary["rolling"]:
-        out += ["", "| W | rolling windows | improved | optimal | final makespan | saved | median s |",
-                "|---|---|---|---|---|---|---|"]
+        out += ["", "| W | rolling windows | improved | optimal | final makespan | saved | complete "
+                "| full-model check | median s |",
+                "|---|---|---|---|---|---|---|---|---|"]
         for r in summary["rolling"]:
+            done = "yes" if r["complete"] else f"no (reached cycle {r['reached_cycle']})"
             out.append(
                 f"| {r['w']} | {r['windows']} | {r['improved']} | {r['optimal']} | {r['final']} "
-                f"| {r['saved']} | {r['median_secs']:.1f} |"
+                f"| {r['saved']} | {done} | {r['full_model_check'] or '-'} | {r['median_secs']:.1f} |"
             )
     return "\n".join(out)
 
@@ -147,6 +159,7 @@ def merge_reports(reports: list[dict]) -> dict:
     merged = dict(reports[0])
     merged["entries"] = [e for r in reports for e in r["entries"]]
     merged["rolling_final"] = [x for r in reports for x in r.get("rolling_final", [])]
+    merged["rolling_checks"] = [x for r in reports for x in r.get("rolling_checks", [])]
     return merged
 
 
@@ -160,6 +173,7 @@ def build_spec(args: argparse.Namespace) -> dict:
         "encodings": args.encodings,
         "sweep": not args.no_sweep,
         "rolling": not args.no_rolling,
+        "prune": not args.no_prune,
         "deterministic_time": args.deterministic_time,
         "time_limit_secs": args.time_limit,
         "output": str(Path(args.report).resolve()),
@@ -207,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--encodings", nargs="+", choices=["free", "fixed"], default=["free", "fixed"])
     p.add_argument("--no-sweep", action="store_true", help="Skip the independent sweep")
     p.add_argument("--no-rolling", action="store_true", help="Skip the rolling pass")
+    p.add_argument("--no-prune", action="store_true",
+                   help="Solve every window on the full model instead of the reduced one (slow; for checks)")
     p.add_argument("--cycle-range", type=int, nargs=2, metavar=("LO", "HI"), help="Only windows starting in [LO, HI)")
     p.add_argument("--deterministic-time", type=float, default=30.0, help="CP-SAT deterministic time per window")
     p.add_argument("--time-limit", type=float, default=900.0, help="Wall-clock backstop per window (s)")

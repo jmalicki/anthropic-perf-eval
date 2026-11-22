@@ -48,10 +48,23 @@ def test_summarize_counts_improvements_bounds_and_encoding_changes():
     fixed = next(r for r in s["sweep"] if r["encodings"] == "fixed")
     assert fixed["improved"] == 0
     assert s["rolling"] == [{"w": 20, "windows": 2, "improved": 2, "optimal": 2, "final": 97,
-                             "saved": 3, "median_secs": 1.0}]
+                             "saved": 3, "complete": True, "reached_cycle": 38,
+                             "full_model_check": None, "median_secs": 1.0}]
     text = markdown(s)
     assert "| 20 | free | 3 | 2 | 2 | 2 | 3 | 1 |" in text
-    assert "| 20 | 2 | 2 | 2 | 97 | 3 |" in text
+    assert "| 20 | 2 | 2 | 2 | 97 | 3 | yes | - |" in text
+
+
+def test_summarize_reports_an_interrupted_rolling_pass():
+    report = {
+        "base_makespan": 100,
+        "entries": [entry("rolling", 20, 0, 1), {**entry("rolling", 20, 19, 1), "makespan": 98}],
+        "rolling_final": [],
+    }
+    (row,) = summarize(report)["rolling"]
+    assert row["final"] == 98 and row["saved"] == 2
+    assert row["complete"] is False and row["reached_cycle"] == 39
+    assert "no (reached cycle 39)" in markdown(summarize(report))
 
 
 def test_merge_reports_requires_one_reference():
