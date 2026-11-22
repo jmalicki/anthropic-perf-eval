@@ -1247,6 +1247,18 @@ impl SsaTickTockKernelBuilder {
                     .collect();
                 let seg_shift: Option<&HashSet<usize>> =
                     if seg_shift_set.is_empty() { None } else { Some(&seg_shift_set) };
+                // Split shifts among the hinted shifts: their lanes, in section cycles like
+                // segment_hints. Without them the hint check would count each as a whole shift
+                // (8 scalar slots in its last lane's cycle), which can exceed the scalar slots
+                // of a schedule the greedy actually produced.
+                let seg_lane_hints: HashMap<usize, Vec<i32>> = seg_shift_set
+                    .iter()
+                    .filter_map(|id| {
+                        ctx.greedy_decisions.shifted_alu_cycles.get(id).map(|lanes| {
+                            (*id, lanes.iter().map(|&c| (c - section_offset).max(0)).collect())
+                        })
+                    })
+                    .collect();
                 let seg_select_set: HashSet<usize> =
                     current_select_fma.intersection(&segment_op_ids).copied().collect();
                 let seg_select = if seg_select_set.is_empty() { None } else { Some(&seg_select_set) };
@@ -1265,7 +1277,7 @@ impl SsaTickTockKernelBuilder {
                     SsaCpsatHints {
                         greedy_hints: Some(&segment_hints),
                         shift_hints: seg_shift,
-                        shifted_lane_cycle_hints: None,
+                        shifted_lane_cycle_hints: Some(&seg_lane_hints).filter(|l| !l.is_empty()),
                         forced_shifts: None,
                         select_choice_hints: seg_select,
                         const_add_imm_hints: seg_const_add_imm_hints,

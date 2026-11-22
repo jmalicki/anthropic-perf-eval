@@ -347,7 +347,7 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--greedy-split-shift", action="store_true", default=False,
                        help="With --use-greedy: let a vector op run as 8 scalar ops spread over two cycles, so "
                             "all 12 scalar slots carry shifted work (3 shifted ops per 2 cycles instead of 2). "
-                            "Ignored with CP-SAT, whose hints carry one cycle per op")
+                            "Ignored with CP-SAT unless --cpsat-split-shift-hint is set")
     group.add_argument("--pressure-soft-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
                        help="Pressure policy: fraction of the scratch budget above which the ready queue blends "
                             "in net pressure and busy-ALU shifts are suppressed (policy default 0.85)")
