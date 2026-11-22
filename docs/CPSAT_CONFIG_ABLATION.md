@@ -834,3 +834,36 @@ uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --budget 20 --
     --config "L2+bucketed+P0:--cpsat-makespan-rows bucketed --cpsat-probing-level 0"
 uv run python -m verification.makespan_rows
 ```
+
+## 10. Group symmetry at 4 rounds, batch 64
+
+With the makespan-only objective and solver seed 2, the `none` configuration reached 118 cycles,
+`checked` reached 126 and `declared` reached 129. The greedy scheduler reported 143 cycles.
+CP-SAT accepted a complete feasible hint with objective 140 in each of the three solves.
+
+| Symmetry mode | Schedule cycles | Lower bound | Total solver deterministic time | Solver wall time (s) | Peak live words |
+|---|---:|---:|---:|---:|---:|
+| declared | 129 | 95 | 20.5330 | 110.2420 | 538 |
+| none | 118 | 95 | 23.1028 | 123.4560 | 575 |
+| checked | 126 | 95 | 21.7012 | 72.5203 | 570 |
+
+All three ran sequentially at commit `f720de5` with eight interleaved workers, a deterministic
+limit of 20 and a 180-second wall-clock backstop. Each completed within the backstop with
+status FEASIBLE. Symbolic dataflow replay proved each kernel and numeric validation passed.
+The runner also retained its seed-1 control with the weighted objective and declared rows.
+It reached 139 cycles, bound 95, in 20.3109 total deterministic time and 104.132 seconds.
+
+These results compare the three modes for one instance and seed. Under default energetic
+tightening, `none` drops the explicit ordering rows but still uses declared ordering during
+ASAP tightening. `checked` bypasses that ordering and widens corresponding operation domains
+to their union before adding one anchor chain per orbit. It found five interchangeable groups
+among eight and added four ordering rows. The three modes therefore change both the constraints
+and the search domains, and their total solver work differs as shown above.
+
+The study runner accepts this subset once the branch's scheduler extension is built.
+
+```bash
+uv run python -m scripts.run_symmetry_measurement --instances 4x64 \
+    --only declared-mk-s2,none-mk-s2,checked-mk-s2 --jobs 1 --time-limit 180 \
+    --out-dir build/symmetry_pickup_4x64 --name seed2_makespan
+```
