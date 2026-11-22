@@ -586,6 +586,20 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
+    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
+    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
+    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
+    // size and start hints), so what is hinted is exactly what the check counted.
+    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        let lo = *asap.get(&op_id).unwrap_or(&0);
+        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
+        hints
+            .shifted_lane_cycle_hints
+            .and_then(|m| m.get(&op_id))
+            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
+            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
+    };
+
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
     // symmetry-aware or energetic tightening is used; use it for both passes and model constraints.
     let mut current_asap = asap.clone();
@@ -2547,7 +2561,10 @@ pub fn schedule_ssa_cpsat(
                     if *def_idx >= hints.len() {
                         continue;
                     }
-                    let def_cycle = hints[*def_idx];
+                    // A split shift reserves its destination from its first lane.
+                    let def_cycle = hinted_lanes(ops[*def_idx].id)
+                        .and_then(|lanes| lanes.iter().copied().min())
+                        .unwrap_or(hints[*def_idx]);
                     let expected_size = if is_live_out {
                         (max_hint - def_cycle + 1).max(1)
                     } else {
@@ -2806,9 +2823,18 @@ pub fn schedule_ssa_cpsat(
                     Engine::Valu if !is_shifted => {
                         valu_per_cycle[cycle] += 1;
                     }
-                    Engine::Valu if is_shifted => {
-                        alu_per_cycle[cycle] += VLEN as i32; // Shifted VALU uses 8 ALU slots
-                    }
+                    Engine::Valu if is_shifted => match hinted_lanes(op.id) {
+                        // Split shift: each lane takes one ALU slot in its own cycle.
+                        Some(lanes) => {
+                            for &lane_cycle in lanes {
+                                if let Some(used) = alu_per_cycle.get_mut(lane_cycle.max(0) as usize) {
+                                    *used += 1;
+                                }
+                            }
+                        }
+                        // Whole shift: 8 ALU slots in the op's cycle.
+                        None => alu_per_cycle[cycle] += VLEN as i32,
+                    },
                     Engine::Alu => {
                         alu_per_cycle[cycle] += 1;
                     }
@@ -3521,8 +3547,13 @@ pub fn schedule_ssa_cpsat(
             if let Some(completion_var) = times[idx].completion() {
                 model.add_hint(completion_var, clamped);
             }
-            for &alu_var in times[idx].lanes() {
-                model.add_hint(alu_var, clamped);
+            let lanes = hinted_lanes(ops[idx].id);
+            for (lane, &alu_var) in times[idx].lanes().iter().enumerate() {
+                // A split shift hints each lane at its own cycle, unclamped: hinted_lanes
+                // only returns lanes inside the lane variables' domain, and the capacity
+                // check counted these exact cycles. Otherwise all lanes run in the op's cycle.
+                let lane_hint = lanes.map_or(clamped, |l| l[lane] as i64);
+                model.add_hint(alu_var, lane_hint);
             }
         }
     }
@@ -3604,10 +3635,14 @@ pub fn schedule_ssa_cpsat(
 
         // Hint scratch shifted_dest_start vars: when not shifted, start = def_cycle.
         // Greedy defaults to not shifting, so hint = def_cycle.
+        // A hinted split shift starts at its first lane.
         for &(start_var, def_idx) in &scratch_shifted_start_vars {
             let hint_cycle = hints.get(def_idx).copied().unwrap_or(-1);
             if hint_cycle >= 0 {
-                model.add_hint(start_var, hint_cycle as i64);
+                let start_hint = hinted_lanes(ops[def_idx].id)
+                    .and_then(|lanes| lanes.iter().copied().min())
+                    .unwrap_or(hint_cycle);
+                model.add_hint(start_var, start_hint as i64);
             }
         }
     }

@@ -576,6 +576,10 @@ pub struct SsaCpsatHints<'a> {
     pub greedy_hints: Option<&'a [i32]>,
     /// Shift decisions from greedy (op ID -> should shift to ALU).
     pub shift_hints: Option<&'a HashSet<usize>>,
+    /// Per-lane cycles of hinted shifted ops whose lanes are not all in the op's cycle (the
+    /// greedy's split shifts): op ID -> VLEN lane cycles, the op's hinted cycle being their
+    /// maximum. An op in `shift_hints` without an entry runs all lanes in its hinted cycle.
+    pub shifted_lane_cycle_hints: Option<&'a HashMap<usize, Vec<i32>>>,
     /// Forced shift decisions (op ID -> must shift to ALU). Unlike shift_hints, these are enforced as constraints.
     pub forced_shifts: Option<&'a HashSet<usize>>,
     /// SelectChoice decisions from greedy (op ID -> use FMA path).

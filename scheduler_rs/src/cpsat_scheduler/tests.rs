@@ -3714,6 +3714,7 @@ mod tests {
             SsaCpsatHints {
                 greedy_hints: Some(&hints),
                 shift_hints: None,
+                shifted_lane_cycle_hints: None,
                 forced_shifts: None,
                 select_choice_hints: None,
                 const_add_imm_hints: None,
@@ -4508,6 +4509,140 @@ mod tests {
             "ALU capacity test: 12 ALU ops at cycle 1, result={:?}",
             r.cycle_assignments
         );
+    }
+
+    /// One vector constant and three shifted vector adds: A whole in cycle 1, B split over
+    /// cycles 1 and 2 (four lanes each), C whole in cycle 2. Twelve scalar slots per cycle.
+    #[cfg(feature = "cpsat")]
+    fn split_shift_hint_case() -> (Vec<SsaOp>, Vec<i32>, HashSet<usize>, HashMap<usize, Vec<i32>>) {
+        use crate::types::Opcode;
+        let add = |id: usize| {
+            make_ssa_op(
+                id,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(id as u32)),
+                vec![Operand::vector(0), Operand::vector(0)],
+                vec![0],
+            )
+        };
+        let ops = vec![
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            add(1),
+            add(2),
+            add(3),
+        ];
+        // A shifted op's hinted cycle is its completion (its last lane).
+        let hints = vec![0, 1, 2, 2];
+        let shift_hints: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        let lane_hints: HashMap<usize, Vec<i32>> =
+            [(2, vec![1, 1, 1, 1, 2, 2, 2, 2])].into_iter().collect();
+        (ops, hints, shift_hints, lane_hints)
+    }
+
+    #[cfg(feature = "cpsat")]
+    fn split_shift_hint_config() -> SsaCpsatConfig {
+        SsaCpsatConfig {
+            time_limit_secs: 10.0,
+            verbose: true,
+            stop_after_first_solution: true,
+            scratch_budget: 0,
+            enable_valu_shift: true,
+            ..Default::default()
+        }
+    }
+
+    /// A split-shift hint with per-lane cycles is accepted: the hint verifier counts scalar
+    /// slots lane by lane (12 per cycle here), and the solver returns the hinted cycles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_lane_hints_are_accepted() {
+        let (ops, hints, shift_hints, lane_hints) = split_shift_hint_case();
+        let result = schedule_ssa_cpsat(
+            &ops,
+            split_shift_hint_config(),
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                shift_hints: Some(&shift_hints),
+                shifted_lane_cycle_hints: Some(&lane_hints),
+                ..Default::default()
+            },
+            None,
+        );
+        let r = result.expect("no error").expect("a solution");
+        assert_eq!(r.cycle_assignments, hints, "the hinted cycles are a solution");
+    }
+
+    /// The same schedule without the per-lane cycles reads as two whole shifted ops (16
+    /// scalar slots) completing in cycle 2, which the hint verifier rejects. Lane cycles for
+    /// an op that is not hinted as shifted are ignored.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_hint_needs_lane_cycles() {
+        let (ops, hints, shift_hints, lane_hints) = split_shift_hint_case();
+        let without_lanes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_ssa_cpsat(
+                &ops,
+                split_shift_hint_config(),
+                SsaCpsatHints {
+                    greedy_hints: Some(&hints),
+                    shift_hints: Some(&shift_hints),
+                    ..Default::default()
+                },
+                None,
+            )
+        }));
+        assert!(without_lanes.is_err(), "16 scalar slots in one cycle must be rejected");
+
+        // Op 2 not hinted as shifted: its lane cycles do not count, the hint is three ops on
+        // the vector ALU and two whole shifts, one per cycle.
+        let unshifted_b: HashSet<usize> = [1, 3].into_iter().collect();
+        let result = schedule_ssa_cpsat(
+            &ops,
+            split_shift_hint_config(),
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                shift_hints: Some(&unshifted_b),
+                shifted_lane_cycle_hints: Some(&lane_hints),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    /// Lane cycles outside the lane variables' domain are not used: op 2's first four lanes
+    /// at cycle 0 precede its input (ASAP 1). The op is then read as a whole shift completing
+    /// in cycle 2, which with op 3 makes 16 scalar slots, and the hint verifier rejects it.
+    /// Counting the out-of-domain lanes while hinting them clamped into the domain would
+    /// verify one schedule and hint another.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_lanes_outside_domain_are_not_counted() {
+        let (ops, hints, shift_hints, _) = split_shift_hint_case();
+        let early_lanes: HashMap<usize, Vec<i32>> =
+            [(2, vec![0, 0, 0, 0, 2, 2, 2, 2])].into_iter().collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_ssa_cpsat(
+                &ops,
+                split_shift_hint_config(),
+                SsaCpsatHints {
+                    greedy_hints: Some(&hints),
+                    shift_hints: Some(&shift_hints),
+                    shifted_lane_cycle_hints: Some(&early_lanes),
+                    ..Default::default()
+                },
+                None,
+            )
+        }));
+        assert!(result.is_err(), "out-of-domain lanes must fall back to a whole shift");
     }
 
     /// Test engine capacity: A shiftable VALU op shifted to ALU uses 8 slots.

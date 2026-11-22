@@ -365,7 +365,7 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--greedy-split-shift", action="store_true", default=False,
                        help="With --use-greedy: let a vector op run as 8 scalar ops spread over two cycles, so "
                             "all 12 scalar slots carry shifted work (3 shifted ops per 2 cycles instead of 2). "
-                            "Ignored with CP-SAT, whose hints carry one cycle per op")
+                            "Ignored with CP-SAT unless --cpsat-split-shift-hint is set")
     group.add_argument("--pressure-soft-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
                        help="Pressure policy: fraction of the scratch budget above which the ready queue blends "
                             "in net pressure and busy-ALU shifts are suppressed (policy default 0.85)")
@@ -382,6 +382,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "every point; 'pools' = 8 * (most vectors live at once) + (most scalars live at "
                             "once) <= budget, under which address assignment always fits (a per-point word "
                             "count does not guarantee that; see docs/ALLOCATION_CONJECTURES.md)")
+    group.add_argument("--cpsat-split-shift-hint", action="store_true", default=False,
+                       help="With --greedy-split-shift and CP-SAT: keep the greedy's split shifts and hint "
+                            "CP-SAT each lane at its own cycle, so the solver starts from the split-shift "
+                            "schedule (default: the greedy that feeds CP-SAT makes no split shifts)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -540,6 +544,7 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -596,6 +601,7 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

@@ -538,12 +538,16 @@ pub struct CompilerConfig {
     /// Words the greedy keeps free below the scratch budget (default: 0). Address
     /// assignment can need a few words more than the greedy's counter reports.
     pub greedy_budget_headroom: usize,
-    /// Greedy-only: let a shifted vector op straddle two cycles so all 12 scalar slots can
-    /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
-    /// carry one cycle per op.
+    /// Let a shifted vector op straddle two cycles so all 12 scalar slots can carry shifted
+    /// work (default: false). When CP-SAT follows it applies only with
+    /// `cpsat_split_shift_hint`.
     pub greedy_split_shift: bool,
     /// What the scratch budget bounds in both schedulers (default: `Words`).
     pub scratch_model: ScratchModel,
+    /// With `greedy_split_shift` and CP-SAT: keep the greedy's split shifts and hint CP-SAT
+    /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
+    /// split shifts).
+    pub cpsat_split_shift_hint: bool,
 }
 
 impl Default for CompilerConfig {
@@ -563,6 +567,7 @@ impl Default for CompilerConfig {
             greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
             greedy_split_shift: false,
+            cpsat_split_shift_hint: false,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_model: ScratchModel::default(),

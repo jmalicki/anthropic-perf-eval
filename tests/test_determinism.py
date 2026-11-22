@@ -43,8 +43,11 @@ def _sha(path):
         # Gather round, CSE groups and symmetry ordering all contribute constraints here.
         ["--rounds", "5", "--batch-size", "16", "--cpsat-deterministic-time", "0.5"],
         ["--rounds", "3", "--batch-size", "16", "--cpsat-deterministic-time", "0.5", "--valu-shift", "alu"],
+        # Wavefront greedy with split shifts, handed to CP-SAT as per-lane hints.
+        ["--rounds", "3", "--batch-size", "64", "--cpsat-deterministic-time", "0.5", "--greedy-barriers", "none",
+         "--greedy-priority", "wavefront", "--greedy-split-shift", "--cpsat-split-shift-hint"],
     ],
-    ids=["2r16", "5r16", "3r16-force-alu"],
+    ids=["2r16", "5r16", "3r16-force-alu", "3r64-split-shift-hint"],
 )
 def test_cpsat_build_is_reproducible(tmp_path, extra):
     kernel_a, model_a = _build(tmp_path, "a", extra)
