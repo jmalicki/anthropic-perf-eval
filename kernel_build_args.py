@@ -343,6 +343,11 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "are deferred (policy default 0.80; 1.0 or more turns deferral off)")
     group.add_argument("--greedy-budget-headroom", type=_non_negative_int, default=0, metavar="WORDS",
                        help="Scratch words the greedy keeps free below the budget (default 0)")
+    group.add_argument("--scratch-model", choices=["words", "pools"], default="words",
+                       help="What the schedulers' scratch budget bounds: 'words' (default) = live words at "
+                            "every point; 'pools' = 8 * (most vectors live at once) + (most scalars live at "
+                            "once) <= budget, under which address assignment always fits (a per-point word "
+                            "count does not guarantee that; see docs/ALLOCATION_CONJECTURES.md)")
 
     # Constraint / CSE options
     import scheduler_rs
@@ -505,6 +510,7 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_model": get("scratch_model", "words"),
     }
     git_sha = _get_git_sha() if use_git_sha else None
     enable_cse = False if get("no_cse_groups", False) else None
@@ -560,6 +566,7 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_model": get("scratch_model", "words"),
     }
 
 

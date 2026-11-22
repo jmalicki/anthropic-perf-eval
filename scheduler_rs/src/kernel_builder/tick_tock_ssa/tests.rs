@@ -224,6 +224,9 @@ fn test_budget_exceeded_propagates() {
                 assert!(peak_live <= budget, "{}", err_msg);
                 assert!(err_msg.contains("highest address used"), "{}", err_msg);
             }
+            BudgetAccounting::AddressPools { .. } => {
+                assert!(err_msg.contains("scratch pools exceeded"), "{}", err_msg);
+            }
         },
         other => panic!("expected BudgetExceeded, got {:?}", other),
     }
@@ -2357,6 +2360,33 @@ fn test_inflation_threshold_retune_shortens_default_schedule() {
         retuned.address_result.peak_live > default.address_result.peak_live,
         "a later threshold should use more of the scratch budget"
     );
+}
+
+/// With `--scratch-model pools` the greedy budget is the assignable words (the zero word at
+/// address 0 is reserved), the same words address assignment checks the pools against; with
+/// `words` it stays the configured budget (default schedules unchanged).
+#[test]
+fn test_greedy_budget_pools_excludes_reserved_zero_word() {
+    use crate::kernel_builder::config::ScratchModel;
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+    use crate::kernel_builder::ssa_program::SsaProgram;
+    let make = |model: ScratchModel, headroom: usize| {
+        let mut config = PipelineConfig::default();
+        config.compiler.scratch_model = model;
+        config.compiler.greedy_budget_headroom = headroom;
+        let program = SsaProgram {
+            ops: vec![],
+            vreg_def: HashMap::new(),
+            vreg_count: 1,
+            const_alternatives: vec![],
+            zero_vreg: Some(VReg::scalar(0)),
+            vector_group_lanes: HashMap::new(),
+        };
+        PipelineContext::new(program, config)
+    };
+    assert_eq!(make(ScratchModel::Words, 0).greedy_budget(), 1536);
+    assert_eq!(make(ScratchModel::Pools, 0).greedy_budget(), 1535);
+    assert_eq!(make(ScratchModel::Pools, 35).greedy_budget(), 1500);
 }
 
 /// Headroom lowers the budget the greedy schedules against, and with it the peak.
