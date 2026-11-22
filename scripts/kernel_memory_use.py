@@ -212,32 +212,58 @@ def memory_use(sym: SymbolicKernel, examples: int = 1) -> dict:
     return {"patterns": out}
 
 
-def scratch_report(sym: SymbolicKernel) -> dict:
-    vals = scratch_values(sym.ops)
-    touched = {a for o in sym.ops for a in o.reads + o.writes}
-    peak, at = peak_live_words(vals, [o.cycle for o in sym.ops])
-    # Words held in memory between a store and its last reader (the memory round trips).
-    last_read: dict[int, int] = {}
-    for s_op, e, l_op, _, _ in sym.flows:
-        last_read[e] = max(last_read.get(e, -1), sym.ops[l_op].cycle)
-    diff = collections.Counter()
-    for e, hi in last_read.items():
-        lo = sym.ops[sym.events[e].op].cycle + 1
+def _occupancy(intervals, T: int) -> list[int]:
+    diff = [0] * (T + 2)
+    for lo, hi in intervals:
         if hi >= lo:
             diff[lo] += 1
             diff[hi + 1] -= 1
-    mem_peak, cur = 0, 0
-    for t in range(len(sym.bundles) + 2):
+    out, cur = [], 0
+    for t in range(T + 1):
         cur += diff[t]
-        mem_peak = max(mem_peak, cur)
-    return {"words_touched": len(touched), "highest_word": max(touched) if touched else None,
-            "peak_live_words": peak, "peak_cycle": at, "peak_words_parked_in_memory": mem_peak}
+        out.append(cur)
+    return out
+
+
+def scratch_report(sym: SymbolicKernel) -> dict:
+    """Scratch words touched and live, and memory words "parked" between a store and its last
+    reader. Parked words are split by what they hold: working values (derived from the input
+    values: hash state, selected node values) would need scratch in a kernel without memory
+    round trips; tree values and constants could be re-read from the tree instead. The
+    combined peak (scratch live + parked working values, same cycle) estimates the scratch a
+    scratch-only version of this schedule would need."""
+    T = len(sym.bundles)
+    start = [o.cycle for o in sym.ops]
+    vals = scratch_values(sym.ops)
+    touched = {a for o in sym.ops for a in o.reads + o.writes}
+    live = _occupancy([(0 if w is None else start[w] + 1, max(start[r] for r in rd))
+                       for w, _, rd in vals if rd], T)
+    kinds = _leaf_kinds(sym)
+    last_read: dict[int, int] = {}
+    for _, e, l_op, _, _ in sym.flows:
+        last_read[e] = max(last_read.get(e, -1), start[l_op])
+    working, other = [], []
+    for e, hi in last_read.items():
+        ev = sym.events[e]
+        iv = (start[ev.op] + 1, hi)
+        (working if "input" in kinds(ev.value) else other).append(iv)
+    park_w, park_o = _occupancy(working, T), _occupancy(other, T)
+    combined = [a + b for a, b in zip(live, park_w)]
+    peak = max(live)
+    return {
+        "words_touched": len(touched), "highest_word": max(touched) if touched else None,
+        "peak_live_words": peak, "peak_cycle": live.index(peak),
+        "peak_parked_working_words": max(park_w), "peak_parked_tree_or_constant_words": max(park_o),
+        "peak_live_plus_parked_working": max(combined),
+    }
 
 
 def format_memory_use(name: str, mu: dict, sr: dict) -> str:
     lines = [f"== {name}: scratch words touched {sr['words_touched']} (highest {sr['highest_word']}), "
-             f"peak live {sr['peak_live_words']} at cycle {sr['peak_cycle']}; "
-             f"peak words parked in memory {sr['peak_words_parked_in_memory']}"]
+             f"peak live {sr['peak_live_words']} at cycle {sr['peak_cycle']}; words parked in memory "
+             f"(peak): {sr['peak_parked_working_words']} working values, "
+             f"{sr['peak_parked_tree_or_constant_words']} tree values/constants; "
+             f"scratch live + parked working values: {sr['peak_live_plus_parked_working']} (limit 1536)"]
     for p in mu["patterns"]:
         lines.append(f"  {p['stores']:5d} x {p['store']:6s} addr {p['address']}; value {p['value']}; "
                      f"read by {'/'.join(p['readers'])}: {p['loads']} loads "

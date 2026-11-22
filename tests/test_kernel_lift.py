@@ -291,6 +291,7 @@ def test_memory_use_classifies_a_scatter_then_load():
     p = pats[0]
     assert p["address"].startswith("data-dependent (2 bases")
     assert p["value"].startswith("working value") and p["readers"] == ["load"] and p["loads"] == 1
+    assert scratch_report(sym)["peak_parked_working_words"] == 1
 
 
 def test_peak_live_words_counts_value_lifetimes():
@@ -299,7 +300,8 @@ def test_peak_live_words_counts_value_lifetimes():
     vals = scratch_values(sym.ops)
     # s10 is live from cycle 1 to 4 while s20 waits from cycle 2 to its first read at 5.
     assert peak_live_words(vals, [o.cycle for o in sym.ops])[0] == 2
-    assert scratch_report(sym)["words_touched"] == 2
+    r = scratch_report(sym)
+    assert r["words_touched"] == 2 and r["peak_live_plus_parked_working"] == 2
 
 
 def test_sampled_witnesses_agree_with_z3(monkeypatch):
