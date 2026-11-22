@@ -3747,7 +3747,19 @@ pub fn schedule_ssa_cpsat(
             );
             // A greedy schedule that does not use the forced encodings is not a schedule of
             // this model (its shift hints say ALU while its cycles were packed for VALU).
-            if cfg!(debug_assertions) && greedy_within_scratch_budget == Some(true) && greedy_matches_forced_modes {
+            // Likewise for ops whose shift is forced (what-if runs) but which the greedy kept
+            // on VALU. (Checked here rather than in greedy_schedule_matches_forced_modes, which
+            // also decides the domains: changing it would change those models.)
+            let forced_shifts_honoured = forced_shifts.map_or(true, |forced| {
+                shiftable_valu.iter().all(|&idx| {
+                    !forced.contains(&ops[idx].id) || shift_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                })
+            });
+            if cfg!(debug_assertions)
+                && greedy_within_scratch_budget == Some(true)
+                && greedy_matches_forced_modes
+                && forced_shifts_honoured
+            {
                 panic!("{}", message);
             }
             eprintln!("  WARNING: {}", message);
