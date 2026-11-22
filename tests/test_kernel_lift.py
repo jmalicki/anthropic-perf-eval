@@ -300,3 +300,18 @@ def test_peak_live_words_counts_value_lifetimes():
     # s10 is live from cycle 1 to 4 while s20 waits from cycle 2 to its first read at 5.
     assert peak_live_words(vals, [o.cycle for o in sym.ops])[0] == 2
     assert scratch_report(sym)["words_touched"] == 2
+
+
+def test_sampled_witnesses_agree_with_z3(monkeypatch):
+    # Every decision taken from a sampled model must be the one Z3 gives on its own.
+    import verification.memory_alias as ma
+    kernels = [
+        _bit_kernel([("load", ("const", 30, VAL_P)), ("load", ("const", 5, VAL_P))], [("alu", ("+", 31, 5, 2))]),
+        _bit_kernel([("load", ("const", 5, VAL_P + 1)), ("load", ("const", 6, VAL_P))],
+                    [("alu", ("-", 30, 5, 2)), ("alu", ("+", 31, 6, 2))]),
+    ]
+    with_samples = [SymbolicKernel(k).run() for k in kernels]
+    monkeypatch.setattr(ma, "N_SAMPLES", 0)
+    z3_only = [SymbolicKernel(k).run() for k in kernels]
+    assert [s.mem_edges for s in with_samples] == [s.mem_edges for s in z3_only]
+    assert with_samples[0].stats.sampled_witnesses > 0 and z3_only[0].stats.sampled_witnesses == 0

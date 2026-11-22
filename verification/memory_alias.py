@@ -57,6 +57,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 import z3
 
 if __package__ in (None, ""):
@@ -70,6 +71,7 @@ SET_CAP = 4096  # largest value set kept explicitly
 MOD_CAP = 64  # x % c with x unbounded is bounded by range(c) for constant c <= MOD_CAP (MA2)
 PRODUCT_CAP = 1 << 16  # largest cartesian product evaluated for a binary op
 Z3_TIMEOUT_MS = 20_000
+N_SAMPLES = 1024  # assignments of the fresh variables tried before asking Z3 (witness search)
 RANGE_OPS = {"&", "%", ">>", "<", "==", "//", "cdiv"}
 
 
@@ -291,6 +293,14 @@ class Z3Encoder:
         self.side: dict[int, z3.BoolRef] = {}  # fresh var id -> its range constraint
         self.deps: dict[int, frozenset[int]] = {}  # term -> fresh vars it uses
         self._inc: tuple[int, z3.Solver] | None = None  # (anchor term, incremental solver)
+        # Witness search: every fresh variable gets one fixed vector of N_SAMPLES values (in
+        # its range), and every encoded term the vector of its values, computed with the same
+        # operations as its Z3 expression. An index where the formula holds is a model of the
+        # Z3 query, so a SAT answer found this way is the answer Z3 would give.
+        self.form: dict[int, tuple] = {}  # term -> ("fresh",) | ("const", v) | (op, kids...)
+        self.samples: dict[int, np.ndarray] = {}
+        self.sampled_sat = 0  # queries answered by a sampled witness
+        self.z3_queries = 0
 
     def _val(self, v: int):
         return z3.BitVecVal(v % MASK, 32, self.ctx)
@@ -326,12 +336,14 @@ class Z3Encoder:
                 stack.pop()
                 self.cache[cur] = self._fresh(cur)
                 self.deps[cur] = frozenset([cur])
+                self.form[cur] = ("fresh",)
                 continue
             term = self.terms.defs[cur]
             if term[0] == "const":
                 stack.pop()
                 self.cache[cur] = self._val(term[1])
                 self.deps[cur] = frozenset()
+                self.form[cur] = ("const", term[1])
                 continue
             kids = [k for k in term[1:] if k not in self.cache]
             if kids:
@@ -340,7 +352,36 @@ class Z3Encoder:
             stack.pop()
             self.cache[cur] = self._build(term)
             self.deps[cur] = frozenset().union(*(self.deps[k] for k in term[1:]))
+            self.form[cur] = term
         return self.cache[t]
+
+    def sample(self, t: int) -> np.ndarray:
+        """Values of encoded term t under the fixed sample assignments (uint64, < 2**32)."""
+        self.encode(t)
+        stack = [t]
+        while stack:
+            cur = stack[-1]
+            if cur in self.samples:
+                stack.pop()
+                continue
+            form = self.form[cur]
+            if form[0] == "fresh":
+                rng = np.random.default_rng(1_000_003 + cur)
+                hi = VALUE_BOUND if cur in self.side else MASK
+                self.samples[cur] = rng.integers(0, hi, N_SAMPLES, dtype=np.uint64)
+                stack.pop()
+                continue
+            if form[0] == "const":
+                self.samples[cur] = np.full(N_SAMPLES, form[1] % MASK, dtype=np.uint64)
+                stack.pop()
+                continue
+            kids = [k for k in form[1:] if k not in self.samples]
+            if kids:
+                stack.extend(kids)
+                continue
+            stack.pop()
+            self.samples[cur] = _np_op(form[0], [self.samples[k] for k in form[1:]])
+        return self.samples[t]
 
     def _build(self, term: tuple):
         op = term[0]
@@ -383,6 +424,10 @@ class Z3Encoder:
         raise ValueError(f"no Z3 encoding for {op!r}")
 
     def _solve(self, formula, *tids: int) -> str:
+        self.z3_queries += 1
+        return self._solve_z3(formula, *tids)
+
+    def _solve_z3(self, formula, *tids: int) -> str:
         """Check `formula` with the range constraints of the fresh variables of `tids`.
         Queries come in runs with the same first term (one load or store address against
         each candidate), so one incremental solver per first term is kept and each query
@@ -414,11 +459,61 @@ class Z3Encoder:
     def ranges_overlap(self, a: int, wa: int, b: int, wb: int) -> bool:
         """Can [a, a+wa) and [b, b+wb) share a word? (mod 2**32; proof in check_overlap_rule)"""
         ea, eb = self.encode(a), self.encode(b)
+        diff = (self.sample(a) - self.sample(b) + np.uint64(wa - 1)) & np.uint64(MASK - 1)
+        if bool(np.any(diff < np.uint64(wa + wb - 1))):
+            self.sampled_sat += 1
+            return True
         return self._solve(overlap_rule(ea, wa, eb, wb, self.ctx), a, b) == "sat"
 
     def always_equal(self, a: int, b: int) -> bool:
         ea, eb = self.encode(a), self.encode(b)
+        if bool(np.any(self.sample(a) != self.sample(b))):
+            self.sampled_sat += 1  # a witness of a != b
+            return False
         return self._solve(ea != eb, a, b) == "unsat"
+
+
+_M = np.uint64(MASK - 1)
+
+
+def _np_op(op: str, args: list[np.ndarray]) -> np.ndarray:
+    """The Z3 encoding of `op` (Z3Encoder._build), on uint64 vectors of 32-bit values."""
+    if op == "sel":
+        return np.where(args[0] != 0, args[1], args[2])
+    if op == "ite_eq":
+        return np.where(args[0] == args[1], args[2], args[3])
+    if op == "fma":
+        return (args[0] * args[1] + args[2]) & _M
+    a, b = args
+    if op == "+":
+        return (a + b) & _M
+    if op == "-":
+        return (a - b) & _M
+    if op == "*":
+        return (a * b) & _M  # exact mod 2**32: 2**32 divides 2**64
+    if op == "^":
+        return a ^ b
+    if op == "&":
+        return a & b
+    if op == "|":
+        return a | b
+    if op == "<<":
+        return np.where(b >= 32, np.uint64(0), (a << np.minimum(b, 31)) & _M)
+    if op == ">>":
+        return np.where(b >= 32, np.uint64(0), a >> np.minimum(b, 31))
+    nz = b != 0
+    safe = np.where(nz, b, np.uint64(1))
+    if op == "%":
+        return np.where(nz, a % safe, a)  # Z3: urem(x, 0) = x
+    if op == "//":
+        return np.where(nz, a // safe, _M)  # Z3: udiv(x, 0) = all ones
+    if op == "cdiv":
+        return np.where(nz, ((a + safe - np.uint64(1)) // safe) & _M, _M)
+    if op == "<":
+        return (a < b).astype(np.uint64)
+    if op == "==":
+        return (a == b).astype(np.uint64)
+    raise ValueError(f"no sample evaluation for {op!r}")
 
 
 def overlap_rule(a, wa: int, b, wb: int, ctx=None):
@@ -457,6 +552,8 @@ class AliasStats:
     must_alias: int = 0  # word pairs that are always equal
     op_pairs_total: int = 0  # ordered op pairs with at least one store
     op_edges: int = 0  # op pairs with a memory edge
+    z3_queries: int = 0  # alias questions Z3 had to answer (no sampled witness)
+    sampled_witnesses: int = 0  # alias questions answered by a sampled model
     seconds: float = 0.0
 
 
@@ -662,6 +759,8 @@ class SymbolicKernel:
         # Ordered pairs (earlier, later) where at least one is a store.
         self.stats.op_pairs_total = n_st * (n_st - 1) // 2 + n_st * n_ld
         self.stats.op_edges = len(self.mem_edges)
+        self.stats.z3_queries = self.z3.z3_queries
+        self.stats.sampled_witnesses = self.z3.sampled_sat
 
 
 # =============================================================================

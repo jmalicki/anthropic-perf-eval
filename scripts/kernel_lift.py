@@ -377,7 +377,8 @@ def report(lk: LiftedKernel, bundles: list[dict], name: str = "") -> dict:
         "memory_alias": {
             "mem_ops": s.mem_ops, "op_pairs_with_store": s.op_pairs_total, "op_edges": s.op_edges,
             "z3_disjoint_word_pairs": s.disjoint_z3, "z3_may_alias_word_pairs": s.may_alias_z3,
-            "must_alias_word_pairs": s.must_alias, "seconds": round(s.seconds, 1),
+            "must_alias_word_pairs": s.must_alias, "z3_queries": s.z3_queries,
+            "sampled_witnesses": s.sampled_witnesses, "seconds": round(s.seconds, 1),
         },
         "simulator_cycles": sim,
         "gap_to_fixed_floor": sim - fixed["cycles"],
