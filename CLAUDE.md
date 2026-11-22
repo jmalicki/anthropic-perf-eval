@@ -84,6 +84,11 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 **One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|upstream|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
 
+**Machine load: test slots, and when to run suites locally.** Several agents in different worktrees share this machine; when they all run suites at once, timing-sensitive tests (pytest-timeout, subprocess timeouts, Z3 timeouts) fail for load alone. So:
+- Every `./scripts/test.sh` suite holds one of a few machine-wide test slots while it runs (`scripts/test_slot.py`; an `flock` on files in `~/.cache/anthropic-perf-eval/test-slots`, released automatically when the run ends or is killed). `PERF_EVAL_TEST_SLOTS` sets how many (default 2; `0` disables); CI takes no slot. The wrapper `exec`s the suite with the lock, so the slot is held exactly while the suite (and anything it leaves running) lives. A run that has to wait prints who holds the slots.
+- Run suites locally when you change code or are exploring. After a rebase or merge that only resolves conflicts (your commits' changes are the same, checked with `git range-diff`), do not rerun the full suites locally: push, let CI run them, and quote the range-diff.
+- A local failure that is a timeout under load (`uptime` load average far above the core count) is not a test failure; rerun it later or rely on CI, and say so.
+
 ```bash
 ./scripts/test.sh                 # everything
 ./scripts/test.sh rust            # cargo test --features cpsat
