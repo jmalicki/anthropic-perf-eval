@@ -19,9 +19,11 @@ use super::symmetry_ordering::SymmetryOrdering;
 #[cfg(feature = "cpsat")]
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
-    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator,
+    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
     OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
 };
+#[cfg(feature = "cpsat")]
+use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
@@ -162,24 +164,14 @@ pub(crate) fn build_sat_parameters(
     };
     params.absolute_gap_limit = absolute_gap_limit;
 
-    // Optimize LP relaxation for tighter bounds and faster convergence
-    // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
-    //   - Cumulative constraints have weak LP relaxations by default
-    //   - Level 2 linearizes more constraints, giving tighter best_objective_bound
-    //   - Expected: Gap reduction from 10-15% to 3-8%, 20-40% faster convergence
-    // cp_model_presolve=true: Preprocessing to simplify model before solving
-    //   - Removes redundant variables/constraints, detects symmetries
-    //   - Usually <1% of solve time, but significantly speeds up search
-    // cp_model_probing_level=2: Aggressive probing to tighten variable domains
-    //   - Temporarily fixes variables and observes consequences
-    //   - Strengthens domains and adds binary clauses
-    //   - Expected: 5-15% tighter domains, 10-20% faster search
-    // randomize_search=true: Help escape local optima
-    //   - Adds randomization to search decisions
-    //   - Helps when solver gets stuck in suboptimal regions
-    params.linearization_level = Some(2);
+    // linearization_level (tuning, default 2): how much of the model enters the LP relaxation
+    // (2 adds the cumulative relaxations and cuts). cp_model_probing_level (tuning, default 2):
+    // presolve probing effort. Neither default was chosen by measurement; the measured effect
+    // of each level is in docs/CPSAT_CONFIG_ABLATION.md ("Linearization, probing and makespan
+    // rows"). randomize_search=true is likewise unmeasured.
+    params.linearization_level = Some(tuning.linearization_level);
     params.cp_model_presolve = Some(true);
-    params.cp_model_probing_level = Some(2);
+    params.cp_model_probing_level = Some(tuning.probing_level);
     params.randomize_search = Some(true);
     // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
     // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
@@ -3688,6 +3680,89 @@ pub fn schedule_ssa_cpsat(
                 model.add_hint(end_var, end_hint);
                 model.add_hint(size_var, end_hint - clamped);
             }
+        }
+    }
+
+    // 11b. Makespan rows (tuning.makespan_rows, makespan_rows.rs): head/tail rows from static
+    // longest-path heads and tails, and with Bucketed prefix/suffix variables that follow the
+    // solution. Added after the hints so their auxiliaries are hinted from them.
+    if tuning.makespan_rows != MakespanRows::None {
+        let eliminable_set: HashSet<usize> = eliminable_vbs.iter().map(|(vb, _, _)| *vb).collect();
+        let paths = static_paths(ops, &eliminable_set);
+        let hint_map: HashMap<i32, i64> = model
+            .proto()
+            .solution_hint
+            .as_ref()
+            .map(|h| h.vars.iter().copied().zip(h.values.iter().copied()).collect())
+            .unwrap_or_default();
+        let hint = |v: IntVar| hint_map.get(&v.index()).copied();
+        let ctx = WorkContext {
+            ops,
+            times,
+            classes: OpClasses { shiftable: &shiftable_set, eliminable_vbs: &eliminable_set },
+            const_choice: &op_vars.const_choice,
+            const_choice_mode,
+        };
+        let caps = RowCaps { valu: valu_cap, alu: alu_cap, load: load_cap, store: store_cap, flow: flow_cap };
+        let added = add_makespan_rows(
+            &mut model,
+            &ctx,
+            &paths,
+            &caps,
+            makespan,
+            horizon,
+            tuning.makespan_rows == MakespanRows::Bucketed,
+            &hint,
+        );
+        for &(var, value) in &added.hints {
+            model.add_hint(var, value);
+        }
+        if let Some(sb) = added.static_bound {
+            eprintln!(
+                "  Static head/tail bound: makespan >= {} ({} row, head >= {}, tail >= {}; capacity floor {})",
+                sb.bound,
+                sb.engine.name(),
+                sb.t,
+                sb.q,
+                capacity_lower_bound
+            );
+        }
+        if verbose {
+            eprintln!(
+                "  Makespan rows: {} rows ({} literal head/tail rows), {} buckets, {} new variables",
+                added.rows.len(),
+                added.literal_rows,
+                added.buckets,
+                added.new_vars
+            );
+        }
+        // Every row holds in every schedule (verification/makespan_rows.py), so a greedy
+        // schedule within the slot limits satisfies them; a violation is a bug in the rows.
+        let violations = if greedy_hints.is_some() { added.hint_violations(&hint) } else { Vec::new() };
+        if !violations.is_empty() {
+            let message = format!(
+                "makespan rows cut off the hint: {} row(s), first {:?}",
+                violations.len(),
+                &violations[..violations.len().min(5)]
+            );
+            // A greedy schedule that does not use the forced encodings is not a schedule of
+            // this model (its shift hints say ALU while its cycles were packed for VALU).
+            // Likewise for ops whose shift is forced (what-if runs) but which the greedy kept
+            // on VALU. (Checked here rather than in greedy_schedule_matches_forced_modes, which
+            // also decides the domains: changing it would change those models.)
+            let forced_shifts_honoured = forced_shifts.map_or(true, |forced| {
+                shiftable_valu.iter().all(|&idx| {
+                    !forced.contains(&ops[idx].id) || shift_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                })
+            });
+            if cfg!(debug_assertions)
+                && greedy_within_scratch_budget == Some(true)
+                && greedy_matches_forced_modes
+                && forced_shifts_honoured
+            {
+                panic!("{}", message);
+            }
+            eprintln!("  WARNING: {}", message);
         }
     }
 

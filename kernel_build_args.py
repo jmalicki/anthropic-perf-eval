@@ -92,7 +92,13 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_push_tasks_toward_start", "push_all_tasks_toward_start"),
     ("cpsat_cumulative_propagators", "cumulative_propagators"),
     ("cpsat_ttef_max_intervals", "timetable_edge_finding_max_intervals"),
+    ("cpsat_linearization_level", "linearization_level"),
+    ("cpsat_probing_level", "probing_level"),
+    ("cpsat_makespan_rows", "makespan_rows"),
 ]
+
+# Tuning keys whose value "none" is an enum variant, not "switched off" (JSON null).
+ENUM_TUNING_KEYS = {"makespan_rows"}
 
 CUMULATIVE_PROPAGATORS = ["overload_checker", "timetable_edge_finding", "hard_precedences"]
 
@@ -271,6 +277,16 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--cpsat-ttef-max-intervals", type=_non_negative_int, default=None, metavar="N",
                        help="max_num_intervals_for_timetable_edge_finding (CP-SAT default: 100). Timetable edge "
                             "finding is skipped on larger cumulatives, i.e. on all of ours unless this is raised.")
+    group.add_argument("--cpsat-linearization-level", type=int, choices=[0, 1, 2], default=None,
+                       help="CP-SAT linearization_level (default: 2; CP-SAT's own default is 1). 2 adds the "
+                            "LP relaxations and cuts of cumulatives; see docs/CPSAT_CONFIG_ABLATION.md.")
+    group.add_argument("--cpsat-probing-level", type=int, choices=[0, 1, 2, 3], default=None,
+                       help="CP-SAT cp_model_probing_level (default: 2)")
+    group.add_argument("--cpsat-makespan-rows", choices=["none", "static", "bucketed"], default=None,
+                       help="Extra makespan lower-bound rows (default: none). static: per-engine head/tail "
+                            "energy rows from static longest-path heads and tails. bucketed: static plus "
+                            "prefix-end/suffix-start variables per bucket of heads that follow the solution. "
+                            "See scheduler_rs/src/cpsat_scheduler/makespan_rows.rs.")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
@@ -455,7 +471,7 @@ def args_to_build_kwargs(
 
     # CP-SAT tuning: send only what was set; record the effective values (defaults filled in by Rust).
     cpsat_tuning = {
-        key: (None if get(dest) == "none" else get(dest))
+        key: (None if get(dest) == "none" and key not in ENUM_TUNING_KEYS else get(dest))
         for dest, key in CPSAT_TUNING_OPTIONS
         if get(dest) is not None
     }

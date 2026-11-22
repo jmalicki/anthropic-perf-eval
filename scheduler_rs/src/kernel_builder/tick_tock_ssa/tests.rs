@@ -4275,3 +4275,48 @@ fn test_depth4_cpsat() {
         "Depth 4 CP-SAT should not exceed budget"
     );
 }
+
+/// `--cpsat-makespan-rows bucketed` (which includes the static rows) never cuts off the
+/// greedy schedule. The model checks every new row against the hint and panics in debug
+/// builds when the greedy schedule is within budget and a row excludes it; six rounds give
+/// static heads up to more than two buckets, so the bucketed rows are exercised.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_makespan_rows_keep_the_greedy_hint() {
+    use crate::cpsat_scheduler::{
+        AsapAlapTightening, ConstChoiceMode, CpsatTuning, MakespanRows, SelectChoiceMode, ValuShiftMode,
+    };
+    use crate::kernel_builder::config::ProblemSpec;
+
+    for (rounds, batch) in [(2, 16), (6, 16)] {
+        let config = KernelConfig {
+            spec: ProblemSpec { rounds, batch_size: batch, ..Default::default() },
+            ..Default::default()
+        };
+        let mut builder = SsaTickTockKernelBuilder::new(config);
+        builder.cpsat_tuning = CpsatTuning { makespan_rows: MakespanRows::Bucketed, ..Default::default() };
+        builder.cpsat_deterministic_time = Some(1.0);
+        let result = builder.build_and_schedule_cpsat(
+            20.0,  // time limit
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,
+            None,
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false,
+            AsapAlapTightening::Energetic,
+            false,
+            false,
+            false,
+            None,
+            false,
+            None,
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        );
+        assert!(result.is_ok(), "{}r/{}: {:?}", rounds, batch, result.err());
+    }
+}
