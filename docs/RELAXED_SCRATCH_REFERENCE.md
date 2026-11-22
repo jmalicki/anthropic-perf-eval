@@ -62,4 +62,63 @@ scratch, so the relaxed runs also try `--greedy-groups-in-flight 0` (no limit).
 
 ## Results
 
-RESULTS_PLACEHOLDER
+`forest_height=10`, `batch_size=256`. "Shaped" is the greedy command of
+[GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 1 (`--greedy-barriers none
+--greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95`; CP-SAT
+runs drop `--greedy-split-shift`, which CP-SAT ignores). "Relaxed" is `--no-scratch-constraint`.
+Schedule cycles (simulator cycles). Peak = live scratch words from address assignment. Groups =
+batch groups in flight at the peak-liveness cycle (a group is in flight from its first to its
+last op; with round barriers all 32 always are). No run needed the per-section repair: every
+log says "All sections within budget" or is greedy-only. Every row PROVED and PASSED.
+
+### Greedy, 16 rounds
+
+| Configuration | Real (1,536) | Relaxed | Peak real / relaxed | Groups real / relaxed | Capacity floor |
+|---|---|---|---|---|---|
+| Default shape (round barriers) | 2,007 (1,994) | 1,951 (1,938) | 1,268 / 1,628 | 32 / 32 | 1,271 |
+| Shaped | 1,313 (1,315) | 1,313 (1,315) | 1,244 / 1,244 | 17 / 17 | 1,271 |
+| Shaped, `--greedy-groups-in-flight 0` | 1,313 (1,315) | 1,313 (1,315) | 1,336 / 1,328 | 22 / 22 | 1,271 |
+| Shaped, groups 0, stagger 10 | fails (1,648 > 1,536) | 1,308 (1,310) | - / 1,557 | - / 25 | 1,271 |
+| Shaped, groups 0, stagger 8 | fails (1,652) | 1,302 (1,304) | - / 1,827 | - / 32 | 1,271 |
+| Shaped, groups 0, stagger 6 | fails (1,650) | **1,293 (1,295)** | - / 2,009 | - / 32 | 1,271 |
+| Shaped, groups 0, stagger 4 | fails (1,646) | 1,343 (1,345) | - / 2,097 | - / 32 | 1,271 |
+| Shaped, groups 0, stagger 0 | fails (2,618) | 1,912 (1,914) | - / 3,081 | - / 32 | 1,271 |
+| `--merge-hash-stages --index-form mirrored` (main's best emission), default shape | 1,931 (1,918) | 1,898 (1,885) | 1,269 / 1,620 | 32 / 32 | 1,130 |
+| same, shaped | 1,197 (1,199) | 1,197 (1,199) | 1,118 / 1,118 | 17 / 17 | 1,130 |
+| same, shaped, groups 0 | 1,192 (1,194) | 1,192 (1,194) | 1,305 / 1,305 | 24 / 24 | 1,130 |
+| PR #51 plan `path_flow90.json` (detached checkout of `emission/vector-work` + this change), shaped | 1,097 (1,099) | 1,097 (1,099) | 1,050 / 1,050 | 15 / 15 | 994 |
+| same, groups 0 | **1,087 (1,089)** | 1,087 (1,089) | 1,233 / 1,233 | 16 / 16 | 995 |
+
+`--scratch-budget-override 3072` with shaped and groups 0 gives the same 1,313 as unbounded.
+
+### CP-SAT, `--cpsat-objective makespan --cpsat-deterministic-time 60`
+
+| Configuration | Real: cycles / `lb_cycles` / peak | Relaxed: cycles / `lb_cycles` / peak | Model (vars / constraints) real → relaxed | Capacity floor |
+|---|---|---|---|---|
+| 4 rounds, shaped hint | 425 (427) / 357 / 812 | 425 (427) / 357 / 828 | 29,919 / 102,223 → 23,211 / 76,104 | 357 |
+| 4 rounds, default hint | C4D_REAL | C4D_RELAX | C4D_MODEL | C4D_FLOOR |
+| 16 rounds, shaped hint | C16_REAL | C16_RELAX | C16_MODEL | 1,271 |
+
+`lb_cycles` is CP-SAT's proven bound; at 4 rounds it equals the capacity floor in both runs,
+so removing the scratch constraint did not let CP-SAT prove anything stronger. Neither run
+improved on its hint within the budget.
+
+## What it says
+
+- **Scratch is not what limits the shaped schedules.** With the wavefront shape the relaxed
+  runs give the same cycles as the real ones, for the default emission, main's best emission
+  and PR #51's plan. Their peaks (1,050 to 1,336) are below 1,536 already.
+- **Scratch does limit the default (round-barrier) shape**, through the pressure policy's
+  inflation throttle: relaxed gains 56 cycles (2,007 → 1,951) and 33 with main's best emission,
+  with peaks of 1,620 to 1,628. That shape is far from the floor for other reasons (rounds run
+  one after another), so this is not where to spend effort.
+- **The most any scratch-saving technique could buy this greedy is about 15 to 20 cycles at 16
+  rounds** (best real 1,308 at stagger 10 and 20 in flight in GREEDY_SHAPE_ABLATION.md, or 1,313
+  shaped; best relaxed 1,293 at stagger 6, which needs 2,009 words). That is spilling, a better
+  allocator or more groups in flight, combined, for this scheduler. The remaining 22 to 42
+  cycles to the 1,271 floor are not scratch.
+- **The CP-SAT bound does not move without scratch** at 4 rounds (357 both ways, equal to the
+  capacity floor), so the bound gap is not a scratch artefact either.
+- Side result on the real machine: PR #51's plan with `--greedy-groups-in-flight 0` is
+  **1,089** simulator cycles (peak 1,233, valid on the 1,536-word machine; PROVED, PASSED and
+  `./scripts/check_upstream.sh --strict` passes), 10 better than the 1,099 recorded there.
