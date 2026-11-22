@@ -30,12 +30,17 @@ class Holder:
     def __init__(self, tmp_path, name, lock_dir, slots):
         self.started = tmp_path / f"{name}.started"
         self.release = tmp_path / f"{name}.release"
+        self.log = tmp_path / f"{name}.stderr"
         code = ("import os, time, pathlib; "
                 f"pathlib.Path({str(self.started)!r}).write_text(str(os.getpid())); "
                 f"r = pathlib.Path({str(self.release)!r})\n"
                 "while not r.exists(): time.sleep(0.05)")
-        self.proc = subprocess.Popen([sys.executable, SLOT, name, "--", sys.executable, "-c", code],
-                                     env=_env(lock_dir, slots), stderr=subprocess.PIPE, text=True)
+        with open(self.log, "w") as log:  # a file, so the wrapper's messages can be polled
+            self.proc = subprocess.Popen([sys.executable, SLOT, name, "--", sys.executable, "-c", code],
+                                         env=_env(lock_dir, slots), stderr=log)
+
+    def stderr(self):
+        return self.log.read_text()
 
     def is_running(self):
         return self.started.exists()
@@ -46,18 +51,18 @@ class Holder:
     def finish(self):
         self.release.write_text("go")
         assert self.proc.wait(WAIT) == 0
-        return self.proc.stderr.read()
+        return self.stderr()
 
 
 def test_one_slot_serialises_runs(tmp_path):
     first = Holder(tmp_path, "a", tmp_path / "locks", 1)
     first.wait_running()
     second = Holder(tmp_path, "b", tmp_path / "locks", 1)
-    time.sleep(1.0)  # give the second every chance to start wrongly
+    _poll(lambda: "busy" in second.stderr(), "the second run to find the slot busy")
     assert not second.is_running(), "second run started while the only slot was held"
     first.finish()
     second.wait_running()
-    assert "busy" in second.finish()
+    second.finish()
 
 
 def test_two_slots_allow_two_runs_at_once(tmp_path):
