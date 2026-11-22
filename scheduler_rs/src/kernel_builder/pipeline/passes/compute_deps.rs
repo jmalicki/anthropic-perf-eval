@@ -14,11 +14,11 @@ use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 ///
 /// Sets `op.dep_ids` on each SSA op from RAW data dependencies and, in
 /// `GreedyBarrierMode::Round`, the barrier ordering constraints, and `op.mem_deps` from the
-/// main-memory edges that the data dependencies do not imply (empty for today's emissions).
+/// main-memory edges that the data dependencies do not imply.
 /// Fails if a memory op has no memory location. In
 /// `GreedyBarrierMode::None` the barrier pseudo-ops are removed here, so every later pass
 /// (bounds, greedy, per-section budget check, CP-SAT) sees one section ordered by data
-/// dependencies only.
+/// and memory dependencies.
 pub struct ComputeDependenciesPass;
 
 impl Pass for ComputeDependenciesPass {
@@ -43,14 +43,6 @@ impl Pass for ComputeDependenciesPass {
         // Memory edges are filtered against data paths only, before the barrier edges are
         // added: barriers are elided before CP-SAT, so they cannot be what implies an edge.
         let mem = compute_memory_dependencies(&mut ctx.ops)?;
-        // Every kernel emitted today implies all of its memory edges through data flow (see
-        // `memory_deps`). An emission that stores and later reads the same words (scatter
-        // stores, partition stores) keeps edges and must remove this assertion.
-        debug_assert_eq!(
-            mem.kept, 0,
-            "memory edges not implied by data dependencies in an emission that should have none: {}",
-            mem.summary()
-        );
         if ctx.config.compiler.greedy_barriers == GreedyBarrierMode::Round {
             add_barrier_dependencies(&mut ctx.ops);
         }

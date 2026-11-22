@@ -4371,3 +4371,20 @@ fn test_current_emissions_imply_every_memory_edge() {
         }
     }
 }
+
+/// At a zero-based wrap the final index store no longer depends on its initial
+/// value. The dependency pass preserves their WAR before DCE removes the load.
+#[test]
+fn test_dependency_pass_keeps_index_war_at_wrap() {
+    use crate::kernel_builder::pipeline::{passes::ComputeDependenciesPass, Pass, PipelineContext};
+    use crate::types::{MemEdgeKind, MemRegion};
+
+    let config = KernelConfig::new(10, 2047, 8, 11);
+    let program = SsaTickTockKernelBuilder::new(config).build();
+    let mut ctx = PipelineContext::new(program, Default::default());
+    ComputeDependenciesPass.run(&mut ctx).unwrap();
+    assert!(ctx.ops.iter().any(|op| {
+        op.mem_loc.is_some_and(|loc| loc.region == MemRegion::Indices)
+            && op.mem_deps.iter().any(|&(_, kind)| kind == MemEdgeKind::War)
+    }));
+}

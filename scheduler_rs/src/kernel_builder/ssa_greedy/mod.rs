@@ -1919,7 +1919,7 @@ fn schedule_ssa_greedy_core(
     }
     // Memory ordering edges (`mem_deps`): (target index, latency) per source, and
     // (source index, latency) per target. Kept apart from `consumers`, which is VReg data
-    // flow (the wavefront groups and the liveness counts read it); they only gate readiness.
+    // flow. They gate readiness and link wavefront chains that cannot be admitted independently.
     // A latency-0 (WAR) target is never placed in its source's cycle here: ready ops are
     // collected before any op of the cycle is placed, so it lands one cycle later or more.
     let mem_successors = memory_successors(ops, &id_to_idx);
