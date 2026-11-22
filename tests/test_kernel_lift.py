@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from scripts.capture_public_kernel import capture, check_bundles
 from scripts.kernel_memory_use import memory_use, peak_live_words, scratch_report, scratch_values
 from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges, value_dependency_graph
-from scripts.reschedule_kernel import cpsat, emit, greedy
+from scripts.reschedule_kernel import emit, greedy
 from verification.memory_alias import MemLayout, SymbolicKernel
 
+REPO = Path(__file__).resolve().parent.parent
 L = MemLayout()
 VAL_P = L.val_p  # 2310: first input value
 
@@ -192,9 +196,22 @@ def test_greedy_and_cpsat_reach_the_critical_path(tmp_path):
     assert g.edges == lk.edges
     gs = greedy(g)
     assert check_schedule(g, gs) == [] and max(gs) + 1 == max(heights(g))
-    cs, shifted, info = cpsat(g, [o.cycle for o in g.ops], 5.0, 60.0, workers=1, log=False)
-    assert check_schedule(g, cs) == [] and max(cs) + 1 == 4 and not shifted
-    assert len(emit(g, cs)) == 4
+    assert len(emit(g, gs)) == 4
+
+
+def test_cpsat_reaches_the_critical_path(tmp_path):
+    # Run in a subprocess: the OR-Tools Python wheel and the OR-Tools library that
+    # scheduler_rs links cannot share one process (importing both segfaults).
+    kernel = tmp_path / "k.json"
+    kernel.write_text(json.dumps({"instrs": _chain_kernel()}))
+    out = tmp_path / "r.json"
+    proc = subprocess.run(
+        [sys.executable, "-I", str(REPO / "scripts" / "reschedule_kernel.py"), str(kernel), "--scheduler", "cpsat",
+         "--cpsat-deterministic-time", "5", "--workers", "1", "--seeds", "0", "-q", "--json", str(out)],
+        capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    r = json.loads(out.read_text())
+    assert r["cycles"] == 4 and r["cpsat"]["status"] == "OPTIMAL" and r["greedy_cycles"] == 4
 
 
 def test_swap_in_one_cycle_is_a_co_issue_group():

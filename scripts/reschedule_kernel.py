@@ -27,6 +27,10 @@ relaxation whose CP-SAT bound holds for any re-allocation.
 ``--valu-shift`` lets CP-SAT run any VALU op except multiply_add/vbroadcast as 8 scalar ALU
 ops in the same cycle (our VALU->ALU shift): an encoding freedom, so off by default.
 
+CP-SAT here is the OR-Tools Python wheel. Do not import it into a process that has imported
+``scheduler_rs`` (which links the Homebrew OR-Tools library): the two crash together; run
+this script as its own process.
+
 Every schedule is checked against the graph and run on the upstream simulator against the
 reference for ``--seeds`` random inputs. ``--save-kernel`` writes a kernel JSON for
 ``scripts/check_upstream.sh --kernel``.
