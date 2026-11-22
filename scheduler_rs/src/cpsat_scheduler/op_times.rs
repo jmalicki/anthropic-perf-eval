@@ -588,10 +588,17 @@ impl OpTimes {
                 (self.issue.solution_value(response) as i32, "valu")
             };
         }
-        if let (Some(fma), true) = (self.fma_cycle(), self.on_fma_path(response)) {
+        let on_fma = self.on_fma_path(response);
+        if let (Some(fma), true) = (self.fma_cycle(), on_fma) {
             return (fma.solution_value(response) as i32, "select_fma");
         }
-        let label = if self.select.is_some() { "select_vselect" } else { "c" };
+        // A delta select on the multiply-add path is one VALU op at its issue cycle: the
+        // cycle is the issue cycle, the label still names the path taken.
+        let label = match (self.select.is_some(), on_fma) {
+            (true, true) => "select_fma",
+            (true, false) => "select_vselect",
+            (false, _) => "c",
+        };
         (self.issue.solution_value(response) as i32, label)
     }
 }

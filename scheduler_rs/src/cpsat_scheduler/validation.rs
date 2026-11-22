@@ -653,7 +653,9 @@ pub(crate) fn try_validate_ssa_slot_limits(
 }
 
 /// Verify that every RAW dependency satisfies cycle[consumer] >= the producer's visible cycle
-/// ([`ScheduledTimes::visible`]: SelectChoice FMA => cycle+2; shifted => last lane+1; else cycle+1).
+/// ([`ScheduledTimes::visible`]: a SelectChoice on the FMA path with a `sub_temp_vreg` (sub, then
+/// multiply_add) => cycle+2; a SelectChoice on the FMA path with a precomputed delta (one
+/// multiply_add) => cycle+1; shifted => last lane+1; else cycle+1).
 ///
 /// A shifted consumer executes as VLEN scalar ops at `shifted_alu_cycles[consumer]`, so each of
 /// those lane cycles is checked as well: against the producer's visible cycle, or lane by lane
