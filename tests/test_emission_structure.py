@@ -154,6 +154,27 @@ def test_scatter_escapes_text():
     ET.fromstring(es.scatter_svg([("Flow & Load", [row])]))
 
 
+def test_values_only_tail_patterns_make_the_fit_exact(tmp_path):
+    """With values_only, a group's index updates after its last index read are dead, so the
+    counts depend on each group's gather/select pattern over rounds 12 to 15. Without the
+    tail:* features calibration has no exact fit; with them it predicts unseen plans exactly and
+    the solved plan emits exactly its predicted counts."""
+    ctx = es.Context(rounds=16, batch_size=32, values_only=True)
+    assert ctx.tail_rounds() == [12, 13, 14, 15]
+    table = es.calibrate(ctx, str(tmp_path), n_random=20, seed=3, log=None)
+    checked = es.check_table(table, str(tmp_path), n_plans=8, seed=13, log=None)
+    assert checked["compared"] >= 1 and checked["bad"] == []
+    result = es.solve_plan_isolated(table, time_limit=30)
+    _, _, sched, _ = es.build_emission(result["rows"], ctx, str(tmp_path), name="vo_solved")
+    assert es.emission_counts(sched) == result["counts"]
+    # Fixing the last round to gather keeps select work out of the schedule's tail.
+    fixed = es.solve_plan_isolated(table, time_limit=30, fixed={15: "gather"})
+    assert fixed["rows"][15] == ["gather"] * ctx.n_groups
+    assert fixed["floor"]["cycles"] >= result["floor"]["cycles"]
+    _, _, sched, _ = es.build_emission(fixed["rows"], ctx, str(tmp_path), name="vo_fixed")
+    assert es.emission_counts(sched) == fixed["counts"]
+
+
 def test_cost_table_round_trips(table):
     again = es.CostTable.from_json(json.loads(json.dumps(table.to_json())))
     rows = es.flag_plan(CTX, "bits")

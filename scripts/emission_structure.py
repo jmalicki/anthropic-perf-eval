@@ -213,6 +213,20 @@ class Context:
     def depth(self, rnd: int) -> int:
         return round_depth(rnd, self.forest_height)
 
+    def tail_rounds(self) -> list[int]:
+        """Choice rounds after the last round that must gather. Only with `values_only` does
+        their structure change the index work: no index is stored at the end, so a group's
+        index updates after its last index read in these rounds are dead."""
+        forced = [r for r in range(self.rounds) if self.depth(r) > MAX_CACHED_DEPTH]
+        last = max(forced, default=-1)
+        return [r for r in self.choice_rounds() if r > last]
+
+    def tail_patterns(self) -> list[str]:
+        """Per-group gather ('g') / select ('s') patterns over `tail_rounds`, when they matter."""
+        if not self.values_only:
+            return []
+        return ["".join(p) for p in itertools.product("gs", repeat=len(self.tail_rounds()))]
+
     def choice_rounds(self) -> list[int]:
         """Rounds whose encoding can be chosen (depth 1 to 4); depth 0 is the shared root and
         deeper levels can only gather."""
@@ -267,6 +281,8 @@ def feature_names(ctx: Context) -> list[str]:
         names += [f"table:{d}", f"pairs:{d}", f"pairs_high:{d}", f"mobius:{d}", f"gather_depth:{d}"]
     names += [f"gather_round:{r}" for r in ctx.choice_rounds()]
     names += [interaction_name(c) for c in interactions(ctx)]
+    # One pattern is the reference: the pattern counts always sum to the number of groups.
+    names += [f"tail:{p}" for p in ctx.tail_patterns()[1:]]
     return names
 
 
@@ -283,6 +299,8 @@ def plan_features(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]
         gather_depth:d    1 if any group gathers at depth d (the level's end-pointer constant)
         gather_round:r    1 if any group gathers in round r (the round's address base vector)
         and:a+b[+c]       products for resources shared between features (`interactions`)
+        tail:p            with values_only: groups whose gather/select pattern over the rounds
+                          after the last forced gather is p (which index updates are dead)
     Gathering groups have no feature of their own: per depth the group counts sum to a
     constant, so their cost is in the other coefficients and in "base".
     """
@@ -307,6 +325,12 @@ def plan_features(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]
             f[f"gather_round:{r}"] = 1
     for combo in interactions(ctx):
         f[interaction_name(combo)] = int(all(f[name] for name in combo))
+    if ctx.tail_patterns():
+        tail = ctx.tail_rounds()
+        for g in range(ctx.n_groups):
+            key = "tail:" + "".join("g" if rows[r][g] == "gather" else "s" for r in tail)
+            if key in f:  # the all-gather reference pattern has no feature
+                f[key] += 1
     return f
 
 
@@ -620,6 +644,17 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         b = m.NewBoolVar(interaction_name(combo))
         m.AddMinEquality(b, [feat[name] for name in combo])
         feat[interaction_name(combo)] = b
+    # Groups are interchangeable, so pattern counts consistent with the per-round gather counts
+    # can always be realised by some assignment of patterns to groups.
+    tail, patterns = ctx.tail_rounds(), ctx.tail_patterns()
+    pattern_count = {}
+    if patterns:
+        for p in patterns:
+            pattern_count[p] = m.NewIntVar(0, g, f"tail_{p}")
+            feat[f"tail:{p}"] = pattern_count[p]  # the reference pattern's entry is unused
+        m.Add(sum(pattern_count.values()) == g)
+        for i, r in enumerate(tail):
+            m.Add(sum(pattern_count[p] for p in patterns if p[i] == "g") == n.get((r, "gather"), 0))
     cnt = {c: sum(feat[name] * coef[c] for name, coef in table.coefficients.items() if coef[c]) for c in CATEGORIES}
 
     big = 10 * (sum(abs(v) for coef in table.coefficients.values() for v in coef.values()) * g + 1)
@@ -702,6 +737,16 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             if (r, e) in n:
                 row += [e] * chosen[r, e]
         rows[r] = row
+    if patterns:
+        # Give each group its pattern (in pattern order), then the select groups of each tail
+        # round their bit-driven encodings in a fixed order with the solved counts.
+        group_pattern = [p for p in patterns for _ in range(solver.Value(pattern_count[p]))]
+        for i, r in enumerate(tail):
+            selects = [e for e in BIT_DRIVEN if (r, e) in n for _ in range(solver.Value(n[r, e]))]
+            row = []
+            for p in group_pattern:
+                row.append("gather" if p[i] == "g" else selects.pop(0))
+            rows[r] = row
     counts = table.predict(rows)
     floor = choice_floor(counts)
     assert floor["cycles"] <= best_t, (floor["cycles"], best_t)
@@ -998,6 +1043,9 @@ def main(argv=None):
                     help="measure/sweep: also ./scripts/check_upstream.sh, without and with --strict")
     ap.add_argument("--keep", help="directory for scheduler JSONs and kernels (default: temporary)")
     ap.add_argument("--json", help="measure/table: also write rows here")
+    ap.add_argument("--fix", action="append", default=[], metavar="ROUND=ENCODING",
+                    help="solve/sweep: keep round ROUND uniform with ENCODING (e.g. 15=gather keeps select work "
+                         "out of the last round, the schedule's tail); repeatable")
     ap.add_argument("--no-lateness", action="store_true",
                     help="solve/sweep: drop the tie-break that puts select work at a level's earliest visit")
     ap.add_argument("--input", action="append", default=[], metavar="LABEL=ROWS.json",
@@ -1007,6 +1055,12 @@ def main(argv=None):
                          "yet (an estimate, never compared with an emission)")
     args = ap.parse_args(argv)
     ctx = _context_from_args(args)
+    fixed = {}
+    for item in args.fix:
+        rnd, sep, enc = item.partition("=")
+        if not sep or not rnd.isdigit() or enc not in ENCODINGS:
+            ap.error(f"--fix needs ROUND=ENCODING with ENCODING in {ENCODINGS}, got {item!r}")
+        fixed[int(rnd)] = enc
     if args.command == "scatter":
         series = []
         for item in args.input:
@@ -1073,7 +1127,7 @@ def main(argv=None):
             max_util = parse_max_util(args.max_util[0] if args.max_util else "none")
             # Isolated: on a cold cache the calibration above has loaded scheduler_rs here.
             result = solve_plan_isolated(table, encodings=args.encodings.split(","), time_limit=args.time_limit,
-                                         max_util=max_util, lateness=not args.no_lateness)
+                                         max_util=max_util, lateness=not args.no_lateness, fixed=fixed)
             capped = f", T under caps {result['capped_cycles']:,}" if max_util else ""
             _print_counts(f"best plan ({result['status']}{capped}) [{describe_plan(result['rows'])}]", result["counts"])
             if args.out:
@@ -1091,7 +1145,7 @@ def main(argv=None):
                 max_util = parse_max_util(text)
                 result = solve_plan_isolated(table, encodings=args.encodings.split(","),
                                              time_limit=args.time_limit, max_util=max_util,
-                                             lateness=not args.no_lateness)
+                                             lateness=not args.no_lateness, fixed=fixed)
                 row = measure(result["rows"], table, workdir, f"caps {text}", args.shaped, args.upstream,
                               args.cpsat_deterministic_time)
                 row["capped_cycles"] = result["capped_cycles"]
