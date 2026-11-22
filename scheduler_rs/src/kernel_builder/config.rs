@@ -224,6 +224,48 @@ pub enum PressurePolicyKind {
     Cascade,
 }
 
+/// What the schedulers' scratch budget bounds.
+///
+/// `Words` (default): live words at every point of the schedule (greedy counter, CP-SAT
+/// cumulative over all values). That does not guarantee addresses: for values of 1 and 8
+/// words, a per-point fit does not imply a layout exists (docs/ALLOCATION_CONJECTURES.md).
+/// `Pools`: `8 * max_v + max_s <= budget`, `max_v` / `max_s` the most vectors / scalars live
+/// at once over the schedule. Address assignment (`address_assign::assign_two_pass`) always
+/// fits such a schedule in `8 * max_v + max_s` words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScratchModel {
+    /// Live words at every point (default).
+    #[default]
+    Words,
+    /// Separate vector and scalar maxima, `8 * max_v + max_s <= budget`.
+    Pools,
+}
+
+impl ScratchModel {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"words"` or `"pools"`
+    ///
+    /// # Returns
+    /// The model, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "words" => Ok(ScratchModel::Words),
+            "pools" => Ok(ScratchModel::Pools),
+            other => Err(format!(
+                "Invalid scratch_model '{}': must be 'words' or 'pools'",
+                other
+            )),
+        }
+    }
+
+    /// True for `Pools`.
+    pub fn is_pools(self) -> bool {
+        self == ScratchModel::Pools
+    }
+}
+
 /// How round barriers constrain the greedy scheduler.
 ///
 /// Emission puts a barrier pseudo-op between rounds. With `Round`, every op of round r+1
@@ -415,6 +457,8 @@ pub struct CompilerConfig {
     /// allocator still use `scratch_size`, which should then be large
     /// (`UNBOUNDED_SCRATCH_WORDS`).
     pub cpsat_scratch_constraint: bool,
+    /// What the scratch budget bounds in both schedulers (default: `Words`).
+    pub scratch_model: ScratchModel,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -442,6 +486,7 @@ impl Default for CompilerConfig {
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
             cpsat_scratch_constraint: true,
+            scratch_model: ScratchModel::default(),
         }
     }
 }
@@ -535,6 +580,8 @@ impl CompilerConfig {
                 },
             },
             split_shift: self.greedy_split_shift,
+            scratch_pools: self.scratch_model.is_pools(),
+            pool_caps: None,
         }
     }
 }

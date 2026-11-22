@@ -34,6 +34,7 @@ impl Pass for CpSatSchedulePass {
         // Build CP-SAT config
         let mut cpsat_config = cpsat_pipeline_config.to_full_kernel_config(scratch_budget);
         cpsat_config.enable_valu_shift = enable_valu_shift;
+        cpsat_config.scratch_pools = ctx.config.compiler.scratch_model.is_pools();
 
         // Collect hints from greedy decisions
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();

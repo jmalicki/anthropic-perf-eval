@@ -16,10 +16,14 @@ use super::bounds::{
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
 };
 use super::symmetry_ordering::SymmetryOrdering;
+#[cfg(feature = "cpsat")]
+use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
-    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator,
+    ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
     OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
 };
+#[cfg(feature = "cpsat")]
+use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
 #[cfg(feature = "cpsat")]
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
@@ -27,41 +31,6 @@ use super::validation::{
     verify_scratch_budget_all_readers,
     verify_select_choice_fma_consumer_precedence,
 };
-
-/// Extra cycles, beyond the usual +1, before the result of op `dep_idx` can be read.
-///
-/// A SelectChoice lowered as FMA (no delta) runs sub at its cycle and multiply_add one cycle
-/// later, so its result is visible at cycle + 2. Every constraint that orders a reader after
-/// a producer must add this term; omitting it lets the reader see the address one cycle
-/// before the multiply_add writes it.
-///
-/// # Arguments
-/// * `dep_idx` - Index of the producing op
-/// * `select_choice_with_fma_delay` - SelectChoice ops whose FMA path has the extra cycle
-/// * `select_choice_mode` - Whether the FMA path is forced, forbidden or chosen by the solver
-/// * `select_choice_vars` - Per-op "FMA chosen" Booleans (Optimize mode)
-///
-/// # Returns
-/// A linear expression equal to 1 when the producer takes the FMA path and 0 otherwise.
-#[cfg(feature = "cpsat")]
-fn select_fma_extra_delay(
-    dep_idx: usize,
-    select_choice_with_fma_delay: &HashSet<usize>,
-    select_choice_mode: SelectChoiceMode,
-    select_choice_vars: &HashMap<usize, BoolVar>,
-) -> LinearExpr {
-    let none = LinearExpr::default();
-    if !select_choice_with_fma_delay.contains(&dep_idx) {
-        return none;
-    }
-    match select_choice_mode {
-        SelectChoiceMode::ForceVselect => none,
-        SelectChoiceMode::ForceFma => none + 1,
-        SelectChoiceMode::Optimize => select_choice_vars
-            .get(&dep_idx)
-            .map_or(none, |&fma_chosen| LinearExpr::from(fma_chosen)),
-    }
-}
 
 /// Whether the greedy schedule's encoding choices are allowed by the forced modes.
 ///
@@ -195,24 +164,14 @@ pub(crate) fn build_sat_parameters(
     };
     params.absolute_gap_limit = absolute_gap_limit;
 
-    // Optimize LP relaxation for tighter bounds and faster convergence
-    // linearization_level=2: Stronger LP relaxations (better bounds for cumulative constraints)
-    //   - Cumulative constraints have weak LP relaxations by default
-    //   - Level 2 linearizes more constraints, giving tighter best_objective_bound
-    //   - Expected: Gap reduction from 10-15% to 3-8%, 20-40% faster convergence
-    // cp_model_presolve=true: Preprocessing to simplify model before solving
-    //   - Removes redundant variables/constraints, detects symmetries
-    //   - Usually <1% of solve time, but significantly speeds up search
-    // cp_model_probing_level=2: Aggressive probing to tighten variable domains
-    //   - Temporarily fixes variables and observes consequences
-    //   - Strengthens domains and adds binary clauses
-    //   - Expected: 5-15% tighter domains, 10-20% faster search
-    // randomize_search=true: Help escape local optima
-    //   - Adds randomization to search decisions
-    //   - Helps when solver gets stuck in suboptimal regions
-    params.linearization_level = Some(2);
+    // linearization_level (tuning, default 2): how much of the model enters the LP relaxation
+    // (2 adds the cumulative relaxations and cuts). cp_model_probing_level (tuning, default 2):
+    // presolve probing effort. Neither default was chosen by measurement; the measured effect
+    // of each level is in docs/CPSAT_CONFIG_ABLATION.md ("Linearization, probing and makespan
+    // rows"). randomize_search=true is likewise unmeasured.
+    params.linearization_level = Some(tuning.linearization_level);
     params.cp_model_presolve = Some(true);
-    params.cp_model_probing_level = Some(2);
+    params.cp_model_probing_level = Some(tuning.probing_level);
     params.randomize_search = Some(true);
     // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
     // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
@@ -332,29 +291,57 @@ pub(crate) fn scratch_readers_by_vreg(
     readers
 }
 
-/// Extra cycles, beyond its own cycle, during which reader `idx` still reads its operands.
+/// Vbroadcasts that can be eliminated when all their readers are shifted to scalar ALU.
 ///
-/// A SelectChoice lowered as FMA reads cond/false_val/delta in the multiply_add one cycle
-/// after the op's cycle. Returns 1 for that case (the "FMA chosen" Boolean in Optimize mode)
-/// and 0 for every other reader.
+/// A vbroadcast qualifies when it has exactly one producer, that producer is not a VALU op
+/// (so it is a scalar the shifted readers can read directly), and every reader is shiftable.
+///
+/// # Returns
+/// (vbroadcast index, scalar producer index, shiftable readers in index order) per
+/// eliminable vbroadcast, in index order.
 #[cfg(feature = "cpsat")]
-fn select_read_extra_delay(
-    idx: usize,
+fn find_eliminable_vbroadcasts(
     ops: &[SsaOp],
-    select_choice_mode: SelectChoiceMode,
-    select_choice_vars: &HashMap<usize, BoolVar>,
-) -> LinearExpr {
-    let none = LinearExpr::default();
-    if ops[idx].opcode != Opcode::SelectChoice {
-        return none;
+    op_id_to_idx: &HashMap<usize, usize>,
+    shiftable_set: &HashSet<usize>,
+) -> Vec<(usize, usize, Vec<usize>)> {
+    let mut consumers_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        for &dep_id in &op.dep_ids {
+            consumers_of.entry(dep_id).or_default().push(idx);
+        }
     }
-    match select_choice_mode {
-        SelectChoiceMode::ForceVselect => none,
-        SelectChoiceMode::ForceFma => none + 1,
-        SelectChoiceMode::Optimize => select_choice_vars
-            .get(&idx)
-            .map_or(none, |&fma_chosen| LinearExpr::from(fma_chosen)),
+    let mut list: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for (vb_idx, op) in ops.iter().enumerate() {
+        if op.engine != Engine::Valu || op.opcode != Opcode::Vbroadcast {
+            continue;
+        }
+        let dep_id = match op.dep_ids.iter().next() {
+            Some(&id) if op.dep_ids.len() == 1 => id,
+            _ => continue,
+        };
+        let Some(&scalar_producer_idx) = op_id_to_idx.get(&dep_id) else {
+            continue;
+        };
+        if ops[scalar_producer_idx].engine == Engine::Valu {
+            continue;
+        }
+        let consumers = consumers_of.get(&op.id).map_or(&[] as &[usize], |v| v.as_slice());
+        let shiftable_consumers: Vec<usize> = consumers
+            .iter()
+            .copied()
+            .filter(|&c| shiftable_set.contains(&c))
+            .collect();
+        if shiftable_consumers.is_empty() {
+            continue;
+        }
+        let all_consumers_shiftable = consumers.iter().all(|&c| shiftable_set.contains(&c));
+        if !all_consumers_shiftable {
+            continue;
+        }
+        list.push((vb_idx, scalar_producer_idx, shiftable_consumers));
     }
+    list
 }
 
 /// Schedule SSA operations using CP-SAT solver.
@@ -395,6 +382,7 @@ pub fn schedule_ssa_cpsat(
         stop_after_first_solution,
         enable_valu_shift,
         scratch_budget,
+        scratch_pools,
         ref model_name,
         ref machine,
         const_choice_mode,
@@ -818,36 +806,69 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, op)| (op.id, idx))
         .collect();
 
-    // 4. Create cycle variable for each op with [asap, alap] domain
-    let cycle_vars: Vec<IntVar> = ops
-        .iter()
-        .enumerate()
-        .map(|(idx, op)| {
-            let lb = *final_asap.get(&op.id).unwrap_or(&0) as i64;
-            let ub = *final_alap.get(&op.id).unwrap_or(&(horizon as i32 - 1)) as i64;
-            model.new_int_var_with_name([(lb, ub)], format!("c{}", idx))
-        })
-        .collect();
-
     // SelectChoice ops with sub_temp_vreg (FMA path without delta): result is visible at cycle+2, not cycle+1.
-    // We'll add precedence for their consumers after creating select_choice_vars.
     let select_choice_with_fma_delay: HashSet<usize> = ops
         .iter()
         .enumerate()
         .filter(|(_, op)| op.opcode == Opcode::SelectChoice && op.sub_temp_vreg.is_some())
         .map(|(i, _)| i)
         .collect();
+    let const_choice_ops: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::ConstChoice)
+        .map(|(idx, _)| idx)
+        .collect();
+    let select_choice_ops: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
+        .map(|(idx, _)| idx)
+        .collect();
+    let eliminable_vbs: Vec<(usize, usize, Vec<usize>)> =
+        if enable_valu_shift && enable_vbroadcast_elimination && !shiftable_valu.is_empty() {
+            find_eliminable_vbroadcasts(ops, &op_id_to_idx, &shiftable_set)
+        } else {
+            Vec::new()
+        };
+
+    // 4. Create every per-op variable: issue cycle (domain [asap, alap]), shift literal and
+    // lanes, vbroadcast elimination, ConstChoice and SelectChoice literals, multiply_add
+    // cycles, CSE shared subtracts. Constraint generators below get times only through `times`
+    // (op_times.rs), so each time (start, visible, last read, finish) has one definition.
+    let op_vars = create_op_variables(
+        &mut model,
+        ops,
+        &TimeDomains { final_asap: &final_asap, final_alap: &final_alap, asap: &asap, alap: &alap, horizon },
+        &OpKinds {
+            shiftable_valu: &shiftable_valu,
+            eliminable_vbs: &eliminable_vbs,
+            const_choice_ops: &const_choice_ops,
+            const_choice_mode,
+            select_choice_ops: &select_choice_ops,
+            select_choice_mode,
+            cse_groups,
+        },
+        verbose,
+    );
+    let times = &op_vars.times;
+    let cse_subs = &op_vars.cse_subs;
+    // Decision literals by op index (shift, SelectChoice FMA path chosen).
+    let shift_vars: HashMap<usize, BoolVar> =
+        times.iter().enumerate().filter_map(|(idx, t)| t.shift().map(|b| (idx, b))).collect();
+    let select_choice_vars: HashMap<usize, BoolVar> =
+        times.iter().enumerate().filter_map(|(idx, t)| t.fma_chosen().map(|b| (idx, b))).collect();
 
     // 5. Add precedence constraints from RAW dependencies.
     // These ensure every consumer (including multiply_add) is scheduled at least one cycle after
     // its producers (e.g. offset producer). Results are visible next cycle; without this, an FMA
     // could run in the same cycle as its offset producer and read before the producer writes.
-    // Note: For consumers of shifted VALU ops, we'll add constraints after creating
-    // completion_cycle_vars (see 5c below).
+    // Note: consumers of shiftable VALU ops are ordered after the producer's completion
+    // cycle in 5c below.
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                // Skip if dep_idx is a shiftable VALU op - we'll handle it after creating completion_cycle_vars
+                // Skip if dep_idx is a shiftable VALU op - handled in 5c (visible = completion + 1)
                 if shiftable_set.contains(&dep_idx) {
                     continue;
                 }
@@ -856,7 +877,7 @@ pub fn schedule_ssa_cpsat(
                     continue;
                 }
                 // cycle[idx] >= cycle[dep_idx] + 1
-                let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                let c = model.add_ge(times[idx].issue(), times[dep_idx].visible());
                 model.set_constraint_name(c, &format!("prec_raw_{}_{}", idx, dep_idx));
             }
         }
@@ -874,7 +895,7 @@ pub fn schedule_ssa_cpsat(
         let n_ordering = ordering_pairs.len();
         let order_source = if greedy_hints.is_some() { "greedy" } else { "ALAP" };
         for (i, j) in &ordering_pairs {
-            let c = model.add_le(cycle_vars[*i], cycle_vars[*j]);
+            let c = model.add_le(times[*i].issue(), times[*j].issue());
             model.set_constraint_name(c, &format!("sym_ord_{}_{}", i, j));
         }
         if verbose && n_ordering > 0 {
@@ -941,7 +962,7 @@ pub fn schedule_ssa_cpsat(
                         greedy_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
                     );
                 }
-                let c = model.add_le(cycle_vars[first_op_cur], cycle_vars[first_op_next]);
+                let c = model.add_le(times[first_op_cur].issue(), times[first_op_next].issue());
                 model.set_constraint_name(c, &format!("sym_lex_{}_{}", first_op_cur, first_op_next));
                 lex_constraints += 1;
             }
@@ -955,20 +976,14 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 6. Create shift decision variables and optional/required intervals for shiftable VALU ops
-    // Note: shiftable_set was already created above in section 2
-    let mut shift_vars: HashMap<usize, BoolVar> = HashMap::new();
+    // 6. Shift decisions and optional/required intervals for shiftable VALU ops
+    // (variables were created with the others in section 4)
     let mut valu_optional_intervals: HashMap<usize, IntervalVar> = HashMap::new();
-    // Store 8 intervals per shifted VALU op (one per ALU op) - optional when Optimize, required when ForceAlu
+    // 8 intervals per shifted VALU op (one per ALU op), present when shifted
     let mut alu_optional_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
-    // Store 8 cycle variables per shifted VALU op (one per ALU op)
-    let mut alu_cycle_vars: HashMap<usize, Vec<IntVar>> = HashMap::new();
-    // Store completion cycle variable (max of 8 ALU cycles) per shifted VALU op
-    let mut completion_cycle_vars: HashMap<usize, IntVar> = HashMap::new();
 
     for &idx in &shiftable_valu {
-        let shift_var = model.new_bool_var_with_name(format!("shift_{}", idx));
-        shift_vars.insert(idx, shift_var);
+        let shift_var = times[idx].shift().expect("shiftable op has a shift literal");
 
         match valu_shift_mode {
             ValuShiftMode::ForceValu => {
@@ -991,46 +1006,18 @@ pub fn schedule_ssa_cpsat(
         }
 
         let valu_interval =
-            model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, shift_var.not());
+            model.new_optional_fixed_size_interval_var(times[idx].issue(), 1, shift_var.not());
         valu_optional_intervals.insert(idx, valu_interval);
 
-        let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-        let op_alap = *alap.get(&ops[idx].id).unwrap_or(&((horizon - 1) as i32)) as i64;
-
-        let mut alu_cycles = Vec::with_capacity(VLEN);
-        let mut alu_intervals = Vec::with_capacity(VLEN);
-
-        for i in 0..VLEN {
-            let alu_cycle =
-                model.new_int_var_with_name([(op_asap, op_alap)], format!("alu_c{}_{}", idx, i));
-            alu_cycles.push(alu_cycle);
-            let alu_interval =
-                model.new_optional_fixed_size_interval_var(alu_cycle, 1, shift_var.clone());
-            alu_intervals.push(alu_interval);
-            // Precedence vs deps is added in 5b with shift-activated constraints (see below)
-        }
-        alu_cycle_vars.insert(idx, alu_cycles.clone());
+        let alu_intervals: Vec<IntervalVar> = times[idx]
+            .lanes()
+            .iter()
+            .map(|&lane| model.new_optional_fixed_size_interval_var(lane, 1, shift_var.clone()))
+            .collect();
         alu_optional_intervals.insert(idx, alu_intervals);
 
-        let completion_cycle =
-            model.new_int_var_with_name([(op_asap, op_alap)], format!("completion_c{}", idx));
-        completion_cycle_vars.insert(idx, completion_cycle);
-        let c = model.add_ge(
-            LinearExpr::from(completion_cycle),
-            LinearExpr::from(cycle_vars[idx]),
-        );
-        model.set_constraint_name(c, &format!("completion_ge_start_{}", idx));
-        for (lane_i, &alu_cycle) in alu_cycles.iter().enumerate() {
-            let c = model.add_ge(completion_cycle, LinearExpr::from(alu_cycle));
-            model.set_constraint_name(c, &format!("completion_ge_alu_{}_{}", idx, lane_i));
-        }
-        if matches!(valu_shift_mode, ValuShiftMode::ForceValu) {
-            let c = model.add_eq(
-                LinearExpr::from(completion_cycle),
-                LinearExpr::from(cycle_vars[idx]),
-            );
-            model.set_constraint_name(c, &format!("completion_eq_cycle_{}", idx));
-        }
+        // completion >= issue cycle and every lane (op_times.rs states the mode invariants)
+        times[idx].add_shift_invariants(&mut model, idx, valu_shift_mode);
     }
 
     // 5a. Element-wise dependency map for shifted VALU -> shifted VALU: op lane i depends on dep lane j.
@@ -1053,40 +1040,26 @@ pub fn schedule_ssa_cpsat(
 
     // 5b. Precedence for the 8 ALU ops of shifted VALU. When dep is shifted use element-wise
     // alu_cycle[op][i] >= alu_cycle[dep][j]+1 (j from element_dep_map); when dep not shifted use
-    // cycle_vars[dep]+1.
+    // its issue cycle + 1 (OpTimes::lane_ready).
     for &idx in &shiftable_valu {
-        if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-            for (lane_i, alu_cycle) in alu_cycles.iter().enumerate() {
-                for &dep_id in &ops[idx].dep_ids {
-                    if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                        if shiftable_set.contains(&dep_idx) {
-                            let shift_dep = *shift_vars.get(&dep_idx).unwrap();
-                            let dep_alu_cycles = alu_cycle_vars.get(&dep_idx).unwrap();
-                            let j = element_dep_map
-                                .get(&(idx, dep_idx))
-                                .map(|v| v[lane_i])
-                                .unwrap_or(lane_i);
-                            // When shift[dep]=1: element-wise alu_cycle[op][i] >= alu_cycle[dep][j]+1
-                            let c = model.add_ge(
-                                *alu_cycle,
-                                LinearExpr::from(dep_alu_cycles[j]) + 1,
-                            );
-                            model.only_enforce_if(c, [shift_dep]);
-                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_on", idx, lane_i, dep_idx));
-                            // When shift[dep]=0: use cycle_vars[dep]
-                            let c = model.add_ge(
-                                *alu_cycle,
-                                LinearExpr::from(cycle_vars[dep_idx]) + 1,
-                            );
-                            model.only_enforce_if(c, [!shift_dep]);
-                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_off", idx, lane_i, dep_idx));
-                        } else {
-                            let c = model.add_ge(
-                                *alu_cycle,
-                                LinearExpr::from(cycle_vars[dep_idx]) + 1,
-                            );
-                            model.set_constraint_name(c, &format!("shift_alu_prec_{}_{}_dep_{}_valu", idx, lane_i, dep_idx));
+        for (lane_i, &alu_cycle) in times[idx].lanes().iter().enumerate() {
+            for &dep_id in &ops[idx].dep_ids {
+                if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
+                    let j = element_dep_map
+                        .get(&(idx, dep_idx))
+                        .map(|v| v[lane_i])
+                        .unwrap_or(lane_i);
+                    // Shiftable dep: lane j + 1 when shifted ("on"), its cycle + 1 when not
+                    // ("off"); other deps: cycle + 1 ("valu").
+                    for ready in times[dep_idx].lane_ready(j) {
+                        let c = model.add_ge(alu_cycle, ready.value);
+                        if let Some(when) = ready.when {
+                            model.only_enforce_if(c, [when]);
                         }
+                        model.set_constraint_name(
+                            c,
+                            &format!("shift_alu_prec_{}_{}_dep_{}_{}", idx, lane_i, dep_idx, ready.label),
+                        );
                     }
                 }
             }
@@ -1098,67 +1071,29 @@ pub fn schedule_ssa_cpsat(
     for (idx, op) in ops.iter().enumerate() {
         for &dep_id in &op.dep_ids {
             if let Some(&dep_idx) = op_id_to_idx.get(&dep_id) {
-                // If dependency is a shifted VALU op, use completion_cycle instead of cycle_vars
                 if shiftable_set.contains(&dep_idx) {
-                    if let Some(&completion_cycle) = completion_cycle_vars.get(&dep_idx) {
-                        // cycle[idx] >= completion_cycle[dep_idx] + 1
-                        // This ensures consumer waits for all 8 ALU ops to complete
-                        let c = model.add_ge(cycle_vars[idx], LinearExpr::from(completion_cycle) + 1);
-                        model.set_constraint_name(c, &format!("consumer_after_completion_{}_{}", idx, dep_idx));
-                    }
+                    // cycle[idx] >= completion_cycle[dep_idx] + 1
+                    // This ensures consumer waits for all 8 ALU ops to complete
+                    let c = model.add_ge(times[idx].issue(), times[dep_idx].visible());
+                    model.set_constraint_name(c, &format!("consumer_after_completion_{}_{}", idx, dep_idx));
                 }
             }
         }
     }
 
     // 5d. Eliminable vbroadcasts: optional VALU interval (presence = !eliminate_vb), precedence when eliminated
-    let (eliminable_vbs, eliminate_vb_vars, valu_optional_vb_intervals): (
-        Vec<(usize, usize, Vec<usize>)>,
-        HashMap<usize, BoolVar>,
-        HashMap<usize, IntervalVar>,
-    ) = if enable_valu_shift && enable_vbroadcast_elimination && !shiftable_valu.is_empty() {
-        let mut consumers_of: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (idx, op) in ops.iter().enumerate() {
-            for &dep_id in &op.dep_ids {
-                consumers_of.entry(dep_id).or_default().push(idx);
-            }
-        }
-        let mut list: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    // (the list and the elimination literals were built with the other variables in section 4)
+    let (eliminate_vb_vars, valu_optional_vb_intervals): (HashMap<usize, BoolVar>, HashMap<usize, IntervalVar>) = {
         let mut vars: HashMap<usize, BoolVar> = HashMap::new();
         let mut intervals: HashMap<usize, IntervalVar> = HashMap::new();
-        for (vb_idx, op) in ops.iter().enumerate() {
-            if op.engine != Engine::Valu || op.opcode != Opcode::Vbroadcast {
-                continue;
-            }
-            let dep_id = match op.dep_ids.iter().next() {
-                Some(&id) if op.dep_ids.len() == 1 => id,
-                _ => continue,
-            };
-            let Some(&scalar_producer_idx) = op_id_to_idx.get(&dep_id) else {
-                continue;
-            };
-            if ops[scalar_producer_idx].engine == Engine::Valu {
-                continue;
-            }
-            let consumers = consumers_of.get(&op.id).map_or(&[] as &[usize], |v| v.as_slice());
-            let shiftable_consumers: Vec<usize> = consumers
-                .iter()
-                .copied()
-                .filter(|&c| shiftable_set.contains(&c))
-                .collect();
-            if shiftable_consumers.is_empty() {
-                continue;
-            }
-            let all_consumers_shiftable = consumers.iter().all(|&c| shiftable_set.contains(&c));
-            if !all_consumers_shiftable {
-                continue;
-            }
-            list.push((vb_idx, scalar_producer_idx, shiftable_consumers.clone()));
-            let eliminate_var = model.new_bool_var_with_name(format!("eliminate_vb_{}", vb_idx));
+        for (vb_idx, scalar_producer_idx, shiftable_consumers) in &eliminable_vbs {
+            let (vb_idx, scalar_producer_idx) = (*vb_idx, *scalar_producer_idx);
+            let op = &ops[vb_idx];
+            let eliminate_var = times[vb_idx].eliminate().expect("eliminable vbroadcast has a literal");
             vars.insert(vb_idx, eliminate_var);
             // eliminate_var = AND(shift[C] for C in shiftable_consumers): encode as
             // (1) eliminate_var <= shift_c for each c, (2) eliminate_var >= sum(shift_c) - (k-1)
-            for &c in &shiftable_consumers {
+            for &c in shiftable_consumers {
                 let shift_c = *shift_vars.get(&c).unwrap();
                 let ct = model.add_ge(LinearExpr::from(shift_c), LinearExpr::from(eliminate_var.clone()));
                 model.set_constraint_name(ct, &format!("vb_elim_{}_shift_ge_c{}", vb_idx, c));
@@ -1176,7 +1111,7 @@ pub fn schedule_ssa_cpsat(
             );
             model.set_constraint_name(ct, &format!("vb_elim_{}_sum_ge", vb_idx));
             let vb_interval = model.new_optional_fixed_size_interval_var(
-                cycle_vars[vb_idx],
+                times[vb_idx].issue(),
                 1,
                 eliminate_var.not(),
             );
@@ -1190,43 +1125,28 @@ pub fn schedule_ssa_cpsat(
             } else {
                 model.add_hint(eliminate_var, 0);
             }
-            for &c in &shiftable_consumers {
-                if let Some(alu_cycles) = alu_cycle_vars.get(&c) {
-                    for (lane_i, alu_cycle) in alu_cycles.iter().enumerate() {
-                        let c_elim = model.add_ge(
-                            *alu_cycle,
-                            LinearExpr::from(cycle_vars[scalar_producer_idx]) + 1,
-                        );
-                        model.only_enforce_if(c_elim, [eliminate_var.clone()]);
-                        model.set_constraint_name(
-                            c_elim,
-                            &format!("vb_elim_{}_prec_elim_c{}_lane{}", vb_idx, c, lane_i),
-                        );
-                        let c_keep = model.add_ge(
-                            *alu_cycle,
-                            LinearExpr::from(cycle_vars[vb_idx]) + 1,
-                        );
-                        model.only_enforce_if(c_keep, [eliminate_var.not()]);
-                        model.set_constraint_name(
-                            c_keep,
-                            &format!("vb_elim_{}_prec_keep_c{}_lane{}", vb_idx, c, lane_i),
-                        );
-                    }
+            // Eliminated: the lanes read the scalar producer; kept: they read the vbroadcast.
+            for &c in shiftable_consumers {
+                for (lane_i, &alu_cycle) in times[c].lanes().iter().enumerate() {
+                    let c_elim = model.add_ge(alu_cycle, times[scalar_producer_idx].visible());
+                    model.only_enforce_if(c_elim, [eliminate_var.clone()]);
+                    model.set_constraint_name(
+                        c_elim,
+                        &format!("vb_elim_{}_prec_elim_c{}_lane{}", vb_idx, c, lane_i),
+                    );
+                    let c_keep = model.add_ge(alu_cycle, times[vb_idx].visible());
+                    model.only_enforce_if(c_keep, [eliminate_var.not()]);
+                    model.set_constraint_name(
+                        c_keep,
+                        &format!("vb_elim_{}_prec_keep_c{}_lane{}", vb_idx, c, lane_i),
+                    );
                 }
             }
         }
-        (list, vars, intervals)
-    } else {
-        (Vec::new(), HashMap::new(), HashMap::new())
+        (vars, intervals)
     };
 
-    // 6b. Create ConstChoice decision variables and optional intervals
-    let const_choice_ops: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| op.opcode == Opcode::ConstChoice)
-        .map(|(idx, _)| idx)
-        .collect();
+    // 6b. ConstChoice optional intervals (decision variables were created in section 4)
 
     // Map constant value -> op index (first producer). Used for ALU-derived precedence.
     let value_to_producer_idx: HashMap<i64, usize> = {
@@ -1263,29 +1183,31 @@ pub fn schedule_ssa_cpsat(
 
         match const_choice_mode {
             ConstChoiceMode::ForceLoad => {
-                let load_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                let load_interval = model.new_fixed_size_interval_var(times[idx].issue(), 1);
                 const_load_intervals.insert(idx, load_interval);
             }
             ConstChoiceMode::ForceAddImm => {
-                let add_imm_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                let add_imm_interval = model.new_fixed_size_interval_var(times[idx].issue(), 1);
                 const_flow_intervals.insert(idx, add_imm_interval);
             }
             ConstChoiceMode::Optimize => {
                 if !has_alu_options {
                     // Binary: Load vs AddImm (current behavior)
-                    let choice_var =
-                        model.new_bool_var_with_name(format!("const_choice_{}", idx));
+                    let Some(ConstChoiceVars::AddImm(choice_var)) = op_vars.const_choice.get(&idx) else {
+                        unreachable!("binary ConstChoice has one literal")
+                    };
+                    let choice_var = *choice_var;
                     const_choice_vars.insert(idx, choice_var);
 
                     let load_interval = model.new_optional_fixed_size_interval_var(
-                        cycle_vars[idx],
+                        times[idx].issue(),
                         1,
                         choice_var.not(),
                     );
                     const_load_intervals.insert(idx, load_interval);
 
                     let add_imm_interval =
-                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
+                        model.new_optional_fixed_size_interval_var(times[idx].issue(), 1, choice_var);
                     const_flow_intervals.insert(idx, add_imm_interval);
 
                     let use_add_imm =
@@ -1294,15 +1216,10 @@ pub fn schedule_ssa_cpsat(
                 } else {
                     // N-way: Load, AddImm, and optionally ALU-derived encodings
                     let alts = alternatives.unwrap();
-                    let n = alts.len();
-                    let mut use_vars: Vec<BoolVar> = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let b = model.new_bool_var_with_name(format!(
-                            "const_choice_enc_{}_{}",
-                            idx, i
-                        ));
-                        use_vars.push(b);
-                    }
+                    let Some(ConstChoiceVars::Encoding(use_vars)) = op_vars.const_choice.get(&idx) else {
+                        unreachable!("N-way ConstChoice has one literal per encoding")
+                    };
+                    let use_vars: Vec<BoolVar> = use_vars.clone();
                     // Exactly one encoding
                     let sum_expr = use_vars
                         .iter()
@@ -1317,11 +1234,11 @@ pub fn schedule_ssa_cpsat(
                     let use_add_imm = use_vars[1];
 
                     let load_interval =
-                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, use_load);
+                        model.new_optional_fixed_size_interval_var(times[idx].issue(), 1, use_load);
                     const_load_intervals.insert(idx, load_interval);
 
                     let add_imm_interval = model.new_optional_fixed_size_interval_var(
-                        cycle_vars[idx], 1, use_add_imm,
+                        times[idx].issue(), 1, use_add_imm,
                     );
                     const_flow_intervals.insert(idx, add_imm_interval);
 
@@ -1329,7 +1246,7 @@ pub fn schedule_ssa_cpsat(
                     for (k, enc) in alts[2..].iter().enumerate() {
                         let use_alu_k = use_vars[2 + k];
                         let alu_interval = model.new_optional_fixed_size_interval_var(
-                            cycle_vars[idx], 1, use_alu_k,
+                            times[idx].issue(), 1, use_alu_k,
                         );
                         const_choice_alu_intervals
                             .entry(idx)
@@ -1342,12 +1259,10 @@ pub fn schedule_ssa_cpsat(
                             let right_idx = *value_to_producer_idx.get(&deps[1]).unwrap_or(&idx);
                             if let Some(opcode) = enc.alu_opcode() {
                                 alu_info.push((left_idx, right_idx, opcode));
-                                let c_left =
-                                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[left_idx]) + 1);
+                                let c_left = model.add_ge(times[idx].issue(), times[left_idx].visible());
                                 model.only_enforce_if(c_left, [use_alu_k]);
                                 model.set_constraint_name(c_left, &format!("const_choice_prec_{}_k_{}_left", idx, k));
-                                let c_right =
-                                    model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[right_idx]) + 1);
+                                let c_right = model.add_ge(times[idx].issue(), times[right_idx].visible());
                                 model.only_enforce_if(c_right, [use_alu_k]);
                                 model.set_constraint_name(c_right, &format!("const_choice_prec_{}_k_{}_right", idx, k));
                             }
@@ -1372,13 +1287,8 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 6c. Create SelectChoice decision variables and optional intervals
-    let select_choice_ops: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| op.opcode == Opcode::SelectChoice)
-        .map(|(idx, _)| idx)
-        .collect();
+    // 6c. SelectChoice optional intervals (decision literals and multiply_add cycles were
+    // created in section 4)
 
     // CSE groups: op index -> group index for SelectChoice ops in CSE groups (no delta, has sub_temp)
     let (cse_consumer_set, op_idx_to_cse_group): (HashSet<usize>, HashMap<usize, usize>) =
@@ -1396,59 +1306,36 @@ pub fn schedule_ssa_cpsat(
             (HashSet::new(), HashMap::new())
         };
 
-    let mut select_choice_vars: HashMap<usize, BoolVar> = HashMap::new();
     let mut select_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     let mut select_valu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
-    // For SelectChoice FMA (no-delta): last cycle of op is fma_cycle_var (sub at cycle_var, fma at cycle_var+1). Used so makespan is constrained by chosen path only.
-    let mut select_choice_fma_last_cycle: HashMap<usize, IntVar> = HashMap::new();
 
     for &idx in &select_choice_ops {
+        let issue = times[idx].issue();
         match select_choice_mode {
             SelectChoiceMode::ForceVselect => {
-                let flow_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
+                let flow_interval = model.new_fixed_size_interval_var(issue, 1);
                 select_flow_intervals.insert(idx, flow_interval);
             }
             SelectChoiceMode::ForceFma => {
                 let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
-                    vec![model.new_fixed_size_interval_var(cycle_vars[idx], 1)]
+                    vec![model.new_fixed_size_interval_var(issue, 1)]
                 } else if cse_consumer_set.contains(&idx) {
                     // In CSE group: only FMA interval; shared SUB added per group
-                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-                    let fma_cycle_var = model.new_int_var_with_name(
-                        [(fma_asap as i64, fma_alap as i64)],
-                        format!("fma_cycle_{}", idx),
-                    );
-                    let c = model.add_eq(
-                        LinearExpr::from(fma_cycle_var),
-                        LinearExpr::from(cycle_vars[idx]) + 1,
-                    );
-                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
-                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                    times[idx].add_fma_cycle_invariant(&mut model, idx);
+                    let fma_cycle_var = times[idx].fma_cycle().expect("select without delta has an FMA cycle");
                     let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
                     vec![fma_interval]
                 } else {
-                    let sub_interval = model.new_fixed_size_interval_var(cycle_vars[idx], 1);
-                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-                    let fma_cycle_var = model.new_int_var_with_name(
-                        [(fma_asap as i64, fma_alap as i64)],
-                        format!("fma_cycle_{}", idx),
-                    );
-                    let c = model.add_eq(
-                        LinearExpr::from(fma_cycle_var),
-                        LinearExpr::from(cycle_vars[idx]) + 1,
-                    );
-                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
-                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                    let sub_interval = model.new_fixed_size_interval_var(issue, 1);
+                    times[idx].add_fma_cycle_invariant(&mut model, idx);
+                    let fma_cycle_var = times[idx].fma_cycle().expect("select without delta has an FMA cycle");
                     let fma_interval = model.new_fixed_size_interval_var(fma_cycle_var, 1);
                     vec![sub_interval, fma_interval]
                 };
                 select_valu_intervals.insert(idx, valu_intervals);
             }
             SelectChoiceMode::Optimize => {
-                let choice_var = model.new_bool_var_with_name(format!("select_choice_{}", idx));
-                select_choice_vars.insert(idx, choice_var);
+                let choice_var = times[idx].fma_chosen().expect("Optimize select has a choice literal");
 
                 if let Some(hints) = select_choice_hints {
                     if hints.contains(&ops[idx].id) {
@@ -1461,46 +1348,26 @@ pub fn schedule_ssa_cpsat(
                 }
 
                 let flow_interval = model.new_optional_fixed_size_interval_var(
-                    cycle_vars[idx],
+                    issue,
                     1,
                     choice_var.not(),
                 );
                 select_flow_intervals.insert(idx, flow_interval);
 
                 let valu_intervals = if let Some(_delta_vreg) = ops[idx].delta_vreg {
-                    vec![model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var)]
+                    vec![model.new_optional_fixed_size_interval_var(issue, 1, choice_var)]
                 } else if cse_consumer_set.contains(&idx) {
                     // In CSE group: only FMA interval; shared SUB added per group
-                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-                    let fma_cycle_var = model.new_int_var_with_name(
-                        [(fma_asap as i64, fma_alap as i64)],
-                        format!("fma_cycle_{}", idx),
-                    );
-                    let c = model.add_eq(
-                        LinearExpr::from(fma_cycle_var),
-                        LinearExpr::from(cycle_vars[idx]) + 1,
-                    );
-                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
-                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                    times[idx].add_fma_cycle_invariant(&mut model, idx);
+                    let fma_cycle_var = times[idx].fma_cycle().expect("select without delta has an FMA cycle");
                     let fma_interval =
                         model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
                     vec![fma_interval]
                 } else {
                     let sub_interval =
-                        model.new_optional_fixed_size_interval_var(cycle_vars[idx], 1, choice_var);
-                    let fma_asap = *asap.get(&ops[idx].id).unwrap_or(&0) + 1;
-                    let fma_alap = *alap.get(&ops[idx].id).unwrap_or(&(horizon as i32 - 1)) + 1;
-                    let fma_cycle_var = model.new_int_var_with_name(
-                        [(fma_asap as i64, fma_alap as i64)],
-                        format!("fma_cycle_{}", idx),
-                    );
-                    let c = model.add_eq(
-                        LinearExpr::from(fma_cycle_var),
-                        LinearExpr::from(cycle_vars[idx]) + 1,
-                    );
-                    model.set_constraint_name(c, &format!("select_fma_end_{}", idx));
-                    select_choice_fma_last_cycle.insert(idx, fma_cycle_var);
+                        model.new_optional_fixed_size_interval_var(issue, 1, choice_var);
+                    times[idx].add_fma_cycle_invariant(&mut model, idx);
+                    let fma_cycle_var = times[idx].fma_cycle().expect("select without delta has an FMA cycle");
                     let fma_interval =
                         model.new_optional_fixed_size_interval_var(fma_cycle_var, 1, choice_var);
                     vec![sub_interval, fma_interval]
@@ -1510,81 +1377,25 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 6c-bis. CSE shared SUB: variables and constraints per group (Phase A: SUB on VALU only)
-    let mut cse_sub_active_vars: Vec<BoolVar> = Vec::new();
-    let mut cse_sub_cycle_vars: Vec<IntVar> = Vec::new();
+    // 6c-bis. CSE shared SUB: constraints per group (Phase A: SUB on VALU only); its
+    // variables were created in section 4
     let mut cse_shared_sub_valu_intervals: Vec<IntervalVar> = Vec::new();
     if let Some(groups) = cse_groups {
         for (g, group) in groups.iter().enumerate() {
-            let sub_active_var = model.new_bool_var_with_name(format!("cse_sub_active_{}", g));
-            cse_sub_active_vars.push(sub_active_var);
+            let sub_active_var = cse_subs[g].active();
+            let sub_cycle_var = cse_subs[g].cycle();
 
-            // sub_asap = max(asap[producer_true], asap[producer_false]) + 1 when both producers
-            // are unique. For complex_phi (multi-def/phi), use conservative bound 0; do not
-            // unwrap producer_true_idx/producer_false_idx.
-            let sub_asap = if group.complex_phi {
-                if verbose {
-                    eprintln!(
-                        "  CSE group {}: complex-phi (operands have multiple producers); using conservative sub_asap=0",
-                        g
-                    );
-                }
-                0
-            } else if let (Some(pt), Some(pf)) =
-                (group.producer_true_idx, group.producer_false_idx)
-            {
-                let at = *asap.get(&ops[pt].id).unwrap_or(&0);
-                let af = *asap.get(&ops[pf].id).unwrap_or(&0);
-                at.max(af) + 1
-            } else {
-                0
-            };
-            let sub_alap = horizon as i32 - 1;
-            let sub_cycle_var = model.new_int_var_with_name(
-                [(sub_asap as i64, sub_alap as i64)],
-                format!("cse_sub_cycle_{}", g),
-            );
-            cse_sub_cycle_vars.push(sub_cycle_var);
-
-            // Producer precedence: when sub is active, sub_cycle >= producer result visible cycle.
-            // Uses completion_cycle for shiftable VALU producers (result at completion+1), else cycle+1,
-            // plus one more cycle when the producer is itself a SelectChoice lowered as FMA.
+            // Producer precedence: when sub is active, sub_cycle >= producer result visible cycle
+            // (completion + 1 for a shiftable producer, + 1 more for a select on the
+            // multiply-add path).
             // For complex_phi, one or both producers are None; we only add precedence for present producers.
             if let Some(pt) = group.producer_true_idx {
-                let producer_cycle = completion_cycle_vars
-                    .get(&pt)
-                    .copied()
-                    .unwrap_or(cycle_vars[pt]);
-                let c = model.add_ge(
-                    LinearExpr::from(sub_cycle_var),
-                    LinearExpr::from(producer_cycle)
-                        + 1
-                        + select_fma_extra_delay(
-                            pt,
-                            &select_choice_with_fma_delay,
-                            select_choice_mode,
-                            &select_choice_vars,
-                        ),
-                );
+                let c = model.add_ge(LinearExpr::from(sub_cycle_var), times[pt].visible());
                 model.set_constraint_name(c, &format!("cse_sub_after_producer_true_g{}", g));
                 model.only_enforce_if(c, [sub_active_var]);
             }
             if let Some(pf) = group.producer_false_idx {
-                let producer_cycle = completion_cycle_vars
-                    .get(&pf)
-                    .copied()
-                    .unwrap_or(cycle_vars[pf]);
-                let c = model.add_ge(
-                    LinearExpr::from(sub_cycle_var),
-                    LinearExpr::from(producer_cycle)
-                        + 1
-                        + select_fma_extra_delay(
-                            pf,
-                            &select_choice_with_fma_delay,
-                            select_choice_mode,
-                            &select_choice_vars,
-                        ),
-                );
+                let c = model.add_ge(LinearExpr::from(sub_cycle_var), times[pf].visible());
                 model.set_constraint_name(c, &format!("cse_sub_after_producer_false_g{}", g));
                 model.only_enforce_if(c, [sub_active_var]);
             }
@@ -1627,13 +1438,10 @@ pub fn schedule_ssa_cpsat(
                 if select_choice_mode == SelectChoiceMode::ForceVselect {
                     continue; // No FMA path, no precedence needed
                 }
-                let Some(&fma_cycle_var) = select_choice_fma_last_cycle.get(&idx) else {
+                let Some(fma_cycle_var) = times[idx].fma_cycle() else {
                     continue;
                 };
-                let c = model.add_ge(
-                    LinearExpr::from(fma_cycle_var),
-                    LinearExpr::from(sub_cycle_var) + 1,
-                );
+                let c = model.add_ge(LinearExpr::from(fma_cycle_var), cse_subs[g].visible());
                 model.set_constraint_name(c, &format!("cse_prec_g{}_c{}", g, idx));
                 if select_choice_mode == SelectChoiceMode::Optimize {
                     if let Some(&choice_var) = select_choice_vars.get(&idx) {
@@ -1661,43 +1469,41 @@ pub fn schedule_ssa_cpsat(
             if !select_choice_with_fma_delay.contains(&dep_idx) {
                 continue;
             }
-            // A shifted consumer executes as 8 scalar ops at alu_cycle_vars[idx][lane], not at
-            // cycle_vars[idx], so each lane needs the same FMA delay. Section 5b only gives the
-            // lanes dep_cycle + 1 (the vselect delay).
-            let consumer_lanes: &[IntVar] = alu_cycle_vars.get(&idx).map_or(&[], |v| v.as_slice());
+            // A shifted consumer executes as 8 scalar ops at its lane cycles, not at its issue
+            // cycle, so each lane needs the same FMA delay. Section 5b only gives the lanes
+            // dep_cycle + 1 (the vselect delay).
+            let consumer_lanes: &[IntVar] = times[idx].lanes();
             match select_choice_mode {
                 SelectChoiceMode::ForceVselect => {
-                    let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 1);
+                    let c = model.add_ge(times[idx].issue(), times[dep_idx].visible());
                     model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_vselect", idx, dep_idx));
                 }
                 SelectChoiceMode::ForceFma => {
-                    let c = model.add_ge(cycle_vars[idx], LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                    let c = model.add_ge(times[idx].issue(), times[dep_idx].visible());
                     model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_fma", idx, dep_idx));
                     for (lane_i, alu_cycle) in consumer_lanes.iter().enumerate() {
-                        let c = model.add_ge(*alu_cycle, LinearExpr::from(cycle_vars[dep_idx]) + 2);
+                        let c = model.add_ge(*alu_cycle, times[dep_idx].visible());
                         model.set_constraint_name(c, &format!("select_prec_{}_{}_dep_{}_fma", idx, lane_i, dep_idx));
                     }
                 }
                 SelectChoiceMode::Optimize => {
-                    let choice_var = select_choice_vars
-                        .get(&dep_idx)
-                        .expect("Optimize has choice var");
+                    let choice_var = times[dep_idx].fma_chosen().expect("Optimize has choice var");
                     // consumer >= dep_cycle + 1 + (1 if FMA else 0). Use auxiliary 0-1 int.
                     let extra = model.new_int_var_with_name(
                         [(0, 1)],
                         format!("select_fma_extra_{}_{}", dep_idx, idx),
                     );
-                    let c = model.add_eq(LinearExpr::from(extra), LinearExpr::from(*choice_var));
+                    let c = model.add_eq(LinearExpr::from(extra), LinearExpr::from(choice_var));
                     model.set_constraint_name(c, &format!("select_fma_extra_{}_{}", dep_idx, idx));
                     let c = model.add_ge(
-                        cycle_vars[idx],
-                        LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
+                        times[idx].issue(),
+                        times[dep_idx].visible_with_latency(LinearExpr::from(extra)),
                     );
                     model.set_constraint_name(c, &format!("select_prec_{}_dep_{}_opt", idx, dep_idx));
                     for (lane_i, alu_cycle) in consumer_lanes.iter().enumerate() {
                         let c = model.add_ge(
                             *alu_cycle,
-                            LinearExpr::from(cycle_vars[dep_idx]) + 1 + LinearExpr::from(extra),
+                            times[dep_idx].visible_with_latency(LinearExpr::from(extra)),
                         );
                         model.set_constraint_name(c, &format!("select_prec_{}_{}_dep_{}_opt", idx, lane_i, dep_idx));
                     }
@@ -1745,7 +1551,7 @@ pub fn schedule_ssa_cpsat(
             if eliminable_vb_set.contains(&idx) {
                 continue;
             }
-            valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             valu_demands.push(1);
         }
         // Add optional VALU intervals for eliminable vbroadcasts (presence = !eliminate_vb)
@@ -1760,7 +1566,7 @@ pub fn schedule_ssa_cpsat(
         for &idx in &shiftable_valu {
             match valu_shift_mode {
                 ValuShiftMode::ForceValu => {
-                    valu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+                    valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
                     valu_demands.push(1);
                 }
                 ValuShiftMode::ForceAlu => {}
@@ -1809,7 +1615,7 @@ pub fn schedule_ssa_cpsat(
 
         // Add regular ALU ops (demand = 1)
         for &idx in &alu_ops {
-            alu_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            alu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             alu_demands.push(1);
         }
 
@@ -1860,7 +1666,7 @@ pub fn schedule_ssa_cpsat(
 
         // Add regular Load ops
         for &idx in &regular_load_ops {
-            load_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            load_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             load_demands.push(1);
         }
 
@@ -1897,7 +1703,7 @@ pub fn schedule_ssa_cpsat(
         if !store_ops.is_empty() {
             let intervals: Vec<IntervalVar> = store_ops
                 .iter()
-                .map(|&idx| model.new_fixed_size_interval_var(cycle_vars[idx], 1))
+                .map(|&idx| model.new_fixed_size_interval_var(times[idx].issue(), 1))
                 .collect();
             let demands: Vec<i64> = vec![1; intervals.len()];
             let max_demand = *demands.iter().max().unwrap_or(&0);
@@ -1940,7 +1746,7 @@ pub fn schedule_ssa_cpsat(
 
         // Add regular Flow ops
         for &idx in &regular_flow_ops {
-            flow_intervals.push(model.new_fixed_size_interval_var(cycle_vars[idx], 1));
+            flow_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             flow_demands.push(1);
         }
 
@@ -2116,7 +1922,7 @@ pub fn schedule_ssa_cpsat(
                         // cond (i=0) or false_val (i=2)
                         if let Operand::VReg(vreg) = src {
                             // Update last_use to this SelectChoice op (cycle+1 will be handled in scratch interval end)
-                            // We use idx as the "last use" op, but the scratch constraint will use cycle_vars[idx] + 1
+                            // We use idx as the "last use" op, but the scratch constraint will use the issue cycle + 1
                             if !vreg_last_use.contains_key(vreg) {
                                 vreg_last_use.insert(*vreg, idx);
                             }
@@ -2203,8 +2009,8 @@ pub fn schedule_ssa_cpsat(
                 || live_through_vregs.is_some_and(|s| !s.is_empty()))
         {
             let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
-            for (cv_idx, cv) in cycle_vars.iter().enumerate() {
-                let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(*cv));
+            for (cv_idx, t) in times.iter().enumerate() {
+                let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(t.issue()));
                 model.set_constraint_name(c, &format!("segment_end_ge_c_{}", cv_idx));
             }
             // Hint segment_end to greedy makespan so hint is complete (per-section mode).
@@ -2221,6 +2027,28 @@ pub fn schedule_ssa_cpsat(
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
+
+            // Scratch model `pools`: a write group (alias with no definer, lanes written one by
+            // one) is one 8-word value for address assignment, so it is one vector here, live
+            // from its first lane write to its last lane's end. Lanes then contribute to the
+            // group's interval instead of having their own. (lane -> group; group -> lane
+            // (start, end, def_idx, end hint))
+            let mut pool_group_of_lane: HashMap<VReg, VReg> = HashMap::new();
+            let mut scratch_pool_vars: Option<(IntVar, IntVar)> = None;
+            if scratch_pools {
+                if let Some(groups) = hints.vector_group_lanes {
+                    for (group, lanes) in sorted_by_key(groups) {
+                        if vreg_def_op.contains_key(group) {
+                            continue; // read group: the group value itself is defined (a vector)
+                        }
+                        for lane in lanes {
+                            pool_group_of_lane.insert(*lane, *group);
+                        }
+                    }
+                }
+            }
+            let mut pool_group_lanes: std::collections::BTreeMap<VReg, Vec<(IntVar, LinearExpr, usize, Option<i32>)>> =
+                std::collections::BTreeMap::new();
 
             // =========================================================================
             // CP-SAT LIVENESS MODEL: Matches Address Assignment Logic
@@ -2274,15 +2102,8 @@ pub fn schedule_ssa_cpsat(
                         [(0, horizon + 2)],
                         format!("live_end_{}", vreg.id),
                     );
-                    let read_ends: Vec<LinearExpr> = readers
-                        .iter()
-                        .map(|&r| {
-                            let last_read = completion_cycle_vars.get(&r).copied().unwrap_or(cycle_vars[r]);
-                            LinearExpr::from(last_read)
-                                + 1
-                                + select_read_extra_delay(r, ops, select_choice_mode, &select_choice_vars)
-                        })
-                        .collect();
+                    let read_ends: Vec<LinearExpr> =
+                        readers.iter().map(|&r| times[r].last_read_end()).collect();
                     let c = model.add_max_eq(end_var, read_ends);
                     model.set_constraint_name(c, &format!("scratch_live_end_{}", vreg.id));
                     if let Some(&end_hint) = hinted_live_end.get(vreg) {
@@ -2295,28 +2116,25 @@ pub fn schedule_ssa_cpsat(
                     // the actual read happens at cycle+1, so end should be cycle+2.
                     // A shifted reader reads at its lane cycles: completion is the last of them
                     // (and equals the op cycle when it is not shifted).
-                    let base_cycle = completion_cycle_vars
-                        .get(&last_use_idx)
-                        .copied()
-                        .unwrap_or(cycle_vars[last_use_idx]);
+                    let reader = &times[last_use_idx];
                     if select_choice_set.contains(&last_use_idx) {
                         match select_choice_mode {
                             SelectChoiceMode::ForceFma => {
                                 // FMA forced: reads at cycle+1, end = cycle+2
-                                let e = LinearExpr::from(base_cycle) + 2;
+                                let e = reader.last_read_end_on_path(true);
                                 (e.clone(), e)
                             }
                             SelectChoiceMode::ForceVselect => {
                                 // vselect forced: reads at cycle, end = cycle+1
-                                let e = LinearExpr::from(base_cycle) + 1;
+                                let e = reader.last_read_end_on_path(false);
                                 (e.clone(), e)
                             }
                             SelectChoiceMode::Optimize => {
                                 // Conditional: if FMA chosen, end = cycle+2; if vselect, end = cycle+1
-                                if let Some(&choice_var) = select_choice_vars.get(&last_use_idx) {
+                                if let Some(choice_var) = reader.fma_chosen() {
                                     // Create conditional end: choice_var ? (cycle+2) : (cycle+1)
-                                    let end_fma = LinearExpr::from(base_cycle) + 2;
-                                    let end_vselect = LinearExpr::from(base_cycle) + 1;
+                                    let end_fma = reader.last_read_end_on_path(true);
+                                    let end_vselect = reader.last_read_end_on_path(false);
                                     // Use a variable for the end, constrained by choice
                                     let end_var = model.new_int_var_with_name(
                                         [(0, horizon + 2)],
@@ -2332,14 +2150,14 @@ pub fn schedule_ssa_cpsat(
                                     (LinearExpr::from(end_var), LinearExpr::from(end_var))
                                 } else {
                                     // No choice_var (shouldn't happen in Optimize mode)
-                                    let e = LinearExpr::from(base_cycle) + 1;
+                                    let e = reader.last_read_end_on_path(false);
                                     (e.clone(), e)
                                 }
                             }
                         }
                     } else {
                         // Normal read at cycle C: end = C+1
-                        let e = LinearExpr::from(base_cycle) + 1;
+                        let e = reader.last_read_end();
                         (e.clone(), e)
                     }
                 };
@@ -2348,54 +2166,14 @@ pub fn schedule_ssa_cpsat(
                 // size = end - start
                 //
                 // Shifted VALU dests: 8 ALU ops write at different cycles. The address is reserved from
-                // the FIRST write (min of alu_cycles), not the completion cycle (max). This matches
-                // address_assign.rs logic (line 169: def_cycle = min(alu_cycles)).
-                //
-                // We model this by creating a start variable that equals min(alu_cycles) when shifted,
-                // and cycle_vars[def_idx] when not shifted. To model min(alu_cycles), we constrain:
-                // - start <= each alu_cycle (so start is <= the minimum)
-                // - start >= min_possible_value (to ensure it's not too small)
-                // - When shifted, start is constrained by these bounds; when not shifted, start = cycle_vars[def_idx]
-                let start = if shiftable_set.contains(&def_idx)
-                    && alu_cycle_vars.contains_key(&def_idx)
-                {
-                    let alu_cycles = &alu_cycle_vars[&def_idx];
-                    let shift_var = *shift_vars.get(&def_idx).unwrap();
-                    // Get the minimum possible value across all alu_cycles (ASAP bound)
-                    let min_possible = alu_cycles
-                        .iter()
-                        .map(|&ac| {
-                            // Get domain lower bound (we know alu_cycles are created with [op_asap, op_alap])
-                            // For simplicity, use 0 as lower bound (will be tightened by constraints)
-                            0i64
-                        })
-                        .min()
-                        .unwrap_or(0);
-                    let start_var = model.new_int_var_with_name(
-                        [(min_possible, horizon)],
-                        format!("shifted_dest_start_{}", def_idx),
-                    );
+                // the FIRST write (min of the lane cycles), not the completion cycle (max). This matches
+                // address_assign.rs logic (def_cycle = min(alu_cycles)). `first_write` creates a start
+                // variable no later than any lane and equal to the issue cycle when not shifted; the
+                // objective pushes it up to the minimum.
+                let (start, start_aux) = times[def_idx].first_write(&mut model, def_idx, horizon);
+                if let Some(start_var) = start_aux {
                     scratch_shifted_start_vars.push((start_var, def_idx));
-                    // When shifted: start_var <= each alu_cycle (ensures start_var <= min(alu_cycles))
-                    for (lane_i, &alu_cycle) in alu_cycles.iter().enumerate() {
-                        let c = model.add_ge(LinearExpr::from(alu_cycle), LinearExpr::from(start_var));
-                        model.set_constraint_name(c, &format!("scratch_shifted_start_ge_alu_{}_{}", def_idx, lane_i));
-                    }
-                    // When not shifted: start_var = cycle_vars[def_idx]
-                    let c_not_shifted = model.add_eq(
-                        LinearExpr::from(start_var),
-                        LinearExpr::from(cycle_vars[def_idx]),
-                    );
-                    model.only_enforce_if(c_not_shifted, [!shift_var]);
-                    model.set_constraint_name(c_not_shifted, &format!("scratch_shifted_start_eq_cycle_{}", def_idx));
-                    // Note: We don't explicitly enforce start_var == min(alu_cycles) when shifted,
-                    // but the objective (minimize sum of cycles) will naturally push start_var to the minimum.
-                    // The constraint start_var <= each alu_cycle ensures correctness (start_var <= actual min).
-                    start_var
-                } else {
-                    // Normal VReg: start = cycle when defined
-                    cycle_vars[def_idx]
-                };
+                }
 
                 // Create a size variable: size = end - start
                 // Size must be >= 1 (def and last_use could be same cycle)
@@ -2406,13 +2184,75 @@ pub fn schedule_ssa_cpsat(
                 let c = model.add_eq(LinearExpr::from(start) + LinearExpr::from(size), end_expr);
                 model.set_constraint_name(c, &format!("scratch_live_size_{}", vreg.id));
 
+                size_vars.push((size, def_idx, last_use_idx));
+                if let Some(group) = pool_group_of_lane.get(vreg) {
+                    // Pools: counted in the group's vector interval (built below).
+                    let end_hint = greedy_hints.map(|h| {
+                        hinted_live_end.get(vreg).copied().unwrap_or_else(|| {
+                            h.get(last_use_idx).copied().unwrap_or(0) + 1
+                        })
+                    });
+                    pool_group_lanes.entry(*group).or_default().push((
+                        start,
+                        end_for_interval,
+                        def_idx,
+                        end_hint,
+                    ));
+                    continue;
+                }
                 let interval = model.new_interval_var(start, size, end_for_interval);
                 scratch_intervals.push(interval);
-                size_vars.push((size, def_idx, last_use_idx));
 
                 // Demand = size of VReg (1 for scalar, VLEN for vector)
                 let demand = vreg.size() as i64;
                 scratch_demands.push(demand);
+            }
+
+            // Pools: one vector interval per write group, [min lane start, max lane end).
+            // (group, start hint, end hint) for the pool-peak hints below.
+            let mut pool_group_hints: Vec<(i32, i32)> = Vec::new();
+            for (group, lanes) in &pool_group_lanes {
+                let g_start = model.new_int_var_with_name(
+                    [(0, horizon)],
+                    format!("pool_group_start_{}", group.id),
+                );
+                let g_end = model.new_int_var_with_name(
+                    [(0, horizon + 2)],
+                    format!("pool_group_end_{}", group.id),
+                );
+                let g_size = model.new_int_var_with_name(
+                    [(1, horizon + 2)],
+                    format!("pool_group_size_{}", group.id),
+                );
+                let c = model.add_min_eq(g_start, lanes.iter().map(|(s, _, _, _)| LinearExpr::from(*s)));
+                model.set_constraint_name(c, &format!("pool_group_start_min_{}", group.id));
+                let c = model.add_max_eq(g_end, lanes.iter().map(|(_, e, _, _)| e.clone()));
+                model.set_constraint_name(c, &format!("pool_group_end_max_{}", group.id));
+                let c = model.add_eq(
+                    LinearExpr::from(g_start) + LinearExpr::from(g_size),
+                    LinearExpr::from(g_end),
+                );
+                model.set_constraint_name(c, &format!("pool_group_size_{}", group.id));
+                let interval = model.new_interval_var(g_start, g_size, g_end);
+                scratch_intervals.push(interval);
+                scratch_demands.push(VLEN as i64);
+                if let Some(h) = greedy_hints {
+                    let start_hint = lanes
+                        .iter()
+                        .map(|(_, _, d, _)| h.get(*d).copied().unwrap_or(0))
+                        .min()
+                        .unwrap_or(0);
+                    let end_hint = lanes
+                        .iter()
+                        .filter_map(|(_, _, _, e)| *e)
+                        .max()
+                        .unwrap_or(start_hint + 1)
+                        .max(start_hint + 1);
+                    model.add_hint(g_start, start_hint as i64);
+                    model.add_hint(g_end, end_hint as i64);
+                    model.add_hint(g_size, (end_hint - start_hint) as i64);
+                    pool_group_hints.push((start_hint, end_hint));
+                }
             }
 
             // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
@@ -2427,7 +2267,7 @@ pub fn schedule_ssa_cpsat(
                         if !live_vregs.contains(vreg) {
                             // This VReg is defined in segment but only used after
                             if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let start = cycle_vars[def_idx];
+                                let start = times[def_idx].issue();
                                 let end_expr = LinearExpr::from(seg_end) + 1;
                                 let size = model.new_int_var_with_name(
                                     [(1, horizon + 1)],
@@ -2460,10 +2300,11 @@ pub fn schedule_ssa_cpsat(
             if let Some(il) = initial_live {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
                 for (vreg, last_use_idx) in il {
-                    if *last_use_idx >= cycle_vars.len() {
+                    if *last_use_idx >= times.len() {
                         continue;
                     }
-                    let end_expr = LinearExpr::from(cycle_vars[*last_use_idx]) + 1;
+                    // Issue cycle + 1, not last_read_end: see op_times.rs.
+                    let end_expr = LinearExpr::from(times[*last_use_idx].issue()) + 1;
                     let size = model.new_int_var_with_name(
                         [(1, horizon + 1)],
                         format!("init_live_size_{}", vreg.id),
@@ -2521,14 +2362,14 @@ pub fn schedule_ssa_cpsat(
                 if ops[idx].sub_temp_vreg.is_none() {
                     continue; // delta path: no sub_temp
                 }
-                if idx >= cycle_vars.len() {
+                if idx >= times.len() {
                     continue;
                 }
                 // Skip CSE consumers - they use shared sub_temp instead of individual sub_temp
                 if cse_consumer_set.contains(&idx) {
                     continue;
                 }
-                let start = cycle_vars[idx];
+                let start = times[idx].issue();
                 match select_choice_mode {
                     SelectChoiceMode::ForceFma => {
                         let interval = model.new_fixed_size_interval_var(start, 2);
@@ -2552,11 +2393,11 @@ pub fn schedule_ssa_cpsat(
             // Model end conservatively as horizon+1 (will be tightened by actual FMA cycles in solution).
             if let Some(groups) = cse_groups {
                 for (g, group) in groups.iter().enumerate() {
-                    let sub_active_var = cse_sub_active_vars[g];
-                    let sub_cycle_var = cse_sub_cycle_vars[g];
+                    let sub_active_var = cse_subs[g].active();
+                    let sub_cycle_var = cse_subs[g].cycle();
                     
                     // End cycle: max FMA cycle + 1 among consumers that chose FMA.
-                    // FMA cycle for consumer idx is cycle_vars[idx] + 1 when FMA is chosen.
+                    // FMA cycle for consumer idx is its issue cycle + 1 when FMA is chosen.
                     // Model conservatively: use horizon+1 as upper bound; actual end will be <= this.
                     let end_cycle_var = model.new_int_var_with_name(
                         [(0, horizon + 2)],
@@ -2568,15 +2409,15 @@ pub fn schedule_ssa_cpsat(
                         LinearExpr::from(sub_cycle_var) + 1,
                     );
                     model.set_constraint_name(c_min, &format!("cse_sub_end_ge_sub_plus_1_{}", g));
-                    // Constraint: end >= max(cycle_vars[consumer] + 2) for consumers that chose FMA
+                    // Constraint: end >= max(issue[consumer] + 2) for consumers that chose FMA
                     // (FMA writes at cycle+1, so last read is at cycle+1, interval end is cycle+2)
                     for &consumer_idx in &group.consumer_indices {
-                        if consumer_idx >= cycle_vars.len() {
+                        if consumer_idx >= times.len() {
                             continue;
                         }
                         match select_choice_mode {
                             SelectChoiceMode::ForceFma => {
-                                let fma_end = LinearExpr::from(cycle_vars[consumer_idx]) + 2;
+                                let fma_end = times[consumer_idx].last_read_end_on_path(true);
                                 let c = model.add_ge(
                                     LinearExpr::from(end_cycle_var),
                                     fma_end,
@@ -2585,7 +2426,7 @@ pub fn schedule_ssa_cpsat(
                             }
                             SelectChoiceMode::Optimize => {
                                 if let Some(&choice_var) = select_choice_vars.get(&consumer_idx) {
-                                    let fma_end = LinearExpr::from(cycle_vars[consumer_idx]) + 2;
+                                    let fma_end = times[consumer_idx].last_read_end_on_path(true);
                                     // Only enforce when FMA is chosen (sub_active implies at least one FMA)
                                     let c = model.add_ge(
                                         LinearExpr::from(end_cycle_var),
@@ -2631,8 +2472,39 @@ pub fn schedule_ssa_cpsat(
                 max_demand,
                 scratch_budget
             );
-            let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
-            model.set_constraint_name(c, "cumul_scratch");
+            if scratch_pools {
+                // Two pools: vectors (demand VLEN) and scalars (demand 1), with capacities
+                // N_v and N_s and 8 * N_v + N_s <= budget. Address assignment needs at most
+                // 8 * (most live vectors) + (most live scalars) words.
+                let mut vec_intervals: Vec<IntervalVar> = Vec::new();
+                let mut scalar_intervals: Vec<IntervalVar> = Vec::new();
+                for (iv, d) in scratch_intervals.iter().zip(scratch_demands.iter()) {
+                    if *d == VLEN as i64 {
+                        vec_intervals.push(*iv);
+                    } else {
+                        debug_assert_eq!(*d, 1, "pools: demand {} is neither 1 nor {}", d, VLEN);
+                        scalar_intervals.push(*iv);
+                    }
+                }
+                let budget = scratch_budget as i64;
+                let n_v = model.new_int_var_with_name([(0, budget / VLEN as i64)], "scratch_pool_vectors");
+                let n_s = model.new_int_var_with_name([(0, budget)], "scratch_pool_scalars");
+                let ones_v = vec![1i64; vec_intervals.len()];
+                let ones_s = vec![1i64; scalar_intervals.len()];
+                let c = model.add_cumulative(vec_intervals, ones_v, n_v);
+                model.set_constraint_name(c, "cumul_scratch_vectors");
+                let c = model.add_cumulative(scalar_intervals, ones_s, n_s);
+                model.set_constraint_name(c, "cumul_scratch_scalars");
+                let c = model.add_le(
+                    LinearExpr::from(n_v) * VLEN as i64 + LinearExpr::from(n_s),
+                    LinearExpr::from(budget),
+                );
+                model.set_constraint_name(c, "scratch_pools_capacity");
+                scratch_pool_vars = Some((n_v, n_s));
+            } else {
+                let c = model.add_cumulative(scratch_intervals, scratch_demands, scratch_budget as i64);
+                model.set_constraint_name(c, "cumul_scratch");
+            }
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
@@ -2777,6 +2649,88 @@ pub fn schedule_ssa_cpsat(
                     peak = peak.max(current);
                 }
 
+                if let Some((n_v, n_s)) = scratch_pool_vars {
+                    // Hint N_v, N_s with the hint schedule's pool maxima: the same intervals,
+                    // write-group lanes replaced by their group.
+                    let mut pool_events: Vec<(i32, i64, i64)> = Vec::new(); // (cycle, dv, ds)
+                    let mut push = |start: i32, end: i32, vector: bool| {
+                        let (dv, ds) = if vector { (1, 0) } else { (0, 1) };
+                        pool_events.push((start, dv, ds));
+                        pool_events.push((end, -dv, -ds));
+                    };
+                    if let Some(il) = initial_live {
+                        for (vreg, last_use_idx) in il.iter() {
+                            if *last_use_idx < hints.len() {
+                                push(0, hints[*last_use_idx] + 1, vreg.is_vector());
+                            }
+                        }
+                    }
+                    if let Some(lt) = live_through_vregs {
+                        for vreg in lt {
+                            push(0, max_hint + 1, vreg.is_vector());
+                        }
+                    }
+                    for vreg in &live_vregs {
+                        if pool_group_of_lane.contains_key(vreg) {
+                            continue;
+                        }
+                        let def_idx = vreg_def_op[vreg];
+                        let last_use_idx = vreg_last_use[vreg];
+                        let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                        let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
+                            max_hint + 1
+                        } else {
+                            hinted_live_end
+                                .get(vreg)
+                                .copied()
+                                .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1)
+                        };
+                        push(def_cycle, live_end, vreg.is_vector());
+                    }
+                    if let Some(lo) = live_out_vregs {
+                        for vreg in lo {
+                            if !live_vregs.contains(vreg) {
+                                if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                    push(hints.get(def_idx).copied().unwrap_or(0), max_hint + 1, vreg.is_vector());
+                                }
+                            }
+                        }
+                    }
+                    for &(s, e) in &pool_group_hints {
+                        push(s, e, true);
+                    }
+                    if let Some(fma_ids) = select_choice_hints {
+                        for (op_idx, op) in ops.iter().enumerate() {
+                            if op.opcode == Opcode::SelectChoice
+                                && fma_ids.contains(&op.id)
+                                && op.sub_temp_vreg.is_some()
+                                && op_idx < hints.len()
+                            {
+                                push(hints[op_idx], hints[op_idx] + 2, true);
+                            }
+                        }
+                    }
+                    pool_events.sort_by_key(|&(c, dv, ds)| (c, dv + ds));
+                    let (mut v, mut s, mut max_v, mut max_s) = (0i64, 0i64, 0i64, 0i64);
+                    for (_, dv, ds) in &pool_events {
+                        v += dv;
+                        s += ds;
+                        max_v = max_v.max(v);
+                        max_s = max_s.max(s);
+                    }
+                    let budget = scratch_budget as i64;
+                    model.add_hint(n_v, max_v.min(budget / VLEN as i64));
+                    model.add_hint(n_s, max_s.min(budget));
+                    if verbose || VLEN as i64 * max_v + max_s > budget {
+                        eprintln!(
+                            "  Scratch pools in the hint: 8*{} + {} = {} words (budget {})",
+                            max_v,
+                            max_s,
+                            VLEN as i64 * max_v + max_s,
+                            budget
+                        );
+                    }
+                }
                 if peak > scratch_budget as i64 {
                     // This is expected when greedy scheduler exceeded budget (force-scheduled).
                     // CP-SAT hints are "soft" - they're suggestions, not requirements.
@@ -3054,7 +3008,7 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 10. Create makespan and max_cycle variables; tie makespan to actual last cycle so CP-SAT minimizes it.
-    // max_cycle = max over all cycle_vars, completion_cycle_vars, select_choice_fma_last_cycle.
+    // max_cycle = max over every issue cycle, completion cycle and multiply_add cycle.
     // makespan = max_cycle + 1 (so minimizing makespan forces packing).
     // capacity_lower_bound is a valid lower bound (min over (x,y,z) of per-choice capacity bound),
     // so it never overestimates the true minimum and does not exclude feasible makespans. We pass 0
@@ -3067,15 +3021,15 @@ pub fn schedule_ssa_cpsat(
         model.new_int_var_with_name([(capacity_lower_bound, horizon)], "makespan".to_string());
     let c = model.add_eq(LinearExpr::from(makespan), LinearExpr::from(max_cycle) + 1);
     model.set_constraint_name(c, "makespan_eq_max_cycle");
-    for (cv_idx, &cv) in cycle_vars.iter().enumerate() {
-        let c = model.add_ge(max_cycle, LinearExpr::from(cv));
+    for (cv_idx, t) in times.iter().enumerate() {
+        let c = model.add_ge(max_cycle, LinearExpr::from(t.issue()));
         model.set_constraint_name(c, &format!("max_cycle_ge_c_{}", cv_idx));
     }
-    for (idx, &completion_var) in sorted_by_key(&completion_cycle_vars) {
+    for (idx, completion_var) in times.iter().enumerate().filter_map(|(i, t)| t.completion().map(|v| (i, v))) {
         let c = model.add_ge(max_cycle, LinearExpr::from(completion_var));
         model.set_constraint_name(c, &format!("max_cycle_ge_completion_{}", idx));
     }
-    for (idx, &fma_last) in sorted_by_key(&select_choice_fma_last_cycle) {
+    for (idx, fma_last) in times.iter().enumerate().filter_map(|(i, t)| t.fma_cycle().map(|v| (i, v))) {
         let c = model.add_ge(max_cycle, LinearExpr::from(fma_last));
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
     }
@@ -3193,7 +3147,7 @@ pub fn schedule_ssa_cpsat(
                 } else {
                     let mut c = LinearExpr::from(zero_var);
                     for (g, group) in groups.iter().enumerate() {
-                        c = c + LinearExpr::from(cse_sub_active_vars[g]);
+                        c = c + LinearExpr::from(cse_subs[g].active());
                         for &idx in &group.consumer_indices {
                             if let Some(&cv) = select_choice_vars.get(&idx) {
                                 c = c + LinearExpr::from(cv);
@@ -3250,57 +3204,21 @@ pub fn schedule_ssa_cpsat(
     }
 
     // makespan >= max(chosen_cycle[i]) + 1: for each op use the cycle of the chosen execution path.
-    // Shiftable: when shifted use completion_cycle, when not use cycle_vars[idx].
-    // SelectChoice: when FMA (no-delta) use fma_cycle_var (last cycle), else use cycle_vars[idx]. ConstChoice: both paths use cycle_vars[idx].
+    // Shiftable: when shifted use completion_cycle, when not the issue cycle (OpTimes::finish_alternatives).
+    // SelectChoice: when FMA (no-delta) use fma_cycle_var (last cycle), else the issue cycle. ConstChoice: every path ends at the issue cycle.
     // Optional group ConditionalMakespan: every one of these rows is implied by
-    // makespan = max_cycle + 1 with max_cycle >= cycle_vars, completion and fma_last above
+    // makespan = max_cycle + 1 with max_cycle >= issue, completion and multiply_add cycles above
     // (those are unconditional, so they are at least as strong as the enforced rows here).
     let conditional_makespan_rows =
         !disable_optional_constraint_groups.contains(&OptionalConstraintGroup::ConditionalMakespan);
-    for (idx, &cv) in cycle_vars.iter().enumerate().filter(|_| conditional_makespan_rows) {
-        if shiftable_set.contains(&idx) {
-            let shift_var = *shift_vars.get(&idx).unwrap();
-            if let Some(&completion_var) = completion_cycle_vars.get(&idx) {
-                let c = model.add_ge(makespan, LinearExpr::from(completion_var) + 1);
-                model.only_enforce_if(c, [shift_var]);
-                model.set_constraint_name(c, &format!("makespan_ge_shifted_{}", idx));
+    for (idx, t) in times.iter().enumerate().filter(|_| conditional_makespan_rows) {
+        // One row per finish alternative (op_times.rs), enforced by the literal selecting it.
+        for alternative in t.finish_alternatives() {
+            let c = model.add_ge(makespan, alternative.value + 1);
+            if let Some(when) = alternative.when {
+                model.only_enforce_if(c, [when]);
             }
-            let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-            model.only_enforce_if(c, [!shift_var]);
-            model.set_constraint_name(c, &format!("makespan_ge_valu_{}", idx));
-        } else if select_choice_set.contains(&idx) {
-            match select_choice_mode {
-                SelectChoiceMode::ForceVselect => {
-                    let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-                    model.set_constraint_name(c, &format!("makespan_ge_select_vselect_{}", idx));
-                }
-                SelectChoiceMode::ForceFma => {
-                    if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
-                        let c = model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
-                        model.set_constraint_name(c, &format!("makespan_ge_select_fma_{}", idx));
-                    } else {
-                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-                        model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
-                    }
-                }
-                SelectChoiceMode::Optimize => {
-                    if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
-                        let choice_var = *select_choice_vars.get(&idx).unwrap();
-                        let c = model.add_ge(makespan, LinearExpr::from(fma_last) + 1);
-                        model.only_enforce_if(c, [choice_var]);
-                        model.set_constraint_name(c, &format!("makespan_ge_select_fma_{}", idx));
-                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-                        model.only_enforce_if(c, [!choice_var]);
-                        model.set_constraint_name(c, &format!("makespan_ge_select_vselect_{}", idx));
-                    } else {
-                        let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-                        model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
-                    }
-                }
-            }
-        } else {
-            let c = model.add_ge(makespan, LinearExpr::from(cv) + 1);
-            model.set_constraint_name(c, &format!("makespan_ge_c_{}", idx));
+            model.set_constraint_name(c, &format!("makespan_ge_{}_{}", alternative.label, idx));
         }
     }
 
@@ -3323,9 +3241,9 @@ pub fn schedule_ssa_cpsat(
     //   (1) Tie-breaker: one extra cycle costs scale, so scale > max_sum ensures makespan dominates.
     //   (2) Leading digits: tie_breaker < scale, so floor(objective / scale) = makespan.
     //   (3) Shiftable VALU: chosen path's completion (completion_cycle when shifted, cycle_var when not).
-    //   (4) ConstChoice: all encodings (Load, AddImm, ALU-derived) use cycle_vars[idx] as scheduled cycle.
+    //   (4) ConstChoice: all encodings (Load, AddImm, ALU-derived) use the issue cycle as scheduled cycle.
     //   (5) SelectChoice: chosen path's last cycle (fma_last when FMA, cycle_var when vselect).
-    //   (6) All other ops: cycle_vars[idx].
+    //   (6) All other ops: the issue cycle.
     //
     // tuning.objective = Makespan drops the tie-breaker: the objective is `makespan` alone and
     // the "chosen cycle" variables below are not created. Nothing else in the model reads them.
@@ -3336,7 +3254,18 @@ pub fn schedule_ssa_cpsat(
     let tie_select: &[usize] = if with_tie_breaker { &select_choice_ops } else { &[] };
 
     // Tie-breaker should sum only the chosen path's cycle per op (same as makespan constraints).
-    // Create auxiliary "chosen cycle" vars for shiftable and SelectChoice so the objective matches.
+    // Create auxiliary "chosen cycle" vars for shiftable and SelectChoice so the objective matches:
+    // each equals the finish alternative (op_times.rs) its literal selects.
+    let add_chosen_cycle_rows = |model: &mut CpModelBuilder, chosen: IntVar, idx: usize, rename_c: &str| {
+        for alternative in times[idx].finish_alternatives() {
+            let c = model.add_eq(LinearExpr::from(chosen), alternative.value);
+            if let Some(when) = alternative.when {
+                model.only_enforce_if(c, [when]);
+            }
+            let label = if alternative.label == "c" { rename_c } else { alternative.label };
+            model.set_constraint_name(c, &format!("chosen_cycle_{}_{}", label, idx));
+        }
+    };
     let mut shiftable_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
     for &idx in tie_shiftable {
         let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
@@ -3346,27 +3275,20 @@ pub fn schedule_ssa_cpsat(
             [(op_asap, op_alap)],
             format!("shift_chosen_cycle_{}", idx),
         );
-        let shift_var = *shift_vars.get(&idx).unwrap();
-        if let Some(&cc_var) = completion_cycle_vars.get(&idx) {
-            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cc_var));
-            model.only_enforce_if(c, [shift_var]);
-            model.set_constraint_name(c, &format!("chosen_cycle_shifted_{}", idx));
-        }
-        let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
-        model.only_enforce_if(c, [!shift_var]);
-        model.set_constraint_name(c, &format!("chosen_cycle_valu_{}", idx));
+        // completion when shifted, issue cycle when not
+        add_chosen_cycle_rows(&mut model, chosen, idx, "c");
         shiftable_chosen_cycle.insert(idx, chosen);
     }
 
     // Tie-breaker "chosen cycle" for SelectChoice: always the *last* cycle of the op for the path
-    // that was chosen (FMA path → fma_last; vselect path → cycle_vars[idx]). So the objective
+    // that was chosen (FMA path → multiply_add cycle; vselect path → issue cycle). So the objective
     // tie-breaker uses the actual completion cycle of the chosen variant.
     let mut select_chosen_cycle: HashMap<usize, IntVar> = HashMap::new();
     for &idx in tie_select {
-        if let Some(&fma_last) = select_choice_fma_last_cycle.get(&idx) {
-            let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-            let default_alap = (horizon - 1) as i32;
-            let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+        let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
+        let default_alap = (horizon - 1) as i32;
+        let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+        if times[idx].fma_cycle().is_some() {
             // The FMA path ends one cycle after the op's own cycle, so the domain must reach
             // alap + 1. With alap as the upper bound a select scheduled at its ALAP could not
             // take the FMA path: an auxiliary of the tie-breaker was restricting the schedule.
@@ -3374,32 +3296,16 @@ pub fn schedule_ssa_cpsat(
                 [(op_asap, op_alap + 1)],
                 format!("select_chosen_cycle_{}", idx),
             );
-            if let Some(&choice_var) = select_choice_vars.get(&idx) {
-                // Last cycle for the choice made: FMA → fma_last (C+1); vselect → cycle_vars[idx] (C).
-                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
-                model.only_enforce_if(c, [choice_var]);
-                model.set_constraint_name(c, &format!("chosen_cycle_select_fma_{}", idx));
-                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
-                model.only_enforce_if(c, [!choice_var]);
-                model.set_constraint_name(c, &format!("chosen_cycle_select_vselect_{}", idx));
-            } else {
-                // ForceFma: no choice_var; last cycle is always fma_last.
-                let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(fma_last));
-                model.set_constraint_name(c, &format!("chosen_cycle_select_fma_{}", idx));
-            }
+            add_chosen_cycle_rows(&mut model, chosen, idx, "select");
             select_chosen_cycle.insert(idx, chosen);
-        } else if let Some(&choice_var) = select_choice_vars.get(&idx) {
-            // Optimize but no fma_last (e.g. FMA has delta_vreg → single cycle). Both paths
-            // end at cycle_vars[idx], so last cycle for the choice made is cycle_vars[idx].
-            let op_asap = *asap.get(&ops[idx].id).unwrap_or(&0) as i64;
-            let default_alap = (horizon - 1) as i32;
-            let op_alap = *alap.get(&ops[idx].id).unwrap_or(&default_alap) as i64;
+        } else if times[idx].fma_chosen().is_some() {
+            // Optimize but no multiply_add cycle (e.g. FMA has delta_vreg → single cycle). Both
+            // paths end at the issue cycle.
             let chosen = model.new_int_var_with_name(
                 [(op_asap, op_alap)],
                 format!("select_chosen_cycle_{}", idx),
             );
-            let c = model.add_eq(LinearExpr::from(chosen), LinearExpr::from(cycle_vars[idx]));
-            model.set_constraint_name(c, &format!("chosen_cycle_select_{}", idx));
+            add_chosen_cycle_rows(&mut model, chosen, idx, "select");
             select_chosen_cycle.insert(idx, chosen);
         }
     }
@@ -3413,9 +3319,9 @@ pub fn schedule_ssa_cpsat(
         tie_breaker_vars.push(*shiftable_chosen_cycle.get(&idx).unwrap());
     }
 
-    // ConstChoice: all encodings (Load, AddImm, ALU-derived) schedule at cycle_vars[idx]
+    // ConstChoice: all encodings (Load, AddImm, ALU-derived) schedule at the issue cycle
     for &idx in const_choice_ops.iter().filter(|_| with_tie_breaker) {
-        tie_breaker_vars.push(cycle_vars[idx]);
+        tie_breaker_vars.push(times[idx].issue());
     }
 
     // SelectChoice: chosen path last cycle (fma_last when FMA, cycle_var when vselect)
@@ -3423,7 +3329,7 @@ pub fn schedule_ssa_cpsat(
         if let Some(&chosen) = select_chosen_cycle.get(&idx) {
             tie_breaker_vars.push(chosen);
         } else {
-            tie_breaker_vars.push(cycle_vars[idx]);
+            tie_breaker_vars.push(times[idx].issue());
         }
     }
 
@@ -3433,7 +3339,7 @@ pub fn schedule_ssa_cpsat(
             && !const_choice_set.contains(&idx)
             && !select_choice_set.contains(&idx)
         {
-            tie_breaker_vars.push(cycle_vars[idx]);
+            tie_breaker_vars.push(times[idx].issue());
         }
     }
 
@@ -3480,10 +3386,12 @@ pub fn schedule_ssa_cpsat(
     let hint_debug_ssa = std::env::var("CPSAT_HINT_DEBUG").is_ok();
     if let Some(hints) = greedy_hints {
         let mut skipped_cycle_hints = 0usize;
-        // When ForceLoad, greedy scheduled ConstChoice as add_imm; hinting those cycles would pack
-        // too many Load ops at the same cycle (Load capacity 2). Skip cycle hints for ConstChoice ops.
-        let skip_const_cycle_hints =
-            matches!(const_choice_mode, ConstChoiceMode::ForceLoad);
+        // Under ForceLoad, a greedy schedule that used add_imm for some ConstChoice ops would pack
+        // too many Load ops into a cycle once they are forced to Load (Load capacity 2), so their
+        // cycle hints are skipped then. A greedy that already honoured the forced encodings
+        // (`greedy_matches_forced_modes`) is a feasible schedule and is hinted in full.
+        let skip_const_cycle_hints = matches!(const_choice_mode, ConstChoiceMode::ForceLoad)
+            && !greedy_matches_forced_modes;
         if skip_const_cycle_hints && verbose {
             eprintln!(
                 "  Skipping cycle hints for {} ConstChoice ops (ForceLoad: greedy hint would violate Load capacity)",
@@ -3491,7 +3399,7 @@ pub fn schedule_ssa_cpsat(
             );
         }
         for (idx, &hint_cycle) in hints.iter().enumerate() {
-            if idx < cycle_vars.len() && hint_cycle >= 0 {
+            if idx < times.len() && hint_cycle >= 0 {
                 if skip_const_cycle_hints && const_choice_set.contains(&idx) {
                     skipped_cycle_hints += 1;
                     continue;
@@ -3517,14 +3425,14 @@ pub fn schedule_ssa_cpsat(
                                 ops[idx].id, idx, c, clamped, lb, ub
                             );
                         }
-                        model.add_hint(cycle_vars[idx], clamped);
+                        model.add_hint(times[idx].issue(), clamped);
                     } else {
-                        model.add_hint(cycle_vars[idx], hint_cycle as i64);
+                        model.add_hint(times[idx].issue(), hint_cycle as i64);
                     }
                 } else {
-                    model.add_hint(cycle_vars[idx], hint_cycle as i64);
+                    model.add_hint(times[idx].issue(), hint_cycle as i64);
                 }
-            } else if idx < cycle_vars.len() && hint_cycle < 0 {
+            } else if idx < times.len() && hint_cycle < 0 {
                 skipped_cycle_hints += 1;
             }
         }
@@ -3611,13 +3519,11 @@ pub fn schedule_ssa_cpsat(
                     ops[idx].id, idx, c, clamped, lb, ub
                 );
             }
-            if let Some(completion_var) = completion_cycle_vars.get(&idx) {
-                model.add_hint(*completion_var, clamped);
+            if let Some(completion_var) = times[idx].completion() {
+                model.add_hint(completion_var, clamped);
             }
-            if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-                for &alu_var in alu_cycles {
-                    model.add_hint(alu_var, clamped);
-                }
+            for &alu_var in times[idx].lanes() {
+                model.add_hint(alu_var, clamped);
             }
         }
     }
@@ -3625,9 +3531,11 @@ pub fn schedule_ssa_cpsat(
     // Hint shiftable_chosen_cycle and select_chosen_cycle so "solution hint is complete" (no unhinted vars).
     // These tie-breaker vars are equal to the effective cycle (completion_cycle when shifted, cycle when not;
     // fma_last when FMA, cycle when vselect). Greedy gives one cycle per op -> use that for chosen.
-    // When ForceAlu, skip shiftable_chosen_cycle hints (same reason as completion/alu_cycle above).
+    // When ForceAlu and the greedy did not shift every shiftable op, skip shiftable_chosen_cycle
+    // hints (same reason as completion/alu_cycle above).
     if let Some(hints) = greedy_hints {
-        let skip_shifted_chosen = matches!(valu_shift_mode, ValuShiftMode::ForceAlu);
+        let skip_shifted_chosen =
+            matches!(valu_shift_mode, ValuShiftMode::ForceAlu) && !greedy_matches_forced_modes;
         for &idx in &shiftable_valu {
             if skip_shifted_chosen {
                 continue;
@@ -3653,7 +3561,7 @@ pub fn schedule_ssa_cpsat(
                 // vselect path: chosen = cycle. FMA path without a delta: chosen = fma_last =
                 // cycle + 1 (chosen_cycle_select_fma_*), so the hint must say so or the hint is
                 // infeasible. The domain reaches alap + 1 in that case.
-                let hinted_fma = select_choice_fma_last_cycle.contains_key(&idx)
+                let hinted_fma = times[idx].fma_cycle().is_some()
                     && match select_choice_mode {
                         SelectChoiceMode::ForceFma => true,
                         SelectChoiceMode::ForceVselect => false,
@@ -3668,13 +3576,13 @@ pub fn schedule_ssa_cpsat(
                 model.add_hint(chosen, clamped);
             }
         }
-        // Hint select_choice_fma_last_cycle for ALL SelectChoice ops (not just FMA path).
+        // Hint the multiply_add cycle for ALL SelectChoice ops that have one (not just FMA path).
         // fma_cycle = cycle + 1 by constraint, so hint it to hint_cycle + 1 regardless of path.
         // Previously only hinted when use_fma was true, leaving vars unhinted on the vselect path.
         let use_fma = |idx: usize| -> bool {
             select_choice_hints.map_or(false, |h| h.contains(&ops[idx].id))
         };
-        for (&idx, &fma_last_var) in sorted_by_key(&select_choice_fma_last_cycle) {
+        for (idx, fma_last_var) in times.iter().enumerate().filter_map(|(i, t)| t.fma_cycle().map(|v| (i, v))) {
             let hint_cycle = hints.get(idx).copied().unwrap_or(-1);
             if hint_cycle >= 0 {
                 model.add_hint(fma_last_var, (hint_cycle + 1) as i64);
@@ -3705,8 +3613,8 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // Hint CSE shared SUB vars so the solution hint is complete (cse_sub_active_vars,
-    // cse_sub_cycle_vars; cse_shared_sub_valu_intervals are fully determined by these).
+    // Hint CSE shared SUB vars so the solution hint is complete (active literal and cycle;
+    // cse_shared_sub_valu_intervals are fully determined by these).
     if let Some(groups) = cse_groups {
         for (g, group) in groups.iter().enumerate() {
             // sub_active = 1 if any consumer in the group has select_choice hint indicating FMA
@@ -3716,7 +3624,7 @@ pub fn schedule_ssa_cpsat(
                     .iter()
                     .any(|&c| h.contains(&ops[c].id))
             });
-            model.add_hint(cse_sub_active_vars[g], if sub_active { 1 } else { 0 });
+            model.add_hint(cse_subs[g].active(), if sub_active { 1 } else { 0 });
         }
         let horizon_i64 = horizon as i64;
         for (g, group) in groups.iter().enumerate() {
@@ -3758,7 +3666,7 @@ pub fn schedule_ssa_cpsat(
                 earliest_fma_consumer.map_or(after_producers, |t| t.max(after_producers))
             });
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
-            model.add_hint(cse_sub_cycle_vars[g], clamped);
+            model.add_hint(cse_subs[g].cycle(), clamped);
             // The shared SUB's scratch interval: it ends one cycle after the SUB, or two
             // cycles after the last consumer hinted as FMA (which reads it at cycle + 1).
             if let Some(&(end_var, size_var)) = cse_sub_scratch_vars.get(g) {
@@ -3773,6 +3681,89 @@ pub fn schedule_ssa_cpsat(
                 model.add_hint(end_var, end_hint);
                 model.add_hint(size_var, end_hint - clamped);
             }
+        }
+    }
+
+    // 11b. Makespan rows (tuning.makespan_rows, makespan_rows.rs): head/tail rows from static
+    // longest-path heads and tails, and with Bucketed prefix/suffix variables that follow the
+    // solution. Added after the hints so their auxiliaries are hinted from them.
+    if tuning.makespan_rows != MakespanRows::None {
+        let eliminable_set: HashSet<usize> = eliminable_vbs.iter().map(|(vb, _, _)| *vb).collect();
+        let paths = static_paths(ops, &eliminable_set);
+        let hint_map: HashMap<i32, i64> = model
+            .proto()
+            .solution_hint
+            .as_ref()
+            .map(|h| h.vars.iter().copied().zip(h.values.iter().copied()).collect())
+            .unwrap_or_default();
+        let hint = |v: IntVar| hint_map.get(&v.index()).copied();
+        let ctx = WorkContext {
+            ops,
+            times,
+            classes: OpClasses { shiftable: &shiftable_set, eliminable_vbs: &eliminable_set },
+            const_choice: &op_vars.const_choice,
+            const_choice_mode,
+        };
+        let caps = RowCaps { valu: valu_cap, alu: alu_cap, load: load_cap, store: store_cap, flow: flow_cap };
+        let added = add_makespan_rows(
+            &mut model,
+            &ctx,
+            &paths,
+            &caps,
+            makespan,
+            horizon,
+            tuning.makespan_rows == MakespanRows::Bucketed,
+            &hint,
+        );
+        for &(var, value) in &added.hints {
+            model.add_hint(var, value);
+        }
+        if let Some(sb) = added.static_bound {
+            eprintln!(
+                "  Static head/tail bound: makespan >= {} ({} row, head >= {}, tail >= {}; capacity floor {})",
+                sb.bound,
+                sb.engine.name(),
+                sb.t,
+                sb.q,
+                capacity_lower_bound
+            );
+        }
+        if verbose {
+            eprintln!(
+                "  Makespan rows: {} rows ({} literal head/tail rows), {} buckets, {} new variables",
+                added.rows.len(),
+                added.literal_rows,
+                added.buckets,
+                added.new_vars
+            );
+        }
+        // Every row holds in every schedule (verification/makespan_rows.py), so a greedy
+        // schedule within the slot limits satisfies them; a violation is a bug in the rows.
+        let violations = if greedy_hints.is_some() { added.hint_violations(&hint) } else { Vec::new() };
+        if !violations.is_empty() {
+            let message = format!(
+                "makespan rows cut off the hint: {} row(s), first {:?}",
+                violations.len(),
+                &violations[..violations.len().min(5)]
+            );
+            // A greedy schedule that does not use the forced encodings is not a schedule of
+            // this model (its shift hints say ALU while its cycles were packed for VALU).
+            // Likewise for ops whose shift is forced (what-if runs) but which the greedy kept
+            // on VALU. (Checked here rather than in greedy_schedule_matches_forced_modes, which
+            // also decides the domains: changing it would change those models.)
+            let forced_shifts_honoured = forced_shifts.map_or(true, |forced| {
+                shiftable_valu.iter().all(|&idx| {
+                    !forced.contains(&ops[idx].id) || shift_hints.is_some_and(|h| h.contains(&ops[idx].id))
+                })
+            });
+            if cfg!(debug_assertions)
+                && greedy_within_scratch_budget == Some(true)
+                && greedy_matches_forced_modes
+                && forced_shifts_honoured
+            {
+                panic!("{}", message);
+            }
+            eprintln!("  WARNING: {}", message);
         }
     }
 
@@ -3918,7 +3909,7 @@ pub fn schedule_ssa_cpsat(
         let mut bottleneck_var_indices: Vec<i32> = Vec::new();
         for (idx, op) in ops.iter().enumerate() {
             if op.engine == Engine::Valu || op.engine == Engine::Flow {
-                bottleneck_var_indices.push(cycle_vars[idx].index());
+                bottleneck_var_indices.push(times[idx].issue().index());
             }
         }
         if !bottleneck_var_indices.is_empty() {
@@ -3934,7 +3925,7 @@ pub fn schedule_ssa_cpsat(
         let mut remaining_var_indices: Vec<i32> = Vec::new();
         for (idx, op) in ops.iter().enumerate() {
             if op.engine != Engine::Valu && op.engine != Engine::Flow {
-                remaining_var_indices.push(cycle_vars[idx].index());
+                remaining_var_indices.push(times[idx].issue().index());
             }
         }
         if !remaining_var_indices.is_empty() {
@@ -3966,6 +3957,18 @@ pub fn schedule_ssa_cpsat(
             Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path, e),
         }
     }
+    // CPSAT_EXPORT_MODEL_DIR=dir keeps every model built in this process, per-section solves
+    // included, as dir/model_000.pb, dir/model_001.pb, ... in build order.
+    if let Ok(dir) = std::env::var("CPSAT_EXPORT_MODEL_DIR") {
+        static EXPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = EXPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::path::Path::new(&dir).join(format!("model_{:03}.pb", n));
+        let bytes = prost::Message::encode_to_vec(model.proto());
+        match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes)) {
+            Ok(()) => eprintln!("  CP-SAT model exported to {}", path.display()),
+            Err(e) => eprintln!("  CP-SAT model export to {} failed: {}", path.display(), e),
+        }
+    }
 
     // 14. Solve
     let response = model.solve_with_parameters(&params);
@@ -3987,58 +3990,14 @@ pub fn schedule_ssa_cpsat(
 
     match status {
         CpsatStatus::Optimal | CpsatStatus::Feasible => {
-            // Extract cycle assignments for all ops
-            // For shiftable VALU: ForceAlu => completion_cycle; ForceValu => cycle_vars[idx]; Optimize => shift_var ? completion_cycle : cycle_vars[idx]
-            let mut cycle_assignments: Vec<i32> = Vec::with_capacity(ops.len());
-            for (idx, _) in ops.iter().enumerate() {
-                if shiftable_set.contains(&idx) {
-                    match valu_shift_mode {
-                        ValuShiftMode::ForceAlu => {
-                            if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx) {
-                                cycle_assignments
-                                    .push(completion_cycle_var.solution_value(&response) as i32);
-                            } else {
-                                cycle_assignments
-                                    .push(cycle_vars[idx].solution_value(&response) as i32);
-                            }
-                        }
-                        ValuShiftMode::ForceValu => {
-                            cycle_assignments
-                                .push(cycle_vars[idx].solution_value(&response) as i32);
-                        }
-                        ValuShiftMode::Optimize => {
-                            if let Some(shift_var) = shift_vars.get(&idx) {
-                                let is_shifted = shift_var.solution_value(&response);
-                                if is_shifted {
-                                    if let Some(&completion_cycle_var) =
-                                        completion_cycle_vars.get(&idx)
-                                    {
-                                        cycle_assignments
-                                            .push(completion_cycle_var.solution_value(&response)
-                                                as i32);
-                                    } else {
-                                        cycle_assignments
-                                            .push(cycle_vars[idx].solution_value(&response) as i32);
-                                    }
-                                } else {
-                                    cycle_assignments
-                                        .push(cycle_vars[idx].solution_value(&response) as i32);
-                                }
-                            } else {
-                                cycle_assignments
-                                    .push(cycle_vars[idx].solution_value(&response) as i32);
-                            }
-                        }
-                    }
-                } else {
-                    cycle_assignments.push(cycle_vars[idx].solution_value(&response) as i32);
-                }
-            }
+            // Extract cycle assignments for all ops: the completion cycle of a shifted op, the
+            // issue cycle otherwise (ForceAlu fixes every shift literal to 1, ForceValu to 0).
+            let cycle_assignments: Vec<i32> = times.iter().map(|t| t.reported_cycle(&response)).collect();
 
             // Reported makespan must match the objective's leading digits (floor(objective/scale)).
             // The model constrains makespan >= cycle_var+1 for every cycle_var; for shiftable ops we
             // put completion_cycle into cycle_assignments when shifted, so max(cycle_assignments)+1
-            // can be lower than the solver's makespan (which is driven by cycle_vars). Use the
+            // can be lower than the solver's makespan (which is driven by the issue cycles). Use the
             // makespan variable's solution value so we report the same number that appears in the objective.
             let actual_makespan = makespan.solution_value(&response) as i32;
 
@@ -4096,11 +4055,8 @@ pub fn schedule_ssa_cpsat(
 
                         if is_shifted {
                             // Extract what cycles CP-SAT would assign
-                            if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-                                let cycles: Vec<i32> = alu_cycles
-                                    .iter()
-                                    .map(|cv| cv.solution_value(&response) as i32)
-                                    .collect();
+                            {
+                                let cycles: Vec<i32> = times[idx].lane_values(&response);
                                 let unique_cycles: std::collections::HashSet<i32> =
                                     cycles.iter().copied().collect();
                                 eprintln!(
@@ -4109,8 +4065,7 @@ pub fn schedule_ssa_cpsat(
                                     unique_cycles.len()
                                 );
 
-                                if let Some(&completion_cycle_var) = completion_cycle_vars.get(&idx)
-                                {
+                                if let Some(completion_cycle_var) = times[idx].completion() {
                                     let completion =
                                         completion_cycle_var.solution_value(&response) as i32;
                                     eprintln!("    Completion cycle: {}", completion);
@@ -4132,13 +4087,7 @@ pub fn schedule_ssa_cpsat(
                 let op_id = ops[idx].id;
                 let is_shifted = shifted_ops.contains(&op_id);
                 if is_shifted {
-                    if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-                        let cycles: Vec<i32> = alu_cycles
-                            .iter()
-                            .map(|cv| cv.solution_value(&response) as i32)
-                            .collect();
-                        shifted_alu_cycles.insert(op_id, cycles);
-                    }
+                    shifted_alu_cycles.insert(op_id, times[idx].lane_values(&response));
                 }
             }
 
@@ -4236,12 +4185,11 @@ pub fn schedule_ssa_cpsat(
 
             // Extract CSE group results (sub_active, sub_cycle per group)
             let cse_group_results: Vec<super::cse_groups::CseGroupResult> =
-                cse_sub_active_vars
+                cse_subs
                     .iter()
-                    .zip(cse_sub_cycle_vars.iter())
-                    .map(|(&sub_active_var, &sub_cycle_var)| super::cse_groups::CseGroupResult {
-                        sub_active: sub_active_var.solution_value(&response),
-                        sub_cycle: sub_cycle_var.solution_value(&response) as i32,
+                    .map(|sub| super::cse_groups::CseGroupResult {
+                        sub_active: sub.active().solution_value(&response),
+                        sub_cycle: sub.cycle().solution_value(&response) as i32,
                     })
                     .collect();
 
@@ -4279,47 +4227,14 @@ pub fn schedule_ssa_cpsat(
                 let max_cycle_val = max_cycle.solution_value(&response) as i32;
                 let mut binding_ops: Vec<(usize, usize, &str)> = Vec::new(); // (idx, op_id, reason)
                 for (idx, _) in ops.iter().enumerate() {
-                    let effective_last = if shiftable_set.contains(&idx) {
-                        let is_shifted = shift_vars
-                            .get(&idx)
-                            .map(|v| v.solution_value(&response))
-                            .unwrap_or(false);
-                        if is_shifted {
-                            completion_cycle_vars
-                                .get(&idx)
-                                .map(|v| v.solution_value(&response) as i32)
-                                .unwrap_or(cycle_assignments[idx])
-                        } else {
-                            cycle_assignments[idx]
-                        }
-                    } else if let Some(&fma_last_var) = select_choice_fma_last_cycle.get(&idx) {
-                        let is_fma = select_choice_vars
-                            .get(&idx)
-                            .map(|v| v.solution_value(&response))
-                            .unwrap_or(false);
-                        if is_fma {
-                            fma_last_var.solution_value(&response) as i32
-                        } else {
-                            cycle_assignments[idx]
-                        }
-                    } else {
-                        cycle_assignments[idx]
-                    };
+                    let (effective_last, finish) = times[idx].finish_value(&response);
                     if effective_last == max_cycle_val {
-                        let reason = if shiftable_set.contains(&idx) {
-                            if shift_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false) {
-                                "shifted (completion_cycle)"
-                            } else {
-                                "VALU cycle"
-                            }
-                        } else if select_choice_fma_last_cycle.contains_key(&idx) {
-                            if select_choice_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false) {
-                                "SelectChoice FMA (fma_last)"
-                            } else {
-                                "SelectChoice vselect"
-                            }
-                        } else {
-                            "cycle"
+                        let reason = match finish {
+                            "shifted" => "shifted (completion_cycle)",
+                            "valu" => "VALU cycle",
+                            "select_fma" => "SelectChoice FMA (fma_last)",
+                            "select_vselect" => "SelectChoice vselect",
+                            _ => "cycle",
                         };
                         binding_ops.push((idx, ops[idx].id, reason));
                     }
@@ -4698,19 +4613,7 @@ pub fn schedule_ssa_cpsat(
                     let max_cycle_val = max_cycle.solution_value(&response) as i32;
                     let mut n_binding_ops = 0usize;
                     for (idx, _) in ops.iter().enumerate() {
-                        let effective_last = if shiftable_set.contains(&idx) {
-                            let is_shifted = shift_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false);
-                            if is_shifted {
-                                completion_cycle_vars.get(&idx).map(|v| v.solution_value(&response) as i32).unwrap_or(cycle_assignments[idx])
-                            } else {
-                                cycle_assignments[idx]
-                            }
-                        } else if let Some(&fma_last_var) = select_choice_fma_last_cycle.get(&idx) {
-                            let is_fma = select_choice_vars.get(&idx).map(|v| v.solution_value(&response)).unwrap_or(false);
-                            if is_fma { fma_last_var.solution_value(&response) as i32 } else { cycle_assignments[idx] }
-                        } else {
-                            cycle_assignments[idx]
-                        };
+                        let (effective_last, _) = times[idx].finish_value(&response);
                         if effective_last == max_cycle_val {
                             n_binding_ops += 1;
                         }

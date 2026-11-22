@@ -26,6 +26,7 @@ impl Pass for AssignAddressesPass {
             // The configured scratch size (1,536 on the machine; larger only for the
             // relaxed-scratch reference).
             budget: ctx.config.compiler.scratch_size,
+            scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
             ..Default::default()
         };
 

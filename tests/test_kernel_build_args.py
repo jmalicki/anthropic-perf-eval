@@ -123,6 +123,25 @@ def test_pressure_threshold_flags_reach_kwargs_and_run_options():
             parser.parse_args(bad)
 
 
+def test_scratch_model_reaches_kwargs_and_run_options():
+    """--scratch-model defaults to words, is passed on and recorded, and rejects other values."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    assert default["scratch_model"] == "words"
+    assert json.loads(default["run_options_json"])["scratch_model"] == "words"
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    kwargs = args_to_build_kwargs(parser.parse_args(["--use-greedy", "--scratch-model", "pools"]), use_git_sha=False)
+    assert kwargs["scratch_model"] == "pools"
+    assert json.loads(kwargs["run_options_json"])["scratch_model"] == "pools"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--scratch-model", "bytes"])
+
+
 def _build(n_nodes, rounds=2, batch_size=16):
     instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
         forest_height=10, n_nodes=n_nodes, batch_size=batch_size, rounds=rounds, verbose=False, use_cpsat=False)

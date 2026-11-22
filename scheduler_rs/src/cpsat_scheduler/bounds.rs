@@ -326,6 +326,11 @@ pub struct SsaCpsatConfig {
     pub enable_valu_shift: bool,
     /// Scratch memory budget (max simultaneous live words). 0 = no constraint.
     pub scratch_budget: usize,
+    /// Scratch model `pools`: instead of one cumulative over all live words, a cumulative of
+    /// live vectors (write groups as one vector) with capacity `N_v` and one of live scalars
+    /// with capacity `N_s`, and `8 * N_v + N_s <= scratch_budget`. Address assignment always
+    /// fits such a schedule (`address_assign::assign_two_pass`).
+    pub scratch_pools: bool,
     /// Optional name for the model (appears in solver log, e.g. "Presolved optimization model 'name'").
     pub model_name: Option<String>,
     /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
@@ -382,6 +387,7 @@ impl Default for SsaCpsatConfig {
             stop_after_first_solution: false,
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
+            scratch_pools: false,
             model_name: None,
             machine: MachineConfig::default(),
             const_choice_mode: ConstChoiceMode::default(),

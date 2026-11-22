@@ -183,6 +183,8 @@ def main():
         print(f"  greedy_budget_headroom={args.greedy_budget_headroom}")
     if scratch_size != MACHINE_SCRATCH_SIZE or not scratch_constraint:
         print(f"  scratch_size={scratch_size}, cpsat_scratch_constraint={scratch_constraint}")
+    if getattr(args, "scratch_model", "words") != "words":
+        print(f"  scratch_model={args.scratch_model}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

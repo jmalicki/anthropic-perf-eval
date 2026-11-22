@@ -219,6 +219,20 @@ impl PipelineContext {
         self.config.compiler.cpsat_scratch_budget(self.zero_vreg.is_some())
     }
 
+    /// Scratch budget the greedy schedules against: the configured budget less the greedy
+    /// headroom. With the scratch model `pools` the base is capped at the assignable words
+    /// (`effective_scratch_budget`, which excludes the reserved zero word), since the pool
+    /// condition is checked against exactly those words at address assignment; `words` keeps
+    /// the configured budget so default schedules do not change.
+    pub fn greedy_budget(&self) -> usize {
+        let base = if self.config.compiler.scratch_model.is_pools() {
+            self.config.scratch_budget.min(self.effective_scratch_budget())
+        } else {
+            self.config.scratch_budget
+        };
+        self.config.compiler.greedy_scratch_budget(base)
+    }
+
     // ========================================================================
     // Pipeline orchestration
     // ========================================================================

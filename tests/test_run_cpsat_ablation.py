@@ -240,3 +240,14 @@ def test_saved_cell_of_another_configuration_is_not_reused(tmp_path, monkeypatch
     assert len(calls) == 1, "the same cell is reused"
     result = ablation.run_cell(instance, "a_b", "", 0, tmp_path, 100.0, False, "build")
     assert len(calls) == 2 and result["config"] == "a_b", "another configuration is solved, not reused"
+
+
+def test_lp_subsolvers_follow_the_base_linearization_level():
+    """fixed and quick_restart inherit the base level: at level 0 they are not LP workers."""
+    level0 = "Parameters: max_time_in_seconds: 10 linearization_level: 0 num_workers: 8\n"
+    level2 = "Parameters: max_time_in_seconds: 10 linearization_level: 2 num_workers: 8\n"
+    assert "fixed" not in ablation.lp_subsolvers(level0)
+    assert "fixed" in ablation.lp_subsolvers(level2)
+    for log in (level0, level2):
+        lp = ablation.lp_subsolvers(log)
+        assert "max_lp" in lp and "objective_lb_search" in lp and "no_lp" not in lp
