@@ -107,6 +107,11 @@ pub struct SsaEmitContext {
     /// At address assignment time, the group is allocated as an 8-word block
     /// and lane VRegs derive their addresses as base+i.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+
+    /// Operands of every vector `Add` emitted, by its destination (`dest -> (src1, src2)`).
+    /// Lets `emit_select_choice_shared_delta` check that its true value is `base + delta`
+    /// in O(1), without scanning the emitted ops.
+    pub vector_sums: HashMap<VReg, (VReg, VReg)>,
 }
 
 impl Default for SsaEmitContext {
@@ -140,6 +145,7 @@ impl SsaEmitContext {
             zero_vreg: None,
             // Vector group tracking
             vector_group_lanes: HashMap::new(),
+            vector_sums: HashMap::new(),
         }
     }
 
@@ -428,6 +434,9 @@ impl SsaEmitContext {
             vec![Operand::VReg(src1), Operand::VReg(src2)],
         );
         self.emit(op);
+        if opcode == Opcode::Add {
+            self.vector_sums.insert(dest, (src1, src2));
+        }
         dest
     }
 
@@ -976,13 +985,7 @@ impl SsaEmitContext {
         assert!(true_val.is_vector(), "SelectChoice true_val must be vector");
         assert!(delta.is_vector(), "SelectChoice delta must be vector");
         assert!(base.is_vector(), "SelectChoice base must be vector");
-        let defined_as_sum = self
-            .get_def(true_val)
-            .and_then(|id| self.ops.iter().rev().find(|op| op.id == id))
-            .map_or(false, |op| {
-                op.opcode == Opcode::Add
-                    && op.srcs.iter().filter_map(|src| src.as_vreg()).eq([base, delta])
-            });
+        let defined_as_sum = self.vector_sums.get(&true_val) == Some(&(base, delta));
         assert!(
             defined_as_sum,
             "SelectChoice true_val {:?} must be defined as Add(base {:?}, delta {:?})",

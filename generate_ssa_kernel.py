@@ -138,6 +138,8 @@ def main():
         print("  " + ", ".join(f"{k}={v}" for k, v in overrides.items() if v is not None))
     if getattr(args, "greedy_budget_headroom", 0):
         print(f"  greedy_budget_headroom={args.greedy_budget_headroom}")
+    if getattr(args, "scratch_model", "words") != "words":
+        print(f"  scratch_model={args.scratch_model}")
     print()  # Blank line before Rust output
     sys.stdout.flush()  # Ensure header appears before Rust output
 

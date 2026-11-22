@@ -331,6 +331,18 @@ struct SsaScheduleOutput {
     vreg_count: u32,
     peak_live_words: usize,
     max_addr: i64,
+    /// Peak liveness of the allocated values by pool (vectors, scalars, words), fixed VRegs
+    /// excluded, under the address allocator's exact conflict rule. Absent when address
+    /// assignment did not run (e.g. a JSON exported on an earlier error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scratch_pools: Option<crate::address_assign::PoolPeaks>,
+    /// Non-fixed words the allocator used, from the first allocatable address to the highest
+    /// word of a non-fixed value (fragmentation = this - `scratch_pools.words`). Absent with
+    /// `scratch_pools`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scratch_words_used: Option<usize>,
+    /// First allocatable scratch address.
+    scratch_start_addr: i64,
     budget_exceeded: bool,
     valu_shifted: usize,
     usage_accounting: crate::types::UsageAccounting,
@@ -651,6 +663,9 @@ pub fn write_ssa_schedule_json(
         vreg_count: result.vreg_count,
         peak_live_words: result.address_result.peak_live,
         max_addr: result.address_result.max_addr,
+        scratch_pools: result.address_result.pool_peaks.clone(),
+        scratch_words_used: result.address_result.pool_peaks.as_ref().map(|_| result.address_result.words_used),
+        scratch_start_addr: result.address_result.start_addr,
         budget_exceeded: result.budget_exceeded,
         valu_shifted: result.valu_shifted,
         usage_accounting: result.usage_accounting.clone(),

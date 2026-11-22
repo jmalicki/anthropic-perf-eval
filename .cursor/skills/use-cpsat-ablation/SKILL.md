@@ -66,6 +66,8 @@ the key does not cover. `--report-only` tabulates whatever is saved, whatever bu
 | Solver dtime / wall s | Totals reported by CP-SAT. The deterministic time is summed over workers, so it exceeds the budget, which applies per worker. |
 | Valid | Must read `PROVED, PASSED`. Anything else means the run is not a result. |
 
+The result JSON of each cell also records bound and worker fields the table does not show: `bound_presolve` (the `initial_domain` bound after presolve), `bound_first_lp` (the first bound an LP subsolver proved) and `bound_last`, all in cycles; `first_incumbent_wall` and `first_improvement_wall` (the hint, then the first better solution; wall seconds, so load-dependent); `lp_longest_task_dtime` / `lp_longest_task_worker` (longest single task of an LP subsolver, from the "Task timing" table).
+
 ## Rules
 
 - **Budget in deterministic time, never wall clock.** A run flagged `wall-clock limit hit`

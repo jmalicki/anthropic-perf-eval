@@ -40,6 +40,10 @@ Options:
 - `--links` — Print spec file path with anchors for each theorem (e.g. `path/to/spec.md#t1`)
 - `--seed 42` — Random seed for Z3
 
+## Scratch allocation conjectures (A1-A7)
+
+[`allocation_conjectures.py`](allocation_conjectures.py) asks whether a per-cycle scratch load within budget guarantees an address layout. It does not: `A1-*` (UNSAT) are counterexamples, `A2-*` (SAT) show each fits in one more word, `A3-*` (UNSAT) map our same-cycle-reuse liveness to plain intervals, and `A4`/`A5` prove a sufficient condition for a two-pass allocator. `A6-*` are bounded searches. For them "unsat" means no counterexample exists in the bound and "sat" means one was found. `A7` checks the stored greedy-allocator failures. The fast checks run with the rest of `verification.verify`; slow ones with `uv run python -m verification.allocation_conjectures --slow`. Statements, bounds and literature: [docs/ALLOCATION_CONJECTURES.md](../docs/ALLOCATION_CONJECTURES.md). Counterexample data for allocator tests: [`allocation_counterexamples.json`](allocation_counterexamples.json).
+
 ## Greedy-cap rule (T7-greedy-cap-preserves-G)
 
 **Exact condition (Z3-proven):** Exclude cycle `t` from op `O`'s domain only when (i) the one-step slot-tightening condition holds at `(O, t)` (demand from others at `t` plus `slots(O)` would exceed capacity), and (ii) **t ≠ G(O)** where G is the canonical feasible schedule (e.g. greedy). Under this rule, G remains feasible after any finite set of such exclusions.
