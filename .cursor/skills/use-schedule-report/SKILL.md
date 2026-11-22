@@ -30,6 +30,7 @@ Run it as a module from the project root. Started from inside `scripts/`, `scrip
 | Emitted | Vector ops (on `valu` plus those run as 8 scalar ops), native scalar ops, vector-op equivalents (vector + scalar/8) |
 | Capacity floor for this emission | Fewest cycles the emitted ops fit in when vector ops may run as 8 scalar ops: minimise T with `vector - s <= 6T` and `scalar + 8s <= 12T` over the number shifted `s` (non-shiftable `multiply_add`/`vbroadcast` stay on `valu`), then the max with the load, flow and store floors. Names the binding engine |
 | Gap | Achieved minus floor, in cycles and as a percent of the floor |
+| Static head/tail bound | The floor plus ramp-up and tail (`scripts/static_bounds.py`): `makespan >= t + q + ceil(W / cap)` for every row (valu, alu, load, store, flow, and alu+valu at 60 = 7.5 vector-op equivalents per cycle) and every pair (t, q), with W the row's work in the ops whose dependency depth from the start is >= t and whose longest path to the end, after their own cycle, is >= q. Prints the strongest row, its t and q, how many cycles of the gap it explains, the best head-only and tail-only rows, and the critical path. The headline uses this run's const/select encodings (comparable with the floor). "any encoding" takes the minimum work over the choices, which is what a CP-SAT row may use. `--compare` diffs both. Absent without `ssa_ops` in the JSON |
 | CP-SAT bound | `lb_cycles` when present, labelled as a bound for this emission |
 | Scratch | Non-fixed words the address allocator used above the reserved address 0 (fixed VRegs such as the zero word are neither use nor fragmentation); the per-cycle peak `max_t (8 v(t) + s(t))` (no layout can use fewer); fragmentation = used minus that peak; and `8 * max vectors + max scalars`, which the two-pass allocator never exceeds. From `scratch_pools` and `scratch_words_used` in the JSON (absent in older JSONs and in JSONs exported before address assignment ran) |
 | Round table | First/last cycle, span, vector/scalar/load/flow ops per round (`ssa_ops[*].source_info.round`), and cycles shared with the previous round. Overlap 0 on every row means rounds run strictly one after another |
@@ -40,6 +41,7 @@ Run it as a module from the project root. Started from inside `scripts/`, `scrip
 - **The floor is conditional.** It is slot arithmetic over the ops this compiler emitted, with the const/select encodings chosen in this run. A kernel that emits fewer ops has a lower floor. It is not a bound on the problem: for the 16-round kernel the floor is 1,271 while public kernels reach 863 ([docs/BOUND_GAP_ANALYSIS.md](../../../docs/BOUND_GAP_ANALYSIS.md)). Always quote it as "floor for this emission (N vector-op equivalents)". The same holds for `lb_cycles` and CP-SAT `best_bound`.
 - **Gap large, floor fine:** the schedule is the problem (rounds serialised, an engine idle while another saturates). Look at the round table and utilisation over time.
 - **Gap small, cycles too high:** the emission is the problem. Fewer ops are needed; see section 4 of the bound gap analysis.
+- **Static bound close to the floor:** the dependency graph is wide enough that ramp-up and tail force almost nothing; the gap comes from how the schedule overlaps engines over time, not from depth. With main's best 16-round emission it explains 2 of 67 cycles. With PR #51's load-bound emission it explains 15 of 103, because gathers cannot start before cycle 51. The proof (Z3, random small graphs) is `verification/static_bounds_proof.py`, run by `./scripts/test.sh proofs`.
 - **Binding engine:** `alu+valu` means the two ALUs jointly (7.5 vector-op equivalents per cycle); `load` means 2 loads per cycle is the limit, and shifting more work to the scalar ALU will not help.
 
 ## Related scripts
@@ -51,5 +53,8 @@ All three compute the same joint ALU floor (1,271 for the 16-round greedy JSON).
 - `scripts/slot_usage_by_decile.py` ([use-schedule-debug](../use-schedule-debug/SKILL.md)) gives a more detailed utilisation view.
 
 ## Tests
+
+`uv run pytest tests/test_static_bounds.py` checks heads, tails and rows on hand-made graphs, that the t = q = 0 cells equal the joint floor, that real greedy and CP-SAT kernels are never below the bound, and runs the Z3 checks.
+
 
 `uv run pytest tests/test_schedule_report.py` checks the floor formula on hand-made inputs and, on real greedy and CP-SAT kernels, that engine counts sum to the lowered ops, the gap is non-negative and the round spans cover every scheduled op.
