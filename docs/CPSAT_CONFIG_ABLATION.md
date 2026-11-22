@@ -688,7 +688,7 @@ tag `v9.15`, and confirmed in solver logs ("N full problem subsolvers: [...]").
   `--pressure-inflation-threshold` were not on `main`).
 - The remaining items of section 10 of the modelling review: lane re-encoding (proposal 2,
   excluded on purpose), hint completeness, `select_fma_extra` / `fma_cycle` / constant
-  variables, prefix and suffix capacity rows.
+  variables. (Prefix and suffix capacity rows: section 9.)
 - Variance over seeds.
 
 ## 8. Reproduction
@@ -734,3 +734,103 @@ uv run python -m scripts.diff_cpsat_models a.pb b.pb
 
 OR-Tools sources read: tag `v9.15`, `ortools/sat/cp_model_search.cc`,
 `ortools/sat/parameters_validation.cc`, `ortools/sat/cumulative.cc`.
+
+## 9. Linearization, probing and makespan rows
+
+Added with `--cpsat-linearization-level`, `--cpsat-probing-level` and
+`--cpsat-makespan-rows` (defaults unchanged: 2, 2, none). Before this, `linearization_level=2`,
+`cp_model_probing_level=2` and `randomize_search=true` were hard-coded with an unmeasured
+"expected gap reduction" comment. Background: at 16 rounds the LP-heavy workers spend 50 to
+59 deterministic time on their first task, and the bound never rises above its root value
+(about the capacity floor). The hypothesis was that the capacity floor (vector-op
+equivalents / 7.5) is already the energy relaxation that level 2 adds, so explicit rows at
+level 1 would deliver the useful part and every worker would propagate them.
+
+**The rows** (`scheduler_rs/src/cpsat_scheduler/makespan_rows.rs`). They are built from
+static longest-path heads and tails. Every edge has latency 1, except edges out of an
+eliminable vbroadcast, which have latency 0. A tail excludes the op's own cycle.
+- **Static.** One constant row, `makespan >= max over engines and (t, q) of t + q +
+  ceil(W_min / cap)`, where `W_min` is the work under the cheapest encoding. This is the same
+  definition as `scripts/static_bounds.py` with `encodings="any"`. It also adds up to 8 head
+  and 8 tail window rows per engine (VALU, ALU, Load, Flow) whose work is linear in the shift,
+  select and const literals.
+- **Bucketed.** Also prefix-end and suffix-start variables per 32 cycles of static head.
+  Each op is linked to its own bucket only, and the buckets are chained. Energy rows use
+  chained work auxiliaries. At 6x64: 4 buckets, 30 new variables and 6,762 rows, of which
+  about 6,700 are linking rows (one per finish term, nine per shiftable op on the suffix side).
+- **Soundness.** `verification/makespan_rows.py` (MR1 to MR3 in `./scripts/test.sh proofs`)
+  encodes random small graphs with every op kind the rows treat differently. Z3 finds no
+  schedule that violates any constant, literal or bucketed row (UNSAT). Two variants are
+  checked to fail (SAT): the first draft's tail that counted the op's own cycle, and latency
+  1 out of an eliminable vbroadcast. In every run the greedy hint satisfied every row; the
+  model checks this and panics in debug builds otherwise
+  (`test_makespan_rows_keep_the_greedy_hint`).
+
+**Measurement.** `scripts/run_cpsat_ablation.py`, budget 20 deterministic time, one run per
+cell, interleaved search with 8 workers. How the columns are defined:
+- "Presolve bound" is the `initial_domain` bound after presolve.
+- "First LP bound" is the first bound an LP subsolver proved.
+- "Final bound" is `lb_cycles`.
+- "First improvement" is wall seconds to the first solution better than the complete hint.
+  It depends on load: the machine's load average was 100 to 150.
+- "LP longest task" is the longest single task of an LP subsolver, from CP-SAT's "Task
+  timing" table (one task per LP worker here, so it is the first).
+
+| Instance | Config | Cycles | Presolve bound | First LP bound | Final bound | Floor | First improvement (s) | LP longest task (dtime) |
+|---|---|---|---|---|---|---|---|---|
+| 4x64 | L2 (default) | 139 | 93 | 94 | 95 | 95 | 222 | 1.78 (max_lp_sym) |
+| 4x64 | L1 | 139 | 93 | 94 | 95 | 95 | 199 | 1.78 |
+| 4x64 | L1 + static | 139 | 95 | 95 | 95 | 95 | 307 | 1.94 |
+| 4x64 | L1 + bucketed | 139 | 95 | 95 | 95 | 95 | 294 | 1.96 |
+| 4x64 | L2 + static | 139 | 95 | 95 | 95 | 95 | 267 | 1.94 |
+| 4x64 | L2 + bucketed | 139 | 95 | 95 | 95 | 95 | 212 | 1.96 |
+| 4x64 | L2 + bucketed, probing 0 | 139 | 95 | 95 | 95 | 95 | 260 | 1.60 |
+| 6x64 | L2 (default) | 232 | 130 | 130 | 155 | 131 | 299 | 5.87 (max_lp) |
+| 6x64 | L1 | 232 | 130 | 130 | 155 | 131 | 299 | 5.87 |
+| 6x64 | L1 + static | 230 | 152 | 152 | 155 | 130 | 284 | 7.05 |
+| 6x64 | L1 + bucketed | 229 | 152 | 152 | 153 | 131 | 326 | 4.36 |
+| 6x64 | L2 + static | 230 | 152 | 152 | 155 | 130 | 282 | 7.05 |
+| 6x64 | L2 + bucketed | 229 | 152 | 152 | 153 | 131 | 300 | 4.36 |
+| 6x64 | L2 + bucketed, probing 0 | **227** | 152 | 152 | 153 | 130 | 277 | 4.05 |
+
+Model size: the rows add 57 constraints (static) at both sizes, and 4,058 (4x64) or 6,762
+(6x64) constraints plus 20 or 30 variables (bucketed), to models of 8,390 and 11,785
+variables. All runs ended on the deterministic budget, and every kernel is PROVED and PASSED.
+
+Reading:
+- **Level 1 against level 2 changes almost nothing.** The two search traces are identical
+  apart from which worker found one solution, and the longest LP task is the same (5.87 dtime
+  at 6x64, `max_lp`). `max_lp` and `max_lp_sym` set linearization level 2 themselves; only
+  workers that inherit the base parameters see the switch. If the 50 to 59 dtime first tasks
+  at 16 rounds belong to the `max_lp` workers, as the longest-task column here suggests,
+  lowering the base level cannot shorten them (not checked at 16 rounds).
+- **The static rows raise the presolve bound from 130 to 152 at 6x64**, 21 cycles above the
+  capacity floor (131). The binding row is a Load row (head >= 73, tail >= 15): the gathers
+  of the later rounds. At 4x64 they give 95 at presolve, which the default only reaches at
+  the end of the budget. The final bound does not improve: the LP reaches 155 at 6x64 on its
+  own by the end of the budget, and with bucketed rows the bound ends at 153 (a different
+  search, not a weaker model).
+- **Final makespan at 6x64 is 2 to 5 cycles better with rows** (232 against 230, 229, 227);
+  at 4x64 nothing changed (139 everywhere). One run per cell, so differences of a few cycles
+  are within the run-to-run spread of a different search path.
+- **Probing 0 against 2** (on L2 + bucketed): 227 against 229 at 6x64, 139 at 4x64, and a
+  shorter longest LP task.
+
+Candidates for the 16-round worker-portfolio cells: `--cpsat-makespan-rows bucketed` and
+`--cpsat-makespan-rows bucketed --cpsat-probing-level 0`, at the default linearization level.
+
+Reproduction:
+
+```bash
+uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --budget 20 --jobs 4 \
+    --out-dir build/cpsat_ablation_lin --name linearization \
+    --config "L2:" --config "L1:--cpsat-linearization-level 1" \
+    --config "L1+static:--cpsat-linearization-level 1 --cpsat-makespan-rows static" \
+    --config "L1+bucketed:--cpsat-linearization-level 1 --cpsat-makespan-rows bucketed" \
+    --config "L2+static:--cpsat-makespan-rows static" --config "L2+bucketed:--cpsat-makespan-rows bucketed"
+uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --budget 20 --jobs 2 \
+    --out-dir build/cpsat_ablation_lin --name linearization_probing \
+    --config "L2+bucketed:--cpsat-makespan-rows bucketed" \
+    --config "L2+bucketed+P0:--cpsat-makespan-rows bucketed --cpsat-probing-level 0"
+uv run python -m verification.makespan_rows
+```

@@ -25,6 +25,7 @@ impl Pass for AssignAddressesPass {
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
         let mut assign_config = AddressAssignConfig {
             budget: SCRATCH_BUDGET_HW,
+            scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
             ..Default::default()
         };
 

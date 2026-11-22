@@ -476,3 +476,56 @@ def test_flow_cumulative_can_be_left_out(tmp_path):
 def test_no_disabled_groups_is_recorded_as_empty():
     kwargs = kernel_build_args.args_to_build_kwargs(_parse([]), use_git_sha=False)
     assert json.loads(kwargs["run_options_json"])["disabled_cpsat_constraints"] == []
+
+
+# ----------------------------------------------------------------------------
+# Linearization, probing and makespan rows
+# ----------------------------------------------------------------------------
+
+def test_linearization_and_probing_default_to_level_2(tmp_path):
+    output, _, _, _ = _run(tmp_path, "default", [], quiet=False)
+    params = _solver_parameters(output)
+    assert "linearization_level: 2" in params and "cp_model_probing_level: 2" in params
+
+
+def test_linearization_and_probing_reach_the_solver(tmp_path):
+    output, model_path, sched, _ = _run(
+        tmp_path, "levels", ["--cpsat-linearization-level", "1", "--cpsat-probing-level", "0"], quiet=False
+    )
+    params = _solver_parameters(output)
+    assert "linearization_level: 1" in params and "cp_model_probing_level: 0" in params
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    assert not _model_diff(base_path, model_path), "solver parameters, not a model change"
+    with open(sched) as f:
+        recorded = json.load(f)["run_options"]["cpsat_tuning"]
+    assert recorded["linearization_level"] == 1 and recorded["probing_level"] == 0
+
+
+@pytest.mark.parametrize("argv", [["--cpsat-linearization-level", "3"], ["--cpsat-probing-level", "4"],
+                                  ["--cpsat-makespan-rows", "all"]])
+def test_cli_rejects_bad_levels_and_rows(argv):
+    with pytest.raises(SystemExit):
+        _parse(argv)
+
+
+def test_makespan_rows_none_is_the_default_model(tmp_path):
+    _, base, _, _ = _run(tmp_path, "base", [])
+    _, explicit, sched, _ = _run(tmp_path, "none", ["--cpsat-makespan-rows", "none"])
+    assert not _model_diff(base, explicit)
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["makespan_rows"] == "none"
+
+
+@pytest.mark.parametrize("mode,rounds", [("static", "3"), ("bucketed", "5")])
+def test_makespan_rows_reach_the_model(tmp_path, mode, rounds):
+    """The rows are added, the hint stays complete and feasible, and the static bound printed
+    is at least the capacity floor. Five rounds give static heads in more than one bucket."""
+    output, model_path, _, _ = _run(tmp_path, mode, ["--rounds", rounds, "--cpsat-makespan-rows", mode], quiet=False)
+    names = {c.name for c in diff_cpsat_models.load(str(model_path)).constraints}
+    assert "makespan_ge_static_headtail" in names
+    assert any(n.startswith("makespan_rows_") for n in names)
+    assert any(n.startswith("prefix_energy_") for n in names) == (mode == "bucketed")
+    assert "solution hint is complete and is feasible" in output
+    assert "makespan rows cut off the hint" not in output
+    bound = re.search(r"Static head/tail bound: makespan >= (\d+) .*capacity floor (\d+)\)", output)
+    assert bound and int(bound.group(1)) >= int(bound.group(2))

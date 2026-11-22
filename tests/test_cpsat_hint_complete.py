@@ -67,6 +67,12 @@ def _export_model(tmp_path, extra):
         ["--rounds", "3", "--const-choice", "add_imm"],
         ["--rounds", "3", "--cpsat-makespan-interval"],
         ["--rounds", "3", "--cpsat-objective", "makespan"],
+        # Scratch model pools: vector and scalar cumulatives, write groups as one vector.
+        ["--rounds", "3", "--scratch-model", "pools"],
+        ["--rounds", "5", "--scratch-model", "pools"],
+        ["--rounds", "3", "--cpsat-makespan-rows", "static"],
+        # Five rounds: static heads span more than one bucket.
+        ["--rounds", "5", "--cpsat-makespan-rows", "bucketed"],
     ],
     ids=lambda extra: " ".join(extra).replace("--", ""),
 )
@@ -109,6 +115,9 @@ LANE_MODEL_CASES = [
     [*rounds, "--cpsat-lane-model", lane_model]
     for rounds in (["--rounds", "3"], ["--rounds", "5"])
     for lane_model in ("free", "sorted", "pinned", "sorted-pinned")
+] + [
+    ["--rounds", "5", "--scratch-model", "pools", "--cpsat-makespan-rows", "bucketed",
+     "--cpsat-lane-model", "sorted-pinned"],
 ]
 
 

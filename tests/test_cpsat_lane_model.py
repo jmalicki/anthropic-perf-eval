@@ -264,9 +264,15 @@ CONFIGS = {
     "3r-fma": ["--rounds", "3", "--select-choice", "fma"],
     # Eliminable broadcasts: the vb_elim_* rows on lanes.
     "3r-vb-elim": ["--rounds", "3", "--enable-eliminate-vbroadcast"],
+    # The gather-round write groups exercise scratch pools alongside the new makespan rows.
+    "5r-pools-bucketed": ["--rounds", "5", "--scratch-model", "pools", "--cpsat-makespan-rows", "bucketed"],
 }
 CASES = [(cfg, lane_model) for cfg in ["3r", "5r"] for lane_model in ["free", "sorted", "pinned", "sorted-pinned"]]
-CASES += [(cfg, lane_model) for cfg in ["3r-fma", "3r-vb-elim"] for lane_model in ["free", "sorted-pinned"]]
+CASES += [
+    (cfg, lane_model)
+    for cfg in ["3r-fma", "3r-vb-elim", "5r-pools-bucketed"]
+    for lane_model in ["free", "sorted-pinned"]
+]
 
 
 @pytest.mark.timeout(600)

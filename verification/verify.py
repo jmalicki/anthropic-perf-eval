@@ -58,6 +58,7 @@ from .precedence_fixpoint import (
 from .lane_model import EXPECT_SAT as LANE_EXPECT_SAT, LANE_CHECKS
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
 from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
+from .makespan_rows import MAKESPAN_ROW_CHECKS, EXPECT_SAT as MAKESPAN_ROW_EXPECT_SAT
 
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
@@ -203,6 +204,9 @@ THEOREM_CHECKS += ALLOCATION_CHECKS
 # Lane models of the CP-SAT scheduler (sorted / pinned lanes lose no schedule; verification/lane_model.py).
 THEOREM_CHECKS += LANE_CHECKS
 
+# Soundness of the CP-SAT makespan rows (verification/makespan_rows.py).
+THEOREM_CHECKS += MAKESPAN_ROW_CHECKS
+
 
 def _spec_url(theorem_id: str) -> str:
     """Return file path with anchor for theorem (for terminal/file links)."""
@@ -258,6 +262,7 @@ def run_verification(
             *REWRITE_EXPECT_SAT,
             *ALLOCATION_EXPECT_SAT,
             *LANE_EXPECT_SAT,
+            *MAKESPAN_ROW_EXPECT_SAT,
         )
         # Special handling for multi-result theorems
         if name == "fixpoint-cascade-analysis":

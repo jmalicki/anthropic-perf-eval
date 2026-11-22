@@ -170,13 +170,15 @@ pub mod validation;
 pub mod bounds;
 pub mod model;
 pub(crate) mod op_times;
+pub(crate) mod makespan_rows;
 pub(crate) mod symmetry_ordering;
 #[cfg(test)]
 mod tests;
 
 // Re-exports: all public items from sub-modules
 pub use config::{
-    ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning, CumulativePropagator,
+    ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning,
+    CumulativePropagator, MakespanRows,
     OptionalConstraintGroup,
     SelectChoiceMode, ValuShiftMode,
 };
