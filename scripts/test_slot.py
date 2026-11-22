@@ -4,8 +4,15 @@
 Several agents or worktrees running test suites at once can load the machine so heavily that
 timing-sensitive tests time out (pytest-timeout, subprocess timeouts, Z3 timeouts). This
 wrapper limits how many suites run at the same time on one machine. A slot is an exclusive
-`fcntl.flock` on one of N lock files in a directory shared by every worktree; the kernel
-releases it when the process exits, so a crashed or killed run never leaves a slot taken.
+`fcntl.flock` on one of N lock files in a directory shared by every worktree.
+
+The wrapper takes a slot and then replaces itself with the command (`exec`), passing the
+locked descriptor on. So the slot is held for exactly as long as the command runs, not as
+long as some wrapper process lives: a killed or crashed command frees it (the kernel
+releases the lock), and a command cannot keep running after its slot was freed. Processes
+the command starts inherit the descriptor too, so a background child that outlives the
+command keeps the slot until it exits as well; the limit can therefore be held longer than
+needed, but never exceeded.
 
     scripts/test_slot.py SUITE -- COMMAND [ARGS...]
 
@@ -21,7 +28,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import subprocess
 import sys
 import time
 
@@ -92,12 +98,14 @@ def main(argv: list[str]) -> int:
     label = " ".join(argv[:sep]) or "test"
     command = argv[sep + 1:]
     n = slots()
-    held = acquire(n, label) if n > 0 else None
+    if n > 0:
+        held = acquire(n, label)
+        os.set_inheritable(held.fileno(), True)  # the lock travels with the command
     try:
-        return subprocess.call(command)
-    finally:
-        if held is not None:
-            held.close()
+        os.execvp(command[0], command)
+    except OSError as e:
+        print(f"test_slot.py: cannot run {command[0]!r}: {e}", file=sys.stderr)
+        return 127
 
 
 if __name__ == "__main__":
