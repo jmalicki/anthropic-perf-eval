@@ -61,6 +61,14 @@ pub struct GreedyShape {
     /// Let a shifted vector op straddle two cycles (see [`SplitShift`]). Without it the
     /// greedy runs at most one shifted op per cycle (8 of the 12 scalar slots).
     pub split_shift: bool,
+    /// Scratch model `pools`: the schedule must also keep
+    /// `8 * (most vectors live at once) + (most scalars live at once) <= budget`, the
+    /// condition under which address assignment always fits. See
+    /// [`schedule_ssa_greedy_shaped`] for how the greedy meets it.
+    pub scratch_pools: bool,
+    /// Pool capacities `(vectors, scalars)` the run must keep (set by the pools retry in
+    /// [`schedule_ssa_greedy_shaped`]); `None` = live words against the budget.
+    pub pool_caps: Option<(usize, usize)>,
 }
 
 // ============================================================================
@@ -666,6 +674,87 @@ impl WriteGroups {
     }
 }
 
+/// Live words and live vectors (8-word values, write groups included) held by the counter.
+/// Live scalars are `words - VLEN * vectors`.
+#[derive(Debug, Default, Clone, Copy)]
+struct LiveCount {
+    words: usize,
+    vectors: usize,
+}
+
+impl LiveCount {
+    fn add(&mut self, vreg: VReg) {
+        self.words += vreg.size();
+        if vreg.is_vector() {
+            self.vectors += 1;
+        }
+    }
+
+    fn remove(&mut self, vreg: &VReg) {
+        self.words = self.words.saturating_sub(vreg.size());
+        if vreg.is_vector() {
+            self.vectors = self.vectors.saturating_sub(1);
+        }
+    }
+
+    fn scalars(&self) -> usize {
+        self.words - VLEN * self.vectors
+    }
+
+    /// The count after adding and removing the given values (sizes 1 or VLEN).
+    fn after(&self, added: &[VReg], removed: &[VReg]) -> LiveCount {
+        let mut c = *self;
+        for v in added {
+            c.add(*v);
+        }
+        for v in removed {
+            c.remove(v);
+        }
+        c
+    }
+}
+
+/// Scratch budget check of the greedy: live words against the budget, or fixed pool
+/// capacities `(N_v, N_s)` with `8 * N_v + N_s <= budget`: at most `N_v` vectors and `N_s`
+/// scalars live at once. A schedule within such capacities gets addresses within the budget
+/// (`address_assign::assign_two_pass` needs at most `8 * max_v + max_s` words).
+#[derive(Debug, Default)]
+struct PoolBudget {
+    caps: Option<(usize, usize)>,
+}
+
+impl PoolBudget {
+    fn new(caps: Option<(usize, usize)>) -> Self {
+        PoolBudget { caps }
+    }
+
+    /// The live state expressed as words of the budget, for the pressure policies: live words,
+    /// or with capacities the fuller pool's fill fraction times the budget.
+    fn words_needed(&self, live: &LiveCount, budget: usize) -> usize {
+        match self.caps {
+            None => live.words,
+            Some((n_v, n_s)) => {
+                let frac = |used: usize, cap: usize| {
+                    if cap == 0 {
+                        if used == 0 { 0 } else { usize::MAX / 2 }
+                    } else {
+                        (used * budget).div_ceil(cap)
+                    }
+                };
+                frac(live.vectors, n_v).max(frac(live.scalars(), n_s))
+            }
+        }
+    }
+
+    /// Whether reaching `live` keeps the schedule within the budget (or the capacities).
+    fn fits(&self, live: &LiveCount, budget: usize) -> bool {
+        match self.caps {
+            None => live.words <= budget,
+            Some((n_v, n_s)) => live.vectors <= n_v && live.scalars() <= n_s,
+        }
+    }
+}
+
 /// Add the value written by a just-scheduled op to the live-word counter.
 ///
 /// A write-group lane counts as its group: the whole block is added at the first lane
@@ -677,7 +766,7 @@ fn count_written_dest(
     write_groups: &mut WriteGroups,
     vreg_remaining_users: &HashMap<VReg, usize>,
     live_vregs: &mut HashSet<VReg>,
-    live_words: &mut usize,
+    live: &mut LiveCount,
     vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
     trace: &mut CounterTrace,
 ) {
@@ -692,7 +781,7 @@ fn count_written_dest(
         }
     }
     if live_vregs.insert(counted) {
-        *live_words += counted.size();
+        live.add(counted);
         trace.spans.insert(counted, (cycle as i32, None));
     }
     let writes_done = write_groups.pending_writes.get(&counted).map_or(true, |&p| p == 0);
@@ -713,7 +802,7 @@ fn release_read_values(
     write_groups: &WriteGroups,
     vreg_remaining_users: &mut HashMap<VReg, usize>,
     live_vregs: &mut HashSet<VReg>,
-    live_words: &mut usize,
+    live: &mut LiveCount,
     vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
     trace: &mut CounterTrace,
 ) {
@@ -727,7 +816,7 @@ fn release_read_values(
         }
         if write_groups.releasable_at(vreg, cycle) {
             live_vregs.remove(vreg);
-            *live_words = live_words.saturating_sub(vreg.size());
+            live.remove(vreg);
             trace.release(vreg, cycle);
         } else if let Some(&hold_until) = write_groups.hold_until.get(vreg) {
             // Written out, but an unread lane holds the block one more cycle.
@@ -838,6 +927,19 @@ pub(super) fn interval_liveness_curve(
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
+    let (curve, peak, intervals, _, _) =
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+    Ok((curve, peak, intervals))
+}
+
+/// [`interval_liveness_curve`], also returning the address-assignment config and the
+/// scheduled ops it used (for pool peaks with the same inputs).
+#[allow(clippy::type_complexity)]
+fn interval_liveness_inputs(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>, AddressAssignConfig, Vec<SsaOp>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
     // (`compute_live_intervals` would give it a phantom [0, 1] interval.)
@@ -870,7 +972,7 @@ pub(super) fn interval_liveness_curve(
         live += d;
         curve.push(live as usize);
     }
-    Ok((curve, compute_peak_liveness(&intervals), intervals))
+    Ok((curve, compute_peak_liveness(&intervals), intervals, config, scheduled))
 }
 
 /// Compare the scheduler's counter with interval liveness of the finished schedule.
@@ -1218,6 +1320,184 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
 /// [`schedule_ssa_greedy_with_liveness_agreement`].
 pub(crate) fn schedule_ssa_greedy_shaped(
+    ops: &mut [SsaOp],
+    enable_valu_shift: bool,
+    shifted_ops: &mut HashSet<usize>,
+    scratch_budget: usize,
+    select_choice_fma_ops: Option<&mut HashSet<usize>>,
+    select_sub_cycles: Option<&mut HashMap<usize, i32>>,
+    select_fma_cycles: Option<&mut HashMap<usize, i32>>,
+    const_add_imm_ops: Option<&mut HashSet<usize>>,
+    bounds_usage: &GreedyBoundsUsage,
+    strategy: &dyn PressurePolicy,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    enable_capacity_deferral: bool,
+    const_choice_fixed_to_load: bool,
+    select_choice_fixed_to_vselect: bool,
+    valu_shift_fixed_to_none: bool,
+    fixed_const_choice_encoding: Option<&HashMap<usize, ConstChoiceEncoding>>,
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+    fixed_select_choice_encoding: Option<&HashMap<usize, SelectChoiceEncoding>>,
+    diagnostics: &mut GreedyDiagnostics,
+    shape: &GreedyShape,
+    shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
+) -> Result<((usize, bool, usize), LivenessAgreement), String> {
+    if !shape.scratch_pools || shape.pool_caps.is_some() {
+        return schedule_ssa_greedy_shaped_once(
+            ops,
+            enable_valu_shift,
+            shifted_ops,
+            scratch_budget,
+            select_choice_fma_ops,
+            select_sub_cycles,
+            select_fma_cycles,
+            const_add_imm_ops,
+            bounds_usage,
+            strategy,
+            vector_group_lanes,
+            enable_capacity_deferral,
+            const_choice_fixed_to_load,
+            select_choice_fixed_to_vselect,
+            valu_shift_fixed_to_none,
+            fixed_const_choice_encoding,
+            fixed_shifted_ops,
+            fixed_select_choice_encoding,
+            diagnostics,
+            shape,
+            shifted_lane_cycles,
+        );
+    }
+    // Scratch model `pools`. First the usual run (live words against the budget). If its
+    // schedule already keeps 8 * max_v + max_s within the budget (measured with address
+    // assignment's own liveness, `scratch_pool_peaks`), it is the result: wherever the pool
+    // condition does not bind, the schedule is the same as with `words`. Otherwise run again
+    // with fixed capacities: the first run's scalar maximum N_s and N_v = (budget - N_s) / 8
+    // vectors. Fixed capacities rather than running maxima, because with running maxima the
+    // greedy fills one pool early (all vectors are free up to the current maximum) and then
+    // deadlocks when the other pool has to grow.
+    let mut select_choice_fma_ops = select_choice_fma_ops;
+    let mut select_sub_cycles = select_sub_cycles;
+    let mut select_fma_cycles = select_fma_cycles;
+    let mut const_add_imm_ops = const_add_imm_ops;
+    let saved_cycles: Vec<i32> = ops.iter().map(|op| op.cycle).collect();
+    let saved_shifted = shifted_ops.clone();
+    let saved_fma = select_choice_fma_ops.as_deref().cloned();
+    let saved_sub = select_sub_cycles.as_deref().cloned();
+    let saved_fma_cycles = select_fma_cycles.as_deref().cloned();
+    let saved_add_imm = const_add_imm_ops.as_deref().cloned();
+    let words_shape = GreedyShape { scratch_pools: false, pool_caps: None, ..shape.clone() };
+    let first = schedule_ssa_greedy_shaped_once(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops.as_deref_mut(),
+        select_sub_cycles.as_deref_mut(),
+        select_fma_cycles.as_deref_mut(),
+        const_add_imm_ops.as_deref_mut(),
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+        diagnostics,
+        &words_shape,
+        shifted_lane_cycles,
+    )?;
+    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles)?;
+    if first.0 .1 || peaks.split_words() <= scratch_budget {
+        // Within the pools already, or over budget even on words (reported as such).
+        return Ok(first);
+    }
+    let n_s = peaks.scalars.min(scratch_budget);
+    let n_v = (scratch_budget - n_s) / VLEN;
+    if diagnostics.verbose {
+        eprintln!(
+            "Greedy (--scratch-model pools): words schedule needs 8*{} + {} = {} > {} words; \
+             rescheduling with at most {} vectors and {} scalars live",
+            peaks.vectors,
+            peaks.scalars,
+            peaks.split_words(),
+            scratch_budget,
+            n_v,
+            n_s
+        );
+    }
+    for (op, &c) in ops.iter_mut().zip(&saved_cycles) {
+        op.cycle = c;
+    }
+    *shifted_ops = saved_shifted;
+    if let (Some(m), Some(v)) = (select_choice_fma_ops.as_deref_mut(), saved_fma) {
+        *m = v;
+    }
+    if let (Some(m), Some(v)) = (select_sub_cycles.as_deref_mut(), saved_sub) {
+        *m = v;
+    }
+    if let (Some(m), Some(v)) = (select_fma_cycles.as_deref_mut(), saved_fma_cycles) {
+        *m = v;
+    }
+    if let (Some(m), Some(v)) = (const_add_imm_ops.as_deref_mut(), saved_add_imm) {
+        *m = v;
+    }
+    *diagnostics = GreedyDiagnostics::new(diagnostics.verbose);
+    let pools_shape = GreedyShape { pool_caps: Some((n_v, n_s)), ..shape.clone() };
+    schedule_ssa_greedy_shaped_once(
+        ops,
+        enable_valu_shift,
+        shifted_ops,
+        scratch_budget,
+        select_choice_fma_ops,
+        select_sub_cycles,
+        select_fma_cycles,
+        const_add_imm_ops,
+        bounds_usage,
+        strategy,
+        vector_group_lanes,
+        enable_capacity_deferral,
+        const_choice_fixed_to_load,
+        select_choice_fixed_to_vselect,
+        valu_shift_fixed_to_none,
+        fixed_const_choice_encoding,
+        fixed_shifted_ops,
+        fixed_select_choice_encoding,
+        diagnostics,
+        &pools_shape,
+        shifted_lane_cycles,
+    )
+}
+
+/// Peak vectors and scalars of a greedy schedule under address assignment's own liveness
+/// (`address_assign::compute_value_spans` / `compute_pool_peaks`), with the same interval
+/// inputs as the T16 agreement check (`interval_liveness_curve`).
+///
+/// # Arguments
+/// * `ops` - Ops with assigned cycles; negative cycles (skipped dead stores) are ignored
+/// * `vector_group_lanes` - Vector groups, as passed to the scheduler
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts
+///
+/// # Returns
+/// The pool peaks, or the interval computation's error.
+pub(super) fn scratch_pool_peaks(
+    ops: &[SsaOp],
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> Result<crate::address_assign::PoolPeaks, String> {
+    let (_, _, intervals, config, scheduled) =
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+    let spans = crate::address_assign::compute_value_spans(
+        &intervals,
+        &crate::address_assign::last_write_cycles(&scheduled, &config),
+    );
+    Ok(crate::address_assign::compute_pool_peaks(&spans, &config.fixed_vregs))
+}
+
+/// One greedy run (see [`schedule_ssa_greedy_shaped`]).
+fn schedule_ssa_greedy_shaped_once(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
     shifted_ops: &mut HashSet<usize>,
@@ -1669,7 +1949,8 @@ fn schedule_ssa_greedy_core(
             (*vreg, users.iter().filter(|u| !dead_store_indices.contains(u)).count())
         })
         .collect();
-    let mut live_words: usize = 0;
+    let mut live = LiveCount::default();
+    let pools = PoolBudget::new(shape.pool_caps);
     let mut live_vregs: HashSet<VReg> = HashSet::new();
 
     // Budget tracking
@@ -1742,7 +2023,7 @@ fn schedule_ssa_greedy_core(
             if expiry_cycle <= cycle as i32 {
                 vreg_expiry_heap.pop();
                 if live_vregs.remove(&vreg) {
-                    live_words = live_words.saturating_sub(vreg.size());
+                    live.remove(&vreg);
                     trace.release(&vreg, cycle);
                 }
             } else {
@@ -1829,11 +2110,11 @@ fn schedule_ssa_greedy_core(
                 &write_groups,
                 &mut vreg_remaining_users,
                 &mut live_vregs,
-                &mut live_words,
+                &mut live,
                 &mut vreg_expiry_heap,
                 trace,
             );
-            peak_live_words = peak_live_words.max(live_words);
+            peak_live_words = peak_live_words.max(live.words);
             for &consumer_idx in &consumers[idx] {
                 let offset = ops[idx].precedence_offset_for_asap(shiftable_set.contains(&idx));
                 max_ready_cycle[consumer_idx] =
@@ -1922,7 +2203,7 @@ fn schedule_ssa_greedy_core(
             .collect();
         let sched_ctx = pressure_policy::SchedulingContext {
             cycle,
-            live_words,
+            live_words: pools.words_needed(&live, scratch_budget),
             scratch_budget,
             slots: &slots.view(),
         };
@@ -1962,7 +2243,7 @@ fn schedule_ssa_greedy_core(
             // Build context for inflation decisions
             let inflation_ctx = pressure_policy::SchedulingContext {
                 cycle,
-                live_words,
+                live_words: pools.words_needed(&live, scratch_budget),
                 scratch_budget,
                 slots: &slots.view(),
             };
@@ -2168,18 +2449,18 @@ fn schedule_ssa_greedy_core(
                         && split_carry.is_none()
                         && free_alu >= SplitShift::MIN_FIRST_LANES
                         && free_alu < VLEN
-                        && strategy.allow_shift(live_words, slots.alu_used, scratch_budget)
+                        && strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget)
                     {
                         if let Some(d) = dest {
                             let counted = write_groups.counted(d);
-                            let words_added =
-                                if live_vregs.contains(&counted) { 0 } else { counted.size() };
+                            let added: Vec<VReg> =
+                                if live_vregs.contains(&counted) { vec![] } else { vec![counted] };
                             // A destination no scheduled op reads is released the cycle
                             // after its write, which for a split would be before its last
                             // lanes are written: such an op is only placed whole.
                             let has_reader =
                                 vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
-                            if has_reader && live_words + words_added <= scratch_budget {
+                            if has_reader && pools.fits(&live.after(&added, &[]), scratch_budget) {
                                 slots.alu_used += free_alu;
                                 split_carry = Some(SplitShift {
                                     idx,
@@ -2193,12 +2474,12 @@ fn schedule_ssa_greedy_core(
                                     &mut write_groups,
                                     &vreg_remaining_users,
                                     &mut live_vregs,
-                                    &mut live_words,
+                                    &mut live,
                                     &mut vreg_expiry_heap,
                                     trace,
                                 );
                                 vreg_def_cycle.insert(d, cycle as i32);
-                                peak_live_words = peak_live_words.max(live_words);
+                                peak_live_words = peak_live_words.max(live.words);
                                 continue;
                             }
                         }
@@ -2215,33 +2496,33 @@ fn schedule_ssa_greedy_core(
 
                 // Check scratch budget with same-cycle reuse model:
                 // VRegs that will be freed when this op runs (their last use) reduce pressure.
-                let words_added = match dest.map(|d| write_groups.counted(d)) {
+                let added: Vec<VReg> = match dest.map(|d| write_groups.counted(d)) {
                     // Later lanes of a write group land in the block its first lane reserved.
-                    Some(counted) if live_vregs.contains(&counted) => 0,
-                    Some(counted) => counted.size(),
-                    None => 0,
+                    Some(counted) if live_vregs.contains(&counted) => vec![],
+                    Some(counted) => vec![counted],
+                    None => vec![],
                 };
+                let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                let words_freed: usize = liveness_release_vregs(&ops[idx], &liveness_aliases)
-                    .iter()
+                let freed: Vec<VReg> = liveness_release_vregs(&ops[idx], &liveness_aliases)
+                    .into_iter()
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
                             && write_groups.releasable_at(vreg, cycle)
                     })
-                    .map(|vreg| vreg.size())
-                    .sum();
+                    .collect();
+                let words_freed: usize = freed.iter().map(|v| v.size()).sum();
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
-                let projected_live = live_words + words_added - words_freed;
-                if projected_live > scratch_budget {
+                if !pools.fits(&live.after(&added, &freed), scratch_budget) {
                     // Defer for retry - liveness may decrease after other ops scheduled
                     budget_deferred.push(idx);
                     continue;
                 }
                 // Strategy-driven soft deferral (pressure awareness)
                 if strategy.should_defer_for_pressure(
-                    live_words,
+                    pools.words_needed(&live, scratch_budget),
                     words_added,
                     words_freed,
                     scratch_budget,
@@ -2252,7 +2533,7 @@ fn schedule_ssa_greedy_core(
 
                 // Schedule the op via SlotTracker.
                 // When must_place_shifted (op in fixed_shifted_ops), use shift-only path so hint matches (ALU count).
-                let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
+                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
                 let place_result = if must_place_shifted {
                     slots.try_place_shifted_only()
                 } else {
@@ -2320,7 +2601,7 @@ fn schedule_ssa_greedy_core(
                         &mut write_groups,
                         &vreg_remaining_users,
                         &mut live_vregs,
-                        &mut live_words,
+                        &mut live,
                         &mut vreg_expiry_heap,
                         trace,
                     );
@@ -2338,14 +2619,14 @@ fn schedule_ssa_greedy_core(
                     &write_groups,
                     &mut vreg_remaining_users,
                     &mut live_vregs,
-                    &mut live_words,
+                    &mut live,
                     &mut vreg_expiry_heap,
                     trace,
                 );
 
                 // Record peak after both adds and frees, matching the same-cycle
                 // reuse model used by address assignment's interval-based liveness.
-                peak_live_words = peak_live_words.max(live_words);
+                peak_live_words = peak_live_words.max(live.words);
 
                 // Add newly-ready consumers to heap (O(log n) per consumer)
                 for &consumer_idx in &consumers[idx] {
@@ -2381,7 +2662,11 @@ fn schedule_ssa_greedy_core(
         // force-schedule the highest-LUC op to break the deadlock.
         // This temporarily exceeds the budget but allows progress.
         // ============================================================================
-        if !budget_deferred.is_empty() {
+        // With pool capacities (scratch model `pools`) a budget deferral is a real deferral:
+        // the op waits for a later cycle, and the force path runs only when nothing at all
+        // was scheduled this cycle. (Without capacities the historical behaviour is kept: a
+        // deferred op that has a slot is forced in the same cycle.)
+        if !budget_deferred.is_empty() && (pools.caps.is_none() || scheduled_this_cycle == 0) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
@@ -2444,12 +2729,12 @@ fn schedule_ssa_greedy_core(
                 // Count the over-budget cycle. The detailed breakdown is rendered only for
                 // the first such cycle and for a new worst one, and only when verbose: a run
                 // that stays over budget for thousands of cycles used to dump every cycle.
-                diagnostics.record_over_budget(cycle, live_words, || {
-                    format_live_usage_breakdown(ops, &live_vregs, cycle, live_words, scratch_budget)
+                diagnostics.record_over_budget(cycle, pools.words_needed(&live, scratch_budget), || {
+                    format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
                 // When must_place_shifted use shift-only path; else try with strategy first.
-                let allow_shift = strategy.allow_shift(live_words, slots.alu_used, scratch_budget);
+                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
                 #[allow(unused_assignments)]
                 let force_place_result = if must_place_shifted {
                     slots.try_place_shifted_only()
@@ -2502,7 +2787,7 @@ fn schedule_ssa_greedy_core(
                         &mut write_groups,
                         &vreg_remaining_users,
                         &mut live_vregs,
-                        &mut live_words,
+                        &mut live,
                         &mut vreg_expiry_heap,
                         trace,
                     );
@@ -2516,13 +2801,13 @@ fn schedule_ssa_greedy_core(
                     &write_groups,
                     &mut vreg_remaining_users,
                     &mut live_vregs,
-                    &mut live_words,
+                    &mut live,
                     &mut vreg_expiry_heap,
                     trace,
                 );
 
                 // Record peak after both adds and frees
-                peak_live_words = peak_live_words.max(live_words);
+                peak_live_words = peak_live_words.max(live.words);
 
                 for &consumer_idx in &consumers[force_idx] {
                     let offset = result_latency(ops, force_idx);
@@ -2568,7 +2853,7 @@ fn schedule_ssa_greedy_core(
         if trace.cycle_end_live.len() <= cycle {
             trace.cycle_end_live.resize(cycle + 1, 0);
         }
-        trace.cycle_end_live[cycle] = live_words;
+        trace.cycle_end_live[cycle] = live.words;
 
         cycle += 1;
     }
@@ -2637,7 +2922,7 @@ fn schedule_ssa_greedy_core(
             blocked_count,
             ready_unscheduled,
             sample_blocked,
-            live_words,
+            live.words,
             scratch_budget,
             live_vregs.len()
         ));

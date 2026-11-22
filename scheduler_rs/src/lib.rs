@@ -22,6 +22,7 @@
 use pyo3::prelude::*;
 
 pub mod address_assign;
+pub mod architecture;
 pub mod constants;
 pub mod cpsat_scheduler;
 pub mod diagnostics;

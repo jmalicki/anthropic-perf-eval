@@ -4,7 +4,7 @@
 #   ./scripts/test.sh            # everything below
 #   ./scripts/test.sh rust       # scheduler_rs unit tests (cargo, --features cpsat)
 #   ./scripts/test.sh python     # pytest: interface, dataflow replay, forced modes, proofs, inspect_schedule, CP-SAT tuning
-#   ./scripts/test.sh proofs     # Z3: liveness theorems and rewrite identities
+#   ./scripts/test.sh proofs     # Z3: liveness theorems, rewrite identities, allocation conjectures
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
 #   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
 #
@@ -14,6 +14,10 @@
 #
 # Python suites use the installed scheduler_rs extension; run ./scripts/build_scheduler_rs.sh
 # after changing Rust code.
+#
+# Each suite runs while holding one of a few machine-wide test slots (scripts/test_slot.py),
+# so agents in different worktrees do not all run suites at once and time each other out.
+# PERF_EVAL_TEST_SLOTS sets the number of slots (default 2; 0 = no slot); CI takes none.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -35,11 +39,11 @@ run_rust() {
 }
 run_python() {
   if [ $# -eq 0 ]; then
-    set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
+    set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_allocation_conjectures.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
       tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
       tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
       tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
-      tests/test_emission_options.py \
+      tests/test_emission_options.py tests/test_test_slot.py \
       solver/test_slot_utilization.py
   fi
   uv run pytest -q "$@"
@@ -59,12 +63,21 @@ run_upstream() {
   ./scripts/check_upstream.sh "$@"
 }
 
+# Re-enter this script under a test slot: "./scripts/test.sh SUITE ..." runs
+# "test_slot.py SUITE -- ./scripts/test.sh --in-slot SUITE ...".
+if [ "$suite" = "--in-slot" ]; then
+  suite="$1"
+  shift
+elif [ "$suite" != "all" ]; then
+  exec python3 scripts/test_slot.py "$suite" -- "$(pwd)/scripts/test.sh" --in-slot "$suite" "$@"
+fi
+
 case "$suite" in
   rust) run_rust "$@" ;;
   python) run_python "$@" ;;
   proofs) run_proofs "$@" ;;
   kernel) run_kernel "$@" ;;
   upstream) run_upstream "$@" ;;
-  all) run_rust; run_python; run_proofs; run_kernel; run_upstream ;;
+  all) for s in rust python proofs kernel upstream; do "$(pwd)/scripts/test.sh" "$s"; done ;;
   *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | all)" >&2; exit 2 ;;
 esac

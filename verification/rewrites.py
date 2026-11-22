@@ -578,10 +578,10 @@ def check_bits_from_index(ctx=None) -> tuple[str, str, float, dict]:
         bits, boolean = _bit_vars(count)
         n = _position(bits)
         extracted = extract_bits(n, count)
-        violations.append(And(boolean, Or(*[e != b for e, b in zip(extracted, bits)])))
+        violations.append(And(boolean, Or(*[e != b for e, b in zip(extracted, bits, strict=True)])))
         idx = _const(level_last_index(count)) - n
         from_zero_based = extract_bits(_const(level_last_index(count)) - idx, count)
-        violations.append(And(boolean, Or(*[e != b for e, b in zip(from_zero_based, bits)])))
+        violations.append(And(boolean, Or(*[e != b for e, b in zip(from_zero_based, bits, strict=True)])))
     return _refute("R15-bits-from-index", *violations, ctx=ctx)
 
 
