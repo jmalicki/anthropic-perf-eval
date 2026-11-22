@@ -180,6 +180,35 @@ def analyze(d, buckets=10):
         "rounds": rounds,
         "round_overlap": round_overlap(rounds),
         "utilisation": utilisation_over_time(d, buckets),
+        "scratch": scratch_usage(d),
+    }
+
+
+def scratch_usage(d):
+    """Scratch words in use versus what the schedule's liveness requires, or None for JSONs
+    without pool peaks (written before address assignment reported them, or exported before
+    address assignment ran).
+
+    `words_used` (`scratch_words_used`) counts the non-fixed words from the first allocatable
+    address up to the highest word of a non-fixed value, so fixed VRegs (the zero word) are
+    neither use nor fragmentation; 0 when nothing was placed. `peak_words` is max over time of
+    8 * live vectors + live scalars under the allocator's own conflict rule (no layout can use
+    fewer words); `split_words` is 8 * max vectors + max scalars, which the two-pass allocator
+    never exceeds when no fixed VReg sits among the allocated words.
+    """
+    pools = d.get("scratch_pools")
+    used = d.get("scratch_words_used")
+    if pools is None or used is None:
+        return None
+    return {
+        "start_addr": d.get("scratch_start_addr"),
+        "max_addr": d.get("max_addr"),
+        "words_used": used,
+        "peak_vectors": pools["vectors"],
+        "peak_scalars": pools["scalars"],
+        "peak_words": pools["words"],
+        "split_words": VLEN * pools["vectors"] + pools["scalars"],
+        "fragmentation_words": used - pools["words"],
     }
 
 
@@ -307,6 +336,12 @@ def format_report(rep, verbose_rounds=True):
         lb = run["solver_bound_for_emission"]
         status = "optimal for this emission" if lb == run["cycles"] else "not proven optimal for this emission"
         out.append(f"CP-SAT bound for this emission (lb_cycles): {lb} ({status}; not a bound on the problem)")
+    sc = rep.get("scratch")
+    if sc is not None:
+        out.append(f"Scratch: {sc['words_used']} words used above the reserved addresses (highest address {sc['max_addr']}); "
+                   f"liveness needs {sc['peak_words']} (peak of 8*vectors + scalars), "
+                   f"fragmentation {sc['fragmentation_words']}; "
+                   f"8*{sc['peak_vectors']} + {sc['peak_scalars']} = {sc['split_words']} (allocator's upper bound)")
     if rep["rounds"] and verbose_rounds:
         out.append("")
         out.append("Round  first   last  span  overlap  vector  scalar   load   flow")

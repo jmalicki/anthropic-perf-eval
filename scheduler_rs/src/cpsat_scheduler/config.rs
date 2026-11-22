@@ -178,6 +178,23 @@ pub enum CpsatObjective {
     Makespan,
 }
 
+/// Extra makespan lower-bound rows (`CpsatTuning::makespan_rows`). See `makespan_rows.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakespanRows {
+    /// No extra rows (default).
+    #[default]
+    None,
+    /// Head/tail energy rows from the static longest-path heads and tails: per engine, the
+    /// work of the ops that cannot start before cycle t (or must be followed by q cycles)
+    /// fits in [t, makespan - q).
+    Static,
+    /// `Static`, plus prefix/suffix variables per bucket of static heads that follow the
+    /// solution: the ops of the first k buckets end by `prefix_end_k`, the ops of the last
+    /// buckets start no earlier than `suffix_start_k`, and each set's work fits in its span.
+    Bucketed,
+}
+
 /// Extra cumulative propagators CP-SAT can be asked to run (all off in CP-SAT by default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -270,6 +287,14 @@ pub struct CpsatTuning {
     /// here have hundreds to tens of thousands of intervals, so the propagator does nothing
     /// unless this is raised.
     pub timetable_edge_finding_max_intervals: Option<i32>,
+    /// `linearization_level` (default 2; CP-SAT's own default is 1). 0 = no LP, 1 = the
+    /// linear constraints and some relaxations, 2 = also the relaxations and cuts of
+    /// cumulatives, enforced constraints and others. Measured in docs/CPSAT_CONFIG_ABLATION.md.
+    pub linearization_level: i32,
+    /// `cp_model_probing_level` (default 2, CP-SAT's default): presolve probing effort, 0 to 3.
+    pub probing_level: i32,
+    /// Extra makespan lower-bound rows (default: none). See [`MakespanRows`].
+    pub makespan_rows: MakespanRows,
 }
 
 impl Default for CpsatTuning {
@@ -288,6 +313,9 @@ impl Default for CpsatTuning {
             push_all_tasks_toward_start: false,
             cumulative_propagators: Vec::new(),
             timetable_edge_finding_max_intervals: None,
+            linearization_level: 2,
+            probing_level: 2,
+            makespan_rows: MakespanRows::None,
         }
     }
 }
@@ -334,6 +362,15 @@ impl CpsatTuning {
                 "cpsat tuning: timetable_edge_finding_max_intervals must be 0 or more, got {}",
                 max
             ));
+        }
+        if !(0..=2).contains(&self.linearization_level) {
+            return Err(format!(
+                "cpsat tuning: linearization_level must be 0, 1 or 2, got {}",
+                self.linearization_level
+            ));
+        }
+        if !(0..=3).contains(&self.probing_level) {
+            return Err(format!("cpsat tuning: probing_level must be 0 to 3, got {}", self.probing_level));
         }
         for (field, names) in [
             ("subsolvers", &self.subsolvers),

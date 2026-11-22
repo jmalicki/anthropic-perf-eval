@@ -3,6 +3,7 @@
 //! [`MachineConfig`] defines slot capacities per engine (ALU, VALU, Load, Store, Flow)
 //! and is used by the CP-SAT scheduler; [`Engine::slot_limit()`] gives the default hardware limits.
 
+use crate::architecture::{anthropic_perf_eval, Architecture, IssueSlot};
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -11,8 +12,7 @@ use std::collections::HashSet;
 /// Most ops have 4 (opcode, dest, src1, src2), multiply_add has 5
 pub const MAX_SLOT_SIZE: usize = 6;
 
-/// Vector length for SIMD operations
-pub const VLEN: usize = 8;
+pub use crate::architecture::anthropic_perf_eval::VLEN;
 
 // ============================================================================
 // Engine Enum
@@ -67,19 +67,17 @@ impl Engine {
     }
 
     /// Get the slot limit for this engine
-    pub fn slot_limit(&self) -> usize {
-        match self {
-            Engine::Load => 2,
-            Engine::Store => 2,
-            Engine::Alu => 12,
-            Engine::Valu => 6,
-            Engine::Flow => 1,
-            Engine::Debug => 64,
-            // Internal states have no slots in bundles
-            Engine::EliminatedBroadcast => 0,
-            Engine::ShiftedValu => 0,
-            Engine::Barrier => 0, // Takes no slots
-        }
+    pub const fn slot_limit(&self) -> usize {
+        let slot = match self {
+            Engine::Load => IssueSlot::Load,
+            Engine::Store => IssueSlot::Store,
+            Engine::Alu => IssueSlot::Scalar,
+            Engine::Valu => IssueSlot::Vector,
+            Engine::Flow => IssueSlot::Flow,
+            Engine::Debug => return anthropic_perf_eval::DEBUG_SLOTS,
+            Engine::EliminatedBroadcast | Engine::ShiftedValu | Engine::Barrier => return 0,
+        };
+        Architecture::AnthropicPerfEval.issue_capacity(slot) as usize
     }
 
     /// Check if this is a real hardware engine (vs scheduling-internal)
@@ -99,7 +97,7 @@ impl Engine {
             Engine::Alu => machine.alu_slots,
             Engine::Valu => machine.valu_slots,
             Engine::Flow => machine.flow_slots,
-            Engine::Debug => 64,
+            Engine::Debug => anthropic_perf_eval::DEBUG_SLOTS as u32,
             Engine::EliminatedBroadcast | Engine::ShiftedValu | Engine::Barrier => 0,
         }
     }
@@ -138,11 +136,11 @@ pub struct MachineConfig {
 impl Default for MachineConfig {
     fn default() -> Self {
         Self {
-            alu_slots: 12,
-            valu_slots: 6,
-            load_slots: 2,
-            store_slots: 2,
-            flow_slots: 1,
+            alu_slots: Engine::Alu.slot_limit() as u32,
+            valu_slots: Engine::Valu.slot_limit() as u32,
+            load_slots: Engine::Load.slot_limit() as u32,
+            store_slots: Engine::Store.slot_limit() as u32,
+            flow_slots: Engine::Flow.slot_limit() as u32,
         }
     }
 }
@@ -373,12 +371,12 @@ pub enum SelectChoiceEncoding {
 
 /// Slot limits per engine per cycle
 pub const SLOT_LIMITS: [(&str, usize); 6] = [
-    ("load", 2),
-    ("store", 2),
-    ("alu", 12),
-    ("valu", 6),
-    ("flow", 1),
-    ("debug", 64),
+    ("load", Engine::Load.slot_limit()),
+    ("store", Engine::Store.slot_limit()),
+    ("alu", Engine::Alu.slot_limit()),
+    ("valu", Engine::Valu.slot_limit()),
+    ("flow", Engine::Flow.slot_limit()),
+    ("debug", Engine::Debug.slot_limit()),
 ];
 
 /// Get the slot limit for an engine (legacy string-based version)

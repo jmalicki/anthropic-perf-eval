@@ -160,6 +160,33 @@ def test_cpsat_bound_is_labelled_as_emission_scoped(cpsat):
     assert "CP-SAT bound for this emission (lb_cycles)" in sr.format_report(rep)
 
 
+@pytest.mark.parametrize("fixture", ["greedy", "cpsat"])
+def test_scratch_usage_is_between_liveness_and_pool_bound(fixture, request):
+    """The allocator uses at least the per-cycle peak of 8*vectors + scalars (no layout can do
+    better) and at most 8*max vectors + max scalars (what the two-pass allocator guarantees)."""
+    sched, _ = request.getfixturevalue(fixture)
+    sc = sr.analyze(sched)["scratch"]
+    assert sc is not None
+    assert sc["peak_words"] <= sc["words_used"] <= sc["split_words"]
+    assert sc["fragmentation_words"] == sc["words_used"] - sc["peak_words"]
+    assert "Scratch:" in sr.format_report(sr.analyze(sched))
+
+
+def test_scratch_usage_absent_in_older_json(greedy):
+    sched, _ = greedy
+    for missing in ("scratch_pools", "scratch_words_used"):
+        old = {k: v for k, v in sched.items() if k != missing}
+        assert sr.scratch_usage(old) is None
+        assert "Scratch:" not in sr.format_report(sr.analyze(old))
+
+
+def test_scratch_usage_reports_empty_allocation_as_zero():
+    d = {"scratch_pools": {"vectors": 0, "scalars": 0, "words": 0}, "scratch_words_used": 0,
+         "scratch_start_addr": 1, "max_addr": 0}
+    sc = sr.scratch_usage(d)
+    assert (sc["words_used"], sc["fragmentation_words"], sc["split_words"]) == (0, 0, 0)
+
+
 def test_greedy_json_has_no_bound_fields(greedy):
     sched, _ = greedy
     assert "lb_cycles" not in sched and "lb_scope" not in sched
@@ -177,7 +204,7 @@ def test_cli_json_and_compare(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert sr.main([a, "--json"]) == 0
     rep = json.loads(capsys.readouterr().out)
-    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "round_overlap", "utilisation"}
+    assert set(rep) == {"run", "engines", "emission", "floor", "gap", "rounds", "round_overlap", "utilisation", "scratch"}
     assert sr.main([a, "--compare", b]) == 0
     out = capsys.readouterr().out
     assert "emission floor" in out and "span A" in out and "not a bound on the problem" in out
