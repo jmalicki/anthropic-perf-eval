@@ -168,6 +168,8 @@ def build_spec(args: argparse.Namespace) -> dict:
         spec["cycle_range"] = list(args.cycle_range)
     if args.workers is not None:
         spec["workers"] = args.workers
+    if args.tightening is not None:
+        spec["asap_alap_tightening"] = args.tightening
     return spec
 
 
@@ -207,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--deterministic-time", type=float, default=30.0, help="CP-SAT deterministic time per window")
     p.add_argument("--time-limit", type=float, default=900.0, help="Wall-clock backstop per window (s)")
     p.add_argument("--workers", type=int, default=None, help="CP-SAT workers per window (default: tuning's)")
+    p.add_argument("--tightening", choices=["none", "simple", "symmetry-aware", "energetic"], default=None,
+                   help="ASAP/ALAP tightening in the window models (default: the generator's, energetic)")
     p.add_argument("--report", default="window_probe.json", help="Report JSON path")
     p.add_argument("--output-json", default="scheduler_output_window_probe.json", help="Scheduler output JSON")
     p.add_argument("--save-kernel", default="kernel_window_probe.json", help="Kernel JSON (with validation)")

@@ -365,6 +365,11 @@ pub struct WindowProbeSpec {
     pub time_limit_secs: f64,
     /// CP-SAT workers per window (default: the full-kernel tuning's).
     pub workers: Option<i32>,
+    /// ASAP/ALAP tightening for the window models ("none", "simple", "symmetry-aware",
+    /// "energetic"; default: the full-kernel setting). Tightening only narrows domains that
+    /// the window pins anyway, but symmetry-aware and energetic also add symmetry-breaking
+    /// order constraints, which are only solution-preserving when every op is free.
+    pub asap_alap_tightening: Option<String>,
     /// Report path (JSON, rewritten after every window). Required.
     pub output: String,
 }
@@ -381,6 +386,7 @@ impl Default for WindowProbeSpec {
             deterministic_time: 30.0,
             time_limit_secs: 900.0,
             workers: None,
+            asap_alap_tightening: None,
             output: String::new(),
         }
     }
@@ -407,6 +413,9 @@ impl WindowProbeSpec {
         }
         if let Some(bad) = spec.encodings.iter().find(|e| *e != "free" && *e != "fixed") {
             return Err(format!("window probe spec: encodings must be \"free\" or \"fixed\", got {:?}", bad));
+        }
+        if let Some(mode) = &spec.asap_alap_tightening {
+            mode.parse::<super::AsapAlapTightening>().map_err(|e| format!("window probe spec: {}", e))?;
         }
         if !(spec.deterministic_time > 0.0 && spec.time_limit_secs > 0.0) {
             return Err("window probe spec: deterministic_time and time_limit_secs must be > 0".to_string());
@@ -620,6 +629,9 @@ pub fn run_window_probe(
     if let Some(workers) = spec.workers {
         config.tuning.workers = workers;
     }
+    if let Some(mode) = &spec.asap_alap_tightening {
+        config.asap_alap_tightening = mode.parse()?;
+    }
     let dead: Vec<usize> = base.cycles.iter().enumerate().filter(|(_, &c)| c < 0).map(|(i, _)| i).collect();
     let base_makespan = base.makespan(ops);
 
@@ -636,7 +648,10 @@ pub fn run_window_probe(
     // reference itself. If the model rejects it, no window result means anything.
     let started = std::time::Instant::now();
     let all_fixed = CpsatWindow { start: 0, len: 0, fix_window_encodings: true, reference: base.clone() };
-    let base_result = match solve_window(ops, &config, ctx, &all_fixed) {
+    // Nothing to search: one worker suffices and each extra worker holds another model copy.
+    let mut check_config = config.clone();
+    check_config.tuning.workers = 1;
+    let base_result = match solve_window(ops, &check_config, ctx, &all_fixed) {
         Ok(Some(r)) => r,
         Ok(None) => {
             report.base_check_status = "no solution".to_string();

@@ -4027,7 +4027,21 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 14. Solve
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   model built in {:.1}s: {} variables, {} constraints",
+            start_time.elapsed().as_secs_f64(),
+            model.proto().variables.len(),
+            model.proto().constraints.len()
+        );
+    }
     let response = model.solve_with_parameters(&params);
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   solve: {:.1}s wall, {:.1} deterministic time",
+            response.wall_time, response.deterministic_time
+        );
+    }
     let solve_time = start_time.elapsed().as_secs_f64();
     // A deterministic budget only makes the run reproducible if the solve ended on it (or on
     // optimality). If the wall-clock backstop fired first, how far the search got depended on
