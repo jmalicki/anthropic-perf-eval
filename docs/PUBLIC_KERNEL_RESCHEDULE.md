@@ -49,7 +49,9 @@ Every slot is one op. An edge `src -> dst` with latency `L` means `cycle[dst] >=
   any write reads the machine's initial 0, and its first writer is ordered after those reads.
   The edges are the minimal exact set: only the last writer, never blanket ordering.
 - **Main memory**, exact, from `verification/memory_alias.py` (next section). Same latencies:
-  store to load 1, load to store 0, store to store 1.
+  store to load 1, load to store 0, store to store 0 (a cycle's memory writes commit in
+  slot order, so a later store may share the cycle if it stays later in the bundle; the
+  rescheduler emits each cycle in program order).
 - **Co-issue groups.** Keeping the kernel's scratch addresses can force two ops into one
   cycle: op A reads `w` and writes `v` while op B reads `v` and writes `w`. Then each has a
   latency-0 edge to the other. Such strongly connected components of latency-0 edges are
@@ -82,7 +84,11 @@ never because they cannot be told apart.
 3. **Per pair.** First a value-set over-approximation (constants, `x & c`, `x % c`, `x >> c`,
    selects, arithmetic on small sets): disjoint sets prove the pair disjoint. Otherwise Z3
    over 32-bit bit-vectors: SAT means the addresses can be equal (edge), UNSAT means they never
-   are (no edge). `unknown` raises an error; it is never turned into an edge. Each load lane
+   are (no edge). `unknown` raises an error; it is never turned into an edge. To keep this
+   fast, the query's formula is first evaluated on 1,024 fixed assignments of its free
+   variables with the same operations as the Z3 expression; a satisfying assignment is a Z3
+   model, so SAT is decided without the solver, and only the remaining queries (in practice
+   the UNSAT ones) go to Z3. A test checks that both routes give identical edges. Each load lane
    scans earlier stores newest first and stops at the first store that must alias it (older
    stores are ordered before that one by store-to-store edges); each store scans earlier loads
    and stores the same way.

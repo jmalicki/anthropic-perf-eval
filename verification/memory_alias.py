@@ -26,9 +26,13 @@ How
      * value sets: an over-approximation of the values a term can take (constants,
        ``x & c``, ``x % c``, ``x >> c``, ``select`` and arithmetic on small sets). Disjoint
        sets prove the pair disjoint;
-     * otherwise Z3 over 32-bit bit-vectors: SAT means the addresses can be equal (edge),
-       UNSAT means they never are (no edge). ``unknown`` raises: it is a bug to fix, never
-       a reason to add an edge.
+     * otherwise the Z3 query over 32-bit bit-vectors: SAT means the addresses can be equal
+       (edge), UNSAT means they never are (no edge). ``unknown`` raises: it is a bug to fix,
+       never a reason to add an edge. Before calling the solver, the query's formula is
+       evaluated on 1,024 fixed assignments of its free variables (numpy, the same
+       operations as the Z3 expression); an assignment that satisfies it is a model, so the
+       answer is SAT without the solver. Only queries with no sampled model reach Z3, and
+       those decide UNSAT (or a SAT the samples missed).
 4. The abstraction behind (3), ASSUMPTION A: a subterm whose value set is unbounded
    (a hash value, a tree value) is replaced by a fresh 32-bit variable, shared by every
    occurrence of that subterm. This over-approximates the behaviours, so UNSAT (disjoint)
@@ -36,6 +40,10 @@ How
    practice the branch bits ``h & 1`` of the hashes; treating different hashes' bits as
    independent is the assumption, and the concrete cross-check (`concrete_check`) runs
    the kernel on random inputs and reports how many SAT pairs were actually seen to alias.
+
+Latencies: store -> load 1 (a load reads memory as it was before the cycle); load ->
+store 0; store -> store 0 (stores of one cycle commit in slot order, so the later store may
+share the cycle if it stays later in the bundle).
 
 Dependencies on one word, in program order (cycle, then slot order): a load depends on
 every earlier store that may alias it, back to the first one that must alias it (older
@@ -672,7 +680,11 @@ class SymbolicKernel:
             rel = self._relation(addr, ev.addr)
             if rel == "never":
                 continue
-            self._add_edge(ev.op, op, 0 if ev.kind == "load" else 1)
+            # load -> store and store -> store: latency 0. Memory writes commit at the end of
+            # the cycle in slot order (the simulator's mem_write dict), so two stores to one word
+            # may share a cycle as long as the later one stays later in the bundle; emitters
+            # keep program order within a cycle.
+            self._add_edge(ev.op, op, 0)
             if rel == "must" and ev.kind == "store":
                 break
 
@@ -830,46 +842,42 @@ class ConcreteReport:
 
 
 def concrete_check(sym: SymbolicKernel, runs: int = 8, seed0: int = 1) -> ConcreteReport:
-    """Every pair that aliases on a random input must have an edge (exactness check of the
-    preconditions), and every concrete address must lie in its value set (soundness of the
-    value-set filter). Also counts edges that never aliased (Assumption A's slack)."""
+    """Run the kernel on random inputs with address tracing.
+
+    * Every pair of memory ops that touched a common word (at least one a store) in some run
+      must have a direct edge: a missing one would mean the preconditions are wrong.
+    * Every concrete address must lie in its value set (soundness of the value-set filter).
+    * Memory edges whose two ops never shared a word in any run are counted: aliasing the
+      analysis proved possible but random inputs did not produce (Assumption A's slack, or
+      rare inputs).
+    """
     observed: set[tuple[int, int]] = set()
     outside: list[tuple[int, int]] = []
     ok = True
     layout = sym.layout
+    order = sorted(range(len(sym.ops)), key=lambda i: (sym.ops[i].cycle, sym.ops[i].mem != "load", i))
     for r in range(runs):
         touched, machine, ref = trace_memory(sym.bundles, seed0 + r, layout)
         ok &= machine.mem[layout.val_p:layout.size] == ref[layout.val_p:layout.size]
-        last_store: dict[int, int] = {}
-        loads_since: dict[int, list[int]] = {}
-        # Program order within a cycle: loads read before the cycle's stores commit.
-        by_cycle: dict[int, list[int]] = {}
-        for op in sym.ops:
-            by_cycle.setdefault(op.cycle, []).append(op.index)
-        for cycle in sorted(by_cycle):
-            idxs = by_cycle[cycle]
-            for i in idxs:
-                kind, words = touched[i]
-                op = sym.ops[i]
-                if kind:
-                    vs = sym.vsets.get(op.mem_addr)
-                    if vs is not None and (words[0] % MASK) not in vs:
-                        outside.append((i, words[0]))
-                if kind == "load":
-                    for w in words:
-                        if w in last_store:
-                            observed.add((last_store[w], i))
-                        loads_since.setdefault(w, []).append(i)
-            for i in idxs:
-                kind, words = touched[i]
-                if kind == "store":
-                    for w in words:
-                        if w in last_store and last_store[w] != i:
-                            observed.add((last_store[w], i))
-                        for ld in loads_since.pop(w, []):
-                            if ld != i:
-                                observed.add((ld, i))
-                        last_store[w] = i
+        # Per word, the ops that touched it, in program order (loads of a cycle first).
+        by_word: dict[int, list[int]] = {}
+        for i in order:
+            kind, words = touched[i]
+            if not kind:
+                continue
+            vs = sym.vsets.get(sym.ops[i].mem_addr)
+            if vs is not None and (words[0] % MASK) not in vs:
+                outside.append((i, words[0]))
+            for w in set(words):
+                by_word.setdefault(w, []).append(i)
+        for ops in by_word.values():
+            stores = [k for k, i in enumerate(ops) if sym.ops[i].mem == "store"]
+            for k in stores:
+                s = ops[k]
+                for i in ops[:k]:
+                    observed.add((i, s))
+                for i in ops[k + 1:]:
+                    observed.add((s, i))
     missing = sorted(p for p in observed if p not in sym.mem_edges)
     unseen = sum(1 for p in sym.mem_edges if p not in observed)
     return ConcreteReport(runs, len(observed), missing, unseen, outside, ok)

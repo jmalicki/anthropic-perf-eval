@@ -15,7 +15,9 @@ Edges, each with a minimum distance in cycles (``cycle[dst] >= cycle[src] + late
   (latency 1: two writes of one word in one cycle are a conflict). A word never written
   reads the machine's initial 0, and its first writer is ordered after those reads.
 * Main memory: exact, from ``verification.memory_alias`` - an edge only between ops whose
-  addresses can be equal for some valid input (Z3), same latencies as for scratch.
+  addresses can be equal for some valid input (Z3). Store to load latency 1; load to store
+  and store to store latency 0 (memory writes of a cycle commit in slot order, so the
+  emitter keeps program order within a bundle).
 
 The report gives per-engine op counts, capacity floors, the critical path of the graph,
 the cycles the kernel takes on the upstream simulator, the gap to the floor, and how full

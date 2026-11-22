@@ -315,3 +315,17 @@ def test_sampled_witnesses_agree_with_z3(monkeypatch):
     z3_only = [SymbolicKernel(k).run() for k in kernels]
     assert [s.mem_edges for s in with_samples] == [s.mem_edges for s in z3_only]
     assert with_samples[0].stats.sampled_witnesses > 0 and z3_only[0].stats.sampled_witnesses == 0
+
+
+def test_two_stores_to_one_word_may_share_a_cycle():
+    # Memory writes of a cycle commit in slot order, so store -> store has latency 0 and the
+    # emitter keeps the later store later in the bundle.
+    k = _kernel(
+        [("load", ("const", 3, VAL_P)), ("load", ("const", 4, 9))],
+        [("store", ("store", 3, 3)), ("store", ("store", 3, 4))],
+    )
+    sym = SymbolicKernel(k).run()
+    assert sym.mem_edges == {(2, 3): 0}
+    g = lift(k)
+    out = emit(g, [0, 0, 1, 1])
+    assert out[1]["store"] == [["store", 3, 3], ["store", 3, 4]]
