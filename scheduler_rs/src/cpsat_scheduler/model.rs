@@ -226,6 +226,7 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
 
 /// Where a scratch interval starts: at its value's write, or at the start of the segment
 /// (a value live into a per-section solve).
+#[cfg(feature = "cpsat")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScratchFrom {
     Write,
@@ -234,6 +235,7 @@ enum ScratchFrom {
 
 /// Where a scratch interval ends: after its value's last read, or after the segment (a value
 /// live out of a per-section solve, still held after the segment's last cycle).
+#[cfg(feature = "cpsat")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScratchTo {
     LastRead,
@@ -259,9 +261,14 @@ enum ScratchTo {
 ///   (Proof: verification/allocation_conjectures.py, A8-phase-interval-is-allocator-span and
 ///   A8-phase-peak-exhaustive.) Values read at their own write cycle (L == S) would vanish
 ///   here; the model's precedences never schedule a reader in its producer's cycle.
+///   A value live from the segment start (`ScratchFrom::SegmentStart`) also holds its words
+///   in the read phase of the first cycle, before anything is written; on this timeline the
+///   read phase of cycle t is slot t - 1, so such an interval starts at -1. Without that a
+///   live-in last read at cycle 0 would get the empty `[0, 0)`.
 ///
 /// # Returns
 /// The interval (optional when `presence` is given).
+#[cfg(feature = "cpsat")]
 fn scratch_interval(
     model: &mut CpModelBuilder,
     time: ScratchTime,
@@ -275,9 +282,9 @@ fn scratch_interval(
     let (start, size, end) = match time {
         ScratchTime::Cycle => (start, size, end),
         ScratchTime::Phase => {
-            let _ = from; // both starts stay where they are on the cycle timeline
+            let s_off = if from == ScratchFrom::SegmentStart { -1 } else { 0 };
             let e_off = if to == ScratchTo::LastRead { -1 } else { 0 };
-            (start, size + e_off, end + e_off)
+            (start + s_off, size + (e_off - s_off), end + e_off)
         }
     };
     match presence {
@@ -2398,14 +2405,21 @@ pub fn schedule_ssa_cpsat(
                     if *last_use_idx >= times.len() {
                         continue;
                     }
+                    // Readers of the value, or of one of its lanes when it is a decomposed
+                    // vector (a lane read is a read of the vector's block).
+                    let lanes: &[VReg] = hints
+                        .vector_group_lanes
+                        .and_then(|g| g.get(vreg))
+                        .map_or(&[], |l| l.as_slice());
+                    let reads_it = |v: VReg| v == *vreg || lanes.contains(&v);
                     let mut readers: Vec<usize> = ops
                         .iter()
                         .enumerate()
                         .filter(|(i, op)| {
                             *i < times.len()
-                                && (op.reads().any(|r| r == *vreg)
-                                    || op.delta_vreg == Some(*vreg)
-                                    || op.keep_live.iter().flatten().any(|k| k == vreg))
+                                && (op.reads().any(reads_it)
+                                    || op.delta_vreg.is_some_and(reads_it)
+                                    || op.keep_live.iter().flatten().any(|k| reads_it(*k)))
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -2769,7 +2783,7 @@ pub fn schedule_ssa_cpsat(
                     ),
                     ScratchTime::Phase => (
                         (|c: i32| c) as fn(i32) -> i32,
-                        (|c: i32| c) as fn(i32) -> i32,
+                        (|c: i32| c - 1) as fn(i32) -> i32,
                         (|e: i32| e - 1) as fn(i32) -> i32,
                         (|e: i32| e) as fn(i32) -> i32,
                     ),

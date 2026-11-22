@@ -2190,6 +2190,120 @@ mod ssa_tests {
     /// is read by `early` (named as its last use) and by `late`, which must wait for a chain
     /// whose widest point holds 24 words. So `v` is live across that point: 32 words, which a
     /// 28-word budget cannot hold. With only `early` counted the model accepted it.
+    /// Two 8-word values live into a segment and both read (stored) as early as cycle 0 hold
+    /// 16 words in the first cycle's read phase, before anything is written: a 15-word budget
+    /// is infeasible on the phase timeline too. (Ending live-ins at the last read alone gave
+    /// a live-in read at cycle 0 the empty interval [0, 0).)
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_phase_live_ins_read_at_cycle_zero_hold_their_words() {
+        let mut emit = SsaEmitContext::new();
+        let k0 = emit.emit_const(9);
+        let a = emit.emit_vbroadcast_force(k0);
+        let b = emit.emit_vbroadcast_force(k0);
+        emit.emit_vstore_imm(100, a);
+        emit.emit_vstore_imm(108, b);
+        // A value defined in the segment, so the segment has a scratch model at all.
+        let x = emit.emit_const(1);
+        emit.emit_store_imm(116, x);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let removed: Vec<usize> = emit
+            .ops
+            .iter()
+            .filter(|o| o.dest == Some(a) || o.dest == Some(b) || o.dest == Some(k0))
+            .map(|o| o.id)
+            .collect();
+        emit.ops.retain(|o| !removed.contains(&o.id));
+        for op in &mut emit.ops {
+            op.dep_ids.retain(|d| !removed.contains(d));
+        }
+        let reader = |v: VReg| {
+            emit.ops.iter().position(|o| o.srcs.iter().any(|s| s.as_vreg() == Some(v))).unwrap()
+        };
+        let initial_live = vec![(a, reader(a)), (b, reader(b))];
+        let solve = |budget: usize| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints { initial_live: Some(&initial_live), ..Default::default() },
+                Some(false),
+            )
+            .expect("solve")
+        };
+        assert!(solve(15).is_none(), "both live-ins hold their words in cycle 0's read phase");
+        assert!(solve(16).is_some());
+    }
+
+    /// A live-in decomposed vector is live until the last reader of the vector or of any of
+    /// its lanes: `early` reads `v`, `late` reads a lane of `v` after a chain whose widest
+    /// point holds 24 words, so `v` (8 words) is live across it and 28 words do not suffice.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_live_in_interval_covers_lane_readers() {
+        let mut emit = SsaEmitContext::new();
+        let k0 = emit.emit_const(9);
+        let v = emit.emit_vbroadcast_force(k0);
+        let v_lanes = emit.decompose_vector(v);
+        let k = emit.emit_const(5);
+        let c0 = emit.emit_vbroadcast(k);
+        let c1 = emit.emit_valu(Opcode::Add, c0, c0);
+        let w1 = emit.emit_valu(Opcode::Add, c1, c1);
+        let w2 = emit.emit_valu(Opcode::Xor, c1, c1);
+        let w3 = emit.emit_valu(Opcode::Shl, c1, c1);
+        let m = emit.emit_valu(Opcode::Add, w1, w2);
+        let n = emit.emit_valu(Opcode::Add, m, w3);
+        let n_lanes = emit.decompose_vector(n);
+        let late = emit.emit_alu(Opcode::Add, v_lanes[3], n_lanes[0]);
+        emit.emit_store_imm(200, late);
+        let early = emit.emit_valu(Opcode::Add, v, v);
+        emit.emit_vstore_imm(108, early);
+        let groups = emit.take_vector_group_lanes();
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, Some(&groups));
+        let removed: Vec<usize> = emit
+            .ops
+            .iter()
+            .filter(|o| o.dest == Some(v) || o.dest == Some(k0))
+            .map(|o| o.id)
+            .collect();
+        emit.ops.retain(|o| !removed.contains(&o.id));
+        for op in &mut emit.ops {
+            op.dep_ids.retain(|d| !removed.contains(d));
+        }
+        let early_idx = emit.ops.iter().position(|o| o.dest == Some(early)).unwrap();
+        let initial_live = vec![(v, early_idx)];
+        let solve = |budget: usize| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&initial_live),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            )
+            .expect("solve")
+        };
+        assert!(solve(28).is_none(), "v is live until its lane is read by `late`");
+        assert!(solve(48).is_some());
+    }
+
     #[cfg(feature = "cpsat")]
     #[test]
     fn test_ssa_cpsat_live_in_interval_covers_every_reader() {

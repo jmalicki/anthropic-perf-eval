@@ -10,7 +10,8 @@ The two counts compared here:
   value live over the half-open [def, last_read + 1), i.e. every cycle t with
   def <= t <= last_read. At cycle C it counts both the values read for the last time at C
   and the values written at C.
-- phase: the exact load. Cycle t has a read phase (2t) and a write phase (2t + 1). A value
+- phase: the load as address assignment counts it, for values written in one cycle (see
+  below). Cycle t has a read phase (2t) and a write phase (2t + 1). A value
   with def < last_read holds its words over [2 def + 1, 2 last_read]; a point value
   (def == last_read) over [2 def, 2 def + 1]. This is `address_assign::interval_span`, the
   rule the allocator uses. The per-cycle phase count is the larger of the two phases.
@@ -18,7 +19,10 @@ The two counts compared here:
   peak equals this phase peak (verification/allocation_conjectures.py, A8).
 
 Reads the per-VReg intervals of a scheduler JSON written with `--liveness-detail full`
-(`vregs[*].interval_start/interval_end/size_words`).
+(`vregs[*].interval_start/interval_end/size_words`). The JSON does not carry the last write
+cycle of values written over several cycles (shifted VALU destinations, vector groups), which
+the allocator adds to their span (`compute_value_spans`); for those the phase count here can
+be slightly below the allocator's, so it is exact only for values written in one cycle.
 
   uv run python -m scripts.scratch_time_overcount sched.json [more.json ...]
   uv run python -m scripts.scratch_time_overcount sched.json --json

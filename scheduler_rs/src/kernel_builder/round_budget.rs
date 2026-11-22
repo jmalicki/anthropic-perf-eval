@@ -141,6 +141,12 @@ pub fn sections_exceeding_budget_with(
                         section_def.insert(sub_temp, op.cycle);
                         section_last_use.insert(sub_temp, op.cycle + 1);
                     }
+                    // On the multiply-add path the operands (cond, true/false values, delta)
+                    // are read again at cycle + 1, as address assignment counts them.
+                    for vreg in op.reads().chain(op.delta_vreg) {
+                        let e = section_last_use.entry(vreg).or_insert(op.cycle + 1);
+                        *e = (*e).max(op.cycle + 1);
+                    }
                 }
             }
         }
@@ -491,6 +497,39 @@ mod tests {
         assert_eq!(phase.section_peaks, vec![8]);
         assert_eq!(phase.section_exceeds_budget, vec![false]);
         assert_eq!(sections_exceeding_budget(&ops, 8, None, None).section_peaks, vec![16]);
+    }
+
+    /// A SelectChoice on the multiply-add path reads its operands again at cycle + 1: cond,
+    /// true and false values (8 words each) are live with the subtract temp and the result in
+    /// the read phase of cycle 2, 40 words; on the vselect path the peak is 24.
+    #[test]
+    fn test_sections_exceeding_budget_fma_operands_read_at_next_cycle() {
+        use crate::cpsat_scheduler::ScratchTime;
+        let (c, t, f, d, sub, x) =
+            (VReg::vector(1), VReg::vector(2), VReg::vector(3), VReg::vector(4), VReg::vector(5), VReg::vector(6));
+        let mut select = make_op_with_cycle(
+            3,
+            Engine::Valu,
+            Opcode::SelectChoice,
+            Some(d),
+            vec![Operand::VReg(c), Operand::VReg(t), Operand::VReg(f)],
+            vec![0, 1, 2],
+            1,
+        );
+        select.sub_temp_vreg = Some(sub);
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Valu, Opcode::Vbroadcast, Some(c), vec![], vec![], 0),
+            make_op_with_cycle(1, Engine::Valu, Opcode::Vbroadcast, Some(t), vec![], vec![], 0),
+            make_op_with_cycle(2, Engine::Valu, Opcode::Vbroadcast, Some(f), vec![], vec![], 0),
+            select,
+            make_op_with_cycle(4, Engine::Valu, Opcode::Add, Some(x), vec![Operand::VReg(d), Operand::VReg(d)], vec![3], 3),
+            make_op_with_cycle(5, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(0), Operand::VReg(x)], vec![4], 4),
+        ];
+        let fma: HashSet<usize> = [3].into_iter().collect();
+        let with_fma = sections_exceeding_budget_with(&ops, 1536, Some(&fma), None, ScratchTime::Phase);
+        let vselect = sections_exceeding_budget_with(&ops, 1536, None, None, ScratchTime::Phase);
+        assert_eq!(with_fma.section_peaks, vec![40]);
+        assert_eq!(vselect.section_peaks, vec![24]);
     }
 
     #[test]
