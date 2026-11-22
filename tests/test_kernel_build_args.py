@@ -95,6 +95,24 @@ def test_greedy_split_shift_flag_reaches_kwargs_and_run_options():
     assert json.loads(kwargs["run_options_json"])["greedy_split_shift"] is True
 
 
+def test_cpsat_scratch_time_reaches_kwargs_and_run_options():
+    """--cpsat-scratch-time defaults to phase, is passed on and recorded, and rejects other values."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=False, use_git_sha=False)
+    assert default["cpsat_scratch_time"] == "phase"
+    assert json.loads(default["run_options_json"])["cpsat_scratch_time"] == "phase"
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    kwargs = args_to_build_kwargs(parser.parse_args(["--cpsat-scratch-time", "cycle"]), use_git_sha=False)
+    assert kwargs["cpsat_scratch_time"] == "cycle"
+    assert json.loads(kwargs["run_options_json"])["cpsat_scratch_time"] == "cycle"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--cpsat-scratch-time", "half"])
+
+
 def test_pressure_threshold_flags_reach_kwargs_and_run_options():
     """The threshold overrides default to None (policy built-ins), headroom to 0; all are passed on and recorded."""
     import argparse

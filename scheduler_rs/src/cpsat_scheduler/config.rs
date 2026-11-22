@@ -32,6 +32,33 @@ impl FromStr for ConstChoiceMode {
     }
 }
 
+/// Timeline of the scratch cumulative (see `model::scratch_interval`).
+///
+/// Within a cycle every read happens before every write, so a word last read at cycle C can
+/// be rewritten at cycle C (address assignment's same-cycle reuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScratchTime {
+    /// Half-open `[write, last read + 1)` per value: at cycle C it counts both the values
+    /// last read at C and the values written at C, an overcount of the real load (kept for
+    /// ablation).
+    Cycle,
+    /// Same-cycle reuse: `[write, last read)` per value, whose peak is exactly the peak of
+    /// address assignment's read and write phases (default).
+    #[default]
+    Phase,
+}
+
+impl FromStr for ScratchTime {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cycle" => Ok(Self::Cycle),
+            "phase" => Ok(Self::Phase),
+            _ => Err(format!("invalid cpsat_scratch_time '{}', expected cycle or phase", s)),
+        }
+    }
+}
+
 /// SelectChoice encoding mode: let solver choose (Optimize), force FMA (VALU), or force vselect (Flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectChoiceMode {

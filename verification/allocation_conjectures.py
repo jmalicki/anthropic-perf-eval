@@ -388,6 +388,85 @@ def check_real_embedding() -> CheckResult:
     return _solve("A3-real-embedding", solver)
 
 
+def cpsat_phase_interval(start, last_read):
+    """Half-open cycle interval the CP-SAT scratch cumulative uses with
+    `--cpsat-scratch-time phase` (cpsat_scheduler/model.rs `scratch_interval`): [S, L), the
+    model's [S, L + 1) ended one cycle earlier."""
+    return start, last_read
+
+
+def check_phase_interval_is_allocator_span() -> CheckResult:
+    """A8-phase-interval-is-allocator-span: for a value read after it is written (S < L, which
+    CP-SAT's precedences guarantee), the cumulative counts it at cycle t exactly when the
+    allocator holds its words in the write phase of t (2t + 1), and the allocator holds them in
+    the read phase of t (2t) exactly when the cumulative counts it at t - 1. So the set of
+    values counted at t is the allocator's write-phase set of t and its read-phase set of
+    t + 1, and the cumulative's peak equals the allocator's per-cycle same-cycle-reuse peak
+    (reads before writes): the cumulative fits B iff the allocator's peak does. UNSAT = holds."""
+    s, l, t = Int("s"), Int("l"), Int("t")
+    lo, hi = real_phase_interval(s, l)
+    c_lo, c_hi = cpsat_phase_interval(s, l)
+    counted = lambda c: And(c_lo <= c, c < c_hi)  # noqa: E731
+    write_phase = And(lo <= 2 * t + 1, 2 * t + 1 <= hi)
+    read_phase = And(lo <= 2 * t, 2 * t <= hi)
+    solver = Solver()
+    solver.add(s >= 0, s < l, Or(counted(t) != write_phase, counted(t - 1) != read_phase))
+    return _solve("A8-phase-interval-is-allocator-span", solver)
+
+
+def phase_cumulative_peak(values: Sequence[Value]) -> int:
+    """Peak load of the CP-SAT phase cumulative over real values (start = write, end = last read)."""
+    events = []
+    for v in values:
+        lo, hi = cpsat_phase_interval(v.start, v.end)
+        events += [(lo, v.size), (hi, -v.size)]
+    load = peak = 0
+    for _, d in sorted(events, key=lambda e: (e[0], e[1])):  # frees first at equal times
+        load += d
+        peak = max(peak, load)
+    return peak
+
+
+def allocator_peak(values: Sequence[Value]) -> int:
+    """The allocator's per-cycle peak: max over phases of the words whose span covers it."""
+    spans = [real_phase_interval(v.start, v.end) + (v.size,) for v in values]
+    if not spans:
+        return 0
+    top = max(hi for _, hi, _ in spans)
+    return max(sum(sz for lo, hi, sz in spans if lo <= p <= hi) for p in range(top + 1))
+
+
+def cycle_count_peak(values: Sequence[Value]) -> int:
+    """Peak of the earlier CP-SAT count (`--cpsat-scratch-time cycle`): closed [def, last read]."""
+    if not values:
+        return 0
+    top = max(v.end for v in values)
+    return max(sum(v.size for v in values if v.start <= t <= v.end) for t in range(top + 1))
+
+
+def check_phase_peak_exhaustive(steps: int = 4, max_values: int = 4, sizes=(1, 8)) -> Callable[[], CheckResult]:
+    """A8-phase-peak-exhaustive: on every multiset of up to `max_values` values with
+    0 <= S < L <= `steps` and the given sizes, the phase cumulative's peak equals the
+    allocator's peak (so `<= B` agree for every B), and the cycle count is never below it.
+    Returns UNSAT when no instance disagrees (repo convention: UNSAT = holds)."""
+
+    def check() -> CheckResult:
+        start = time.time()
+        kinds = [Value(s, l, sz) for s in range(steps + 1) for l in range(s + 1, steps + 1) for sz in sizes]
+        tested = 0
+        for n in range(1, max_values + 1):
+            for combo in itertools.combinations_with_replacement(kinds, n):
+                tested += 1
+                a, c = allocator_peak(combo), phase_cumulative_peak(combo)
+                if a != c or cycle_count_peak(combo) < a:
+                    return (f"A8-phase-peak-exhaustive-T{steps}-n{max_values}", "sat", time.time() - start,
+                            {"instance": instance_to_rows(combo), "allocator": a, "phase": c})
+        return (f"A8-phase-peak-exhaustive-T{steps}-n{max_values}", "unsat", time.time() - start,
+                {"instances": tested})
+
+    return check
+
+
 # =============================================================================
 # Candidate allocators (C2, C3)
 # =============================================================================
@@ -825,6 +904,12 @@ ALLOCATION_CHECKS = [
     _bounded("A6-c1-cegis", (1, 2), 4, 3, Alignment(2), method="cegis"),
     ("A7-greedy-witnesses", "Stored greedy witnesses: a layout exists and the greedy fails",
      check_greedy_witnesses),
+    ("A8-phase-interval-is-allocator-span",
+     "CP-SAT phase interval [S, L) counts exactly the allocator's write/read phases (S < L)",
+     check_phase_interval_is_allocator_span),
+    ("A8-phase-peak-exhaustive-T4-n4",
+     "Phase cumulative peak = allocator peak <= cycle-count peak, all instances T<=4, n<=4",
+     check_phase_peak_exhaustive(4, 4)),
 ]
 
 # Slow checks (--slow): minutes in total; each bound is recorded in docs/ALLOCATION_CONJECTURES.md.
@@ -843,6 +928,9 @@ SLOW_ALLOCATION_CHECKS = [
     _bounded("A6-c1-bounded", (1, 3), 6, 5, slack=1),
     ("A5-c3-exhaustive-k3-B8-T3-n6", "C3: two-pass succeeds, k=3, B=8, <= 3 steps, <= 6 values",
      check_c3_exhaustive(3, 8, 3, 6)),
+    ("A8-phase-peak-exhaustive-T5-n5",
+     "Phase cumulative peak = allocator peak <= cycle-count peak, all instances T<=5, n<=5",
+     check_phase_peak_exhaustive(5, 5)),
 ]
 
 EXPECT_SAT = {

@@ -125,6 +125,9 @@ pub struct SsaTickTockKernelBuilder {
     /// Switchable CP-SAT configuration for the full-kernel solve (workers, search mode, ...).
     /// The default leaves the model and the solver parameters as they were. Set after `new()`.
     pub cpsat_tuning: crate::cpsat_scheduler::CpsatTuning,
+    /// Timeline of the CP-SAT scratch cumulative (default `Phase`). Set before
+    /// `build_and_schedule_cpsat`; applies to the per-section and full-kernel solves.
+    pub cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime,
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
@@ -628,6 +631,7 @@ impl SsaTickTockKernelBuilder {
             zero_vreg: None,
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
+            cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime::default(),
         }
     }
 
@@ -821,7 +825,7 @@ impl SsaTickTockKernelBuilder {
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
             live_in_for_section_filtered, live_out_from_section, live_through_for_section,
-            sections_exceeding_budget, vreg_def_section,
+            sections_exceeding_budget_with, vreg_def_section,
         };
         use super::pipeline::{
             BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
@@ -881,6 +885,7 @@ impl SsaTickTockKernelBuilder {
                 disable_optional_constraint_groups,
                 enable_cse_groups,
                 enable_bulk_move,
+                scratch_time: self.cpsat_scratch_time,
             }),
             ..Default::default()
         };
@@ -986,11 +991,19 @@ impl SsaTickTockKernelBuilder {
         // ====================================================================
         let boundaries = section_boundaries(&ctx.ops);
         let effective_budget = effective_scratch_budget(ctx.zero_vreg.is_some());
-        let budget_result = sections_exceeding_budget(
+        // Which sections to repair: counted on the cycle timeline whatever the model's
+        // timeline. This count only sees operand reads (no shifted lanes, keep_live or group
+        // aliases), so on the phase timeline it can miss a section whose greedy schedule is
+        // over budget (3x256 with the greedy pressure policy: the greedy force-scheduled, this
+        // check said the section fits, and the full-kernel solve then started from an
+        // infeasible hint). The cycle count's same-cycle overcount makes it the safe side; the
+        // repair itself and the checks of its result use the model's timeline.
+        let budget_result = sections_exceeding_budget_with(
             &ctx.ops,
             effective_budget,
             Some(&greedy_select_fma_ops),
             None,
+            crate::cpsat_scheduler::ScratchTime::Cycle,
         );
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
@@ -1200,6 +1213,7 @@ impl SsaTickTockKernelBuilder {
                     enable_valu_shift: false,
                     scratch_budget: effective_budget,
                     scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
+                    scratch_time: self.cpsat_scratch_time,
                     model_name: Some(format!("section_{}_feasibility", k)),
                     ..Default::default()
                 };
@@ -1307,11 +1321,12 @@ impl SsaTickTockKernelBuilder {
                     (seg_result.makespan as i32).max(greedy_section_makespan),
                 );
                 if verbose {
-                    let after_budget = sections_exceeding_budget(
+                    let after_budget = sections_exceeding_budget_with(
                         &ctx.ops,
                         effective_scratch_budget(ctx.zero_vreg.is_some()),
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
+                        self.cpsat_scratch_time,
                     );
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
@@ -1339,10 +1354,11 @@ impl SsaTickTockKernelBuilder {
         }
 
         // Presolve guarantee: merged schedule must be within scratch budget
-        let post_merge_budget = sections_exceeding_budget(
+        let post_merge_budget = sections_exceeding_budget_with(
             &ctx.ops, SCRATCH_BUDGET_HW,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
+            self.cpsat_scratch_time,
         );
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
@@ -1369,8 +1385,8 @@ impl SsaTickTockKernelBuilder {
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
         let effective_budget_hint = effective_scratch_budget(ctx.zero_vreg.is_some());
-        let hint_peak = sections_exceeding_budget(
-            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None,
+        let hint_peak = sections_exceeding_budget_with(
+            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time,
         ).section_peaks.iter().copied().max().unwrap_or(0);
 
         if hint_peak > SCRATCH_BUDGET_HW {
@@ -1401,6 +1417,7 @@ impl SsaTickTockKernelBuilder {
             enable_vbroadcast_elimination,
             scratch_budget: effective_scratch_budget(ctx.zero_vreg.is_some()),
             scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
+            scratch_time: cpsat_cfg.scratch_time,
             model_name: Some("full_kernel_optimization".to_string()),
             machine: MachineConfig::default(),
             const_choice_mode,

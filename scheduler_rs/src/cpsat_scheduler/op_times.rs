@@ -47,8 +47,9 @@
 //!   ([`OpTimes::lane_ready`]); separate rows add the latency for the same edge.
 //! * the main cycle of a reader is ordered after `completion` of a shiftable producer and
 //!   is itself free when the reader is shifted, so these rows only bind the lanes.
-//! * symmetry orderings, `segment_end`, live-in interval ends and live-out interval starts
-//!   use the issue cycle even for shifted ops.
+//! * symmetry orderings, `segment_end` and live-out interval starts use the issue cycle even
+//!   for shifted ops. (Live-in interval ends use `last_read_end` over every reader in the
+//!   segment.)
 
 use std::collections::{HashMap, HashSet};
 

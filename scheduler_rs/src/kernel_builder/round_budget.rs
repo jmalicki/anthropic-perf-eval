@@ -50,6 +50,31 @@ pub fn sections_exceeding_budget(
     select_fma_op_ids: Option<&HashSet<usize>>,
     section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
 ) -> SectionBudgetResult {
+    sections_exceeding_budget_with(
+        ops,
+        scratch_budget,
+        select_fma_op_ids,
+        section_select_fma_overrides,
+        crate::cpsat_scheduler::ScratchTime::Cycle,
+    )
+}
+
+/// [`sections_exceeding_budget`] on the timeline the CP-SAT scratch model uses.
+///
+/// `ScratchTime::Cycle` counts every value over the closed `[def, last use]` at each cycle, as
+/// before. `ScratchTime::Phase` counts the read phase and the write phase of each cycle
+/// separately (a value written at D and last read at L > D holds its words over phases
+/// `2D + 1 ..= 2L`; one with L == D over `2D ..= 2D + 1`) and takes the larger, so a word read
+/// for the last time at a cycle is free for a value written in that cycle, as in address
+/// assignment and in the per-section CP-SAT solve with `ScratchTime::Phase`. With `Cycle` this
+/// check rejected merged per-section schedules that the phase model had accepted.
+pub fn sections_exceeding_budget_with(
+    ops: &[SsaOp],
+    scratch_budget: usize,
+    select_fma_op_ids: Option<&HashSet<usize>>,
+    section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
+    scratch_time: crate::cpsat_scheduler::ScratchTime,
+) -> SectionBudgetResult {
     let boundaries = section_boundaries(ops);
 
     // VReg -> defining op index (for cycle); only ops with cycle >= 0
@@ -133,16 +158,33 @@ pub fn sections_exceeding_budget(
         }).unwrap_or(max_c);
 
         let peak = if min_c <= end_c {
+            let phase = scratch_time == crate::cpsat_scheduler::ScratchTime::Phase;
             let mut peak_words = 0usize;
             for t in min_c..=end_c {
-                let mut live = 0usize;
-                for (vreg, &def_c) in &section_def {
-                    let last_c = section_last_use.get(vreg).copied().unwrap_or(def_c);
-                    if def_c <= t && t <= last_c {
-                        live += vreg.size();
+                // Cycle: one sample per cycle. Phase: the read phase (2t) and the write phase
+                // (2t + 1) of the cycle.
+                let samples: &[i64] = if phase { &[0, 1] } else { &[0] };
+                for &ph in samples {
+                    let p = 2 * t as i64 + ph;
+                    let mut live = 0usize;
+                    for (vreg, &def_c) in &section_def {
+                        let last_c = section_last_use.get(vreg).copied().unwrap_or(def_c);
+                        let covers = if phase {
+                            let (lo, hi) = if last_c > def_c {
+                                (2 * def_c as i64 + 1, 2 * last_c as i64)
+                            } else {
+                                (2 * def_c as i64, 2 * def_c as i64 + 1)
+                            };
+                            lo <= p && p <= hi
+                        } else {
+                            def_c <= t && t <= last_c
+                        };
+                        if covers {
+                            live += vreg.size();
+                        }
                     }
+                    peak_words = peak_words.max(live);
                 }
-                peak_words = peak_words.max(live);
             }
             peak_words
         } else {
@@ -428,6 +470,27 @@ mod tests {
         op.dep_ids = deps.into_iter().collect();
         op.cycle = cycle;
         op
+    }
+
+    /// A chain where each input dies as the next value is written: the cycle count holds two
+    /// values at every step, the phase count one (same-cycle reuse), so at a one-vector budget
+    /// only `Phase` accepts it.
+    #[test]
+    fn test_sections_exceeding_budget_phase_reuses_words_read_in_the_cycle() {
+        use crate::cpsat_scheduler::ScratchTime;
+        let v: Vec<VReg> = (0..3).map(VReg::vector).collect();
+        let ops = vec![
+            make_op_with_cycle(0, Engine::Valu, Opcode::Vbroadcast, Some(v[0]), vec![], vec![], 0),
+            make_op_with_cycle(1, Engine::Valu, Opcode::Add, Some(v[1]), vec![Operand::VReg(v[0]), Operand::VReg(v[0])], vec![0], 1),
+            make_op_with_cycle(2, Engine::Valu, Opcode::Add, Some(v[2]), vec![Operand::VReg(v[1]), Operand::VReg(v[1])], vec![1], 2),
+            make_op_with_cycle(3, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(0), Operand::VReg(v[2])], vec![2], 3),
+        ];
+        let cycle = sections_exceeding_budget_with(&ops, 8, None, None, ScratchTime::Cycle);
+        let phase = sections_exceeding_budget_with(&ops, 8, None, None, ScratchTime::Phase);
+        assert_eq!(cycle.section_peaks, vec![16]);
+        assert_eq!(phase.section_peaks, vec![8]);
+        assert_eq!(phase.section_exceeds_budget, vec![false]);
+        assert_eq!(sections_exceeding_budget(&ops, 8, None, None).section_peaks, vec![16]);
     }
 
     #[test]
