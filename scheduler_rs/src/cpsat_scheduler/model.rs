@@ -409,13 +409,6 @@ pub fn schedule_ssa_cpsat(
     let flow_cap: i64 = machine.flow_slots as i64;
     let greedy_hints = hints.greedy_hints;
     let shift_hints = hints.shift_hints;
-    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per lane.
-    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
-        hints
-            .shifted_lane_cycle_hints
-            .and_then(|m| m.get(&op_id))
-            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
-    };
     let forced_shifts = hints.forced_shifts;
     let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
@@ -591,6 +584,20 @@ pub fn schedule_ssa_cpsat(
         tighter_alap
     } else {
         alap
+    };
+
+    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
+    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
+    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
+    // size and start hints), so what is hinted is exactly what the check counted.
+    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        let lo = *asap.get(&op_id).unwrap_or(&0);
+        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
+        hints
+            .shifted_lane_cycle_hints
+            .and_then(|m| m.get(&op_id))
+            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
+            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
     };
 
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
@@ -3542,9 +3549,10 @@ pub fn schedule_ssa_cpsat(
             }
             let lanes = hinted_lanes(ops[idx].id);
             for (lane, &alu_var) in times[idx].lanes().iter().enumerate() {
-                // A split shift hints each lane at its own cycle; otherwise all lanes run
-                // in the op's cycle.
-                let lane_hint = lanes.map_or(clamped, |l| (l[lane] as i64).max(lb).min(ub));
+                // A split shift hints each lane at its own cycle, unclamped: hinted_lanes
+                // only returns lanes inside the lane variables' domain, and the capacity
+                // check counted these exact cycles. Otherwise all lanes run in the op's cycle.
+                let lane_hint = lanes.map_or(clamped, |l| l[lane] as i64);
                 model.add_hint(alu_var, lane_hint);
             }
         }

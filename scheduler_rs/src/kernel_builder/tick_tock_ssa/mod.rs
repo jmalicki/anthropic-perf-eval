@@ -128,6 +128,28 @@ pub struct SsaTickTockKernelBuilder {
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
+/// Move every scheduled op of a section (barriers excluded) by `delta` cycles, together with
+/// the per-lane cycles of its split shift, if it has one, so the lanes stay where the op is.
+///
+/// # Arguments
+/// * `ops` - The section's ops
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts, keyed by op id
+/// * `delta` - Cycles to add
+pub(crate) fn translate_section_cycles(
+    ops: &mut [SsaOp],
+    shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
+    delta: i32,
+) {
+    for op in ops.iter_mut() {
+        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+            op.cycle += delta;
+            if let Some(lanes) = shifted_lane_cycles.get_mut(&op.id) {
+                lanes.iter_mut().for_each(|c| *c += delta);
+            }
+        }
+    }
+}
+
 fn scratch_write_size(op: &Op) -> usize {
     match op.engine {
         Engine::Valu => 8,
@@ -1063,11 +1085,11 @@ impl SsaTickTockKernelBuilder {
                     0
                 };
                 if span > 0 {
-                    for op in &mut ctx.ops[start..end] {
-                        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                            op.cycle = section_offset + (op.cycle - min_c);
-                        }
-                    }
+                    translate_section_cycles(
+                        &mut ctx.ops[start..end],
+                        &mut ctx.greedy_decisions.shifted_alu_cycles,
+                        section_offset - min_c,
+                    );
                 }
                 span
             };
@@ -1295,13 +1317,21 @@ impl SsaTickTockKernelBuilder {
                 }
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
-                        ctx.ops[filtered_global_indices[seg_idx]].cycle = section_offset + cycle;
+                        let op = &mut ctx.ops[filtered_global_indices[seg_idx]];
+                        op.cycle = section_offset + cycle;
+                        // Rescheduled without VALU shift: the greedy's lanes no longer apply.
+                        ctx.greedy_decisions.shifted_alu_cycles.remove(&op.id);
                     }
                 }
                 for &i in &global_indices {
                     if !filtered_global_set.contains(&i) && ctx.ops[i].cycle >= 0 {
-                        ctx.ops[i].cycle =
-                            section_offset + (ctx.ops[i].cycle - greedy_min_c);
+                        let delta = section_offset - greedy_min_c;
+                        ctx.ops[i].cycle += delta;
+                        if let Some(lanes) =
+                            ctx.greedy_decisions.shifted_alu_cycles.get_mut(&ctx.ops[i].id)
+                        {
+                            lanes.iter_mut().for_each(|c| *c += delta);
+                        }
                     }
                 }
                 this_section_makespan = Some(

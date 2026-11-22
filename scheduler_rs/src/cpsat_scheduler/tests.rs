@@ -4618,6 +4618,33 @@ mod tests {
         assert!(matches!(result, Ok(Some(_))));
     }
 
+    /// Lane cycles outside the lane variables' domain are not used: op 2's first four lanes
+    /// at cycle 0 precede its input (ASAP 1). The op is then read as a whole shift completing
+    /// in cycle 2, which with op 3 makes 16 scalar slots, and the hint verifier rejects it.
+    /// Counting the out-of-domain lanes while hinting them clamped into the domain would
+    /// verify one schedule and hint another.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_lanes_outside_domain_are_not_counted() {
+        let (ops, hints, shift_hints, _) = split_shift_hint_case();
+        let early_lanes: HashMap<usize, Vec<i32>> =
+            [(2, vec![0, 0, 0, 0, 2, 2, 2, 2])].into_iter().collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_ssa_cpsat(
+                &ops,
+                split_shift_hint_config(),
+                SsaCpsatHints {
+                    greedy_hints: Some(&hints),
+                    shift_hints: Some(&shift_hints),
+                    shifted_lane_cycle_hints: Some(&early_lanes),
+                    ..Default::default()
+                },
+                None,
+            )
+        }));
+        assert!(result.is_err(), "out-of-domain lanes must fall back to a whole shift");
+    }
+
     /// Test engine capacity: A shiftable VALU op shifted to ALU uses 8 slots.
     /// Create scenario with 1 shifted VALU (8 slots) + 4 ALU ops (4 slots) = 12 total.
     /// Should work with enable_valu_shift=true and shift_hints.

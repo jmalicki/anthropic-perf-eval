@@ -4369,3 +4369,25 @@ fn test_makespan_rows_keep_the_greedy_hint() {
         assert!(result.is_ok(), "{}r/{}: {:?}", rounds, batch, result.err());
     }
 }
+
+/// Rebasing a section moves a split shift's lane cycles with its op; barriers and
+/// unscheduled ops stay put.
+#[test]
+fn test_translate_section_cycles_moves_split_shift_lanes() {
+    let mut ops = vec![
+        make_test_ssa_op(0, Engine::Valu, Opcode::Add, Some(VReg::vector(0)), vec![], vec![]),
+        make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)), vec![], vec![]),
+        make_test_ssa_op(2, Engine::Flow, Opcode::Barrier, None, vec![], vec![]),
+        make_test_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![], vec![]),
+    ];
+    ops[0].cycle = 10;
+    ops[1].cycle = 11;
+    ops[2].cycle = 11;
+    ops[3].cycle = -1;
+    let mut lanes: HashMap<usize, Vec<i32>> =
+        [(1, vec![10, 10, 10, 10, 11, 11, 11, 11]), (9, vec![5; 8])].into_iter().collect();
+    translate_section_cycles(&mut ops, &mut lanes, -7);
+    assert_eq!(ops.iter().map(|o| o.cycle).collect::<Vec<_>>(), vec![3, 4, 11, -1]);
+    assert_eq!(lanes[&1], vec![3, 3, 3, 3, 4, 4, 4, 4]);
+    assert_eq!(lanes[&9], vec![5; 8], "lanes of ops outside the section do not move");
+}
