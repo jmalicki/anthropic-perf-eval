@@ -634,6 +634,11 @@ impl SsaTickTockKernelBuilder {
     /// Build the kernel, returning an `SsaProgram` with all emission artifacts.
     pub fn build(&mut self) -> SsaProgram {
         self.build_internal();
+        assert!(
+            self.emit.next_mem_loc.is_none(),
+            "BUG: memory location {:?} set but no memory op emitted after it",
+            self.emit.next_mem_loc
+        );
         SsaProgram {
             vreg_def: std::mem::take(&mut self.emit.vreg_def),
             const_alternatives: self.emit.take_const_alternatives(),
@@ -1119,6 +1124,10 @@ impl SsaTickTockKernelBuilder {
                     .map(|&i| {
                         let mut op = ctx.ops[i].clone();
                         op.dep_ids.retain(|id| segment_op_ids.contains(id));
+                        // Memory edges from an earlier section hold already: sections are
+                        // placed one after another (`section_offset`), so the source runs
+                        // in an earlier cycle than any op of this one.
+                        op.mem_deps.retain(|(id, _)| segment_op_ids.contains(id));
                         op
                     })
                     .collect();

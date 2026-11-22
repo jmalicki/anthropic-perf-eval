@@ -4516,3 +4516,32 @@ fn test_pools_greedy_same_schedule_when_pools_do_not_bind() {
     let cycles = |ops: &[SsaOp]| ops.iter().map(|op| op.cycle).collect::<Vec<_>>();
     assert_eq!(cycles(&words.ops), cycles(&pools.ops));
 }
+
+/// The greedy scheduler respects kept memory edges: a load after a store to its word runs at
+/// least one cycle later (RAW), a store over a word read earlier runs no earlier than the
+/// read (WAR, latency 0), and two stores to one word are a cycle apart (WAW). Without the
+/// edges the second load would be ready in the store's cycle.
+#[test]
+fn test_greedy_respects_memory_edges() {
+    use crate::kernel_builder::memory_deps::{compute_memory_dependencies, test_programs::store_load_same_word};
+
+    let (mut ops, ix) = store_load_same_word();
+    let stats = compute_memory_dependencies(&mut ops).unwrap();
+    assert_eq!(stats.kept, 3);
+    let mut shifted_ops = HashSet::new();
+    schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted_ops, 1536).unwrap();
+    let c = |i: usize| ops[i].cycle;
+    assert!(c(ix.store_word0) >= c(ix.load_before), "WAR: {} < {}", c(ix.store_word0), c(ix.load_before));
+    assert!(c(ix.load_after) >= c(ix.store_word0) + 1, "RAW: {} vs {}", c(ix.load_after), c(ix.store_word0));
+    assert!(c(ix.last_store) >= c(ix.first_store) + 1, "WAW: {} vs {}", c(ix.last_store), c(ix.first_store));
+
+    // Control: without the memory edges the second load is not held back by the store.
+    let (mut free, _) = store_load_same_word();
+    schedule_ssa_greedy_with_shift_budget(&mut free, false, &mut HashSet::new(), 1536).unwrap();
+    assert!(
+        free[ix.load_after].cycle <= free[ix.store_word0].cycle,
+        "the test needs a program where the RAW edge binds: load {} store {}",
+        free[ix.load_after].cycle,
+        free[ix.store_word0].cycle
+    );
+}

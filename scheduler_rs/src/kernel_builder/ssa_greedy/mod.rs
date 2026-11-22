@@ -34,6 +34,8 @@ pub mod wavefront;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use crate::kernel_builder::memory_deps::{check_memory_edges, memory_predecessors, memory_successors};
+
 use crate::types::{
     ConstChoiceEncoding, EmissionPhase, Engine, LiveInterval, Opcode, Operand, PrecedenceOffset,
     SelectChoiceEncoding, SsaOp, VReg, VLEN,
@@ -1546,6 +1548,8 @@ fn schedule_ssa_greedy_shaped_once(
         shape,
         shifted_lane_cycles,
     )?;
+    // Memory edges are enforced by readiness; check the result (free when there are none).
+    check_memory_edges(ops, |idx| ops[idx].cycle).map_err(|e| format!("greedy schedule: {}", e))?;
     check_liveness_agreement(ops, vector_group_lanes, shifted_lane_cycles, &trace, result)
 }
 
@@ -1640,6 +1644,33 @@ fn check_liveness_agreement(
         }
     }
     Ok((result, agreement))
+}
+
+/// Record that op `idx` was placed at `cycle` for its memory-edge successors: raise each
+/// one's ready cycle by the edge latency, and push it onto the ready heap once nothing else
+/// holds it back. The memory-edge counterpart of the `consumers` loops in
+/// `schedule_ssa_greedy_core`.
+fn release_memory_successors(
+    successors: &[(usize, i32)],
+    cycle: i32,
+    ops: &[SsaOp],
+    bounds_usage: &GreedyBoundsUsage,
+    max_ready_cycle: &mut [i32],
+    remaining_deps: &mut [usize],
+    ready_heap: &mut BinaryHeap<Reverse<(i32, usize)>>,
+) {
+    for &(target, latency) in successors {
+        max_ready_cycle[target] = max_ready_cycle[target].max(cycle + latency);
+        remaining_deps[target] -= 1;
+        if remaining_deps[target] == 0 {
+            let priority = bounds_usage
+                .core_bounds()
+                .and_then(|(a, _)| a.get(&ops[target].id).copied())
+                .map(|lb| max_ready_cycle[target].max(lb))
+                .unwrap_or(max_ready_cycle[target]);
+            ready_heap.push(Reverse((priority, target)));
+        }
+    }
 }
 
 fn schedule_ssa_greedy_core(
@@ -1886,6 +1917,13 @@ fn schedule_ssa_greedy_core(
             }
         }
     }
+    // Memory ordering edges (`mem_deps`): (target index, latency) per source, and
+    // (source index, latency) per target. Kept apart from `consumers`, which is VReg data
+    // flow (the wavefront groups and the liveness counts read it); they only gate readiness.
+    // A latency-0 (WAR) target is never placed in its source's cycle here: ready ops are
+    // collected before any op of the cycle is placed, so it lands one cycle later or more.
+    let mem_successors = memory_successors(ops, &id_to_idx);
+    let mem_predecessors = memory_predecessors(ops, &id_to_idx);
 
     // Wavefront priority: per-op keys and the window of chains allowed to run.
     let mut wavefront: Option<Wavefront> = match shape.priority {
@@ -1922,6 +1960,10 @@ fn schedule_ssa_greedy_core(
                     !dead_store_indices.contains(&dep_idx)
                 })
                 .count()
+                + mem_predecessors[_op_idx]
+                    .iter()
+                    .filter(|(src, _)| !dead_store_indices.contains(src))
+                    .count()
         })
         .collect();
 
@@ -2059,6 +2101,9 @@ fn schedule_ssa_greedy_core(
                         let offset = result_latency(ops, dep_idx);
                         ops[dep_idx].cycle + offset <= cycle as i32
                     })
+            }) && mem_predecessors[idx].iter().all(|&(src, latency)| {
+                dead_store_indices.contains(&src)
+                    || (ops[src].cycle >= 0 && ops[src].cycle + latency <= cycle as i32)
             });
 
             // Wavefront window: a chain beyond the in-flight window waits for an earlier chain
@@ -2129,6 +2174,15 @@ fn schedule_ssa_greedy_core(
                     ready_heap.push(Reverse((priority, consumer_idx)));
                 }
             }
+            release_memory_successors(
+                &mem_successors[idx],
+                cycle as i32,
+                ops,
+                bounds_usage,
+                &mut max_ready_cycle,
+                &mut remaining_deps,
+                &mut ready_heap,
+            );
         }
 
         // Helper: compute LUC (Last-Use-Count) for an op - count of source VRegs
@@ -2645,6 +2699,15 @@ fn schedule_ssa_greedy_core(
                         ready_heap.push(Reverse((priority, consumer_idx)));
                     }
                 }
+                release_memory_successors(
+                    &mem_successors[idx],
+                    cycle as i32,
+                    ops,
+                    bounds_usage,
+                    &mut max_ready_cycle,
+                    &mut remaining_deps,
+                    &mut ready_heap,
+                );
             }
         }
 
@@ -2824,6 +2887,15 @@ fn schedule_ssa_greedy_core(
                         ready_heap.push(Reverse((priority, consumer_idx)));
                     }
                 }
+                release_memory_successors(
+                    &mem_successors[force_idx],
+                    cycle as i32,
+                    ops,
+                    bounds_usage,
+                    &mut max_ready_cycle,
+                    &mut remaining_deps,
+                    &mut ready_heap,
+                );
             } else {
                 // No slot this cycle: back with the other deferred ops for the next one.
                 // (Dropping it here left the op unscheduled forever.)
@@ -3057,6 +3129,15 @@ pub(super) fn schedule_ssa_greedy_with_shift_impl(
                         };
                         let dep_cycle = ops[dep_idx].cycle;
                         dep_cycle >= 0 && dep_cycle < cycle as i32
+                    })
+                    // Memory edges: source placed in an earlier cycle (at least the edge
+                    // latency, which is at most 1)
+                    && op.mem_deps.iter().all(|(src_id, _)| {
+                        let Some(&src_idx) = id_to_idx.get(src_id) else {
+                            return true;
+                        };
+                        let src_cycle = ops[src_idx].cycle;
+                        src_cycle >= 0 && src_cycle < cycle as i32
                     })
             })
             .map(|(idx, _)| idx)

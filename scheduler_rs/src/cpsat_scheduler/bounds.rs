@@ -85,6 +85,26 @@ pub(crate) fn diagnose_precedence_bounds(
                 }
             }
         }
+        // Memory edges, with their own latency
+        for &(src_id, kind) in &succ_op.mem_deps {
+            if !id_to_idx.contains_key(&src_id) {
+                continue;
+            }
+            let latency = kind.latency();
+            let pred_asap = *asap.get(&src_id).unwrap_or(&0);
+            let succ_asap = *asap.get(&succ_op.id).unwrap_or(&0);
+            let pred_alap = *alap.get(&src_id).unwrap_or(&0);
+            let succ_alap = *alap.get(&succ_op.id).unwrap_or(&0);
+            if succ_asap < pred_asap + latency || pred_alap > succ_alap - latency {
+                violation_count += 1;
+                if samples.len() < 3 {
+                    samples.push(format!(
+                        "Memory {} edge violation: op[{}](asap={}, alap={}) → op[{}](asap={}, alap={}), latency {}",
+                        kind.as_str(), src_id, pred_asap, pred_alap, succ_op.id, succ_asap, succ_alap, latency
+                    ));
+                }
+            }
+        }
     }
 
     // Check domain consistency
@@ -632,7 +652,8 @@ pub struct SsaCpsatResult {
 }
 
 /// Compute ASAP (As Soon As Possible) cycle for each SSA op.
-/// Uses the RAW-only dependencies from dep_ids, with per-edge precedence offsets.
+/// Uses the RAW dependencies from dep_ids, with per-edge precedence offsets, and the memory
+/// edges from mem_deps, with their own latency (0 for WAR).
 ///
 /// # Arguments
 /// * `ops` - SSA operations to compute bounds for
@@ -649,13 +670,13 @@ pub fn compute_ssa_asap(ops: &[SsaOp], shiftable_set: &HashSet<usize>) -> HashMa
         .collect();
 
     for op in ops {
-        in_degree.insert(op.id, op.dep_ids.len());
+        in_degree.insert(op.id, op.dep_ids.len() + op.mem_deps.len());
     }
 
     // Start with ops that have no dependencies
     let mut queue: VecDeque<usize> = VecDeque::new();
     for op in ops {
-        if op.dep_ids.is_empty() {
+        if op.dep_ids.is_empty() && op.mem_deps.is_empty() {
             queue.push_back(op.id);
             asap.insert(op.id, 0);
         }
@@ -668,6 +689,8 @@ pub fn compute_ssa_asap(ops: &[SsaOp], shiftable_set: &HashSet<usize>) -> HashMa
             successors.entry(dep_id).or_default().push(op.id);
         }
     }
+    // Memory edges: successor id and edge latency, by source id
+    let mem_successors = memory_successors_by_id(ops);
 
     // Process in topological order
     while let Some(op_id) = queue.pop_front() {
@@ -677,25 +700,36 @@ pub fn compute_ssa_asap(ops: &[SsaOp], shiftable_set: &HashSet<usize>) -> HashMa
         // Offset is determined by the predecessor (this op): how many cycles until its result is visible
         let offset = ops[pred_idx].precedence_offset_for_asap(pred_is_shiftable);
 
-        if let Some(succs) = successors.get(&op_id) {
-            for &succ_id in succs {
-                let new_asap = my_asap + offset;
-                let current = asap.entry(succ_id).or_insert(0);
-                if new_asap > *current {
-                    *current = new_asap;
-                }
+        let data_succs = successors.get(&op_id).into_iter().flatten().map(|&s| (s, offset));
+        let mem_succs = mem_successors.get(&op_id).into_iter().flatten().copied();
+        for (succ_id, offset) in data_succs.chain(mem_succs) {
+            let new_asap = my_asap + offset;
+            let current = asap.entry(succ_id).or_insert(0);
+            if new_asap > *current {
+                *current = new_asap;
+            }
 
-                if let Some(deg) = in_degree.get_mut(&succ_id) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(succ_id);
-                    }
+            if let Some(deg) = in_degree.get_mut(&succ_id) {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push_back(succ_id);
                 }
             }
         }
     }
 
     asap
+}
+
+/// Memory-edge successors by source op id: `(target id, latency)`, in op order.
+fn memory_successors_by_id(ops: &[SsaOp]) -> HashMap<usize, Vec<(usize, i32)>> {
+    let mut succ: HashMap<usize, Vec<(usize, i32)>> = HashMap::new();
+    for op in ops {
+        for &(src_id, kind) in &op.mem_deps {
+            succ.entry(src_id).or_default().push((op.id, kind.latency()));
+        }
+    }
+    succ
 }
 
 /// Compute ALAP (As Late As Possible) cycle for each SSA op.
@@ -726,17 +760,27 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32, shiftable_set: &HashSet<usi
             }
         }
     }
+    // Memory-edge successors count towards the out-degree like data consumers.
+    let mut mem_out: HashMap<usize, usize> = HashMap::new();
+    for op in ops {
+        for &(src_id, _) in &op.mem_deps {
+            if consumers.contains_key(&src_id) {
+                *mem_out.entry(src_id).or_insert(0) += 1;
+            }
+        }
+    }
 
     // Build out-degree
     let mut out_degree: HashMap<usize, usize> = HashMap::new();
     for op in ops {
-        out_degree.insert(op.id, consumers.get(&op.id).map(|c| c.len()).unwrap_or(0));
+        let data = consumers.get(&op.id).map(|c| c.len()).unwrap_or(0);
+        out_degree.insert(op.id, data + mem_out.get(&op.id).copied().unwrap_or(0));
     }
 
     // Start with sinks (ops with no consumers)
     let mut queue: VecDeque<usize> = VecDeque::new();
     for op in ops {
-        if consumers.get(&op.id).map(|c| c.is_empty()).unwrap_or(true) {
+        if out_degree.get(&op.id).copied().unwrap_or(0) == 0 {
             queue.push_back(op.id);
             alap.insert(op.id, horizon - 1);
         }
@@ -772,6 +816,23 @@ pub fn compute_ssa_alap(ops: &[SsaOp], horizon: i32, shiftable_set: &HashSet<usi
                     }
                 }
             }
+            // Memory edges: the source must run `latency` cycles before this op.
+            for &(src_id, kind) in &op.mem_deps {
+                if !id_to_idx.contains_key(&src_id) {
+                    continue;
+                }
+                let new_alap = my_alap - kind.latency();
+                let current = alap.entry(src_id).or_insert(horizon - 1);
+                if new_alap < *current {
+                    *current = new_alap;
+                }
+                if let Some(deg) = out_degree.get_mut(&src_id) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(src_id);
+                    }
+                }
+            }
         }
     }
 
@@ -788,11 +849,11 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
     let mut in_degree: HashMap<usize, usize> = HashMap::new();
     let id_to_idx: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
     for op in ops {
-        in_degree.insert(op.id, op.dep_ids.len());
+        in_degree.insert(op.id, op.dep_ids.len() + op.mem_deps.len());
     }
     let mut queue: VecDeque<usize> = VecDeque::new();
     for op in ops {
-        if op.dep_ids.is_empty() {
+        if op.dep_ids.is_empty() && op.mem_deps.is_empty() {
             queue.push_back(op.id);
             max_asap.insert(op.id, 0);
         }
@@ -803,23 +864,25 @@ pub fn compute_max_latency_critical_path(ops: &[SsaOp], shiftable_set: &HashSet<
             successors.entry(dep_id).or_default().push(op.id);
         }
     }
+    // Memory edges keep their own latency (no max-delay variant: memory ops are not shifted)
+    let mem_successors = memory_successors_by_id(ops);
     while let Some(op_id) = queue.pop_front() {
         let my_asap = *max_asap.get(&op_id).unwrap_or(&0);
         let pred_idx = id_to_idx[&op_id];
         let pred_is_shiftable = shiftable_set.contains(&pred_idx);
         let offset = ops[pred_idx].precedence_offset_for_alap(pred_is_shiftable);
-        if let Some(succs) = successors.get(&op_id) {
-            for &succ_id in succs {
-                let new_asap = my_asap + offset;
-                let current = max_asap.entry(succ_id).or_insert(0);
-                if new_asap > *current {
-                    *current = new_asap;
-                }
-                if let Some(deg) = in_degree.get_mut(&succ_id) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(succ_id);
-                    }
+        let data_succs = successors.get(&op_id).into_iter().flatten().map(|&s| (s, offset));
+        let mem_succs = mem_successors.get(&op_id).into_iter().flatten().copied();
+        for (succ_id, offset) in data_succs.chain(mem_succs) {
+            let new_asap = my_asap + offset;
+            let current = max_asap.entry(succ_id).or_insert(0);
+            if new_asap > *current {
+                *current = new_asap;
+            }
+            if let Some(deg) = in_degree.get_mut(&succ_id) {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push_back(succ_id);
                 }
             }
         }
@@ -1597,6 +1660,7 @@ pub(crate) fn fix_precedence_bounds_fixpoint(
             successors.entry(dep_id).or_default().push(op.id);
         }
     }
+    let mem_successors = memory_successors_by_id(ops);
 
     let max_iters = ops.len();
     for _ in 0..max_iters {
@@ -1619,6 +1683,14 @@ pub(crate) fn fix_precedence_bounds_fixpoint(
                     }
                 }
             }
+            for &(succ_id, latency) in mem_successors.get(&op.id).into_iter().flatten() {
+                let required = pred_asap + latency;
+                let current = current_asap.entry(succ_id).or_insert(0);
+                if required > *current {
+                    *current = required;
+                    changed = true;
+                }
+            }
         }
 
         // Backward pass: propagate ALAP decreases (reverse iteration)
@@ -1631,6 +1703,18 @@ pub(crate) fn fix_precedence_bounds_fixpoint(
                 let succ_alap = *current_alap.get(&op.id).unwrap_or(&0);
                 let required = succ_alap - offset;
                 let current = current_alap.entry(dep_id).or_insert(required);
+                if required < *current {
+                    *current = required;
+                    changed = true;
+                }
+            }
+            for &(src_id, kind) in &op.mem_deps {
+                if !id_to_idx.contains_key(&src_id) {
+                    continue;
+                }
+                let succ_alap = *current_alap.get(&op.id).unwrap_or(&0);
+                let required = succ_alap - kind.latency();
+                let current = current_alap.entry(src_id).or_insert(required);
                 if required < *current {
                     *current = required;
                     changed = true;

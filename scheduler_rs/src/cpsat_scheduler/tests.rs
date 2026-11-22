@@ -6661,3 +6661,40 @@ mod tuning_alap_shift_tests {
         }
     }
 }
+
+/// CP-SAT respects kept memory edges, and a WAR edge allows the same cycle: in the 6-cycle
+/// optimum of the store/load program the store over word 0 runs in the cycle of the earlier
+/// load of word 0 (it must, or the RAW-ordered second load chain needs 7 cycles), the second
+/// load runs one cycle after the store, and the two stores to word 1 are a cycle apart.
+#[cfg(all(test, feature = "cpsat"))]
+mod memory_edge_tests {
+    use super::*;
+    use crate::kernel_builder::memory_deps::{compute_memory_dependencies, test_programs::store_load_same_word};
+
+    #[test]
+    fn test_cpsat_respects_memory_edges_war_same_cycle() {
+        let (mut ops, ix) = store_load_same_word();
+        assert_eq!(compute_memory_dependencies(&mut ops).unwrap().kept, 3);
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 60.0,
+                verbose: false,
+                stop_after_first_solution: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        )
+        .unwrap()
+        .expect("CP-SAT finds a schedule");
+        let c = |i: usize| result.cycle_assignments[i];
+        assert_eq!(result.makespan, 6, "cycles: {:?}", result.cycle_assignments);
+        assert_eq!(c(ix.store_word0), c(ix.load_before), "WAR allows the same cycle: {:?}", result.cycle_assignments);
+        assert_eq!(c(ix.load_after), c(ix.store_word0) + 1, "RAW: {:?}", result.cycle_assignments);
+        assert!(c(ix.last_store) >= c(ix.first_store) + 1, "WAW: {:?}", result.cycle_assignments);
+    }
+}

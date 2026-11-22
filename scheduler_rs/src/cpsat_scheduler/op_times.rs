@@ -25,6 +25,7 @@
 //! | read latency | 1 on the multiply-add path of any select (it reads its operands at c+1), else 0 | same |
 //! | last read end | exec end + 1 + read latency | same |
 //! | finish | completion when shifted, multiply_add cycle on the FMA path, else `c_o` | |
+//! | memory access | `c_o` (memory ops are never shifted and never selects) | the cycle |
 //!
 //! # Mode invariants
 //!
@@ -439,6 +440,14 @@ impl OpTimes {
         self.exec_end() + 1 + self.result_latency()
     }
 
+    /// Cycle in which a memory op reads or writes main memory: its issue cycle. Memory ops
+    /// (load, vload, store, vstore) run on the load and store engines, are never shifted and
+    /// are never selects, so the issue cycle is their only representation.
+    pub(crate) fn memory_access(&self) -> LinearExpr {
+        debug_assert!(self.shift.is_none() && self.select.is_none());
+        LinearExpr::from(self.issue)
+    }
+
     /// [`Self::visible`] with the result latency given as an equal expression (an auxiliary
     /// variable fixed to the multiply-add literal).
     pub(crate) fn visible_with_latency(&self, latency: LinearExpr) -> LinearExpr {
@@ -684,6 +693,11 @@ impl<'a> ScheduledTimes<'a> {
     /// Cycle after the last read of the op's operands.
     pub(crate) fn last_read_end(&self, idx: usize) -> i32 {
         self.exec_end(idx) + 1 + i32::from(self.on_fma_path(idx))
+    }
+
+    /// Cycle in which memory op `idx` reads or writes main memory (its cycle).
+    pub(crate) fn memory_access(&self, idx: usize) -> i32 {
+        self.cycle(idx)
     }
 }
 

@@ -8,7 +8,7 @@
 //! budget model counts one VReg per ConstChoice op; scratch usage is the same whether
 //! we later lower to Load or AddImm, so no extra logic is needed there.
 
-use crate::types::{EmissionPhase, Opcode, VarType, VLEN};
+use crate::types::{EmissionPhase, MemLocation, MemRegion, Opcode, VarType, VLEN};
 
 use super::config::{
     level_last_index, merged_hash_stage_constants, IndexForm, HASH_STAGES, MERGED_HASH_STAGE,
@@ -259,12 +259,16 @@ impl SsaTickTockKernelBuilder {
         // Load pointers from memory (addresses 4, 5, 6, 7)
         // Note: n_nodes_s not needed in SSA version (was only for v_nn which is unused)
         self.emit.set_next_var_type(VarType::Pointer);
+        self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Header, 4));
         self.ctx.forest_p = Some(self.emit.emit_load_imm(4));
         self.emit.set_next_var_type(VarType::Pointer);
+        self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Header, 5));
         self.ctx.idx_p = Some(self.emit.emit_load_imm(5));
         self.emit.set_next_var_type(VarType::Pointer);
+        self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Header, 6));
         self.ctx.val_p = Some(self.emit.emit_load_imm(6));
         self.emit.set_next_var_type(VarType::Pointer);
+        self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Header, 7));
         self.ctx.extra_room_p = Some(self.emit.emit_load_imm(7));
 
         // Partition buffer offsets
@@ -327,6 +331,7 @@ impl SsaTickTockKernelBuilder {
                 .emit_alu(Opcode::Add, forest_p, self.ctx.c[i].unwrap());
             self.ctx.tc_addr[i] = Some(addr);
             self.emit.set_next_var_type(VarType::TreeCache);
+            self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Tree, i as i64));
             self.ctx.tc[i] = Some(self.emit.emit_load(addr));
         }
 
@@ -423,6 +428,7 @@ impl SsaTickTockKernelBuilder {
                 .emit
                 .emit_alu(Opcode::Add, forest_p, self.ctx.c_r3[i].unwrap());
             self.ctx.tc_r3_addr[i] = Some(addr);
+            self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Tree, 7 + i as i64));
             self.ctx.tc_r3[i] = Some(self.emit.emit_load(addr));
         }
 
@@ -483,6 +489,7 @@ impl SsaTickTockKernelBuilder {
                 let addr = self.emit.emit_alu(Opcode::Add, forest_p, self.ctx.c_r4[i].unwrap());
                 self.ctx.tc_r4_addr[i] = Some(addr);
                 self.emit.set_next_var_type(VarType::TreeCache);
+                self.emit.set_next_mem_loc(MemLocation::word(MemRegion::Tree, 15 + i as i64));
                 self.ctx.tc_r4[i] = Some(self.emit.emit_load(addr));
             }
 
@@ -573,9 +580,11 @@ impl SsaTickTockKernelBuilder {
             let val_addr = self.emit.emit_alu(Opcode::Add, val_p, off);
             if let Some(idx_addr) = idx_addr {
                 self.emit.set_next_var_type(VarType::BatchData);
+                self.emit.set_next_mem_loc(MemLocation::block(MemRegion::Indices, offset, VLEN as u32));
                 self.ctx.all_idx[g] = Some(self.emit.emit_vload(idx_addr));
             }
             self.emit.set_next_var_type(VarType::BatchData);
+            self.emit.set_next_mem_loc(MemLocation::block(MemRegion::Values, offset, VLEN as u32));
             self.ctx.all_val[g] = Some(self.emit.emit_vload(val_addr));
         }
 
@@ -620,8 +629,10 @@ impl SsaTickTockKernelBuilder {
             self.emit.set_next_var_type(VarType::Address);
             let val_addr = self.emit.emit_alu(Opcode::Add, val_p, off);
             if let (Some(idxs), Some(idx_addr)) = (store_data_idxs, idx_addr) {
+                self.emit.set_next_mem_loc(MemLocation::block(MemRegion::Indices, offset, VLEN as u32));
                 self.emit.emit_vstore(idx_addr, idxs[g]);
             }
+            self.emit.set_next_mem_loc(MemLocation::block(MemRegion::Values, offset, VLEN as u32));
             self.emit.emit_vstore(val_addr, store_data_vals[g]);
         }
     }
@@ -1202,9 +1213,12 @@ impl SsaTickTockKernelBuilder {
                 self.emit.set_next_var_type(VarType::Temporary);
                 let (v_nv, result_elements) = self.emit.fresh_vector_group();
 
-                // Scalar loads from each computed address
+                // Scalar loads from each computed address: tree node idx[elem], which lies in
+                // [0, n_nodes) (the problem keeps every index inside the tree).
+                let n_nodes = self.config.spec.n_nodes as i64;
                 for elem in 0..VLEN {
                     self.emit.set_next_var_type(VarType::Temporary);
+                    self.emit.set_next_mem_loc(MemLocation::word_in(MemRegion::Tree, 0, n_nodes));
                     self.emit.emit_load_into(addr_elements[elem], result_elements[elem]);
                 }
 
@@ -1495,7 +1509,13 @@ impl SsaTickTockKernelBuilder {
                 eprintln!("[DEBUG emit_partition_stores] g={}: vstore(idx_addr={:?}, idx={:?}), vstore(val_addr={:?}, val={:?})",
                     g, idx_addr, idx_vreg, val_addr, val_vreg);
             }
+            // Extra room: indices of group g at word g * VLEN, values at batch_size + g * VLEN
+            // (partition_val_offset).
+            let idx_word = (g * VLEN) as i64;
+            let val_word = (self.config.spec.batch_size + g * VLEN) as i64;
+            self.emit.set_next_mem_loc(MemLocation::block(MemRegion::ExtraRoom, idx_word, VLEN as u32));
             self.emit.emit_vstore(idx_addr, idx_vreg);
+            self.emit.set_next_mem_loc(MemLocation::block(MemRegion::ExtraRoom, val_word, VLEN as u32));
             self.emit.emit_vstore(val_addr, val_vreg);
 
             // Increment addresses for next group
