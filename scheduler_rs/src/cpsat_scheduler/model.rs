@@ -20,7 +20,7 @@ use super::symmetry_ordering::SymmetryOrdering;
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
     ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
-    OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
+    OptionalConstraintGroup, SelectChoiceMode, SymmetryRows, ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
@@ -173,6 +173,9 @@ pub(crate) fn build_sat_parameters(
     params.cp_model_presolve = Some(true);
     params.cp_model_probing_level = Some(tuning.probing_level);
     params.randomize_search = Some(true);
+    if let Some(seed) = tuning.random_seed {
+        params.random_seed = Some(seed);
+    }
     // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
     // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
     // shaving, lb_tree_search and objective_lb_search workers in this mode; turning it off
@@ -591,7 +594,10 @@ pub fn schedule_ssa_cpsat(
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering() {
+    // With checked symmetry rows the emission-declared ordering is not trusted, here either.
+    let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering()
+        && tuning.symmetry_rows != SymmetryRows::Checked
+    {
         Some(SymmetryOrdering::from_bounds(
             ops,
             &current_asap,
@@ -789,6 +795,25 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // 2d. Checked symmetry rows: find the orbits of identical vector groups and give
+    // corresponding ops of an orbit one domain (group_symmetry.rs), so that every swap within
+    // an orbit is an automorphism of the model.
+    let group_orbits = if tuning.symmetry_rows == SymmetryRows::Checked {
+        let orbits = super::group_symmetry::group_orbits(ops, hints.vector_group_lanes, cse_groups.unwrap_or(&[]));
+        super::group_symmetry::symmetric_domains(ops, &orbits, &mut [&mut final_asap, &mut final_alap]);
+        Some(orbits)
+    } else {
+        None
+    };
+    let (asap, alap) = match &group_orbits {
+        Some(orbits) => {
+            let (mut asap, mut alap) = (asap, alap);
+            super::group_symmetry::symmetric_domains(ops, orbits, &mut [&mut asap, &mut alap]);
+            (asap, alap)
+        }
+        None => (asap, alap),
+    };
+
     // 3. Build the CP model
     let mut model = CpModelBuilder::default();
     if let Some(name) = &model_name {
@@ -884,7 +909,7 @@ pub fn schedule_ssa_cpsat(
 
     // 5b. Symmetry breaking (ordering groups): use the canonical ordering built earlier.
     // Validate that final bounds are consistent with the ordering, then add cycle[i] <= cycle[j].
-    {
+    if tuning.symmetry_rows == SymmetryRows::Declared {
         let ordering_pairs: Vec<(usize, usize)> = if let Some(ref ord) = symmetry_ordering {
             ord.validate_bounds(ops, &final_asap, &final_alap, greedy_hints);
             ord.ordering_pairs()
@@ -908,7 +933,7 @@ pub fn schedule_ssa_cpsat(
     // 5c. Symmetry breaking (lexicographic streams): for each stream_key, items ordered by item_key
     // get first_op[item_i] <= first_op[item_{i+1}]. When greedy hints are available, order items
     // by greedy cycle of their first op so constraints match the hint. Verify domain consistency.
-    {
+    if tuning.symmetry_rows == SymmetryRows::Declared {
         use std::collections::{BTreeMap, HashMap};
         let mut streams: HashMap<Vec<i64>, BTreeMap<i64, Vec<usize>>> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
@@ -972,6 +997,46 @@ pub fn schedule_ssa_cpsat(
                 "  Symmetry breaking (lex streams): {} streams, {} constraints (order from {})",
                 n_streams, lex_constraints, lex_source
             );
+        }
+    }
+
+    // 5e. Checked symmetry rows: in each orbit of identical groups, the anchor ops' issue
+    // cycles in a chain, groups ordered by the anchor's greedy cycle so the hint satisfies it.
+    if let Some(orbits) = &group_orbits {
+        let mut rows = 0usize;
+        for o in 0..orbits.orbits.len() {
+            let Some(anchor) = super::group_symmetry::anchor_position(ops, orbits, o, &shiftable_set) else {
+                continue;
+            };
+            let mut members: Vec<(i32, usize, usize)> = orbits.orbits[o]
+                .iter()
+                .map(|&g| {
+                    let idx = orbits.groups[g][anchor];
+                    (greedy_hints.and_then(|h| h.get(idx).copied()).unwrap_or(0), g, idx)
+                })
+                .collect();
+            members.sort();
+            for w in members.windows(2) {
+                let c = model.add_le(times[w[0].2].issue(), times[w[1].2].issue());
+                model.set_constraint_name(c, &format!("group_sym_{}_{}_{}", o, w[0].1, w[1].1));
+                rows += 1;
+            }
+        }
+        // Declared rows, classified against the orbits (for the record; none are added).
+        let declared = super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints);
+        let (justified, same_group, other) = super::group_symmetry::classify_pairs(orbits, &declared);
+        let sizes: Vec<usize> = orbits.orbits.iter().map(Vec::len).collect();
+        eprintln!(
+            "  Group symmetry: {} groups, orbits of sizes {:?}, {} chain rows; declared ordering pairs: {} justified by a group swap, {} within one group, {} other",
+            orbits.groups.len(),
+            sizes,
+            rows,
+            justified,
+            same_group,
+            other
+        );
+        for why in &orbits.rejections {
+            eprintln!("    not identical: {}", why);
         }
     }
 

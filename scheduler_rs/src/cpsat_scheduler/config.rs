@@ -195,6 +195,23 @@ pub enum MakespanRows {
     Bucketed,
 }
 
+/// Which symmetry-breaking ordering rows the model gets (`CpsatTuning::symmetry_rows`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymmetryRows {
+    /// The rows emission declares (`sym_ord_*` from `symmetry_hint.ordering_group`,
+    /// `sym_lex_*` from `symmetry_hint.lexicographic_stream`), unchecked (default).
+    #[default]
+    Declared,
+    /// No ordering rows.
+    None,
+    /// Only rows justified by a swap of structurally identical groups (`group_symmetry.rs`):
+    /// one anchor op per group, groups of an orbit in a chain. Replaces the declared rows and
+    /// the declared ordering in symmetry-aware tightening, and gives corresponding ops of an
+    /// orbit the same domain.
+    Checked,
+}
+
 /// Extra cumulative propagators CP-SAT can be asked to run (all off in CP-SAT by default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -295,6 +312,11 @@ pub struct CpsatTuning {
     pub probing_level: i32,
     /// Extra makespan lower-bound rows (default: none). See [`MakespanRows`].
     pub makespan_rows: MakespanRows,
+    /// Symmetry-breaking ordering rows (default: the ones emission declares). See [`SymmetryRows`].
+    pub symmetry_rows: SymmetryRows,
+    /// CP-SAT `random_seed` (default: `None`, CP-SAT's own default). A different seed gives a
+    /// different but still reproducible search, for repeating a measurement.
+    pub random_seed: Option<i32>,
 }
 
 impl Default for CpsatTuning {
@@ -316,6 +338,8 @@ impl Default for CpsatTuning {
             linearization_level: 2,
             probing_level: 2,
             makespan_rows: MakespanRows::None,
+            symmetry_rows: SymmetryRows::Declared,
+            random_seed: None,
         }
     }
 }

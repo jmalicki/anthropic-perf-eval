@@ -58,6 +58,7 @@ from .precedence_fixpoint import (
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
 from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
 from .makespan_rows import MAKESPAN_ROW_CHECKS, EXPECT_SAT as MAKESPAN_ROW_EXPECT_SAT
+from .group_symmetry import GROUP_SYMMETRY_CHECKS, EXPECT_SAT as GROUP_SYMMETRY_EXPECT_SAT
 
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
@@ -203,6 +204,8 @@ THEOREM_CHECKS += ALLOCATION_CHECKS
 
 # Soundness of the CP-SAT makespan rows (verification/makespan_rows.py).
 THEOREM_CHECKS += MAKESPAN_ROW_CHECKS
+# Group symmetry breaking (verification/group_symmetry.py).
+THEOREM_CHECKS += GROUP_SYMMETRY_CHECKS
 
 
 def _spec_url(theorem_id: str) -> str:
@@ -259,6 +262,7 @@ def run_verification(
             *REWRITE_EXPECT_SAT,
             *ALLOCATION_EXPECT_SAT,
             *MAKESPAN_ROW_EXPECT_SAT,
+            *GROUP_SYMMETRY_EXPECT_SAT,
         )
         # Special handling for multi-result theorems
         if name == "fixpoint-cascade-analysis":

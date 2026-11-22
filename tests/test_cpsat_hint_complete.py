@@ -67,6 +67,8 @@ def _export_model(tmp_path, extra):
         ["--rounds", "3", "--const-choice", "add_imm"],
         ["--rounds", "3", "--cpsat-makespan-interval"],
         ["--rounds", "3", "--cpsat-objective", "makespan"],
+        # Checked symmetry rows widen corresponding ops' domains and add group_sym rows.
+        ["--rounds", "4", "--cpsat-symmetry-rows", "checked"],
         # Scratch model pools: vector and scalar cumulatives, write groups as one vector.
         ["--rounds", "3", "--scratch-model", "pools"],
         ["--rounds", "5", "--scratch-model", "pools"],

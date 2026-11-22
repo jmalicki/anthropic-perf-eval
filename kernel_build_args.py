@@ -95,10 +95,12 @@ CPSAT_TUNING_OPTIONS = [
     ("cpsat_linearization_level", "linearization_level"),
     ("cpsat_probing_level", "probing_level"),
     ("cpsat_makespan_rows", "makespan_rows"),
+    ("cpsat_symmetry_rows", "symmetry_rows"),
+    ("cpsat_random_seed", "random_seed"),
 ]
 
 # Tuning keys whose value "none" is an enum variant, not "switched off" (JSON null).
-ENUM_TUNING_KEYS = {"makespan_rows"}
+ENUM_TUNING_KEYS = {"makespan_rows", "symmetry_rows"}
 
 CUMULATIVE_PROPAGATORS = ["overload_checker", "timetable_edge_finding", "hard_precedences"]
 
@@ -287,6 +289,14 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "energy rows from static longest-path heads and tails. bucketed: static plus "
                             "prefix-end/suffix-start variables per bucket of heads that follow the solution. "
                             "See scheduler_rs/src/cpsat_scheduler/makespan_rows.rs.")
+    group.add_argument("--cpsat-random-seed", type=int, default=None, metavar="N",
+                       help="CP-SAT random_seed (default: CP-SAT's own). Another seed gives another reproducible "
+                            "search, for repeating a measurement.")
+    group.add_argument("--cpsat-symmetry-rows", choices=["declared", "none", "checked"], default=None,
+                       help="Symmetry-breaking ordering rows (default: declared = the sym_ord/sym_lex rows emission "
+                            "declares, unchecked). none = no ordering rows. checked = only orderings justified by a "
+                            "swap of structurally identical vector groups (one anchor per group; "
+                            "scheduler_rs/src/cpsat_scheduler/group_symmetry.rs)")
     group.add_argument("--per-section-optimize-secs", type=float, default=None, metavar="SECS",
                        help="Per-section CP-SAT optimize time; 0 or omit = feasibility only")
     group.add_argument("--use-greedy", action="store_true",
