@@ -170,6 +170,7 @@ pub mod validation;
 pub mod bounds;
 pub mod model;
 pub(crate) mod symmetry_ordering;
+pub mod window;
 #[cfg(test)]
 mod tests;
 
@@ -190,6 +191,7 @@ pub use bounds::{
 #[cfg(feature = "cpsat")]
 pub use bounds::compute_ssa_asap_alap_bounds;
 pub use model::schedule_ssa_cpsat;
+pub use window::{CpsatWindow, WindowReference, WindowRegion, WindowRegionCounts};
 
 // Re-exports needed by tests (via `use super::*;` in test modules)
 #[cfg(test)]

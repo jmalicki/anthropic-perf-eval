@@ -429,6 +429,8 @@ pub fn schedule_ssa_cpsat(
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
     let cse_groups = hints.cse_groups;
+    let alu_lane_hints = hints.alu_lane_hints;
+    let window = hints.window;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -2853,7 +2855,18 @@ pub fn schedule_ssa_cpsat(
                         valu_per_cycle[cycle] += 1;
                     }
                     Engine::Valu if is_shifted => {
-                        alu_per_cycle[cycle] += VLEN as i32; // Shifted VALU uses 8 ALU slots
+                        // Shifted VALU uses 8 ALU slots: at the lane cycles when lane hints
+                        // (an earlier CP-SAT solution) give them, else all at the op's cycle.
+                        match alu_lane_hints.and_then(|h| h.get(&op.id)).filter(|l| l.len() == VLEN) {
+                            Some(lanes) => {
+                                for &lane_cycle in lanes {
+                                    if lane_cycle >= 0 && (lane_cycle as usize) < max_cycle {
+                                        alu_per_cycle[lane_cycle as usize] += 1;
+                                    }
+                                }
+                            }
+                            None => alu_per_cycle[cycle] += VLEN as i32,
+                        }
                     }
                     Engine::Alu => {
                         alu_per_cycle[cycle] += 1;
@@ -3077,6 +3090,41 @@ pub fn schedule_ssa_cpsat(
     for (idx, &fma_last) in sorted_by_key(&select_choice_fma_last_cycle) {
         let c = model.add_ge(max_cycle, LinearExpr::from(fma_last));
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
+    }
+
+    // 10a. Window optimality probe (analysis only, hints.window): hold every op outside the
+    // window at its reference cycle (ops after it move as one block) and keep the ops inside
+    // it in the window. See cpsat_scheduler::window.
+    if let Some(window) = window {
+        let counts = super::window::apply_window_constraints(
+            &mut model,
+            ops,
+            window,
+            &super::window::WindowModelVars {
+                cycle_vars: &cycle_vars,
+                alu_cycle_vars: &alu_cycle_vars,
+                completion_cycle_vars: &completion_cycle_vars,
+                select_choice_fma_last_cycle: &select_choice_fma_last_cycle,
+                shift_vars: &shift_vars,
+                const_choice_vars: &const_choice_vars,
+                const_choice_encoding_vars: &const_choice_encoding_vars,
+                const_choice_alu_encoding_info: &const_choice_alu_encoding_info,
+                select_choice_vars: &select_choice_vars,
+                eliminate_vb_vars: &eliminate_vb_vars,
+            },
+        );
+        if verbose {
+            eprintln!(
+                "  Window [{}, {}): {} ops before (fixed), {} inside (free{}), {} after (move as one block), {} free",
+                window.start,
+                window.start + window.len,
+                counts.before,
+                counts.inside,
+                if window.fix_window_encodings { ", encodings fixed" } else { "" },
+                counts.after,
+                counts.free
+            );
+        }
     }
 
     // 10b. Makespan interval (tuning.makespan_interval): one interval [makespan, horizon) that
@@ -3610,12 +3658,19 @@ pub fn schedule_ssa_cpsat(
                     ops[idx].id, idx, c, clamped, lb, ub
                 );
             }
+            // Lanes from an earlier CP-SAT solution (alu_lane_hints) need not share one cycle;
+            // the completion is then the last lane.
+            let lane_hints = alu_lane_hints
+                .filter(|_| shift_hints.is_some_and(|h| h.contains(&ops[idx].id)))
+                .and_then(|h| h.get(&ops[idx].id))
+                .filter(|lanes| lanes.len() == VLEN);
             if let Some(completion_var) = completion_cycle_vars.get(&idx) {
-                model.add_hint(*completion_var, clamped);
+                let done = lane_hints.map_or(clamped, |lanes| lanes.iter().copied().max().unwrap_or(0) as i64);
+                model.add_hint(*completion_var, done);
             }
             if let Some(alu_cycles) = alu_cycle_vars.get(&idx) {
-                for &alu_var in alu_cycles {
-                    model.add_hint(alu_var, clamped);
+                for (lane, &alu_var) in alu_cycles.iter().enumerate() {
+                    model.add_hint(alu_var, lane_hints.map_or(clamped, |lanes| lanes[lane] as i64));
                 }
             }
         }
@@ -3696,10 +3751,15 @@ pub fn schedule_ssa_cpsat(
 
         // Hint scratch shifted_dest_start vars: when not shifted, start = def_cycle.
         // Greedy defaults to not shifting, so hint = def_cycle.
+        // With lane hints (an earlier CP-SAT solution) a shifted value starts at its first lane.
         for &(start_var, def_idx) in &scratch_shifted_start_vars {
             let hint_cycle = hints.get(def_idx).copied().unwrap_or(-1);
             if hint_cycle >= 0 {
-                model.add_hint(start_var, hint_cycle as i64);
+                let first_lane = alu_lane_hints
+                    .filter(|_| shift_hints.is_some_and(|h| h.contains(&ops[def_idx].id)))
+                    .and_then(|h| h.get(&ops[def_idx].id))
+                    .and_then(|lanes| lanes.iter().copied().min());
+                model.add_hint(start_var, first_lane.unwrap_or(hint_cycle) as i64);
             }
         }
     }

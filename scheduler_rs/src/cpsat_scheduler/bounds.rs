@@ -589,6 +589,13 @@ pub struct SsaCpsatHints<'a> {
     /// Vector group key/alias → lane VRegs. The scratch model needs it to see that reading a
     /// lane keeps a decomposed vector live and reading an alias keeps its lanes live.
     pub vector_group_lanes: Option<&'a HashMap<VReg, Vec<VReg>>>,
+    /// Op ID -> the eight ALU lane cycles to hint for an op hinted as shifted (`shift_hints`).
+    /// Without an entry all eight lanes are hinted at the op's cycle (the greedy's convention).
+    /// Used to warm-start from an earlier CP-SAT solution whose lanes differ.
+    pub alu_lane_hints: Option<&'a HashMap<usize, Vec<i32>>>,
+    /// Window optimality probe (analysis only): hold every op outside the window at its
+    /// reference cycle and let the ops inside move. See `cpsat_scheduler::window`.
+    pub window: Option<&'a super::window::CpsatWindow>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions

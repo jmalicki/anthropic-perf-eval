@@ -1211,6 +1211,7 @@ impl SsaTickTockKernelBuilder {
                         live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
                         cse_groups: None, // Per-section: no CSE (feasibility only)
                         vector_group_lanes: Some(&ctx.vector_group_lanes),
+                        ..Default::default()
                     },
                     Some(false),
                 ) {
@@ -1482,7 +1483,59 @@ impl SsaTickTockKernelBuilder {
             vec![]
         };
         let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
-        let cpsat_result = match schedule_ssa_cpsat(
+
+        // Window optimality probe (analysis only; CPSAT_WINDOW_PROBE=spec.json): instead of the
+        // whole-program solve, re-optimise windows of the warm start with everything outside
+        // each window fixed, write the report, and carry on with the best rolling-pass schedule
+        // (or the warm start). See cpsat_scheduler::window and docs/WINDOW_OPTIMALITY_PROBE.md.
+        let window_probe_spec = match crate::cpsat_scheduler::window::WindowProbeSpec::from_env() {
+            Ok(spec) => spec,
+            Err(e) => {
+                let error = KernelBuilderError::Other(e);
+                export_partial_result_on_error_safe(&ctx, &error);
+                return Err(error);
+            }
+        };
+        let probe_result = if let Some(spec) = &window_probe_spec {
+            let base = crate::cpsat_scheduler::WindowReference {
+                cycles: greedy_hints.clone(),
+                shifted_ops: full_kernel_shift_set.clone(),
+                select_fma_ops: select_choice_hints_set.clone(),
+                const_choice_encoding: const_add_imm_hints_set
+                    .iter()
+                    .map(|&id| (id, crate::types::ConstChoiceEncoding::AddImm))
+                    .collect(),
+                ..Default::default()
+            };
+            let probe_ctx = crate::cpsat_scheduler::window::WindowProbeContext {
+                forced_shifts: forced_shifts.as_ref(),
+                cse_groups: cse_groups_ref,
+                vector_group_lanes: Some(&ctx.vector_group_lanes),
+            };
+            match crate::cpsat_scheduler::window::run_window_probe(&ctx.ops, &cpsat_config, &probe_ctx, base, spec) {
+                Ok((report, result)) => {
+                    eprintln!(
+                        "[window probe] report written to {} ({} windows); continuing with a {}-cycle schedule",
+                        spec.output,
+                        report.entries.len(),
+                        result.makespan
+                    );
+                    Some(result)
+                }
+                Err(e) => {
+                    let error = KernelBuilderError::Other(e);
+                    export_partial_result_on_error_safe(&ctx, &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        let cpsat_result = if let Some(result) = probe_result {
+            result
+        } else {
+            match schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
             SsaCpsatHints {
@@ -1497,6 +1550,7 @@ impl SsaTickTockKernelBuilder {
                 live_through_vregs: None,
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                ..Default::default()
             },
             Some(!greedy_budget_exceeded),
         ) {
@@ -1510,6 +1564,7 @@ impl SsaTickTockKernelBuilder {
                 let error = KernelBuilderError::Other(e);
                 export_partial_result_on_error_safe(&ctx, &error);
                 return Err(error);
+            }
             }
         };
 

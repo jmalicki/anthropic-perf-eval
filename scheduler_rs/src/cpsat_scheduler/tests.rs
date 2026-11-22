@@ -3656,6 +3656,7 @@ mod tests {
                 live_through_vregs: None,
                 cse_groups: None,
                 vector_group_lanes: None,
+                ..Default::default()
             },
             Some(true), // valid hints, within scratch
         );
