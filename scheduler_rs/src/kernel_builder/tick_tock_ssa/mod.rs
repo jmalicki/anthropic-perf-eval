@@ -128,6 +128,29 @@ pub struct SsaTickTockKernelBuilder {
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
+/// First and last cycle a section occupies: the cycles of its scheduled ops (barriers
+/// excluded) and the lane cycles of its split shifts, whose earlier lanes precede the op's
+/// cycle (its last lane). Returns `(i32::MAX, i32::MIN)` when nothing is scheduled.
+///
+/// # Arguments
+/// * `ops` - The section's ops
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts, keyed by op id
+pub(crate) fn section_cycle_range(
+    ops: &[SsaOp],
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> (i32, i32) {
+    let mut range = (i32::MAX, i32::MIN);
+    for op in ops {
+        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+            let lanes = shifted_lane_cycles.get(&op.id).map_or(&[][..], |l| l.as_slice());
+            for c in std::iter::once(op.cycle).chain(lanes.iter().copied()) {
+                range = (range.0.min(c), range.1.max(c));
+            }
+        }
+    }
+    range
+}
+
 /// Move every scheduled op of a section (barriers excluded) by `delta` cycles, together with
 /// the per-lane cycles of its split shift, if it has one, so the lanes stay where the op is.
 ///
@@ -1071,14 +1094,10 @@ impl SsaTickTockKernelBuilder {
             let mut this_section_makespan: Option<i32> = None;
             let (start, end) = boundaries[k];
             let section_span_after_rebase: i32 = {
-                let mut min_c = i32::MAX;
-                let mut max_c = i32::MIN;
-                for op in &ctx.ops[start..end] {
-                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                        min_c = min_c.min(op.cycle);
-                        max_c = max_c.max(op.cycle);
-                    }
-                }
+                let (min_c, max_c) = section_cycle_range(
+                    &ctx.ops[start..end],
+                    &ctx.greedy_decisions.shifted_alu_cycles,
+                );
                 let span = if min_c <= max_c {
                     max_c - min_c + 1
                 } else {
@@ -1098,13 +1117,10 @@ impl SsaTickTockKernelBuilder {
                     .filter(|&i| ctx.ops[i].opcode != Opcode::Barrier)
                     .collect();
                 if !global_indices.is_empty() {
-                let (greedy_min_c, greedy_max_c) = global_indices
-                    .iter()
-                    .filter_map(|&i| {
-                        let c = ctx.ops[i].cycle;
-                        if c >= 0 { Some(c) } else { None }
-                    })
-                    .fold((i32::MAX, i32::MIN), |(lo, hi), c| (lo.min(c), hi.max(c)));
+                let (greedy_min_c, greedy_max_c) = section_cycle_range(
+                    &ctx.ops[start..end],
+                    &ctx.greedy_decisions.shifted_alu_cycles,
+                );
                 let greedy_section_makespan = if greedy_min_c <= greedy_max_c {
                     greedy_max_c - greedy_min_c + 1
                 } else {
