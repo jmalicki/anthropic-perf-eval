@@ -4320,3 +4320,54 @@ fn test_makespan_rows_keep_the_greedy_hint() {
         assert!(result.is_ok(), "{}r/{}: {:?}", rounds, batch, result.err());
     }
 }
+
+/// Every emission the generator offers today implies all of its main-memory edges through
+/// data flow (the final stores read what the loads of the same words fed), so `mem_deps` is
+/// empty and no model changes. Covers the index forms, index pruning, values-only, merged
+/// hash stages, every tree-reduce depth and round counts across the wrap, with and without
+/// DCE. Fails if an emission path leaves a memory op without a location.
+#[test]
+fn test_current_emissions_imply_every_memory_edge() {
+    use crate::kernel_builder::config::IndexForm;
+    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, eliminate_ssa_dead_code};
+    use crate::kernel_builder::memory_deps::compute_memory_dependencies;
+
+    type Variant = (&'static str, fn(&mut KernelConfig));
+    let variants: [Variant; 7] = [
+        ("default", |_| {}),
+        ("mirrored", |c| c.spec.index_form = IndexForm::Mirrored),
+        ("prune-dead-index", |c| c.spec.prune_dead_index = true),
+        ("values-only", |c| c.spec.values_only = true),
+        ("merge-hash-stages", |c| c.spec.merge_hash_stages = true),
+        ("tree-reduce-2", |c| c.spec.tree_reduce_max_depth = 2),
+        ("tree-reduce-4", |c| c.spec.tree_reduce_max_depth = 4),
+    ];
+    for rounds in [1usize, 2, 4, 12, 16] {
+        for (name, apply) in variants.iter() {
+            let mut config = KernelConfig::new(10, 2047, 64, rounds);
+            apply(&mut config);
+            let mut program = SsaTickTockKernelBuilder::new(config).build();
+            let vgl = Some(&program.vector_group_lanes);
+            for dce in [false, true] {
+                if dce {
+                    let (ops, vreg_def, alts) = eliminate_ssa_dead_code(
+                        std::mem::take(&mut program.ops),
+                        &mut program.vreg_def,
+                        &mut program.const_alternatives,
+                        program.zero_vreg,
+                        vgl,
+                    );
+                    program.ops = ops;
+                    program.vreg_def = vreg_def;
+                    program.const_alternatives = alts;
+                }
+                compute_ssa_dependencies(&mut program.ops, &program.vreg_def, program.zero_vreg, vgl);
+                let stats = compute_memory_dependencies(&mut program.ops)
+                    .unwrap_or_else(|e| panic!("{} r{} dce={}: {}", name, rounds, dce, e));
+                assert_eq!(stats.kept, 0, "{} r{} dce={}: {}", name, rounds, dce, stats.summary());
+                assert!(stats.computed > 0, "{} r{} dce={}: the value stores have WAR edges", name, rounds, dce);
+                assert!(program.ops.iter().all(|op| op.mem_deps.is_empty()));
+            }
+        }
+    }
+}
