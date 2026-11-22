@@ -75,6 +75,15 @@ CONFIGS: list[tuple[str, str]] = [
     ("no-cse", "--no-cse-groups"),
 ]
 
+# Cells that exercise the per-section (segment-mode) model: the greedy's "greedy" pressure
+# policy overflows the scratch budget in one section, so a per-section feasibility solve
+# runs and its model is exported first (model_000.pb). That solve finds no schedule within a
+# small deterministic budget, so the run fails; the cell is valid when it fails the same way
+# (same return code, models exported, no kernel). (instance, name, options)
+SEGMENT_CELLS: list[tuple[str, str, str]] = [
+    ("3x256", "segment-greedy-policy", "--scheduling-pressure-policy greedy"),
+]
+
 
 def _cell_dir(out: Path, instance: str, config: str) -> Path:
     return out / f"{instance}__{config}"
@@ -106,6 +115,7 @@ def _run_cell(out: Path, instance: str, config: str, options: str, budget: float
     record = {
         "instance": instance,
         "config": config,
+        "expect_failure": any(i == instance and n == config for i, n, _ in SEGMENT_CELLS),
         "options": options,
         "command": shlex.join(cmd),
         "returncode": result.returncode,
@@ -122,6 +132,7 @@ def record(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     configs = [(n, o) for n, o in CONFIGS if not args.configs or n in args.configs]
     cells = [(i, n, o) for i in args.instances for n, o in configs]
+    cells += [(i, n, o) for i, n, o in SEGMENT_CELLS if not args.configs or n in args.configs]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
             pool.submit(_run_cell, out, i, n, o, args.budget, args.time_limit): (i, n) for i, n, o in cells
@@ -144,6 +155,10 @@ def record(args: argparse.Namespace) -> int:
 
 def _record_problem(r: dict) -> str | None:
     """Why a cell's record cannot be compared (None when it is valid)."""
+    if r.get("expect_failure"):
+        if r["models"] < 1:
+            return "no model exported (does the extension support CPSAT_EXPORT_MODEL_DIR?)"
+        return None
     if r["returncode"] != 0:
         return f"return code {r['returncode']}"
     if r["models"] < 1:
