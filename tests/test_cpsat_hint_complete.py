@@ -70,6 +70,9 @@ def _export_model(tmp_path, extra):
         # Scratch model pools: vector and scalar cumulatives, write groups as one vector.
         ["--rounds", "3", "--scratch-model", "pools"],
         ["--rounds", "5", "--scratch-model", "pools"],
+        ["--rounds", "3", "--cpsat-makespan-rows", "static"],
+        # Five rounds: static heads span more than one bucket.
+        ["--rounds", "5", "--cpsat-makespan-rows", "bucketed"],
     ],
     ids=lambda extra: " ".join(extra).replace("--", ""),
 )
