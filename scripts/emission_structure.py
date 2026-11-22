@@ -67,7 +67,9 @@ CATEGORIES = (
     "const",          # ConstChoice: 1 load or 1 flow add_imm
     "const_alu",      # ConstChoice: 1 load, 1 flow add_imm, or 1 scalar ALU op
 )
-CAP = {"valu": 6, "alu": 12, "load": 2, "store": 2, "flow": 1}
+# Issue slots per cycle: the one Python copy (scripts/analyze_bound_gap.py, as schedule_report
+# uses); scheduler_rs/src/architecture.rs holds the same numbers for AnthropicPerfEval.
+from scripts.analyze_bound_gap import CAP  # noqa: E402
 VLEN = 8
 FIXED_VECTOR_OPCODES = ("multiply_add", "vbroadcast")
 
@@ -108,15 +110,16 @@ def vector_op_equivalents(counts: Mapping[str, int], resolution: Mapping[str, in
     return vec + (counts["alu"] + r["const_alu_on_alu"]) / VLEN
 
 
-def _feasible_at(c: Mapping[str, int], t: int):
-    """Best choice resolution with everything in `t` cycles, or None. See choice_floor."""
-    if c["load"] > CAP["load"] * t or c["store"] > CAP["store"] * t or c["flow"] > CAP["flow"] * t:
+def _feasible_at(c: Mapping[str, int], t: int, cap: Mapping[str, int] = CAP):
+    """Best choice resolution with everything in `t` cycles under issue capacities `cap`, or
+    None. See choice_floor."""
+    if c["load"] > cap["load"] * t or c["store"] > cap["store"] * t or c["flow"] > cap["flow"] * t:
         return None
     consts = c["const"] + c["const_alu"]
-    off_load = max(0, c["load"] + consts - CAP["load"] * t)  # consts that must leave the load engine
+    off_load = max(0, c["load"] + consts - cap["load"] * t)  # consts that must leave the load engine
     for on_alu in range(min(c["const_alu"], off_load) + 1):
         on_flow = off_load - on_alu
-        room = CAP["flow"] * t - c["flow"] - on_flow
+        room = cap["flow"] * t - c["flow"] - on_flow
         if room < 0:
             continue
         # A 2-op select moved to flow saves a fixed and a shiftable vector op, a 1-op select a
@@ -125,10 +128,10 @@ def _feasible_at(c: Mapping[str, int], t: int):
         s1 = min(c["select1"], room - s2)
         vector = (c["vec_fixed"] + c["vec_shiftable"] + (c["select1"] - s1) + 2 * (c["select2"] - s2))
         shiftable = c["vec_shiftable"] + (c["select2"] - s2)
-        alu_room = CAP["alu"] * t - c["alu"] - on_alu
+        alu_room = cap["alu"] * t - c["alu"] - on_alu
         if alu_room < 0:
             continue
-        lo = max(0, vector - CAP["valu"] * t)
+        lo = max(0, vector - cap["valu"] * t)
         hi = min(shiftable, alu_room // VLEN)
         if lo <= hi:
             return {"select1_flow": s1, "select2_flow": s2, "const_on_flow": on_flow,
@@ -152,7 +155,8 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
         engines at the limit (load / flow: T - 1 does not fit them alone).
     """
     c = {k: int(counts[k]) for k in CATEGORIES}
-    t = max(1, math.ceil(c["store"] / CAP["store"]), c["flow"], math.ceil(c["load"] / CAP["load"]))
+    t = max(1, math.ceil(c["store"] / CAP["store"]), math.ceil(c["flow"] / CAP["flow"]),
+            math.ceil(c["load"] / CAP["load"]))
     while _feasible_at(c, t) is None:
         t += 1
     res = _feasible_at(c, t)
@@ -160,17 +164,10 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
     if t > 1:
         # An engine binds if giving it unlimited capacity would let T - 1 fit.
         for engine in ("load", "flow", "valu+alu"):
-            saved = dict(CAP)
-            try:
-                if engine == "valu+alu":
-                    CAP["valu"] = CAP["alu"] = 10 ** 9
-                else:
-                    CAP[engine] = 10 ** 9
-                if _feasible_at(c, t - 1) is not None:
-                    binding.append(engine)
-            finally:
-                CAP.clear()
-                CAP.update(saved)
+            lifted = ("valu", "alu") if engine == "valu+alu" else (engine,)
+            relaxed = {k: (10 ** 9 if k in lifted else v) for k, v in CAP.items()}
+            if _feasible_at(c, t - 1, relaxed) is not None:
+                binding.append(engine)
     return {"cycles": t, "binding": binding, "resolution": res,
             "vector_op_equivalents": vector_op_equivalents(c, res)}
 
@@ -439,12 +436,17 @@ def calibrate(ctx: Context, workdir: str, n_random: int = 40, seed: int = 1, log
     """Fit the cost table from emitter builds of the design plans; exact or an error."""
     names = feature_names(ctx)
     plans = design_plans(ctx, n_random, seed)
-    xs, ys = [], []
+    xs, ys, built, skipped = [], [], [], []
     for i, rows in enumerate(plans):
-        _, _, sched, _ = build_emission(rows, ctx, workdir, name=f"cal{i}", extra=PROBE_OPTIONS)
+        try:
+            _, _, sched, _ = build_emission(rows, ctx, workdir, name=f"cal{i}", extra=PROBE_OPTIONS)
+        except RuntimeError as e:  # e.g. scratch budget exceeded: no SSA JSON for this plan
+            skipped.append(f"cal{i}: {e}")
+            continue
         f = plan_features(rows, ctx)
         xs.append([f[n] for n in names])
         ys.append(emission_counts(sched))
+        built.append(rows)
         if log and (i + 1) % 10 == 0:
             log(f"  calibration: {i + 1}/{len(plans)} plans built")
     coefficients = {n: {} for n in names}
@@ -458,8 +460,10 @@ def calibrate(ctx: Context, workdir: str, n_random: int = 40, seed: int = 1, log
             notes.append(f"{c}: features {[names[j] for j in free]} not identified by the design plans (set to 0)")
         for n, v in zip(names, w):
             coefficients[n][c] = v
-    table = CostTable(ctx, coefficients, calibration_plans=len(plans), notes=notes)
-    for rows, y in zip(plans, ys):  # exactness on the design itself
+    if skipped:
+        notes.append(f"{len(skipped)} design plans skipped (did not build): " + "; ".join(skipped[:3]))
+    table = CostTable(ctx, coefficients, calibration_plans=len(built), notes=notes)
+    for rows, y in zip(built, ys):  # exactness on the design itself
         assert table.predict(rows) == y
     return table
 
@@ -471,7 +475,10 @@ def check_table(table: CostTable, workdir: str, n_plans: int, seed: int, log=pri
     bad = []
     for i in range(n_plans):
         rows = random_rows(table.context, rng)
-        _, _, sched, _ = build_emission(rows, table.context, workdir, name=f"chk{i}", extra=PROBE_OPTIONS)
+        try:
+            _, _, sched, _ = build_emission(rows, table.context, workdir, name=f"chk{i}", extra=PROBE_OPTIONS)
+        except RuntimeError:  # does not fit the scratch budget: nothing to compare
+            continue
         got, want = emission_counts(sched), table.predict(rows)
         if got != want:
             bad.append({"plan": rows, "emitted": got, "predicted": want})
@@ -593,7 +600,7 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     m.Add(ca + cfa <= cnt["const_alu"])
     m.Add(cnt["load"] + (cnt["const"] - cf) + (cnt["const_alu"] - ca - cfa) <= CAP["load"] * t)
     m.Add(cnt["store"] <= CAP["store"] * t)
-    m.Add(cnt["flow"] + s1 + s2 + cf + cfa <= t)
+    m.Add(cnt["flow"] + s1 + s2 + cf + cfa <= CAP["flow"] * t)
     vector = cnt["vec_fixed"] + cnt["vec_shiftable"] + (cnt["select1"] - s1) + 2 * (cnt["select2"] - s2)
     m.Add(vector - sh <= CAP["valu"] * t)
     m.Add(cnt["alu"] + ca + VLEN * sh <= CAP["alu"] * t)
