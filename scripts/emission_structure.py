@@ -39,6 +39,8 @@ import random
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
+from xml.sax.saxutils import escape as xml_escape
 from typing import Iterable, Mapping, Sequence
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -382,8 +384,8 @@ def design_plans(ctx: Context, n_random: int, seed: int) -> list[list[list[str]]
         for subset in itertools.combinations(depths, k):
             for e in BIT_DRIVEN:
                 plans.append(uniform_rows(ctx, lambda r, d, e=e, s=subset: e if d == 0 or d in s else "gather"))
-    # Pairs and Mobius coefficients at the same level, alone.
-    for d in depths:
+    # Pairs and Mobius coefficients at the same level, alone (needs two groups).
+    for d in depths if ctx.n_groups >= 2 else []:
         r = min(r for r in ctx.choice_rounds() if ctx.depth(r) == d)
         for pair_mode in ("bits", "bits-flow"):
             rows = baseline_rows(ctx)
@@ -449,6 +451,9 @@ def calibrate(ctx: Context, workdir: str, n_random: int = 40, seed: int = 1, log
         built.append(rows)
         if log and (i + 1) % 10 == 0:
             log(f"  calibration: {i + 1}/{len(plans)} plans built")
+    if not built:
+        raise RuntimeError(f"calibration: none of the {len(plans)} design plans built; first errors: "
+                           + "; ".join(skipped[:3]))
     coefficients = {n: {} for n in names}
     notes = []
     for c in CATEGORIES:
@@ -468,22 +473,44 @@ def calibrate(ctx: Context, workdir: str, n_random: int = 40, seed: int = 1, log
     return table
 
 
-def check_table(table: CostTable, workdir: str, n_plans: int, seed: int, log=print) -> list[dict]:
-    """Build `n_plans` fresh random plans; return the ones whose emitted counts differ from the
-    prediction (empty list = every prediction exact)."""
+def check_table(table: CostTable, workdir: str, n_plans: int, seed: int, log=print) -> dict:
+    """Build `n_plans` fresh random plans and compare emitted with predicted counts.
+
+    Returns:
+        {"compared": plans built and compared, "bad": the ones whose counts differ (empty = every
+        prediction exact), "skipped": build errors of plans that did not build}.
+    """
     rng = random.Random(seed)
-    bad = []
+    bad, skipped, compared = [], [], 0
     for i in range(n_plans):
         rows = random_rows(table.context, rng)
         try:
             _, _, sched, _ = build_emission(rows, table.context, workdir, name=f"chk{i}", extra=PROBE_OPTIONS)
-        except RuntimeError:  # does not fit the scratch budget: nothing to compare
+        except RuntimeError as e:  # e.g. does not fit the scratch budget: nothing to compare
+            skipped.append(f"chk{i}: {e}")
             continue
+        compared += 1
         got, want = emission_counts(sched), table.predict(rows)
         if got != want:
             bad.append({"plan": rows, "emitted": got, "predicted": want})
-    table.checked_plans += n_plans
-    return bad
+    table.checked_plans += compared
+    return {"compared": compared, "bad": bad, "skipped": skipped}
+
+
+def write_json_atomic(path: str, obj) -> None:
+    """Write JSON to `path` through a temporary file in the same directory, so a concurrent
+    reader sees either the old file or the complete new one."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def default_table_path(ctx: Context) -> str:
@@ -500,9 +527,7 @@ def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -
         log(f"  {path} is for another context; recalibrating")
     log(f"  calibrating the cost table for {asdict(ctx)} ...")
     table = calibrate(ctx, workdir, log=log)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(table.to_json(), f, indent=1)
+    write_json_atomic(path, table.to_json())
     log(f"  cost table written to {path}")
     return table
 
@@ -537,12 +562,20 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         {"rows", "floor" (choice_floor of the plan), "capped_cycles" (T under max_util),
         "counts", "status"}.
     """
-    from ortools.sat.python import cp_model
-
     ctx = table.context
     g = ctx.n_groups
-    encodings = [e for e in ENCODINGS if e in set(encodings)]
+    wanted = set(encodings)  # once: `encodings` may be an iterator
+    encodings = [e for e in ENCODINGS if e in wanted]
     fixed = dict(fixed or {})
+    for r, e in fixed.items():
+        if not 0 <= r < ctx.rounds or e not in allowed_encodings(ctx.depth(r)):
+            raise ValueError(f"fixed: {e!r} is not available in round {r} (depth {ctx.depth(r)})"
+                             if 0 <= r < ctx.rounds else f"fixed: no round {r}")
+
+    # Imported only after the arguments are checked: in a process that has loaded scheduler_rs
+    # this import crashes (see solve_plan_isolated), and a bad argument should fail cleanly.
+    from ortools.sat.python import cp_model
+
     m = cp_model.CpModel()
     n, u = {}, {}
     for r in ctx.choice_rounds():
@@ -587,7 +620,15 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     cnt = {c: sum(feat[name] * coef[c] for name, coef in table.coefficients.items() if coef[c]) for c in CATEGORIES}
 
     big = 10 * (sum(abs(v) for coef in table.coefficients.values() for v in coef.values()) * g + 1)
-    t = m.NewIntVar(1, big, "T")
+    # Caps as exact ratios (no rounding); T may need up to big / (smallest cap) cycles.
+    caps = {}
+    for engine, frac in (max_util or {}).items():
+        ratio = Fraction(str(frac))
+        if engine not in ("load", "flow", "valu") or not 0 < ratio <= 1:
+            raise ValueError(f"max_util: {engine}={frac}; engines load, flow, valu, fraction in (0, 1]")
+        caps[engine] = ratio
+    t_max = big if not caps else math.ceil(big / min(caps.values())) + 1
+    t = m.NewIntVar(1, t_max, "T")
     s1 = m.NewIntVar(0, big, "select1_flow")
     s2 = m.NewIntVar(0, big, "select2_flow")
     cf = m.NewIntVar(0, big, "const_flow")
@@ -607,11 +648,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     m.Add(sh <= cnt["vec_shiftable"] + (cnt["select2"] - s2))
     used = {"load": cnt["load"] + (cnt["const"] - cf) + (cnt["const_alu"] - ca - cfa),
             "flow": cnt["flow"] + s1 + s2 + cf + cfa, "valu": vector - sh}
-    for engine, frac in (max_util or {}).items():
-        if engine not in used or not 0 < frac <= 1:
-            raise ValueError(f"max_util: {engine}={frac}; engines {sorted(used)}, fraction in (0, 1]")
-        permille = round(frac * 1000)
-        m.Add(1000 * used[engine] <= permille * CAP[engine] * t)
+    for engine, ratio in caps.items():
+        m.Add(ratio.denominator * used[engine] <= ratio.numerator * CAP[engine] * t)
     m.Minimize(t)
 
     solver = cp_model.CpSolver()
@@ -622,6 +660,9 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         raise RuntimeError(f"structure model: {solver.StatusName(status)}")
     best_t = solver.Value(t)
     proven = status == cp_model.OPTIMAL
+    chosen = {key: solver.Value(var) for key, var in n.items()}
+    pattern_values = {}
+    tie_break_status = "not run"
     if tie_break:
         m.Add(t == best_t)
         mixes = sum(u.values()) - len(ctx.choice_rounds())
@@ -634,21 +675,29 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
             m.AddHint(var, val)
         status2 = solver.Solve(m)
-        if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise RuntimeError(f"structure model tie-break: {solver.StatusName(status2)}")
+        tie_break_status = solver.StatusName(status2)
+        if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            chosen = {key: solver.Value(var) for key, var in n.items()}
+        elif status2 != cp_model.UNKNOWN:  # MODEL_INVALID / INFEASIBLE would be a bug
+            raise RuntimeError(f"structure model tie-break: {tie_break_status}")
+        # UNKNOWN (time limit without an incumbent): keep the first solve's plan.
 
     rows = baseline_rows(ctx)
+    for r, e in fixed.items():  # rounds outside the choice rounds (e.g. the root) keep their fixed encoding
+        rows[r] = [e] * g
     for r in ctx.choice_rounds():
         row = []
         for e in ENCODINGS:  # contiguous runs, in a fixed encoding order
             if (r, e) in n:
-                row += [e] * solver.Value(n[r, e])
+                row += [e] * chosen[r, e]
         rows[r] = row
     counts = table.predict(rows)
     floor = choice_floor(counts)
-    assert floor["cycles"] <= best_t and (max_util or floor["cycles"] == best_t), (floor["cycles"], best_t)
+    assert floor["cycles"] <= best_t, (floor["cycles"], best_t)
+    if proven and not caps:
+        assert floor["cycles"] == best_t, (floor["cycles"], best_t)
     return {"rows": rows, "floor": floor, "capped_cycles": best_t, "counts": counts,
-            "status": "optimal" if proven else "feasible"}
+            "status": "optimal" if proven else "feasible", "tie_break": tie_break_status}
 
 
 def _solve_plan_child(table_json, kwargs):
@@ -702,10 +751,15 @@ def what_if_packets(table: CostTable, pairs: Sequence[int] = (5, 7)) -> CostTabl
     coef = {k: dict(v) for k, v in table.coefficients.items()}
     b = coef["base"]
     for level in pairs:
-        if not all(any(ctx.depth(r) == d for r in range(ctx.rounds)) for d in (level, level + 1)):
-            raise ValueError(f"levels {level} and {level + 1} are not both visited")
-        if level <= MAX_CACHED_DEPTH or level + 1 > ctx.forest_height:
+        if level <= MAX_CACHED_DEPTH:
             raise ValueError(f"packet pair {level}+{level + 1} must be deeper than the cached levels")
+        if level + 1 > ctx.forest_height:
+            raise ValueError(f"packet pair {level}+{level + 1}: level {level + 1} does not exist "
+                             f"(deepest level {ctx.forest_height})")
+        visits = [sum(1 for r in range(ctx.rounds) if ctx.depth(r) == d) for d in (level, level + 1)]
+        if visits != [1, 1]:
+            raise ValueError(f"levels {level} and {level + 1} must each be visited exactly once (visits {visits}): "
+                             f"the estimate replaces one gather pair per group")
         g = ctx.n_groups
         b["load"] += -8 * g + 3 * 2 ** level // 8
         b["vec_shiftable"] += -4 * g + 3 * 2 ** level // 8
@@ -790,15 +844,24 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
         "scheduler": "greedy (shaped)" if shaped and cpsat_deterministic_time is None else (
             "greedy" if cpsat_deterministic_time is None else f"CP-SAT dtime {cpsat_deterministic_time:g}"),
     }
-    if upstream or keep_kernel:
-        kernel_path = keep_kernel or os.path.join(workdir, f"kernel_{name}.json")
-        save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123,
-                            values_only=ctx.values_only)
-        if upstream:
-            import subprocess
-            out = subprocess.run([os.path.join(ROOT, "scripts", "check_upstream.sh"), "--strict", "--kernel", kernel_path],
+    # Always saved (in the working directory unless keep_kernel names a file), so --keep keeps it.
+    kernel_path = os.path.abspath(keep_kernel or os.path.join(workdir, f"kernel_{name}.json"))
+    save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123,
+                        values_only=ctx.values_only)
+    row["kernel"] = kernel_path
+    row["upstream_strict"] = None
+    if upstream:
+        import subprocess
+
+        def upstream_ok(*flags):
+            out = subprocess.run([os.path.join(ROOT, "scripts", "check_upstream.sh"), *flags, "--kernel", kernel_path],
                                  cwd=ROOT, capture_output=True, text=True)
-            row["upstream"] = out.returncode == 0
+            return out.returncode == 0
+
+        # Correctness on the unmodified upstream simulator and tests; --strict adds the upstream
+        # speed thresholds, which a slow kernel fails by design.
+        row["upstream"] = upstream_ok()
+        row["upstream_strict"] = upstream_ok("--strict")
     return row
 
 
@@ -835,11 +898,11 @@ def scatter_svg(series: Sequence[tuple[str, Sequence[Mapping]]], width: int = 64
         colour = colours[i % len(colours)]
         for r in rows:
             out.append(f'<circle cx="{sx(r["emitted_floor"]):.1f}" cy="{sy(r["simulator_cycles"]):.1f}" r="5" '
-                       f'fill="{colour}" fill-opacity="0.8"><title>{r["name"]}: floor {r["emitted_floor"]}, '
-                       f'{r["simulator_cycles"]} cycles</title></circle>')
+                       f'fill="{colour}" fill-opacity="0.8"><title>{xml_escape(str(r["name"]))}: floor '
+                       f'{r["emitted_floor"]}, {r["simulator_cycles"]} cycles</title></circle>')
         y = top + 14 + 18 * i
         out.append(f'<circle cx="{left + 14}" cy="{y - 4}" r="5" fill="{colour}"/>')
-        out.append(f'<text x="{left + 24}" y="{y}">{label}</text>')
+        out.append(f'<text x="{left + 24}" y="{y}">{xml_escape(label)}</text>')
     out.append(f'<text x="{sx(diag) - 4:.1f}" y="{sy(diag) + 14:.1f}" text-anchor="end" fill="#777">'
                f'cycles = floor</text>')
     out.append("</svg>")
@@ -847,13 +910,14 @@ def scatter_svg(series: Sequence[tuple[str, Sequence[Mapping]]], width: int = 64
 
 
 def rows_ok(rows: Sequence[Mapping]) -> bool:
-    """Every measured row predicted exactly, PROVED, PASSED and (when run) upstream-clean."""
+    """Every measured row predicted exactly, PROVED, PASSED and (when run) correct upstream.
+    The upstream speed thresholds (--strict) are reported, not required."""
     return all(r["counts_match"] and r["proved"] and r["passed"] and r["upstream"] is not False for r in rows)
 
 
 def format_rows(rows: list[dict]) -> str:
     header = ["Structure", "Predicted floor", "Emitted floor", "Counts match", "Scheduled floor",
-              "Cycles (sched / sim)", "Peak live", "PROVED", "PASSED", "Upstream --strict"]
+              "Cycles (sched / sim)", "Peak live", "PROVED", "PASSED", "Upstream correct", "Upstream --strict"]
     yes = lambda v: "-" if v is None else ("yes" if v else "NO")  # noqa: E731
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     for r in rows:
@@ -861,7 +925,7 @@ def format_rows(rows: list[dict]) -> str:
             r["name"], f"{r['predicted_floor']:,}", f"{r['emitted_floor']:,}", yes(r["counts_match"]),
             f"{r['scheduled_floor']:,} ({'+'.join(r['scheduled_floor_binds'])})",
             f"{r['cycles']:,} / {r['simulator_cycles']:,}", str(r["peak_live"]), yes(r["proved"]),
-            yes(r["passed"]), yes(r["upstream"])]) + " |")
+            yes(r["passed"]), yes(r["upstream"]), yes(r.get("upstream_strict"))]) + " |")
     return "\n".join(lines)
 
 
@@ -919,7 +983,8 @@ def main(argv=None):
     ap.add_argument("--shaped", action="store_true", help="measure: shaped greedy flags (" +
                     " ".join(f"{k}={v}" for k, v in SHAPED_GREEDY.items()) + ")")
     ap.add_argument("--cpsat-deterministic-time", type=float, default=None, help="measure: CP-SAT instead of greedy")
-    ap.add_argument("--upstream", action="store_true", help="measure: also ./scripts/check_upstream.sh --strict")
+    ap.add_argument("--upstream", action="store_true",
+                    help="measure/sweep: also ./scripts/check_upstream.sh, without and with --strict")
     ap.add_argument("--keep", help="directory for scheduler JSONs and kernels (default: temporary)")
     ap.add_argument("--json", help="measure/table: also write rows here")
     ap.add_argument("--no-lateness", action="store_true",
@@ -954,9 +1019,7 @@ def main(argv=None):
         if args.command == "calibrate":
             path = args.table or default_table_path(ctx)
             table = calibrate(ctx, workdir)
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(table.to_json(), f, indent=1)
+            write_json_atomic(path, table.to_json())
             print(f"calibrated from {table.calibration_plans} plans (exact); written to {path}")
             for note in table.notes:
                 print("  note: " + note)
@@ -974,11 +1037,15 @@ def main(argv=None):
             return os.path.basename(spec), expand_plan(load_plan(spec), ctx.rounds, ctx.n_groups, ctx.forest_height)
 
         if args.command == "check":
-            bad = check_table(table, workdir, args.plans, args.seed)
-            print(f"{args.plans} random plans built: {args.plans - len(bad)} predicted exactly, {len(bad)} not")
+            result = check_table(table, workdir, args.plans, args.seed)
+            bad = result["bad"]
+            print(f"{result['compared']} random plans compared: {result['compared'] - len(bad)} predicted exactly, "
+                  f"{len(bad)} not; {len(result['skipped'])} did not build")
             for b in bad[:3]:
                 print(json.dumps(b))
-            return 1 if bad else 0
+            for e in result["skipped"][:3]:
+                print("  did not build: " + e)
+            return 1 if bad or not result["compared"] else 0
         if args.command == "table":
             print("| Feature | " + " | ".join(CATEGORIES) + " |")
             print("|---|" + "---|" * len(CATEGORIES))

@@ -5,8 +5,8 @@ A small model decides how every group of 8 lanes fetches its tree node in every 
 emitter and predicts the op counts of every plan exactly. Its best plan has a capacity floor of
 989 cycles against 1,049 for today's best flags. With the shaped greedy scheduler a plan from the
 model runs in **1,104 cycles (1,106 on the simulator)** against 1,153 / 1,155 for today's best
-flags. Every kernel here is proved equal to its SSA program, passes validation and passes the
-unmodified upstream tests with `--strict`. The floor ignores time, so it is a good guide only
+flags. Every kernel here is proved equal to its SSA program, passes validation and is correct on
+the unmodified upstream tests; every model plan also passes their speed thresholds (`--strict`). The floor ignores time, so it is a good guide only
 while the scheduler can approach it. Here every schedule lands 90 to 120 cycles above its floor,
 and two plans with the same floor can differ by 100 cycles (section 5). Estimated with the model,
 `vload` at the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles
@@ -164,8 +164,9 @@ Shaped greedy (`--greedy-barriers none --greedy-priority wavefront --greedy-spli
 --pressure-inflation-threshold 0.95`). "Predicted floor" is `choice_floor` of the model's counts,
 "emitted floor" the same of the built kernel's counts, "scheduled floor" `schedule_report`'s floor
 with the scheduler's own resolution (binding engine in brackets). Every row: counts predicted
-exactly, PROVED (dataflow replay), PASSED (values and indices), and `./scripts/check_upstream.sh
---strict` (unmodified upstream correctness and speed tests) passes.
+exactly, PROVED (dataflow replay), PASSED (values and indices), and correct on the unmodified
+upstream tests (`./scripts/check_upstream.sh`). Every row also passes the upstream speed
+thresholds (`--strict`) except `bits-flow` with level 4 on both visits, at 1,700 cycles.
 
 | Structure | Predicted floor | Emitted floor | Scheduled floor | Cycles (sched / sim) | Peak live |
 |---|---|---|---|---|---|
@@ -236,10 +237,13 @@ CP-SAT on the best plan: section 5.1.
 
 ### 5.1 CP-SAT
 
-A 16-round CP-SAT run on `flow90.json` (`--cpsat-deterministic-time 300`, greedy warm start
-from the shaped flags) is in progress on a shared, heavily loaded machine; its result will be
-added here. CP-SAT at 3 rounds through the same emission paths is covered by
-docs/EMISSION_ABLATION.md section 3.4.
+One 16-round run on `flow90.json` with the shaped flags and `--cpsat-deterministic-time 300`
+(wall-clock backstop 7,200 s, on a shared and heavily loaded machine): **1,132 schedule / 1,134
+simulator cycles**, PROVED and PASSED, best bound 1,000. It stopped on the wall-clock backstop
+after 172 of the 300 deterministic-time units, so it is not reproducible, and it did not improve
+its warm start. That warm start is worse than the greedy's own 1,104 because the greedy split
+shift is not used when CP-SAT follows the greedy. CP-SAT at 3 rounds through the same emission
+paths is covered by docs/EMISSION_ABLATION.md section 3.4.
 
 ## 6. Phases 2 and 3: what the model says they are worth
 
@@ -321,7 +325,8 @@ $M predict                                     # floors of the flag configuratio
 $M solve --out docs/emission_plans/floor_optimal.json
 $M solve --max-util flow=0.9 --out docs/emission_plans/flow90.json
 $M measure --shaped --upstream --plan bits --plan bits-flow --plan mobius --plan bits+depth4-after-wrap \
-  --plan bits-flow+depth4-after-wrap --plan docs/emission_plans/floor_optimal.json \
+  --plan bits-flow+depth4-after-wrap --plan bits+depth4 --plan bits-flow+depth4 \
+  --plan docs/emission_plans/floor_optimal.json \
   --plan docs/emission_plans/flow90.json                                       # section 5, first table
 $M sweep --shaped --upstream --max-util none --max-util flow=0.95 --max-util flow=0.9 --max-util flow=0.85 \
   --max-util flow=0.8 --max-util flow=0.7 --max-util flow=0.6 --max-util load=0.95,flow=0.8 --json sweep.json

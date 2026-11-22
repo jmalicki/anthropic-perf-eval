@@ -79,7 +79,8 @@ def table(tmp_path_factory):
 
 def test_calibration_is_exact_on_unseen_plans(table, tmp_path):
     assert table.calibration_plans > len(es.feature_names(CTX))
-    assert es.check_table(table, str(tmp_path), n_plans=12, seed=11, log=None) == []
+    result = es.check_table(table, str(tmp_path), n_plans=12, seed=11, log=None)
+    assert result["compared"] >= 1 and result["bad"] == []
 
 
 def test_counts_cover_every_ssa_op(tmp_path):
@@ -101,8 +102,53 @@ def test_what_ifs_adjust_the_table_and_are_labelled(table):
     assert any("not calibrated" in n for n in packets.notes)
     with pytest.raises(ValueError, match="deeper than the cached levels"):
         es.what_if_packets(table, (3,))
-    with pytest.raises(ValueError, match="not both visited"):
+    with pytest.raises(ValueError, match="level 11 does not exist"):
         es.what_if_packets(table, (10,))
+
+
+def flat_table(ctx, **base):
+    """A cost table whose counts are `base` whatever the plan (for solver edge cases)."""
+    coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+    coef["base"].update(base)
+    return es.CostTable(ctx, coef)
+
+
+def test_caps_are_exact_and_bound_t_by_the_cap():
+    ctx = es.Context(rounds=16, batch_size=8)
+    # 1 flow op under a 0.001 flow cap needs 1,000 cycles (beyond the uncapped bound on T).
+    assert es.solve_plan_isolated(flat_table(ctx, flow=1), max_util={"flow": 0.001},
+                                  time_limit=10)["capped_cycles"] == 1000
+    # 901 flow ops under 0.9006 need 1,001 cycles; rounding the cap to 0.901 would allow 1,000.
+    assert es.solve_plan_isolated(flat_table(ctx, flow=901), max_util={"flow": 0.9006},
+                                  time_limit=10)["capped_cycles"] == 1001
+
+
+def test_fixed_root_and_encoding_iterators():
+    ctx = es.Context(rounds=16, batch_size=8)
+    result = es.solve_plan_isolated(flat_table(ctx, flow=1), encodings=iter(es.ENCODINGS),
+                                    fixed={0: "mobius"}, time_limit=10)
+    assert result["rows"][0] == ["mobius"]
+    with pytest.raises(ValueError, match="not available"):
+        es.solve_plan(flat_table(ctx, flow=1), fixed={5: "bits"})
+
+
+def test_one_group_design_plans_are_valid():
+    ctx = es.Context(rounds=16, batch_size=8)
+    for rows in es.design_plans(ctx, n_random=5, seed=1):
+        assert all(len(row) == 1 for row in rows)
+
+
+def test_packet_what_if_needs_single_visits(table):
+    long_ctx = es.Context(rounds=18, batch_size=32)
+    with pytest.raises(ValueError, match="exactly once"):
+        es.what_if_packets(es.CostTable(long_ctx, table.coefficients), (5,))
+
+
+def test_scatter_escapes_text():
+    import xml.etree.ElementTree as ET
+
+    row = {"name": "a & b", "emitted_floor": 990, "simulator_cycles": 1100}
+    ET.fromstring(es.scatter_svg([("Flow & Load", [row])]))
 
 
 def test_cost_table_round_trips(table):
