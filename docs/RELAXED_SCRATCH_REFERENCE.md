@@ -96,12 +96,20 @@ log says "All sections within budget" or is greedy-only. Every row PROVED and PA
 | Configuration | Real: cycles / `lb_cycles` / peak | Relaxed: cycles / `lb_cycles` / peak | Model (vars / constraints) real → relaxed | Capacity floor |
 |---|---|---|---|---|
 | 4 rounds, shaped hint | 425 (427) / 357 / 812 | 425 (427) / 357 / 828 | 29,919 / 102,223 → 23,211 / 76,104 | 357 |
-| 4 rounds, default hint | C4D_REAL | C4D_RELAX | C4D_MODEL | C4D_FLOOR |
-| 16 rounds, shaped hint | C16_REAL | C16_RELAX | C16_MODEL | 1,271 |
+| 4 rounds, default hint (round barriers) | 455 (457) / 357 / 1,266 | **405 (407)** / 357 / 1,793 | 29,932 / 103,392 → 23,219 / 77,094 | 357 / 358 |
+| 16 rounds, shaped hint | 1,399 (1,401) / 1,271 / 1,156 | not measured yet (queued) | 108,171 / 378,621 → 84,201 / 284,023 | 1,271 |
+| 16 rounds, default hint | not measured yet (queued) | not measured yet (queued) | | 1,271 |
 
-`lb_cycles` is CP-SAT's proven bound; at 4 rounds it equals the capacity floor in both runs,
-so removing the scratch constraint did not let CP-SAT prove anything stronger. Neither run
-improved on its hint within the budget.
+The queued 16-round solves were stopped for CPU priority (and two run at once were killed for
+memory); they run one at a time with the same options. 16 rounds, shaped, real: CP-SAT did not
+improve on the 1,399-cycle hint and proved 1,271, the capacity floor.
+
+`lb_cycles` is CP-SAT's proven bound; at 4 rounds it equals the capacity floor in every run,
+so removing the scratch constraint did not let CP-SAT prove anything stronger. Every solve
+ended on the deterministic budget (no wall-clock warning). With the shaped hint neither run
+improved on the hint. With the default hint the relaxed greedy starts at 423 instead of 458
+(no inflation throttle) and CP-SAT reaches 405, against 455 with scratch; 405 is also 20
+below the best real 4-round result here (425).
 
 ## What it says
 
@@ -117,8 +125,13 @@ improved on its hint within the budget.
   shaped; best relaxed 1,293 at stagger 6, which needs 2,009 words). That is spilling, a better
   allocator or more groups in flight, combined, for this scheduler. The remaining 22 to 42
   cycles to the 1,271 floor are not scratch.
-- **The CP-SAT bound does not move without scratch** at 4 rounds (357 both ways, equal to the
-  capacity floor), so the bound gap is not a scratch artefact either.
+- **CP-SAT does find shorter schedules without scratch from the round-barrier hint** at 4
+  rounds: 405 against 455 with scratch and 425 for the best real run. So with CP-SAT,
+  scratch-saving could be worth up to 20 cycles (5%) at 4 rounds. Whether this carries to 16
+  rounds is what the queued runs measure.
+- **The CP-SAT bound does not move without scratch** at 4 rounds (357 in every run, the
+  capacity floor), and 1,271 (the floor) with scratch at 16 rounds. So the bound gap is not a
+  scratch artefact.
 - Side result on the real machine: PR #51's plan with `--greedy-groups-in-flight 0` is
   **1,089** simulator cycles (peak 1,233, valid on the 1,536-word machine; PROVED, PASSED and
   `./scripts/check_upstream.sh --strict` passes), 10 better than the 1,099 recorded there.
