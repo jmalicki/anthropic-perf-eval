@@ -73,6 +73,9 @@ CATEGORIES = (
 # uses); scheduler_rs/src/architecture.rs holds the same numbers for AnthropicPerfEval.
 from scripts.analyze_bound_gap import CAP  # noqa: E402
 VLEN = 8
+# Utilisation caps are used as exact ratios; at most 6 decimal places keeps CP-SAT's coefficients
+# within 64 bits.
+MAX_CAP_DENOMINATOR = 10 ** 6
 FIXED_VECTOR_OPCODES = ("multiply_add", "vbroadcast")
 
 
@@ -626,8 +629,16 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         ratio = Fraction(str(frac))
         if engine not in ("load", "flow", "valu") or not 0 < ratio <= 1:
             raise ValueError(f"max_util: {engine}={frac}; engines load, flow, valu, fraction in (0, 1]")
+        if ratio.denominator > MAX_CAP_DENOMINATOR:  # e.g. 0.3333333333333333: coefficients would overflow
+            raise ValueError(f"max_util: {engine}={frac} has more than 6 decimal places; give the cap with at "
+                             f"most 6 (it is used exactly, never rounded)")
         caps[engine] = ratio
     t_max = big if not caps else math.ceil(big / min(caps.values())) + 1
+    for engine, ratio in caps.items():
+        # CP-SAT rejects a linear constraint whose terms can exceed 64 bits.
+        if max(ratio.denominator * big * 4, ratio.numerator * CAP[engine] * t_max) >= 2 ** 62:
+            raise ValueError(f"max_util: {engine}={ratio} makes the cap constraint too large for CP-SAT "
+                             f"(T up to {t_max:,}); use a larger cap")
     t = m.NewIntVar(1, t_max, "T")
     s1 = m.NewIntVar(0, big, "select1_flow")
     s2 = m.NewIntVar(0, big, "select2_flow")

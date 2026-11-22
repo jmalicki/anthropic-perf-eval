@@ -121,6 +121,9 @@ def test_caps_are_exact_and_bound_t_by_the_cap():
     # 901 flow ops under 0.9006 need 1,001 cycles; rounding the cap to 0.901 would allow 1,000.
     assert es.solve_plan_isolated(flat_table(ctx, flow=901), max_util={"flow": 0.9006},
                                   time_limit=10)["capped_cycles"] == 1001
+    # A cap with more precision than CP-SAT's coefficients allow is rejected, naming the cap.
+    with pytest.raises(ValueError, match="0.3333333333333333 has more than 6 decimal places"):
+        es.solve_plan_isolated(flat_table(ctx, flow=901), max_util={"flow": 0.3333333333333333}, time_limit=10)
 
 
 def test_fixed_root_and_encoding_iterators():
