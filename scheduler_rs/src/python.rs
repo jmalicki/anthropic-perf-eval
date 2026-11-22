@@ -1084,8 +1084,9 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// cached_select: node selection on the cached levels: "standard" (default), "bits" (select
 /// tree driven by the branch bits; leaf selects are multiply_adds, the rest SelectChoices),
 /// "bits-flow" (leaf selects are SelectChoices too) or "mobius" (2^d - 1 multiply_adds, no flow).
-/// select_bit_source: "index" (default; older bits extracted from the index, no bit vectors
-/// live across rounds) or "path" (all bits kept live, no extraction ops, more scratch).
+/// select_bit_source: "index" (default; the older bits used at depths 3 and 4 are extracted
+/// from the index and not kept; the newest bit and, at depth 2, the depth-0 bit stay live) or
+/// "path" (all bits kept live, no extraction ops, more scratch).
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index",

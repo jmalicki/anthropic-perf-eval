@@ -80,8 +80,9 @@ pub enum CachedSelect {
     Standard,
     /// Binary tree of `2^d - 1` two-way selects driven by the branch bits. The `2^(d-1)`
     /// leaf selects are multiply_adds with a precomputed delta; the selects above them are
-    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Uses the flow engine exactly
-    /// as much as `Standard` does.
+    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Per group that is 0, 1, 3 and 7
+    /// `SelectChoice`s at depths 1 to 4, against `Standard`'s 1, 3, 3 and 7: fewer choices that
+    /// can go to the flow engine at depths 1 and 2, the same at depths 3 and 4.
     Bits,
     /// As `Bits`, but the leaf selects are `SelectChoice`s too (flow `vselect`, or one
     /// multiply_add): every select can go to the flow engine, which gives the lowest
@@ -119,10 +120,13 @@ impl CachedSelect {
 /// The newest bit (the round just before the select) always comes straight from the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectBitSource {
-    /// Extract the older bits from the index as it was before the last update
-    /// (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth `d >= 2`
-    /// (one more to mirror a zero-based index at depth `d >= 3`), and no bit vector stays
-    /// live across rounds. Proof: `R15-bits-from-index`.
+    /// Extract the older bits used at depths 3 and 4 from the index as it was before the
+    /// last update (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth
+    /// `d >= 3` (one more to mirror a zero-based index), so those bits are not kept live. Two
+    /// bits still are: the newest bit, from the branch until the next cached select, and at
+    /// depth 2 the depth-0 bit, which the select reads directly. With the mirrored index that
+    /// bit is the index itself (no extra scratch); with the zero-based index it is a separate
+    /// vector, live for one more round. Proof: `R15-bits-from-index`.
     #[default]
     Index,
     /// Keep every branch bit live until the select: no extraction ops, but 8 scratch words
