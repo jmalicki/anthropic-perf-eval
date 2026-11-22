@@ -40,6 +40,10 @@ Options:
 - `--links` — Print spec file path with anchors for each theorem (e.g. `path/to/spec.md#t1`)
 - `--seed 42` — Random seed for Z3
 
+## Static makespan bounds (SB1-SB4)
+
+[`static_bounds_proof.py`](static_bounds_proof.py) proves the head-body-tail rows of `scripts/static_bounds.py` sound: `makespan >= t + q + ceil(W/cap)`, where W is the work of one row in the ops with head >= t and tail >= q. `SB1` takes 150 random small graphs, computes the bound through the same scheduler-JSON adapter, and asks Z3 for a schedule one cycle shorter under a reference model more permissive than CP-SAT's. The model allows split shift lanes, selects on flow or VALU, const choice and optional broadcasts. UNSAT on all of them means sound. `SB2` and `SB4` (SAT) confirm the stored counterexamples: a tail that counts the op's own cycle needs `q - 1`, and an eliminable vbroadcast's out-edge needs latency 0. `SB3` (SAT) shows the bound is attained, and above the capacity floor, on stored instances. Data: [`static_bound_counterexamples.json`](static_bound_counterexamples.json). `uv run python -m verification.static_bounds_proof --slow` runs 2,000 instances.
+
 ## Scratch allocation conjectures (A1-A7)
 
 [`allocation_conjectures.py`](allocation_conjectures.py) asks whether a per-cycle scratch load within budget guarantees an address layout. It does not: `A1-*` (UNSAT) are counterexamples, `A2-*` (SAT) show each fits in one more word, `A3-*` (UNSAT) map our same-cycle-reuse liveness to plain intervals, and `A4`/`A5` prove a sufficient condition for a two-pass allocator. `A6-*` are bounded searches. For them "unsat" means no counterexample exists in the bound and "sat" means one was found. `A7` checks the stored greedy-allocator failures. The fast checks run with the rest of `verification.verify`; slow ones with `uv run python -m verification.allocation_conjectures --slow`. Statements, bounds and literature: [docs/ALLOCATION_CONJECTURES.md](../docs/ALLOCATION_CONJECTURES.md). Counterexample data for allocator tests: [`allocation_counterexamples.json`](allocation_counterexamples.json).

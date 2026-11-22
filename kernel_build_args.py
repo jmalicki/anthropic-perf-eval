@@ -169,6 +169,8 @@ EMISSION_DEFAULTS = {
     "index_form": "zero-based",
     "prune_dead_index": False,
     "values_only": False,
+    "cached_select": "standard",
+    "select_bit_source": "index",
 }
 
 
@@ -198,6 +200,22 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "the upstream tests compare). The last round's index update and everything else "
                             "that only fed the index store is then dead and removed. --validate checks values "
                             "only under this flag")
+    group.add_argument("--cached-select", choices=["standard", "bits", "bits-flow", "mobius"],
+                       default=EMISSION_DEFAULTS["cached_select"],
+                       help="Node selection on the cached tree levels (depth 0 to --tree-reduce-max-depth). bits: "
+                            "select tree driven by the branch bits over node constants that already carry the "
+                            "deferred hash constant (no compare, root broadcast or XOR per group); leaf selects "
+                            "are multiply_adds, the selects above them go to flow or the vector ALU as the "
+                            "scheduler chooses. bits-flow: the leaf selects are scheduler's choice too, so all "
+                            "2^d - 1 can use the flow engine. mobius: the same table as 2^d - 1 multiply_adds, "
+                            "no flow ops (proofs: R13, R14)")
+    group.add_argument("--select-bit-source", choices=["index", "path"], default=EMISSION_DEFAULTS["select_bit_source"],
+                       help="With --cached-select bits|bits-flow|mobius: where the bits of earlier rounds come "
+                            "from. index (default) extracts the older bits used at depths 3 and 4 from the index (2 "
+                            "vector ops per group at depth 3, 4 at depth 4; one more for a zero-based index); the "
+                            "newest bit and, at depth 2, the depth-0 bit are still read directly. path keeps "
+                            "every bit live until the select: no ops, but 8 scratch words per group and earlier "
+                            "round, which can exceed the scratch budget (proof: R15-bits-from-index)")
     return group
 
 
