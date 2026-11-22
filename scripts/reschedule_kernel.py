@@ -237,10 +237,16 @@ def main() -> int:
     result = {"kernel": args.kernel, "ops": g.n, "edges": len(g.edges),
               "original_cycles": len({c for c in original})}
     t0 = time.perf_counter()
-    gstart = greedy(g)
+    runs = {p: greedy(g, p) for p in ("height", "original")}
+    for p, s in runs.items():
+        result[f"greedy_{p}_cycles"] = max(s) + 1
+    best = min(runs, key=lambda p: max(runs[p]))
+    gstart = runs[best]
     result["greedy_cycles"] = max(gstart) + 1
+    result["greedy_priority"] = best
     result["greedy_seconds"] = round(time.perf_counter() - t0, 1)
-    print(f"greedy: {result['greedy_cycles']} cycles (kernel's own: {result['original_cycles']})", flush=True)
+    print(f"greedy: critical-path priority {result['greedy_height_cycles']} cycles, original-order priority "
+          f"{result['greedy_original_cycles']} (kernel's own: {result['original_cycles']})", flush=True)
     sched, shifted = gstart, set()
     if args.scheduler == "cpsat":
         hint = original if args.hint == "original" else gstart

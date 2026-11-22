@@ -290,6 +290,7 @@ class Z3Encoder:
         self.fresh: dict[int, z3.BitVecRef] = {}
         self.side: dict[int, z3.BoolRef] = {}  # fresh var id -> its range constraint
         self.deps: dict[int, frozenset[int]] = {}  # term -> fresh vars it uses
+        self._inc: tuple[int, z3.Solver] | None = None  # (anchor term, incremental solver)
 
     def _val(self, v: int):
         return z3.BitVecVal(v % MASK, 32, self.ctx)
@@ -382,14 +383,29 @@ class Z3Encoder:
         raise ValueError(f"no Z3 encoding for {op!r}")
 
     def _solve(self, formula, *tids: int) -> str:
-        solver = z3.Solver(ctx=self.ctx)
-        solver.set("timeout", Z3_TIMEOUT_MS)
+        """Check `formula` with the range constraints of the fresh variables of `tids`.
+        Queries come in runs with the same first term (one load or store address against
+        each candidate), so one incremental solver per first term is kept and each query
+        is pushed and popped on it."""
+        anchor = tids[0]
+        if self._inc is None or self._inc[0] != anchor:
+            solver = z3.Solver(ctx=self.ctx)
+            solver.set("timeout", Z3_TIMEOUT_MS)
+            for v in self.deps[anchor]:
+                if v in self.side:
+                    solver.add(self.side[v])
+            self._inc = (anchor, solver)
+        solver = self._inc[1]
+        solver.push()
         solver.add(formula)
-        for t in tids:
+        for t in tids[1:]:
             for v in self.deps[t]:
                 if v in self.side:
                     solver.add(self.side[v])
-        result = str(solver.check())
+        try:
+            result = str(solver.check())
+        finally:
+            solver.pop()
         if result == "unknown":
             raise RuntimeError(f"Z3 returned unknown ({solver.reason_unknown()}) for "
                                f"{self.terms.show(tids[0], 4)} vs {self.terms.show(tids[-1], 4)}")

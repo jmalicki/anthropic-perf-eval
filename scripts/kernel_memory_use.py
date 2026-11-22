@@ -143,7 +143,7 @@ def _value_class(sym, kinds, tids: list[int]) -> str:
         return "working value (derived from input values)"
     if heads & {"sel", "ite_eq"}:
         return "selected tree values"
-    return "tree value copy"
+    return "function of tree values (no input values)"
 
 
 def _addr_class(sym, base: int, width: int) -> str:
