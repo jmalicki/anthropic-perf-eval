@@ -171,6 +171,7 @@ EMISSION_DEFAULTS = {
     "values_only": False,
     "cached_select": "standard",
     "select_bit_source": "index",
+    "depth4_select_rounds": "all",
 }
 
 
@@ -216,6 +217,12 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "newest bit and, at depth 2, the depth-0 bit are still read directly. path keeps "
                             "every bit live until the select: no ops, but 8 scratch words per group and earlier "
                             "round, which can exceed the scratch budget (proof: R15-bits-from-index)")
+    group.add_argument("--depth4-select-rounds", choices=["all", "after-wrap"],
+                       default=EMISSION_DEFAULTS["depth4_select_rounds"],
+                       help="With --tree-reduce-max-depth 4: which visits of tree level 4 select among the 16 "
+                            "cached nodes instead of gathering. all (default): every visit (rounds 4 and 15 of "
+                            "16). after-wrap: only visits after the first wrap (round 15); round 4 gathers. "
+                            "Selecting costs 15 selects per group and saves 8 loads per group")
     return group
 
 
