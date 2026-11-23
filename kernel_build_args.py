@@ -172,6 +172,9 @@ EMISSION_DEFAULTS = {
     "cached_select": "standard",
     "select_bit_source": "index",
     "depth4_select_rounds": "all",
+    # Per round and group tree-access encodings (solver/emission_plan.py): a path, a plan dict,
+    # or an expanded list. Passed to the binding expanded; None = choose from the flags above.
+    "emission_plan": None,
 }
 
 
@@ -223,18 +226,50 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "cached nodes instead of gathering. all (default): every visit (rounds 4 and 15 of "
                             "16). after-wrap: only visits after the first wrap (round 15); round 4 gathers. "
                             "Selecting costs 15 selects per group and saves 8 loads per group")
+    group.add_argument("--emission-plan", default=EMISSION_DEFAULTS["emission_plan"], metavar="PATH",
+                       help="JSON plan of the tree-access encoding (gather, bits, bits-flow, mobius) of every "
+                            "group in every round (format: solver/emission_plan.py). Replaces --cached-select, "
+                            "--tree-reduce-max-depth and --depth4-select-rounds for the tree access")
     return group
 
 
+def resolve_emission_plan(plan, rounds: int, batch_size: int, forest_height: int, cached_select: str,
+                          depth4_select_rounds: str):
+    """The `emission_plan` value for the binding: `plan` (a path, plan dict or list) expanded to
+    one encoding name per round and group, or None. Rejects combining a plan with the flags it
+    replaces."""
+    if plan is None:
+        return None
+    from solver.emission_plan import expand_plan, load_plan
+
+    if cached_select != EMISSION_DEFAULTS["cached_select"] or depth4_select_rounds != EMISSION_DEFAULTS["depth4_select_rounds"]:
+        raise ValueError("--emission-plan chooses the tree access of every round and group; "
+                         "do not combine it with --cached-select or --depth4-select-rounds")
+    if isinstance(plan, str):
+        plan = load_plan(plan)
+    return expand_plan(plan, rounds, batch_size // 8, forest_height)
+
+
 def emission_options(get) -> dict:
-    """Every emission option with its value, read through `get(name, default)`."""
-    return {name: get(name, default) for name, default in EMISSION_DEFAULTS.items()}
+    """Every emission option with its value, read through `get(name, default)`. The emission
+    plan comes back expanded (resolve_emission_plan)."""
+    options = {name: get(name, default) for name, default in EMISSION_DEFAULTS.items()}
+    options["emission_plan"] = resolve_emission_plan(
+        options["emission_plan"], get("rounds", 16), get("batch_size", 256), get("forest_height", 10),
+        options["cached_select"], options["depth4_select_rounds"])
+    return options
 
 
 def non_default_emission_options(build_kwargs: dict) -> dict:
-    """Emission options in `build_kwargs` that differ from their defaults (for the run header)."""
-    return {name: build_kwargs[name] for name, default in EMISSION_DEFAULTS.items()
-            if build_kwargs.get(name, default) != default}
+    """Emission options in `build_kwargs` that differ from their defaults (for the run header).
+    An emission plan is shown as a one-line summary."""
+    options = {name: build_kwargs[name] for name, default in EMISSION_DEFAULTS.items()
+               if build_kwargs.get(name, default) != default}
+    if options.get("emission_plan") is not None:
+        from solver.emission_plan import describe_plan
+
+        options["emission_plan"] = describe_plan(options["emission_plan"])
+    return options
 
 
 def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
@@ -519,8 +554,9 @@ def args_to_build_kwargs(
     if out_path is None:
         out_path = DEFAULT_SCHEDULER_JSON
 
+    emission = emission_options(get)
     run_options = {
-        **emission_options(get),
+        **emission,
         "forest_height": forest_height,
         "n_nodes": n_nodes,
         "batch_size": batch_size,
@@ -570,7 +606,7 @@ def args_to_build_kwargs(
     enable_cse = False if get("no_cse_groups", False) else None
 
     return {
-        **emission_options(get),
+        **emission,
         "forest_height": forest_height,
         "n_nodes": n_nodes,
         "batch_size": batch_size,

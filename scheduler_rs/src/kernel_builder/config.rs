@@ -154,6 +154,86 @@ impl SelectBitSource {
     }
 }
 
+/// How one group of 8 lanes fetches its tree node in one round (one level visit).
+///
+/// Without an emission plan every group of a round uses the same encoding, derived from
+/// `tree_reduce_max_depth`, `cached_select` and `depth4_select_after_wrap_only`
+/// (`ProblemSpec::access_encoding`). With `ProblemSpec::access_plan` it is chosen per round
+/// and per group (plan format: `solver/emission_plan.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessEncoding {
+    /// Scalar gather: one vector address op, 8 scalar loads, XOR with the deferred stage-5
+    /// constant (`emit_scattered_access`). Any depth from 1.
+    Gather,
+    /// The cached-level emission of `CachedSelect::Standard` (compares or index bits, select
+    /// tree, XOR). Flag path only: an emission plan cannot name it.
+    Standard,
+    /// `CachedSelect::Bits` on this group (depth 0 to `MAX_TREE_REDUCE_DEPTH`).
+    Bits,
+    /// `CachedSelect::BitsFlow` on this group.
+    BitsFlow,
+    /// `CachedSelect::Mobius` on this group.
+    Mobius,
+}
+
+impl AccessEncoding {
+    /// Parse the plan spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"gather"`, `"bits"`, `"bits-flow"` or `"mobius"`.
+    ///
+    /// # Returns
+    /// The encoding, or an error naming the valid spellings. `Standard` has no spelling.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "gather" => Ok(AccessEncoding::Gather),
+            "bits" => Ok(AccessEncoding::Bits),
+            "bits-flow" => Ok(AccessEncoding::BitsFlow),
+            "mobius" => Ok(AccessEncoding::Mobius),
+            other => Err(format!(
+                "Invalid access encoding '{}': must be 'gather', 'bits', 'bits-flow' or 'mobius'",
+                other
+            )),
+        }
+    }
+
+    /// The `CachedSelect` mode of a bit-driven encoding, or `None` for `Gather` / `Standard`.
+    pub fn cached_select(self) -> Option<CachedSelect> {
+        match self {
+            AccessEncoding::Bits => Some(CachedSelect::Bits),
+            AccessEncoding::BitsFlow => Some(CachedSelect::BitsFlow),
+            AccessEncoding::Mobius => Some(CachedSelect::Mobius),
+            AccessEncoding::Gather | AccessEncoding::Standard => None,
+        }
+    }
+
+    /// Check that this encoding can fetch a node at `tree_depth` in a plan.
+    ///
+    /// # Returns
+    /// `Err` for `Standard` (not plannable), for `Gather` at depth 0 (every lane is at the
+    /// root; the mirrored index does not even exist there) and for a bit-driven encoding
+    /// below `MAX_TREE_REDUCE_DEPTH`.
+    pub fn check_plannable(self, tree_depth: usize) -> Result<(), String> {
+        match self {
+            AccessEncoding::Standard => {
+                Err("the standard cached-level encoding cannot be named in an emission plan".to_string())
+            }
+            AccessEncoding::Gather if tree_depth == 0 => {
+                Err("gather is not available at depth 0 (every lane is at the root)".to_string())
+            }
+            AccessEncoding::Bits | AccessEncoding::BitsFlow | AccessEncoding::Mobius
+                if tree_depth > MAX_TREE_REDUCE_DEPTH as usize =>
+            {
+                Err(format!(
+                    "{:?} selects among cached nodes, which exist only down to depth {} (got depth {})",
+                    self, MAX_TREE_REDUCE_DEPTH, tree_depth
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Largest tree index at depth `depth`: `L_d = 2^(d+1) - 2`.
 ///
 /// # Arguments
@@ -230,6 +310,11 @@ pub struct ProblemSpec {
     /// (round 4). Selecting costs 15 selects per group and saves 8 loads per group; after
     /// the wrap the loads are what binds. Default false (select on every visit).
     pub depth4_select_after_wrap_only: bool,
+    /// Emission plan: the access encoding of every group in every round, `[round][group]`.
+    /// When set it replaces `tree_reduce_max_depth`, `cached_select` and
+    /// `depth4_select_after_wrap_only` for the choice of tree access (`access_encoding`);
+    /// check it with `check_access_plan`. Default `None`: the emission is unchanged.
+    pub access_plan: Option<Vec<Vec<AccessEncoding>>>,
 }
 
 impl Default for ProblemSpec {
@@ -257,6 +342,7 @@ impl Default for ProblemSpec {
             cached_select: CachedSelect::Standard,
             select_bit_source: SelectBitSource::Index,
             depth4_select_after_wrap_only: false,
+            access_plan: None,
         }
     }
 }
@@ -311,6 +397,76 @@ impl ProblemSpec {
         let first_pass = rnd < self.tree_height();
         self.use_tree_reduce_at_depth(tree_depth)
             && !(tree_depth == 4 && self.depth4_select_after_wrap_only && first_pass)
+    }
+
+    /// Tree depth visited in round `rnd`: rounds walk down the tree and wrap to the root
+    /// after the deepest level.
+    pub fn round_depth(&self, rnd: usize) -> usize {
+        rnd % self.tree_height()
+    }
+
+    /// How group `g` fetches its node in round `rnd`, which visits `tree_depth`.
+    ///
+    /// # Returns
+    /// The plan's entry when `access_plan` is set. Otherwise the flag-driven choice shared by
+    /// every group: `Gather` unless `selects_cached_level`, then `Standard` or the bit-driven
+    /// encoding of `cached_select`.
+    pub fn access_encoding(&self, rnd: usize, tree_depth: usize, g: usize) -> AccessEncoding {
+        if let Some(plan) = &self.access_plan {
+            return plan[rnd][g];
+        }
+        if !self.selects_cached_level(rnd, tree_depth) {
+            return AccessEncoding::Gather;
+        }
+        match self.cached_select {
+            CachedSelect::Standard => AccessEncoding::Standard,
+            CachedSelect::Bits => AccessEncoding::Bits,
+            CachedSelect::BitsFlow => AccessEncoding::BitsFlow,
+            CachedSelect::Mobius => AccessEncoding::Mobius,
+        }
+    }
+
+    /// True if some group in some round fetches tree level `tree_depth` with `encoding`.
+    pub fn uses_access(&self, tree_depth: usize, encoding: AccessEncoding) -> bool {
+        (0..self.rounds).any(|r| {
+            self.round_depth(r) == tree_depth
+                && (0..self.n_groups()).any(|g| self.access_encoding(r, tree_depth, g) == encoding)
+        })
+    }
+
+    /// Check `access_plan` against the problem shape: one row per round, one entry per group,
+    /// and every entry available at its round's depth (`AccessEncoding::check_plannable`).
+    ///
+    /// # Returns
+    /// `Ok(())` when there is no plan or it is valid, else a message naming the first bad entry.
+    pub fn check_access_plan(&self) -> Result<(), String> {
+        let Some(plan) = &self.access_plan else {
+            return Ok(());
+        };
+        if plan.len() != self.rounds {
+            return Err(format!(
+                "emission plan has {} rounds, the kernel has {}",
+                plan.len(),
+                self.rounds
+            ));
+        }
+        for (rnd, row) in plan.iter().enumerate() {
+            if row.len() != self.n_groups() {
+                return Err(format!(
+                    "emission plan round {} has {} groups, the kernel has {}",
+                    rnd,
+                    row.len(),
+                    self.n_groups()
+                ));
+            }
+            let depth = self.round_depth(rnd);
+            for (g, encoding) in row.iter().enumerate() {
+                encoding
+                    .check_plannable(depth)
+                    .map_err(|e| format!("emission plan round {} (depth {}) group {}: {}", rnd, depth, g, e))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -823,6 +979,76 @@ mod tests {
         // The option only concerns depth 4.
         assert!(spec(4, true).selects_cached_level(3, 3));
         assert!(!spec(4, true).selects_cached_level(5, 5));
+    }
+
+    #[test]
+    fn test_access_encoding_from_flags() {
+        let spec = ProblemSpec {
+            cached_select: CachedSelect::Bits,
+            tree_reduce_max_depth: 4,
+            depth4_select_after_wrap_only: true,
+            ..Default::default()
+        };
+        assert_eq!(spec.access_encoding(0, 0, 5), AccessEncoding::Bits);
+        assert_eq!(spec.access_encoding(4, 4, 5), AccessEncoding::Gather);
+        assert_eq!(spec.access_encoding(15, 4, 5), AccessEncoding::Bits);
+        assert_eq!(spec.access_encoding(5, 5, 0), AccessEncoding::Gather);
+        let standard = ProblemSpec::default();
+        assert_eq!(standard.access_encoding(2, 2, 0), AccessEncoding::Standard);
+        assert!(standard.uses_access(3, AccessEncoding::Standard));
+        assert!(!standard.uses_access(4, AccessEncoding::Standard));
+        assert!(standard.uses_access(4, AccessEncoding::Gather));
+    }
+
+    #[test]
+    fn test_access_plan_overrides_flags_and_is_checked() {
+        let n_groups = 4;
+        let rounds = 16;
+        let mut plan: Vec<Vec<AccessEncoding>> = (0..rounds)
+            .map(|r| {
+                let depth = r % 11;
+                vec![if depth == 0 { AccessEncoding::Bits } else { AccessEncoding::Gather }; n_groups]
+            })
+            .collect();
+        plan[15][1] = AccessEncoding::Mobius;
+        let mut spec = ProblemSpec {
+            batch_size: n_groups * VLEN,
+            rounds,
+            cached_select: CachedSelect::Bits,
+            access_plan: Some(plan),
+            ..Default::default()
+        };
+        assert_eq!(spec.check_access_plan(), Ok(()));
+        assert_eq!(spec.access_encoding(2, 2, 0), AccessEncoding::Gather);
+        assert_eq!(spec.access_encoding(15, 4, 1), AccessEncoding::Mobius);
+        assert!(spec.uses_access(4, AccessEncoding::Mobius));
+        assert!(!spec.uses_access(3, AccessEncoding::Mobius));
+
+        let bad = |spec: &mut ProblemSpec, rnd: usize, g: usize, e: AccessEncoding| {
+            let saved = spec.access_plan.as_ref().unwrap()[rnd][g];
+            spec.access_plan.as_mut().unwrap()[rnd][g] = e;
+            let result = spec.check_access_plan();
+            spec.access_plan.as_mut().unwrap()[rnd][g] = saved;
+            result
+        };
+        assert!(bad(&mut spec, 0, 0, AccessEncoding::Gather).unwrap_err().contains("depth 0"));
+        assert!(bad(&mut spec, 5, 0, AccessEncoding::Bits).unwrap_err().contains("depth 5"));
+        assert!(bad(&mut spec, 2, 3, AccessEncoding::Standard).unwrap_err().contains("standard"));
+        spec.access_plan.as_mut().unwrap().pop();
+        assert!(spec.check_access_plan().unwrap_err().contains("15 rounds"));
+    }
+
+    #[test]
+    fn test_access_encoding_from_str() {
+        for (s, e) in [
+            ("gather", AccessEncoding::Gather),
+            ("bits", AccessEncoding::Bits),
+            ("bits-flow", AccessEncoding::BitsFlow),
+            ("mobius", AccessEncoding::Mobius),
+        ] {
+            assert_eq!(AccessEncoding::from_str(s), Ok(e));
+        }
+        assert!(AccessEncoding::from_str("standard").is_err());
     }
 
     #[test]
