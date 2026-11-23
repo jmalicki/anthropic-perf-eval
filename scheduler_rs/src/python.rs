@@ -1092,7 +1092,8 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// emission_plan: per round, per group the tree-access encoding ("gather", "bits", "bits-flow",
 /// "mobius"); a list of `rounds` lists of `batch_size / 8` names. Replaces cached_select,
 /// tree_reduce_max_depth and depth4_select_rounds for the choice of tree access (combining it
-/// with cached_select or depth4_select_rounds is an error). Plan format: solver/emission_plan.py.
+/// with cached_select or depth4_select_rounds is an error). Plan format: solver/emission_plan.py;
+/// see docs/EMISSION_STRUCTURE_MODEL.md.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None,
