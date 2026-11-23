@@ -22,17 +22,20 @@ pub struct CachedSelectPair {
 }
 
 /// Constants for selecting the node value of one cached tree level from the branch bits.
-/// Every node value already carries the deferred stage-5 constant.
-#[derive(Debug, Clone)]
-pub enum CachedLevelTable {
+/// Every node value already carries the deferred stage-5 constant. Holds what the
+/// bit-driven encodings used at this level need; with an emission plan several can be in
+/// use at once (e.g. `Bits` in some groups, `Mobius` in others).
+#[derive(Debug, Clone, Default)]
+pub struct CachedLevelTable {
     /// Depth 0: the root value, shared by every group.
-    Root(VReg),
-    /// `CachedSelect::Bits` / `BitsFlow`: `2^(d-1)` leaf pairs, pair `j` holding table entries
-    /// `2j` and `2j+1` (table index = branch bits with the oldest bit lowest).
-    Pairs(Vec<CachedSelectPair>),
+    pub root: Option<VReg>,
+    /// `CachedSelect::Bits` / `BitsFlow`: `2^(d-1)` leaf pairs, pair `j` holding table
+    /// entries `2j` and `2j+1` (table index = branch bits with the oldest bit lowest).
+    /// `high` is set when some group uses `BitsFlow`.
+    pub pairs: Option<Vec<CachedSelectPair>>,
     /// `CachedSelect::Mobius`: `2^d` vectors of multilinear coefficients, indexed by the
     /// set of bits they multiply (oldest bit lowest).
-    Coefficients(Vec<VReg>),
+    pub coefficients: Option<Vec<VReg>>,
 }
 
 /// SSA scratch context - holds VRegs for all kernel values.
@@ -112,7 +115,7 @@ pub struct SsaScratchContext {
     /// [n_groups] - the tracked index as it was before the latest branch update, i.e. at the
     /// depth of the round just emitted (same form and `None` convention as `all_idx`).
     pub prev_idx: Vec<Option<VReg>>,
-    /// [depth] - select constants per cached level (`CachedSelect` other than `Standard`).
+    /// [depth] - select constants per cached level (bit-driven `AccessEncoding`s).
     pub cached_tables: Vec<Option<CachedLevelTable>>,
     pub v_nv: Vec<Vec<Option<VReg>>>, // [n_iters][UNROLL] - tree value vectors
     pub v_t: Vec<Vec<Option<VReg>>>,  // [n_iters][UNROLL] - temp vectors
