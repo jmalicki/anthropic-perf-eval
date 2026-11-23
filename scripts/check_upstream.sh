@@ -42,9 +42,11 @@ if [ -z "$kernel" ]; then
   # skip the save or change the problem size, and remove any kernel left by an earlier run.
   for arg in "$@"; do
     case "$arg" in
-      --save-kernel|--save-kernel=*|--validate-only|--validate-only=*|--output-json|--output-json=*|\
+      --save-kernel|--save-kernel=*|--validate-only|--validate-only=*|--output-json|--output-json=*)
+        echo "check_upstream.sh sets ${arg%%=*} itself; use --kernel PATH to test a kernel built elsewhere" >&2
+        exit 2 ;;
       --scratch-budget-override|--scratch-budget-override=*|--no-scratch-constraint)
-        echo "check_upstream.sh: ${arg%%=*} builds an analysis-only kernel that does not fit the machine" >&2
+        echo "check_upstream.sh: ${arg%%=*} changes the scratch budget; use --kernel PATH to test a kernel built elsewhere" >&2
         exit 2 ;;
       --forest-height|--forest-height=*|--batch-size|--batch-size=*|--rounds|--rounds=*|--n-nodes|--n-nodes=*)
         echo "check_upstream.sh sets ${arg%%=*} itself; use --kernel PATH to test a kernel built elsewhere" >&2

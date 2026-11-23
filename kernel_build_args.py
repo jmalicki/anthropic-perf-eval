@@ -16,6 +16,13 @@ import sys
 from typing import Any, Optional
 
 DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
+RELAXED_SCHEDULER_JSON = "scheduler_output_relaxed_scratch.json"
+NORMAL_KERNEL_PATHS = {
+    "kernel_to_validate.json",
+    "kernel_upstream_check.json",
+    "scheduler_output_upstream_check.json",
+    DEFAULT_SCHEDULER_JSON,
+}
 
 # Mirrors of DEFAULT_GREEDY_* in scheduler_rs/src/kernel_builder/config.rs.
 DEFAULT_GREEDY_STAGGER_CYCLES = 12
@@ -586,10 +593,13 @@ def args_to_build_kwargs(
     cpsat_tuning_effective = json.loads(scheduler_rs.resolve_cpsat_tuning(cpsat_tuning_json))
 
     scratch_size, scratch_constraint = scratch_settings(get)
+    relaxed = is_relaxed_scratch(scratch_size, scratch_constraint)
 
     out_path = output_json if output_json is not None else get("output_json")
     if out_path is None:
-        out_path = DEFAULT_SCHEDULER_JSON
+        out_path = RELAXED_SCHEDULER_JSON if relaxed else DEFAULT_SCHEDULER_JSON
+    elif relaxed and os.path.basename(out_path) in NORMAL_KERNEL_PATHS:
+        raise ValueError(f"refusing to write a relaxed-scratch build to {out_path}, a normal kernel/result path")
 
     emission = emission_options(get)
     run_options = {
@@ -639,7 +649,7 @@ def args_to_build_kwargs(
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
         "scratch_size": scratch_size,
         "scratch_constraint": scratch_constraint,
-        "relaxed_scratch": is_relaxed_scratch(scratch_size, scratch_constraint),
+        "relaxed_scratch": relaxed,
         "scratch_model": get("scratch_model", "words"),
     }
     git_sha = _get_git_sha() if use_git_sha else None

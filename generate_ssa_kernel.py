@@ -34,6 +34,8 @@ import time
 from kernel_build_args import (
     DEFAULT_SCHEDULER_JSON,
     MACHINE_SCRATCH_SIZE,
+    NORMAL_KERNEL_PATHS,
+    RELAXED_SCHEDULER_JSON,
     add_kernel_build_args,
     is_relaxed_scratch,
     scratch_settings,
@@ -45,11 +47,8 @@ from kernel_build_args import (
 
 BASELINE = 147734
 
-# Default output paths of a relaxed-scratch build, so it never lands where a normal kernel does.
-RELAXED_SCHEDULER_JSON = "scheduler_output_relaxed_scratch.json"
+# Default kernel output of a relaxed-scratch build.
 RELAXED_KERNEL_JSON = "kernel_relaxed_scratch.json"
-# Paths a relaxed-scratch kernel must never be written to (normal kernels and recorded results).
-NORMAL_KERNEL_PATHS = {"kernel_to_validate.json", "kernel_upstream_check.json", DEFAULT_SCHEDULER_JSON}
 
 
 def relaxed_scratch_banner(scratch_size, scratch_constraint):

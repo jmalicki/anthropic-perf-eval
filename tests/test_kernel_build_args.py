@@ -188,7 +188,12 @@ def test_relaxed_scratch_flags_reach_kwargs_and_run_options():
     by default the machine's 1536 words with the constraint."""
     import argparse
 
-    from kernel_build_args import UNBOUNDED_SCRATCH_WORDS, add_kernel_build_args
+    from kernel_build_args import (
+        DEFAULT_SCHEDULER_JSON,
+        RELAXED_SCHEDULER_JSON,
+        UNBOUNDED_SCRATCH_WORDS,
+        add_kernel_build_args,
+    )
 
     parser = argparse.ArgumentParser()
     add_kernel_build_args(parser)
@@ -205,6 +210,9 @@ def test_relaxed_scratch_flags_reach_kwargs_and_run_options():
         assert (kwargs["scratch_size"], kwargs["scratch_constraint"]) == (size, constraint), argv
         assert (recorded["scratch_size"], recorded["scratch_constraint"], recorded["relaxed_scratch"]) == \
             (size, constraint, relaxed), argv
+        assert kwargs["output_json"] == (RELAXED_SCHEDULER_JSON if relaxed else DEFAULT_SCHEDULER_JSON), argv
+    with pytest.raises(ValueError, match="a normal kernel/result path"):
+        args_to_build_kwargs(None, scratch_constraint=False, output_json=DEFAULT_SCHEDULER_JSON)
     with pytest.raises(SystemExit):
         parser.parse_args(["--scratch-budget-override", "0"])
 
