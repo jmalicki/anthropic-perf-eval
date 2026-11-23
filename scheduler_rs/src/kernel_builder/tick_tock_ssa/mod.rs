@@ -18,7 +18,7 @@ use crate::cpsat_scheduler::OptionalConstraintGroup;
 use crate::types::{Engine, MachineConfig, Op, Opcode, Operand, SsaId, SsaOp, UsageAccounting, VReg, VarType};
 use crate::types::SlotVal;
 
-use super::config::{fma_multiplier, KernelConfig};
+use super::config::{fma_multiplier, AccessEncoding, KernelConfig};
 use super::context_ssa::SsaScratchContext;
 use super::emit_ssa::SsaEmitContext;
 use super::ssa_program::SsaProgram;
@@ -117,6 +117,9 @@ pub struct SsaTickTockKernelBuilder {
     pub(crate) depth4_broadcasts_initialized: bool,
     /// Whether any round will use depth 4
     pub(crate) uses_depth4: bool,
+    /// Groups the tree-access emitter being run emits (`emits_group`); `None` = all. Set per
+    /// encoding by `emit_round` when an emission plan mixes encodings within a round.
+    pub(crate) access_groups: Option<Vec<bool>>,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
     /// Per-solve CP-SAT budget in deterministic time (None = wall-clock limit only). Set
@@ -645,16 +648,20 @@ impl SsaTickTockKernelBuilder {
     pub fn new(config: KernelConfig) -> Self {
         let n_groups = config.n_groups();
         let n_iters = config.n_iters();
-        let tree_height = config.spec.forest_height;
-        let uses_depth3 = (0..config.spec.rounds).any(|r| {
-            let tree_depth = r % tree_height;
-            tree_depth == 3
-        });
-        let uses_depth4 = config.spec.use_tree_reduce_at_depth(4)
-            && (0..config.spec.rounds).any(|r| {
-                let tree_depth = r % tree_height;
-                tree_depth == 4
-            });
+        // Round r visits depth r % tree_height() (`ProblemSpec::round_depth`).
+        let uses_depth3 = (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 3);
+        if let Err(e) = config.spec.check_access_plan() {
+            panic!("invalid emission plan: {}", e);
+        }
+        let uses_depth4 = if config.spec.access_plan.is_some() {
+            // Some group selects among the cached level-4 nodes.
+            [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius]
+                .into_iter()
+                .any(|e| config.spec.uses_access(4, e))
+        } else {
+            config.spec.use_tree_reduce_at_depth(4)
+                && (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 4)
+        };
 
         // Pre-compute FMA multipliers in config-compatible format
         let mut hash_fma_mult = [None; 6];
@@ -673,6 +680,7 @@ impl SsaTickTockKernelBuilder {
             uses_depth3,
             depth4_broadcasts_initialized: false,
             uses_depth4,
+            access_groups: None,
             zero_vreg: None,
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
