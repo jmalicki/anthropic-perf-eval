@@ -21,6 +21,7 @@ $M predict [--plan plan.json|bits|bits-flow+depth4-after-wrap ...]   # counts an
 $M solve --out plan.json [--max-util flow=0.9] [--encodings gather,bits]
 $M measure --shaped --upstream --plan plan.json --plan bits          # build, prove, validate, upstream --strict
 $M sweep --shaped --max-util none --max-util flow=0.9 ...            # solve + measure per cap
+$M solve --values-only --select-bit-source path --fix 15=gather --max-util flow=0.9 --out p.json
 $M solve --what-if gather-without-address-op                        # uncalibrated estimate for a future encoding
 ```
 
@@ -62,6 +63,10 @@ All floors are for one emission and ignore time; never quote them as bounds on t
 - The pip `ortools` used for the structure solve and the OR-Tools linked into `scheduler_rs`
   crash when loaded into one process. Commands that solve and build use `solve_plan_isolated`
   (a spawned child); do the same in tests.
+- With `--values-only` the floor prefers level-4 selects in round 15 (they also kill that group's
+  late index updates), which schedules 40 to 100 cycles worse: use `--fix 15=gather`. The Z3
+  negatives for an address-free `vload` index and a node-XOR fold are in
+  `scripts/analyze_bound_gap.py --z3`; do not re-derive them.
 - Plans with the same floor can schedule 100 cycles apart. Select work in the last round is the
   schedule's tail; the solve's tie-break puts it at the earliest visit. Compare plans by measured
   cycles, and use `--max-util` to keep headroom on engines the scheduler packs badly (flow).

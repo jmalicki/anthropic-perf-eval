@@ -6,11 +6,14 @@ emitter and predicts the op counts of every plan exactly. Its best plan has a ca
 989 cycles against 1,049 for today's best flags. With the shaped greedy scheduler a plan from the
 model runs in **1,104 cycles (1,106 on the simulator)** against 1,153 / 1,155 for today's best
 flags. Every kernel here is proved equal to its SSA program, passes validation and is correct on
-the unmodified upstream tests; every model plan also passes their speed thresholds (`--strict`). The floor ignores time, so it is a good guide only
-while the scheduler can approach it. Here every schedule lands 90 to 120 cycles above its floor,
-and two plans with the same floor can differ by 100 cycles (section 5). Estimated with the model,
-`vload` at the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles
-of floor on this structure: once loads stop binding, the vector work binds near 975 (section 6).
+the unmodified upstream tests; every model plan also passes their speed thresholds (`--strict`).
+The floor ignores time, so it is a good guide only while the scheduler can approach it. Here
+every schedule lands 90 to 120 cycles above its floor, and two plans with the same floor can
+differ by 100 cycles (section 5). Cutting vector work (section 6.1) takes it to **1,099** on the
+simulator with the output unchanged (branch bits kept live), and **1,083** with `--values-only`
+(indices not stored; the unmodified upstream tests pass). Estimated with the model, `vload` at
+the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles of floor
+on this structure: once loads stop binding, the vector work binds near 975 (section 6).
 
 November 2026. Code: `scripts/emission_structure.py` (model, calibration, solve, measurement),
 `solver/emission_plan.py` (plan format), `--emission-plan` (emitter). Skill:
@@ -293,7 +296,60 @@ Leads from the leaderboard research, to verify:
 | 982 cycles | Level-4 caching for a searched subset of groups | What this model does (section 5) |
 | Estimate | 899-style packets for levels 4 to 7: about -480 loads, load floor about 822 | The load floor falls, but the ALUs bind near 975 first |
 
-## 7. Known limits of the model
+### 6.1 Cutting vector work (the direction taken)
+
+The user chose to cut vector work rather than build packets or work on the scheduler. Four
+candidates, cheapest to verify first:
+
+| Candidate | Result | Evidence |
+|---|---|---|
+| Address-free gather by `vload` at a pointer-form index (phase 2) | **Impossible at the same op count.** A `vload` at `p = idx + F` leaves `tree[idx]` in a fixed word for any `F = forest_p - w`, but the true branch bit is `1 - (lazy & 1)`, so the update `p' = 2p + bit + 1 - F` needs one op giving `(2 - F) - (v & 1)`. No single ISA op with a constant does, for any `F` from 1 to 8 and either operand order. The update stays 3 ops, which costs the address op back in every round | Z3, `scripts/analyze_bound_gap.py --z3` ("NO SUCH OP") |
+| Fold the node XOR into hash stage 0 | **No fold exists.** It would need `(x ^ y) * 4097 + C0` to be affine in the value `x` and the node `y`; no constants make it so | Z3, same script ("NO SUCH FOLD") |
+| Skip index updates nothing reads | Only with `--values-only`: otherwise the final index store reads the whole chain. With it, a group's updates after its last index read are dead, and which ones depends on the group's own gather/select pattern over rounds 12 to 15, so the cost model gains `tail:<pattern>` features (exact: 144 design plans and every unseen plan) | `tests/test_emission_structure.py::test_values_only_tail_patterns_make_the_fit_exact` |
+| Branch bits kept live instead of extracted (`--select-bit-source path`) | No bit-extraction ops at depths 3 and 4. Fits the scratch budget under the wavefront for the solved plans; some calibration plans do not build and are skipped | Calibration notes; the rows below |
+
+`--values-only` changes the output (indices not stored) and is allowed in recorded results when
+the unmodified upstream tests pass; every values-only number below says so.
+
+Solved and measured (shaped greedy; every row counts predicted exactly, PROVED, PASSED, and
+`./scripts/check_upstream.sh --strict` passes; values-only rows are validated on values only):
+
+| Context | Cap | Plan floor | Cycles (sched / sim) | Level-4 selects |
+|---|---|---|---|---|
+| merge + mirrored (section 5) | flow 0.9 | 997 | 1,104 / 1,106 | round 4, 15 groups |
+| + `--select-bit-source path` | none | 973 | 1,107 / 1,109 | round 4, 21 groups |
+| + `--select-bit-source path` | **flow 0.9** | 980 | **1,097 / 1,099** | round 4, 20 groups |
+| + `--select-bit-source path` | flow 0.8 | 989 | 1,103 / 1,105 | round 4, 17 groups |
+| + `--values-only` (values only) | none | 980 | 1,200 / 1,202 | round 15, 20 groups |
+| + `--values-only` (values only) | flow 0.9 | 985 | 1,196 / 1,198 | round 15, 18 groups |
+| + `--values-only` (values only) | flow 0.8 | 995 | 1,137 / 1,139 | round 15, 16 groups |
+| + both (values only) | none | 957 | 1,157 / 1,159 | round 15, 25 groups |
+| + both (values only) | flow 0.9 | 965 | 1,107 / 1,109 | round 15, 23 groups |
+| + both (values only) | flow 0.8 | 973 | 1,112 / 1,114 | round 15, 21 groups |
+| + `--values-only`, `--fix 15=gather` (values only) | none | 981 | 1,120 / 1,122 | round 4, 19 groups |
+| + `--values-only`, `--fix 15=gather` (values only) | flow 0.9 | 989 | 1,095 / 1,097 | round 4, 17 groups |
+| + `--values-only`, `--fix 15=gather` (values only) | flow 0.8 | 997 | 1,109 / 1,111 | round 4, 15 groups |
+| + both, `--fix 15=gather` (values only) | none | 964 | 1,086 / 1,088 | round 4, 24 groups |
+| + both, `--fix 15=gather` (values only) | **flow 0.9** | 969 | **1,081 / 1,083** | round 4, 22 groups |
+| + both, `--fix 15=gather` (values only) | flow 0.8 | 977 | 1,084 / 1,086 | round 4, 20 groups |
+
+What this says:
+
+- Path bits are worth 7 cycles measured (1,106 to 1,099) and 9 to 16 of floor, with the output
+  unchanged.
+- Values-only lowers the floor (989 to 980 alone, 957 with path bits) but the measured cycles get
+  worse, because it makes level-4 selects in round 15 cheaper in ops: a group that selects there
+  needs no index update in rounds 14 and 15. The floor then prefers round 15, the schedule's tail,
+  and the lateness tie-break never applies (the floors differ). This is the model's known limit
+  (section 7) showing up in the opposite direction: an op-count saving that costs time.
+- Keeping the last round free of select work (`--fix 15=gather`, a constraint on the plan rather
+  than a tie-break) recovers it: values-only with path bits reaches **1,081 / 1,083** (floor 969),
+  values-only alone 1,095 / 1,097. Under every cap, the fixed plans beat the unfixed ones by 15 to
+  100 cycles.
+- Best plans, both checked in: `docs/emission_plans/path_flow90.json` (output unchanged, 1,099 on
+  the simulator) and `docs/emission_plans/values_only_path_fix15_flow90.json` (values only, 1,083).
+
+
 
 | Limit | Consequence | Mitigation here |
 |---|---|---|
@@ -336,6 +392,12 @@ $M measure --shaped --json flags.json --plan bits --plan bits-flow --plan mobius
   --plan bits-flow+depth4-after-wrap --plan bits+depth4 --plan bits-flow+depth4
 $M scatter --input "flag configurations=flags.json" --input "model plans=sweep.json" \
   --input "model plans, no lateness tie-break=nolate.json" --out docs/emission_plans/floor_vs_cycles.svg
+$M sweep --shaped --upstream --select-bit-source path --max-util none --max-util flow=0.9 \
+  --max-util flow=0.8                                                         # section 6.1
+$M sweep --shaped --upstream --values-only --select-bit-source path --fix 15=gather --max-util none \
+  --max-util flow=0.9 --max-util flow=0.8                                     # (also without --fix,
+                                                                              # and without path)
+uv run --extra verify python scripts/analyze_bound_gap.py --z3 --json sched.json  # the two Z3 negatives
 $M solve --what-if gather-without-address-op                                 # section 6, also packets-5,
                                                                               # packets-5-7, packets-5-7-9
 
