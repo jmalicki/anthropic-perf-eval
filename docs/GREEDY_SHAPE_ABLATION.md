@@ -25,10 +25,11 @@ limits hold, address assignment peak 1,244 of 1,536, two runs give the same kern
 `./scripts/check_upstream.sh --strict` with the same options passes upstream's CorrectnessTests and
 every speed threshold at 1,315 cycles.
 
-**This is a greedy-only result.** Split shift is switched off whenever CP-SAT follows the
-greedy, because CP-SAT's hint carries one cycle per op. CP-SAT therefore starts from the
-wavefront schedule without split shifts: 1,398 cycles at 16 rounds, not 1,313. Section 6
-says what it would take to hand CP-SAT the split-shift schedule.
+**This is a greedy-only result.** By default split shift is switched off whenever CP-SAT
+follows the greedy, because CP-SAT's hint then carries one cycle per op, and CP-SAT starts
+from the wavefront schedule without split shifts (1,398 cycles at 16 rounds, not 1,313).
+`--cpsat-split-shift-hint` hands CP-SAT the split-shift schedule lane by lane; section 6
+has the measurements.
 
 Defaults are unchanged. The four switches are independent options; sections 4 and 5 give
 each alone and combined.
@@ -275,10 +276,13 @@ gives 446 again and 0.95 gives 437, both inside the budget with the exact counte
 ## 6. CP-SAT started from these greedy schedules
 
 The greedy schedule is CP-SAT's warm start and bounds its search (every op's latest cycle
-is capped at its greedy cycle + 15). `--greedy-split-shift` is ignored in this pipeline,
-so the start is the wavefront schedule without split shifts. All runs
-`--cpsat-deterministic-time 20` with a generous wall-clock backstop (none stopped on it),
-PROVED and PASSED.
+is capped at its greedy cycle + 15). Without `--cpsat-split-shift-hint`,
+`--greedy-split-shift` is ignored in this pipeline, so the start is the wavefront schedule
+without split shifts. All runs `--cpsat-deterministic-time 20` with a generous wall-clock
+backstop (none stopped on it), PROVED and PASSED. The table below was measured before #41,
+when the hint handed to CP-SAT from 3 rounds up was incomplete (the shared CSE
+subtractions' scratch intervals were not hinted); the split-shift hint measurements further
+down are on main after #41, with a complete hint.
 
 | Rounds | Greedy start | Greedy cycles | CP-SAT cycles (simulator) |
 |---|---|---|---|
@@ -305,25 +309,50 @@ PROVED and PASSED.
 
 ### Handing CP-SAT a split-shift schedule
 
-Not done here (the model belongs to the CP-SAT work), but it looks feasible, from reading
-`cpsat_scheduler/model.rs`. The model already has what a split shift needs: one cycle
-variable per lane of every shiftable op (`alu_cycle_vars`), a completion variable that is
-their maximum, a scratch interval for the destination that starts at the earliest lane,
-and lane-by-lane precedence. What is missing is on the hint side only:
+`--cpsat-split-shift-hint` (with `--greedy-split-shift`) does this. The model already had
+what a split shift needs: one cycle variable per lane of every shiftable op
+(`alu_cycle_vars`), a completion variable that is their maximum, a scratch interval for the
+destination that starts at the earliest lane, and lane-by-lane precedence. The change is on
+the hint side only:
 
-1. `SsaCpsatHints` has no per-lane cycles. It needs an optional map from op id to lane
-   cycles, filled from the greedy's `shifted_alu_cycles`.
-2. The hint loop gives every lane of a shifted op the op's completion cycle
-   (`model.add_hint(alu_var, clamped)` for all eight). With the map it would hint each lane
-   its own cycle.
-3. The hint verifier ("Merged hint violates engine capacity") counts eight scalar slots at
-   the op's cycle. It would have to count lane by lane, or it rejects a valid split-shift
-   hint (two shifted ops complete in the same cycle, 16 > 12).
-4. The hinted scratch interval of a split op's destination must start at its first lane.
-5. `GreedySchedulePass` stops clearing `split_shift` for the CP-SAT pipeline.
+1. `SsaCpsatHints::shifted_lane_cycle_hints` maps an op id to its lane cycles and is filled
+   from the greedy's `shifted_alu_cycles`.
+2. Each lane variable is hinted at its own cycle (before, all eight lanes of a shifted op
+   were hinted at the op's cycle).
+3. The hint verifier ("Merged hint violates engine capacity") counts scalar slots lane by
+   lane. Counted whole, a split-shift schedule has 16 scalar slots in a cycle and is
+   rejected.
+4. The hinted scratch interval of a split op's destination starts at its first lane.
+5. `GreedySchedulePass` keeps split shifts for the CP-SAT pipeline when the flag is given.
 
-An incomplete or slightly inconsistent hint is not an error for CP-SAT, but the verifier in
-step 3 is, so steps 1 to 3 have to land together.
+Measured on main after #41 and #43 (complete greedy hints), shaped start
+(`--greedy-barriers none --greedy-priority wavefront --pressure-inflation-threshold 0.95
+--greedy-split-shift`), with and without `--cpsat-split-shift-hint`. Without the flag the
+greedy that feeds CP-SAT drops its split shifts, so the start is the wavefront schedule
+without them. Every run: the solver log says "The solution hint is complete and is
+feasible", the first solution is the hint (`complete_hint`), PROVED and PASSED.
+
+| Rounds | Budget (dtime) | Start without the hint | CP-SAT without (simulator) | Start with the hint | CP-SAT with (simulator) |
+|---|---|---|---|---|---|
+| 3 | 20 | 297 | 297 (299) | 289 | **289 (291)** |
+| 4 | 20 | 425 | 425 (427) | 423 | **423 (425)** |
+| 16 | 60 | 1399 | 1399 (1401) | 1314 | **1314 (1316)** |
+
+- In every case CP-SAT returns its start unchanged in this budget, so what the hint buys is
+  the start: 8, 2 and 85 cycles at 3, 4 and 16 rounds.
+- The 16-round kernel with the hint (1,316 simulator cycles, scratch peak 1,182) passes
+  `./scripts/check_upstream.sh --strict --kernel ...`: correctness and every speed threshold.
+  It is one cycle longer than the greedy-only kernel (1,313 / 1,315): with CP-SAT following,
+  the greedy runs with full bounds (ASAP deferral and cycle clamping), which costs a cycle.
+- The hint is also complete and feasible under `--cpsat-objective makespan`,
+  `--cpsat-makespan-interval` and `--select-choice fma` (3 rounds, batch 64).
+- Wall time at 16 rounds, on a machine whose load average was 100 to 200: 1.5 hours with the
+  hint (the solve ended on the deterministic budget), 6 hours without. The run without the
+  hint ended on the 21,600 s wall-clock backstop, so its search depended on load; it found
+  nothing better than its start after 1,012 s, and its start does not depend on load.
+  The solver reported about 400 deterministic time units for both runs against a budget of
+  60, so the "stopped on the wall-clock limit" warning, which compares those two numbers,
+  did not fire (see BUGS.md).
 
 ## 7. With the emission options
 
@@ -376,8 +405,6 @@ and PASSED unless it says fails. The wavefront found 32 chains in every row.
   tail it could recover is at most the 37 to 43 cycles left.
 - **Priority-rule sampling** (several staggers and windows, keep the best): not built. The
   sweeps in section 5 show what it would find: about 5 cycles at 16 rounds, 14 at 4 rounds.
-- **Split shift for CP-SAT**: the hint would need per-lane cycles; that belongs with the
-  CP-SAT model.
 - **The 2-lane minimum for starting a split** was not tuned.
 
 ## 9. Recommendation
