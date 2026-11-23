@@ -2028,19 +2028,21 @@ pub fn schedule_ssa_cpsat(
         // read only through a vector-group alias have no direct reader at all.
         let scratch_readers =
             scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes);
-        // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
-        let hinted_read_end = |idx: usize| -> Option<i32> {
-            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
-            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
-            let fma = ops[idx].opcode == Opcode::SelectChoice
+        let hinted_fma = |idx: usize| {
+            ops[idx].opcode == Opcode::SelectChoice
                 && match select_choice_mode {
                     SelectChoiceMode::ForceFma => true,
                     SelectChoiceMode::ForceVselect => false,
                     SelectChoiceMode::Optimize => {
                         select_choice_hints.is_some_and(|h| h.contains(&ops[idx].id))
                     }
-                };
-            Some(cycle + 1 + i32::from(fma))
+                }
+        };
+        // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
+        let hinted_read_end = |idx: usize| -> Option<i32> {
+            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
+            Some(cycle + 1 + i32::from(hinted_fma(idx)))
         };
         // Hinted end of each value's interval: the latest hinted read end over all readers.
         let hinted_live_end: HashMap<VReg, i32> = scratch_readers
@@ -2087,6 +2089,23 @@ pub fn schedule_ssa_cpsat(
         // Sorted so scratch intervals are created in the same order on every run.
         live_vregs.sort();
 
+        let hinted_segment_finish = greedy_hints.map(|cycles| {
+            cycles
+                .iter()
+                .zip(times.iter())
+                .enumerate()
+                .filter(|(_, (&cycle, _))| cycle >= 0)
+                .map(|(idx, (&cycle, time))| {
+                    cycle + i32::from(
+                        scratch_time == ScratchTime::Phase
+                            && time.fma_cycle().is_some()
+                            && hinted_fma(idx),
+                    )
+                })
+                .max()
+                .unwrap_or(0)
+        });
+
         // Segment mode with live-out or live-through: need segment_end so we can model
         // VRegs live until end of segment (live-out = defined here, used later; live-through = defined in prev section, used later).
         let segment_end_var: Option<IntVar> = if initial_live.is_some()
@@ -2094,14 +2113,23 @@ pub fn schedule_ssa_cpsat(
                 || live_through_vregs.is_some_and(|s| !s.is_empty()))
         {
             let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
-            for (cv_idx, t) in times.iter().enumerate() {
-                let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(t.issue()));
-                model.set_constraint_name(c, &format!("segment_end_ge_c_{}", cv_idx));
+            for (idx, time) in times.iter().enumerate() {
+                if scratch_time == ScratchTime::Phase {
+                    // A live-through value still occupies scratch at the last write slot.
+                    for finish in time.finish_alternatives() {
+                        let c = model.add_ge(m, finish.value);
+                        if let Some(when) = finish.when {
+                            model.only_enforce_if(c, [when]);
+                        }
+                        model.set_constraint_name(c, &format!("segment_end_ge_{}_{}", finish.label, idx));
+                    }
+                } else {
+                    let c = model.add_ge(m, time.issue());
+                    model.set_constraint_name(c, &format!("segment_end_ge_c_{}", idx));
+                }
             }
-            // Hint segment_end to greedy makespan so hint is complete (per-section mode).
-            if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().max().copied().unwrap_or(0);
-                model.add_hint(m, max_hint as i64);
+            if let Some(finish) = hinted_segment_finish {
+                model.add_hint(m, i64::from(finish));
             }
             Some(m)
         } else {
@@ -2141,7 +2169,7 @@ pub fn schedule_ssa_cpsat(
             // mode it subtracts one from such ends; a lane held through the section keeps
             // the final write slot, so compensate before taking the maximum over lanes.
             let group_live_out_offset = i32::from(scratch_time == ScratchTime::Phase);
-            let hinted_segment_end = greedy_hints.map(|h| h.iter().copied().max().unwrap_or(0) + 1);
+            let hinted_segment_end = hinted_segment_finish.map(|finish| finish + 1);
 
             // =========================================================================
             // CP-SAT LIVENESS MODEL: Matches Address Assignment Logic
@@ -2427,6 +2455,7 @@ pub fn schedule_ssa_cpsat(
             // completion cycle, +1 for a SelectChoice on the multiply-add path). A single reader
             // picked from the greedy schedule (`last_use_idx`) is not enough: the solve can move
             // another reader later. The cycle timeline's same-cycle overcount used to hide this.
+            let mut incoming_hinted_ends = Vec::new();
             if let Some(il) = initial_live {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
                 // Include external owners when resolving aliases. An incoming assembled
@@ -2441,40 +2470,27 @@ pub fn schedule_ssa_cpsat(
                     }
                     let fallback = [*last_use_idx];
                     let readers = incoming_readers.get(vreg).map_or(fallback.as_slice(), Vec::as_slice);
-                    // Exec end + 1 + read latency (multiply-add path), as for values defined here.
                     let read_end = |r: usize| times[r].last_read_end();
-                    // Hinted end: the latest reader's hinted read + 1 (+1 on the FMA path).
-                    let hinted_end = greedy_hints.map(|hints| {
-                        readers
-                            .iter()
-                            .filter(|&&r| r < hints.len())
-                            .map(|&r| {
-                                let fma = ops[r].opcode == Opcode::SelectChoice
-                                    && match select_choice_mode {
-                                        SelectChoiceMode::ForceFma => true,
-                                        SelectChoiceMode::ForceVselect => false,
-                                        SelectChoiceMode::Optimize => select_choice_hints
-                                            .is_some_and(|h| h.contains(&ops[r].id)),
-                                    };
-                                hints[r] + 1 + i32::from(fma)
-                            })
-                            .max()
-                            .unwrap_or(1)
-                    });
-                    let end_expr = if readers.len() == 1 {
-                        read_end(readers[0])
+                    // OR-Tools interval endpoints must be affine in a single variable.
+                    // An optional FMA read adds its path literal to the issue cycle.
+                    let end = model.new_int_var_with_name(
+                        [(1, horizon + 2)],
+                        format!("init_live_end_{}", vreg.id),
+                    );
+                    let end_expr = LinearExpr::from(end);
+                    let c = if readers.len() == 1 {
+                        model.add_eq(end_expr.clone(), read_end(readers[0]))
                     } else {
-                        let end_var = model.new_int_var_with_name(
-                            [(0, horizon + 2)],
-                            format!("init_live_end_{}", vreg.id),
-                        );
-                        let c = model.add_max_eq(end_var, readers.iter().map(|&r| read_end(r)));
-                        model.set_constraint_name(c, &format!("scratch_init_live_end_{}", vreg.id));
-                        if let Some(e) = hinted_end {
-                            model.add_hint(end_var, e as i64);
-                        }
-                        LinearExpr::from(end_var)
+                        model.add_max_eq(end, readers.iter().map(|&r| read_end(r)))
                     };
+                    model.set_constraint_name(c, &format!("scratch_init_live_end_{}", vreg.id));
+                    let hinted_end = greedy_hints.map(|_| {
+                        readers.iter().filter_map(|&r| hinted_read_end(r)).max().unwrap_or(1)
+                    });
+                    if let Some(hint) = hinted_end {
+                        model.add_hint(end, i64::from(hint));
+                        incoming_hinted_ends.push((*vreg, hint));
+                    }
                     let size = model.new_int_var_with_name(
                         [(1, horizon + 2)],
                         format!("init_live_size_{}", vreg.id),
@@ -2515,10 +2531,8 @@ pub fn schedule_ssa_cpsat(
                         format!("live_through_size_{}", vreg.id),
                     );
                     // Hint: size = seg_end + 1 (start is 0, end is seg_end + 1)
-                    if let Some(hints) = greedy_hints {
-                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
-                        let size_hint = (seg_end_hint + 1).max(1);
-                        model.add_hint(size, size_hint as i64);
+                    if let Some(end) = hinted_segment_end {
+                        model.add_hint(size, i64::from(end));
                     }
                     let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
@@ -2715,7 +2729,7 @@ pub fn schedule_ssa_cpsat(
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                let max_hint = hinted_segment_finish.unwrap_or(0);
                 // segment_end_var is already hinted where it's created (line ~3633); don't duplicate.
                 let mut bad_size_count = 0;
                 for vreg in &live_vregs {
@@ -2787,7 +2801,7 @@ pub fn schedule_ssa_cpsat(
             // CRITICAL: Verify hints are feasible before solving
             // If hints are infeasible, there's a bug in our model - fail immediately
             if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                let max_hint = hinted_segment_finish.unwrap_or(0);
                 // Compute peak liveness from hints (live-out VRegs extend to segment end = max_hint)
                 let mut events: Vec<(i32, i64)> = Vec::new();
                 // Same timeline as the cumulative (`scratch_interval`): times of a start at a
@@ -2806,14 +2820,10 @@ pub fn schedule_ssa_cpsat(
                         (|e: i32| e) as fn(i32) -> i32,
                     ),
                 };
-                if let Some(il) = initial_live {
-                    for (vreg, last_use_idx) in il.iter() {
-                        if *last_use_idx < hints.len() {
-                            let size = vreg.size() as i64;
-                            events.push((at_seg_start(0), size));
-                            events.push((after_read(hints[*last_use_idx] + 1), -size));
-                        }
-                    }
+                for &(vreg, end) in &incoming_hinted_ends {
+                    let size = vreg.size() as i64;
+                    events.push((at_seg_start(0), size));
+                    events.push((after_read(end), -size));
                 }
                 if let Some(lt) = live_through_vregs {
                     for vreg in lt {
@@ -2886,12 +2896,8 @@ pub fn schedule_ssa_cpsat(
                         pool_events.push((start, dv, ds));
                         pool_events.push((end, -dv, -ds));
                     };
-                    if let Some(il) = initial_live {
-                        for (vreg, last_use_idx) in il.iter() {
-                            if *last_use_idx < hints.len() {
-                                push(at_seg_start(0), after_read(hints[*last_use_idx] + 1), vreg.is_vector());
-                            }
-                        }
+                    for &(vreg, end) in &incoming_hinted_ends {
+                        push(at_seg_start(0), after_read(end), vreg.is_vector());
                     }
                     if let Some(lt) = live_through_vregs {
                         for vreg in lt {

@@ -2245,6 +2245,43 @@ mod ssa_tests {
 
     #[cfg(feature = "cpsat")]
     #[test]
+    fn test_ssa_cpsat_live_ins_with_one_optional_fma_reader() {
+        let mut emit = SsaEmitContext::new();
+        let args = [VReg::vector(100), VReg::vector(101), VReg::vector(102)];
+        let result = emit.emit_select_choice(args[0], args[1], args[2]);
+        let reader = emit.ops.iter().position(|op| op.dest == Some(result)).unwrap();
+        assert!(emit.ops[reader].sub_temp_vreg.is_some(), "needs a two-stage FMA path");
+        let initial_live = args.map(|vreg| (vreg, reader));
+        let live_out = [result].into_iter().collect();
+        let live_through = [VReg::vector(103)].into_iter().collect();
+
+        for scratch_pools in [false, true] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    select_choice_mode: SelectChoiceMode::Optimize,
+                    scratch_budget: 64,
+                    scratch_pools,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&initial_live),
+                    live_out_vregs: Some(&live_out),
+                    live_through_vregs: Some(&live_through),
+                    ..Default::default()
+                },
+                Some(false),
+            )
+            .expect("OR-Tools accepts the interval endpoints");
+            assert!(solution.is_some());
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
     fn test_ssa_cpsat_segment_scratch_live_through_without_incoming_reads() {
         let mut emit = SsaEmitContext::new();
         let result = emit.emit_vload_imm(0);

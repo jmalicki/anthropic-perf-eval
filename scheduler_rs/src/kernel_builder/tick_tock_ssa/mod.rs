@@ -1152,7 +1152,16 @@ impl SsaTickTockKernelBuilder {
                 } else {
                     0
                 };
-                let greedy_section_peak = budget_result.section_peaks[k];
+                let greedy_section_peak = verbose.then(|| {
+                    section_budget(
+                        &ctx.ops,
+                        effective_budget,
+                        Some(&greedy_select_fma_ops),
+                        Some(&section_select_fma_overrides),
+                        self.cpsat_scratch_time,
+                        &scratch_aliases,
+                    ).section_peaks[k]
+                });
 
                 let section_optimize = per_section_optimize_secs.map_or(false, |t| t > 0.0);
                 if verbose {
@@ -1395,7 +1404,7 @@ impl SsaTickTockKernelBuilder {
                 this_section_makespan = Some(
                     (seg_result.makespan as i32).max(greedy_section_makespan),
                 );
-                if verbose {
+                if let Some(greedy_section_peak) = greedy_section_peak {
                     let after_budget = section_budget(
                         &ctx.ops,
                         effective_scratch_budget(ctx.zero_vreg.is_some()),
