@@ -40,6 +40,10 @@ Options:
 - `--links` — Print spec file path with anchors for each theorem (e.g. `path/to/spec.md#t1`)
 - `--seed 42` — Random seed for Z3
 
+## Static makespan bounds (SB1-SB4)
+
+[`static_bounds_proof.py`](static_bounds_proof.py) proves the head-body-tail rows of `scripts/static_bounds.py` sound: `makespan >= t + q + ceil(W/cap)`, where W is the work of one row in the ops with head >= t and tail >= q. `SB1` takes 150 random small graphs, computes the bound through the same scheduler-JSON adapter, and asks Z3 for a schedule one cycle shorter under a reference model more permissive than CP-SAT's. The model allows split shift lanes, selects on flow or VALU, const choice and optional broadcasts. UNSAT on all of them means sound. `SB2` and `SB4` (SAT) confirm the stored counterexamples: a tail that counts the op's own cycle needs `q - 1`, and an eliminable vbroadcast's out-edge needs latency 0. `SB3` (SAT) shows the bound is attained, and above the capacity floor, on stored instances. Data: [`static_bound_counterexamples.json`](static_bound_counterexamples.json). `uv run python -m verification.static_bounds_proof --slow` runs 2,000 instances.
+
 ## Scratch allocation conjectures (A1-A7)
 
 [`allocation_conjectures.py`](allocation_conjectures.py) asks whether a per-cycle scratch load within budget guarantees an address layout. It does not: `A1-*` (UNSAT) are counterexamples, `A2-*` (SAT) show each fits in one more word, `A3-*` (UNSAT) map our same-cycle-reuse liveness to plain intervals, and `A4`/`A5` prove a sufficient condition for a two-pass allocator. `A6-*` are bounded searches. For them "unsat" means no counterexample exists in the bound and "sat" means one was found. `A7` checks the stored greedy-allocator failures. The fast checks run with the rest of `verification.verify`; slow ones with `uv run python -m verification.allocation_conjectures --slow`. Statements, bounds and literature: [docs/ALLOCATION_CONJECTURES.md](../docs/ALLOCATION_CONJECTURES.md). Counterexample data for allocator tests: [`allocation_counterexamples.json`](allocation_counterexamples.json).
@@ -66,6 +70,32 @@ The energetic slot tightening (`--energetic-slot-tightening`) uses **contributin
 - **T7-undercount-chain-preserves-witness**: Contributing exclusions preserve a witness. Model: fan-out O1→O2, O1→O3, cap 1. At t=1, min_demand=2; exclude O2 from 1. Witness (0,2,3) satisfies precedence, ordering, capacity. SAT.
 - **T7-undercount-parallel-contributing-sound**: Contributing exclusion with 3 parallel ops, cap 2. All asap 0 → min_demand=3. Exclude O3 from 0. Prove (capacity ∧ ordering ∧ c3=0) UNSAT.
 - **T7-undercount-contributing-implies-T7**: When O contributes and we exclude (total>cap), the T7 one-step condition holds. Symbolic link to general T7 soundness lemma.
+
+## Lane models of the CP-SAT scheduler (LANE-*)
+
+`verification/lane_model.py` proves that `--cpsat-lane-model sorted`, `pinned` and
+`sorted-pinned` lose no schedule (see [CPSAT_LANE_MODEL.md](../docs/CPSAT_LANE_MODEL.md)).
+Each check maps a feasible schedule of the free model to the restricted model and encodes a
+**violation** (some row broken), so **UNSAT = no schedule lost**. Variables are unbounded
+integers, so each UNSAT holds for all values. Sorting is done by a fixed compare-exchange
+network (Batcher, 19 comparators for 8 lanes) applied to every op at once:
+
+- **LANE-network-sorts** (UNSAT): the network sorts every input.
+- **LANE-sort-lanewise-precedence**, **LANE-sort-uniform-bounds** (UNSAT): sorting keeps
+  `a_o,i >= a_d,i + delta` (same lane index) and bounds equal for all lanes of an op
+  (including min and max).
+- **LANE-sort-cycle-counts** (UNSAT): each compare-exchange keeps the lanes per cycle.
+- **LANE-sort-dag**, **LANE-sorted-pinned-dag** (UNSAT for every comparator of the
+  network): one compare-exchange on every op of a DAG carrying every lane row shape of the
+  model keeps all rows, in the free and in the pinned model; by induction over the network,
+  the sorted schedule is feasible.
+- **LANE-pin-dag** (UNSAT): setting the lanes of unshifted ops to their cycle keeps every row
+  and satisfies the pinned model's unconditional lane precedences.
+- **LANE-pin-unconditional-precedence** (UNSAT): with pinned lanes, the unconditional lane
+  precedence and the free model's pair enforced by the producer's shift are equivalent.
+- **LANE-sort-lane-specific-producers** (**SAT**, a counterexample kept on purpose): a reader
+  whose lane i waits for its own scalar producer cannot be sorted on its own. The model has
+  no such row; `tests/test_cpsat_lane_model.py` fails if one appears.
 
 ## Theorems
 

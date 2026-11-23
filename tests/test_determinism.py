@@ -8,6 +8,7 @@ runs can be compared. Each build therefore runs in its own process.
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 
@@ -42,8 +43,11 @@ def _sha(path):
         # Gather round, CSE groups and symmetry ordering all contribute constraints here.
         ["--rounds", "5", "--batch-size", "16", "--cpsat-deterministic-time", "0.5"],
         ["--rounds", "3", "--batch-size", "16", "--cpsat-deterministic-time", "0.5", "--valu-shift", "alu"],
+        # Wavefront greedy with split shifts, handed to CP-SAT as per-lane hints.
+        ["--rounds", "3", "--batch-size", "64", "--cpsat-deterministic-time", "0.5", "--greedy-barriers", "none",
+         "--greedy-priority", "wavefront", "--greedy-split-shift", "--cpsat-split-shift-hint"],
     ],
-    ids=["2r16", "5r16", "3r16-force-alu"],
+    ids=["2r16", "5r16", "3r16-force-alu", "3r64-split-shift-hint"],
 )
 def test_cpsat_build_is_reproducible(tmp_path, extra):
     kernel_a, model_a = _build(tmp_path, "a", extra)
@@ -77,11 +81,15 @@ def test_diff_reports_reordered_constraints(tmp_path):
     assert "different entries" in "\n".join(diff_cpsat_models.compare(a, b))
 
 
-def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkeypatch):
+def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkeypatch, capfd):
     """The documented API is scheduler_rs.build_tick_tock_kernel_ssa(**args_to_build_kwargs(...)).
 
     The budget must travel in those kwargs (not through a side channel), be recorded in
     run_options, and stop the solve.
+
+    2 rounds / batch 32 is the smallest size measured whose full solve does not reach OPTIMAL
+    within 0.5 deterministic time (2 rounds / batch 16 does, in about 7 s), so the solve ends
+    on the budget; the test asserts that instead of assuming it.
     """
     import json
 
@@ -92,13 +100,18 @@ def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkey
     sched = tmp_path / "sched.json"
     kwargs = kernel_build_args.args_to_build_kwargs(
         None, output_json=str(sched), use_git_sha=False,
-        rounds=4, batch_size=64, cpsat_time_limit=300.0, cpsat_deterministic_time=0.5,
+        rounds=2, batch_size=32, cpsat_time_limit=300.0, cpsat_deterministic_time=0.5,
     )
     assert kwargs["cpsat_deterministic_time"] == 0.5
-    kwargs["verbose"] = False
+    kwargs["verbose"] = True
     scheduler_rs.build_tick_tock_kernel_ssa(**kwargs)
     with open(sched) as f:
         assert json.load(f)["run_options"]["cpsat_deterministic_time"] == 0.5
+    captured = capfd.readouterr()
+    log = captured.out + captured.err
+    assert "max_deterministic_time: 0.5" in log, "budget did not reach the solver parameters"
+    assert re.search(r"SSA CP-SAT result: .*status Feasible", log), "solve did not end on the budget (OPTIMAL, or no solution)"
+    assert "stopped on the wall-clock limit" not in log
 
 
 def test_environment_budget_is_recorded_when_no_option_is_given(monkeypatch):

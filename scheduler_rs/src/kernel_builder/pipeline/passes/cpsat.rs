@@ -97,6 +97,8 @@ impl Pass for CpSatSchedulePass {
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),
                 shift_hints,
+                shifted_lane_cycle_hints: Some(&ctx.greedy_decisions.shifted_alu_cycles)
+                    .filter(|lanes| !lanes.is_empty()),
                 forced_shifts,
                 select_choice_hints: select_hints,
                 const_add_imm_hints: Some(&const_add_imm_hints),
