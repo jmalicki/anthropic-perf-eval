@@ -2038,6 +2038,14 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
         };
+        let hinted_first_write = |idx: usize| -> Option<i32> {
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
+            Some(
+                hinted_lanes(ops[idx].id)
+                    .and_then(|lanes| lanes.iter().copied().min())
+                    .unwrap_or(cycle),
+            )
+        };
         // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
         let hinted_read_end = |idx: usize| -> Option<i32> {
             // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
@@ -2346,7 +2354,11 @@ pub fn schedule_ssa_cpsat(
                         if !live_vregs.contains(vreg) {
                             // This VReg is defined in segment but only used after
                             if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let start = times[def_idx].issue();
+                                let (start, start_aux) =
+                                    times[def_idx].first_write(&mut model, def_idx, horizon);
+                                if let Some(start_var) = start_aux {
+                                    scratch_shifted_start_vars.push((start_var, def_idx));
+                                }
                                 let end_expr = LinearExpr::from(seg_end) + 1;
                                 if let Some(group) = pool_group_of_lane.get(vreg) {
                                     pool_group_lanes.entry(*group).or_default().push((
@@ -2361,14 +2373,10 @@ pub fn schedule_ssa_cpsat(
                                     [(1, horizon + 1)],
                                     format!("live_out_size_{}", vreg.id),
                                 );
-                                // Hint: size = seg_end - def_cycle + 1 (live until segment end)
-                                if let Some(hints) = greedy_hints {
-                                    if def_idx < hints.len() {
-                                        let def_cycle = hints[def_idx];
-                                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
-                                        let size_hint = (seg_end_hint - def_cycle + 1).max(1);
-                                        model.add_hint(size, size_hint as i64);
-                                    }
+                                if let (Some(start), Some(end)) =
+                                    (hinted_first_write(def_idx), hinted_segment_end)
+                                {
+                                    model.add_hint(size, i64::from((end - start).max(1)));
                                 }
                                 let c = model.add_eq(
                                     LinearExpr::from(start) + LinearExpr::from(size),
@@ -2430,10 +2438,10 @@ pub fn schedule_ssa_cpsat(
                 );
                 scratch_intervals.push(interval);
                 scratch_demands.push(VLEN as i64);
-                if let Some(h) = greedy_hints {
+                if greedy_hints.is_some() {
                     let start_hint = lanes
                         .iter()
-                        .map(|(_, _, d, _)| h.get(*d).copied().unwrap_or(0))
+                        .map(|(_, _, d, _)| hinted_first_write(*d).unwrap_or(0))
                         .min()
                         .unwrap_or(0);
                     let end_hint = lanes
@@ -2686,13 +2694,7 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            let max_demand = scratch_demands.iter().copied().max().unwrap_or(0);
-            debug_assert!(
-                max_demand <= scratch_budget as i64,
-                "cumul_scratch: max demand {} > budget {}",
-                max_demand,
-                scratch_budget
-            );
+            // The cumulative rejects mandatory intervals wider than the scratch budget.
             if scratch_pools {
                 // Two pools: vectors (demand VLEN) and scalars (demand 1), with capacities
                 // N_v and N_s and 8 * N_v + N_s <= budget. Address assignment needs at most
@@ -2770,9 +2772,7 @@ pub fn schedule_ssa_cpsat(
                         continue;
                     }
                     // A split shift reserves its destination from its first lane.
-                    let def_cycle = hinted_lanes(ops[*def_idx].id)
-                        .and_then(|lanes| lanes.iter().copied().min())
-                        .unwrap_or(hints[*def_idx]);
+                    let def_cycle = hinted_first_write(*def_idx).unwrap_or(hints[*def_idx]);
                     let expected_size = if is_live_out {
                         (max_hint - def_cycle + 1).max(1)
                     } else {
@@ -2835,7 +2835,7 @@ pub fn schedule_ssa_cpsat(
                 for vreg in &live_vregs {
                     let def_idx = vreg_def_op[vreg];
                     let last_use_idx = vreg_last_use[vreg];
-                    let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                    let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                     let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
                         after_seg(max_hint + 1)
                     } else {
@@ -2856,7 +2856,7 @@ pub fn schedule_ssa_cpsat(
                         if !live_vregs.contains(vreg) {
                             // This VReg is defined in segment but only used after
                             if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                                let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                                 let size = vreg.size() as i64;
                                 events.push((at_write(def_cycle), size)); // VReg becomes live
                                 events.push((after_seg(max_hint + 1), -size)); // VReg dies at segment end
@@ -2910,7 +2910,7 @@ pub fn schedule_ssa_cpsat(
                         }
                         let def_idx = vreg_def_op[vreg];
                         let last_use_idx = vreg_last_use[vreg];
-                        let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                        let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                         let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
                             after_seg(max_hint + 1)
                         } else {
@@ -2928,7 +2928,7 @@ pub fn schedule_ssa_cpsat(
                             if !pool_group_of_lane.contains_key(vreg) && !live_vregs.contains(vreg) {
                                 if let Some(&def_idx) = vreg_def_op.get(vreg) {
                                     push(
-                                        at_write(hints.get(def_idx).copied().unwrap_or(0)),
+                                        at_write(hinted_first_write(def_idx).unwrap_or(0)),
                                         after_seg(max_hint + 1),
                                         vreg.is_vector(),
                                     );

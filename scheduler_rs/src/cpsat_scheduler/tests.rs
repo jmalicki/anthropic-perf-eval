@@ -2245,6 +2245,79 @@ mod ssa_tests {
 
     #[cfg(feature = "cpsat")]
     #[test]
+    fn test_ssa_cpsat_live_in_wider_than_budget_is_infeasible() {
+        let mut emit = SsaEmitContext::new();
+        let incoming = VReg::vector(100);
+        emit.emit_vstore_imm(100, incoming);
+        let initial_live = [(incoming, 0)];
+        for scratch_pools in [false, true] {
+            for budget in [7, 8] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        verbose: false,
+                        scratch_budget: budget,
+                        scratch_pools,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&initial_live),
+                        ..Default::default()
+                    },
+                    Some(false),
+                )
+                .expect("an undersized budget must not cause a model error");
+                assert_eq!(solution.is_some(), budget == 8);
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_shifted_live_out_starts_at_first_lane() {
+        let mut emit = SsaEmitContext::new();
+        let incoming = VReg::vector(100);
+        let result = emit.emit_valu(Opcode::Add, incoming, incoming);
+        let initial_live = [(incoming, 0)];
+        let live_out = [result].into_iter().collect();
+        let machine = crate::types::MachineConfig {
+            alu_slots: 4,
+            ..Default::default()
+        };
+        for scratch_pools in [false, true] {
+            for budget in [8, 16] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        time_limit_secs: 5.0,
+                        verbose: false,
+                        enable_valu_shift: true,
+                        valu_shift_mode: ValuShiftMode::ForceAlu,
+                        scratch_budget: budget,
+                        scratch_pools,
+                        machine,
+                        asap_alap_tightening: AsapAlapTightening::None,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&initial_live),
+                        live_out_vregs: Some(&live_out),
+                        ..Default::default()
+                    },
+                    Some(false),
+                )
+                .expect("valid scratch intervals");
+                assert_eq!(solution.is_some(), budget == 16);
+                if let Some(solution) = solution {
+                    let lanes = &solution.shifted_alu_cycles[&emit.ops[0].id];
+                    assert!(lanes.iter().min() < lanes.iter().max(), "must use two or more cycles");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
     fn test_ssa_cpsat_live_ins_with_one_optional_fma_reader() {
         let mut emit = SsaEmitContext::new();
         let args = [VReg::vector(100), VReg::vector(101), VReg::vector(102)];
