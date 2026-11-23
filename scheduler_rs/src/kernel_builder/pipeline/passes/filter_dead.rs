@@ -20,6 +20,14 @@ impl Pass for FilterDeadStoresPass {
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
         let before = ctx.ops.len();
         ctx.ops.retain(|op| op.cycle >= 0);
+        // A memory edge from a removed op (a load whose result nobody reads) orders nothing
+        // any more: drop it so no edge names an op that is not in the list.
+        if ctx.ops.iter().any(|op| !op.mem_deps.is_empty()) {
+            let kept_ids: std::collections::HashSet<usize> = ctx.ops.iter().map(|op| op.id).collect();
+            for op in ctx.ops.iter_mut() {
+                op.mem_deps.retain(|(id, _)| kept_ids.contains(id));
+            }
+        }
         let after = ctx.ops.len();
         Ok(format!(
             "{} → {} ops (removed {} dead stores)",
