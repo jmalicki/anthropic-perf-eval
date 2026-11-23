@@ -159,7 +159,7 @@ impl SelectBitSource {
 /// Without an emission plan every group of a round uses the same encoding, derived from
 /// `tree_reduce_max_depth`, `cached_select` and `depth4_select_after_wrap_only`
 /// (`ProblemSpec::access_encoding`). With `ProblemSpec::access_plan` it is chosen per round
-/// and per group (plan format: `solver/emission_plan.py`).
+/// and per group (plan format: `solver/emission_plan.py`; `docs/EMISSION_STRUCTURE_MODEL.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccessEncoding {
     /// Scalar gather: one vector address op, 8 scalar loads, XOR with the deferred stage-5

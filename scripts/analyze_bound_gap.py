@@ -398,6 +398,35 @@ def section_z3():
             sv.add(*[f(K(p)) == K((p & 1) + 1 - base) for p in pts])
             print(f"  [{'NO SUCH MASK' if sv.check() == z3.unsat else 'EXISTS?'}] "
                   f"m with (v {opname} m) == (v & 1) + 1 - {base} for all v  (2-op pointer update, tree base {base})")
+    # Address-free gather by vload (phase 2 of docs/EMISSION_STRUCTURE_MODEL.md). A vload at
+    # p = idx + F leaves tree[idx] in a fixed word for any F = forest_p - w, w in 0..7, so F is
+    # 1 to 8 here. The true branch bit is 1 - (lazy & 1) (parity check above), so the update
+    # p' = 2p + bit + 1 - F needs one op giving (2 - F) - (v & 1). No single op does, with the
+    # constant on either side: the update stays 3 ops, so removing the address add saves nothing.
+    ops = (("&", lambda a, b: a & b), ("|", lambda a, b: a | b), ("^", lambda a, b: a ^ b),
+           ("+", lambda a, b: a + b), ("-", lambda a, b: a - b), ("*", lambda a, b: a * b),
+           ("%", lambda a, b: z3.URem(a, b)), ("//", lambda a, b: z3.UDiv(a, b)),
+           ("<<", lambda a, b: a << b), (">>", lambda a, b: z3.LShR(a, b)),
+           ("<", lambda a, b: z3.If(z3.ULT(a, b), K(1), K(0))), ("==", lambda a, b: z3.If(a == b, K(1), K(0))))
+    found = []
+    for f_base in range(1, 9):
+        target = lambda p: K(((2 - f_base) - (p & 1)) & M32)  # noqa: E731
+        for opname, f in ops:
+            for side, g in (("v op m", lambda q: f(q, m)), ("m op v", lambda q: f(m, q))):
+                sv = z3.Solver()
+                sv.add(*[g(K(p)) == target(p) for p in pts])
+                if sv.check() != z3.unsat:
+                    found.append(f"F={f_base} {side} with {opname}")
+    print(f"  [{'NO SUCH OP' if not found else 'EXISTS? ' + ', '.join(found)}] one op with a constant m giving "
+          f"(2 - F) - (v & 1) for all v, F = 1..8, either operand order  (address-free vload index update)")
+    # Folding the node XOR into hash stage 0 (value x, node y): the multiply_add would have to
+    # compute (x ^ y) * 4097 + C0 from x and a per-node precomputed term, i.e. be affine in x
+    # and y. No constants a, b, c make it so on a handful of points, so no fold exists.
+    a_, b_, c_ = z3.BitVecs("fa fb fc", 32)
+    sv = z3.Solver()
+    sv.add(*[(K(p) ^ K(q)) * K(4097) + K(C0) == a_ * K(p) + b_ * K(q) + c_ for p in pts[:6] for q in pts[:6]])
+    print(f"  [{'NO SUCH FOLD' if sv.check() == z3.unsat else 'EXISTS?'}] a, b, c with (x ^ y) * 4097 + C0 == "
+          f"a*x + b*y + c for all x, y  (node XOR folded into the stage-0 multiply_add)")
 
 
 # ----------------------------------------------------------------------------

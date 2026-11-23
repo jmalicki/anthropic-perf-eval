@@ -8,14 +8,14 @@ BUILDER.py is a public take-home solution: a `perf_takehome.py` replacement that
 `.instrs`. It is untrusted code, so it never runs in this process:
 
 * It is copied, with the unmodified upstream simulator (`upstream/tests/frozen_problem.py`,
-  importable as `problem`), into a fresh temporary directory. Nothing else is importable:
-  the interpreter runs with `-I -S -B` (no site-packages, no PYTHON* environment, no
-  script directory on the path) and a minimal environment.
-* On macOS it runs under `sandbox-exec` with no network, no file writes outside the
-  temporary directory, and no reads under the user's home directory (the repository
-  included) except the Python installation itself.
-* Only the emitted bundles come back, as JSON, and they are checked to be plain data
-  (engine names from the ISA, slots of strings and integers) before they are written.
+  importable as `problem`), into a fresh temporary directory. The interpreter uses
+  `-I -S -B` and a minimal environment, with an import path for the standard library
+  and the copied sources.
+* The macOS profile restricts file reads to the capture directory, Python installation,
+  and selected system runtime paths. It restricts file writes to the capture directory
+  and `/dev/null`, denies networking and fork, and allows only the configured Python executable.
+* The parent reads a bounded JSON result from a regular file and checks the bundle schema
+  before writing the capture.
 
 The output has the format `generate_ssa_kernel.py --save-kernel` writes, so
 `scripts/check_upstream.sh --kernel` and `scripts/kernel_report.py` read it directly.
@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -38,9 +39,11 @@ REPO = Path(__file__).resolve().parent.parent
 FROZEN_PROBLEM = REPO / "upstream" / "tests" / "frozen_problem.py"
 ENGINES = ("alu", "valu", "load", "store", "flow")
 DEFAULT_PARAMS = (10, 2047, 256, 16)  # forest_height, n_nodes, batch_size, rounds
+MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 
 DRIVER = """\
-import json, sys
+import json, resource, sys
+resource.setrlimit(resource.RLIMIT_FSIZE, ({max_bytes}, {max_bytes}))
 sys.path.insert(0, {sandbox!r})
 from perf_takehome import KernelBuilder
 kb = KernelBuilder()
@@ -53,20 +56,25 @@ with open({result!r}, "w") as f:
 """
 
 
-def sandbox_profile(sandbox: str, python_prefix: str) -> str:
-    """macOS sandbox profile: no network, writes only in `sandbox`, no reads under $HOME
-    except the Python installation (later rules override earlier ones)."""
-    home = os.path.realpath(os.path.expanduser("~"))
+def sandbox_profile(sandbox: str, python_prefix: str, python: str) -> str:
+    """Allow Python to read its runtime and the capture directory on macOS."""
     return "\n".join([
         "(version 1)",
         "(allow default)",
         "(deny network*)",
+        "(deny process-fork)",
+        "(deny process-exec)",
+        f"(allow process-exec (literal {json.dumps(python, ensure_ascii=False)}))",
         "(deny file-write*)",
-        f'(allow file-write* (subpath "{sandbox}"))',
+        f"(allow file-write* (subpath {json.dumps(sandbox, ensure_ascii=False)}))",
         '(allow file-write* (literal "/dev/null"))',
-        f'(deny file-read* (subpath "{home}"))',
-        f'(allow file-read* (subpath "{python_prefix}"))',
-        f'(allow file-read* (subpath "{sandbox}"))',
+        "(deny file-read*)",
+        # Python startup needs an operation on the root directory itself.
+        '(allow file-read-data (literal "/"))',
+        '(allow file-read* (subpath "/System/Library") (subpath "/usr/lib")'
+        ' (literal "/dev/null") (literal "/dev/urandom"))',
+        f"(allow file-read* (subpath {json.dumps(python_prefix, ensure_ascii=False)}))",
+        f"(allow file-read* (subpath {json.dumps(sandbox, ensure_ascii=False)}))",
     ])
 
 
@@ -80,11 +88,28 @@ def check_bundles(bundles) -> list[dict]:
         for engine, slots in bundle.items():
             if engine not in ENGINES:
                 raise ValueError(f"bundle {i}: unknown engine {engine!r}")
+            if not isinstance(slots, list):
+                raise ValueError(f"bundle {i}: {engine} slots are not a list")
             for slot in slots:
-                if not slot or not isinstance(slot[0], str) or not all(
+                if not isinstance(slot, list) or not slot or not isinstance(slot[0], str) or not all(
                         isinstance(x, int) and not isinstance(x, bool) for x in slot[1:]):
                     raise ValueError(f"bundle {i}: malformed {engine} slot {slot!r}")
     return bundles
+
+
+def _read_capture_result(result: str) -> list[dict]:
+    """Read only a bounded regular file from the builder's capture directory."""
+    fd = os.open(result, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as output:
+        info = os.fstat(output.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("builder result is not a regular file with one link")
+        if info.st_size > MAX_CAPTURE_BYTES:
+            raise ValueError("builder result exceeds the capture limit")
+        data = output.read(MAX_CAPTURE_BYTES + 1)
+    if len(data) > MAX_CAPTURE_BYTES:
+        raise ValueError("builder result exceeds the capture limit")
+    return check_bundles(json.loads(data))
 
 
 def capture(builder: Path, params=DEFAULT_PARAMS, timeout: float = 600.0, sandbox_exec: bool = True) -> list[dict]:
@@ -102,16 +127,23 @@ def capture(builder: Path, params=DEFAULT_PARAMS, timeout: float = 600.0, sandbo
         result = os.path.join(sandbox, "result.json")
         driver = os.path.join(sandbox, "_capture_driver.py")
         fh, nn, bs, r = params
-        Path(driver).write_text(DRIVER.format(sandbox=sandbox, fh=fh, nn=nn, bs=bs, r=r, result=result))
+        Path(driver).write_text(DRIVER.format(
+            sandbox=sandbox, fh=fh, nn=nn, bs=bs, r=r, result=result, max_bytes=MAX_CAPTURE_BYTES,
+        ))
         cmd = [python, "-I", "-S", "-B", driver]
         if use_sbx:
-            cmd = ["sandbox-exec", "-p", sandbox_profile(sandbox, python_prefix)] + cmd
+            cmd = ["sandbox-exec", "-p", sandbox_profile(sandbox, python_prefix, python)] + cmd
         env = {"PATH": "/usr/bin:/bin", "HOME": sandbox, "TMPDIR": sandbox, "LANG": "C.UTF-8"}
-        proc = subprocess.run(cmd, cwd=sandbox, env=env, timeout=timeout, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"builder failed (exit {proc.returncode}):\n{proc.stderr[-4000:]}")
-        with open(result) as f:
-            return check_bundles(json.load(f))
+        with tempfile.TemporaryFile() as diagnostics:
+            proc = subprocess.run(
+                cmd, cwd=sandbox, env=env, timeout=timeout, stdout=subprocess.DEVNULL, stderr=diagnostics,
+            )
+            if proc.returncode != 0:
+                size = diagnostics.seek(0, os.SEEK_END)
+                diagnostics.seek(max(0, size - 4000))
+                error = diagnostics.read(4000).decode(errors="replace")
+                raise RuntimeError(f"builder failed (exit {proc.returncode}):\n{error}")
+        return _read_capture_result(result)
 
 
 def main() -> int:

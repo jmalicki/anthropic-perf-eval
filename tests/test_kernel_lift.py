@@ -291,6 +291,22 @@ def test_check_bundles_rejects_non_data():
         check_bundles([{"alu": [["+", 1, "2", 3]]}])
     with pytest.raises(ValueError):
         check_bundles([{"gpu": [["+", 1, 2, 3]]}])
+    for malformed in ({"load": "a"}, {"load": ["a"]}, {"load": None}):
+        with pytest.raises(ValueError):
+            check_bundles([malformed])
+
+
+def test_capture_result_read_is_bounded(tmp_path, monkeypatch):
+    from scripts import capture_public_kernel
+
+    result = tmp_path / "result.json"
+    bundles = [{"load": [["const", 0, 8]]}]
+    result.write_text(json.dumps(bundles))
+    assert capture_public_kernel._read_capture_result(str(result)) == bundles
+
+    monkeypatch.setattr(capture_public_kernel, "MAX_CAPTURE_BYTES", 1)
+    with pytest.raises(ValueError, match="capture limit"):
+        capture_public_kernel._read_capture_result(str(result))
 
 
 @pytest.mark.skipif(shutil.which("sandbox-exec") is None, reason="needs macOS sandbox-exec")

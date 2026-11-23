@@ -233,12 +233,13 @@ scope: the lifter handles straight-line code only.
 The builder file is copied into a fresh temporary directory as `perf_takehome.py`, next to the
 unmodified upstream simulator (`upstream/tests/frozen_problem.py`, importable as `problem`).
 It runs as `python -I -S -B` (no site-packages, no `PYTHON*` variables, no script directory
-on the path) with a minimal environment, under `sandbox-exec`: no network, no writes outside
-the temporary directory, no reads under `$HOME` except the Python installation. The driver
-calls `KernelBuilder().build_kernel(10, 2047, 256, 16)` and writes `kb.instrs` as JSON; the
-result is checked to be plain data (ISA engine names, slots of strings and integers).
-`debug` slots are dropped. All three builders ran cleanly; their cycle counts on the upstream
-simulator match their published numbers.
+on the path) with a minimal environment. On macOS, the profile allows reads within the
+capture directory, Python installation, and selected system runtime paths. It also allows
+access to the root directory itself, and limits writes to the capture directory and
+`/dev/null`. It denies networking and fork and allows only the configured Python executable.
+The parent reads at most 16 MiB from a regular, single-link result file and validates the
+bundle schema before writing the requested JSON. Use a disposable isolated environment
+for builders from untrusted sources.
 
 ### Lifting (`scripts/kernel_lift.py`)
 

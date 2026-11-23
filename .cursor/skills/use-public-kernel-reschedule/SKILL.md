@@ -14,8 +14,10 @@ Results and method: [docs/PUBLIC_KERNEL_RESCHEDULE.md](../../../docs/PUBLIC_KERN
 
 ```bash
 # 1. Capture a third-party builder's instructions (untrusted code). Keep the builder in its own
-#    empty directory, outside the repo. It runs under sandbox-exec: no network, no writes outside
-#    a temp dir, no reads under $HOME, only the stdlib and upstream frozen_problem.py importable.
+#    empty directory, outside the repo. Use a disposable isolated environment for untrusted
+#    sources. On macOS the capture profile denies network access and limits reads to the capture
+#    directory, Python installation, and selected system runtime paths. The parent validates
+#    the bounded JSON result before writing it.
 uv run python -I scripts/capture_public_kernel.py /path/to/their_perf_takehome.py --out k880.json --source URL
 
 # 2. Lift and report (any kernel JSON: ours from --save-kernel, or a captured one). NAME=PATH names rows.
