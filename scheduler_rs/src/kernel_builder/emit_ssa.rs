@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{
-    compute_const_encodings_alu_ready, ConstEncoding, EmissionPhase, Engine, LiveInterval, Opcode,
-    Operand, SsaOp, SymmetryHint, VReg, VarSource, VarType,
+    compute_const_encodings_alu_ready, ConstEncoding, EmissionPhase, Engine, LiveInterval,
+    MemEdgeKind, MemLocation, Opcode, Operand, SsaOp, SymmetryHint, VReg, VarSource, VarType,
 };
 
 /// Tracks alternative implementations for a constant.
@@ -82,6 +82,10 @@ pub struct SsaEmitContext {
     pub next_trace_id: Option<String>,
     /// VRegs that must stay live until the next emitted op (liveness-only; set by emission)
     pub next_keep_live: Option<Vec<VReg>>,
+    /// Main-memory location for the next emitted memory op (load, vload, store, vstore).
+    /// Ops that do not touch memory leave it pending, so it can be set before a helper that
+    /// first materialises an address (e.g. `emit_load_imm`).
+    pub next_mem_loc: Option<MemLocation>,
 
     // =========================================================================
     // Constant Alternative Tracking (for CP-SAT optimization)
@@ -107,6 +111,11 @@ pub struct SsaEmitContext {
     /// At address assignment time, the group is allocated as an 8-word block
     /// and lane VRegs derive their addresses as base+i.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+
+    /// Operands of every vector `Add` emitted, by its destination (`dest -> (src1, src2)`).
+    /// Lets `emit_select_choice_shared_delta` check that its true value is `base + delta`
+    /// in O(1), without scanning the emitted ops.
+    pub vector_sums: HashMap<VReg, (VReg, VReg)>,
 }
 
 impl Default for SsaEmitContext {
@@ -135,11 +144,13 @@ impl SsaEmitContext {
             next_var_type: None,
             next_trace_id: None,
             next_keep_live: None,
+            next_mem_loc: None,
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
             // Vector group tracking
             vector_group_lanes: HashMap::new(),
+            vector_sums: HashMap::new(),
         }
     }
 
@@ -217,6 +228,7 @@ impl SsaEmitContext {
         self.current_phase = EmissionPhase::Init;
         self.next_var_type = None;
         self.next_trace_id = None;
+        self.next_mem_loc = None;
         // Reset const alternative tracking
         self.const_alternatives.clear();
         self.zero_vreg = None;
@@ -307,6 +319,19 @@ impl SsaEmitContext {
         self.next_keep_live = Some(vregs);
     }
 
+    /// Set the main-memory location of the next emitted memory op. Every load, vload, store
+    /// and vstore of a kernel must have one (`compute_memory_dependencies` rejects a memory op
+    /// without it).
+    pub fn set_next_mem_loc(&mut self, loc: MemLocation) {
+        assert!(
+            self.next_mem_loc.is_none(),
+            "BUG: memory location {:?} set while {:?} is still pending",
+            loc,
+            self.next_mem_loc
+        );
+        self.next_mem_loc = Some(loc);
+    }
+
     /// Record that a VReg is defined by a specific op.
     ///
     /// Panics if the VReg is already defined - this indicates an SSA violation.
@@ -356,6 +381,11 @@ impl SsaEmitContext {
         }
         if let Some(keep) = self.next_keep_live.take() {
             op.keep_live = Some(keep);
+        }
+        if op.is_memory_op() {
+            if let Some(loc) = self.next_mem_loc.take() {
+                op.mem_loc = Some(loc);
+            }
         }
 
         self.next_op_id += 1;
@@ -428,6 +458,9 @@ impl SsaEmitContext {
             vec![Operand::VReg(src1), Operand::VReg(src2)],
         );
         self.emit(op);
+        if opcode == Opcode::Add {
+            self.vector_sums.insert(dest, (src1, src2));
+        }
         dest
     }
 
@@ -941,6 +974,47 @@ impl SsaEmitContext {
         // Compute true_val = base + delta for operands (needed for dependency tracking and vselect path)
         // This is computed once per SelectChoice, not globally upfront
         let true_val = self.emit_valu(Opcode::Add, base, delta);
+        self.emit_select_choice_shared_delta(cond, true_val, delta, base)
+    }
+
+    /// Emit SelectChoice with a precomputed delta and an already emitted true value:
+    /// result = cond ? true_val : base, where `true_val` is the op `base + delta`.
+    ///
+    /// Unlike `emit_select_choice_with_delta` this emits one op: the caller emits
+    /// `true_val = base + delta` once and shares it between all selects of the same pair
+    /// (e.g. two tree-node constants selected by every group).
+    /// FMA path: `cond * delta + base` (1 VALU op). vselect path: `vselect(cond, true_val, base)`.
+    ///
+    /// `true_val` must be defined as `base + delta`: dependencies are computed from the
+    /// operands only, so the delta's producer is ordered before this op through `true_val`,
+    /// and the FMA lowering equals the select only for that delta.
+    ///
+    /// # Arguments
+    /// * `cond` - 0/1 condition vector.
+    /// * `true_val` - Vector defined by `Add(base, delta)`.
+    /// * `delta` - Vector of `true - base`.
+    /// * `base` - Vector selected when `cond` is 0.
+    ///
+    /// # Returns
+    /// The destination vector VReg.
+    #[track_caller]
+    pub fn emit_select_choice_shared_delta(
+        &mut self,
+        cond: VReg,
+        true_val: VReg,
+        delta: VReg,
+        base: VReg,
+    ) -> VReg {
+        assert!(cond.is_vector(), "SelectChoice cond must be vector");
+        assert!(true_val.is_vector(), "SelectChoice true_val must be vector");
+        assert!(delta.is_vector(), "SelectChoice delta must be vector");
+        assert!(base.is_vector(), "SelectChoice base must be vector");
+        let defined_as_sum = self.vector_sums.get(&true_val) == Some(&(base, delta));
+        assert!(
+            defined_as_sum,
+            "SelectChoice true_val {:?} must be defined as Add(base {:?}, delta {:?})",
+            true_val, base, delta
+        );
 
         let dest = self.fresh_vector();
 
@@ -1178,57 +1252,9 @@ pub fn compute_ssa_dependencies_with_barriers(
     zero_vreg: Option<VReg>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) {
-    // First compute normal RAW deps
+    // First compute normal RAW deps, then the barrier ordering
     compute_ssa_dependencies(ops, vreg_def, zero_vreg, vector_group_lanes);
-
-    // Find barrier ops
-    let barrier_indices: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| op.opcode == Opcode::Barrier)
-        .map(|(idx, _)| idx)
-        .collect();
-
-    if barrier_indices.is_empty() {
-        return;
-    }
-
-    // Process barriers in order
-    let mut prev_barrier_idx: Option<usize> = None;
-
-    for &barrier_idx in &barrier_indices {
-        let barrier_op_id = ops[barrier_idx].id;
-
-        // Find start of this section (after previous barrier, or start of ops)
-        let section_start = prev_barrier_idx.map_or(0, |idx| idx + 1);
-
-        // Barrier depends on all non-barrier ops in its section
-        for idx in section_start..barrier_idx {
-            if ops[idx].opcode != Opcode::Barrier {
-                ops[barrier_idx].dep_ids.insert(ops[idx].id);
-            }
-        }
-
-        // Barrier also depends on previous barrier (to chain them)
-        if let Some(prev_idx) = prev_barrier_idx {
-            ops[barrier_idx].dep_ids.insert(ops[prev_idx].id);
-        }
-
-        // All ops after this barrier (until next barrier or end) depend on it
-        let next_barrier_idx = barrier_indices
-            .iter()
-            .find(|&&i| i > barrier_idx)
-            .copied()
-            .unwrap_or(ops.len());
-
-        for idx in (barrier_idx + 1)..next_barrier_idx {
-            if ops[idx].opcode != Opcode::Barrier {
-                ops[idx].dep_ids.insert(barrier_op_id);
-            }
-        }
-
-        prev_barrier_idx = Some(barrier_idx);
-    }
+    super::memory_deps::add_barrier_dependencies(ops);
 }
 
 /// Eliminate SSA dead code: remove ops whose result has no users.
@@ -1374,6 +1400,17 @@ pub fn eliminate_ssa_dead_code(
             };
             mark_live_atomic(def_idx, &mut live, &mut worklist, &const_choice_partner);
         }
+        // A store a kept load reads (memory RAW edge) is live. Stores are roots today, so this
+        // marks nothing new; it keeps the rule if stores stop being roots. WAR and WAW sources
+        // are not needed by their targets.
+        for &(src_id, kind) in &ops[idx].mem_deps {
+            if kind != MemEdgeKind::Raw {
+                continue;
+            }
+            if let Some(&src_idx) = id_to_idx.get(&src_id) {
+                mark_live_atomic(src_idx, &mut live, &mut worklist, &const_choice_partner);
+            }
+        }
     }
 
     // Build new ops and old_idx -> new_idx
@@ -1518,6 +1555,57 @@ mod tests {
         );
         let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
         assert!(!has_dead_const, "const(99) should be removed by DCE");
+    }
+
+    #[test]
+    fn test_select_choice_shared_delta_emits_one_op_per_select() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond_a = ctx.emit_vbroadcast_force(s);
+        let cond_b = ctx.emit_vbroadcast_force(s);
+        let high = ctx.emit_valu(Opcode::Add, base, delta);
+        let before = ctx.len();
+        let a = ctx.emit_select_choice_shared_delta(cond_a, high, delta, base);
+        let b = ctx.emit_select_choice_shared_delta(cond_b, high, delta, base);
+        assert_eq!(ctx.len(), before + 2, "one SelectChoice per select, no extra Add");
+        assert_ne!(a, b);
+        let ops = ctx.take_ops();
+        for op in &ops[before..] {
+            assert_eq!(op.opcode, Opcode::SelectChoice);
+            assert_eq!(op.delta_vreg, Some(delta));
+            assert_eq!(op.sub_temp_vreg, None);
+            assert_eq!(op.reads().collect::<Vec<_>>()[1..], [high, base]);
+        }
+    }
+
+    #[test]
+    fn test_select_choice_with_delta_still_emits_its_own_add() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond = ctx.emit_vbroadcast_force(s);
+        let before = ctx.len();
+        ctx.emit_select_choice_with_delta(cond, delta, base);
+        let ops = ctx.take_ops();
+        assert_eq!(ops.len(), before + 2);
+        assert_eq!(ops[before].opcode, Opcode::Add);
+        assert_eq!(ops[before + 1].opcode, Opcode::SelectChoice);
+        assert_eq!(ops[before + 1].delta_vreg, Some(delta));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be defined as Add")]
+    fn test_select_choice_shared_delta_rejects_a_true_value_that_is_not_base_plus_delta() {
+        let mut ctx = SsaEmitContext::new();
+        let s = ctx.emit_const(5);
+        let base = ctx.emit_vbroadcast_force(s);
+        let delta = ctx.emit_vbroadcast_force(s);
+        let cond = ctx.emit_vbroadcast_force(s);
+        let not_the_sum = ctx.emit_valu(Opcode::Add, delta, base); // operands swapped
+        ctx.emit_select_choice_shared_delta(cond, not_the_sum, delta, base);
     }
 
     #[test]

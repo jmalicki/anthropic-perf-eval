@@ -125,7 +125,7 @@ pub(crate) struct StaticPaths {
 /// Longest-path heads and tails over the dependency edges of `ops`.
 ///
 /// # Arguments
-/// * `ops` - SSA ops (edges: `dep_ids` that name an op of the slice)
+/// * `ops` - SSA ops (edges: `dep_ids` and `mem_deps` that name an op of the slice)
 /// * `zero_latency_out` - Ops whose out-edges have latency 0 (eliminable vbroadcasts)
 ///
 /// # Returns
@@ -133,15 +133,25 @@ pub(crate) struct StaticPaths {
 pub(crate) fn static_paths(ops: &[SsaOp], zero_latency_out: &HashSet<usize>) -> StaticPaths {
     let n = ops.len();
     let id_to_idx: BTreeMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Edges with their latency: data edges (`dep_ids`, 1, or 0 out of an eliminable
+    // vbroadcast) and memory edges (`mem_deps`, the edge's own latency, 0 for WAR).
+    let mut preds: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
+    let mut succs: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
+    let latency = |from: usize| -> i64 { if zero_latency_out.contains(&from) { 0 } else { 1 } };
     for (i, op) in ops.iter().enumerate() {
         for dep in &op.dep_ids {
             if let Some(&d) = id_to_idx.get(dep) {
                 if d != i {
-                    preds[i].push(d);
-                    succs[d].push(i);
+                    preds[i].push((d, latency(d)));
+                    succs[d].push((i, latency(d)));
                 }
+            }
+        }
+        for &(src, kind) in &op.mem_deps {
+            if let Some(&d) = id_to_idx.get(&src) {
+                let l = i64::from(kind.latency());
+                preds[i].push((d, l));
+                succs[d].push((i, l));
             }
         }
     }
@@ -151,7 +161,7 @@ pub(crate) fn static_paths(ops: &[SsaOp], zero_latency_out: &HashSet<usize>) -> 
     let mut order = Vec::with_capacity(n);
     while let Some(i) = ready.pop_first() {
         order.push(i);
-        for &s in &succs[i] {
+        for &(s, _) in &succs[i] {
             indegree[s] -= 1;
             if indegree[s] == 0 {
                 ready.insert(s);
@@ -159,17 +169,16 @@ pub(crate) fn static_paths(ops: &[SsaOp], zero_latency_out: &HashSet<usize>) -> 
         }
     }
     assert_eq!(order.len(), n, "dependency graph has a cycle");
-    let latency = |from: usize| -> i64 { if zero_latency_out.contains(&from) { 0 } else { 1 } };
     let mut head = vec![0i64; n];
     for &i in &order {
-        for &p in &preds[i] {
-            head[i] = head[i].max(head[p] + latency(p));
+        for &(p, l) in &preds[i] {
+            head[i] = head[i].max(head[p] + l);
         }
     }
     let mut tail = vec![0i64; n];
     for &i in order.iter().rev() {
-        for &s in &succs[i] {
-            tail[i] = tail[i].max(tail[s] + latency(i));
+        for &(s, l) in &succs[i] {
+            tail[i] = tail[i].max(tail[s] + l);
         }
     }
     StaticPaths { head, tail }

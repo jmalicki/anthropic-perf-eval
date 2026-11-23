@@ -134,28 +134,44 @@ impl Wavefront {
         let private: Vec<bool> = reached.iter().map(|&r| r > 0 && r <= shared_above).collect();
 
         // Chains: connected components of private ops, ranked by their first op.
-        let mut parent: Vec<usize> = (0..n).collect();
+        let shared = n;
+        let mut parent: Vec<usize> = (0..=n).collect();
         for idx in 0..n {
             if !private[idx] {
                 continue;
             }
             for &consumer in &consumers[idx] {
                 if private[consumer] {
-                    let (a, b) = (find_root(&mut parent, idx), find_root(&mut parent, consumer));
-                    // The root is the smallest op index of the component.
-                    parent[a.max(b)] = a.min(b);
+                    join(&mut parent, idx, consumer);
                 }
             }
         }
-        let mut roots: Vec<usize> =
-            (0..n).filter(|&i| private[i]).map(|i| find_root(&mut parent, i)).collect();
+        // A bounded window can admit these data-flow chains independently only if no
+        // chain needs an op from another, unadmitted chain. Join private chains linked
+        // by memory ordering. A private chain needed by a shared op must itself be
+        // available in every window. A shared source already runs in every window.
+        for (target, op) in ops.iter().enumerate() {
+            if skipped.contains(&target) {
+                continue;
+            }
+            for (id, _) in &op.mem_deps {
+                if let Some(&source) = id_to_idx.get(id) {
+                    if private[source] {
+                        join(&mut parent, source, if private[target] { target } else { shared });
+                    }
+                }
+            }
+        }
+        let shared_root = find_root(&mut parent, shared);
+        let chain_root: Vec<Option<usize>> = (0..n)
+            .map(|idx| private[idx].then(|| find_root(&mut parent, idx)).filter(|&root| root != shared_root))
+            .collect();
+        let mut roots: Vec<usize> = chain_root.iter().flatten().copied().collect();
         roots.sort_unstable();
         roots.dedup();
         let rank_of_root: HashMap<usize, usize> =
             roots.iter().enumerate().map(|(rank, &root)| (root, rank)).collect();
-        let chain: Vec<Option<usize>> = (0..n)
-            .map(|i| private[i].then(|| rank_of_root[&find_root(&mut parent, i)]))
-            .collect();
+        let chain: Vec<Option<usize>> = chain_root.iter().map(|root| root.map(|r| rank_of_root[&r])).collect();
 
         let mut key = vec![i64::MAX; n];
         for idx in 0..n {
@@ -238,6 +254,13 @@ impl Wavefront {
             }
         }
     }
+}
+
+/// Keep the first emitted op as the representative of the joined chains.
+fn join(parent: &mut [usize], a: usize, b: usize) {
+    let a = find_root(parent, a);
+    let b = find_root(parent, b);
+    parent[a.max(b)] = a.min(b);
 }
 
 /// Union-find root with path halving.

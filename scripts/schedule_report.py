@@ -7,7 +7,8 @@
     uv run python -m scripts.schedule_report --table base=a.json wavefront=b.json
 
 Prints cycles achieved, per-engine op counts and floors, the joint capacity floor for the
-ops THIS run emitted, the gap to it, per-round cycle spans and utilisation over time.
+ops THIS run emitted, the static head-body-tail bound (scripts/static_bounds.py: the floor
+plus ramp-up and tail), the gap to them, per-round cycle spans and utilisation over time.
 `--table` prints one Markdown row per run instead (cycles, simulator cycles, floor, gap,
 scratch peak, utilisation, round overlap), for ablation tables.
 
@@ -27,6 +28,7 @@ import json
 import math
 import sys
 
+from scripts import static_bounds
 from scripts.analyze_bound_gap import CAP, VEQ_PER_CYCLE
 from scripts.theoretical_lower_bounds import compute_capacity_bound
 
@@ -181,7 +183,34 @@ def analyze(d, buckets=10):
         "round_overlap": round_overlap(rounds),
         "utilisation": utilisation_over_time(d, buckets),
         "scratch": scratch_usage(d),
+        "static_bound": static_bound(d, floor["cycles"], cycles),
     }
+
+
+def static_bound(d, floor_cycles, cycles):
+    """Head-body-tail rows (scripts/static_bounds.py), or None without ssa_ops.
+
+    `run`: this run's const/select encodings, shift relaxed, so it is directly comparable
+    with the emission floor; its `bound` is max(floor, rows). `any`: minimum work over every
+    encoding, valid whatever CP-SAT chooses (the rows a CP-SAT model may add).
+    `explained_cycles` / `explained_pct`: how much of the gap to the floor the run rows
+    account for; `gap_cycles`: achieved minus the run bound.
+    """
+    if not d.get("ssa_ops"):
+        return None
+    out = {}
+    for enc in ("run", "any"):
+        r = static_bounds.static_makespan_bound(d, enc)
+        out[enc] = {k: r[k] for k in ("bound", "engine", "t", "q", "work", "critical_path")}
+        out[enc]["head_row"] = max((x["head_row"]["bound"], name) for name, x in r["rows"].items())
+        out[enc]["tail_row"] = max((x["tail_row"]["bound"], name) for name, x in r["rows"].items())
+    run = out["run"]
+    run["bound"] = max(run["bound"], floor_cycles)
+    gap = cycles - floor_cycles
+    out["explained_cycles"] = run["bound"] - floor_cycles
+    out["explained_pct"] = 100.0 * out["explained_cycles"] / gap if gap > 0 else 0.0
+    out["gap_cycles"] = cycles - run["bound"]
+    return out
 
 
 def scratch_usage(d):
@@ -305,9 +334,19 @@ def summary_lines(rep):
     return [
         f"Emission floor: {f['cycles']} cycles ({_binding(f)} binds; "
         f"{f['vector_op_equivalents']:,.0f} vector-op equivalents, {rep['engines']['load']['ops']} loads)",
-        f"Gap to floor: {g['cycles']} cycles ({g['pct_of_floor']:.1f}% above the floor)",
-        f"The floor is for the ops this run emitted. {SCOPE_NOTE}",
+        f"Gap to floor: {g['cycles']} cycles ({g['pct_of_floor']:.1f}% above the floor)" + static_clause(rep),
+        f"The floor and bound are for the ops this run emitted. {SCOPE_NOTE}",
     ]
+
+
+def static_clause(rep):
+    """'; static head/tail bound ...' for the summary's gap line, or '' without ssa_ops."""
+    sbd = rep.get("static_bound")
+    if sbd is None:
+        return ""
+    r = sbd["run"]
+    return (f"; static head/tail bound {r['bound']} ({r['engine']}, t={r['t']}, q={r['q']}) "
+            f"explains {sbd['explained_cycles']} of them")
 
 
 def format_report(rep, verbose_rounds=True):
@@ -332,6 +371,16 @@ def format_report(rep, verbose_rounds=True):
                f"valu {f['valu_cycles_at_floor']}, alu {f['alu_cycles_at_floor']}), load {t['load']}, flow {t['flow']}, store {t['store']}")
     out.append(f"  encodings (const, select) as chosen in this run; precedence and scratch ignored")
     out.append(f"Gap: achieved {run['cycles']} - floor {f['cycles']} = {g['cycles']} cycles ({g['pct_of_floor']:.1f}% above the floor)")
+    sbd = rep.get("static_bound")
+    if sbd is not None:
+        r, a = sbd["run"], sbd["any"]
+        out.append(f"Static head/tail bound for this emission: {r['bound']} (t + q + ceil(W/cap), row {r['engine']}, "
+                   f"t={r['t']} = head >= t, q={r['q']} = tail >= q, W={r['work']})")
+        out.append(f"  explains {sbd['explained_cycles']} of the {g['cycles']}-cycle gap ({sbd['explained_pct']:.1f}%); "
+                   f"achieved - bound = {sbd['gap_cycles']}. Best head row {r['head_row'][0]} ({r['head_row'][1]}), "
+                   f"best tail row {r['tail_row'][0]} ({r['tail_row'][1]}), critical path {r['critical_path']}")
+        out.append(f"  any encoding (min work over const/select choices, what a CP-SAT row may use): {a['bound']} "
+                   f"({a['engine']}, t={a['t']}, q={a['q']}). {static_bounds.SCOPE_NOTE}")
     if run["solver_bound_for_emission"] is not None:
         lb = run["solver_bound_for_emission"]
         status = "optimal for this emission" if lb == run["cycles"] else "not proven optimal for this emission"
@@ -373,6 +422,11 @@ def format_compare(a, b, name_a, name_b):
     row("cycles", a["run"]["cycles"], b["run"]["cycles"])
     row("emission floor", a["floor"]["cycles"], b["floor"]["cycles"])
     row("gap to floor", a["gap"]["cycles"], b["gap"]["cycles"])
+    sa, sb_ = a.get("static_bound"), b.get("static_bound")
+    if sa is not None and sb_ is not None:
+        row("static head/tail bound", sa["run"]["bound"], sb_["run"]["bound"])
+        row("  any encoding", sa["any"]["bound"], sb_["any"]["bound"])
+        row("gap to static bound", sa["gap_cycles"], sb_["gap_cycles"])
     row("vector-op equivalents", a["floor"]["vector_op_equivalents"], b["floor"]["vector_op_equivalents"], "{:>9.2f}")
     for e in ENGINES:
         row(f"{e} ops", a["engines"][e]["ops"], b["engines"][e]["ops"])
@@ -396,7 +450,7 @@ def format_compare(a, b, name_a, name_b):
             fb = "-" if y is None else str(y["first_cycle"])
             out.append(f"{name:>5} {sa:>8} {sb:>8} {dd:>8} {fa:>9} {fb:>8}")
     out.append("")
-    out.append(f"Floors are per emission. {SCOPE_NOTE}")
+    out.append(f"Floors and static bounds are per emission. {SCOPE_NOTE}")
     return "\n".join(out)
 
 
