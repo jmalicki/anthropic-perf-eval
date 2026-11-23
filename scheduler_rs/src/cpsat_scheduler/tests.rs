@@ -3714,6 +3714,7 @@ mod tests {
             SsaCpsatHints {
                 greedy_hints: Some(&hints),
                 shift_hints: None,
+                shifted_lane_cycle_hints: None,
                 forced_shifts: None,
                 select_choice_hints: None,
                 const_add_imm_hints: None,
@@ -4508,6 +4509,140 @@ mod tests {
             "ALU capacity test: 12 ALU ops at cycle 1, result={:?}",
             r.cycle_assignments
         );
+    }
+
+    /// One vector constant and three shifted vector adds: A whole in cycle 1, B split over
+    /// cycles 1 and 2 (four lanes each), C whole in cycle 2. Twelve scalar slots per cycle.
+    #[cfg(feature = "cpsat")]
+    fn split_shift_hint_case() -> (Vec<SsaOp>, Vec<i32>, HashSet<usize>, HashMap<usize, Vec<i32>>) {
+        use crate::types::Opcode;
+        let add = |id: usize| {
+            make_ssa_op(
+                id,
+                Engine::Valu,
+                Opcode::Add,
+                Some(VReg::vector(id as u32)),
+                vec![Operand::vector(0), Operand::vector(0)],
+                vec![0],
+            )
+        };
+        let ops = vec![
+            make_ssa_op(
+                0,
+                Engine::Load,
+                Opcode::Const,
+                Some(VReg::vector(0)),
+                vec![Operand::imm(1)],
+                vec![],
+            ),
+            add(1),
+            add(2),
+            add(3),
+        ];
+        // A shifted op's hinted cycle is its completion (its last lane).
+        let hints = vec![0, 1, 2, 2];
+        let shift_hints: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        let lane_hints: HashMap<usize, Vec<i32>> =
+            [(2, vec![1, 1, 1, 1, 2, 2, 2, 2])].into_iter().collect();
+        (ops, hints, shift_hints, lane_hints)
+    }
+
+    #[cfg(feature = "cpsat")]
+    fn split_shift_hint_config() -> SsaCpsatConfig {
+        SsaCpsatConfig {
+            time_limit_secs: 10.0,
+            verbose: true,
+            stop_after_first_solution: true,
+            scratch_budget: 0,
+            enable_valu_shift: true,
+            ..Default::default()
+        }
+    }
+
+    /// A split-shift hint with per-lane cycles is accepted: the hint verifier counts scalar
+    /// slots lane by lane (12 per cycle here), and the solver returns the hinted cycles.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_lane_hints_are_accepted() {
+        let (ops, hints, shift_hints, lane_hints) = split_shift_hint_case();
+        let result = schedule_ssa_cpsat(
+            &ops,
+            split_shift_hint_config(),
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                shift_hints: Some(&shift_hints),
+                shifted_lane_cycle_hints: Some(&lane_hints),
+                ..Default::default()
+            },
+            None,
+        );
+        let r = result.expect("no error").expect("a solution");
+        assert_eq!(r.cycle_assignments, hints, "the hinted cycles are a solution");
+    }
+
+    /// The same schedule without the per-lane cycles reads as two whole shifted ops (16
+    /// scalar slots) completing in cycle 2, which the hint verifier rejects. Lane cycles for
+    /// an op that is not hinted as shifted are ignored.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_hint_needs_lane_cycles() {
+        let (ops, hints, shift_hints, lane_hints) = split_shift_hint_case();
+        let without_lanes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_ssa_cpsat(
+                &ops,
+                split_shift_hint_config(),
+                SsaCpsatHints {
+                    greedy_hints: Some(&hints),
+                    shift_hints: Some(&shift_hints),
+                    ..Default::default()
+                },
+                None,
+            )
+        }));
+        assert!(without_lanes.is_err(), "16 scalar slots in one cycle must be rejected");
+
+        // Op 2 not hinted as shifted: its lane cycles do not count, the hint is three ops on
+        // the vector ALU and two whole shifts, one per cycle.
+        let unshifted_b: HashSet<usize> = [1, 3].into_iter().collect();
+        let result = schedule_ssa_cpsat(
+            &ops,
+            split_shift_hint_config(),
+            SsaCpsatHints {
+                greedy_hints: Some(&hints),
+                shift_hints: Some(&unshifted_b),
+                shifted_lane_cycle_hints: Some(&lane_hints),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    /// Lane cycles outside the lane variables' domain are not used: op 2's first four lanes
+    /// at cycle 0 precede its input (ASAP 1). The op is then read as a whole shift completing
+    /// in cycle 2, which with op 3 makes 16 scalar slots, and the hint verifier rejects it.
+    /// Counting the out-of-domain lanes while hinting them clamped into the domain would
+    /// verify one schedule and hint another.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_split_shift_lanes_outside_domain_are_not_counted() {
+        let (ops, hints, shift_hints, _) = split_shift_hint_case();
+        let early_lanes: HashMap<usize, Vec<i32>> =
+            [(2, vec![0, 0, 0, 0, 2, 2, 2, 2])].into_iter().collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_ssa_cpsat(
+                &ops,
+                split_shift_hint_config(),
+                SsaCpsatHints {
+                    greedy_hints: Some(&hints),
+                    shift_hints: Some(&shift_hints),
+                    shifted_lane_cycle_hints: Some(&early_lanes),
+                    ..Default::default()
+                },
+                None,
+            )
+        }));
+        assert!(result.is_err(), "out-of-domain lanes must fall back to a whole shift");
     }
 
     /// Test engine capacity: A shiftable VALU op shifted to ALU uses 8 slots.
@@ -5997,6 +6132,132 @@ mod capacity_lb_tests {
         assert!(r.capacity_lower_bound >= 5);
         assert!(r.capacity_lower_bound >= r.store_bound);
     }
+
+    /// The bound before the CSE VALU count was precomputed per z: the same triple loop with
+    /// the group sizes sorted again for every (x, y, z). Kept to check the fast path.
+    #[allow(clippy::too_many_arguments)]
+    fn capacity_lb_unmemoised(
+        valu_count: i64,
+        alu_count: i64,
+        load_count: i64,
+        store_count: i64,
+        flow_base: i64,
+        shiftable_count: i64,
+        const_choice_count: i64,
+        select_choice_count: i64,
+        enable_valu_shift: bool,
+        critical_path_len: i64,
+        group_sizes: Option<&[usize]>,
+    ) -> i64 {
+        let (valu_cap, alu_cap, load_cap, store_cap, _) = default_caps();
+        let cse_valu = |z: i64, sizes: &[usize]| -> i64 {
+            if z <= 0 {
+                return 0;
+            }
+            let mut sizes = sizes.to_vec();
+            sizes.sort_by(|a, b| b.cmp(a));
+            let mut sum = 0usize;
+            for (k, &s) in sizes.iter().enumerate() {
+                sum += s;
+                if sum >= z as usize {
+                    return (k + 1) as i64 + z;
+                }
+            }
+            sizes.len() as i64 + z
+        };
+        let mut lb = critical_path_len;
+        if !enable_valu_shift && valu_count > 0 {
+            lb = lb.max((valu_count + valu_cap - 1) / valu_cap);
+        }
+        let store_bound = if store_count > 0 { (store_count + store_cap - 1) / store_cap } else { 0 };
+        let mut global_min = i64::MAX;
+        for x in 0..=shiftable_count {
+            let valu_ops = if enable_valu_shift { (valu_count - shiftable_count + x).max(0) } else { valu_count };
+            let alu_ops = if enable_valu_shift { alu_count + 8 * (shiftable_count - x) } else { alu_count };
+            for y in 0..=const_choice_count {
+                let load_ops = (load_count - y).max(0);
+                for z in 0..=select_choice_count {
+                    let valu_select = match group_sizes {
+                        Some(sizes) if !sizes.is_empty() => cse_valu(z, sizes),
+                        _ => 2 * z,
+                    };
+                    let v = valu_ops + valu_select;
+                    let v = if v > 0 { (v + valu_cap - 1) / valu_cap } else { 0 };
+                    let a = if alu_ops > 0 { (alu_ops + alu_cap - 1) / alu_cap } else { 0 };
+                    let ld = if load_ops > 0 { (load_ops + load_cap - 1) / load_cap } else { 0 };
+                    let fl = flow_base + y - z;
+                    global_min = global_min.min(v.max(a).max(ld).max(fl).max(store_bound));
+                }
+            }
+        }
+        if global_min != i64::MAX {
+            lb = lb.max(global_min);
+        }
+        lb
+    }
+
+    fn cse_groups_of_sizes(sizes: &[usize]) -> Vec<crate::cpsat_scheduler::CseGroup> {
+        use crate::types::VReg;
+        let mut next = 0usize;
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(g, &n)| {
+                let consumer_indices: Vec<usize> = (next..next + n).collect();
+                next += n;
+                crate::cpsat_scheduler::CseGroup {
+                    true_val: VReg::vector(3 * g as u32),
+                    false_val: VReg::vector(3 * g as u32 + 1),
+                    consumer_indices,
+                    producer_true_idx: None,
+                    producer_false_idx: None,
+                    complex_phi: false,
+                    sub_temp_vreg: VReg::vector(3 * g as u32 + 2),
+                }
+            })
+            .collect()
+    }
+
+    /// Precomputing the CSE VALU count once per z must give exactly the old bound, with and
+    /// without CSE groups and with every mix of shift, ConstChoice and SelectChoice counts.
+    #[test]
+    fn test_capacity_lb_precomputed_cse_matches_unmemoised() {
+        let (vc, ac, lc, sc, fc) = default_caps();
+        // (valu, alu, load, store, flow_base, shiftable, const_choice, select_choice, shift, cp)
+        let configs: [(i64, i64, i64, i64, i64, i64, i64, i64, bool, i64); 8] = [
+            (40, 30, 10, 4, 12, 20, 5, 9, true, 0),
+            (40, 30, 10, 4, 12, 20, 5, 9, false, 0),
+            (6, 0, 0, 0, 9, 0, 0, 9, true, 0),
+            (120, 60, 24, 8, 30, 80, 6, 24, true, 3),
+            (12, 200, 3, 0, 2, 4, 3, 2, true, 0),
+            (0, 0, 8, 0, 0, 0, 8, 0, true, 0),
+            (300, 10, 50, 16, 40, 250, 12, 30, true, 0),
+            (300, 10, 50, 16, 40, 250, 12, 30, true, 90),
+        ];
+        let group_layouts: [&[usize]; 4] = [&[], &[3, 3, 3], &[1, 4, 2, 2], &[9]];
+        for &(v, a, l, s, f, sh, cc, scc, shift, cp) in &configs {
+            for &sizes in &group_layouts {
+                // Groups cannot hold more consumers than there are SelectChoice ops.
+                if sizes.iter().sum::<usize>() > scc as usize {
+                    continue;
+                }
+                let groups = cse_groups_of_sizes(sizes);
+                let groups_arg = if sizes.is_empty() { None } else { Some(groups.as_slice()) };
+                let got = compute_capacity_lower_bound_global(
+                    v, a, l, s, f, sh, cc, scc, shift, vc, ac, lc, sc, fc, cp, groups_arg,
+                );
+                let want = capacity_lb_unmemoised(
+                    v, a, l, s, f, sh, cc, scc, shift, cp, if sizes.is_empty() { None } else { Some(sizes) },
+                );
+                assert_eq!(
+                    got.capacity_lower_bound, want,
+                    "config {:?} groups {:?}",
+                    (v, a, l, s, f, sh, cc, scc, shift, cp),
+                    sizes
+                );
+            }
+        }
+    }
 }
 
 /// Minimal CP-SAT reproducer for cumulative + optional intervals (capacity 1).
@@ -6659,5 +6920,120 @@ mod tuning_alap_shift_tests {
                 warm.cycle_assignments[idx]
             );
         }
+    }
+}
+
+// ============================================================================
+// CP-SAT tuning: lane model of shiftable ops
+// ============================================================================
+
+#[cfg(all(test, feature = "cpsat"))]
+mod tuning_lane_model_tests {
+    use super::tuning_objective_tests::{solve, toy_ops};
+    use super::*;
+    use crate::cpsat_scheduler::CpsatLaneModel;
+
+    const ALL: [CpsatLaneModel; 4] =
+        [CpsatLaneModel::Free, CpsatLaneModel::Sorted, CpsatLaneModel::Pinned, CpsatLaneModel::SortedPinned];
+
+    #[test]
+    fn test_lane_model_json_names() {
+        assert_eq!(CpsatTuning::default().lane_model, CpsatLaneModel::Free);
+        assert!(CpsatTuning::default().to_json().contains(r#""lane_model":"free""#));
+        for (name, model) in [("free", ALL[0]), ("sorted", ALL[1]), ("pinned", ALL[2]), ("sorted-pinned", ALL[3])] {
+            let tuning = CpsatTuning::from_json(Some(&format!(r#"{{"lane_model": "{}"}}"#, name))).unwrap();
+            assert_eq!(tuning.lane_model, model);
+            assert_eq!(CpsatTuning::from_json(Some(&tuning.to_json())).unwrap(), tuning);
+        }
+        assert!(CpsatTuning::from_json(Some(r#"{"lane_model": "sorted_pinned"}"#)).is_err());
+        assert!(ALL[1].sorted() && !ALL[1].pinned() && ALL[2].pinned() && !ALL[2].sorted());
+        assert!(ALL[3].sorted() && ALL[3].pinned() && !ALL[0].sorted() && !ALL[0].pinned());
+    }
+
+    /// Sorting and pinning are dominance restrictions: the proved optimum must not change,
+    /// under either objective.
+    #[test]
+    fn test_every_lane_model_reaches_the_same_optimal_makespan() {
+        let ops = toy_ops();
+        for objective in [CpsatObjective::MakespanTiebreak, CpsatObjective::Makespan] {
+            let free = solve(&ops, CpsatTuning { objective, ..Default::default() });
+            assert_eq!(free.status, CpsatStatus::Optimal);
+            for lane_model in ALL {
+                let tuned = solve(&ops, CpsatTuning { objective, lane_model, ..Default::default() });
+                assert_eq!(tuned.status, CpsatStatus::Optimal, "{:?} {:?}", lane_model, objective);
+                assert_eq!(tuned.makespan, free.makespan, "{:?} {:?}", lane_model, objective);
+            }
+        }
+    }
+
+    /// With every op shifted (13 ops x 8 lanes on 12 scalar slots) lanes must straddle
+    /// cycles; the sorted models return them in order.
+    #[test]
+    fn test_sorted_lane_models_return_ordered_lanes() {
+        let ops = toy_ops();
+        for lane_model in ALL {
+            let config = SsaCpsatConfig {
+                time_limit_secs: 60.0,
+                deterministic_time_limit: Some(2.0),
+                verbose: false,
+                enable_valu_shift: true,
+                valu_shift_mode: ValuShiftMode::ForceAlu,
+                machine: MachineConfig { valu_slots: 2, ..Default::default() },
+                asap_alap_tightening: AsapAlapTightening::None,
+                tuning: CpsatTuning { lane_model, ..Default::default() },
+                ..Default::default()
+            };
+            let result = schedule_ssa_cpsat(&ops, config, SsaCpsatHints::default(), None)
+                .expect("post-solve validation")
+                .expect("a schedule");
+            let straddling = result
+                .shifted_alu_cycles
+                .values()
+                .filter(|lanes| lanes.iter().min() != lanes.iter().max())
+                .count();
+            assert!(straddling > 0, "{:?}: no op has lanes in two cycles; the test checks nothing", lane_model);
+            if lane_model.sorted() {
+                for (op_id, lanes) in &result.shifted_alu_cycles {
+                    assert!(lanes.windows(2).all(|w| w[0] <= w[1]), "{:?}: op {} lanes {:?}", lane_model, op_id, lanes);
+                }
+            }
+        }
+    }
+}
+
+/// CP-SAT respects kept memory edges, and a WAR edge allows the same cycle: in the 6-cycle
+/// optimum of the store/load program the store over word 0 runs in the cycle of the earlier
+/// load of word 0 (it must, or the RAW-ordered second load chain needs 7 cycles), the second
+/// load runs one cycle after the store, and the two stores to word 1 are a cycle apart.
+#[cfg(all(test, feature = "cpsat"))]
+mod memory_edge_tests {
+    use super::*;
+    use crate::kernel_builder::memory_deps::{compute_memory_dependencies, test_programs::store_load_same_word};
+
+    #[test]
+    fn test_cpsat_respects_memory_edges_war_same_cycle() {
+        let (mut ops, ix) = store_load_same_word();
+        assert_eq!(compute_memory_dependencies(&mut ops).unwrap().kept, 3);
+        let result = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 60.0,
+                verbose: false,
+                stop_after_first_solution: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                model_name: None,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        )
+        .unwrap()
+        .expect("CP-SAT finds a schedule");
+        let c = |i: usize| result.cycle_assignments[i];
+        assert_eq!(result.makespan, 6, "cycles: {:?}", result.cycle_assignments);
+        assert_eq!(c(ix.store_word0), c(ix.load_before), "WAR allows the same cycle: {:?}", result.cycle_assignments);
+        assert_eq!(c(ix.load_after), c(ix.store_word0) + 1, "RAW: {:?}", result.cycle_assignments);
+        assert!(c(ix.last_store) >= c(ix.first_store) + 1, "WAW: {:?}", result.cycle_assignments);
     }
 }

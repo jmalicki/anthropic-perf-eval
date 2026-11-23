@@ -130,6 +130,22 @@ pub fn build_ssa_schedule_constraints(
         }
     }
 
+    // 5-mem. Memory edges (mem_deps): target cycle >= source cycle + latency (0 for WAR).
+    // Memory ops are never shifted, so the source's cycle is its access cycle.
+    for (idx, op) in ops.iter().enumerate() {
+        for &(src_id, kind) in &op.mem_deps {
+            let Some(&dep_idx) = op_id_to_idx.get(&src_id) else {
+                continue;
+            };
+            out.push(ScheduleConstraint::Precedence {
+                consumer_idx: idx,
+                dep_idx,
+                result_offset: kind.latency(),
+                dep_is_shifted: false,
+            });
+        }
+    }
+
     // 5b. Ordering groups: cycle[i] <= cycle[j] for consecutive in group
     let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
     for (idx, op) in ops.iter().enumerate() {

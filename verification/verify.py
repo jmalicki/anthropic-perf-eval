@@ -55,8 +55,10 @@ from .precedence_fixpoint import (
     model_slot_tightening_before_fixpoint_preserves_feasibility,
 )
 
+from .lane_model import EXPECT_SAT as LANE_EXPECT_SAT, LANE_CHECKS
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
 from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
+from .static_bounds_proof import STATIC_BOUND_CHECKS, EXPECT_SAT as STATIC_BOUND_EXPECT_SAT
 from .makespan_rows import MAKESPAN_ROW_CHECKS, EXPECT_SAT as MAKESPAN_ROW_EXPECT_SAT
 from .group_symmetry import GROUP_SYMMETRY_CHECKS, EXPECT_SAT as GROUP_SYMMETRY_EXPECT_SAT
 
@@ -201,6 +203,11 @@ THEOREM_CHECKS += REWRITE_CHECKS
 
 # Scratch address allocation conjectures, fast checks (verification/allocation_conjectures.py).
 THEOREM_CHECKS += ALLOCATION_CHECKS
+# Lane models of the CP-SAT scheduler (sorted / pinned lanes lose no schedule; verification/lane_model.py).
+THEOREM_CHECKS += LANE_CHECKS
+
+# Static head/tail makespan rows of scripts/static_bounds.py (verification/static_bounds_proof.py).
+THEOREM_CHECKS += STATIC_BOUND_CHECKS
 
 # Soundness of the CP-SAT makespan rows (verification/makespan_rows.py).
 THEOREM_CHECKS += MAKESPAN_ROW_CHECKS
@@ -261,6 +268,8 @@ def run_verification(
             "fixpoint-iteration-bounded",
             *REWRITE_EXPECT_SAT,
             *ALLOCATION_EXPECT_SAT,
+            *LANE_EXPECT_SAT,
+            *STATIC_BOUND_EXPECT_SAT,
             *MAKESPAN_ROW_EXPECT_SAT,
             *GROUP_SYMMETRY_EXPECT_SAT,
         )
