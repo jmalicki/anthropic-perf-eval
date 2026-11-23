@@ -35,9 +35,11 @@
 //!   `--valu-shift valu`, `completion = c` ([`OpTimes::add_shift_invariants`]).
 //! * select with a multiply_add cycle: `fma_cycle = c + 1` ([`OpTimes::add_fma_cycle_invariant`]).
 //!
-//! The lanes of an op that is not shifted, and `c` of an op that is, are not pinned: the
-//! model leaves the inactive representation free (CPSAT_VARIABLE_MODELLING_REVIEW.md 4.2).
-//! A change that pins or sorts lanes belongs in `add_shift_invariants`.
+//! By default (`--cpsat-lane-model free`) the lanes of an op that is not shifted, and `c` of
+//! an op that is, are not pinned: the model leaves the inactive representation free
+//! (CPSAT_VARIABLE_MODELLING_REVIEW.md 4.2). `sorted` orders the lanes and `pinned` sets an
+//! unshifted op's lanes to `c`, both in `add_shift_invariants`; under `pinned`,
+//! [`OpTimes::lane_ready`] gives one unconditional per-lane precedence (docs/CPSAT_LANE_MODEL.md).
 //!
 //! # Where the model is weaker than the definitions
 //!
@@ -59,7 +61,7 @@ use cp_sat::builder::{BoolVar, CpModelBuilder, IntVar, LinearExpr};
 use cp_sat::proto::CpSolverResponse;
 
 #[cfg(feature = "cpsat")]
-use super::config::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+use super::config::{ConstChoiceMode, CpsatLaneModel, SelectChoiceMode, ValuShiftMode};
 #[cfg(feature = "cpsat")]
 use super::cse_groups::CseGroup;
 use crate::types::{Opcode, SelectChoiceEncoding, SsaOp};
@@ -458,8 +460,14 @@ impl OpTimes {
     /// state it: lane `lane` + 1 when shifted, issue + 1 when not. For a select on the
     /// multiply-add path the extra cycle is not included here; its readers get separate rows
     /// with [`Self::visible`].
-    pub(crate) fn lane_ready(&self, lane: usize) -> Vec<Alternative> {
+    ///
+    /// With `pinned` lanes (`CpsatLaneModel::pinned`) an unshifted op's lanes equal its issue
+    /// cycle, so a shiftable op gives one unconditional alternative, lane + 1 (empty label).
+    pub(crate) fn lane_ready(&self, lane: usize, pinned: bool) -> Vec<Alternative> {
         match &self.shift {
+            Some(s) if pinned => {
+                vec![Alternative { value: LinearExpr::from(s.lanes[lane]) + 1, when: None, label: "" }]
+            }
             Some(s) => vec![
                 Alternative { value: LinearExpr::from(s.lanes[lane]) + 1, when: Some(s.shift), label: "on" },
                 Alternative { value: LinearExpr::from(self.issue) + 1, when: Some(!s.shift), label: "off" },
@@ -514,7 +522,13 @@ impl OpTimes {
     /// * `model` - Model under construction
     /// * `idx` - Op index (for constraint names)
     /// * `valu_shift_mode` - With `ForceValu`, the completion equals the issue cycle
-    pub(crate) fn add_shift_invariants(&self, model: &mut CpModelBuilder, idx: usize, valu_shift_mode: ValuShiftMode) {
+    pub(crate) fn add_shift_invariants(
+        &self,
+        model: &mut CpModelBuilder,
+        idx: usize,
+        valu_shift_mode: ValuShiftMode,
+        lane_model: CpsatLaneModel,
+    ) {
         let Some(s) = &self.shift else {
             return;
         };
@@ -527,6 +541,22 @@ impl OpTimes {
         if matches!(valu_shift_mode, ValuShiftMode::ForceValu) {
             let c = model.add_eq(LinearExpr::from(s.completion), LinearExpr::from(self.issue));
             model.set_constraint_name(c, &format!("completion_eq_cycle_{}", idx));
+        }
+        // Lane model (free adds nothing). Sorted: the lanes of one op are interchangeable, so
+        // order them. Pinned: an unshifted op's lanes are its issue cycle. Neither loses a
+        // schedule (verification/lane_model.py, docs/CPSAT_LANE_MODEL.md).
+        if lane_model.sorted() {
+            for lane_i in 0..s.lanes.len() - 1 {
+                let c = model.add_le(s.lanes[lane_i], s.lanes[lane_i + 1]);
+                model.set_constraint_name(c, &format!("lane_order_{}_{}", idx, lane_i));
+            }
+        }
+        if lane_model.pinned() {
+            for (lane_i, &lane) in s.lanes.iter().enumerate() {
+                let c = model.add_eq(LinearExpr::from(lane), LinearExpr::from(self.issue));
+                model.only_enforce_if(c, [!s.shift]);
+                model.set_constraint_name(c, &format!("lane_pin_{}_{}", idx, lane_i));
+            }
         }
     }
 

@@ -499,6 +499,14 @@ pub fn compute_capacity_lower_bound_global(
         0
     };
     let cse_group_sizes: Option<Vec<usize>> = cse_groups.map(|g| g.iter().map(|grp| grp.consumer_indices.len()).collect());
+    // VALU ops from SelectChoice for each z, computed once: the CSE count sorts the group
+    // sizes, and doing that inside the triple loop took minutes at 16 rounds.
+    let valu_select_by_z: Vec<i64> = (0..=select_choice_count.max(0))
+        .map(|z| match &cse_group_sizes {
+            Some(sizes) if !sizes.is_empty() => min_valu_from_select_cse(z, sizes),
+            _ => 2 * z,
+        })
+        .collect();
     let mut global_min = i64::MAX;
     for x in 0..=shiftable_count {
         let valu_ops = if enable_valu_shift {
@@ -514,10 +522,7 @@ pub fn compute_capacity_lower_bound_global(
         for y in 0..=const_choice_count {
             let load_ops = (load_count - y).max(0);
             for z in 0..=select_choice_count {
-                let valu_select = match &cse_group_sizes {
-                    Some(sizes) if !sizes.is_empty() => min_valu_from_select_cse(z, sizes),
-                    _ => 2 * z,
-                };
+                let valu_select = valu_select_by_z[z as usize];
                 let valu_with_select = valu_ops + valu_select;
                 // flow_base already counts all Flow ops (including SelectChoice). When z choose FMA they use VALU;
                 // (select_choice_count - z) use vselect (1 Flow each). So total Flow = flow_base + y - z.
@@ -591,6 +596,10 @@ pub struct SsaCpsatHints<'a> {
     pub greedy_hints: Option<&'a [i32]>,
     /// Shift decisions from greedy (op ID -> should shift to ALU).
     pub shift_hints: Option<&'a HashSet<usize>>,
+    /// Per-lane cycles of hinted shifted ops whose lanes are not all in the op's cycle (the
+    /// greedy's split shifts): op ID -> VLEN lane cycles, the op's hinted cycle being their
+    /// maximum. An op in `shift_hints` without an entry runs all lanes in its hinted cycle.
+    pub shifted_lane_cycle_hints: Option<&'a HashMap<usize, Vec<i32>>>,
     /// Forced shift decisions (op ID -> must shift to ALU). Unlike shift_hints, these are enforced as constraints.
     pub forced_shifts: Option<&'a HashSet<usize>>,
     /// SelectChoice decisions from greedy (op ID -> use FMA path).

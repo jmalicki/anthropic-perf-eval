@@ -205,6 +205,23 @@ def test_explicit_default_objective_is_the_default_model(tmp_path):
     assert not _model_diff(base, same)
 
 
+@pytest.mark.timeout(600)
+def test_lane_model_reaches_the_model_and_run_options(tmp_path):
+    """--cpsat-lane-model: free is the default model; the others add their rows and are recorded.
+    The row shapes themselves are checked in tests/test_cpsat_lane_model.py."""
+    _, base, _, _ = _run(tmp_path, "base", [])
+    _, free, _, _ = _run(tmp_path, "free", ["--cpsat-lane-model", "free"])
+    assert not _model_diff(base, free)
+    _, model_path, sched, _ = _run(tmp_path, "sp", ["--cpsat-lane-model", "sorted-pinned"])
+    names = [c.name for c in diff_cpsat_models.load(str(model_path)).constraints]
+    assert any(name.startswith("lane_order_") for name in names)
+    assert any(name.startswith("lane_pin_") for name in names)
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["lane_model"] == "sorted-pinned"
+    with pytest.raises(SystemExit):
+        _parse(["--cpsat-lane-model", "sorted_pinned"])
+
+
 def _hints(model):
     return dict(zip(model.solution_hint.vars, model.solution_hint.values))
 
