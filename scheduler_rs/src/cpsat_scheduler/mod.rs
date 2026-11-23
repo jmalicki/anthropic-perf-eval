@@ -178,8 +178,8 @@ mod tests;
 
 // Re-exports: all public items from sub-modules
 pub use config::{
-    ConstChoiceMode, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning, CumulativePropagator,
-    MakespanRows,
+    ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning,
+    CumulativePropagator, MakespanRows,
     OptionalConstraintGroup,
     SelectChoiceMode, ValuShiftMode,
 };

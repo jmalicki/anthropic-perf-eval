@@ -709,6 +709,41 @@ pub(crate) fn verify_all_raw_precedence(
     }
 }
 
+/// Verify that every memory edge (`mem_deps`) holds: the target's memory access is at least
+/// the edge latency after the source's ([`ScheduledTimes::memory_access`]; latency 0 for WAR,
+/// so the same cycle is allowed). Panics if violated (model bug).
+#[cfg(feature = "cpsat")]
+pub(crate) fn verify_memory_precedence(ops: &[SsaOp], cycle_assignments: &[i32]) {
+    let no_shifts = HashSet::new();
+    let no_lanes = HashMap::new();
+    let no_selects = HashMap::new();
+    let times = ScheduledTimes::new(ops, cycle_assignments, &no_shifts, &no_lanes, &no_selects);
+    let id_to_idx: HashMap<usize, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.id, idx))
+        .collect();
+    for (target_idx, op) in ops.iter().enumerate() {
+        for &(src_id, kind) in &op.mem_deps {
+            let Some(&src_idx) = id_to_idx.get(&src_id) else {
+                continue;
+            };
+            let target = times.memory_access(target_idx);
+            let source = times.memory_access(src_idx);
+            assert!(
+                target >= source + kind.latency(),
+                "BUG: memory {} precedence violation: op id={} at cycle {} must be at least {} cycle(s) after op id={} at cycle {}",
+                kind.as_str(),
+                op.id,
+                target,
+                kind.latency(),
+                src_id,
+                source
+            );
+        }
+    }
+}
+
 /// Verify that each active CSE shared SUB runs no earlier than its operands are visible.
 /// The shared SUB computes true_val - false_val at `sub_cycle`. Panics if violated (model bug).
 #[cfg(feature = "cpsat")]

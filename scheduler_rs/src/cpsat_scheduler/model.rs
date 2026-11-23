@@ -28,7 +28,7 @@ use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, 
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
     validate_ssa_slot_limits, verify_all_raw_precedence, verify_cse_sub_precedence,
-    verify_scratch_budget_all_readers,
+    verify_memory_precedence, verify_scratch_budget_all_readers,
     verify_select_choice_fma_consumer_precedence,
 };
 
@@ -588,6 +588,24 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
+    // A window can also supply lane cycles from a previous feasible CP-SAT solution.
+    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
+    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
+    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
+    // size and start hints), so what is hinted is exactly what the check counted.
+    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        if !shift_hints.is_some_and(|ids| ids.contains(&op_id)) {
+            return None;
+        }
+        let lo = *asap.get(&op_id).unwrap_or(&0);
+        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
+        hints
+            .shifted_lane_cycle_hints
+            .and_then(|m| m.get(&op_id))
+            .filter(|lanes| lanes.len() == VLEN && lanes.iter().all(|&c| c >= lo && c <= hi))
+            .or_else(|| alu_lane_hints.and_then(|m| m.get(&op_id)).filter(|lanes| lanes.len() == VLEN))
+    };
+
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
     // symmetry-aware or energetic tightening is used; use it for both passes and model constraints.
     let mut current_asap = asap.clone();
@@ -918,6 +936,22 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // 5-mem. Memory edges (`mem_deps`, sorted per op): the target's memory access is at least
+    // the edge latency after the source's. WAR has latency 0 (same cycle allowed: within a
+    // cycle the simulator reads memory before it writes); RAW and WAW have 1. Empty for every
+    // kernel emitted today, so this adds no constraint to their models.
+    for (idx, op) in ops.iter().enumerate() {
+        for &(src_id, kind) in &op.mem_deps {
+            if let Some(&src_idx) = op_id_to_idx.get(&src_id) {
+                let c = model.add_ge(
+                    times[idx].memory_access(),
+                    times[src_idx].memory_access() + kind.latency() as i64,
+                );
+                model.set_constraint_name(c, &format!("prec_mem_{}_{}_{}", kind.as_str(), idx, src_idx));
+            }
+        }
+    }
+
     // 5b. Symmetry breaking (ordering groups): use the canonical ordering built earlier.
     // Validate that final bounds are consistent with the ordering, then add cycle[i] <= cycle[j].
     {
@@ -1052,7 +1086,8 @@ pub fn schedule_ssa_cpsat(
         alu_optional_intervals.insert(idx, alu_intervals);
 
         // completion >= issue cycle and every lane (op_times.rs states the mode invariants)
-        times[idx].add_shift_invariants(&mut model, idx, valu_shift_mode);
+        // and, with tuning.lane_model, the lane order and the pinned lanes of an unshifted op
+        times[idx].add_shift_invariants(&mut model, idx, valu_shift_mode, tuning.lane_model);
     }
 
     // 5a. Element-wise dependency map for shifted VALU -> shifted VALU: op lane i depends on dep lane j.
@@ -1085,16 +1120,16 @@ pub fn schedule_ssa_cpsat(
                         .map(|v| v[lane_i])
                         .unwrap_or(lane_i);
                     // Shiftable dep: lane j + 1 when shifted ("on"), its cycle + 1 when not
-                    // ("off"); other deps: cycle + 1 ("valu").
-                    for ready in times[dep_idx].lane_ready(j) {
+                    // ("off"); other deps: cycle + 1 ("valu"). With pinned lanes a shiftable
+                    // dep gives one unconditional row (no label).
+                    for ready in times[dep_idx].lane_ready(j, tuning.lane_model.pinned()) {
                         let c = model.add_ge(alu_cycle, ready.value);
                         if let Some(when) = ready.when {
                             model.only_enforce_if(c, [when]);
                         }
-                        model.set_constraint_name(
-                            c,
-                            &format!("shift_alu_prec_{}_{}_dep_{}_{}", idx, lane_i, dep_idx, ready.label),
-                        );
+                        let name = format!("shift_alu_prec_{}_{}_dep_{}", idx, lane_i, dep_idx);
+                        let name = if ready.label.is_empty() { name } else { format!("{}_{}", name, ready.label) };
+                        model.set_constraint_name(c, &name);
                     }
                 }
             }
@@ -2612,10 +2647,8 @@ pub fn schedule_ssa_cpsat(
                     if *def_idx >= hints.len() {
                         continue;
                     }
-                    // A shifted value starts at its first lane (the hinted shifted_dest_start).
-                    let def_cycle = alu_lane_hints
-                        .filter(|_| shift_hints.is_some_and(|h| h.contains(&ops[*def_idx].id)))
-                        .and_then(|h| h.get(&ops[*def_idx].id))
+                    // A split shift reserves its destination from its first lane.
+                    let def_cycle = hinted_lanes(ops[*def_idx].id)
                         .and_then(|lanes| lanes.iter().copied().min())
                         .unwrap_or(hints[*def_idx]);
                     let expected_size = if is_live_out {
@@ -2876,20 +2909,18 @@ pub fn schedule_ssa_cpsat(
                     Engine::Valu if !is_shifted => {
                         valu_per_cycle[cycle] += 1;
                     }
-                    Engine::Valu if is_shifted => {
-                        // Shifted VALU uses 8 ALU slots: at the lane cycles when lane hints
-                        // (an earlier CP-SAT solution) give them, else all at the op's cycle.
-                        match alu_lane_hints.and_then(|h| h.get(&op.id)).filter(|l| l.len() == VLEN) {
-                            Some(lanes) => {
-                                for &lane_cycle in lanes {
-                                    if lane_cycle >= 0 && (lane_cycle as usize) < max_cycle {
-                                        alu_per_cycle[lane_cycle as usize] += 1;
-                                    }
+                    Engine::Valu if is_shifted => match hinted_lanes(op.id) {
+                        // Split shift: each lane takes one ALU slot in its own cycle.
+                        Some(lanes) => {
+                            for &lane_cycle in lanes {
+                                if let Some(used) = alu_per_cycle.get_mut(lane_cycle.max(0) as usize) {
+                                    *used += 1;
                                 }
                             }
-                            None => alu_per_cycle[cycle] += VLEN as i32,
                         }
-                    }
+                        // Whole shift: 8 ALU slots in the op's cycle.
+                        None => alu_per_cycle[cycle] += VLEN as i32,
+                    },
                     Engine::Alu => {
                         alu_per_cycle[cycle] += 1;
                     }
@@ -3011,6 +3042,25 @@ pub fn schedule_ssa_cpsat(
                                 idx, op.id, consumer_cycle, dep_idx, ops[dep_idx].id, producer_cycle, producer_cycle + 1
                             );
                         }
+                    }
+                }
+            }
+            // Memory edges: consumer >= source + latency (0 for WAR)
+            for &(src_id, kind) in &op.mem_deps {
+                let Some(&src_idx) = op_id_to_idx.get(&src_id) else {
+                    continue;
+                };
+                if src_idx >= hints.len() || hints[src_idx] < 0 {
+                    continue;
+                }
+                if consumer_cycle < hints[src_idx] + kind.latency() {
+                    prec_violations += 1;
+                    if prec_violations <= 5 && verbose {
+                        eprintln!(
+                            "  WARNING: Memory {} edge violation: op {} (id={}) at cycle {} after op {} (id={}) at cycle {} (need >= {})",
+                            kind.as_str(), idx, op.id, consumer_cycle, src_idx, src_id, hints[src_idx],
+                            hints[src_idx] + kind.latency()
+                        );
                     }
                 }
             }
@@ -3624,18 +3674,16 @@ pub fn schedule_ssa_cpsat(
                     ops[idx].id, idx, c, clamped, lb, ub
                 );
             }
-            // Lanes from an earlier CP-SAT solution (alu_lane_hints) need not share one cycle;
-            // the completion is then the last lane.
-            let lane_hints = alu_lane_hints
-                .filter(|_| shift_hints.is_some_and(|h| h.contains(&ops[idx].id)))
-                .and_then(|h| h.get(&ops[idx].id))
-                .filter(|lanes| lanes.len() == VLEN);
+            let lanes = hinted_lanes(ops[idx].id);
             if let Some(completion_var) = times[idx].completion() {
-                let done = lane_hints.map_or(clamped, |lanes| lanes.iter().copied().max().unwrap_or(0) as i64);
+                let done = lanes.map_or(clamped, |lanes| lanes.iter().copied().max().unwrap_or(0) as i64);
                 model.add_hint(completion_var, done);
             }
             for (lane, &alu_var) in times[idx].lanes().iter().enumerate() {
-                model.add_hint(alu_var, lane_hints.map_or(clamped, |lanes| lanes[lane] as i64));
+                // Match the lane cycles used in the capacity check. A whole shift
+                // uses the same cycle for every lane.
+                let lane_hint = lanes.map_or(clamped, |l| l[lane] as i64);
+                model.add_hint(alu_var, lane_hint);
             }
         }
     }
@@ -3717,15 +3765,14 @@ pub fn schedule_ssa_cpsat(
 
         // Hint scratch shifted_dest_start vars: when not shifted, start = def_cycle.
         // Greedy defaults to not shifting, so hint = def_cycle.
-        // With lane hints (an earlier CP-SAT solution) a shifted value starts at its first lane.
+        // A hinted split shift starts at its first lane.
         for &(start_var, def_idx) in &scratch_shifted_start_vars {
             let hint_cycle = hints.get(def_idx).copied().unwrap_or(-1);
             if hint_cycle >= 0 {
-                let first_lane = alu_lane_hints
-                    .filter(|_| shift_hints.is_some_and(|h| h.contains(&ops[def_idx].id)))
-                    .and_then(|h| h.get(&ops[def_idx].id))
-                    .and_then(|lanes| lanes.iter().copied().min());
-                model.add_hint(start_var, first_lane.unwrap_or(hint_cycle) as i64);
+                let start_hint = hinted_lanes(ops[def_idx].id)
+                    .and_then(|lanes| lanes.iter().copied().min())
+                    .unwrap_or(hint_cycle);
+                model.add_hint(start_var, start_hint as i64);
             }
         }
     }
@@ -4692,6 +4739,8 @@ pub fn schedule_ssa_cpsat(
             );
             // SelectChoice FMA result visible at C+2 (redundant with verify_all_raw_precedence but kept for clarity).
             verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_choice_encoding);
+            // Memory edges (latency 0 for WAR).
+            verify_memory_precedence(ops, &cycle_assignments);
             // The scratch cumulative must have covered every reader of every value.
             if scratch_budget > 0 && !scratch_values.is_empty() {
                 verify_scratch_budget_all_readers(

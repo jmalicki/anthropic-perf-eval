@@ -2285,6 +2285,54 @@ fn test_split_shift_ignored_when_cpsat_follows() {
     assert_slot_limits_hold(&result);
 }
 
+/// With `cpsat_split_shift_hint` the greedy that feeds CP-SAT keeps its split shifts and
+/// hands them over lane by lane: the hint verifier accepts the schedule (it would panic on
+/// 16 scalar slots in a cycle if it counted a split op whole) and the kernel is valid.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_split_shift_hint_reaches_cpsat() {
+    use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+
+    // The greedy alone, same shape: it does make split shifts on this kernel.
+    let configure = |c: &mut KernelConfig| {
+        configure_wavefront(c);
+        c.compiler.greedy_split_shift = true;
+        c.compiler.cpsat_split_shift_hint = true;
+    };
+    let greedy_only = schedule_shape_kernel(2, configure);
+    assert!(!greedy_only.shifted_alu_cycles.is_empty(), "the greedy start contains split shifts");
+
+    let mut config = KernelConfig::new(10, 2047, 256, 2);
+    configure(&mut config);
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.cpsat_deterministic_time = Some(1.0);
+    let result = builder
+        .build_and_schedule_cpsat(
+            600.0, // time limit (backstop)
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,  // per_section_optimize_secs
+            None,  // forced_shifts
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false, // force_zero_gap
+            crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+            false, // enable_scratch_tightening
+            false, // symmetry_precedence_integrated
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
+            false, // precedence_neutral_horizon
+            None,  // disable_optional_constraint_groups
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        )
+        .expect("CP-SAT accepts the split-shift hint");
+    assert!(!result.budget_exceeded);
+    assert_slot_limits_hold(&result);
+}
+
 // =========================================================================
 // Greedy schedule shape: pressure thresholds and budget headroom
 // =========================================================================
@@ -3987,6 +4035,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
         SsaCpsatHints {
             greedy_hints: Some(&greedy_hints),
             shift_hints: None,
+            shifted_lane_cycle_hints: None,
             forced_shifts: None,
             select_choice_hints: None,
             const_add_imm_hints: None,
@@ -4320,4 +4369,99 @@ fn test_makespan_rows_keep_the_greedy_hint() {
         );
         assert!(result.is_ok(), "{}r/{}: {:?}", rounds, batch, result.err());
     }
+}
+
+/// A section's cycle range covers split-shift lanes, and rebasing moves a split shift's lane
+/// cycles with its op; barriers and unscheduled ops stay put.
+#[test]
+fn test_translate_section_cycles_moves_split_shift_lanes() {
+    let mut ops = vec![
+        make_test_ssa_op(0, Engine::Valu, Opcode::Add, Some(VReg::vector(0)), vec![], vec![]),
+        make_test_ssa_op(1, Engine::Valu, Opcode::Add, Some(VReg::vector(1)), vec![], vec![]),
+        make_test_ssa_op(2, Engine::Flow, Opcode::Barrier, None, vec![], vec![]),
+        make_test_ssa_op(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![], vec![]),
+    ];
+    ops[0].cycle = 10;
+    ops[1].cycle = 11;
+    ops[2].cycle = 11;
+    ops[3].cycle = -1;
+    let mut lanes: HashMap<usize, Vec<i32>> =
+        [(1, vec![10, 10, 10, 10, 11, 11, 11, 11]), (9, vec![5; 8])].into_iter().collect();
+    lanes.insert(1, vec![9, 9, 9, 9, 11, 11, 11, 11]);
+    assert_eq!(section_cycle_range(&ops, &lanes), (9, 11), "earlier lanes extend the section");
+    lanes.insert(1, vec![10, 10, 10, 10, 11, 11, 11, 11]);
+    assert_eq!(section_cycle_range(&ops, &lanes), (10, 11));
+    assert_eq!(section_cycle_range(&ops[3..], &lanes), (i32::MAX, i32::MIN), "nothing scheduled");
+    translate_section_cycles(&mut ops, &mut lanes, -7);
+    assert_eq!(ops.iter().map(|o| o.cycle).collect::<Vec<_>>(), vec![3, 4, 11, -1]);
+    assert_eq!(lanes[&1], vec![3, 3, 3, 3, 4, 4, 4, 4]);
+    assert_eq!(lanes[&9], vec![5; 8], "lanes of ops outside the section do not move");
+}
+
+/// Every emission the generator offers today implies all of its main-memory edges through
+/// data flow (the final stores read what the loads of the same words fed), so `mem_deps` is
+/// empty and no model changes. Covers the index forms, index pruning, values-only, merged
+/// hash stages, every tree-reduce depth and round counts across the wrap, with and without
+/// DCE. Fails if an emission path leaves a memory op without a location.
+#[test]
+fn test_current_emissions_imply_every_memory_edge() {
+    use crate::kernel_builder::config::IndexForm;
+    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, eliminate_ssa_dead_code};
+    use crate::kernel_builder::memory_deps::compute_memory_dependencies;
+
+    type Variant = (&'static str, fn(&mut KernelConfig));
+    let variants: [Variant; 7] = [
+        ("default", |_| {}),
+        ("mirrored", |c| c.spec.index_form = IndexForm::Mirrored),
+        ("prune-dead-index", |c| c.spec.prune_dead_index = true),
+        ("values-only", |c| c.spec.values_only = true),
+        ("merge-hash-stages", |c| c.spec.merge_hash_stages = true),
+        ("tree-reduce-2", |c| c.spec.tree_reduce_max_depth = 2),
+        ("tree-reduce-4", |c| c.spec.tree_reduce_max_depth = 4),
+    ];
+    for rounds in [1usize, 2, 4, 12, 16] {
+        for (name, apply) in variants.iter() {
+            let mut config = KernelConfig::new(10, 2047, 64, rounds);
+            apply(&mut config);
+            let mut program = SsaTickTockKernelBuilder::new(config).build();
+            let vgl = Some(&program.vector_group_lanes);
+            for dce in [false, true] {
+                if dce {
+                    let (ops, vreg_def, alts) = eliminate_ssa_dead_code(
+                        std::mem::take(&mut program.ops),
+                        &mut program.vreg_def,
+                        &mut program.const_alternatives,
+                        program.zero_vreg,
+                        vgl,
+                    );
+                    program.ops = ops;
+                    program.vreg_def = vreg_def;
+                    program.const_alternatives = alts;
+                }
+                compute_ssa_dependencies(&mut program.ops, &program.vreg_def, program.zero_vreg, vgl);
+                let stats = compute_memory_dependencies(&mut program.ops)
+                    .unwrap_or_else(|e| panic!("{} r{} dce={}: {}", name, rounds, dce, e));
+                assert_eq!(stats.kept, 0, "{} r{} dce={}: {}", name, rounds, dce, stats.summary());
+                assert!(stats.computed > 0, "{} r{} dce={}: the value stores have WAR edges", name, rounds, dce);
+                assert!(program.ops.iter().all(|op| op.mem_deps.is_empty()));
+            }
+        }
+    }
+}
+
+/// At a zero-based wrap the final index store no longer depends on its initial
+/// value. The dependency pass preserves their WAR before DCE removes the load.
+#[test]
+fn test_dependency_pass_keeps_index_war_at_wrap() {
+    use crate::kernel_builder::pipeline::{passes::ComputeDependenciesPass, Pass, PipelineContext};
+    use crate::types::{MemEdgeKind, MemRegion};
+
+    let config = KernelConfig::new(10, 2047, 8, 11);
+    let program = SsaTickTockKernelBuilder::new(config).build();
+    let mut ctx = PipelineContext::new(program, Default::default());
+    ComputeDependenciesPass.run(&mut ctx).unwrap();
+    assert!(ctx.ops.iter().any(|op| {
+        op.mem_loc.is_some_and(|loc| loc.region == MemRegion::Indices)
+            && op.mem_deps.iter().any(|&(_, kind)| kind == MemEdgeKind::War)
+    }));
 }

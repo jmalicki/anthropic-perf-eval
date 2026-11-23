@@ -131,7 +131,10 @@ def main():
         print(f"  greedy_priority={args.greedy_priority} (stagger_cycles={args.greedy_stagger_cycles}, "
               f"groups_in_flight={args.greedy_groups_in_flight})")
     if getattr(args, "greedy_split_shift", False):
-        print("  greedy_split_shift=True" + ("" if args.use_greedy else " (ignored: CP-SAT follows the greedy)"))
+        hinted = getattr(args, "cpsat_split_shift_hint", False)
+        note = "" if args.use_greedy else (" (hinted to CP-SAT lane by lane)" if hinted
+                                           else " (ignored: CP-SAT follows the greedy)")
+        print("  greedy_split_shift=True" + note)
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):
