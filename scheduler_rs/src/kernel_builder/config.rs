@@ -65,6 +65,95 @@ impl IndexForm {
     }
 }
 
+/// How the node value is selected on the cached tree levels (depth 0 up to
+/// `tree_reduce_max_depth`).
+///
+/// At depth `d` the node is `tree[L_d - n]` with `n = b_0 b_1 .. b_(d-1)` in binary, where
+/// `b_r` is the branch bit of the round at depth `r` (`R9`, `R13`). `Bits`, `BitsFlow` and
+/// `Mobius` select with those bits, from node constants that already carry the deferred
+/// stage-5 constant, so there is no per-group compare, root broadcast or XOR with the
+/// constant. Proofs: `R13`, `R14` in `verification/rewrites.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CachedSelect {
+    /// Compare or extract bits from the index, select, then XOR the deferred constant.
+    #[default]
+    Standard,
+    /// Binary tree of `2^d - 1` two-way selects driven by the branch bits. The `2^(d-1)`
+    /// leaf selects are multiply_adds with a precomputed delta; the selects above them are
+    /// `SelectChoice`s (flow `vselect`, or SUB + multiply_add). Per group that is 0, 1, 3 and 7
+    /// `SelectChoice`s at depths 1 to 4, against `Standard`'s 1, 3, 3 and 7: fewer choices that
+    /// can go to the flow engine at depths 1 and 2, the same at depths 3 and 4.
+    Bits,
+    /// As `Bits`, but the leaf selects are `SelectChoice`s too (flow `vselect`, or one
+    /// multiply_add): every select can go to the flow engine, which gives the lowest
+    /// vector-op count but needs a scheduler that spreads the flow work.
+    BitsFlow,
+    /// `2^d - 1` multiply_adds evaluating the multilinear (Mobius) form of the node table
+    /// in the branch bits. No flow ops and no choice for the scheduler.
+    Mobius,
+}
+
+impl CachedSelect {
+    /// Parse the CLI / binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"standard"`, `"bits"`, `"bits-flow"` or `"mobius"`.
+    ///
+    /// # Returns
+    /// The mode, or an error message naming the valid spellings.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "standard" => Ok(CachedSelect::Standard),
+            "bits" => Ok(CachedSelect::Bits),
+            "bits-flow" => Ok(CachedSelect::BitsFlow),
+            "mobius" => Ok(CachedSelect::Mobius),
+            other => Err(format!(
+                "Invalid cached_select '{}': must be 'standard', 'bits', 'bits-flow' or 'mobius'",
+                other
+            )),
+        }
+    }
+}
+
+/// Where `CachedSelect::Bits` / `BitsFlow` / `Mobius` take the branch bits of earlier rounds from.
+///
+/// The newest bit (the round just before the select) always comes straight from the branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectBitSource {
+    /// Extract the older bits used at depths 3 and 4 from the index as it was before the
+    /// last update (`n = b_0 .. b_(d-2)` in binary): `2 (d - 2)` vector ops per group at depth
+    /// `d >= 3` (one more to mirror a zero-based index), so those bits are not kept live. Two
+    /// bits still are: the newest bit, from the branch until the next cached select, and at
+    /// depth 2 the depth-0 bit, which the select reads directly. With the mirrored index that
+    /// bit is the index itself (no extra scratch); with the zero-based index it is a separate
+    /// vector, live for one more round. Proof: `R15-bits-from-index`.
+    #[default]
+    Index,
+    /// Keep every branch bit live until the select: no extraction ops, but 8 scratch words
+    /// per group for each earlier round, which the schedulers may not be able to fit.
+    Path,
+}
+
+impl SelectBitSource {
+    /// Parse the CLI / binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"index"` or `"path"`.
+    ///
+    /// # Returns
+    /// The source, or an error message naming the valid spellings.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "index" => Ok(SelectBitSource::Index),
+            "path" => Ok(SelectBitSource::Path),
+            other => Err(format!(
+                "Invalid select_bit_source '{}': must be 'index' or 'path'",
+                other
+            )),
+        }
+    }
+}
+
 /// Largest tree index at depth `depth`: `L_d = 2^(d+1) - 2`.
 ///
 /// # Arguments
@@ -131,6 +220,16 @@ pub struct ProblemSpec {
     /// index chain after the last gather) is removed by dead code elimination. **Changes
     /// the output**: only the values are correct. Default false.
     pub values_only: bool,
+    /// Selection of the node value on the cached levels. Default `CachedSelect::Standard`.
+    pub cached_select: CachedSelect,
+    /// Source of the older branch bits for `CachedSelect::Bits` / `BitsFlow` / `Mobius`. Default
+    /// `SelectBitSource::Index`. Ignored for `CachedSelect::Standard`.
+    pub select_bit_source: SelectBitSource,
+    /// With `tree_reduce_max_depth = 4`: select among the 16 cached level-4 nodes only on
+    /// visits after the first wrap (round 15 of 16), and gather level 4 on the first pass
+    /// (round 4). Selecting costs 15 selects per group and saves 8 loads per group; after
+    /// the wrap the loads are what binds. Default false (select on every visit).
+    pub depth4_select_after_wrap_only: bool,
 }
 
 impl Default for ProblemSpec {
@@ -155,6 +254,9 @@ impl Default for ProblemSpec {
             index_form: IndexForm::ZeroBased,
             prune_dead_index: false,
             values_only: false,
+            cached_select: CachedSelect::Standard,
+            select_bit_source: SelectBitSource::Index,
+            depth4_select_after_wrap_only: false,
         }
     }
 }
@@ -193,6 +295,22 @@ impl ProblemSpec {
     /// True if tree-reduce selection should be used at the given tree depth.
     pub fn use_tree_reduce_at_depth(&self, depth: usize) -> bool {
         depth <= self.tree_reduce_max_depth.min(MAX_TREE_REDUCE_DEPTH) as usize
+    }
+
+    /// True if round `rnd`, which visits `tree_depth`, selects its nodes among cached
+    /// values instead of gathering them.
+    ///
+    /// # Arguments
+    /// * `rnd` - Round number (0-based).
+    /// * `tree_depth` - Depth the indices are at in that round.
+    ///
+    /// # Returns
+    /// `use_tree_reduce_at_depth(tree_depth)`, except that depth 4 is gathered before the
+    /// first wrap when `depth4_select_after_wrap_only` is set.
+    pub fn selects_cached_level(&self, rnd: usize, tree_depth: usize) -> bool {
+        let first_pass = rnd < self.tree_height();
+        self.use_tree_reduce_at_depth(tree_depth)
+            && !(tree_depth == 4 && self.depth4_select_after_wrap_only && first_pass)
     }
 }
 
@@ -442,9 +560,9 @@ pub struct CompilerConfig {
     /// Words the greedy keeps free below the scratch budget (default: 0). Address
     /// assignment can need a few words more than the greedy's counter reports.
     pub greedy_budget_headroom: usize,
-    /// Greedy-only: let a shifted vector op straddle two cycles so all 12 scalar slots can
-    /// carry shifted work (default: false). Ignored when CP-SAT follows, because its hints
-    /// carry one cycle per op.
+    /// Let a shifted vector op straddle two cycles so all 12 scalar slots can carry shifted
+    /// work (default: false). When CP-SAT follows it applies only with
+    /// `cpsat_split_shift_hint`.
     pub greedy_split_shift: bool,
     // === Relaxed-scratch reference (analysis only) ===
     /// Scratch words the greedy, the per-section repair, CP-SAT and address assignment may use
@@ -459,6 +577,10 @@ pub struct CompilerConfig {
     pub cpsat_scratch_constraint: bool,
     /// What the scratch budget bounds in both schedulers (default: `Words`).
     pub scratch_model: ScratchModel,
+    /// With `greedy_split_shift` and CP-SAT: keep the greedy's split shifts and hint CP-SAT
+    /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
+    /// split shifts).
+    pub cpsat_split_shift_hint: bool,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -482,6 +604,7 @@ impl Default for CompilerConfig {
             greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
             greedy_split_shift: false,
+            cpsat_split_shift_hint: false,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -712,6 +835,47 @@ mod tests {
         for d in 0..11 {
             assert_eq!(level_last_index(d + 1), 2 * level_last_index(d) + 2);
         }
+    }
+
+    #[test]
+    fn test_cached_select_from_str() {
+        assert_eq!(CachedSelect::from_str("standard"), Ok(CachedSelect::Standard));
+        assert_eq!(CachedSelect::from_str("bits"), Ok(CachedSelect::Bits));
+        assert_eq!(CachedSelect::from_str("bits-flow"), Ok(CachedSelect::BitsFlow));
+        assert_eq!(CachedSelect::from_str("mobius"), Ok(CachedSelect::Mobius));
+        assert!(CachedSelect::from_str("flow").is_err());
+        assert_eq!(CachedSelect::default(), CachedSelect::Standard);
+    }
+
+    #[test]
+    fn test_selects_cached_level() {
+        let spec = |max_depth, after_wrap_only| ProblemSpec {
+            tree_reduce_max_depth: max_depth,
+            depth4_select_after_wrap_only: after_wrap_only,
+            ..Default::default()
+        };
+        // Default: levels 0 to 3 are cached on every visit, level 4 never.
+        for rnd in [3, 14] {
+            assert!(spec(3, false).selects_cached_level(rnd, 3));
+        }
+        assert!(!spec(3, false).selects_cached_level(4, 4));
+        assert!(!spec(3, true).selects_cached_level(15, 4));
+        // Depth 4 cached: every visit, or only after the first wrap (round 11 for height 10).
+        assert!(spec(4, false).selects_cached_level(4, 4));
+        assert!(spec(4, false).selects_cached_level(15, 4));
+        assert!(!spec(4, true).selects_cached_level(4, 4));
+        assert!(spec(4, true).selects_cached_level(15, 4));
+        // The option only concerns depth 4.
+        assert!(spec(4, true).selects_cached_level(3, 3));
+        assert!(!spec(4, true).selects_cached_level(5, 5));
+    }
+
+    #[test]
+    fn test_select_bit_source_from_str() {
+        assert_eq!(SelectBitSource::from_str("index"), Ok(SelectBitSource::Index));
+        assert_eq!(SelectBitSource::from_str("path"), Ok(SelectBitSource::Path));
+        assert!(SelectBitSource::from_str("idx").is_err());
+        assert_eq!(SelectBitSource::default(), SelectBitSource::Index);
     }
 
     #[test]

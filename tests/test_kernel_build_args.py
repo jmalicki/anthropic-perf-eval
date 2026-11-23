@@ -94,6 +94,14 @@ def test_greedy_split_shift_flag_reaches_kwargs_and_run_options():
     assert kwargs["greedy_split_shift"] is True
     assert json.loads(kwargs["run_options_json"])["greedy_split_shift"] is True
 
+    # The CP-SAT hint for split shifts is a separate switch, off by default.
+    assert default["cpsat_split_shift_hint"] is False
+    assert kwargs["cpsat_split_shift_hint"] is False
+    hinted = args_to_build_kwargs(
+        parser.parse_args(["--greedy-split-shift", "--cpsat-split-shift-hint"]), use_git_sha=False)
+    assert hinted["cpsat_split_shift_hint"] is True
+    assert json.loads(hinted["run_options_json"])["cpsat_split_shift_hint"] is True
+
 
 def test_pressure_threshold_flags_reach_kwargs_and_run_options():
     """The threshold overrides default to None (policy built-ins), headroom to 0; all are passed on and recorded."""

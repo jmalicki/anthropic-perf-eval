@@ -411,9 +411,22 @@ struct SsaOpDebugOut {
     dest: Option<String>, // VReg as string
     srcs: Vec<SsaOperandOut>,
     dep_ids: Vec<usize>,
+    /// Memory ordering edges into this op (`SsaOp::mem_deps`). Written only when non-empty,
+    /// so the JSON of a kernel without memory edges (every kernel emitted today) is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mem_deps: Vec<MemDepOut>,
     cycle: i32,
     var_type: Option<String>,
     source_info: Option<SsaSourceInfoOut>,
+}
+
+/// One memory ordering edge: the source op, its kind ("raw", "war", "waw") and the minimum
+/// cycles from the source to the target (0 for WAR).
+#[derive(Serialize)]
+struct MemDepOut {
+    source: usize,
+    kind: &'static str,
+    latency: i32,
 }
 
 #[derive(Serialize)]
@@ -612,6 +625,11 @@ pub fn write_ssa_schedule_json(
                     }),
                     srcs,
                     dep_ids: op.dep_ids.iter().copied().collect(),
+                    mem_deps: op
+                        .mem_deps
+                        .iter()
+                        .map(|&(source, kind)| MemDepOut { source, kind: kind.as_str(), latency: kind.latency() })
+                        .collect(),
                     cycle: op.cycle,
                     var_type: op.var_type.as_ref().map(|vt| vt.as_str().to_string()),
                     source_info,

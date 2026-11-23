@@ -1471,6 +1471,161 @@ pub struct SsaOp {
     /// a value is consumed transitively (e.g. through a pipeline) and the allocator would
     /// otherwise expire it too early. Compiler treats these like srcs for interval extension only.
     pub keep_live: Option<Vec<VReg>>,
+
+    /// Main-memory words this op reads or writes, set by the emitter on every op that touches
+    /// main memory (`load`, `vload`, `load_offset`, `store`, `vstore`). `None` on every other
+    /// op. A memory op without a location is an error in `compute_memory_dependencies`: memory
+    /// edges are exact, never conservative. See [`MemLocation`].
+    pub mem_loc: Option<MemLocation>,
+
+    /// Memory ordering edges into this op: `(source op id, kind)`, sorted by (id, kind).
+    ///
+    /// Separate from `dep_ids`, which are VReg RAW edges with latency >= 1 everywhere they are
+    /// read. A memory edge carries no scratch value (it never extends a live interval) and its
+    /// latency is [`MemEdgeKind::latency`], 0 for a WAR edge. Only edges that the `dep_ids`
+    /// graph does not already imply are kept (`compute_memory_dependencies`), so this is empty
+    /// for every kernel emitted today.
+    pub mem_deps: Vec<(usize, MemEdgeKind)>,
+}
+
+// ============================================================================
+// Main-memory locations and memory dependency edges
+// ============================================================================
+
+/// Region of main memory, as laid out by the problem's memory image.
+///
+/// Layout (`build_mem_image` in `problem.py`, and in the upstream `tests/frozen_problem.py`,
+/// whose header is 7 words): the header, then the tree values (`n_nodes` words at
+/// `forest_values_p = header`), then the input indices (`batch_size` words at
+/// `inp_indices_p = forest_values_p + n_nodes`), then the input values (`batch_size` words at
+/// `inp_values_p = inp_indices_p + batch_size`), then the extra room. The kernel reads the
+/// pointers from header words 4, 5, 6 (and 7 for the extra room, which exists only in the
+/// 8-word header of `problem.py`). Under both layouts the regions are disjoint, consecutive
+/// ranges, so two accesses in different regions never alias.
+///
+/// Upstream's header is 7 words and it writes `extra_room` to word 7, which the tree values
+/// then overwrite: there word 7 is tree node 0. The kernel only ever reads the header and the
+/// tree (it stores to the indices, the values and the extra room), so the alias decision
+/// between header word 7 and the tree is never needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MemRegion {
+    /// Header words (offset = word index from address 0)
+    Header,
+    /// Tree node values (offset = node index from `forest_values_p`)
+    Tree,
+    /// Input/output indices (offset = batch element from `inp_indices_p`)
+    Indices,
+    /// Input/output values (offset = batch element from `inp_values_p`)
+    Values,
+    /// Extra working memory (offset = word from `extra_room_p`)
+    ExtraRoom,
+}
+
+impl MemRegion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemRegion::Header => "header",
+            MemRegion::Tree => "tree",
+            MemRegion::Indices => "indices",
+            MemRegion::Values => "values",
+            MemRegion::ExtraRoom => "extra_room",
+        }
+    }
+}
+
+/// First word of an access, relative to its region's base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemOffset {
+    /// A constant word offset.
+    Const(i64),
+    /// A data-dependent offset known to lie in `[lo, hi)` (e.g. a tree gather at node index
+    /// `idx` with `0 <= idx < n_nodes`).
+    Range { lo: i64, hi: i64 },
+}
+
+/// Main-memory words an op accesses: a region, the first word's offset in it and the number
+/// of consecutive words (1 for `load`/`store`, VLEN for `vload`/`vstore`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemLocation {
+    pub region: MemRegion,
+    pub offset: MemOffset,
+    pub width: u32,
+}
+
+impl MemLocation {
+    /// One word at a constant offset.
+    pub fn word(region: MemRegion, offset: i64) -> Self {
+        Self { region, offset: MemOffset::Const(offset), width: 1 }
+    }
+
+    /// `width` consecutive words from a constant offset.
+    pub fn block(region: MemRegion, offset: i64, width: u32) -> Self {
+        Self { region, offset: MemOffset::Const(offset), width }
+    }
+
+    /// One word at a data-dependent offset in `[lo, hi)`.
+    pub fn word_in(region: MemRegion, lo: i64, hi: i64) -> Self {
+        Self { region, offset: MemOffset::Range { lo, hi }, width: 1 }
+    }
+
+    /// Half-open range `[first, end)` of words, relative to the region base, that this access
+    /// may touch.
+    pub fn word_range(&self) -> (i64, i64) {
+        let w = self.width as i64;
+        match self.offset {
+            MemOffset::Const(k) => (k, k + w),
+            MemOffset::Range { lo, hi } => (lo, hi - 1 + w),
+        }
+    }
+
+    /// Whether the two accesses can touch a common word: same region and overlapping word
+    /// ranges. Different regions never alias (see [`MemRegion`]).
+    pub fn may_alias(&self, other: &MemLocation) -> bool {
+        if self.region != other.region {
+            return false;
+        }
+        let (a0, a1) = self.word_range();
+        let (b0, b1) = other.word_range();
+        a0 < b1 && b0 < a1
+    }
+}
+
+/// Kind of a memory ordering edge from an earlier op (source) to a later one (target), in
+/// program (emission) order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MemEdgeKind {
+    /// Store, then a load of an aliasing word: the load must see the store.
+    Raw,
+    /// Load, then a store to an aliasing word: the load must see the old value.
+    War,
+    /// Store, then a store to an aliasing word: the later value must be the one left.
+    Waw,
+}
+
+impl MemEdgeKind {
+    /// Minimum cycles from the source's issue cycle to the target's.
+    ///
+    /// The simulator (`Machine.step` in `problem.py`, same in the upstream
+    /// `tests/frozen_problem.py`) executes every slot of a bundle against the state at the
+    /// start of the cycle, collecting memory writes in `mem_write`, and applies them after all
+    /// slots ran. So a load in the same cycle as a store reads the old word: RAW needs 1, WAR
+    /// needs 0 (same cycle is allowed). Two stores to one word in one cycle would leave
+    /// whichever slot ran last, so WAW needs 1.
+    pub fn latency(self) -> i32 {
+        match self {
+            MemEdgeKind::Raw => 1,
+            MemEdgeKind::War => 0,
+            MemEdgeKind::Waw => 1,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemEdgeKind::Raw => "raw",
+            MemEdgeKind::War => "war",
+            MemEdgeKind::Waw => "waw",
+        }
+    }
 }
 
 impl SsaOp {
@@ -1502,7 +1657,24 @@ impl SsaOp {
             sub_temp_vreg: None, // Default: no sub temp needed (set for SelectChoice without delta)
             trace_id: None,
             keep_live: None,
+            mem_loc: None,
+            mem_deps: Vec::new(),
         }
+    }
+
+    /// Whether this op reads main memory (`load`, `vload`, `load_offset`; not `const`).
+    pub fn reads_memory(&self) -> bool {
+        matches!(self.opcode, Opcode::Load | Opcode::Vload | Opcode::LoadOffset)
+    }
+
+    /// Whether this op writes main memory (`store`, `vstore`).
+    pub fn writes_memory(&self) -> bool {
+        matches!(self.opcode, Opcode::Store | Opcode::Vstore)
+    }
+
+    /// Whether this op touches main memory (and so must carry a [`MemLocation`]).
+    pub fn is_memory_op(&self) -> bool {
+        self.reads_memory() || self.writes_memory()
     }
 
     /// Get all VRegs read by this op

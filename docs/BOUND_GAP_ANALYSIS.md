@@ -75,6 +75,14 @@ Reading of the code (`scheduler_rs/src/cpsat_scheduler/bounds.rs`,
 
 So the bound is not wrong. It is conditional, and the condition is where the gap lives.
 
+Ramp-up and tail, measured later (V): `scripts/static_bounds.py` adds static head-body-tail
+rows, `makespan >= t + q + ceil(W / cap)` over the ops at dependency depth >= t from the start
+and >= q from the end (proved sound with Z3 in `verification/static_bounds_proof.py`). They
+explain little. Main's best 16-round shaped greedy gets 1,130 -> 1,132 against 1,197 achieved
+(2 of 67 cycles). PR #51's 1,097-cycle kernel gets 994 -> 1,009 (15 of 103), from the load row:
+the gathers cannot start before cycle 51. The rest of the gap is not depth. `schedule_report`
+prints these rows.
+
 ## 3. Where our ops go
 
 Vector-op equivalents (vector ALU ops plus scalar ALU ops / 8), from the JSON (V).
@@ -134,6 +142,22 @@ in a write-up or public source; the source is named.
 
 After these the ALUs would allow about 942 but 2,088 loads force 1,044. Loads are then the
 problem.
+
+**Measured (November 2026, [EMISSION_ABLATION.md](EMISSION_ABLATION.md)).** The rows above
+exist as emission switches, off by default, each with its proof in
+`verification/rewrites.py`:
+
+| Row | Switch | Estimated | Measured (16 rounds) |
+|---|---|---|---|
+| Merge hash stages 2 and 3 | `--merge-hash-stages` | 512 | 511 |
+| Index update in 2 ops | `--index-form mirrored` | 480 | 541 (also drops the depth-0 `multiply_add`s and the wrap broadcasts), and 23 loads |
+| No index chain where nothing reads it | `--prune-dead-index`, `--values-only` | 160 | 100 for either on the default form; contained in the 541 for the mirrored form |
+| Tree access on cached levels | `--cached-select bits-flow` / `bits` / `mobius` | 1,257 | 1,083 / 642 / 385. Bit extraction at depth 3 (2 to 3 ops per group) is the difference to the estimate: keeping every branch bit live instead does not fit the scratch budget |
+| Final indices not stored | `--values-only` | 49, and 48 loads | 100 alone (with the dead last-round update); 101 and 2 loads on top of the other switches |
+| **Sum** | merge + mirrored + `bits` | 2,458, floor 1,044 | **1,757, floor 1,057 with the output unchanged**; 1,858 and floor 1,056 with `--values-only`; 2,299 with `bits-flow` and `--values-only`, same floor |
+
+The prediction that loads become the binding engine is confirmed: 2,114 loads give 1,057
+while the ALUs alone would allow 1,036.
 
 ### 4.2 Fewer loads
 
@@ -197,6 +221,16 @@ above its vector-ALU floor of 967.
 | C2. C0 with selection free (not achievable) | 6,844 | 0 | 1,576 | 788 | **913** |
 | C3. C0 with a hypothetical 9-op hash | 6,332 | 1,664 | 1,576 | 788 | **942** |
 | D. Packets and per-lane `vload` (the 880 kernel, measured) | 6,541 | (843 flow) | 1,724 | 862 | **873** |
+
+Measured against this model (see [EMISSION_ABLATION.md](EMISSION_ABLATION.md)): B0 is
+implemented and lands at 1,056 (values only; 2,112 loads against the model's 2,088, the
+difference being constant and header loads). B1 is implemented as
+`--tree-reduce-max-depth 4 --depth4-select-rounds after-wrap` and does not reach 954: with
+every select a scheduler's choice (`--cached-select bits-flow`) the best division of selects
+between flow and the vector ALU gives 1,018, and the greedy scheduler's own division gives
+1,228. The model charges a select one flow slot or one vector op; the emitted 16-way select
+also needs 4 vector ops per group to recover the older branch bits, and selects above the
+leaf level cost 2 vector ops when they are not on flow.
 
 Which design reaches which target:
 

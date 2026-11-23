@@ -4516,3 +4516,97 @@ fn test_pools_greedy_same_schedule_when_pools_do_not_bind() {
     let cycles = |ops: &[SsaOp]| ops.iter().map(|op| op.cycle).collect::<Vec<_>>();
     assert_eq!(cycles(&words.ops), cycles(&pools.ops));
 }
+
+/// The greedy scheduler respects kept memory edges: a load after a store to its word runs at
+/// least one cycle later (RAW), a store over a word read earlier runs no earlier than the
+/// read (WAR, latency 0), and two stores to one word are a cycle apart (WAW). Without the
+/// edges the second load would be ready in the store's cycle.
+#[test]
+fn test_greedy_respects_memory_edges() {
+    use crate::kernel_builder::memory_deps::{compute_memory_dependencies, test_programs::store_load_same_word};
+
+    let (mut ops, ix) = store_load_same_word();
+    let stats = compute_memory_dependencies(&mut ops).unwrap();
+    assert_eq!(stats.kept, 3);
+    let mut shifted_ops = HashSet::new();
+    schedule_ssa_greedy_with_shift_budget(&mut ops, false, &mut shifted_ops, 1536).unwrap();
+    let c = |i: usize| ops[i].cycle;
+    assert!(c(ix.store_word0) >= c(ix.load_before), "WAR: {} < {}", c(ix.store_word0), c(ix.load_before));
+    assert!(c(ix.load_after) >= c(ix.store_word0) + 1, "RAW: {} vs {}", c(ix.load_after), c(ix.store_word0));
+    assert!(c(ix.last_store) >= c(ix.first_store) + 1, "WAW: {} vs {}", c(ix.last_store), c(ix.first_store));
+
+    // Control: without the memory edges the second load is not held back by the store.
+    let (mut free, _) = store_load_same_word();
+    schedule_ssa_greedy_with_shift_budget(&mut free, false, &mut HashSet::new(), 1536).unwrap();
+    assert!(
+        free[ix.load_after].cycle <= free[ix.store_word0].cycle,
+        "the test needs a program where the RAW edge binds: load {} store {}",
+        free[ix.load_after].cycle,
+        free[ix.store_word0].cycle
+    );
+}
+
+/// The first chain by emission order feeds the last store, which must wait for the
+/// store in the other chain. Both stores need to be reachable with a one-chain window.
+#[test]
+fn test_wavefront_window_respects_memory_store_order() {
+    use crate::kernel_builder::memory_deps::{check_memory_edges, compute_memory_dependencies};
+    use crate::types::{MemLocation, MemRegion};
+
+    let mut emit = SsaEmitContext::new();
+    let p = emit.emit_const_choice(100);
+    let a = emit.emit_const_choice(7);
+    let b = emit.emit_const_choice(8);
+    for value in [b, a] {
+        emit.set_next_mem_loc(MemLocation::word(MemRegion::ExtraRoom, 0));
+        emit.emit_store(p, value);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    assert_eq!(compute_memory_dependencies(&mut emit.ops).unwrap().kept, 1);
+    schedule_with_shape(&mut emit.ops, &wavefront_shape(0, Some(1)));
+    check_memory_edges(&emit.ops, |i| emit.ops[i].cycle).unwrap();
+}
+
+/// A capped wavefront must also admit loads and stores linked by RAW and WAR.
+#[test]
+fn test_wavefront_window_respects_mixed_memory_edges() {
+    use crate::kernel_builder::memory_deps::{
+        check_memory_edges, compute_memory_dependencies, test_programs::store_load_same_word,
+    };
+
+    let (mut ops, _) = store_load_same_word();
+    assert_eq!(compute_memory_dependencies(&mut ops).unwrap().kept, 3);
+    schedule_with_shape(&mut ops, &wavefront_shape(0, Some(1)));
+    check_memory_edges(&ops, |i| ops[i].cycle).unwrap();
+}
+
+/// A shared load feeding several otherwise independent chains can require a store
+/// from a later chain. That store and its data prerequisites must be admitted too.
+#[test]
+fn test_wavefront_shared_load_admits_its_store() {
+    use crate::kernel_builder::memory_deps::{check_memory_edges, compute_memory_dependencies};
+    use crate::types::{MemLocation, MemRegion};
+
+    let mut emit = SsaEmitContext::new();
+    let addr = emit.emit_const(100);
+    let offsets: Vec<_> = (1..=3).map(|c| emit.emit_const(c)).collect();
+    let value = emit.emit_const(7);
+    let written = MemLocation::word(MemRegion::ExtraRoom, 0);
+    emit.set_next_mem_loc(written);
+    emit.emit_store(addr, value);
+    let store = emit.ops.len() - 1;
+    emit.set_next_mem_loc(written);
+    let shared = emit.emit_load(addr);
+    for (i, input) in offsets.into_iter().enumerate() {
+        let out = emit.emit_alu(Opcode::Add, shared, input);
+        let dest = emit.emit_const(101 + i as i64);
+        emit.set_next_mem_loc(MemLocation::word(MemRegion::ExtraRoom, 1 + i as i64));
+        emit.emit_store(dest, out);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    assert!(wavefront_for(&emit.ops, 0, Some(1)).chain(store).is_some());
+    assert_eq!(compute_memory_dependencies(&mut emit.ops).unwrap().kept, 1);
+    assert_eq!(wavefront_for(&emit.ops, 0, Some(1)).chain(store), None);
+    schedule_with_shape(&mut emit.ops, &wavefront_shape(0, Some(1)));
+    check_memory_edges(&emit.ops, |i| emit.ops[i].cycle).unwrap();
+}
