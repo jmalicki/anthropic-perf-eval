@@ -44,7 +44,7 @@ def _export_model(tmp_path, extra):
     cmd = [sys.executable, os.path.join(ROOT, "generate_ssa_kernel.py"), "--no-validate",
            "--output-json", str(tmp_path / "sched.json"), "--save-kernel", str(tmp_path / "kernel.json"),
            *BASE, *extra]
-    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=110)
+    result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     return diff_cpsat_models.load(str(model_path)), result.stdout + result.stderr
 
@@ -99,3 +99,34 @@ def test_cse_groups_are_present_in_the_three_round_model(tmp_path):
     names = [var.name for var in model.variables]
     assert any(name.startswith("cse_sub_end_") for name in names)
     assert any(name.startswith("cse_sub_size_") for name in names)
+
+
+def check_hint_is_feasible(model_path):
+    """Fix each hinted variable to its hint and solve (scripts/check_cpsat_hint.py).
+
+    Runs in a separate process: OR-Tools' Python solver crashes next to scheduler_rs.
+    """
+    cmd = [sys.executable, "-m", "scripts.check_cpsat_hint", str(model_path)]
+    result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, "the hint is not a solution: " + result.stdout[-2000:] + result.stderr[-2000:]
+
+
+LANE_MODEL_CASES = [
+    [*rounds, "--cpsat-lane-model", lane_model]
+    for rounds in (["--rounds", "3"], ["--rounds", "5"])
+    for lane_model in ("free", "sorted", "pinned", "sorted-pinned")
+] + [
+    ["--rounds", "5", "--scratch-model", "pools", "--cpsat-makespan-rows", "bucketed",
+     "--cpsat-lane-model", "sorted-pinned"],
+]
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("extra", LANE_MODEL_CASES, ids=lambda extra: " ".join(extra).replace("--", ""))
+def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):
+    """Sorted lanes and pinned lanes must not cut off the greedy schedule: the greedy hints
+    all eight lanes of an op at the op's cycle, which is sorted and pinned."""
+    model, log = _export_model(tmp_path, extra)
+    assert not unhinted_variables(model)
+    assert "The solution hint is complete and is feasible" in log
+    check_hint_is_feasible(tmp_path / "model.pb")

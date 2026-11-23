@@ -137,8 +137,9 @@ impl Pass for GreedySchedulePass {
         let forced = ForcedEncodings::from_context(ctx);
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         let mut shape = ctx.config.compiler.greedy_shape();
-        // CP-SAT hints carry one cycle per op, so a split shift cannot be hinted.
-        if is_cpsat_pipeline {
+        // A split shift reaches CP-SAT only as per-lane hints (cpsat_split_shift_hint);
+        // without them the hint has one cycle per op and cannot describe it.
+        if is_cpsat_pipeline && !ctx.config.compiler.cpsat_split_shift_hint {
             shape.split_shift = false;
         }
         let mut shifted_lane_cycles = std::collections::HashMap::new();

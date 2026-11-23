@@ -281,6 +281,29 @@ def test_greedy_split_shift():
     assert builds[True][1]["cycles"] <= builds[False][1]["cycles"]
 
 
+def test_cpsat_split_shift_hint():
+    """PyO3: with cpsat_split_shift_hint the split-shift greedy schedule is accepted by CP-SAT and the kernel is correct."""
+    import scheduler_rs
+
+    forest = Tree.generate(FOREST_HEIGHT)
+    inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+    mem = build_mem_image(forest, inp)
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+        verbose=False,
+        use_cpsat=True,
+        cpsat_time_limit=120.0,
+        cpsat_deterministic_time=1.0,
+        greedy_barriers="none",
+        greedy_priority="wavefront",
+        greedy_split_shift=True,
+        cpsat_split_shift_hint=True,
+    )
+    assert not stats.get("budget_exceeded", False)
+    assert max(_alu_slots_per_cycle(list(instrs))) <= 12
+    _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+
+
 def test_pressure_thresholds_and_headroom():
     """PyO3: threshold overrides and budget headroom are accepted, give a correct kernel, and bad values raise."""
     import scheduler_rs

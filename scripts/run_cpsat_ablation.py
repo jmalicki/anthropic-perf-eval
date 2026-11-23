@@ -84,6 +84,10 @@ STANDARD_CONFIGS = [
     ("probing-0", "--cpsat-probing-level 0"),
     ("makespan-rows-static", "--cpsat-makespan-rows static"),
     ("makespan-rows-bucketed", "--cpsat-makespan-rows bucketed"),
+    # 8. Lane model of shiftable ops
+    ("lane-sorted", "--cpsat-lane-model sorted"),
+    ("lane-pinned", "--cpsat-lane-model pinned"),
+    ("lane-sorted-pinned", "--cpsat-lane-model sorted-pinned"),
 ]
 
 
