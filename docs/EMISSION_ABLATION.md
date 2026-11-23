@@ -286,7 +286,8 @@ caching (256 loads in round 15), and it pays for them with vector ops and select
 `bits-flow` it lands at 990 for the ALUs and 934 for the loads but needs 1,184 selects
 divided well between flow and the vector ALU (floor 1,018), and with `bits` it adds 342
 vector-op equivalents (floor 1,082). Caching a level for part of the groups (the
-"best mix" of `docs/BOUND_GAP_ANALYSIS.md` section 5) is not implemented. Below about 1,000
+"best mix" of `docs/BOUND_GAP_ANALYSIS.md` section 5) can be emitted with `--emission-plan`
+(encoding per round and per group); choosing the mix is not done here. Below about 1,000
 the route is the one that document describes: one load per lane serving several rounds
 (packets and per-lane `vload`), which is out of scope here.
 

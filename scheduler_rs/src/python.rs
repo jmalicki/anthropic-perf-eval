@@ -1089,9 +1089,13 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// "path" (all bits kept live, no extraction ops, more scratch).
 /// depth4_select_rounds: with tree_reduce_max_depth=4, "all" (default) selects level 4 on
 /// every visit; "after-wrap" gathers it on the first pass and selects only after the wrap.
+/// emission_plan: per round, per group the tree-access encoding ("gather", "bits", "bits-flow",
+/// "mobius"); a list of `rounds` lists of `batch_size / 8` names. Replaces cached_select,
+/// tree_reduce_max_depth and depth4_select_rounds for the choice of tree access (combining it
+/// with cached_select or depth4_select_rounds is an error). Plan format: solver/emission_plan.py.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
-    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all",
+    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None,
     cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_model="words", cpsat_split_shift_hint=false))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
@@ -1117,6 +1121,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     cached_select: &str,
     select_bit_source: &str,
     depth4_select_rounds: &str,
+    emission_plan: Option<Vec<Vec<String>>>,
     // Scheduler, solver and output options.
     cpsat_tuning_json: Option<&str>,
     liveness_detail: Option<String>,
@@ -1221,6 +1226,28 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             )));
         }
     };
+    let access_plan = match emission_plan {
+        None => None,
+        Some(rows) => {
+            if cached_select != crate::kernel_builder::config::CachedSelect::Standard
+                || depth4_select_after_wrap_only
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "emission_plan chooses the tree access of every round and group; do not combine it \
+                     with cached_select or depth4_select_rounds",
+                ));
+            }
+            let parsed: Result<Vec<Vec<_>>, String> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|name| crate::kernel_builder::config::AccessEncoding::from_str(name))
+                        .collect()
+                })
+                .collect();
+            Some(parsed.map_err(pyo3::exceptions::PyValueError::new_err)?)
+        }
+    };
 
     let config = KernelConfig {
         spec: ProblemSpec {
@@ -1246,6 +1273,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             cached_select,
             select_bit_source,
             depth4_select_after_wrap_only,
+            access_plan,
         },
         compiler: CompilerConfig {
             enable_valu_shift,
@@ -1270,6 +1298,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             cpsat_split_shift_hint,
         },
     };
+    config
+        .spec
+        .check_access_plan()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let mut builder = SsaTickTockKernelBuilder::new(config);
     builder.cpsat_deterministic_time = cpsat_deterministic_time;
