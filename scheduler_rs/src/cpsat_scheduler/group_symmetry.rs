@@ -10,6 +10,7 @@
 //! * dependency edges and the values read, with values defined in `A` mapped to the
 //!   corresponding values of `B` (vector-group lanes and aliases included), values defined
 //!   outside both unchanged, and no value of one group read by the other;
+//! * directed main-memory ordering edges, including their access kind;
 //! * every op outside `A` and `B` that reads ops of the groups (it must read corresponding
 //!   ops of both, so the swap leaves it unchanged);
 //! * ConstChoice derivations (the producers of the values an ALU encoding combines) and the
@@ -33,7 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::cse_groups::CseGroup;
-use crate::types::{Opcode, Operand, SsaOp, VReg};
+use crate::types::{MemEdgeKind, Opcode, Operand, SsaOp, VReg};
 
 /// Structural groups and the orbits of identical ones.
 #[derive(Debug, Clone, Default)]
@@ -164,6 +165,8 @@ struct Context<'a> {
     alias_of_lanes: HashMap<Vec<VReg>, VReg>,
     /// Ops reading each op (indices)
     consumers: Vec<Vec<usize>>,
+    /// Targets and kinds of each op's outgoing main-memory ordering edges.
+    memory_successors: Vec<Vec<(usize, MemEdgeKind)>>,
     /// First producer of each constant value (ConstChoice derivations use it)
     value_producer: HashMap<i64, usize>,
     /// Ops whose ConstChoice derivations use op `p` as a producer
@@ -189,10 +192,16 @@ impl<'a> Context<'a> {
             }
         }
         let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+        let mut memory_successors = vec![Vec::new(); ops.len()];
         for (i, op) in ops.iter().enumerate() {
             for dep in &op.dep_ids {
                 if let Some(&d) = id_to_idx.get(dep) {
                     consumers[d].push(i);
+                }
+            }
+            for &(source_id, kind) in &op.mem_deps {
+                if let Some(&source) = id_to_idx.get(&source_id) {
+                    memory_successors[source].push((i, kind));
                 }
             }
         }
@@ -218,7 +227,7 @@ impl<'a> Context<'a> {
                 cse_of.insert(c, g);
             }
         }
-        Context { ops, id_to_idx, vreg_def, group_of, lanes_of, alias_of_lanes, consumers, value_producer, derivation_users, cse_of, cse_groups }
+        Context { ops, id_to_idx, vreg_def, group_of, lanes_of, alias_of_lanes, consumers, memory_successors, value_producer, derivation_users, cse_of, cse_groups }
     }
 }
 
@@ -340,6 +349,26 @@ fn check_identical(cx: &Context<'_>, groups: &[Vec<usize>], a: usize, b: usize) 
         let deps_b: BTreeSet<usize> = ob.dep_ids.iter().filter_map(|d| cx.id_to_idx.get(d).copied()).collect();
         if deps_a? != deps_b {
             return Err(format!("op {} vs {}: dependencies", oa.id, ob.id));
+        }
+        // Both directions matter: an incoming edge may come from a shared op, and an
+        // outgoing edge to a shared op must still be present when its source is swapped.
+        let incoming_memory = |op: &SsaOp| {
+            op.mem_deps
+                .iter()
+                .filter_map(|&(id, kind)| cx.id_to_idx.get(&id).map(|&i| (i, kind)))
+                .collect::<Vec<_>>()
+        };
+        for (a, b) in [
+            (&incoming_memory(oa)[..], &incoming_memory(ob)[..]),
+            (&cx.memory_successors[ia][..], &cx.memory_successors[ib][..]),
+        ] {
+            let mapped: Result<BTreeSet<_>, _> = a
+                .iter()
+                .map(|&(i, kind)| map_op(i).map(|j| (j, kind)))
+                .collect();
+            if mapped? != b.iter().copied().collect() {
+                return Err(format!("op {} vs {}: memory ordering", oa.id, ob.id));
+            }
         }
         // Readers outside both groups read corresponding ops of both.
         for (x, y, own, other) in [(ia, ib, &pos_a, &pos_b), (ib, ia, &pos_b, &pos_a)] {
@@ -561,6 +590,35 @@ mod tests {
         ops.extend([reader, reader2]);
         let o = group_orbits(&ops, None, &[]);
         assert!(o.orbits.is_empty(), "groups {:?}", o.groups);
+    }
+
+    #[test]
+    fn test_matching_memory_edges_keep_the_symmetry() {
+        let ops = program(3, |_, ops| {
+            let n = ops.len();
+            ops[n - 1].mem_deps.push((n - 3, MemEdgeKind::War));
+        });
+        let o = group_orbits(&ops, None, &[]);
+        assert_eq!(o.orbits, vec![vec![0, 1, 2]], "{:?}", o.rejections);
+    }
+
+    #[test]
+    fn test_a_memory_edge_between_groups_breaks_the_symmetry() {
+        let mut ops = program(3, |_, _| {});
+        ops[6].mem_deps.push((3, MemEdgeKind::Waw));
+        let o = group_orbits(&ops, None, &[]);
+        assert!(o.orbits.is_empty(), "orbits {:?}", o.orbits);
+    }
+
+    #[test]
+    fn test_memory_edge_kind_affects_symmetry() {
+        let ops = program(3, |group, ops| {
+            let n = ops.len();
+            let kind = if group == 1 { MemEdgeKind::Raw } else { MemEdgeKind::War };
+            ops[n - 1].mem_deps.push((n - 3, kind));
+        });
+        let o = group_orbits(&ops, None, &[]);
+        assert_eq!(o.orbits, vec![vec![0, 2]], "{:?}", o.rejections);
     }
 
     #[test]

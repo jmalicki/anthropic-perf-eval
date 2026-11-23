@@ -798,7 +798,15 @@ pub fn schedule_ssa_cpsat(
     // 2d. Checked symmetry rows: find the orbits of identical vector groups and give
     // corresponding ops of an orbit one domain (group_symmetry.rs), so that every swap within
     // an orbit is an automorphism of the model.
-    let group_orbits = if tuning.symmetry_rows == SymmetryRows::Checked {
+    // Section liveness, per-op shift restrictions, and dead-store hints can distinguish
+    // otherwise identical groups. The structural check does not model those restrictions.
+    let group_orbits = if tuning.symmetry_rows == SymmetryRows::Checked
+        && !forced_shifts.is_some_and(|ids| !ids.is_empty())
+        && initial_live.is_none()
+        && !live_out_vregs.is_some_and(|vregs| !vregs.is_empty())
+        && !live_through_vregs.is_some_and(|vregs| !vregs.is_empty())
+        && !greedy_hints.is_some_and(|cycles| cycles.iter().any(|&cycle| cycle < 0))
+    {
         let orbits = super::group_symmetry::group_orbits(ops, hints.vector_group_lanes, cse_groups.unwrap_or(&[]));
         super::group_symmetry::symmetric_domains(ops, &orbits, &mut [&mut final_asap, &mut final_alap]);
         Some(orbits)
