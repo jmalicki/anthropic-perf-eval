@@ -71,6 +71,14 @@ Reading of the code (`scheduler_rs/src/cpsat_scheduler/bounds.rs`,
 
 So the bound is not wrong. It is conditional, and the condition is where the gap lives.
 
+Ramp-up and tail, measured later (V): `scripts/static_bounds.py` adds static head-body-tail
+rows, `makespan >= t + q + ceil(W / cap)` over the ops at dependency depth >= t from the start
+and >= q from the end (proved sound with Z3 in `verification/static_bounds_proof.py`). They
+explain little. Main's best 16-round shaped greedy gets 1,130 -> 1,132 against 1,197 achieved
+(2 of 67 cycles). PR #51's 1,097-cycle kernel gets 994 -> 1,009 (15 of 103), from the load row:
+the gathers cannot start before cycle 51. The rest of the gap is not depth. `schedule_report`
+prints these rows.
+
 ## 3. Where our ops go
 
 Vector-op equivalents (vector ALU ops plus scalar ALU ops / 8), from the JSON (V).

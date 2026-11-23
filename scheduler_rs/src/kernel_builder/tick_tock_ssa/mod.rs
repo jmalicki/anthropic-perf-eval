@@ -128,6 +128,51 @@ pub struct SsaTickTockKernelBuilder {
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
+/// First and last cycle a section occupies: the cycles of its scheduled ops (barriers
+/// excluded) and the lane cycles of its split shifts, whose earlier lanes precede the op's
+/// cycle (its last lane). Returns `(i32::MAX, i32::MIN)` when nothing is scheduled.
+///
+/// # Arguments
+/// * `ops` - The section's ops
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts, keyed by op id
+pub(crate) fn section_cycle_range(
+    ops: &[SsaOp],
+    shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> (i32, i32) {
+    let mut range = (i32::MAX, i32::MIN);
+    for op in ops {
+        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+            let lanes = shifted_lane_cycles.get(&op.id).map_or(&[][..], |l| l.as_slice());
+            for c in std::iter::once(op.cycle).chain(lanes.iter().copied()) {
+                range = (range.0.min(c), range.1.max(c));
+            }
+        }
+    }
+    range
+}
+
+/// Move every scheduled op of a section (barriers excluded) by `delta` cycles, together with
+/// the per-lane cycles of its split shift, if it has one, so the lanes stay where the op is.
+///
+/// # Arguments
+/// * `ops` - The section's ops
+/// * `shifted_lane_cycles` - Per-lane cycles of split shifts, keyed by op id
+/// * `delta` - Cycles to add
+pub(crate) fn translate_section_cycles(
+    ops: &mut [SsaOp],
+    shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
+    delta: i32,
+) {
+    for op in ops.iter_mut() {
+        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
+            op.cycle += delta;
+            if let Some(lanes) = shifted_lane_cycles.get_mut(&op.id) {
+                lanes.iter_mut().for_each(|c| *c += delta);
+            }
+        }
+    }
+}
+
 fn scratch_write_size(op: &Op) -> usize {
     match op.engine {
         Engine::Valu => 8,
@@ -1049,25 +1094,21 @@ impl SsaTickTockKernelBuilder {
             let mut this_section_makespan: Option<i32> = None;
             let (start, end) = boundaries[k];
             let section_span_after_rebase: i32 = {
-                let mut min_c = i32::MAX;
-                let mut max_c = i32::MIN;
-                for op in &ctx.ops[start..end] {
-                    if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                        min_c = min_c.min(op.cycle);
-                        max_c = max_c.max(op.cycle);
-                    }
-                }
+                let (min_c, max_c) = section_cycle_range(
+                    &ctx.ops[start..end],
+                    &ctx.greedy_decisions.shifted_alu_cycles,
+                );
                 let span = if min_c <= max_c {
                     max_c - min_c + 1
                 } else {
                     0
                 };
                 if span > 0 {
-                    for op in &mut ctx.ops[start..end] {
-                        if op.opcode != Opcode::Barrier && op.cycle >= 0 {
-                            op.cycle = section_offset + (op.cycle - min_c);
-                        }
-                    }
+                    translate_section_cycles(
+                        &mut ctx.ops[start..end],
+                        &mut ctx.greedy_decisions.shifted_alu_cycles,
+                        section_offset - min_c,
+                    );
                 }
                 span
             };
@@ -1076,13 +1117,10 @@ impl SsaTickTockKernelBuilder {
                     .filter(|&i| ctx.ops[i].opcode != Opcode::Barrier)
                     .collect();
                 if !global_indices.is_empty() {
-                let (greedy_min_c, greedy_max_c) = global_indices
-                    .iter()
-                    .filter_map(|&i| {
-                        let c = ctx.ops[i].cycle;
-                        if c >= 0 { Some(c) } else { None }
-                    })
-                    .fold((i32::MAX, i32::MIN), |(lo, hi), c| (lo.min(c), hi.max(c)));
+                let (greedy_min_c, greedy_max_c) = section_cycle_range(
+                    &ctx.ops[start..end],
+                    &ctx.greedy_decisions.shifted_alu_cycles,
+                );
                 let greedy_section_makespan = if greedy_min_c <= greedy_max_c {
                     greedy_max_c - greedy_min_c + 1
                 } else {
@@ -1209,6 +1247,18 @@ impl SsaTickTockKernelBuilder {
                     .collect();
                 let seg_shift: Option<&HashSet<usize>> =
                     if seg_shift_set.is_empty() { None } else { Some(&seg_shift_set) };
+                // Split shifts among the hinted shifts: their lanes, in section cycles like
+                // segment_hints. Without them the hint check would count each as a whole shift
+                // (8 scalar slots in its last lane's cycle), which can exceed the scalar slots
+                // of a schedule the greedy actually produced.
+                let seg_lane_hints: HashMap<usize, Vec<i32>> = seg_shift_set
+                    .iter()
+                    .filter_map(|id| {
+                        ctx.greedy_decisions.shifted_alu_cycles.get(id).map(|lanes| {
+                            (*id, lanes.iter().map(|&c| (c - section_offset).max(0)).collect())
+                        })
+                    })
+                    .collect();
                 let seg_select_set: HashSet<usize> =
                     current_select_fma.intersection(&segment_op_ids).copied().collect();
                 let seg_select = if seg_select_set.is_empty() { None } else { Some(&seg_select_set) };
@@ -1227,6 +1277,7 @@ impl SsaTickTockKernelBuilder {
                     SsaCpsatHints {
                         greedy_hints: Some(&segment_hints),
                         shift_hints: seg_shift,
+                        shifted_lane_cycle_hints: Some(&seg_lane_hints).filter(|l| !l.is_empty()),
                         forced_shifts: None,
                         select_choice_hints: seg_select,
                         const_add_imm_hints: seg_const_add_imm_hints,
@@ -1294,13 +1345,21 @@ impl SsaTickTockKernelBuilder {
                 }
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
-                        ctx.ops[filtered_global_indices[seg_idx]].cycle = section_offset + cycle;
+                        let op = &mut ctx.ops[filtered_global_indices[seg_idx]];
+                        op.cycle = section_offset + cycle;
+                        // Rescheduled without VALU shift: the greedy's lanes no longer apply.
+                        ctx.greedy_decisions.shifted_alu_cycles.remove(&op.id);
                     }
                 }
                 for &i in &global_indices {
                     if !filtered_global_set.contains(&i) && ctx.ops[i].cycle >= 0 {
-                        ctx.ops[i].cycle =
-                            section_offset + (ctx.ops[i].cycle - greedy_min_c);
+                        let delta = section_offset - greedy_min_c;
+                        ctx.ops[i].cycle += delta;
+                        if let Some(lanes) =
+                            ctx.greedy_decisions.shifted_alu_cycles.get_mut(&ctx.ops[i].id)
+                        {
+                            lanes.iter_mut().for_each(|c| *c += delta);
+                        }
                     }
                 }
                 this_section_makespan = Some(
@@ -1508,12 +1567,17 @@ impl SsaTickTockKernelBuilder {
             vec![]
         };
         let cse_groups_ref = if cse_groups.is_empty() { None } else { Some(cse_groups.as_slice()) };
+        // Split shifts made by the greedy (only with --cpsat-split-shift-hint): hint each lane
+        // at its own cycle. Lanes of ops whose shift hint was dropped are ignored by the model.
+        let split_shift_lane_hints = Some(&ctx.greedy_decisions.shifted_alu_cycles)
+            .filter(|lanes| !lanes.is_empty());
         let cpsat_result = match schedule_ssa_cpsat(
             &ctx.ops,
             cpsat_config,
             SsaCpsatHints {
                 greedy_hints: Some(&greedy_hints),
                 shift_hints,
+                shifted_lane_cycle_hints: split_shift_lane_hints,
                 forced_shifts: forced_shifts_ref,
                 select_choice_hints,
                 const_add_imm_hints,
