@@ -1,0 +1,54 @@
+{
+ "format": "emission-plan/1",
+ "rounds": 16,
+ "groups": 32,
+ "forest_height": 10,
+ "access": [
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  {
+   "gather": 15,
+   "bits-flow": 17
+  },
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  "gather"
+ ],
+ "context": {
+  "rounds": 16,
+  "batch_size": 256,
+  "forest_height": 10,
+  "merge_hash_stages": true,
+  "index_form": "mirrored",
+  "select_bit_source": "index",
+  "values_only": false
+ },
+ "predicted": {
+  "floor": 989,
+  "counts": {
+   "vec_fixed": 2518,
+   "vec_shiftable": 4849,
+   "alu": 208,
+   "load": 1978,
+   "store": 64,
+   "flow": 0,
+   "select1": 584,
+   "select2": 375,
+   "const": 48,
+   "const_alu": 6
+  },
+  "max_util": {},
+  "capped_cycles": 989
+ },
+ "comment": "written by scripts/emission_structure.py solve"
+}
