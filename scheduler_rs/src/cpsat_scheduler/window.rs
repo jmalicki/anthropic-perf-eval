@@ -631,7 +631,7 @@ impl WindowReference {
 /// The window model restricted to the ops that can matter (see [`restrict_to_window`]).
 #[derive(Debug, Clone)]
 pub struct WindowSubproblem {
-    /// Ops kept, in their original order, with `dep_ids` cut to kept ops. Op ids unchanged.
+    /// Ops kept, in their original order, with dependencies cut to kept ops. Op ids unchanged.
     pub ops: Vec<SsaOp>,
     /// Kept op index -> index in the full op list.
     pub global: Vec<usize>,
@@ -658,7 +658,7 @@ pub struct WindowSubproblem {
 /// The rest are dropped. They and everything between them are pinned (or move with the
 /// block), so every constraint among them holds as in the reference; constraints between a
 /// dropped op and a kept one hold too, because a dropped op only meets kept ops that are
-/// themselves pinned or are far enough away (see `pruned_ops`). Kept ops' `dep_ids` on
+/// themselves pinned or are far enough away (see `pruned_ops`). Data and memory edges from
 /// dropped ops are removed.
 ///
 /// # Returns
@@ -733,6 +733,7 @@ pub fn restrict_to_window(
         .map(|&g| {
             let mut op = ops[g].clone();
             op.dep_ids.retain(|id| kept_ids.contains(id));
+            op.mem_deps.retain(|(id, _)| kept_ids.contains(id));
             op
         })
         .collect();
@@ -782,12 +783,13 @@ pub fn expand_window_solution(
 ) -> super::SsaCpsatResult {
     let num_cse_groups = cse_groups.len();
     let reference = &window.reference;
-    // The block shift, read off a kept op after the window (all of them move by the same).
+    // Every retained suffix op moves by delta. For shifted ops both cycle arrays
+    // use the last lane, so a shifted op can witness the movement too.
     let delta = sub
         .global
         .iter()
         .enumerate()
-        .find(|(_, &g)| window.region(g, &ops[g]) == WindowRegion::After && !reference.shifted_ops.contains(&ops[g].id))
+        .find(|(_, &g)| window.region(g, &ops[g]) == WindowRegion::After)
         .map_or(0, |(local, &g)| reference.cycles[g] - result.cycle_assignments[local]);
     let mut local_of = vec![usize::MAX; ops.len()];
     for (local, &g) in sub.global.iter().enumerate() {
@@ -1169,7 +1171,7 @@ pub fn run_window_probe(
             eprintln!("[window probe] rolling W={}: {} -> {} cycles", w, base_makespan, makespan);
             report.rolling_final.push((w, makespan));
             // Re-check the rolled schedule on the full, unreduced model: every op pinned.
-            if let Some(r) = &improved {
+            if let Some(r) = &mut improved {
                 let check = CpsatWindow {
                     start: 0,
                     len: 0,
@@ -1178,7 +1180,14 @@ pub fn run_window_probe(
                     prune: false,
                 };
                 let status = match solve_window(ops, &check_config, ctx, &check) {
-                    Ok(Some(c)) if c.makespan == r.makespan => format!("{} (makespan {})", c.status, c.makespan),
+                    Ok(Some(c)) if c.makespan == r.makespan => {
+                        // Lowering and bulk moves use metadata indexed by the full op list.
+                        // The reduced solution only carried it for retained ops.
+                        r.eliminated_vb_to_scalar_producer = c.eliminated_vb_to_scalar_producer;
+                        r.schedule_constraints = c.schedule_constraints;
+                        r.empty_cycle_count = c.empty_cycle_count;
+                        format!("{} (makespan {})", c.status, c.makespan)
+                    }
                     Ok(Some(c)) => {
                         return Err(format!(
                             "window probe: rolling W={} schedule re-checks at makespan {} instead of {}",
@@ -1404,6 +1413,46 @@ mod tests {
                 WindowRegion::Free => {}
             }
         }
+    }
+
+    /// The retained last op can be a split shift and the only witness of suffix movement.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn pruned_suffix_uses_retained_shifted_op_to_recover_delta() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+
+        let mut emit = SsaEmitContext::new();
+        let scalar = emit.emit_const_choice(3);
+        let vector = emit.emit_vbroadcast(scalar);
+        emit.emit_valu(Opcode::Add, vector, vector);
+        emit.emit_valu(Opcode::Xor, vector, vector);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let ops = emit.ops;
+        let first = ops[2].id;
+        let last = ops[3].id;
+        let reference = WindowReference {
+            cycles: vec![0, 6, 70, 90],
+            shifted_ops: HashSet::from([first, last]),
+            shifted_alu_cycles: HashMap::from([
+                (first, vec![69, 69, 69, 69, 70, 70, 70, 70]),
+                (last, vec![89, 89, 89, 89, 90, 90, 90, 90]),
+            ]),
+            ..Default::default()
+        };
+        let window = CpsatWindow { start: 6, len: 4, fix_window_encodings: true, reference, prune: true };
+        let sub = restrict_to_window(&ops, &window, &[], None).expect("pruned subproblem");
+        assert_eq!(sub.global, [0, 1, 3]);
+        let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
+            .expect("model")
+            .expect("solution");
+        let delta = window.reference.cycles[3] - result.cycle_assignments[3];
+        assert!(delta > 0, "the loose suffix must move earlier");
+        assert_eq!(result.cycle_assignments[2], 70 - delta);
+        assert_eq!(
+            result.shifted_alu_cycles[&first],
+            window.reference.shifted_alu_cycles[&first].iter().map(|c| c - delta).collect::<Vec<_>>()
+        );
     }
 
     /// Leaving far-away pinned ops out of the cumulatives does not change the optimum, and
