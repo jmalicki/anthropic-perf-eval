@@ -39,6 +39,10 @@ pub fn elide_barriers(ops: Vec<SsaOp>) -> Vec<SsaOp> {
         .map(|mut op| {
             // Remove barrier deps from remaining ops
             op.dep_ids.retain(|id| !barrier_ids.contains(id));
+            // Memory edges join memory ops only, never a barrier, and none was implied
+            // through a barrier (`compute_memory_dependencies` looks at data paths only), so
+            // removing the barriers loses no memory ordering.
+            debug_assert!(op.mem_deps.iter().all(|(id, _)| !barrier_ids.contains(id)));
             op
         })
         .collect()

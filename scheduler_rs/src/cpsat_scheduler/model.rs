@@ -28,7 +28,7 @@ use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, 
 use super::validation::{
     build_flow_audit, summarise_ssa_solution_engines_and_choices,
     validate_ssa_slot_limits, verify_all_raw_precedence, verify_cse_sub_precedence,
-    verify_scratch_budget_all_readers,
+    verify_memory_precedence, verify_scratch_budget_all_readers,
     verify_select_choice_fma_consumer_precedence,
 };
 
@@ -892,6 +892,22 @@ pub fn schedule_ssa_cpsat(
                 // cycle[idx] >= cycle[dep_idx] + 1
                 let c = model.add_ge(times[idx].issue(), times[dep_idx].visible());
                 model.set_constraint_name(c, &format!("prec_raw_{}_{}", idx, dep_idx));
+            }
+        }
+    }
+
+    // 5-mem. Memory edges (`mem_deps`, sorted per op): the target's memory access is at least
+    // the edge latency after the source's. WAR has latency 0 (same cycle allowed: within a
+    // cycle the simulator reads memory before it writes); RAW and WAW have 1. Empty for every
+    // kernel emitted today, so this adds no constraint to their models.
+    for (idx, op) in ops.iter().enumerate() {
+        for &(src_id, kind) in &op.mem_deps {
+            if let Some(&src_idx) = op_id_to_idx.get(&src_id) {
+                let c = model.add_ge(
+                    times[idx].memory_access(),
+                    times[src_idx].memory_access() + kind.latency() as i64,
+                );
+                model.set_constraint_name(c, &format!("prec_mem_{}_{}_{}", kind.as_str(), idx, src_idx));
             }
         }
     }
@@ -2960,6 +2976,25 @@ pub fn schedule_ssa_cpsat(
                     }
                 }
             }
+            // Memory edges: consumer >= source + latency (0 for WAR)
+            for &(src_id, kind) in &op.mem_deps {
+                let Some(&src_idx) = op_id_to_idx.get(&src_id) else {
+                    continue;
+                };
+                if src_idx >= hints.len() || hints[src_idx] < 0 {
+                    continue;
+                }
+                if consumer_cycle < hints[src_idx] + kind.latency() {
+                    prec_violations += 1;
+                    if prec_violations <= 5 && verbose {
+                        eprintln!(
+                            "  WARNING: Memory {} edge violation: op {} (id={}) at cycle {} after op {} (id={}) at cycle {} (need >= {})",
+                            kind.as_str(), idx, op.id, consumer_cycle, src_idx, src_id, hints[src_idx],
+                            hints[src_idx] + kind.latency()
+                        );
+                    }
+                }
+            }
         }
         if prec_violations > 0 && verbose {
             eprintln!("  Total precedence violations: {}", prec_violations);
@@ -4591,6 +4626,8 @@ pub fn schedule_ssa_cpsat(
             );
             // SelectChoice FMA result visible at C+2 (redundant with verify_all_raw_precedence but kept for clarity).
             verify_select_choice_fma_consumer_precedence(ops, &cycle_assignments, &select_choice_encoding);
+            // Memory edges (latency 0 for WAR).
+            verify_memory_precedence(ops, &cycle_assignments);
             // The scratch cumulative must have covered every reader of every value.
             if scratch_budget > 0 && !scratch_values.is_empty() {
                 verify_scratch_budget_all_readers(

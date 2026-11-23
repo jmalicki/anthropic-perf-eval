@@ -9,6 +9,7 @@
 //! - `config` - Kernel configuration (forest height, batch size, etc.)
 //! - `context_ssa` - SSA scratch context with VRegs (no pre-allocated addresses)
 //! - `emit_ssa` - SSA-based op emission using virtual registers
+//! - `memory_deps` - Main-memory locations, exact memory edges and their redundancy filter
 //! - `ssa_emit` - High-level SSA emission (hash, branch, tree selection)
 //! - `ssa_greedy/` - Greedy scheduler (budget-aware, precedence offsets)
 //! - `ssa_lower` - SSA→concrete lowering (address assignment, VALU→ALU expansion)
@@ -20,6 +21,7 @@ pub mod barrier_elision;
 pub mod config;
 pub mod context_ssa;
 pub mod emit_ssa;
+pub mod memory_deps;
 pub mod tree_select;
 pub mod pipeline;
 pub mod round_budget;
