@@ -589,20 +589,6 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
-    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
-    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
-    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
-    // size and start hints), so what is hinted is exactly what the check counted.
-    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
-        let lo = *asap.get(&op_id).unwrap_or(&0);
-        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
-        hints
-            .shifted_lane_cycle_hints
-            .and_then(|m| m.get(&op_id))
-            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
-            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
-    };
-
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
     // symmetry-aware or energetic tightening is used; use it for both passes and model constraints.
     let mut current_asap = asap.clone();
@@ -826,6 +812,20 @@ pub fn schedule_ssa_cpsat(
             (asap, alap)
         }
         None => (asap, alap),
+    };
+
+    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
+    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
+    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
+    // size and start hints), so what is hinted is exactly what the check counted.
+    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        let lo = *asap.get(&op_id).unwrap_or(&0);
+        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
+        hints
+            .shifted_lane_cycle_hints
+            .and_then(|m| m.get(&op_id))
+            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
+            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
     };
 
     // 3. Build the CP model

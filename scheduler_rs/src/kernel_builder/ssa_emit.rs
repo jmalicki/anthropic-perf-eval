@@ -11,8 +11,8 @@
 use crate::types::{EmissionPhase, MemLocation, MemRegion, Opcode, VarType, VLEN};
 
 use super::config::{
-    level_last_index, merged_hash_stage_constants, CachedSelect, IndexForm, SelectBitSource,
-    HASH_STAGES, MAX_TREE_REDUCE_DEPTH, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
+    level_last_index, merged_hash_stage_constants, AccessEncoding, CachedSelect, IndexForm,
+    SelectBitSource, HASH_STAGES, MAX_TREE_REDUCE_DEPTH, MERGED_HASH_STAGE, STAGE5_XOR_CONST,
 };
 use super::context_ssa::{CachedLevelTable, CachedSelectPair};
 use super::tick_tock_ssa::{
@@ -100,6 +100,12 @@ impl SsaTickTockKernelBuilder {
     // =========================================================================
     // Index Form
     // =========================================================================
+
+    /// True if the tree-access emitter being run emits group `g`: `g` exists and is one of
+    /// `access_groups` (every group when that is `None`).
+    pub(super) fn emits_group(&self, g: usize, n_groups: usize) -> bool {
+        g < n_groups && self.access_groups.as_ref().map_or(true, |groups| groups[g])
+    }
 
     /// True when the kernel tracks the mirrored index `n = L_d - idx` (`IndexForm::Mirrored`).
     pub(super) fn mirrored_index(&self) -> bool {
@@ -651,19 +657,37 @@ impl SsaTickTockKernelBuilder {
         n_iters: usize,
         is_last_round: bool,
     ) {
-        // Tree access based on depth
+        // Tree access: one emitter call per encoding used in this round, over the groups that
+        // use it, in the order of the first group using each. Without an emission plan every
+        // group shares one encoding, so this is a single call over all groups as before.
         self.emit.set_phase(EmissionPhase::TreeAccess);
-        let cached = self.config.spec.selects_cached_level(rnd, tree_depth);
-        let select_from_bits = cached && self.config.spec.cached_select != CachedSelect::Standard;
-        match tree_depth {
-            _ if select_from_bits => self.emit_cached_level_select(tree_depth, n_iters, n_groups),
-            0 => self.emit_depth0_access(n_iters, n_groups),
-            1 => self.emit_depth1_access(n_iters, n_groups),
-            2 => self.emit_depth2_access(n_iters, n_groups),
-            3 if cached => self.emit_depth3_access(n_iters, n_groups),
-            4 if cached => self.emit_depth4_access(n_iters, n_groups),
-            _ => self.emit_scattered_access(n_iters, n_groups, tree_depth),
+        let encodings: Vec<AccessEncoding> = (0..n_groups)
+            .map(|g| self.config.spec.access_encoding(rnd, tree_depth, g))
+            .collect();
+        let mut order: Vec<AccessEncoding> = Vec::new();
+        for &encoding in &encodings {
+            if !order.contains(&encoding) {
+                order.push(encoding);
+            }
         }
+        let mixed = order.len() > 1;
+        for encoding in order {
+            self.access_groups = mixed.then(|| encodings.iter().map(|&e| e == encoding).collect());
+            if let Some(mode) = encoding.cached_select() {
+                self.emit_cached_level_select(tree_depth, mode, n_iters, n_groups);
+                continue;
+            }
+            match (encoding, tree_depth) {
+                (AccessEncoding::Standard, 0) => self.emit_depth0_access(n_iters, n_groups),
+                (AccessEncoding::Standard, 1) => self.emit_depth1_access(n_iters, n_groups),
+                (AccessEncoding::Standard, 2) => self.emit_depth2_access(n_iters, n_groups),
+                (AccessEncoding::Standard, 3) => self.emit_depth3_access(n_iters, n_groups),
+                (AccessEncoding::Standard, 4) => self.emit_depth4_access(n_iters, n_groups),
+                (AccessEncoding::Gather, _) => self.emit_scattered_access(n_iters, n_groups, tree_depth),
+                (other, depth) => panic!("no emitter for {:?} at depth {}", other, depth),
+            }
+        }
+        self.access_groups = None;
 
         // XOR
         self.emit.set_phase(EmissionPhase::Xor);
@@ -890,24 +914,28 @@ impl SsaTickTockKernelBuilder {
         }
     }
 
-    /// Build the select constants of every cached level some round visits (nothing for
-    /// `CachedSelect::Standard`).
+    /// Build the select constants of every cached level that some group selects with the
+    /// branch bits (`AccessEncoding::Bits`, `BitsFlow`, `Mobius`); nothing when none does.
+    ///
+    /// Per level: the XORed node table, then the leaf pairs if `Bits` or `BitsFlow` is used
+    /// there (with `high` if `BitsFlow` is), then the Mobius coefficients if `Mobius` is.
     pub(super) fn emit_cached_select_init(&mut self) {
-        let mode = self.config.spec.cached_select;
-        if mode == CachedSelect::Standard {
+        let max_depth = MAX_TREE_REDUCE_DEPTH as usize;
+        let used: Vec<[bool; 3]> = (0..=max_depth)
+            .map(|depth| {
+                [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius]
+                    .map(|e| self.config.spec.uses_access(depth, e))
+            })
+            .collect();
+        if used.iter().all(|u| u.iter().all(|&x| !x)) {
             return;
         }
         let stage5 = self.ctx.stage5_xor_s.unwrap();
-        let tree_height = self.config.spec.tree_height();
-        let rounds = self.config.spec.rounds;
-        let max_depth = MAX_TREE_REDUCE_DEPTH as usize;
         self.ctx.cached_tables = vec![None; max_depth + 1];
 
         for depth in 0..=max_depth {
-            let selected = (0..rounds).any(|r| {
-                r % tree_height == depth && self.config.spec.selects_cached_level(r, depth)
-            });
-            if !selected {
+            let [bits, bits_flow, mobius] = used[depth];
+            if !(bits || bits_flow || mobius) {
                 continue;
             }
             // U[m] = tree[L_d - n] ^ C, where n (the position in the level from the right)
@@ -921,10 +949,14 @@ impl SsaTickTockKernelBuilder {
                 table.push(self.emit.emit_alu(Opcode::Xor, node, stage5));
             }
 
-            let level = if depth == 0 {
+            let mut level = CachedLevelTable::default();
+            if depth == 0 {
                 self.emit.set_next_var_type(VarType::TreeCache);
-                CachedLevelTable::Root(self.emit.emit_vbroadcast(table[0]))
-            } else if mode != CachedSelect::Mobius {
+                level.root = Some(self.emit.emit_vbroadcast(table[0]));
+                self.ctx.cached_tables[depth] = Some(level);
+                continue;
+            }
+            if bits || bits_flow {
                 // Leaf pairs: entries 2j and 2j+1 differ in the oldest branch bit only.
                 let mut pairs = Vec::with_capacity(table.len() / 2);
                 for j in 0..table.len() / 2 {
@@ -934,14 +966,15 @@ impl SsaTickTockKernelBuilder {
                     let base = self.emit.emit_vbroadcast(table[2 * j]);
                     self.emit.set_next_var_type(VarType::TreeCache);
                     let delta = self.emit.emit_vbroadcast(delta_s);
-                    let high = (mode == CachedSelect::BitsFlow).then(|| {
+                    let high = bits_flow.then(|| {
                         self.emit.set_next_var_type(VarType::TreeCache);
                         self.emit.emit_valu(Opcode::Add, base, delta)
                     });
                     pairs.push(CachedSelectPair { base, delta, high });
                 }
-                CachedLevelTable::Pairs(pairs)
-            } else {
+                level.pairs = Some(pairs);
+            }
+            if mobius {
                 // Mobius transform: a[m] = sum over subsets s of m of (-1)^(|m| - |s|) U[s], so
                 // that U[m] = sum of a[s] over the subsets s of m (R14).
                 let mut coeff = table.clone();
@@ -959,8 +992,8 @@ impl SsaTickTockKernelBuilder {
                     self.emit.set_next_var_type(VarType::TreeCache);
                     vectors.push(self.emit.emit_vbroadcast(scalar));
                 }
-                CachedLevelTable::Coefficients(vectors)
-            };
+                level.coefficients = Some(vectors);
+            }
             self.ctx.cached_tables[depth] = Some(level);
         }
     }
@@ -1008,8 +1041,8 @@ impl SsaTickTockKernelBuilder {
         bits
     }
 
-    /// Tree access on a cached level, selecting with the branch bits (`CachedSelect` other
-    /// than `Standard`). Sets `v_nv` to the node value already XORed with the deferred
+    /// Tree access on a cached level, selecting with the branch bits (bit-driven
+    /// `AccessEncoding`, i.e. `CachedSelect` other than `Standard`). Sets `v_nv` to the node value already XORed with the deferred
     /// stage-5 constant.
     ///
     /// Per group: nothing at depth 0 (one shared root vector); otherwise `2^d - 1` selects
@@ -1018,22 +1051,27 @@ impl SsaTickTockKernelBuilder {
     ///
     /// # Arguments
     /// * `tree_depth` - Depth the indices are at; `path_bits[g]` holds that many bits.
-    /// * `n_iters`, `n_groups` - Loop bounds as in the other access emitters.
+    /// * `mode` - `Bits`, `BitsFlow` or `Mobius` (not `Standard`).
+    /// * `n_iters`, `n_groups` - Loop bounds as in the other access emitters; only the groups
+    ///   of `access_groups` are emitted.
     pub(super) fn emit_cached_level_select(
         &mut self,
         tree_depth: usize,
+        mode: CachedSelect,
         n_iters: usize,
         n_groups: usize,
     ) {
+        assert_ne!(mode, CachedSelect::Standard, "standard selection has its own emitters");
         let table = self.ctx.cached_tables[tree_depth]
             .clone()
             .unwrap_or_else(|| panic!("no select constants for cached depth {}", tree_depth));
+        let missing = format!("no {:?} select constants for cached depth {}", mode, tree_depth);
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
                 let g = base_g + i;
-                if g >= n_groups {
+                if !self.emits_group(g, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, g);
@@ -1042,51 +1080,48 @@ impl SsaTickTockKernelBuilder {
                 // Bit that selects at level `level` of the select tree (0 = leaves): oldest first.
                 let bit_at = |level: usize| bits[level];
 
-                let node = match &table {
-                    CachedLevelTable::Root(root) => *root,
-                    CachedLevelTable::Pairs(pairs) => {
-                        self.emit.set_symmetry_hint(0);
-                        let mut cur: Vec<crate::types::VReg> = Vec::with_capacity(pairs.len());
-                        for pair in pairs {
+                let node = if tree_depth == 0 {
+                    table.root.expect(&missing)
+                } else if mode != CachedSelect::Mobius {
+                    let pairs = table.pairs.as_ref().expect(&missing);
+                    self.emit.set_symmetry_hint(0);
+                    let mut cur: Vec<crate::types::VReg> = Vec::with_capacity(pairs.len());
+                    for pair in pairs {
+                        self.emit.set_next_var_type(VarType::Temporary);
+                        cur.push(if mode == CachedSelect::BitsFlow {
+                            // vselect(bit, high, base) or bit * delta + base.
+                            let high = pair.high.expect(&missing);
+                            self.emit
+                                .emit_select_choice_shared_delta(bit_at(0), high, pair.delta, pair.base)
+                        } else {
+                            // bit * delta + base (R4-fma-select).
+                            self.emit.emit_fma(bit_at(0), pair.delta, pair.base)
+                        });
+                    }
+                    for level in 1..tree_depth {
+                        self.emit.set_symmetry_hint(level as u8);
+                        let mut next = Vec::with_capacity(cur.len() / 2);
+                        for k in 0..cur.len() / 2 {
                             self.emit.set_next_var_type(VarType::Temporary);
-                            cur.push(match pair.high {
-                                // BitsFlow: vselect(bit, high, base) or bit * delta + base.
-                                Some(high) => self.emit.emit_select_choice_shared_delta(
-                                    bit_at(0),
-                                    high,
-                                    pair.delta,
-                                    pair.base,
-                                ),
-                                // Bits: bit * delta + base (R4-fma-select).
-                                None => self.emit.emit_fma(bit_at(0), pair.delta, pair.base),
-                            });
+                            next.push(self.select_2way(bit_at(level), cur[2 * k + 1], cur[2 * k]));
                         }
-                        for level in 1..tree_depth {
-                            self.emit.set_symmetry_hint(level as u8);
-                            let mut next = Vec::with_capacity(cur.len() / 2);
-                            for k in 0..cur.len() / 2 {
-                                self.emit.set_next_var_type(VarType::Temporary);
-                                next.push(self.select_2way(bit_at(level), cur[2 * k + 1], cur[2 * k]));
-                            }
-                            cur = next;
-                        }
-                        self.emit.clear_symmetry_hint();
-                        cur[0]
+                        cur = next;
                     }
-                    CachedLevelTable::Coefficients(coeff) => {
-                        let mut cur = coeff.clone();
-                        for level in 0..tree_depth {
-                            self.emit.set_symmetry_hint(level as u8);
-                            let mut next = Vec::with_capacity(cur.len() / 2);
-                            for k in 0..cur.len() / 2 {
-                                self.emit.set_next_var_type(VarType::Temporary);
-                                next.push(self.emit.emit_fma(bit_at(level), cur[2 * k + 1], cur[2 * k]));
-                            }
-                            cur = next;
+                    self.emit.clear_symmetry_hint();
+                    cur[0]
+                } else {
+                    let mut cur = table.coefficients.clone().expect(&missing);
+                    for level in 0..tree_depth {
+                        self.emit.set_symmetry_hint(level as u8);
+                        let mut next = Vec::with_capacity(cur.len() / 2);
+                        for k in 0..cur.len() / 2 {
+                            self.emit.set_next_var_type(VarType::Temporary);
+                            next.push(self.emit.emit_fma(bit_at(level), cur[2 * k + 1], cur[2 * k]));
                         }
-                        self.emit.clear_symmetry_hint();
-                        cur[0]
+                        cur = next;
                     }
+                    self.emit.clear_symmetry_hint();
+                    cur[0]
                 };
                 self.ctx.v_nv[it][i] = Some(node);
             }
@@ -1106,7 +1141,7 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                if base_g + i >= n_groups {
+                if !self.emits_group(base_g + i, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
@@ -1129,7 +1164,7 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                if base_g + i >= n_groups {
+                if !self.emits_group(base_g + i, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
@@ -1159,7 +1194,7 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                if base_g + i >= n_groups {
+                if !self.emits_group(base_g + i, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
@@ -1205,7 +1240,7 @@ impl SsaTickTockKernelBuilder {
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
-                    if base_g + i >= n_groups {
+                    if !self.emits_group(base_g + i, n_groups) {
                         continue;
                     }
                     self.emit.set_iter_group(it, base_g + i);
@@ -1258,7 +1293,7 @@ impl SsaTickTockKernelBuilder {
             for it in 0..n_iters {
                 let base_g = it * UNROLL;
                 for i in 0..UNROLL {
-                    if base_g + i >= n_groups {
+                    if !self.emits_group(base_g + i, n_groups) {
                         continue;
                     }
                     let idx = self.ctx.all_idx[base_g + i].unwrap();
@@ -1319,7 +1354,7 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                if base_g + i >= n_groups {
+                if !self.emits_group(base_g + i, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
@@ -1427,7 +1462,7 @@ impl SsaTickTockKernelBuilder {
         for it in 0..n_iters {
             let base_g = it * UNROLL;
             for i in 0..UNROLL {
-                if base_g + i >= n_groups {
+                if !self.emits_group(base_g + i, n_groups) {
                     continue;
                 }
                 self.emit.set_iter_group(it, base_g + i);
