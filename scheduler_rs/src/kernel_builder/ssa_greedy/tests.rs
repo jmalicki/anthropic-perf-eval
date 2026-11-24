@@ -4902,3 +4902,189 @@ fn test_wavefront_feeds_load() {
         }
     }
 }
+
+// =========================================================================
+// Flow priority and select overflow (docs/GREEDY_SHAPE_ABLATION.md section 12)
+// =========================================================================
+
+/// `chains` independent chains, each: vector AND -> SelectChoice with a precomputed delta
+/// (one multiply_add or one vselect) -> vector add -> vstore. The table vectors (base,
+/// delta, base + delta) are shared. Returns the context and the select op ids.
+fn emit_delta_select_chains(chains: usize) -> (SsaEmitContext, HashSet<usize>) {
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const(1);
+    let one = emit.emit_vbroadcast(c1);
+    let c5 = emit.emit_const(5);
+    let base = emit.emit_vbroadcast(c5);
+    let c9 = emit.emit_const(9);
+    let delta = emit.emit_vbroadcast(c9);
+    let true_val = emit.emit_valu(Opcode::Add, base, delta);
+    let addr = emit.emit_const(100);
+    let mut selects = HashSet::new();
+    for chain in 0..chains {
+        let cv = emit.emit_const(chain as i64);
+        let v = emit.emit_vbroadcast(cv);
+        let cond = emit.emit_valu(Opcode::And, v, one);
+        let sel = emit.emit_select_choice_shared_delta(cond, true_val, delta, base);
+        selects.insert(emit.ops.last().unwrap().id);
+        let out = emit.emit_valu(Opcode::Add, sel, one);
+        emit.emit_vstore(addr, out);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, selects)
+}
+
+/// Schedule with shifting on; with `collect`, also collect the selects placed in the
+/// multiply_add form. Returns (budget exceeded, shifted, multiply-add selects, lane cycles).
+fn schedule_collecting_fma(
+    ops: &mut [SsaOp],
+    shape: &GreedyShape,
+    budget: usize,
+    policy: &dyn PressurePolicy,
+    collect: bool,
+) -> Result<(bool, HashSet<usize>, HashSet<usize>, HashMap<usize, Vec<i32>>), String> {
+    let mut shifted = HashSet::new();
+    let mut lanes = HashMap::new();
+    let mut fma = HashSet::new();
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+        ops,
+        true,
+        &mut shifted,
+        budget,
+        if collect { Some(&mut fma) } else { None },
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        policy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        shape,
+        &mut lanes,
+    )?;
+    Ok((budget_exceeded, shifted, fma, lanes))
+}
+
+/// Per-cycle slot limits with selects resolved as the run chose: a select in `fma` takes a
+/// vector slot, any other flow op the flow slot.
+fn assert_slot_limits_with_selects(
+    ops: &[SsaOp],
+    shifted: &HashSet<usize>,
+    fma: &HashSet<usize>,
+    lanes: &HashMap<usize, Vec<i32>>,
+    label: &str,
+) {
+    let (mut valu, alu) = vector_and_scalar_use(ops, shifted, lanes);
+    let mut flow: HashMap<i32, usize> = HashMap::new();
+    for op in ops {
+        if op.engine == Engine::Flow {
+            if fma.contains(&op.id) {
+                assert_eq!(op.opcode, Opcode::SelectChoice, "{}: op {} in the fma set", label, op.id);
+                assert!(op.delta_vreg.is_some(), "{}: select {} has no one-op form", label, op.id);
+                *valu.entry(op.cycle).or_default() += 1;
+            } else {
+                *flow.entry(op.cycle).or_default() += 1;
+            }
+        }
+    }
+    assert!(valu.values().all(|&n| n <= 6), "{}: vector ALU {:?}", label, valu);
+    assert!(alu.values().all(|&n| n <= 12), "{}: scalar ALU {:?}", label, alu);
+    assert!(flow.values().all(|&n| n <= 1), "{}: flow {:?}", label, flow);
+    assert_dependencies_respected(ops, lanes);
+}
+
+/// Default (`Never`): every select stays on flow. `Valu`: selects that find the flow slot
+/// taken run as a multiply_add, within the limit. Slot limits hold either way, with and
+/// without split shifts, under the wavefront priority with both flow priorities.
+#[test]
+fn test_select_overflow_keeps_slot_limits() {
+    let overflows = [
+        SelectOverflow::Never,
+        SelectOverflow::Valu { limit: None },
+        SelectOverflow::Valu { limit: Some(3) },
+    ];
+    for &select_overflow in &overflows {
+        for split_shift in [false, true] {
+            for flow_priority in [FlowPriority::Key, FlowPriority::FeedsLoadFirst] {
+                let shape = GreedyShape {
+                    priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+                    split_shift,
+                    select_overflow,
+                    flow_priority,
+                    ..Default::default()
+                };
+                let (mut emit, selects) = emit_delta_select_chains(24);
+                let (_, shifted, fma, lanes) =
+                    schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
+                let label = format!("{:?} split={} {:?}", select_overflow, split_shift, flow_priority);
+                assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, &label);
+                assert!(fma.is_subset(&selects), "{}", label);
+                match select_overflow {
+                    SelectOverflow::Never => assert!(fma.is_empty(), "{}", label),
+                    SelectOverflow::Valu { limit: None } => assert!(fma.len() > 3, "{}: {}", label, fma.len()),
+                    SelectOverflow::Valu { limit: Some(l) } => assert_eq!(fma.len(), l, "{}", label),
+                }
+            }
+        }
+    }
+}
+
+/// Force-schedule path (tight budget, adaptive policy): select overflow keeps the slot
+/// limits there too.
+#[test]
+fn test_select_overflow_keeps_slot_limits_when_force_scheduling() {
+    for split_shift in [false, true] {
+        let shape = GreedyShape {
+            split_shift,
+            select_overflow: SelectOverflow::Valu { limit: None },
+            ..Default::default()
+        };
+        let (mut emit, _) = emit_delta_select_chains(16);
+        let (budget_exceeded, shifted, fma, lanes) =
+            schedule_collecting_fma(&mut emit.ops, &shape, 80, &AdaptivePolicy::default(), true)
+                .expect("greedy completes past the budget");
+        assert!(budget_exceeded, "the budget is tight enough to force-schedule");
+        assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, "force");
+    }
+}
+
+/// A caller that does not collect multiply-add selects cannot use select overflow: lowering
+/// would emit vselects on a flow slot the greedy did not count.
+#[test]
+fn test_select_overflow_requires_collecting_fma_selects() {
+    let shape = GreedyShape { select_overflow: SelectOverflow::Valu { limit: None }, ..Default::default() };
+    let (mut emit, _) = emit_delta_select_chains(24);
+    assert!(schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, false).is_err());
+    let (mut emit, _) = emit_delta_select_chains(24);
+    assert!(schedule_collecting_fma(&mut emit.ops, &GreedyShape::default(), 1536, &GreedyPolicy, false).is_ok());
+}
+
+/// The wavefront marks the ops a non-final load depends on. In load -> add -> load -> add
+/// -> load (final), the first add feeds the middle load (non-final); the middle load and
+/// the second add feed only the final load.
+#[test]
+fn test_wavefront_feeds_nonfinal_load() {
+    let (emit, finals) = emit_load_chains(3);
+    let w = wavefront_for(&emit.ops, 6, None);
+    let by_id: HashMap<usize, usize> = emit.ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    // The latest-emitted producer of an op is its chain predecessor (constants come first).
+    let pred = |idx: usize| by_id[&emit.ops[idx].dep_ids.iter().copied().max().unwrap()];
+    for &f in &finals {
+        let final_idx = by_id[&f];
+        assert!(!w.feeds_nonfinal_load(final_idx));
+        let add1 = pred(final_idx);
+        assert!(!w.feeds_nonfinal_load(add1), "add before the final load");
+        let load1 = pred(add1);
+        assert_eq!(emit.ops[load1].engine, Engine::Load);
+        assert!(!w.feeds_nonfinal_load(load1), "middle load");
+        let add0 = pred(load1);
+        assert!(w.feeds_nonfinal_load(add0), "add before the middle load");
+    }
+}

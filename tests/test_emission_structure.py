@@ -126,6 +126,25 @@ def test_caps_are_exact_and_bound_t_by_the_cap():
         es.solve_plan_isolated(flat_table(ctx, flow=901), max_util={"flow": 0.3333333333333333}, time_limit=10)
 
 
+def test_greedy_model_objective_matches_its_formula():
+    ctx = es.Context(rounds=16, batch_size=8)
+    model = {"a_floor": 3, "a_load": 5, "flow0": 10, "b_flow_x100": 50}
+    # Load term: 400 loads / 2 + 5 = 205 beats the floor (200) + 3.
+    counts = dict.fromkeys(es.CATEGORIES, 0) | {"load": 400}
+    assert es.greedy_model_cycles(counts, model) == 205
+    res = es.solve_plan_isolated(flat_table(ctx, load=400), greedy_model=model, time_limit=10)
+    assert res["objective"] == 205 and res["floor"]["cycles"] == 200
+    # Flow term: 300 flow ops -> floor 300 + 3 = 303; pipeline 100 + 5 + 0.5 * 290 = 250.
+    counts = dict.fromkeys(es.CATEGORIES, 0) | {"load": 200, "flow": 300}
+    assert es.greedy_model_cycles(counts, model) == 303
+    res = es.solve_plan_isolated(flat_table(ctx, load=200, flow=300), greedy_model=model, time_limit=10)
+    assert res["objective"] == 303
+    # The model is a heuristic, combined with nothing else that changes the objective.
+    with pytest.raises(ValueError, match="not combined"):
+        es.solve_plan(flat_table(ctx, flow=1), greedy_model={}, windows=[{"t": 0, "q": 0, "const": {},
+                                                                          "per_group": {}}])
+
+
 def test_fixed_root_and_encoding_iterators():
     ctx = es.Context(rounds=16, batch_size=8)
     result = es.solve_plan_isolated(flat_table(ctx, flow=1), encodings=iter(es.ENCODINGS),

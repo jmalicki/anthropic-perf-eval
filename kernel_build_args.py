@@ -479,6 +479,18 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
+    group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first"], default="key",
+                       help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "
+                            "wavefront key; 'feeds-load-first' flow ops that a non-final load depends on (the "
+                            "selects before the mid-kernel gathers) before the others "
+                            "(docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-select-overflow", choices=["never", "valu"], default="never",
+                       help="Where a SelectChoice with a one-op multiply_add form runs: 'never' (default) always "
+                            "a flow vselect; 'valu' the multiply_add on the vector ALU when the flow slot is taken "
+                            "in that cycle and a vector slot is free (docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-select-overflow-limit", type=_positive_int, default=None, metavar="N",
+                       help="With --greedy-select-overflow valu: at most N selects take the multiply_add form "
+                            "(default: no limit). The structure model's floor resolution gives one value")
     group.add_argument("--pressure-soft-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
                        help="Pressure policy: fraction of the scratch budget above which the ready queue blends "
                             "in net pressure and busy-ALU shifts are suppressed (policy default 0.85)")
@@ -679,6 +691,9 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -743,6 +758,9 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

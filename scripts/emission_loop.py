@@ -666,6 +666,8 @@ def surrogates(stage2: Stage2, caps: Mapping[str, float] | None) -> list[dict]:
             "capped_floor": capped_floor(b["counts"], caps) if caps else None,
             "capped_floor_flow90": capped_floor(b["counts"], {"flow": 0.9}),
             "static_bound_any": b["summary"]["static_bound_any"],
+            # Calibrated heuristic of the load-tail greedy's cycles (es.GREEDY_MODEL), not a bound.
+            "greedy_model": es.greedy_model_cycles(b["counts"]),
             "rows_le_cycles": max(b["predicted_floor"], rb["bound"]) <= b["cycles"],
             "peak_live": b.get("peak_live"), "max_addr": b.get("max_addr"),
             # Post-build diagnostic, not a stage-1 surrogate: vector work the greedy left on the
@@ -686,7 +688,7 @@ def failed_builds(stage2: Stage2) -> list[dict]:
 def correlation_table(points: Sequence[Mapping], subset: str = "all") -> list[dict]:
     rows = []
     for name in ("floor", "floor_plus_rows", "capped_floor", "capped_floor_flow90", "static_bound_any",
-                 "valu_after_greedy_shift"):
+                 "greedy_model", "valu_after_greedy_shift"):
         pts = [(p[name], p["cycles"]) for p in points if p.get(name) is not None]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         rows.append({"surrogate": name, "subset": subset, "n": len(pts), "pearson": pearson(xs, ys),

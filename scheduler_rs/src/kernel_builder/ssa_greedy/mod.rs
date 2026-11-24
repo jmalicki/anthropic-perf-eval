@@ -75,6 +75,51 @@ pub struct GreedyShape {
     pub shift_policy: ShiftPolicy,
     /// Wavefront only: which ready loads get the load slots (see [`LoadPriority`]).
     pub load_priority: LoadPriority,
+    /// Wavefront only: which ready flow ops get the flow slot (see [`FlowPriority`]).
+    pub flow_priority: FlowPriority,
+    /// Where a SelectChoice that has a one-op `multiply_add` form may run (see
+    /// [`SelectOverflow`]).
+    pub select_overflow: SelectOverflow,
+}
+
+/// Wavefront only: the order in which ready flow ops are offered the flow slot. Other
+/// engines keep their order.
+///
+/// The selects of the first rounds (before the mid-kernel gathers) and those of the last
+/// rounds (after them) share the one flow slot in the middle of the schedule: early groups
+/// are in their last select rounds while late groups are still in their first ones. Under
+/// the wavefront key the early groups' late selects go first, and the late groups reach the
+/// load stream late (docs/GREEDY_SHAPE_ABLATION.md section 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowPriority {
+    /// Wavefront key (default).
+    #[default]
+    Key,
+    /// Flow ops that feed a non-final load (a load that some later load depends on, e.g. a
+    /// mid-kernel gather) before the other flow ops, then key.
+    FeedsLoadFirst,
+}
+
+/// Where a SelectChoice with a precomputed delta (one `multiply_add` on the vector ALU, or
+/// one `vselect` on flow; both visible one cycle later) runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectOverflow {
+    /// Always flow (default): the greedy never takes the multiply_add form.
+    #[default]
+    Never,
+    /// Flow when the flow slot is free in this cycle; otherwise the vector ALU when it has a
+    /// free slot, for at most `limit` selects over the run (`None` = no limit).
+    Valu { limit: Option<usize> },
+}
+
+impl SelectOverflow {
+    /// Whether one more select may take the multiply_add form after `taken` have.
+    fn allows(&self, taken: usize) -> bool {
+        match *self {
+            SelectOverflow::Never => false,
+            SelectOverflow::Valu { limit } => limit.map_or(true, |l| taken < l),
+        }
+    }
 }
 
 /// Wavefront only: the order in which ready loads are offered the two load slots. Other
@@ -2159,6 +2204,9 @@ fn schedule_ssa_greedy_core(
     // multiply-add path in this cycle (see fma_extra_latency): the subtract runs at the
     // select's cycle, the multiply_add one cycle later, one vector slot each.
     let mut fma_carry: usize = 0;
+    // SelectChoice ops this run placed on the vector ALU in their one-op multiply_add form
+    // (`SelectOverflow::Valu`); reported with the other multiply-add selects at the end.
+    let mut overflow_select_fma: HashSet<usize> = HashSet::new();
 
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
@@ -2402,6 +2450,17 @@ fn schedule_ssa_greedy_core(
                     ready_this_cycle[p] = idx;
                 }
             }
+            if shape.flow_priority == FlowPriority::FeedsLoadFirst {
+                // Same for the flow ops (ConstChoice is a load-engine op in the SSA).
+                let positions: Vec<usize> = (0..ready_this_cycle.len())
+                    .filter(|&p| ops[ready_this_cycle[p]].engine == Engine::Flow)
+                    .collect();
+                let mut flows: Vec<usize> = positions.iter().map(|&p| ready_this_cycle[p]).collect();
+                flows.sort_by_key(|&idx| (!w.feeds_nonfinal_load(idx), w.key(idx), idx));
+                for (&p, idx) in positions.iter().zip(flows) {
+                    ready_this_cycle[p] = idx;
+                }
+            }
         }
 
         // Keep retrying as long as we make progress (schedule something or free VRegs)
@@ -2610,6 +2669,13 @@ fn schedule_ssa_greedy_core(
                         }
                     } else if select_choice_fixed_to_vselect {
                         Engine::Flow
+                    } else if shape.select_overflow.allows(overflow_select_fma.len())
+                        && ops[idx].delta_vreg.is_some()
+                        && slots.flow_used >= 1
+                        && slots.valu_used < 6
+                    {
+                        // Flow slot taken this cycle: the one-op multiply_add form.
+                        Engine::Valu
                     } else {
                         ops[idx].engine // default Flow (vselect)
                     }
@@ -2781,6 +2847,11 @@ fn schedule_ssa_greedy_core(
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&idx) {
                             fma_carry += 1;
+                        }
+                        if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
+                            && fixed_select_choice_encoding.is_none()
+                        {
+                            overflow_select_fma.insert(op_id);
                         }
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
@@ -3194,6 +3265,12 @@ fn schedule_ssa_greedy_core(
     // these collections will be empty. The tracking code remains for compatibility
     // but will not find any expanded SelectChoice ops.
     // =========================================================================
+    if select_choice_fma_ops.is_none() && !overflow_select_fma.is_empty() {
+        // Lowering would emit these as vselects on the flow slot the greedy did not count.
+        return Err("select overflow placed SelectChoice ops on the vector ALU, but the caller \
+                    does not collect multiply-add selects"
+            .to_string());
+    }
     if let Some(fma_ops) = select_choice_fma_ops {
         // When select_choice_fixed_to_vselect (hint pass enabled), leave set empty so hint pass owns the decision.
         if !select_choice_fixed_to_vselect {
@@ -3209,6 +3286,7 @@ fn schedule_ssa_greedy_core(
             }
             fma_ops.extend(selectchoice_to_fma);
         }
+        fma_ops.extend(overflow_select_fma.iter().copied());
     }
 
     if let Some(sub_cycles) = select_sub_cycles {

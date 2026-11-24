@@ -183,6 +183,9 @@ def main():
               + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
     if getattr(args, "greedy_load_priority", "key") != "key":
         print(f"  greedy_load_priority={args.greedy_load_priority}")
+    for name, default in (("greedy_flow_priority", "key"), ("greedy_select_overflow", "never")):
+        if getattr(args, name, default) != default:
+            print(f"  {name}={getattr(args, name)}")
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):

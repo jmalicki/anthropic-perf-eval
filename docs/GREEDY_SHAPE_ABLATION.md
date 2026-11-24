@@ -6,7 +6,26 @@ Every build was run with `--validate`; a row with numbers was PROVED (symbolic d
 replay) and PASSED (numeric validation), and a row that says "fails" did not produce a
 kernel. Tables come from `uv run python -m scripts.schedule_report --table`.
 
-## 0. Latest: the load-bound plans (section 11)
+## 0. Latest: what limits useful shifting (section 12)
+
+The greedy's shift count is a symptom of its cycle count, not a cause. Every vector op it does
+not shift takes one vector slot, so `V - s = 6T - I` exactly. The vector ALU is busy in every
+steady-state cycle, so a schedule that is longer for any reason shifts fewer ops. Of the 158
+shifts that `flow90.json` (1,039) "misses" against the floor's split, 98 cannot be had by any
+schedule of that emission: its static head/tail bound is 1,029. The other 60 are 10 cycles of
+scheduling loss. Slower plans lose cycles for two measured reasons:
+
+- **The one flow slot.** The greedy runs every SelectChoice as a flow `vselect` and never takes
+  the `multiply_add` form. With path bits and `bits-flow` in round 4, this ordering alone needs
+  at least 1,050 cycles. New flag `--greedy-select-overflow valu`: 1,101 -> 1,054.
+- **A longer flow queue in the middle of the schedule.** Late groups reach the load stream late.
+  Index bits with `bits-flow` in round 1 run 1,053 against 1,039, and the cause is not scratch.
+
+Neither new flag is a default win. A calibrated heuristic of the greedy's cycles now ranks
+index-bit plans (Spearman +0.96 leave-one-out, +0.71 near the best). It found no plan better
+than 1,039 / 1,033.
+
+## 0.1 Previous: the load-bound plans (section 11)
 
 On the structure-model plans (`flow90.json` and the PR #69 plans that all landed at 1,104)
 the shaped greedy was held back by the load engine's tail, not by its VALU/ALU split.
@@ -634,4 +653,178 @@ uv run generate_ssa_kernel.py --rounds 16 --use-greedy -q --validate \
   --output-json best.json --save-kernel best_kernel.json
 uv run python -m scripts.greedy_gap_diagnosis best.json --from 51 --slice 100
 ./scripts/check_upstream.sh --strict --kernel best_kernel.json
+```
+
+## 12. What limits useful shifting
+
+**Conclusion.** The number of vector ops the greedy shifts to the scalar ALU does not limit the
+schedule. It follows from the schedule's length. Every vector op left unshifted takes one
+vector slot, so for vector ops V, shifted s, cycles T and idle vector slots I:
+
+```
+V - s = 6 T - I        (exact; checked on every schedule below)
+```
+
+The vector ALU is busy in every steady-state cycle (I is 115 to 250 slots, all in the start-up
+and the tail). So a schedule that is longer for any reason shifts fewer ops. PR #74 found
+cycles = VALU ops left / 6 + 19 to 32 (Spearman +0.83 to +0.99). That is this identity, not a
+cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes schedules slower.
+The causes are elsewhere:
+
+| Plan (cycles) | Cycles above the floor | Needed by any schedule | Cause of the rest (measured) |
+|---|---|---|---|
+| `flow90.json`, index (1,039) | 42 (floor 997) | 32 (static head/tail bound 1,029, load row) | 10 cycles of scheduling loss |
+| `r1 bits-flow` variant of a 1,039 plan, index (1,053) | 59 (floor 994) | 31 (bound 1,025) | the flow queue in mid-schedule delays late groups into the load stream (28 cycles). Not scratch, not the pressure policy |
+| `path_flow90.json`, path (1,033) | 53 (floor 980) | 29 (bound 1,009) | 24 cycles of scheduling loss (scratch-relaxed: 1,034) |
+| probe A: `path_flow90.json` with `bits-flow` in round 4, path (1,101) | 124 (floor 977) | 32 (load bound 1,009); 73 with every select on flow (flow row 1,050) | the greedy never uses the `multiply_add` form of a select: `--greedy-select-overflow valu` gives 1,054. Scratch-relaxed: 1,093 |
+| `flow90.json`, path (1,105) | 108 (floor 997) | 32 (bound 1,029) | the 1,536-word scratch budget: scratch-relaxed gives 1,046 (analysis only) |
+
+In shift counts, for `flow90.json`: the floor's split is 1,465 and the greedy's is 1,307.
+That is 158 "missing" shifts. At the static bound of 1,029 cycles, with the same idle slots,
+the identity allows only 1,367 shifts. So 98 of the 158 cannot be had by any schedule of this
+emission. The other 60 are the 10 cycles of scheduling loss. "Needed by any schedule" is
+`scripts.static_bounds` (minimum work over every encoding; Z3-checked,
+`verification/static_bounds_proof.py`). The probe-A flow row uses the run's encodings, so it
+holds for every schedule that runs every SelectChoice as a vselect, as the default greedy
+does.
+
+All builds: 16 rounds, batch 256, `--merge-hash-stages --index-form mirrored`, the shaped
+greedy flags plus the load-tail flags (`loop run --load-tail`). They are greedy development
+measurements. Every kernel quoted is PROVED (dataflow replay) and PASSED (`--validate`).
+"Scratch-relaxed" runs (`--scratch-budget-override 4096`) are analysis only, not kernels. Of
+the 50-build budget, 31 sixteen-round builds were used, one at a time.
+
+### 12.1 Candidates, ruled in or out
+
+| Candidate | Test | Result |
+|---|---|---|
+| Op kinds that cannot shift (multiply_add, vbroadcast; selects) | per-round counts from the schedule | `bits` adds one fixed multiply_add per group and select; `bits-flow` moves it to a flow `vselect`. Never-shiftable work does not set the count: shiftable ops ready and waiting while the scalar ALU has room ("declined") is 18 to 41 shift equivalents per schedule |
+| Shifted op = 8 scalar slots, lane rules, split shift | idle scalar slots by class | Most idle scalar slots are in cycles where `multiply_add`s wait and shiftable ops hold vector slots (priority inversion: 133 shift equivalents on `flow90.json`). Removing the inversion (`reserve`, PR #73) is slower: the loads are full in those cycles |
+| Timing mismatch (H2) | round bands, below | Idle scalar slots sit in the round-15 tail and the gather band. Ready shiftable work sits in the select bands. They rarely coincide |
+| Scratch pressure policy (soft 85%, critical 95%) | `--pressure-soft-threshold 0.999 --pressure-critical-threshold 0.999` | **Ruled out.** probe A 1,101 -> 1,106; `r1 bits-flow` plan 1,053 -> 1,055; path `flow90.json` 1,105 -> 1,118 |
+| The 1,536-word budget itself | `--scratch-budget-override 4096` (analysis) | **Ruled in for path `flow90.json`** (1,105 -> 1,046). Not for probe A (1,093), `path_flow90.json` (1,034), or the index plans (1,039 and 1,053 unchanged) |
+| Flow saturation, all selects on flow (H1) | select resolution per round; `--greedy-select-overflow valu` | **Ruled in for flow-heavy path plans.** The greedy put 1,004 of 1,004 selects on flow. Flow was busy every cycle from 0 to 900, with 90 to 140 flow ops waiting. Overflow puts 348 on the vector ALU: 1,101 -> 1,054, and the shift count rises from 809 to 1,369. **But it is not a default win:** `path_flow90.json` 1,033 -> 1,059, `flow90.json` 1,039 -> 1,066, `r1 bits-flow` plan 1,053 -> 1,067, path floor-optimal plan over the scratch budget |
+| Flow order: early-round selects first | `--greedy-flow-priority feeds-load-first` | **Negative:** `r1 bits-flow` plan 1,053 -> 1,074; 1,039 plan -> 1,052 |
+| `--select-choice fma` as a resolution hook | probe A | Ignored by the greedy-only pipeline (same 1,101 kernel). There was no per-op hook before `--greedy-select-overflow` |
+
+**H1 (is `bits` vs `bits-flow` only a select-resolution choice?): partly.** On probe A the
+resolution is worth 47 of the 68 cycles (1,101 -> 1,054 against 1,033 for `bits`). But no
+resolution rule tried recovers the rest or wins elsewhere. A count limit set to the floor's
+resolution (81 selects) gives 1,083, and 160 gives 1,072. On the gm-path plan below, `bits`
+and `bits-flow` in round 4 run 1,054 and 1,053. So with this greedy the choice still changes
+cycles through timing, not only through the op set. It should stay a stage-1 choice until a
+scheduler resolves selects well; then it can become a scheduler variable. Select resolution
+by round in the winning and losing builds (default greedy):
+
+| Build | Round 1 | 2 | 3 | 4 | 12 | 13 | 14 | Mean flow wait (rounds 1-4 / 12-14) |
+|---|---|---|---|---|---|---|---|---|
+| `path_flow90.json` (1,033) | flow 32 | flow 96 | flow 224 | flow 140 (bits x20 use multiply_adds) | flow 32 | flow 96 | flow 224 | 7 to 24 / 1 to 5 |
+| probe A (1,101) | flow 32 | flow 96 | flow 224 | flow 300 | flow 32 | flow 96 | flow 224 | 97 to 147 / 48 to 66 |
+| probe A + overflow (1,054) | 30 + fma 2 | 81 + 15 | 137 + 87 | 186 + 114 | 26 + 6 | 64 + 32 | 132 + 92 | 0.5 to 6 / 0.6 to 2 |
+| index 1,039 plan | bits | flow 96 | flow 224 | flow 240 | bits | flow 96 | flow 224 | 10 to 14 / 15 to 17 |
+| same, `bits-flow` in round 1 (1,053) | flow 32 | flow 96 | flow 224 | flow 240 | bits | flow 96 | flow 224 | 9 to 29 / 20 to 24 |
+
+**H2 (by phase).** Bands are the round of the vector work in each cycle. The table gives
+shiftable ops, shifts taken, op-cycles that shiftable ops spent ready and waiting, and idle
+scalar slots:
+
+| Band | 1,039 plan (index): shiftable / shifted / ready-wait / scalar idle | 1,053 plan (`r1 bits-flow`): same |
+|---|---|---|
+| setup | 110 / 34 / 44 / 106 | 111 / 37 / 93 / 92 |
+| rounds 0-4 | 1,440 / 593 / 721 / 446 | 1,440 / 505 / 412 / 756 |
+| rounds 5-10 | 1,888 / 318 / 629 / 488 | 1,888 / 287 / 323 / 1,064 |
+| rounds 11-14 | 1,088 / 352 / 732 / 152 | 1,088 / 366 / 520 / 216 |
+| round 15 | 320 / 12 / 41 / 596 | 320 / 15 / 24 / 620 |
+
+In the 1,053 plan, idle scalar slots grow in the gather band (488 -> 1,064). Ready shiftable
+work there shrinks (629 -> 323): the load stream starves, so nothing is ready to shift.
+Per group, the last group ends its round-4 work 13 cycles later (821 -> 834). Its round-10
+gathers end 12 cycles later. Load slots idle 26 times in cycles 700 to 800, and the schedule
+ends 14 cycles later.
+
+### 12.2 The new options (off by default; default kernels byte-identical)
+
+| Option | Default | What it does |
+|---|---|---|
+| `--greedy-select-overflow {never,valu}` | `never` | `valu`: a SelectChoice with a precomputed delta (one `multiply_add`) runs on the vector ALU when the flow slot is taken in that cycle and a vector slot is free. The greedy reports these selects as multiply-add selects for lowering and address assignment. It refuses to run if the caller does not collect them |
+| `--greedy-select-overflow-limit N` | none | At most N selects take the multiply_add form |
+| `--greedy-flow-priority {key,feeds-load-first}` | `key` | Wavefront only: ready flow ops that a non-final load depends on go first |
+
+Tests (`ssa_greedy/tests.rs`): slot limits (vector 6, scalar 12, flow 1, with multiply-add
+selects counted as vector ops) under every overflow setting, with and without split shift,
+under both flow priorities, on the normal path and on the force-schedule path. Also covered:
+a caller that does not collect the multiply-add selects is refused, and `feeds_nonfinal_load`
+marks the right ops. `flow90.json` built with the new code and default flags is
+byte-identical to the build before the change.
+
+### 12.3 Stage 1: a greedy pipeline term (heuristic)
+
+No valid bound ranks the plans. The bounds checked never exceed the cycles over the 44
+recorded builds:
+
+- the floor with selects pinned to flow;
+- the flow row with selects on flow plus its 27-cycle tail;
+- the static bound.
+
+Near the optimum they rank the plans no better than the floor (index Spearman -0.54 to
++0.50). So the stage-1 term is a **calibrated heuristic** of the load-tail greedy, not a
+bound. In `es.GREEDY_MODEL` / `solve_plan(greedy_model={})` / `solve --greedy-model`:
+
+```
+predicted = max(floor + 32,  (loads + consts) / 2 + 19 + 0.75 * max(0, flow ops + selects - 900))
+```
+
+The load engine paces the kernel. The selects of all groups' first and last rounds share the
+flow slot, and above about 900 of them (about 0.9 per load cycle) every extra select costs
+about 0.75 cycles. The model is fitted on the 24 index-bit builds under 1,200 cycles in
+`docs/emission_plans/loop_report_load_tail.json`. Leave-one-out error: MAE 6.2 cycles,
+maximum 18.
+
+| Surrogate (Spearman) | Index, all (28) | Index, loop (22) | Index, near (13) | Path, all (16) |
+|---|---|---|---|---|
+| floor | +0.24 | -0.09 | -0.54 | -0.47 |
+| capped floor `flow=0.92` | +0.79 | +0.71 | +0.19 | -0.12 |
+| greedy model (in-sample) | +0.95 | +0.94 | +0.71 | +0.05 |
+| greedy model (leave-one-out, 24 plans) | +0.96 | | +0.71 | |
+
+- **(a) Ranking.** Index bits: the plans are ranked (+0.71 near the best, where the floor gave
+  -0.54). Path bits: they are not (+0.05). 12 of the 16 path builds run near the scratch
+  ceiling (1,489 to 1,505 words), and the model does not include scratch.
+- **(b) The path round-4 mistake.** The model ranks probe A (predicted 1,101, actual 1,101)
+  behind `path_flow90.json` (predicted 1,023, actual 1,033). Stage 1 with the term picks
+  `r0 bits; r1 bits-flow; r2 bits; r3 bits-flow; r4 gather x9 + bits-flow x23; r11 bits; r12
+  bits x21 + bits-flow x11; r13 bits; r14 bits-flow`: **1,053 / 1,055**. The best path plan
+  any earlier stage-1 mode found ran 1,099. The same plan with `bits` in round 4 runs
+  1,054 / 1,056, so its round-4 `bits-flow` is not a mistake there.
+- **(c) A new best: no.** Index bits: the model's plan runs 1,051 / 1,053 (predicted 1,030).
+  Fixing rounds 1 and 12 to `bits` gives 1,058 / 1,060 (predicted 1,030). Path bits: 1,053
+  against 1,033. Out of sample, the model is optimistic by 21 to 42 cycles on the plans it
+  chooses. Minimising a fitted model selects its errors. No plan is checked in.
+
+### 12.4 Not verified
+
+- Why the 1,039 schedules lose their last 10 cycles.
+- A select-resolution rule that wins on both the index and the path plans. Overflow keyed
+  to a target count or to the scalar ALU's slack was not tried beyond the limits above.
+- A scratch term for path-bit plans. The 1,505-word ceiling's cause was not checked beyond
+  `--scratch-budget-override`.
+- The model in other contexts (rounds, batch, values-only).
+- CP-SAT on any of these emissions (no whole-program CP-SAT, by the machine rules).
+
+### 12.5 Reproduction
+
+```bash
+# One plan with the load-tail greedy, its schedule JSON kept
+uv run generate_ssa_kernel.py --rounds 16 --use-greedy -q --validate \
+  --emission-plan docs/emission_plans/flow90.json --merge-hash-stages --index-form mirrored \
+  --greedy-barriers none --greedy-priority wavefront --greedy-split-shift \
+  --pressure-inflation-threshold 0.95 \
+  --greedy-load-priority final-last --greedy-stagger-cycles 9 --greedy-groups-in-flight 32 \
+  --output-json s.json --save-kernel k.json
+uv run python -m scripts.shift_limit_diagnosis s.json --floor 997
+# The flags of section 12.2 on top: --greedy-select-overflow valu [--greedy-select-overflow-limit N],
+# --greedy-flow-priority feeds-load-first. Scratch-relaxed analysis: --scratch-budget-override 4096.
+# Stage 1 with the greedy model
+uv run python -m scripts.emission_structure solve --greedy-model [--select-bit-source path] --out plan.json
+uv run python -m scripts.emission_structure loop report --state <state.json> ... --near 30   # greedy_model row
 ```

@@ -25,7 +25,13 @@ loop plan runs 1,099 against 1,033 / 1,035 for `path_flow90.json`. The 1,104 pla
 stage 1 computes ranks them (index bits: floor Spearman rho -0.54, exact static bound -0.29). The spread now
 follows how many vector ops the greedy moves to the ALU (rho +0.93), which stage 1 does not
 model. So stage 1 gets within about 35 cycles of the best plan with index bits and is wrong by
-more than 60 with path bits. It cannot choose among plans closer than that. These are greedy
+more than 60 with path bits. It cannot choose among plans closer than that.
+
+Update (section 10, "Update"): the shift count follows from the cycle count, by an exact
+identity. The causes of slow plans are the greedy's select resolution (every select on flow),
+the mid-schedule flow queue, and scratch. A calibrated greedy term (`--greedy-model`,
+heuristic) now ranks index-bit plans: Spearman +0.71 near the best, against -0.54 for the
+floor. It finds no plan better than 1,039 / 1,033. These are greedy
 development measurements; the PR #69 measurement (1,104 plateau) is kept in section 10 as
 history.
 
@@ -442,6 +448,37 @@ each other. With path bits it is off by 66 cycles: it prefers `bits-flow` for th
 selects, which costs 68 cycles at a floor 3 cycles lower. Scratch did not fail any of 44 builds.
 Path-bit plans run within 31 words of the budget, and no plan-level proxy predicts the peak
 (section 10.0.4).
+
+**Update: the shift count is a symptom, and a greedy term for stage 1 (heuristic)**
+(docs/GREEDY_SHAPE_ABLATION.md section 12). "VALU cycles left after the greedy's shifts"
+ranks plans because of an identity, not a mechanism. Vector ops left = 6 x cycles - idle
+vector slots, and the vector ALU is busy in every steady-state cycle. So a schedule that is
+longer for any reason shifts fewer ops.
+
+Of the 158 shifts `flow90.json` misses against the floor's split, 98 cannot be had by any
+schedule of that emission: its static bound is 1,029. The rest are 10 cycles of scheduling
+loss. The measured causes of slower plans are:
+
+- The greedy runs every SelectChoice on the one flow slot. With path bits, round-4
+  `bits-flow` is flow-bound at 1,050 or more, and letting selects overflow to the vector ALU
+  gives 1,101 -> 1,054.
+- A longer mid-schedule flow queue delays late groups into the load stream (index bits,
+  depth-1 `bits-flow`).
+- The scratch budget: path `flow90.json` runs 1,046 scratch-relaxed against 1,105.
+
+No valid bound ranks the plans near the optimum. Stage 1 therefore gets a calibrated
+heuristic of the greedy's cycles: `solve_plan(greedy_model={})` / `solve --greedy-model`,
+`max(floor + 32, loads/2 + 19 + 0.75 * max(0, selects + flow ops - 900))`.
+
+- It ranks index-bit plans: leave-one-out MAE 6.2 cycles; Spearman +0.96 over all plans and
+  +0.71 within 30 cycles of the best, where the floor gives -0.54.
+- It does not rank path-bit plans, which are scratch-bound (+0.05).
+- Its path plan runs 1,053, against 1,099 for the best earlier loop plan.
+- It finds nothing below 1,039 / 1,041 (index; its plan runs 1,051) or 1,033 / 1,035 (path).
+
+The `bits` / `bits-flow` choice is only partly a select-resolution choice for this greedy.
+Resolution recovers 47 of the 68 round-4 cycles, but no resolution rule tried wins
+everywhere. So it stays a stage-1 choice for now.
 
 The rest of this section, from "History" on, is the PR #69 measurement with the shaped greedy
 before the load-tail flags. Its plateau and its conclusion are superseded by section 10.0.
