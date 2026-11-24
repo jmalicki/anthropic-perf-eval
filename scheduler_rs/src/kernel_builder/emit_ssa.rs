@@ -1326,6 +1326,16 @@ pub fn compute_ssa_dependencies_with_barriers(
     super::memory_deps::add_barrier_dependencies(ops);
 }
 
+/// True if dead code elimination always keeps `op`: control flow, barriers and stores
+/// (stores have side effects: the harness reads output memory, a use SSA does not see).
+/// The one definition of the roots, shared with `kernel_builder::transform`.
+pub fn is_dce_root(op: &SsaOp) -> bool {
+    matches!(
+        op.opcode,
+        Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier | Opcode::Store | Opcode::Vstore
+    )
+}
+
 /// Eliminate SSA dead code: remove ops whose result has no users.
 ///
 /// This reduces cycles, optimizer time, and scratch pressure. Roots (always live)
@@ -1401,16 +1411,8 @@ pub fn eliminate_ssa_dead_code(
 
     // Roots: control flow, barriers, and all stores (side effects; harness reads memory later)
     for (idx, op) in ops.iter().enumerate() {
-        match op.opcode {
-            Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier => {
-                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
-            }
-            Opcode::Store | Opcode::Vstore => {
-                // Always keep stores: they have side effects (memory). The harness reads
-                // output memory; that use is not visible in SSA, so treat all stores as roots.
-                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
-            }
-            _ => {}
+        if is_dce_root(op) {
+            mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
         }
     }
 
