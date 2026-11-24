@@ -1816,7 +1816,7 @@ pub fn compute_ssa_asap_alap_bounds(
         }
     }
 
-    if config.enable_scratch_tightening {
+    if config.enable_scratch_tightening && scratch_budget > 0 {
         if let Some((scratch_asap, scratch_alap)) = tighten_asap_alap_by_scratch(
             ops,
             &current_asap,

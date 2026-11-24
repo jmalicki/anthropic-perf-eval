@@ -42,7 +42,12 @@ if [ -z "$kernel" ]; then
   # skip the save or change the problem size, and remove any kernel left by an earlier run.
   for arg in "$@"; do
     case "$arg" in
-      --save-kernel|--save-kernel=*|--validate-only|--validate-only=*|--output-json|--output-json=*|\
+      --save-kernel|--save-kernel=*|--validate-only|--validate-only=*|--output-json|--output-json=*)
+        echo "check_upstream.sh sets ${arg%%=*} itself; use --kernel PATH to test a kernel built elsewhere" >&2
+        exit 2 ;;
+      --scratch-budget-override|--scratch-budget-override=*|--no-scratch-constraint)
+        echo "check_upstream.sh: ${arg%%=*} changes the scratch budget; use --kernel PATH to test a kernel built elsewhere" >&2
+        exit 2 ;;
       --forest-height|--forest-height=*|--batch-size|--batch-size=*|--rounds|--rounds=*|--n-nodes|--n-nodes=*)
         echo "check_upstream.sh sets ${arg%%=*} itself; use --kernel PATH to test a kernel built elsewhere" >&2
         exit 2 ;;
@@ -58,6 +63,13 @@ case "$kernel" in
   *) kernel="$(pwd)/$kernel" ;;
 esac
 export UPSTREAM_KERNEL_JSON="$kernel"
+
+# A relaxed-scratch kernel (--scratch-budget-override above 1536, --no-scratch-constraint) is an
+# analysis reference that does not fit the machine; it is never an upstream result.
+if grep -q '"relaxed_scratch"' "$kernel"; then
+  echo "check_upstream.sh: $kernel is a relaxed-scratch analysis kernel (not valid on the machine); refusing" >&2
+  exit 2
+fi
 
 # -E -S: no site-packages and no PYTHON* environment, so only the standard library and
 # upstream/ are importable; this repository's problem.py cannot be picked up.

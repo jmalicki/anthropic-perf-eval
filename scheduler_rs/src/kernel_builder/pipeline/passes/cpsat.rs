@@ -29,7 +29,7 @@ impl Pass for CpSatSchedulePass {
             .ok_or_else(|| "CpSatSchedulePass requires cpsat config".to_string())?;
 
         let enable_valu_shift = ctx.config.compiler.enable_valu_shift;
-        let scratch_budget = ctx.effective_scratch_budget();
+        let scratch_budget = ctx.cpsat_scratch_budget();
 
         // Build CP-SAT config
         let mut cpsat_config = cpsat_pipeline_config.to_full_kernel_config(scratch_budget);
@@ -162,6 +162,7 @@ impl Pass for CpSatSchedulePass {
             ssa_cycle_assignments,
             ssa_ops_bulk_move,
             lb_cycles: cpsat_result.lb_cycles,
+            cpsat_scratch_budget: Some(scratch_budget),
         });
 
         // Report choices

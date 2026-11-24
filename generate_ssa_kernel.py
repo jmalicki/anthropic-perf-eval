@@ -33,7 +33,12 @@ import time
 
 from kernel_build_args import (
     DEFAULT_SCHEDULER_JSON,
+    MACHINE_SCRATCH_SIZE,
+    NORMAL_KERNEL_PATHS,
+    RELAXED_SCHEDULER_JSON,
     add_kernel_build_args,
+    is_relaxed_scratch,
+    scratch_settings,
     args_to_build_kwargs,
     build_kernel_with_args,
     n_nodes_for_height,
@@ -41,6 +46,24 @@ from kernel_build_args import (
 )
 
 BASELINE = 147734
+
+# Default kernel output of a relaxed-scratch build.
+RELAXED_KERNEL_JSON = "kernel_relaxed_scratch.json"
+
+
+def relaxed_scratch_banner(scratch_size, scratch_constraint):
+    """Loud multi-line warning that this build is an analysis reference, not a kernel."""
+    limit = f"{scratch_size} words" + ("" if scratch_constraint else ", no CP-SAT scratch constraint")
+    bar = "!" * 80
+    return "\n".join([
+        bar,
+        f"!!  RELAXED SCRATCH ({limit})",
+        f"!!  ANALYSIS ONLY: this kernel is NOT valid on the real machine ({MACHINE_SCRATCH_SIZE} words).",
+        "!!  Its cycle count is a heuristic schedule under a relaxed constraint, not a floor;",
+        "!!  CP-SAT's lb_cycles is the floor. Never record it as a result.",
+        "!!  See docs/RELAXED_SCRATCH_REFERENCE.md.",
+        bar,
+    ])
 
 
 def main():
@@ -80,6 +103,25 @@ def main():
 
     use_cpsat = not args.use_greedy
     verbose = not args.quiet  # Show Rust scheduler progress by default
+
+    scratch_size, scratch_constraint = scratch_settings(lambda name, default=None: getattr(args, name, default))
+    relaxed = is_relaxed_scratch(scratch_size, scratch_constraint)
+    if relaxed:
+        if args.output_json is None:
+            args.output_json = RELAXED_SCHEDULER_JSON
+        if args.save_kernel is None:
+            args.save_kernel = RELAXED_KERNEL_JSON
+        for path in (args.output_json, args.save_kernel):
+            if os.path.basename(path) in NORMAL_KERNEL_PATHS:
+                print(f"error: refusing to write a relaxed-scratch build to {path}, a normal kernel/result path; "
+                      f"use another path (default {RELAXED_KERNEL_JSON} / {RELAXED_SCHEDULER_JSON})",
+                      file=sys.stderr)
+                return 2
+        if args.enable_scratch_tightening and not scratch_constraint:
+            print("error: --enable-scratch-tightening needs a scratch constraint; drop --no-scratch-constraint",
+                  file=sys.stderr)
+            return 2
+        print(relaxed_scratch_banner(scratch_size, scratch_constraint))
 
     # Derive n_nodes if not set
     n_nodes_val = getattr(args, "n_nodes", None)
@@ -141,6 +183,8 @@ def main():
         print("  " + ", ".join(f"{k}={v}" for k, v in overrides.items() if v is not None))
     if getattr(args, "greedy_budget_headroom", 0):
         print(f"  greedy_budget_headroom={args.greedy_budget_headroom}")
+    if scratch_size != MACHINE_SCRATCH_SIZE or not scratch_constraint:
+        print(f"  scratch_size={scratch_size}, cpsat_scratch_constraint={scratch_constraint}")
     if getattr(args, "scratch_model", "words") != "words":
         print(f"  scratch_model={args.scratch_model}")
     print()  # Blank line before Rust output
@@ -169,6 +213,11 @@ def main():
     print(f"  VRegs: {stats.get('vreg_count', 'N/A')}")
     print(f"  Peak live: {stats.get('peak_live', 'N/A')} words")
     print(f"  Budget exceeded: {stats.get('budget_exceeded', False)}")
+    if relaxed:
+        print(f"  Highest scratch address used: {stats.get('max_addr', 'N/A')} "
+              f"(machine has {MACHINE_SCRATCH_SIZE} words)")
+        print(f"  CP-SAT scratch budget: {stats.get('cpsat_scratch_budget', 'n/a (greedy)')} (0 = not modelled)")
+        print(relaxed_scratch_banner(scratch_size, scratch_constraint))
 
     budget_exceeded = stats.get("budget_exceeded", False)
     if budget_exceeded:
@@ -192,8 +241,10 @@ def main():
             args.rounds,
             args.seed,
             values_only=args.values_only,
+            relaxed_scratch_size=simulator_scratch_size(scratch_size, stats.get("max_addr")) if relaxed else None,
         )
-        print(f"\n  Kernel saved to {kernel_path} (rerun with --validate-only {kernel_path})")
+        marked = " [RELAXED SCRATCH: not valid on the machine]" if relaxed else ""
+        print(f"\n  Kernel saved to {kernel_path}{marked} (rerun with --validate-only {kernel_path})")
 
     if args.validate:
         if budget_exceeded:
@@ -205,7 +256,12 @@ def main():
             print("\nChecking kernel dataflow against the SSA program...")
             if not check_kernel_dataflow(instrs, output_json_path):
                 return 1
-        print("\nValidating against reference kernel...")
+        sim_scratch = simulator_scratch_size(scratch_size, stats.get("max_addr")) if relaxed else None
+        if sim_scratch is not None:
+            print(f"\nValidating against reference kernel on a simulator with {sim_scratch} scratch words "
+                  f"(RELAXED; the machine has {MACHINE_SCRATCH_SIZE})...")
+        else:
+            print("\nValidating against reference kernel...")
         correct = validate_kernel(
             instrs,
             args.forest_height,
@@ -213,6 +269,7 @@ def main():
             args.rounds,
             args.seed,
             values_only=args.values_only,
+            scratch_size=sim_scratch,
         )
         if correct:
             print(f"  {passed_message(args.values_only)}")
@@ -288,6 +345,7 @@ def load_kernel_from_json(path):
             "rounds": data.get("rounds"),
             "seed": data.get("seed"),
             "values_only": bool(data.get("values_only", False)),
+            "relaxed_scratch": data.get("relaxed_scratch"),
         }
     else:
         raw = data
@@ -315,8 +373,22 @@ def simulator_cycles(instrs):
     return counted, len(instrs) - counted
 
 
-def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed, values_only=False):
-    """Save instruction list and problem params to JSON so --validate-only uses same params."""
+def simulator_scratch_size(scratch_size, max_addr):
+    """Scratch words a simulator needs to run a relaxed-scratch kernel.
+
+    The allocator's limit, capped to what the kernel touches (highest address + 1) so an
+    unbounded build does not allocate a million-word scratch, and never below the machine's.
+    """
+    needed = scratch_size if max_addr is None else min(scratch_size, int(max_addr) + 1)
+    return max(MACHINE_SCRATCH_SIZE, needed)
+
+
+def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed, values_only=False,
+                        relaxed_scratch_size=None):
+    """Save instruction list and problem params to JSON so --validate-only uses same params.
+
+    relaxed_scratch_size: for a relaxed-scratch build, the scratch words the simulator needs;
+    the file is then marked as not valid on the machine and --validate-only uses that size."""
     serializable = []
     for bundle in instrs:
         sb = {}
@@ -331,6 +403,13 @@ def save_kernel_to_json(instrs, path, forest_height, batch_size, rounds, seed, v
         "values_only": bool(values_only),
         "instrs": serializable,
     }
+    if relaxed_scratch_size is not None:
+        payload["relaxed_scratch"] = {
+            "valid_on_machine": False,
+            "scratch_size": int(relaxed_scratch_size),
+            "machine_scratch_size": MACHINE_SCRATCH_SIZE,
+            "note": "Analysis reference built with a relaxed scratch limit; see docs/RELAXED_SCRATCH_REFERENCE.md",
+        }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -350,8 +429,14 @@ def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed, valu
     # A kernel saved by a --values-only build says so; --values-only on the command line
     # covers kernels saved without that field.
     values_only = values_only or bool(saved_params and saved_params.get("values_only"))
+    relaxed = (saved_params or {}).get("relaxed_scratch")
+    scratch_size = None
+    if relaxed:
+        scratch_size = int(relaxed["scratch_size"])
+        print(f"  RELAXED-SCRATCH kernel (not valid on the machine): simulating with {scratch_size} scratch words")
     print("\nValidating against reference kernel...")
-    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=values_only)
+    correct = validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=values_only,
+                              scratch_size=scratch_size)
     if correct:
         print(f"  {passed_message(values_only)}")
         return 0
@@ -359,8 +444,11 @@ def run_validate_only(kernel_path, forest_height, batch_size, rounds, seed, valu
     return 1
 
 
-def validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=False):
+def validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only=False, scratch_size=None):
     """Validate kernel against reference implementation.
+
+    scratch_size: scratch words of the simulated machine (default: the real machine's). Only
+    relaxed-scratch kernels pass a larger value; the simulator is otherwise unchanged.
 
     Compares the final values and the final indices with reference_kernel2. With
     values_only (kernels built with --values-only, which do not store indices) only the
@@ -382,6 +470,7 @@ def validate_kernel(instrs, forest_height, batch_size, rounds, seed, values_only
         DebugInfo(scratch_map={}),
         n_cores=N_CORES,
         trace=False,
+        **({} if scratch_size is None else {"scratch_size": scratch_size}),
     )
     machine.enable_pause = False
     machine.enable_debug = False

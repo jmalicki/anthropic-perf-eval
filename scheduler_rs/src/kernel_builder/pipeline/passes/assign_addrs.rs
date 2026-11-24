@@ -6,7 +6,6 @@ use std::collections::HashMap;
 
 use crate::address_assign::{assign_addresses, verify_no_address_conflicts_fast, AddressAssignConfig};
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
-use crate::kernel_builder::tick_tock_ssa::SCRATCH_BUDGET_HW;
 
 /// Assigns physical scratch addresses to VRegs using linear scan allocation.
 ///
@@ -24,7 +23,9 @@ impl Pass for AssignAddressesPass {
 
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
         let mut assign_config = AddressAssignConfig {
-            budget: SCRATCH_BUDGET_HW,
+            // The configured scratch size (1,536 on the machine; larger only for the
+            // relaxed-scratch reference).
+            budget: ctx.config.compiler.scratch_size,
             scratch_pools: ctx.config.compiler.scratch_model.is_pools(),
             ..Default::default()
         };

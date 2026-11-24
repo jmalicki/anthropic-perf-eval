@@ -16,10 +16,41 @@ import sys
 from typing import Any, Optional
 
 DEFAULT_SCHEDULER_JSON = "scheduler_output.json"
+RELAXED_SCHEDULER_JSON = "scheduler_output_relaxed_scratch.json"
+NORMAL_KERNEL_PATHS = {
+    "kernel_to_validate.json",
+    "kernel_upstream_check.json",
+    "scheduler_output_upstream_check.json",
+    DEFAULT_SCHEDULER_JSON,
+}
 
 # Mirrors of DEFAULT_GREEDY_* in scheduler_rs/src/kernel_builder/config.rs.
 DEFAULT_GREEDY_STAGGER_CYCLES = 12
 DEFAULT_GREEDY_GROUPS_IN_FLIGHT = 16
+
+# Machine scratch size (problem.SCRATCH_SIZE) and the size used for --no-scratch-constraint
+# (UNBOUNDED_SCRATCH_WORDS in scheduler_rs/src/kernel_builder/config.rs).
+MACHINE_SCRATCH_SIZE = 1536
+UNBOUNDED_SCRATCH_WORDS = 1 << 20
+
+
+def scratch_settings(get) -> tuple:
+    """Effective (scratch_size, scratch_constraint) for the relaxed-scratch options.
+
+    get: option lookup (name, default) -> value, as in args_to_build_kwargs.
+
+    Returns (words the greedy and the allocator may use, whether CP-SAT models scratch).
+    """
+    constraint = get("scratch_constraint", True)
+    size = get("scratch_budget_override")
+    if size is None:
+        size = MACHINE_SCRATCH_SIZE if constraint else UNBOUNDED_SCRATCH_WORDS
+    return size, constraint
+
+
+def is_relaxed_scratch(scratch_size: int, scratch_constraint: bool) -> bool:
+    """True when the kernel would not be valid on the machine's 1,536-word scratch."""
+    return scratch_size > MACHINE_SCRATCH_SIZE or not scratch_constraint
 
 
 def n_nodes_for_height(forest_height: int) -> int:
@@ -444,6 +475,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "CP-SAT each lane at its own cycle, so the solver starts from the split-shift "
                             "schedule (default: the greedy that feeds CP-SAT makes no split shifts)")
 
+    # Relaxed-scratch reference (analysis only; docs/RELAXED_SCRATCH_REFERENCE.md)
+    group.add_argument("--scratch-budget-override", type=_positive_int, default=None, metavar="WORDS",
+                       help="ANALYSIS ONLY: scratch words the greedy, the per-section repair, CP-SAT and "
+                            "address assignment may use instead of the machine's 1536. Above 1536 the kernel "
+                            "does not run on the real machine; it is saved as a marked relaxed-scratch kernel "
+                            "and validated on a simulator with that much scratch.")
+    group.add_argument("--no-scratch-constraint", action="store_false", dest="scratch_constraint", default=True,
+                       help="ANALYSIS ONLY: drop the scratch constraint from the CP-SAT model and give the greedy "
+                            f"and the allocator {UNBOUNDED_SCRATCH_WORDS} words (unless --scratch-budget-override "
+                            "is given). Measures what any scratch-saving technique could buy at most.")
+
     # Constraint / CSE options
     import scheduler_rs
     _constraint_names = ", ".join(scheduler_rs.optional_constraint_group_names())
@@ -557,9 +599,14 @@ def args_to_build_kwargs(
     cpsat_tuning_json = json.dumps(cpsat_tuning) if cpsat_tuning else None
     cpsat_tuning_effective = json.loads(scheduler_rs.resolve_cpsat_tuning(cpsat_tuning_json))
 
+    scratch_size, scratch_constraint = scratch_settings(get)
+    relaxed = is_relaxed_scratch(scratch_size, scratch_constraint)
+
     out_path = output_json if output_json is not None else get("output_json")
     if out_path is None:
-        out_path = DEFAULT_SCHEDULER_JSON
+        out_path = RELAXED_SCHEDULER_JSON if relaxed else DEFAULT_SCHEDULER_JSON
+    elif relaxed and os.path.basename(out_path) in NORMAL_KERNEL_PATHS:
+        raise ValueError(f"refusing to write a relaxed-scratch build to {out_path}, a normal kernel/result path")
 
     emission = emission_options(get)
     run_options = {
@@ -608,6 +655,9 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_size": scratch_size,
+        "scratch_constraint": scratch_constraint,
+        "relaxed_scratch": relaxed,
         "scratch_model": get("scratch_model", "words"),
     }
     git_sha = _get_git_sha() if use_git_sha else None
@@ -666,6 +716,8 @@ def args_to_build_kwargs(
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
         "greedy_budget_headroom": get("greedy_budget_headroom", 0),
+        "scratch_size": scratch_size,
+        "scratch_constraint": scratch_constraint,
         "scratch_model": get("scratch_model", "words"),
     }
 

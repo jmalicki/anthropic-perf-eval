@@ -199,3 +199,65 @@ def test_simulator_cycles_matches_machine():
     assert len(instrs) == stats["cycles"] + 2, "schedule cycles plus the two pause bundles"
     assert counted == stats["cycles"] + 2 - empty
     assert empty == sum(1 for bundle in instrs if not bundle)
+
+
+def test_relaxed_scratch_flags_reach_kwargs_and_run_options():
+    """--scratch-budget-override and --no-scratch-constraint reach the binding and are recorded;
+    by default the machine's 1536 words with the constraint."""
+    import argparse
+
+    from kernel_build_args import (
+        DEFAULT_SCHEDULER_JSON,
+        RELAXED_SCHEDULER_JSON,
+        UNBOUNDED_SCRATCH_WORDS,
+        add_kernel_build_args,
+    )
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    cases = [
+        ([], 1536, True, False),
+        (["--scratch-budget-override", "3072"], 3072, True, True),
+        (["--no-scratch-constraint"], UNBOUNDED_SCRATCH_WORDS, False, True),
+        (["--no-scratch-constraint", "--scratch-budget-override", "4096"], 4096, False, True),
+        (["--scratch-budget-override", "1024"], 1024, True, False),
+    ]
+    for argv, size, constraint, relaxed in cases:
+        kwargs = args_to_build_kwargs(parser.parse_args(["--use-greedy", *argv]), use_git_sha=False)
+        recorded = json.loads(kwargs["run_options_json"])
+        assert (kwargs["scratch_size"], kwargs["scratch_constraint"]) == (size, constraint), argv
+        assert (recorded["scratch_size"], recorded["scratch_constraint"], recorded["relaxed_scratch"]) == \
+            (size, constraint, relaxed), argv
+        assert kwargs["output_json"] == (RELAXED_SCHEDULER_JSON if relaxed else DEFAULT_SCHEDULER_JSON), argv
+    with pytest.raises(ValueError, match="a normal kernel/result path"):
+        args_to_build_kwargs(None, scratch_constraint=False, output_json=DEFAULT_SCHEDULER_JSON)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--scratch-budget-override", "0"])
+
+
+def test_relaxed_scratch_build_is_marked_and_kept_off_normal_paths(tmp_path, monkeypatch, capsys):
+    """A relaxed-scratch build refuses normal kernel paths, prints the warning, saves a kernel
+    marked as not valid on the machine, and validates it on a simulator with more scratch."""
+    import generate_ssa_kernel
+
+    monkeypatch.chdir(tmp_path)
+    base = ["generate_ssa_kernel.py", "--use-greedy", "-q", "--forest-height", "5", "--batch-size", "64",
+            "--rounds", "2", "--scratch-budget-override", "3072"]
+    monkeypatch.setattr(sys, "argv", base + ["--save-kernel", "kernel_to_validate.json"])
+    assert generate_ssa_kernel.main() == 2
+    assert not (tmp_path / "kernel_to_validate.json").exists()
+
+    monkeypatch.setattr(sys, "argv", base)
+    assert generate_ssa_kernel.main() == 0
+    out = capsys.readouterr().out
+    assert "RELAXED SCRATCH" in out and "NOT valid on the real machine" in out
+    saved = json.loads((tmp_path / "kernel_relaxed_scratch.json").read_text())
+    assert saved["relaxed_scratch"]["valid_on_machine"] is False
+    assert saved["relaxed_scratch"]["scratch_size"] >= 1536
+    sched = json.loads((tmp_path / "scheduler_output_relaxed_scratch.json").read_text())
+    assert sched["scratch_size"] == 3072 and sched["scratch_relaxed"] is True
+    assert sched["run_options"]["relaxed_scratch"] is True
+
+    monkeypatch.setattr(sys, "argv", ["generate_ssa_kernel.py", "--validate-only", "kernel_relaxed_scratch.json"])
+    assert generate_ssa_kernel.main() == 0
+    assert "RELAXED-SCRATCH kernel" in capsys.readouterr().out
