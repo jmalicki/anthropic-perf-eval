@@ -16,10 +16,19 @@
 //! 4. Constants (catalogue coupling C13): a `ConstChoice`'s ALU-derived alternatives are the
 //!    derivations whose operand values are constants created before it
 //!    (`SsaEmitContext::emit_const_choice`). Creating or removing a constant can change the
-//!    alternatives of every later constant. `new` checks that this function of the ordered
-//!    constant set reproduces the input program's alternatives (otherwise it refuses the
-//!    program); `finish` recomputes them for the rewritten order and reports each change.
-//! 5. Renumber op ids in order and rebuild `vreg_def`.
+//!    alternatives of every later constant. `new` marks the constants whose alternatives are
+//!    this function of the ordered constant set (all of them in emitted programs); `finish`
+//!    recomputes those for the rewritten order and reports each change. Any other
+//!    ("foreign") alternatives are kept as given, less the derivations whose operands no
+//!    longer exist before the constant, so no alternative ever names a missing constant.
+//! 5. Check: nothing reads a removed value, every value is defined before it is read
+//!    (`delta_vreg` and `keep_live` included).
+//! 6. Renumber op ids in order and rebuild `vreg_def`.
+//!
+//! Preconditions (`Surgery::check`, also run by `new`): single assignment (every VReg
+//! defined by at most one op), def before use, no dependencies computed yet, no legacy
+//! dual-op constants. A program that fails them is refused as a whole; rules turn shapes
+//! they cannot rewrite safely into per-site rejections before getting here.
 //!
 //! New constants and broadcasts go through `constant` / `broadcast`, which reuse an existing
 //! op with the same value (or source) created at or before the insertion point, as the
@@ -33,7 +42,7 @@ use crate::types::{compute_const_encodings_alu_ready, ConstEncoding, Engine, Opc
 
 use super::super::emit_ssa::eliminate_ssa_dead_code;
 use super::super::SsaProgram;
-use super::graph::SsaGraph;
+use super::graph::{op_reads, SsaGraph};
 
 /// Metadata a new op takes over from an existing one: scheduling hints and accounting labels,
 /// never semantics.
@@ -108,6 +117,10 @@ pub struct SurgeryReport {
     pub dropped_dead: usize,
     /// `ConstChoice` ops whose alternatives changed, in program order.
     pub alternatives: Vec<AlternativesChange>,
+    /// `ConstChoice` ops whose input alternatives were not the emitter's function of the
+    /// constants before them: kept as given, less derivations from constants that no longer
+    /// exist before them.
+    pub foreign_alternatives: usize,
 }
 
 /// An op spliced next to an original op: a new one, or an original one moved there.
@@ -129,27 +142,43 @@ pub struct Surgery {
     const_ops: HashMap<i64, Vec<usize>>,
     /// Scalar -> indices of `vbroadcast` ops of it, increasing (lookup only).
     broadcast_ops: HashMap<VReg, Vec<usize>>,
+    /// `ConstChoice` ops whose alternatives are not the emitter's function (kept as given).
+    foreign: BTreeSet<usize>,
     /// Constants and broadcasts created so far: key -> (anchor index, VReg).
     new_consts: BTreeMap<i64, (usize, VReg)>,
     new_broadcasts: BTreeMap<VReg, (usize, VReg)>,
 }
 
-/// Alternatives of every `ConstChoice` as `emit_const_choice` computes them for this order:
-/// Load, AddImm, then up to two ALU derivations from constants created before it (and 0 when
-/// the program reserves the zero register). Ops without alternatives keep `None`.
-pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool) -> Vec<Option<Vec<ConstEncoding>>> {
+/// Alternatives of every `ConstChoice` for this order.
+///
+/// An op with `foreign(i)` false gets them as `emit_const_choice` computes them: Load,
+/// AddImm, then up to two ALU derivations from constants created before it (and 0 when the
+/// program reserves the zero register). A foreign op keeps its own alternatives, less those
+/// not ready from the constants before it. Ops without alternatives keep `None`.
+///
+/// # Arguments
+/// * `ops` - The ops in order.
+/// * `zero` - The program reserves the zero register.
+/// * `foreign` - Whether op `i` keeps its own alternatives.
+///
+/// # Returns
+/// One entry per op.
+pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool, foreign: impl Fn(usize) -> bool) -> Vec<Option<Vec<ConstEncoding>>> {
     let mut available: HashSet<i64> = HashSet::new();
     if zero {
         available.insert(0);
     }
     let mut out = Vec::with_capacity(ops.len());
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
         if op.opcode != Opcode::ConstChoice {
             out.push(None);
             continue;
         }
         let value = op.produces_constant.unwrap_or(0);
-        out.push(op.const_alternatives.as_ref().map(|_| {
+        out.push(op.const_alternatives.as_ref().map(|own| {
+            if foreign(i) {
+                return own.iter().filter(|e| e.is_ready(&available)).cloned().collect();
+            }
             let mut alts = vec![ConstEncoding::Load, ConstEncoding::AddImm { value }];
             alts.extend(compute_const_encodings_alu_ready(value, &available, 2));
             alts
@@ -200,7 +229,7 @@ fn check_def_before_use(ops: &[SsaOp], program: &SsaProgram) -> Result<(), Strin
     let graph = SsaGraph::new(ops, &program.vector_group_lanes);
     let mut defined: HashSet<VReg> = HashSet::new();
     for (i, op) in ops.iter().enumerate() {
-        for v in op.reads().chain(op.keep_live.iter().flatten().copied()) {
+        for v in op_reads(op).chain(op.keep_live.iter().flatten().copied()) {
             if Some(v) == program.zero_vreg {
                 continue;
             }
@@ -224,42 +253,62 @@ fn check_def_before_use(ops: &[SsaOp], program: &SsaProgram) -> Result<(), Strin
 }
 
 impl Surgery {
-    /// Start editing `program`.
+    /// Whether `program` can be edited: single assignment, def before use, no dependencies
+    /// computed yet, no legacy dual-op constants. `new` runs it; call it first to keep the
+    /// program when it fails (`new` consumes it).
     ///
     /// # Arguments
-    /// * `program` - A finished program before dependency computation (no `dep_ids` or
-    ///   `mem_deps`, which hold op ids that the edits would invalidate), without legacy
-    ///   dual-op constants (`const_alternatives` empty).
+    /// * `program` - The program.
     ///
     /// # Returns
-    /// The editor, or why the program cannot be edited safely. In particular a program whose
-    /// `ConstChoice` alternatives are not the function of the ordered constant set that
-    /// `finish` recomputes is refused, since the rewrite could not keep them consistent.
-    pub fn new(program: SsaProgram) -> Result<Self, String> {
+    /// Why it cannot be edited, if so.
+    pub fn check(program: &SsaProgram) -> Result<(), String> {
         if !program.const_alternatives.is_empty() {
             return Err("legacy dual-op constants (emit_const) are not supported".into());
         }
         if let Some(op) = program.ops.iter().find(|o| !o.dep_ids.is_empty() || !o.mem_deps.is_empty()) {
             return Err(format!("op {} already has dependencies: run transforms before ComputeDependencies", op.id));
         }
-        check_def_before_use(&program.ops, &program)?;
-        let recomputed = recompute_alternatives(&program.ops, program.zero_vreg.is_some());
-        for (op, alts) in program.ops.iter().zip(&recomputed) {
-            if op.opcode == Opcode::ConstChoice && op.const_alternatives != *alts {
-                return Err(format!(
-                    "ConstChoice {:?} (op {}): alternatives {:?} are not those of the constants created before it ({:?}); \
-                     cannot keep them consistent across a rewrite",
-                    op.produces_constant, op.id, op.const_alternatives, alts
-                ));
+        let mut defined: HashSet<VReg> = HashSet::new();
+        for (i, op) in program.ops.iter().enumerate() {
+            if let Some(d) = op.dest {
+                if !defined.insert(d) {
+                    return Err(format!("{:?} is defined more than once (again by op {}): not single assignment", d, i));
+                }
             }
         }
+        check_def_before_use(&program.ops, program)
+    }
+
+    /// Start editing `program`.
+    ///
+    /// # Arguments
+    /// * `program` - A finished program that passes `check`.
+    ///
+    /// # Returns
+    /// The editor, or why the program cannot be edited safely (`check`).
+    pub fn new(program: SsaProgram) -> Result<Self, String> {
+        Self::check(&program)?;
+        let zero = program.zero_vreg.is_some();
+        let recomputed = recompute_alternatives(&program.ops, zero, |_| false);
+        let foreign: BTreeSet<usize> = program
+            .ops
+            .iter()
+            .zip(&recomputed)
+            .enumerate()
+            .filter(|(_, (op, alts))| op.opcode == Opcode::ConstChoice && op.const_alternatives != **alts)
+            .map(|(i, _)| i)
+            .collect();
         let mut const_ops: HashMap<i64, Vec<usize>> = HashMap::new();
         let mut broadcast_ops: HashMap<VReg, Vec<usize>> = HashMap::new();
         for (i, op) in program.ops.iter().enumerate() {
             match op.opcode {
                 Opcode::ConstChoice | Opcode::Const => {
-                    if let Some(v) = op.produces_constant {
-                        const_ops.entry(v).or_default().push(i);
+                    // Only a constant whose immediate agrees with its annotation is reused.
+                    if let (Some(v), Some(Operand::Imm(imm))) = (op.produces_constant, op.srcs.first()) {
+                        if *imm == v {
+                            const_ops.entry(v).or_default().push(i);
+                        }
                     }
                 }
                 Opcode::Vbroadcast => {
@@ -279,6 +328,7 @@ impl Surgery {
             rename: BTreeMap::new(),
             const_ops,
             broadcast_ops,
+            foreign,
             new_consts: BTreeMap::new(),
             new_broadcasts: BTreeMap::new(),
         })
@@ -489,7 +539,7 @@ impl Surgery {
     /// eliminated beyond what the rewrite killed) and the report, or an error if a removed
     /// value is still read.
     pub fn finish(self) -> Result<(SsaProgram, SurgeryReport), String> {
-        let Surgery { program, removed, mut before, mut after, moved, rename, .. } = self;
+        let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
         let resolve = |mut v: VReg| {
             let mut guard = 0;
             while let Some(&to) = rename.get(&v) {
@@ -560,7 +610,7 @@ impl Surgery {
             let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
             let dangling = |op: &SsaOp| {
-                op.reads().any(|v| {
+                op_reads(op).any(|v| {
                     Some(v) != program.zero_vreg
                         && graph.def_index(v).is_none()
                         && graph.group_lanes(v).is_none()
@@ -581,14 +631,16 @@ impl Surgery {
                 break;
             }
         }
-        let mut ops: Vec<SsaOp> = kept.into_iter().map(|(o, _)| o).collect();
+        let (mut ops, origins): (Vec<SsaOp>, Vec<Option<usize>>) = kept.into_iter().unzip();
 
         // Nothing may read a value that no longer exists, and every value is defined before
         // it is read (the input's order, which the splice must keep).
         check_def_before_use(&ops, &program).map_err(|e| format!("after the rewrite: {}", e))?;
 
         // 4. Constants: alternatives for the new order (C13).
-        let recomputed = recompute_alternatives(&ops, program.zero_vreg.is_some());
+        let is_foreign = |k: usize| origins[k].map_or(false, |i| foreign.contains(&i));
+        report.foreign_alternatives = (0..ops.len()).filter(|&k| is_foreign(k)).count();
+        let recomputed = recompute_alternatives(&ops, program.zero_vreg.is_some(), is_foreign);
         for (op, alts) in ops.iter_mut().zip(recomputed) {
             if op.opcode != Opcode::ConstChoice || op.const_alternatives.is_none() {
                 continue;

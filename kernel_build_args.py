@@ -272,7 +272,8 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                        help="Rewrite the finished SSA program with RULE before scheduling (repeatable; applied in "
                             "order). hash-merge: find hash stages x = a*m + c; (x + d) ^ (x << k) from the ops "
                             "alone and rewrite them to (a*m + c+d) ^ (a*(m<<k) + (c<<k)), the program "
-                            "--merge-hash-stages emits (proof: R8-hash-stage-merge). Off by default")
+                            "--merge-hash-stages emits (proof: R8-hash-stage-merge-general; with --merge-hash-stages "
+                            "there is nothing left to merge and it warns). Off by default")
     return group
 
 

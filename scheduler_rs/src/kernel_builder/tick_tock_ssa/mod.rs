@@ -989,6 +989,20 @@ impl SsaTickTockKernelBuilder {
         // Phase 1: [Transforms] + Dependencies + DCE + Bounds + Greedy (via pipeline passes)
         if !ctx.config.compiler.transforms.is_empty() {
             run_pass_with_error_export!(&mut ctx, &TransformPass);
+            // Transforms renumber op ids: forced shifts must name vector ops of the
+            // transformed program (as its scheduler JSON lists them).
+            if let Some(forced) = forced_shifts.as_ref() {
+                let mut ids: Vec<usize> = forced.iter().copied().collect();
+                ids.sort_unstable();
+                if let Some(bad) = ids.iter().find(|&&id| !ctx.ops.iter().any(|o| o.id == id && o.engine == Engine::Valu)) {
+                    return Err(KernelBuilderError::Other(format!(
+                        "forced_shifts: op {} is not a vector op of the transformed program; with --transform, \
+                         op ids are those of the rewritten program (take them from a scheduler JSON of a run \
+                         with the same transforms)",
+                        bad
+                    )));
+                }
+            }
         }
         run_pass_with_error_export!(&mut ctx, &ComputeDependenciesPass);
         if self.config.compiler.enable_ssa_dce {

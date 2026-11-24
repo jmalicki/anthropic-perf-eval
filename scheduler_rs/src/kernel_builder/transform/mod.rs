@@ -21,6 +21,7 @@
 //! - `apply` - rewrite the instantiated canonical program into the program of a selection
 //! - `surgery` - edits on a finished program: insert, rewire, remove what died, keep the
 //!   constants' scheduling alternatives consistent (C13)
+//! - `interp` - concrete interpreter of SSA programs, to test that rewrites keep values
 //! - `hash_merge` - rule `hash-merge` (hash stages 2+3), a peephole on finished SSA that
 //!   reads no emitter state
 
@@ -28,6 +29,7 @@ pub mod apply;
 pub mod cost;
 pub mod graph;
 pub mod hash_merge;
+pub mod interp;
 pub mod rule;
 pub mod surgery;
 pub mod tree_access;

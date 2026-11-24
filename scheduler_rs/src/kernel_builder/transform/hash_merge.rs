@@ -3,7 +3,13 @@
 //! program. Catalogue rule 3; the emitter's `--merge-hash-stages` writes the same program
 //! directly.
 //!
-//! The rule depends on the ops only, never on emitter state:
+//! The rule depends on the ops only, never on emitter state. What "works on untagged SSA"
+//! covers today: any program that is single assignment, in def-before-use order, before
+//! dependency computation, whose stage pair is vector ops on broadcast constants
+//! (`ConstChoice` / `Const` whose immediate agrees with `produces_constant`). Not covered:
+//! scalar (ALU) hashes and the reference 18-op form (they need SLP vectorisation and R1
+//! fusion first), constants computed by other ops, and programs whose dependencies or
+//! memory edges were already computed (refused).
 //!
 //! * Propose: every `multiply_add` is a candidate anchor (`ProposalSource::Ops`, the default,
 //!   which also works on untagged or lifted SSA), or only those inside `hash` regions
@@ -140,6 +146,9 @@ impl HashMergeRule {
             return reject("anchor is not a vector multiply_add".into());
         }
         let Some(x) = fma.dest else { return reject("multiply_add without a dest".into()) };
+        if graph.is_redefined(x) {
+            return reject("x is defined more than once (not single assignment)".into());
+        }
         let Some(s) = vreg_srcs(fma).filter(|s| s.len() == 3) else {
             return reject("multiply_add operands are not three VRegs".into());
         };
@@ -199,9 +208,24 @@ impl HashMergeRule {
             return reject(format!("the combining op is {:?}, not t ^ s", xop.opcode));
         }
         let Some(r) = xop.dest else { return reject("xor without a dest".into()) };
+        for (v, name) in [(a, "a"), (t, "t"), (sh, "s"), (r, "r")] {
+            if graph.is_redefined(v) {
+                return reject(format!("{} is defined more than once (not single assignment)", name));
+            }
+        }
         for (v, name) in [(x, "x"), (t, "t"), (sh, "s")] {
             if graph.is_kept_live(v) {
-                return reject(format!("{} is kept live by another op", name));
+                return reject(format!("{} (or a lane of it) is kept live by another op", name));
+            }
+        }
+        // The removed ops' own keep_live lists would be lost with them.
+        if [i, add, shl, xor].iter().any(|&j| ops[j].keep_live.as_ref().map_or(false, |k| !k.is_empty())) {
+            return reject("a site op carries keep_live".into());
+        }
+        // Vector groups name VRegs outside the ops (lanes, aliases); a rename would orphan them.
+        for (v, name) in [(x, "x"), (t, "t"), (sh, "s"), (r, "r")] {
+            if graph.group_lanes(v).is_some() || graph.element_of(v).is_some() {
+                return reject(format!("{} belongs to a vector group", name));
             }
         }
         if [i, add, shl].iter().any(|&j| ops[j].trace_id.is_some()) {
@@ -322,12 +346,34 @@ pub struct HashMergeReport {
     pub resource_delta: Counts,
     /// The surgery's report (cascaded removals, constants whose alternatives changed).
     pub surgery: SurgeryReport,
+    /// Why the program was left unchanged although sites matched (`Surgery::new` refused it,
+    /// e.g. a VReg defined twice).
+    pub refused: Option<String>,
+    /// Why the cost could not be counted (an op the categories do not know); the rewrite is
+    /// done regardless and the cost fields are then empty.
+    pub cost_error: Option<String>,
+    /// Why moving the old operands that stay to the new setup was skipped (they then stay
+    /// where they are).
+    pub regroup_skipped: Option<String>,
 }
 
 impl HashMergeReport {
     /// One line for the pipeline log.
     pub fn summary(&self) -> String {
+        if let Some(r) = &self.refused {
+            return format!("hash-merge: program left unchanged: {}", r);
+        }
         let classes: Vec<String> = self.site_classes.iter().map(|(d, n)| format!("{} x {:?}", n, d)).collect();
+        let mut notes = String::new();
+        if let Some(e) = &self.cost_error {
+            notes.push_str(&format!("; cost not counted: {}", e));
+        }
+        if let Some(e) = &self.regroup_skipped {
+            notes.push_str(&format!("; old operands left in place: {}", e));
+        }
+        if self.surgery.foreign_alternatives > 0 {
+            notes.push_str(&format!("; {} ConstChoice with non-emitter alternatives kept", self.surgery.foreign_alternatives));
+        }
         format!(
             "hash-merge: {} sites; per-site delta {}; resources {:?}; {} ops inserted, {} removed, {} moved, {} cascaded, {} ConstChoice alternatives changed",
             self.sites,
@@ -338,7 +384,7 @@ impl HashMergeReport {
             self.surgery.moved,
             self.surgery.cascaded.len(),
             self.surgery.alternatives.len()
-        )
+        ) + &notes
     }
 }
 
@@ -374,13 +420,16 @@ fn dce_counts(program: &SsaProgram) -> Result<Counts, String> {
 ///
 /// # Returns
 /// The rewritten program (dead code the rewrite made is removed; other dead code is left for
-/// the pipeline's DCE) and the report with per-site and shared cost deltas.
+/// the pipeline's DCE) and the report with per-site and shared cost deltas. Sites the rule
+/// cannot rewrite safely are rejected one by one (`rejections`); a program that is not
+/// single assignment or not in def-before-use order is returned unchanged (`refused`); an
+/// op the cost categories do not know leaves the cost empty (`cost_error`) and does not stop
+/// the rewrite. An `Err` means the surgery itself found an inconsistency (a bug).
 pub fn apply_hash_merge(
     program: SsaProgram,
     rule: &HashMergeRule,
     select: impl Fn(&HashMergeSite) -> bool,
 ) -> Result<(SsaProgram, HashMergeReport), String> {
-    let before_counts = dce_counts(&program)?;
     let (sites, rejections) = {
         let graph = SsaGraph::new(&program.ops, &program.vector_group_lanes);
         rule.find_sites(&graph)
@@ -390,6 +439,20 @@ pub fn apply_hash_merge(
     if sites.is_empty() {
         return Ok((program, report));
     }
+    // A program the surgery cannot edit safely is left as it is, with the reason.
+    if let Err(e) = Surgery::check(&program) {
+        report.refused = Some(e);
+        report.sites = 0;
+        return Ok((program, report));
+    }
+    // Cost accounting never blocks the rewrite: on an op it cannot categorise it is skipped.
+    let before_counts = match dce_counts(&program) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            report.cost_error = Some(e);
+            None
+        }
+    };
     // Insertion point of new constants: after the last definition of any constant operand of
     // the rewritten sites (all of them are visible there), unless that comes after the first
     // site (operands defined next to each site); then right before the first site, where new
@@ -403,7 +466,8 @@ pub fn apply_hash_merge(
             }
         }
         let first_site = sites.iter().map(|s| s.fma).min().unwrap();
-        let anchor = if last_def < first_site { last_def } else { first_site - 1 };
+        // first_site > 0: its constant operands are defined before it.
+        let anchor = if last_def < first_site { last_def } else { first_site.saturating_sub(1) };
         // Metadata of new scalar and vector constants: the anchor's labels (no region or
         // symmetry hint when the anchor is not a setup op), the type of the operand they
         // stand in for (the multiplier for M2, the addend for C1 and C2).
@@ -442,8 +506,10 @@ pub fn apply_hash_merge(
     let [(mult_s, mult_v), (add_s, add_v)] = roles;
 
     let mut surgery = Surgery::new(program)?;
-    // Left in place if something that stays reads them before the anchor.
-    let _ = surgery.move_after(&regroup.into_iter().collect::<Vec<_>>(), anchor);
+    // Left in place (and reported) if something that stays reads them before the anchor.
+    if let Err(e) = surgery.move_after(&regroup.into_iter().collect::<Vec<_>>(), anchor) {
+        report.regroup_skipped = Some(e);
+    }
     for s in &sites {
         let (m1, c1, m2, c2) = s.merged;
         let v_m1 = surgery.vector_constant(m1, anchor, &mult_s, &mult_v);
@@ -466,11 +532,15 @@ pub fn apply_hash_merge(
         let inserted = [l_op, h_op, r_op];
 
         // The site's own delta: the ops it inserts less the ops it removes.
-        let removed = counts_of(s.ops().iter().map(|&i| &surgery.ops()[i]))?;
-        let added = counts_of(inserted.iter())?;
-        let mut delta = [0i64; 10];
-        for k in 0..10 {
-            delta[k] = added[k] - removed[k];
+        let delta = counts_of(s.ops().iter().map(|&i| &surgery.ops()[i])).and_then(|removed| {
+            let added = counts_of(inserted.iter())?;
+            Ok(std::array::from_fn::<i64, 10, _>(|k| added[k] - removed[k]))
+        });
+        match delta {
+            Ok(d) => *report.site_classes.entry(d).or_default() += 1,
+            Err(e) => {
+                report.cost_error.get_or_insert(e);
+            }
         }
         for op in inserted {
             surgery.insert_before(s.fma, op, &stamp);
@@ -479,17 +549,23 @@ pub fn apply_hash_merge(
             surgery.remove(idx);
         }
         surgery.replace_uses(s.output, r);
-        *report.site_classes.entry(delta).or_default() += 1;
     }
     let (program, surgery_report) = surgery.finish()?;
     report.surgery = surgery_report;
 
-    let after_counts = dce_counts(&program)?;
-    let mut resource = [0i64; 10];
-    for k in 0..10 {
-        let sites_total: i64 = report.site_classes.iter().map(|(d, n)| d[k] * *n as i64).sum();
-        resource[k] = after_counts[k] - before_counts[k] - sites_total;
+    if report.cost_error.is_some() {
+        report.site_classes.clear();
+        return Ok((program, report));
     }
-    report.resource_delta = resource;
+    match (before_counts, dce_counts(&program)) {
+        (Some(before), Ok(after)) => {
+            for k in 0..10 {
+                let sites_total: i64 = report.site_classes.iter().map(|(d, n)| d[k] * *n as i64).sum();
+                report.resource_delta[k] = after[k] - before[k] - sites_total;
+            }
+        }
+        (_, Err(e)) => report.cost_error = Some(e),
+        (None, _) => {}
+    }
     Ok((program, report))
 }

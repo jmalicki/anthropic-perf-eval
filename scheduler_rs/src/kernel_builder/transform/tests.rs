@@ -608,7 +608,7 @@ fn test_hash_merge_rejects_near_misses() {
     expect(
         mutate_first_site(|p, s| {
             let x = p.ops[s.fma].dest.unwrap();
-            p.ops[s.xor + 1].keep_live = Some(vec![x]);
+            p.ops.last_mut().unwrap().keep_live = Some(vec![x]);
         }),
         "kept live",
         63,
@@ -624,12 +624,16 @@ fn test_hash_merge_rejects_near_misses() {
     );
     // Wrong constant relationship: the multiplier varies.
     expect(mutate_first_site(|p, s| p.ops[s.fma].srcs[1] = Operand::VReg(s.input)), "multiplier is not a broadcast constant", 63);
-    // Shift amount out of range: the shared shift constant becomes 40 (every site rejects).
+    // Shift amount out of range: the shared shift constant becomes 40, immediate and
+    // annotation (every site rejects).
     expect(
         mutate_first_site(|p, s| {
-            let k_scalar = p.ops[p.vreg_def[&s.operands[3]]].srcs[0].as_vreg().unwrap();
+            let k_vec = p.vreg_def[&s.operands[3]];
+            let k_scalar = p.ops[k_vec].srcs[0].as_vreg().unwrap();
             let def = p.vreg_def[&k_scalar];
+            p.ops[def].srcs[0] = Operand::Imm(40);
             p.ops[def].produces_constant = Some(40);
+            p.ops[k_vec].produces_constant = Some(40);
         }),
         "not in 0..32",
         0,
@@ -774,4 +778,321 @@ fn test_hash_merge_pass_schedules_like_the_merged_emission() {
     eprintln!("greedy (cycles, ops): rewritten {:?} merged {:?} default {:?}", rewritten, merged, default);
     assert_eq!(rewritten.1, merged.1);
     assert_ne!(default.1, merged.1);
+}
+
+// ----------------------------------------------------------------------------
+// Hash merge: the rewrite keeps values (interp), and foreign input is refused per site
+// ----------------------------------------------------------------------------
+
+/// Deterministic pseudo-random 32-bit words.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 32) as u32
+    }
+    /// A word biased towards edge values.
+    fn word(&mut self) -> u32 {
+        const EDGES: [u32; 6] = [0, 1, 0x8000_0000, 0xFFFF_FFFF, 0x7FFF_FFFF, 33];
+        match self.next() % 3 {
+            0 => EDGES[self.next() as usize % EDGES.len()],
+            _ => self.next(),
+        }
+    }
+}
+
+/// A program of `n` independent stage pairs `r = (a*m + c + d) ^ ((a*m + c) << k)`, not
+/// written by the emitter: per site its own loaded input `a`, its own constants (values
+/// repeat across sites, ops do not), and the shape varied by the site index (multiply_add
+/// factors commuted, add operands swapped, shift emitted before the add, xor operands
+/// swapped). Outputs: `r` and `r ^ a` are stored.
+///
+/// # Returns
+/// The program and each site's `(m, c, d, k)`.
+fn synthetic_hash_program(seed: u64, n: usize) -> (crate::kernel_builder::SsaProgram, Vec<[i64; 4]>) {
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    let mut rng = Lcg(seed);
+    let mut next_id = 0u32;
+    let mut fresh = |vector: bool| {
+        next_id += 1;
+        if vector { VReg::vector(next_id - 1) } else { VReg::scalar(next_id - 1) }
+    };
+    let mut ops: Vec<SsaOp> = Vec::new();
+    let mut constants = Vec::new();
+    let push = |ops: &mut Vec<SsaOp>, engine, opcode, dest, srcs: Vec<Operand>| {
+        let mut op = SsaOp::new(ops.len(), engine, opcode, dest, srcs);
+        if let (Opcode::ConstChoice, Some(Operand::Imm(k))) = (opcode, op.srcs.first()) {
+            op.produces_constant = Some(*k);
+        }
+        ops.push(op);
+        dest
+    };
+    for i in 0..n {
+        let k = match i % 4 {
+            0 => 0,
+            1 => 31,
+            _ => (rng.next() % 32) as i64,
+        };
+        let [m, c, d] = [rng.word() as i64, rng.word() as i64, rng.word() as i64];
+        constants.push([m, c, d, k]);
+        let a = push(&mut ops, Engine::Load, Opcode::Vload, Some(fresh(true)), vec![Operand::Imm(1000 + 8 * i as i64)]);
+        let mut vec_const = |ops: &mut Vec<SsaOp>, value: i64| {
+            let s = push(ops, Engine::Load, Opcode::ConstChoice, Some(fresh(false)), vec![Operand::Imm(value)]).unwrap();
+            let v = push(ops, Engine::Valu, Opcode::Vbroadcast, Some(fresh(true)), vec![Operand::VReg(s)]).unwrap();
+            ops.last_mut().unwrap().produces_constant = Some(value);
+            v
+        };
+        let (vm, vc, vd, vk) = (vec_const(&mut ops, m), vec_const(&mut ops, c), vec_const(&mut ops, d), vec_const(&mut ops, k));
+        let a = a.unwrap();
+        let v = |x: VReg| Operand::VReg(x);
+        let fma_srcs = if i & 1 == 0 { vec![v(a), v(vm), v(vc)] } else { vec![v(vm), v(a), v(vc)] };
+        let x = push(&mut ops, Engine::Valu, Opcode::MultiplyAdd, Some(fresh(true)), fma_srcs).unwrap();
+        let add_srcs = if i & 2 == 0 { vec![v(x), v(vd)] } else { vec![v(vd), v(x)] };
+        let (t, s) = if i & 4 == 0 {
+            let t = push(&mut ops, Engine::Valu, Opcode::Add, Some(fresh(true)), add_srcs).unwrap();
+            (t, push(&mut ops, Engine::Valu, Opcode::Shl, Some(fresh(true)), vec![v(x), v(vk)]).unwrap())
+        } else {
+            let s = push(&mut ops, Engine::Valu, Opcode::Shl, Some(fresh(true)), vec![v(x), v(vk)]).unwrap();
+            (push(&mut ops, Engine::Valu, Opcode::Add, Some(fresh(true)), add_srcs).unwrap(), s)
+        };
+        let xor_srcs = if i & 8 == 0 { vec![v(t), v(s)] } else { vec![v(s), v(t)] };
+        let r = push(&mut ops, Engine::Valu, Opcode::Xor, Some(fresh(true)), xor_srcs).unwrap();
+        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(5000 + 8 * i as i64), v(r)]);
+        let out = push(&mut ops, Engine::Valu, Opcode::Xor, Some(fresh(true)), vec![v(r), v(a)]).unwrap();
+        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(9000 + 8 * i as i64), v(out)]);
+    }
+    let vreg_def = ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect();
+    let program = crate::kernel_builder::SsaProgram {
+        ops,
+        vreg_def,
+        vreg_count: next_id,
+        const_alternatives: Vec::new(),
+        zero_vreg: None,
+        vector_group_lanes: Default::default(),
+    };
+    (program, constants)
+}
+
+/// Run `before` and `after` on the same random inputs and compare every store.
+fn assert_same_values(before: &crate::kernel_builder::SsaProgram, after: &crate::kernel_builder::SsaProgram, seed: u64) {
+    use super::interp::run;
+    let input = |v: crate::types::VReg, lane: usize| {
+        let mut r = Lcg(seed ^ ((v.id as u64) << 8) ^ lane as u64);
+        r.next();
+        r.word()
+    };
+    let (b, a) = (run(&before.ops, input).unwrap(), run(&after.ops, input).unwrap());
+    assert_eq!(b.stores.len(), a.stores.len());
+    for (i, (x, y)) in b.stores.iter().zip(&a.stores).enumerate() {
+        assert_eq!(x, y, "store {} differs (seed {})", i, seed);
+    }
+}
+
+#[test]
+fn test_hash_merge_preserves_values_on_random_constants() {
+    // Random m, c, d per site (edge words 0, 1, 2^31, 2^32 - 1 included), k = 0, 31 and
+    // random, every shape variant, random input lanes biased to edge words.
+    for seed in 1..=8u64 {
+        let (program, constants) = synthetic_hash_program(seed, 32);
+        let before = clone_program(&program);
+        let (after, report) = apply_hash_merge(program, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+        assert_eq!(report.sites, 32, "seed {}: {:?}", seed, report.rejections);
+        let g = SsaGraph::new(&after.ops, &after.vector_group_lanes);
+        assert!(merge_rule(ProposalSource::Ops).find_sites(&g).0.is_empty());
+        assert!(constants.iter().any(|c| c[3] == 0) && constants.iter().any(|c| c[3] == 31));
+        for run_seed in 0..4 {
+            assert_same_values(&before, &after, seed * 100 + run_seed);
+        }
+    }
+}
+
+#[test]
+fn test_hash_merge_preserves_values_with_zero_results() {
+    // Constants that make x, t, s or r zero on every lane (m = 0, c = 0, d = -c, k = 31 with
+    // even x), and the emitter's constants.
+    use crate::kernel_builder::config::{fma_multiplier, HASH_STAGES};
+    let cases: [[i64; 4]; 4] = [
+        [0, 0, 0, 0],
+        [0, 5, 0xFFFF_FFFB, 31],
+        [2, 0, 0, 31],
+        [fma_multiplier(2).unwrap(), HASH_STAGES[2].1, HASH_STAGES[3].1, HASH_STAGES[3].4],
+    ];
+    let (mut program, _) = synthetic_hash_program(77, cases.len());
+    // Overwrite each site's constants (both the immediate and the annotation).
+    let mut consts = program.ops.iter().enumerate().filter(|(_, o)| o.opcode == crate::types::Opcode::ConstChoice).map(|(i, _)| i).collect::<Vec<_>>().into_iter();
+    for case in cases {
+        for value in case {
+            let i = consts.next().unwrap();
+            program.ops[i].srcs[0] = crate::types::Operand::Imm(value);
+            program.ops[i].produces_constant = Some(value);
+            program.ops[i + 1].produces_constant = Some(value);
+        }
+    }
+    let before = clone_program(&program);
+    let (after, report) = apply_hash_merge(program, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, cases.len());
+    for s in 0..4 {
+        assert_same_values(&before, &after, 500 + s);
+    }
+}
+
+/// Apply the rule to the 2-round default program after `mutate` changed it around the first
+/// site.
+fn rewrite_mutated(
+    mutate: impl Fn(&mut crate::kernel_builder::SsaProgram, &HashMergeSite),
+) -> Result<(crate::kernel_builder::SsaProgram, HashMergeReport), String> {
+    let mut p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+    let site = {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        merge_rule(ProposalSource::Ops).find_sites(&g).0.remove(0)
+    };
+    mutate(&mut p, &site);
+    apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true)
+}
+
+/// The rewrite of a mutated program rejected the first site with a reason containing `text`
+/// and rewrote the other 63.
+fn assert_first_site_rejected(result: Result<(crate::kernel_builder::SsaProgram, HashMergeReport), String>, text: &str) {
+    let (_, report) = result.unwrap_or_else(|e| panic!("{}: the rewrite failed instead of rejecting one site: {}", text, e));
+    assert_eq!(report.sites, 63, "{}: {:?}", text, report.rejections);
+    assert!(report.rejections.keys().any(|k| k.contains(text)), "{}: {:?}", text, report.rejections);
+}
+
+#[test]
+fn test_hash_merge_rejects_a_site_op_carrying_keep_live() {
+    // The emitter attaches keep_live to the next op it emits; on a site op the list would be
+    // lost with the op.
+    for pick in 0..4 {
+        let result = rewrite_mutated(|p, s| {
+            let other = p.ops[s.fma - 1].dest.unwrap();
+            p.ops[s.ops()[pick]].keep_live = Some(vec![other]);
+        });
+        assert_first_site_rejected(result, "keep_live");
+    }
+}
+
+#[test]
+fn test_hash_merge_refuses_redefined_vregs() {
+    use super::surgery::Surgery;
+    use crate::types::{Engine, Opcode, Operand};
+    // A second definition of the first site's x (after the site): not single assignment.
+    let redefine = |p: &mut crate::kernel_builder::SsaProgram, s: &HashMergeSite| {
+        let x = p.ops[s.fma].dest.unwrap();
+        let mut op = SsaOp::new(0, Engine::Valu, Opcode::Xor, Some(x), vec![Operand::VReg(s.input), Operand::VReg(s.input)]);
+        op.id = p.ops.len();
+        let at = s.xor + 1;
+        p.ops.insert(at, op);
+    };
+    let mut p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+    let site = {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        merge_rule(ProposalSource::Ops).find_sites(&g).0.remove(0)
+    };
+    redefine(&mut p, &site);
+    {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        assert_eq!(g.redefined().len(), 1);
+        let err = merge_rule(ProposalSource::Ops).match_at(&g, site.fma).unwrap_err();
+        assert!(err.0.contains("defined more than once"), "{:?}", err);
+    }
+    let err = Surgery::new(clone_program(&p)).err().expect("Surgery refuses a program that is not single assignment");
+    assert!(err.contains("more than once"), "{}", err);
+    // The pass leaves such a program unchanged and says why.
+    let before = canonical_ops(&p);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert!(report.refused.as_deref().map_or(false, |r| r.contains("more than once")), "{:?}", report.refused);
+    assert_eq!(canonical_ops(&after), before);
+}
+
+#[test]
+fn test_hash_merge_treats_a_select_delta_as_a_read() {
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // A SelectChoice whose delta (read by its multiply_add lowering, not in srcs) is x.
+    let result = rewrite_mutated(|p, s| {
+        let x = p.ops[s.fma].dest.unwrap();
+        let mut op = SsaOp::new(0, Engine::Valu, Opcode::SelectChoice, Some(VReg::vector(p.vreg_count)), vec![
+            Operand::VReg(s.input),
+            Operand::VReg(s.input),
+            Operand::VReg(s.input),
+        ]);
+        p.vreg_count += 1;
+        op.delta_vreg = Some(x);
+        p.ops.insert(s.xor + 1, op);
+    });
+    assert_first_site_rejected(result, "3 readers");
+}
+
+#[test]
+fn test_hash_merge_rejects_vector_group_sites_per_site() {
+    use crate::types::VReg;
+    // r is the key of a vector group (its lanes read elsewhere): renaming r would orphan them.
+    let lanes = |p: &mut crate::kernel_builder::SsaProgram| {
+        let l: Vec<VReg> = (0..8).map(|k| VReg::scalar(p.vreg_count + k)).collect();
+        p.vreg_count += 8;
+        l
+    };
+    let result = rewrite_mutated(|p, s| {
+        let r = p.ops[s.xor].dest.unwrap();
+        let l = lanes(p);
+        p.vector_group_lanes.insert(r, l);
+    });
+    assert_first_site_rejected(result, "vector group");
+    // A lane of x named in keep_live.
+    let result = rewrite_mutated(|p, s| {
+        let x = p.ops[s.fma].dest.unwrap();
+        let l = lanes(p);
+        let first = l[0];
+        p.vector_group_lanes.insert(x, l);
+        p.ops.last_mut().unwrap().keep_live = Some(vec![first]);
+    });
+    assert_first_site_rejected(result, "kept live");
+}
+
+#[test]
+fn test_hash_merge_keeps_foreign_const_alternatives() {
+    use crate::types::{ConstEncoding, Opcode};
+    // A ConstChoice whose alternatives are not the emitter's function of the constants before
+    // it: the program is still rewritten. Its alternatives are kept, less any ALU derivation
+    // whose operands no longer exist before it.
+    let mut p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+    let c2 = crate::kernel_builder::config::HASH_STAGES[2].1;
+    let target = p.ops.iter().rposition(|o| o.opcode == Opcode::ConstChoice && o.produces_constant.map_or(false, |v| v > 100)).unwrap();
+    let value = p.ops[target].produces_constant.unwrap();
+    let derived = ConstEncoding::Add { a_value: c2, b_value: value.wrapping_sub(c2) };
+    let foreign = ConstEncoding::Add { a_value: 1, b_value: 2 };
+    p.ops[target].const_alternatives = Some(vec![ConstEncoding::Load, foreign.clone(), derived.clone()]);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 64);
+    let op = after.ops.iter().find(|o| o.opcode == Opcode::ConstChoice && o.produces_constant == Some(value)).unwrap();
+    // C2 is gone, so the derivation from it is dropped; the rest is kept as given.
+    assert_eq!(op.const_alternatives.as_ref().unwrap(), &vec![ConstEncoding::Load, foreign]);
+    assert_eq!(report.surgery.foreign_alternatives, 1);
+}
+
+#[test]
+fn test_hash_merge_cost_cannot_block_the_rewrite() {
+    use crate::types::{Engine, Opcode, Operand};
+    // An op on an engine the cost categories do not know (a debug op).
+    let result = rewrite_mutated(|p, s| {
+        let op = SsaOp::new(0, Engine::Debug, Opcode::DebugPrint, None, vec![Operand::VReg(s.input)]);
+        p.ops.insert(s.fma, op);
+    });
+    let (_, report) = result.unwrap();
+    assert_eq!(report.sites, 64);
+    assert!(report.cost_error.as_deref().map_or(false, |e| e.contains("Debug")), "{:?}", report.cost_error);
+}
+
+#[test]
+fn test_hash_merge_checks_the_constant_annotation() {
+    use crate::types::Operand;
+    // The shift constant's immediate says 10 while its annotation still says 9: the matcher
+    // must not trust the annotation.
+    let (err, n) = mutate_first_site(|p, s| {
+        let k_scalar = p.ops[p.vreg_def[&s.operands[3]]].srcs[0].as_vreg().unwrap();
+        let def = p.vreg_def[&k_scalar];
+        p.ops[def].srcs[0] = Operand::Imm(10);
+    });
+    assert!(err.unwrap().contains("shift amount is not a broadcast constant"));
+    assert_eq!(n, 0);
 }

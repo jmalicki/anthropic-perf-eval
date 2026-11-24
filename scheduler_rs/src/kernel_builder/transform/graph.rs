@@ -2,14 +2,32 @@
 //!
 //! Works on a complete program (`SsaProgram`) and on the ops emitted so far (the emitter's
 //! `ops`, whose op ids equal their indices). Dependencies follow dead code elimination
-//! (`eliminate_ssa_dead_code`) exactly: a read of a vector group alias depends on the 8 lane
-//! definers, and a read of a decomposed lane depends on the decomposed vector's definer.
+//! (`eliminate_ssa_dead_code`): a read of a vector group alias depends on the 8 lane
+//! definers, and a read of a decomposed lane depends on the decomposed vector's definer. One
+//! addition: a `SelectChoice`'s `delta_vreg` (read by its multiply_add lowering, not in
+//! `srcs`) counts as a read (`op_reads`), so no rewrite can remove or move a delta under its
+//! select. In emitted programs the delta's definer is also reached through the select's true
+//! value, so liveness is the same as DCE's.
+//!
+//! The view assumes single assignment; `redefined` names the VRegs with more than one
+//! definer (`def_index` gives the first, `const_value` none), so callers can refuse them.
 //! Maps are used for lookup only and never iterated, so results do not depend on hash order.
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::types::{Opcode, SsaOp, VReg};
+use crate::types::{Opcode, Operand, SsaOp, VReg};
+
+/// The VRegs `op` reads: its VReg operands and a `SelectChoice`'s `delta_vreg`.
+///
+/// # Arguments
+/// * `op` - The op.
+///
+/// # Returns
+/// The VRegs, operands first (duplicates kept).
+pub fn op_reads(op: &SsaOp) -> impl Iterator<Item = VReg> + '_ {
+    op.reads().chain(op.delta_vreg)
+}
 
 /// Def/use view of a slice of SSA ops.
 pub struct SsaGraph<'a> {
@@ -25,6 +43,8 @@ pub struct SsaGraph<'a> {
     users_cache: OnceCell<Vec<Vec<usize>>>,
     /// VRegs some op names in `keep_live`, computed on first use of `is_kept_live`.
     kept_live_cache: OnceCell<HashSet<VReg>>,
+    /// VRegs defined by more than one op.
+    redefined: BTreeSet<VReg>,
 }
 
 impl<'a> SsaGraph<'a> {
@@ -38,9 +58,14 @@ impl<'a> SsaGraph<'a> {
     /// The graph; nothing is copied but two lookup maps.
     pub fn new(ops: &'a [SsaOp], lanes: &'a HashMap<VReg, Vec<VReg>>) -> Self {
         let mut def = HashMap::with_capacity(ops.len());
+        let mut redefined = BTreeSet::new();
         for (i, op) in ops.iter().enumerate() {
             if let Some(dest) = op.dest {
-                def.entry(dest).or_insert(i);
+                if def.contains_key(&dest) {
+                    redefined.insert(dest);
+                } else {
+                    def.insert(dest, i);
+                }
             }
         }
         // Lanes of a vector that has a definer are decomposed elements (read group); lanes of
@@ -48,7 +73,7 @@ impl<'a> SsaGraph<'a> {
         // so the map is built deterministically (only looked up afterwards).
         let mut element_of = HashMap::new();
         for op in ops {
-            for v in op.reads() {
+            for v in op_reads(op) {
                 if let Some(ls) = lanes.get(&v) {
                     if def.contains_key(&v) {
                         for (k, &e) in ls.iter().enumerate() {
@@ -65,7 +90,17 @@ impl<'a> SsaGraph<'a> {
                 }
             }
         }
-        SsaGraph { ops, def, lanes, element_of, users_cache: OnceCell::new(), kept_live_cache: OnceCell::new() }
+        SsaGraph { ops, def, lanes, element_of, users_cache: OnceCell::new(), kept_live_cache: OnceCell::new(), redefined }
+    }
+
+    /// VRegs with more than one definer (not single assignment), in increasing order.
+    pub fn redefined(&self) -> &BTreeSet<VReg> {
+        &self.redefined
+    }
+
+    /// Whether `v` has more than one definer.
+    pub fn is_redefined(&self, v: VReg) -> bool {
+        self.redefined.contains(&v)
     }
 
     /// Index of the op defining `v`, if any (a write-group alias and the zero VReg have none).
@@ -89,13 +124,26 @@ impl<'a> SsaGraph<'a> {
     }
 
     /// Constant produced by the op defining `v` (`ConstChoice` / `Const`), if any.
+    ///
+    /// The `produces_constant` annotation is trusted only when it agrees with the op's
+    /// immediate (`srcs[0]`), which is what lowering emits; a mismatch, a missing immediate or
+    /// a redefined `v` gives `None`.
     pub fn const_value(&self, v: VReg) -> Option<i64> {
-        self.def_op(v).filter(|op| matches!(op.opcode, Opcode::ConstChoice | Opcode::Const))
-            .and_then(|op| op.produces_constant)
+        if self.is_redefined(v) {
+            return None;
+        }
+        let op = self.def_op(v).filter(|op| matches!(op.opcode, Opcode::ConstChoice | Opcode::Const))?;
+        match (op.srcs.first(), op.produces_constant) {
+            (Some(Operand::Imm(imm)), Some(k)) if *imm == k => Some(k),
+            _ => None,
+        }
     }
 
-    /// The scalar `s` if `v` is `vbroadcast(s)`.
+    /// The scalar `s` if `v` is `vbroadcast(s)` (and `v` is defined once).
     pub fn broadcast_source(&self, v: VReg) -> Option<VReg> {
+        if self.is_redefined(v) {
+            return None;
+        }
         let op = self.def_op(v)?;
         if op.opcode != Opcode::Vbroadcast {
             return None;
@@ -109,8 +157,9 @@ impl<'a> SsaGraph<'a> {
     }
 
     /// Indices of the ops op `idx` depends on, as dead code elimination sees it: the definer
-    /// of each VReg it reads, the 8 lane definers for a vector group alias, the decomposed
-    /// vector's definer for a lane. Sorted, without duplicates.
+    /// of each VReg it reads (`op_reads`, so including a select's delta), the 8 lane
+    /// definers for a vector group alias, the decomposed vector's definer for a lane. Sorted,
+    /// without duplicates.
     ///
     /// # Arguments
     /// * `idx` - Op index.
@@ -119,7 +168,7 @@ impl<'a> SsaGraph<'a> {
     /// The producer indices.
     pub fn producers(&self, idx: usize) -> Vec<usize> {
         let mut out = Vec::new();
-        for v in self.ops[idx].reads() {
+        for v in op_reads(&self.ops[idx]) {
             if let Some(ls) = self.lanes.get(&v) {
                 if !self.def.contains_key(&v) {
                     out.extend(ls.iter().filter_map(|l| self.def_index(*l)));
@@ -159,7 +208,8 @@ impl<'a> SsaGraph<'a> {
         &self.users_cache.get_or_init(|| self.users())[idx]
     }
 
-    /// Whether some op lists `v` in its `keep_live` (lifetime extension, not a read).
+    /// Whether some op lists `v`, or a lane of `v` when `v` is a vector group, in its
+    /// `keep_live` (lifetime extension, not a read).
     ///
     /// # Arguments
     /// * `v` - The VReg.
@@ -167,8 +217,9 @@ impl<'a> SsaGraph<'a> {
     /// # Returns
     /// True if a rewrite that removes `v` would leave a dangling `keep_live` entry.
     pub fn is_kept_live(&self, v: VReg) -> bool {
-        self.kept_live_cache
-            .get_or_init(|| self.ops.iter().filter_map(|o| o.keep_live.as_ref()).flatten().copied().collect())
-            .contains(&v)
+        let kept = self
+            .kept_live_cache
+            .get_or_init(|| self.ops.iter().filter_map(|o| o.keep_live.as_ref()).flatten().copied().collect());
+        kept.contains(&v) || self.group_lanes(v).map_or(false, |ls| ls.iter().any(|l| kept.contains(l)))
     }
 }

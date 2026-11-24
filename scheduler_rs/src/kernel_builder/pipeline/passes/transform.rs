@@ -4,6 +4,11 @@
 //! dead code elimination). Each rule in `CompilerConfig::transforms` reads only the ops, never
 //! emitter state (see `kernel_builder::transform`). With no transforms configured it does
 //! nothing, so default output is unchanged.
+//!
+//! Op ids are renumbered by a transform, so ids that refer to the program (for example the
+//! CP-SAT `forced_shifts`) mean ops of the transformed program, as the scheduler JSON of a
+//! run with the same transforms lists them; `build_and_schedule_cpsat` checks they name
+//! vector ops of it.
 
 use crate::kernel_builder::config::TransformKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
@@ -36,6 +41,14 @@ impl Pass for TransformPass {
             let (program, summary) = match t {
                 TransformKind::HashMerge => {
                     let (p, report) = apply_hash_merge(program, &HashMergeRule::default(), |_| true)?;
+                    if report.sites == 0 {
+                        // Always shown: a requested rewrite that does nothing is a configuration
+                        // mistake (e.g. combined with --merge-hash-stages, already merged).
+                        eprintln!(
+                            "warning: --transform hash-merge rewrote 0 sites{}",
+                            if report.refused.is_some() { "" } else { " (already merged, e.g. with --merge-hash-stages?)" }
+                        );
+                    }
                     (p, report.summary())
                 }
             };

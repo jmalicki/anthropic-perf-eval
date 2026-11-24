@@ -1096,8 +1096,10 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// see docs/EMISSION_STRUCTURE_MODEL.md.
 /// transform: rewrite rules applied to the finished SSA program before scheduling, in order
 /// (list of names; default none). "hash-merge": hash stages 2+3 in three ops, found and
-/// rewritten from the ops alone (the program `merge_hash_stages` emits, up to the position of
-/// one shared constant). See scheduler_rs/src/kernel_builder/transform/hash_merge.rs.
+/// rewritten from the ops alone; on the default emission the result is the program
+/// `merge_hash_stages` emits, op for op up to VReg numbering. Op ids are renumbered, so
+/// `forced_shifts` must name ops of the transformed program. See
+/// scheduler_rs/src/kernel_builder/transform/hash_merge.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,
