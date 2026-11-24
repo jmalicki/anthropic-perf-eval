@@ -49,6 +49,8 @@ mod tests;
 mod tests_index;
 #[cfg(test)]
 mod tests_interp;
+#[cfg(test)]
+mod tests_values;
 
 pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};

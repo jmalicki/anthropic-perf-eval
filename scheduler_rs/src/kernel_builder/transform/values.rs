@@ -4,7 +4,15 @@
 //!
 //! * `MemoryLayout`: where the problem keeps its arrays (`problem.py` `build_mem_image`): the
 //!   header word holding the pointer to the tree (4), the indices (5) and the values (6), and
-//!   the batch size. A whole-program fact (`FactSource::Program`).
+//!   their extents (`n_nodes`, `batch_size`, `batch_size`). The three arrays lie back to back
+//!   after the header, so two accesses are disjoint when each is *located* (inside the extent
+//!   of the array its header word points to) and they are in different arrays or in
+//!   non-overlapping ranges of one (`MemoryLayout::may_overlap`); an access that is not located
+//!   may alias anything. A whole-program fact (`FactSource::Program`).
+//! * Addresses (`ValueFacts::address`): `mem[word] + offset`, a pointer loaded from a constant
+//!   header word plus constants, offsets mod 2^32 as the machine adds. A header word is read as
+//!   a pointer only while no store with an address that is not located came before the load
+//!   (such a store could have rewritten the header); after one, addresses are unknown.
 //! * `Assumption`: what the run declares and the ops cannot show. `InitialIndicesZero` is an
 //!   input precondition (`problem.py` `Input.generate` starts every index at 0; the canonical
 //!   program already relies on it, R7's base case). `IndicesNotObserved` is an output
@@ -38,6 +46,9 @@ pub struct MemoryLayout {
     pub values_word: i64,
     /// Words in the indices (and in the values) array.
     pub batch_size: i64,
+    /// Words in the tree array, when known; `None` makes no tree access located (sound: every
+    /// tree access may alias).
+    pub n_nodes: Option<i64>,
 }
 
 impl MemoryLayout {
@@ -49,7 +60,51 @@ impl MemoryLayout {
     /// # Returns
     /// Header words 4 (tree), 5 (indices), 6 (values).
     pub fn problem(batch_size: usize) -> Self {
-        MemoryLayout { tree_word: 4, indices_word: 5, values_word: 6, batch_size: batch_size as i64 }
+        MemoryLayout { tree_word: 4, indices_word: 5, values_word: 6, batch_size: batch_size as i64, n_nodes: None }
+    }
+
+    /// The layout with the tree's extent known.
+    ///
+    /// # Arguments
+    /// * `n_nodes` - Words in the tree array.
+    /// * `batch_size` - Number of lanes.
+    ///
+    /// # Returns
+    /// `problem(batch_size)` with `n_nodes` set.
+    pub fn problem_with_tree(n_nodes: usize, batch_size: usize) -> Self {
+        MemoryLayout { n_nodes: Some(n_nodes as i64), ..Self::problem(batch_size) }
+    }
+
+    /// Words in the array header word `word` points to, if it points to one of known extent.
+    pub fn extent(&self, word: i64) -> Option<i64> {
+        if word == self.indices_word || word == self.values_word {
+            Some(self.batch_size)
+        } else if word == self.tree_word {
+            self.n_nodes
+        } else {
+            None
+        }
+    }
+
+    /// Whether `width` words at `a` lie inside the array `a.word` points to.
+    pub fn located(&self, a: Address, width: i64) -> bool {
+        self.extent(a.word).map_or(false, |n| a.offset >= 0 && a.offset + width <= n)
+    }
+
+    /// Whether two accesses may touch a common word: `false` only when both are located and
+    /// they are in different arrays (laid out disjoint by `build_mem_image`) or in
+    /// non-overlapping ranges of one.
+    ///
+    /// # Arguments
+    /// * `a`, `wa` - First address (`None`: unknown) and width.
+    /// * `b`, `wb` - Second address and width.
+    pub fn may_overlap(&self, a: Option<Address>, wa: i64, b: Option<Address>, wb: i64) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) if self.located(a, wa) && self.located(b, wb) => {
+                a.word == b.word && a.offset < b.offset + wb && b.offset < a.offset + wa
+            }
+            _ => true,
+        }
     }
 
     /// The fact a rule records when it relies on the layout.
@@ -66,7 +121,7 @@ impl MemoryLayout {
 
     /// Whether `width` words at `offset` from the indices pointer lie inside the indices.
     pub fn in_indices(&self, a: Address, width: i64) -> bool {
-        a.word == self.indices_word && a.offset >= 0 && a.offset + width <= self.batch_size
+        a.word == self.indices_word && self.located(a, width)
     }
 }
 
@@ -124,6 +179,8 @@ pub struct ValueFacts {
     known: Vec<Option<i64>>,
     /// Per op: whether that constant relies on `InitialIndicesZero`.
     assumed: Vec<bool>,
+    /// Per op: the address its (scalar) result holds, `mem[word] + offset`, if shown.
+    addresses: Vec<Option<Address>>,
     /// The reserved zero register (holds 0, no definer).
     zero: Option<VReg>,
 }
@@ -172,14 +229,25 @@ impl ValueFacts {
     /// The facts.
     pub fn compute(graph: &SsaGraph, zero: Option<VReg>, layout: &MemoryLayout, assumptions: &[Assumption]) -> Self {
         let n = graph.ops.len();
-        let mut facts = ValueFacts { known: vec![None; n], assumed: vec![false; n], zero };
+        let mut facts = ValueFacts { known: vec![None; n], assumed: vec![false; n], addresses: vec![None; n], zero };
         let initial_zero = assumptions.contains(&Assumption::InitialIndicesZero);
         let mut stored = false;
+        // Set once a store whose address is not located has run: it may have rewritten a
+        // header word, so no header word is read as a pointer after it.
+        let mut header_clobbered = false;
         for (i, op) in graph.ops.iter().enumerate() {
             let (value, assumed) = facts.evaluate(graph, op, layout, initial_zero && !stored);
             facts.known[i] = value.map(|v| v & MASK);
             facts.assumed[i] = value.is_some() && assumed;
-            stored |= op.writes_memory();
+            facts.addresses[i] = facts.address_of(graph, op, header_clobbered);
+            if op.writes_memory() {
+                stored = true;
+                let w = if matches!(op.opcode, Opcode::Vstore) { 8 } else { 1 };
+                let a = op.srcs.first().and_then(|s| s.as_vreg()).and_then(|v| facts.address(graph, v));
+                if !a.map_or(false, |a| layout.located(a, w)) {
+                    header_clobbered = true;
+                }
+            }
         }
         facts
     }
@@ -219,7 +287,7 @@ impl ValueFacts {
                     }
                 }
                 match (a.0, b.0, c.0) {
-                    (Some(x), Some(y), Some(z)) => (Some((x.wrapping_mul(y) + z) & MASK), a.1 || b.1 || c.1),
+                    (Some(x), Some(y), Some(z)) => (Some(x.wrapping_mul(y).wrapping_add(z) & MASK), a.1 || b.1 || c.1),
                     _ => (None, false),
                 }
             }
@@ -276,9 +344,21 @@ impl ValueFacts {
     /// # Returns
     /// The address, or `None` if it is not of that form.
     pub fn address(&self, graph: &SsaGraph, v: VReg) -> Option<Address> {
-        let op = graph.def_op(v)?;
+        if graph.is_redefined(v) {
+            return None;
+        }
+        graph.def_index(v).and_then(|i| self.addresses.get(i).copied().flatten())
+    }
+
+    /// The address op `op`'s result holds, from the addresses and constants of the ops before
+    /// it (memoised per op by `compute`, so add chains cost linear time).
+    fn address_of(&self, graph: &SsaGraph, op: &SsaOp, header_clobbered: bool) -> Option<Address> {
+        let dest = op.dest?;
+        if !dest.is_scalar() || graph.is_redefined(dest) {
+            return None;
+        }
         match (op.engine, op.opcode) {
-            (Engine::Load, Opcode::Load) => {
+            (Engine::Load, Opcode::Load) if !header_clobbered => {
                 let word = op.srcs.first().and_then(|s| match s {
                     Operand::Imm(k) => Some(*k),
                     Operand::VReg(w) => self.value(graph, *w),
@@ -289,7 +369,8 @@ impl ValueFacts {
                 let (a, b) = (op.srcs[0].as_vreg()?, op.srcs[1].as_vreg()?);
                 for (p, k) in [(a, b), (b, a)] {
                     if let (Some(base), Some(k)) = (self.address(graph, p), self.value(graph, k)) {
-                        return Some(Address { word: base.word, offset: base.offset + k });
+                        // The machine adds mod 2^32.
+                        return Some(Address { word: base.word, offset: (base.offset + k) & MASK });
                     }
                 }
                 None

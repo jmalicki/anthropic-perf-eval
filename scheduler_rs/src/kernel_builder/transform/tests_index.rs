@@ -514,6 +514,17 @@ fn test_values_only_delta_table() {
             }
         }
     }
+    // Pinned rows (the measured table, not a formula): the per-site, shared and total deltas.
+    for row in [
+        "| 2 | ZeroBased | Index | standard | 32 x [vec_fixed -1, vec_shiftable -2, alu -1, store -1] | 0 | vec_fixed -32, vec_shiftable -64, alu -32, store -32 |",
+        "| 2 | ZeroBased | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -3, alu -2, load -1, store -1] | vec_fixed -1, load -1, const_alu -1 | vec_fixed -65, vec_shiftable -96, alu -64, load -33, store -32, const_alu -1 |",
+        "| 2 | Mirrored | Index | standard | 32 x [vec_fixed -1, vec_shiftable -2, alu -1, store -1] | vec_fixed -2, alu -1, load -1, const_alu -1 | vec_fixed -34, vec_shiftable -64, alu -33, load -1, store -32, const_alu -1 |",
+        "| 16 | ZeroBased | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -3, alu -1, store -1] | 0 | vec_fixed -64, vec_shiftable -96, alu -32, store -32 |",
+        "| 16 | ZeroBased | Path | Bits | 32 x [vec_fixed -6, vec_shiftable -6, alu -1, store -1] | 0 | vec_fixed -192, vec_shiftable -192, alu -32, store -32 |",
+        "| 16 | Mirrored | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -2, alu -1, store -1] | vec_fixed -1, load -1, const_alu -1 | vec_fixed -65, vec_shiftable -64, alu -32, load -1, store -32, const_alu -1 |",
+    ] {
+        assert!(rows.iter().any(|r| r == row), "missing or changed row: {}", row);
+    }
     eprintln!("| rounds | form | bit source | depths 1-4 | per site (alone) | shared | total |");
     eprintln!("|---|---|---|---|---|---|---|");
     for r in rows {
@@ -568,10 +579,79 @@ fn test_index_transforms_schedule_like_the_flags_at_32_groups() {
                 "{} {:?}: (cycles, ops, peak, over budget, lane entries, live lane entries) rewritten {:?} flags {:?}",
                 label, ts, rewritten, flagged
             );
+            assert_eq!(rewritten.0, flagged.0, "{} {:?}: cycles", label, ts);
             assert_eq!(rewritten.1, flagged.1, "{} {:?}: lowered ops", label, ts);
+            assert_eq!(rewritten.2, flagged.2, "{} {:?}: peak live words", label, ts);
             assert_eq!(rewritten.3, flagged.3, "{} {:?}: budget", label, ts);
             assert_eq!(rewritten.5, flagged.5, "{} {:?}: live lane entries", label, ts);
             assert_eq!(rewritten.4 - rewritten.5, flagged.4 - flagged.5, "{} {:?}: stale lane entries", label, ts);
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Near misses of prune_index.rs's match_at and values-only's keep_live check (review of #77)
+// ----------------------------------------------------------------------------
+
+/// Apply `mutate` to the first site of `kind` in the 16-round default program and return that
+/// op's rejection.
+fn prune_near_miss(kind: PruneKind, mutate: impl Fn(&mut SsaProgram, usize)) -> String {
+    let mut p = raw_program(&ProblemSpec::default());
+    let rule = PruneIndexRule::for_problem(256);
+    let op = {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        rule.find_sites(&g, p.zero_vreg).0.into_iter().find(|s| s.kind == kind).unwrap().op
+    };
+    mutate(&mut p, op);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let values = super::values::ValueFacts::compute(&g, p.zero_vreg, &rule.layout, &rule.assumptions);
+    match rule.match_at(&g, &values, op) {
+        Ok(s) => panic!("{:?} site at op {} still matched: {:?}", kind, op, s.facts),
+        Err(e) => e.0,
+    }
+}
+
+#[test]
+fn test_prune_index_near_misses_are_refused() {
+    for kind in [PruneKind::ZeroUpdate, PruneKind::SharedConstant] {
+        // keep_live on the op itself: the list would be lost with the op.
+        let why = prune_near_miss(kind, |p, op| {
+            let other = p.ops[op - 1].dest.or(p.ops[0].dest).unwrap();
+            p.ops[op].keep_live = Some(vec![other]);
+        });
+        assert!(why.contains("keep_live"), "{:?}: {}", kind, why);
+        // The result is a vector group key: renaming it would orphan its lanes.
+        let why = prune_near_miss(kind, |p, op| {
+            let out = p.ops[op].dest.unwrap();
+            let lanes: Vec<crate::types::VReg> = (0..8).map(|k| crate::types::VReg::scalar(p.vreg_count + k)).collect();
+            p.vreg_count += 8;
+            p.vector_group_lanes.insert(out, lanes);
+        });
+        assert!(why.contains("vector group"), "{:?}: {}", kind, why);
+        // The result is defined again later: not single assignment.
+        let why = prune_near_miss(kind, |p, op| {
+            let out = p.ops[op].dest.unwrap();
+            let mut again = p.ops[op].clone();
+            again.id = p.ops.len();
+            again.dest = Some(out);
+            p.ops.push(again);
+        });
+        assert!(why.contains("more than once"), "{:?}: {}", kind, why);
+        // A trace id: the traced value would disappear.
+        let why = prune_near_miss(kind, |p, op| p.ops[op].trace_id = Some("t".into()));
+        assert!(why.contains("trace id"), "{:?}: {}", kind, why);
+    }
+}
+
+#[test]
+fn test_values_only_refuses_a_store_carrying_keep_live() {
+    let mut p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+    let store = found_store(&p, 3);
+    let v = p.ops[0].dest.unwrap();
+    p.ops[store].keep_live = Some(vec![v]);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let (sites, rejected) = ValuesOnlyRule::for_problem(256).find_sites(&g, p.zero_vreg);
+    assert_eq!(sites.len(), 31);
+    assert!(!sites.iter().any(|s| s.store == store));
+    assert_eq!(reason_count(&rejected, "keep_live"), 1, "{:?}", rejected);
 }

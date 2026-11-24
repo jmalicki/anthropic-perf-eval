@@ -37,13 +37,16 @@ use super::values::{Assumption, MemoryLayout, ValueFacts};
 /// Rule id.
 pub const PRUNE_INDEX_RULE: &str = "prune-index";
 
-/// Alternatives of a site (rewritten or not).
-pub const PRUNE_INDEX_ALTERNATIVES: [AlternativeSpec; 2] = [
+/// Alternatives of a site (rewritten or not). A rule-5 site (`shared-constant`) is plain CSE
+/// and takes `shared`, justified by `CSE-identical-broadcast`; only rule-6 sites
+/// (`zero-update`) take `pruned` and the R12 proofs.
+pub const PRUNE_INDEX_ALTERNATIVES: [AlternativeSpec; 3] = [
     AlternativeSpec { name: "kept", proofs: &[] },
     AlternativeSpec {
         name: "pruned",
         proofs: &["R12-fma-zero-factor", "R12-index-update-from-root", "R12-index-update-from-root-needs-zero"],
     },
+    AlternativeSpec { name: "shared", proofs: &["CSE-identical-broadcast"] },
 ];
 
 /// The prune-index rule.
@@ -84,6 +87,15 @@ pub enum PruneKind {
 }
 
 impl PruneKind {
+    /// The alternative a rewritten site of this kind takes (`PRUNE_INDEX_ALTERNATIVES`), with
+    /// its proofs.
+    pub fn alternative(&self) -> &'static AlternativeSpec {
+        match self {
+            PruneKind::SharedConstant => &PRUNE_INDEX_ALTERNATIVES[2],
+            PruneKind::ZeroUpdate => &PRUNE_INDEX_ALTERNATIVES[1],
+        }
+    }
+
     /// Name in reports.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -164,11 +176,14 @@ impl PruneIndexRule {
                     zero: None,
                     round,
                     group,
-                    facts: vec![Fact {
-                        name: "same_op",
-                        value: format!("vbroadcast of the same scalar (constant {}) as op {}", value, first),
-                        source: FactSource::Structure,
-                    }],
+                    facts: vec![
+                        Fact {
+                            name: "same_op",
+                            value: format!("vbroadcast of the same scalar (constant {}) as op {}", value, first),
+                            source: FactSource::Structure,
+                        },
+                        Fact { name: "proofs", value: PruneKind::SharedConstant.alternative().proofs.join(", "), source: FactSource::Structure },
+                    ],
                 })
             }
             (Engine::Valu, Opcode::MultiplyAdd) => {
@@ -192,6 +207,7 @@ impl PruneIndexRule {
                     },
                     source: FactSource::Structure,
                 }];
+                facts.push(Fact { name: "proofs", value: PruneKind::ZeroUpdate.alternative().proofs.join(", "), source: FactSource::Structure });
                 if values.relies_on_assumption(graph, zero) {
                     facts.push(self.layout.fact());
                     facts.push(Assumption::InitialIndicesZero.fact());

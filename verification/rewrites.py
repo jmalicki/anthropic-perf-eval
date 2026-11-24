@@ -430,6 +430,20 @@ def check_index_update_from_root(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+def check_cse_identical_broadcast(ctx=None) -> tuple[str, str, float, dict]:
+    """CSE-identical-broadcast: two vbroadcasts of one scalar hold the same 8 lanes.
+
+    The justification of the prune-index rule's `shared-constant` sites (rule 5): a later
+    `vbroadcast(s)` is replaced by an earlier one of the same scalar `s`. Plain common
+    subexpression elimination of a pure op; R12 says nothing about it. Lane-wise model: lane i
+    of vbroadcast(s) is s.
+    """
+    s = _bv("s")
+    first = [s for _ in range(8)]
+    second = [s for _ in range(8)]
+    return _refute("CSE-identical-broadcast", Or(*[a != b for a, b in zip(first, second, strict=True)]), ctx=ctx)
+
+
 def check_fma_zero_factor(ctx=None) -> tuple[str, str, float, dict]:
     """R12-fma-zero-factor: multiply_add(0, m, c) = multiply_add(m, 0, c) = c for all m, c.
 
@@ -646,6 +660,7 @@ REWRITE_CHECKS = [
     ("R11-mirrored-index-range", "Mirrored index range per depth and the level constants", check_mirrored_index_range),
     ("R12-index-update-from-root", "From idx = 0 the index update is its offset", check_index_update_from_root),
     ("R12-index-update-from-root-needs-zero", "The offset alone is wrong for a nonzero index (SAT)", check_index_update_from_root_needs_zero),
+    ("CSE-identical-broadcast", "Two vbroadcasts of one scalar are equal lane for lane", check_cse_identical_broadcast),
     ("R12-fma-zero-factor", "multiply_add with a zero factor is its addend", check_fma_zero_factor),
     ("R13-select-by-path-bits", "Select tree driven by the branch bits yields the reference node", check_select_by_path_bits),
     ("R13-select-by-path-bits-needs-bit-order", "Select tree with the bits in the wrong order is wrong (SAT)", check_select_by_path_bits_needs_bit_order),
