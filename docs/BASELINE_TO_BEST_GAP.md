@@ -226,20 +226,19 @@ These are goal-only. None is needed for the benchmark number.
 
 ## 6. Reproduction
 
+`scripts/measure_baseline.py` reads the original builder from git (`git show
+dceff11:perf_takehome.py`, into a temporary directory; no copy is committed). It runs the
+builder on the vendored upstream simulator (`upstream/tests/frozen_problem.py`) and prints
+the counts in section 1. `--save` writes the kernel without debug slots and with layout
+metadata for the lifter.
+
 ```bash
-# The baseline builder as of the repo's first commit (not byte-identical to upstream's file)
-git show dceff11:perf_takehome.py > $SCRATCH/pt_dceff11.py
+# Section 1 (prints cycles 147734 and the op counts)
+uv run python -m scripts.measure_baseline
+uv run python -m scripts.measure_baseline --save $SCRATCH/baseline_16r256b.json
+uv run python -m scripts.measure_baseline --rounds 2 --batch-size 8 --save $SCRATCH/baseline_2r8b.json
 
-# Count ops and run it on the vendored upstream simulator; --save writes the kernel without
-# debug slots and with layout metadata for the lifter. The script is a ~60-line harness that
-# exec's the builder part of that file with `problem` bound to upstream/tests/frozen_problem.py.
-uv run python $SCRATCH/measure_baseline.py $REPO $SCRATCH/pt_dceff11.py 16 256 --save $SCRATCH/baseline_16r256b.json
-uv run python $SCRATCH/measure_baseline.py $REPO $SCRATCH/pt_dceff11.py 2 8   --save $SCRATCH/baseline_2r8b.json
-
-# Lift and alias analysis
+# Section 2 (lift and alias analysis)
 uv run python -m scripts.kernel_lift baseline_2r8b=$SCRATCH/baseline_2r8b.json --concrete-runs 4
 uv run python -m scripts.kernel_lift baseline_16r256b=$SCRATCH/baseline_16r256b.json
 ```
-
-The measurement harness was a scratch file and is not checked in. If this map turns into
-work, check it in under `scripts/`, with a skill.
