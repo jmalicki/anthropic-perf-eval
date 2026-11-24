@@ -603,6 +603,20 @@ impl Surgery {
                 }
             }
         }
+        // Single assignment again, before dead ops are dropped: a rule that inserts a second
+        // definer of a VReg (e.g. two replacements of one op) must fail here. Checked later, the
+        // second definer would already be gone as "dead" (liveness follows the first one), and
+        // the program would silently use whichever came first.
+        {
+            let mut defined: HashSet<VReg> = HashSet::new();
+            for (op, _) in &seq {
+                if let Some(d) = op.dest {
+                    if !defined.insert(d) {
+                        return Err(format!("after the rewrite: {:?} is defined more than once", d));
+                    }
+                }
+            }
+        }
         // 3. Remove what the rewrite made dead.
         let ops_only: Vec<SsaOp> = seq.iter().map(|(o, _)| o.clone()).collect();
         let live_after = dce_live(&ops_only, &program);
@@ -653,6 +667,7 @@ impl Surgery {
         // Nothing may read a value that no longer exists, and every value is defined before
         // it is read (the input's order, which the splice must keep).
         check_def_before_use(&ops, &program).map_err(|e| format!("after the rewrite: {}", e))?;
+
 
         // 4. Constants: alternatives for the new order (C13).
         let is_foreign = |k: usize| origins[k].map_or(false, |i| foreign.contains(&i));

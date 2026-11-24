@@ -240,11 +240,42 @@ impl MirrorIndexRule {
                     return Err(format!("index value {:?} is the delta of select op {}", v, r));
                 }
                 let u = self.classify(graph, &values, &plan, &index_stores, r, v, k)?;
+                // A constant the use rewrites with (compare, level position, mirror) may itself
+                // rely on InitialIndicesZero: the rewrite then does too.
+                if matches!(u, IndexUse::Compare { .. } | IndexUse::LevelPosition { .. } | IndexUse::Mirror)
+                    && op.srcs.iter().filter_map(|s| s.as_vreg()).any(|w| w != v && values.relies_on_assumption(graph, w))
+                {
+                    plan.assumed = true;
+                }
                 plan.uses.push((r, v, u));
             }
         }
         plan.uses.sort_by_key(|(r, v, _)| (*r, *v));
         plan.uses.dedup_by_key(|(r, v, _)| (*r, *v));
+        // An op the rewrite replaces must be replaced once: one reading two index values (e.g.
+        // `idxA == idxB` where both fold to constants) would get two replacements.
+        let replaced = |u: &IndexUse| !matches!(u, IndexUse::Step | IndexUse::Constant);
+        for w in plan.uses.windows(2) {
+            if w[0].0 == w[1].0 && replaced(&w[0].2) && replaced(&w[1].2) {
+                return Err(format!("op {} reads two index values", w[0].0));
+            }
+        }
+        // The rewrite removes the steps, the mirror ops and the depth-0 index definers without
+        // a replacement that carries their metadata: refuse a trace id or keep_live on them
+        // (as the other rules refuse a site op carrying one).
+        let mut dropped: Vec<usize> = plan.steps.iter().map(|s| s.op).collect();
+        dropped.extend(plan.uses.iter().filter(|(_, _, u)| *u == IndexUse::Mirror).map(|(r, _, _)| *r));
+        dropped.extend(plan.index_values.iter().filter(|(_, (k, _))| *k == 0).filter_map(|(v, _)| graph.def_index(*v)));
+        dropped.sort_unstable();
+        dropped.dedup();
+        for i in dropped {
+            if graph.ops[i].trace_id.is_some() {
+                return Err(format!("op {} the rewrite removes carries a trace id", i));
+            }
+            if graph.ops[i].keep_live.is_some() {
+                return Err(format!("op {} the rewrite removes keeps other values live (keep_live)", i));
+            }
+        }
         plan.facts.push(Fact {
             name: "index_chain",
             value: format!("{} steps, {} index values, depth from the step count", plan.steps.len(), plan.index_values.len()),
@@ -359,6 +390,8 @@ fn v_constant(surgery: &mut Surgery, graph_values: &[Option<i64>], value: i64, a
     let scalar = if value == 0 {
         None
     } else if value <= 15 {
+        // `graph_values` holds only constant expressions (`constant_expressions`): a scalar
+        // that equals `value` only under an assumption, or an ALU temporary, is never reused.
         (0..=after).find(|&i| ops[i].dest.map_or(false, |d| d.is_scalar()) && graph_values[i] == Some(value)).and_then(|i| ops[i].dest)
     } else {
         None
@@ -368,6 +401,34 @@ fn v_constant(surgery: &mut Surgery, graph_values: &[Option<i64>], value: i64, a
         None => surgery.constant(value, after, &stamp.clone().with_var_type(Some(VarType::Constant))),
     };
     surgery.broadcast(s, after, &stamp.clone().with_var_type(Some(VarType::Constant)))
+}
+
+/// Per op: its value when it is a constant expression, i.e. a `ConstChoice` / `Const`, or an
+/// ALU op whose operands are all constant expressions, holding the value without any
+/// assumption. Anything else (a load, an op whose value folds only through an absorbing zero
+/// or an assumed zero) is `None`, so reusing it as a constant cannot import an assumption or
+/// keep a temporary alive.
+fn constant_expressions(graph: &SsaGraph, values: &ValueFacts) -> Vec<Option<i64>> {
+    let mut out: Vec<Option<i64>> = vec![None; graph.ops.len()];
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Some(d) = op.dest else { continue };
+        let Some(v) = values.value(graph, d) else { continue };
+        if values.relies_on_assumption(graph, d) {
+            continue;
+        }
+        let ok = match (op.engine, op.opcode) {
+            (_, Opcode::ConstChoice) | (_, Opcode::Const) => true,
+            (Engine::Alu, _) => op.srcs.iter().all(|s| match s {
+                Operand::Imm(_) => true,
+                Operand::VReg(w) => graph.def_index(*w).map_or(false, |j| j < i && out[j].is_some()),
+            }),
+            _ => false,
+        };
+        if ok {
+            out[i] = Some(v);
+        }
+    }
+    out
 }
 
 /// Rewrite every index value of `program` to the mirrored form, or none.
@@ -391,8 +452,7 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
             }
         };
         let values = ValueFacts::compute(&graph, program.zero_vreg, &rule.layout, &rule.assumptions);
-        let op_values: Vec<Option<i64>> =
-            program.ops.iter().map(|o| o.dest.and_then(|d| values.value(&graph, d))).collect();
+        let op_values = constant_expressions(&graph, &values);
         let value_stores = rule.stores_to(&graph, &values, rule.layout.values_word);
         let defs: Vec<usize> = value_stores
             .iter()
@@ -493,6 +553,22 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
         let c = v_constant(&mut surgery, &op_values, value, first - 1, &stamp);
         visit_consts.insert((vis, value), c);
     }
+    // Where each n becomes available (original op index): a depth-1 n is the bit itself; a
+    // later n is the multiply_add inserted at the step.
+    let mut n_at: BTreeMap<VReg, usize> = BTreeMap::new();
+    for (&v, (k, bits)) in &plan.index_values {
+        if *k == 1 {
+            if let Some(d) = surgery.ops().iter().position(|o| o.dest == Some(bits[0])) {
+                n_at.insert(v, d);
+            }
+        }
+    }
+    for s in &plan.steps {
+        let dest = surgery.ops()[s.op].dest.unwrap();
+        if s.depth >= 1 {
+            n_at.insert(dest, s.op);
+        }
+    }
     // Uses.
     let anchor = value_store_defs.iter().copied().max();
     let mut visit: Option<(usize, VReg, usize, VReg)> = None; // (visit, scalar, last use op, base)
@@ -553,7 +629,16 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
                 *report.sites.entry("mirror").or_default() += 1;
             }
             IndexUse::Store => {
-                let at = anchor.ok_or("index store without value stores to anchor the final index")?;
+                // After the last stored value (where the emitter computes final indices), but
+                // never before n is defined, and always before the store itself.
+                let after_n = n_at.get(&v).copied();
+                let at = match (anchor, after_n) {
+                    (Some(a), Some(b)) => a.max(b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => r - 1,
+                }
+                .min(r - 1);
                 let fstamp = Stamp::of(&surgery.ops()[at]).with_var_type(Some(VarType::BatchData));
                 let value = match nv {
                     None => v_constant(&mut surgery, &op_values, 0, at, &fstamp),
