@@ -30,6 +30,7 @@ use crate::types::{ConstEncoding, Engine, Opcode, SsaOp};
 
 use super::super::config::{AccessEncoding, CachedSelect, IndexForm, KernelConfig, ProblemSpec, SelectBitSource, MAX_TREE_REDUCE_DEPTH};
 use super::super::tick_tock_ssa::SsaTickTockKernelBuilder;
+use super::super::emit_ssa::is_dce_root;
 use super::graph::SsaGraph;
 use super::tree_access::{encoding_name, TreeAccessInstantiation, BIT_DRIVEN, TREE_ACCESS_ALTERNATIVES, TREE_ACCESS_RULE};
 
@@ -110,7 +111,7 @@ type Atom = (u32, u32, usize);
 
 /// When an op is alive, as a function of the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Liveness {
+pub(super) enum Liveness {
     /// In no plan.
     Dead,
     /// In every plan.
@@ -145,7 +146,7 @@ impl Term {
 
 /// The problem shape the features are defined over (`Context` in the Python model).
 #[derive(Clone, Debug)]
-struct Shape {
+pub(super) struct Shape {
     rounds: usize,
     n_groups: usize,
     /// Choice rounds (depth 1 to `MAX_TREE_REDUCE_DEPTH`) by depth.
@@ -154,7 +155,7 @@ struct Shape {
 }
 
 impl Shape {
-    fn new(spec: &ProblemSpec) -> Self {
+    pub(super) fn new(spec: &ProblemSpec) -> Self {
         let depth_of: Vec<usize> = (0..spec.rounds).map(|r| spec.round_depth(r)).collect();
         let mut rounds_at: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (r, &d) in depth_of.iter().enumerate() {
@@ -501,6 +502,93 @@ pub fn instantiate_tree_access(
     Ok((program, inst))
 }
 
+/// ConstChoice ops whose category (`const` or `const_alu`) can differ between plans.
+///
+/// A ConstChoice is `const_alu` iff it can be derived by ALU ops from the constants created
+/// before it (`emit_const_choice`): a property of emission order, not of liveness. The level
+/// end constants `L_d` of gather bases are created lazily, at the first round that gathers at
+/// depth `d`, so whether one exists before a later constant, and where `L_d` itself is
+/// created, depend on the plan. For every constant live in some plan this recomputes the
+/// category with every subset of the lazy constants before it missing, and for a lazy
+/// constant also at each later user (where a plan without the earlier gather creates it).
+///
+/// # Returns
+/// One problem per constant whose category changes (empty: categories are plan-independent).
+pub(super) fn plan_dependent_const_categories(
+    ops: &[SsaOp],
+    live: &[Liveness],
+    users: &[Vec<usize>],
+    has_zero: bool,
+    shape: &Shape,
+) -> Vec<String> {
+    use crate::types::{compute_const_encodings_alu_ready, RegionKind};
+    use std::collections::HashSet;
+    let consts: Vec<(usize, i64)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.opcode == Opcode::ConstChoice)
+        .map(|(i, o)| (i, o.produces_constant.expect("ConstChoice carries its value")))
+        .collect();
+    let is_lazy = |i: usize| {
+        ops[i].region.map_or(false, |t| {
+            t.kind == RegionKind::TreeAccess(AccessEncoding::Gather)
+                && t.group.is_none()
+                && t.round.map_or(false, |r| shape.rounds_at.contains_key(&shape.depth_of[r as usize]))
+        })
+    };
+    let lazy: Vec<(usize, i64)> = consts.iter().copied().filter(|&(i, _)| is_lazy(i)).collect();
+    let available_before = |pos: usize, missing: &HashSet<i64>| -> HashSet<i64> {
+        let mut a: HashSet<i64> = consts
+            .iter()
+            .filter(|&&(j, v)| j < pos && !missing.contains(&v))
+            .map(|&(_, v)| v)
+            .collect();
+        if has_zero {
+            a.insert(0);
+        }
+        a
+    };
+    let derivable = |v: i64, a: &HashSet<i64>| !compute_const_encodings_alu_ready(v, a, 2).is_empty();
+    let mut problems = Vec::new();
+    for &(x, value) in &consts {
+        if live[x] == Liveness::Dead {
+            continue;
+        }
+        let as_emitted = derivable(value, &available_before(x, &HashSet::new()));
+        // Positions where some plan may create it: here, and for a lazy constant at each user.
+        let mut positions = vec![x];
+        if is_lazy(x) {
+            positions.extend(users[x].iter().copied());
+        }
+        'pos: for pos in positions {
+            let before: Vec<i64> = lazy.iter().filter(|&&(j, _)| j < pos && j != x).map(|&(_, v)| v).collect();
+            if before.len() > 6 {
+                problems.push(format!("constant {} (op {}): too many lazy constants to check", value, x));
+                break;
+            }
+            for mask in 0u32..(1 << before.len()) {
+                let mut missing: HashSet<i64> =
+                    (0..before.len()).filter(|k| mask & (1 << k) != 0).map(|k| before[k]).collect();
+                missing.insert(value);
+                if derivable(value, &available_before(pos, &missing)) != as_emitted {
+                    problems.push(format!(
+                        "constant {} (op {}) is {} as emitted but {} when created at op {} without {:?}: its \
+                         category depends on the plan",
+                        value,
+                        x,
+                        if as_emitted { "const_alu" } else { "const" },
+                        if as_emitted { "const" } else { "const_alu" },
+                        pos,
+                        missing.iter().filter(|&&m| m != value).collect::<BTreeSet<_>>()
+                    ));
+                    break 'pos;
+                }
+            }
+        }
+    }
+    problems
+}
+
 /// Derive the tree-access cost table of `spec` by instantiation (module docs).
 ///
 /// # Arguments
@@ -551,10 +639,7 @@ pub fn derive_tree_access_costs(spec: &ProblemSpec) -> Result<DerivedCostTable, 
             continue;
         }
         let op = &ops[i];
-        if matches!(
-            op.opcode,
-            Opcode::Store | Opcode::Vstore | Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier
-        ) {
+        if is_dce_root(op) {
             live[i] = Liveness::Always;
             continue;
         }
@@ -573,6 +658,8 @@ pub fn derive_tree_access_costs(spec: &ProblemSpec) -> Result<DerivedCostTable, 
         }
         live[i] = acc;
     }
+
+    problems.extend(plan_dependent_const_categories(ops, &live, &users, program.zero_vreg.is_some(), &shape));
 
     // Shared ops: base, or features through their OR.
     let feature_order = shape.feature_names();

@@ -97,6 +97,25 @@ def test_table_by_instantiation_equals_calibrated(table):
     assert {f["name"]: f["source"] for f in site["facts"]}["depth"] == "structure"
 
 
+@pytest.mark.parametrize("context", [
+    es.Context(rounds=16, batch_size=32, index_form="zero-based"),  # bits not matched on the zero-based chain
+    es.Context(rounds=16, batch_size=32, values_only=True),         # tail:* liveness is per group
+])
+def test_table_by_instantiation_refuses_unsupported_contexts(context):
+    with pytest.raises(RuntimeError, match="problems"):
+        es.derive_table(context)
+
+
+@pytest.mark.ci_only
+@pytest.mark.timeout(1800)
+def test_table_by_instantiation_equals_calibrated_32_groups(tmp_path):
+    """The parity gate at the shape of the recorded results (144 probe builds, a few minutes)."""
+    ctx = es.Context(rounds=16, batch_size=256)
+    calibrated = es.calibrate(ctx, str(tmp_path), log=None)
+    derived, _ = es.derive_table(ctx)
+    assert es.table_differences(derived, calibrated) == []
+
+
 def test_counts_cover_every_ssa_op(tmp_path):
     rows = es.flag_plan(CTX, "bits-flow", "after-wrap")
     _, _, sched, _ = es.build_emission(rows, CTX, str(tmp_path))

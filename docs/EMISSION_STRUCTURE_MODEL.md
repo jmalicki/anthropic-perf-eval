@@ -135,8 +135,10 @@ features above: shared tables to `table:d` / `pairs:d` / `pairs_high:d` / `mobiu
 base vectors and level-end constants to `gather_round:r` / `gather_depth:d`, and ORs across
 levels, by inclusion-exclusion, to the `and:table:*` products (the scalar constants 3 to 15
 that address the cached nodes). Per-site differences to gathering give `groups:d:e` and are
-checked to be the same at every site. Anything that does not reduce to the features is
-reported, never fitted. At 16 rounds the derived table equals the calibrated one entry for
+checked to be the same at every site. Whether a constant is `const` or `const_alu` depends
+on the constants created before it, so on emission order: every constant is checked to keep
+its category whatever the lazily created level-end constants `L_d` (and its own position, for
+those). Anything that does not reduce to the features is reported, never fitted. At 16 rounds the derived table equals the calibrated one entry for
 entry with 4 and with 32 groups (`tests/test_emission_structure.py`, and `derive` against
 `calibrate`); the Rust tests also compare its predictions with emitted programs directly.
 Contexts it does not cover yet: the zero-based index (bits are matched only on the mirrored

@@ -581,6 +581,10 @@ def derive_table(ctx: Context) -> tuple[CostTable, dict]:
     unknown = sorted(set(doc["coefficients"]) - set(names))
     if unknown:
         raise RuntimeError(f"derived cost table has features the model lacks: {unknown}")
+    not_derived = [n for n in names if n not in doc["coefficients"]]
+    if not_derived:  # e.g. tail:* (values_only): never zero-filled
+        raise RuntimeError(f"derived cost table does not derive {len(not_derived)} features of the model: "
+                           f"{not_derived[:5]}")
     coefficients = {n: {c: int(doc["coefficients"].get(n, {}).get(c, 0)) for c in CATEGORIES} for n in names}
     return CostTable(ctx, coefficients, notes=["derived by instantiation (scheduler_rs)"]), doc
 
