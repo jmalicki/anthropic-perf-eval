@@ -97,12 +97,14 @@ struct Known {
     assumed: bool,
 }
 
-/// The bit-path analysis of a program: the form of every op's result, if any.
+/// The bit-path analysis of a program: the form of every op's result, or why it has none.
+///
+/// Computed once, in op order: an op's result is evaluated from its operands' stored results,
+/// so the cost is linear in the program (no recursion). A failure that comes from an operand
+/// carries that operand's reason unchanged (the first failing step down the chain); reasons
+/// are short and name no VReg, so rejection counts group by cause.
 pub struct BitPaths {
-    forms: Vec<Option<Known>>,
-    /// For rejection reasons at the base of a chain.
-    layout: MemoryLayout,
-    assumptions: Vec<Assumption>,
+    results: Vec<Result<Known, String>>,
 }
 
 impl BitPaths {
@@ -110,61 +112,93 @@ impl BitPaths {
     ///
     /// # Arguments
     /// * `graph` - The program.
-    /// * `values` - Its value facts (zero values, with the assumption they rely on).
-    /// * `layout`, `assumptions` - What `values` was computed with (for rejection reasons).
+    /// * `values` - Its value facts (constants and zero values, with the assumption they rely on).
+    /// * `layout`, `assumptions` - What `values` was computed with (for the reason at the base
+    ///   of a chain).
     ///
     /// # Returns
     /// The analysis.
     pub fn compute(graph: &SsaGraph, values: &ValueFacts, layout: &MemoryLayout, assumptions: &[Assumption]) -> Self {
-        let mut paths =
-            BitPaths { forms: vec![None; graph.ops.len()], layout: *layout, assumptions: assumptions.to_vec() };
+        let mut paths = BitPaths { results: Vec::with_capacity(graph.ops.len()) };
         for i in 0..graph.ops.len() {
-            paths.forms[i] = paths.evaluate(graph, values, i).ok();
+            let r = paths.evaluate(graph, values, layout, assumptions, i);
+            paths.results.push(r);
         }
         paths
     }
 
     /// The form of `v` (`None` if unknown or `v` is not single assignment).
     pub fn form(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Option<BitForm> {
-        self.known(graph, values, v).map(|k| k.form)
+        self.known(graph, values, v).ok().map(|k| k.form)
     }
 
-    fn known(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Option<Known> {
-        if graph.is_redefined(v) || !v.is_vector() {
-            return None;
+    /// The stored result of op `i`: its form, or why it has none.
+    pub fn result(&self, i: usize) -> Result<BitForm, &str> {
+        match &self.results[i] {
+            Ok(k) => Ok(k.form.clone()),
+            Err(e) => Err(e.as_str()),
+        }
+    }
+
+    /// Whether op `i`'s form relies on `InitialIndicesZero`.
+    pub fn assumed(&self, i: usize) -> bool {
+        matches!(&self.results[i], Ok(k) if k.assumed)
+    }
+
+    fn known(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Result<Known, String> {
+        if graph.is_redefined(v) {
+            return Err("a VReg is defined more than once".into());
+        }
+        if !v.is_vector() {
+            return Err("a scalar, not a vector".into());
         }
         if values.value(graph, v) == Some(0) {
             // A zero is Pos([]) and Zero([]) at once; `Pos` is returned and `zero_form` below
             // accepts it as `Zero([])` too.
-            return Some(Known { form: BitForm::Pos(vec![]), assumed: values.relies_on_assumption(graph, v) });
+            return Ok(Known { form: BitForm::Pos(vec![]), assumed: values.relies_on_assumption(graph, v) });
         }
-        graph.def_index(v).and_then(|i| self.forms[i].clone())
+        match graph.def_index(v) {
+            Some(i) if i < self.results.len() => self.results[i].clone(),
+            Some(_) => Err("read before its definition".into()),
+            None => Err("no definer (vector group or lane)".into()),
+        }
     }
 
-    /// `v` as `Pos`, with the assumption flag.
-    fn pos(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Option<(Vec<VReg>, bool)> {
+    /// `v` as `Pos`, with the assumption flag, or why not.
+    fn pos(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Result<(Vec<VReg>, bool), String> {
         match self.known(graph, values, v)? {
-            Known { form: BitForm::Pos(l), assumed } => Some((l, assumed)),
-            _ => None,
+            Known { form: BitForm::Pos(l), assumed } => Ok((l, assumed)),
+            Known { form: BitForm::Zero(_), .. } => Err("a zero-based index where a position is needed".into()),
         }
     }
 
-    /// `v` as `Zero` (a zero value is `Zero([])`), with the assumption flag.
-    fn zero_form(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Option<(Vec<VReg>, bool)> {
+    /// `v` as `Zero` (a zero value is `Zero([])`), with the assumption flag, or why not.
+    fn zero_form(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> Result<(Vec<VReg>, bool), String> {
         match self.known(graph, values, v)? {
-            Known { form: BitForm::Zero(l), assumed } => Some((l, assumed)),
-            Known { form: BitForm::Pos(l), assumed } if l.is_empty() => Some((l, assumed)),
-            _ => None,
+            Known { form: BitForm::Zero(l), assumed } => Ok((l, assumed)),
+            Known { form: BitForm::Pos(l), assumed } if l.is_empty() => Ok((l, assumed)),
+            Known { form: BitForm::Pos(_), .. } => Err("a position where a zero-based index is needed".into()),
         }
     }
 
-    /// The form of op `i`'s result from the forms before it, or why it has none (the first
-    /// failing step, for rejections).
-    fn evaluate(&self, graph: &SsaGraph, values: &ValueFacts, i: usize) -> Result<Known, String> {
+    /// The form of op `i`'s result from the stored results before it, or why it has none.
+    fn evaluate(
+        &self,
+        graph: &SsaGraph,
+        values: &ValueFacts,
+        layout: &MemoryLayout,
+        assumptions: &[Assumption],
+        i: usize,
+    ) -> Result<Known, String> {
         let op = &graph.ops[i];
         let Some(dest) = op.dest else { return Err("op without a dest".into()) };
         if graph.is_redefined(dest) {
-            return Err(format!("{:?} is defined more than once", dest));
+            return Err("a VReg is defined more than once".into());
+        }
+        if matches!(op.opcode, Opcode::Vload | Opcode::Load) {
+            // The base of a zero-based chain (when its value is 0, `known` answers before
+            // this): say why it is not shown to be 0.
+            return Err(format!("chain base: {}", values.why_not_zero(graph, dest, layout, assumptions)));
         }
         if op.engine != Engine::Valu || !dest.is_vector() {
             return Err(format!("{:?} {:?} is not a vector ALU op", op.engine, op.opcode));
@@ -175,115 +209,101 @@ impl BitPaths {
         };
         // Constants by propagation (`ValueFacts`): folds the ALU-derived constants the emitter
         // builds (e.g. `L_2 = 6` as `3 + 3`) and trusts an annotation only where it agrees
-        // with the immediate.
+        // with the immediate. A constant can itself rely on `InitialIndicesZero` (e.g.
+        // `loaded_idx + 1`), so every form built with one carries that flag too.
         let konst = |v: VReg| values.value(graph, v);
-        let why = |v: VReg| self.why_no_form(graph, values, v);
+        let konst_assumed = |v: VReg| values.relies_on_assumption(graph, v);
         match (op.opcode, srcs.as_slice()) {
             (Opcode::And, &[a, b]) => {
-                let x = if konst(b) == Some(1) {
-                    a
+                let (x, one) = if konst(b) == Some(1) {
+                    (a, b)
                 } else if konst(a) == Some(1) {
-                    b
+                    (b, a)
                 } else {
                     return Err(format!("AND with neither operand the constant 1 ({:?}, {:?})", konst(a), konst(b)));
                 };
                 match self.pos(graph, values, x) {
                     // Pos(L) & 1 is the last bit of L.
-                    Some((l, assumed)) if !l.is_empty() => {
-                        Ok(Known { form: BitForm::Pos(vec![*l.last().unwrap()]), assumed })
+                    Ok((l, assumed)) if !l.is_empty() => {
+                        Ok(Known { form: BitForm::Pos(vec![*l.last().unwrap()]), assumed: assumed || konst_assumed(one) })
                     }
                     // Anything & 1 is a bit (R6): its own result.
-                    _ => Ok(Known { form: BitForm::Pos(vec![dest]), assumed: false }),
+                    _ => Ok(Known { form: BitForm::Pos(vec![dest]), assumed: konst_assumed(one) }),
                 }
             }
             (Opcode::Shr, &[x, k]) => {
                 if konst(k) != Some(1) {
                     return Err(format!("shift right by {:?}, not by the constant 1", konst(k)));
                 }
-                match self.pos(graph, values, x) {
-                    Some((mut l, assumed)) if !l.is_empty() => {
-                        l.pop();
-                        Ok(Known { form: BitForm::Pos(l), assumed })
-                    }
-                    Some(_) => Err("shift right of a zero".into()),
-                    None => Err(format!("shifted value is not a position of branch bits: {}", why(x))),
+                let (mut l, assumed) = self.pos(graph, values, x)?;
+                if l.is_empty() {
+                    return Err("shift right of a zero".into());
                 }
+                l.pop();
+                Ok(Known { form: BitForm::Pos(l), assumed: assumed || konst_assumed(k) })
             }
             (Opcode::Sub, &[c, x]) => {
-                let Some(c) = konst(c) else { return Err("SUB minuend is not a broadcast constant".into()) };
-                if let Some((l, assumed)) = self.zero_form(graph, values, x).filter(|(l, _)| !l.is_empty()) {
-                    return if c == level_last(l.len()) {
-                        Ok(Known { form: BitForm::Pos(l), assumed })
-                    } else {
-                        Err(format!("SUB constant {} is not L_{} = {}", c, l.len(), level_last(l.len())))
-                    };
-                }
-                match self.pos(graph, values, x) {
-                    Some((l, assumed)) if !l.is_empty() => {
-                        if c == level_last(l.len()) {
-                            Ok(Known { form: BitForm::Zero(l), assumed })
+                let Some(cv) = konst(c) else { return Err("SUB minuend is not a constant".into()) };
+                let ca = konst_assumed(c);
+                match self.known(graph, values, x)? {
+                    Known { form: BitForm::Zero(l), assumed } if !l.is_empty() => {
+                        if cv == level_last(l.len()) {
+                            Ok(Known { form: BitForm::Pos(l), assumed: assumed || ca })
                         } else {
-                            Err(format!("SUB constant {} is not L_{} = {}", c, l.len(), level_last(l.len())))
+                            Err(format!("SUB constant {} is not L_{} = {}", cv, l.len(), level_last(l.len())))
                         }
                     }
-                    _ => Err(format!("SUB subtrahend has no bit form: {}", why(x))),
+                    Known { form: BitForm::Pos(l), assumed } if !l.is_empty() => {
+                        if cv == level_last(l.len()) {
+                            Ok(Known { form: BitForm::Zero(l), assumed: assumed || ca })
+                        } else {
+                            Err(format!("SUB constant {} is not L_{} = {}", cv, l.len(), level_last(l.len())))
+                        }
+                    }
+                    _ => Err("SUB of a zero".into()),
                 }
             }
             (Opcode::MultiplyAdd, &[a, b, c]) => {
-                let x = if konst(b) == Some(2) {
-                    a
+                let (x, two) = if konst(b) == Some(2) {
+                    (a, b)
                 } else if konst(a) == Some(2) {
-                    b
+                    (b, a)
                 } else {
                     return Err(format!("multiply_add with no factor the constant 2 ({:?}, {:?})", konst(a), konst(b)));
                 };
-                // Mirrored: 2 Pos(L) + Pos([b]).
-                if let (Some((l, a1)), Some((bit, a2))) = (self.pos(graph, values, x), self.pos(graph, values, c)) {
-                    if bit.len() == 1 && l.len() < MAX_PATH_BITS {
-                        let mut l = l;
+                let ta = konst_assumed(two);
+                let extend = |mut l: Vec<VReg>, bit: Vec<VReg>| -> Option<Vec<VReg>> {
+                    (bit.len() == 1 && l.len() < MAX_PATH_BITS).then(|| {
                         l.push(bit[0]);
-                        return Ok(Known { form: BitForm::Pos(l), assumed: a1 || a2 });
+                        l
+                    })
+                };
+                // An operand without a form: its reason is the cause.
+                self.known(graph, values, x)?;
+                self.known(graph, values, c)?;
+                // Mirrored: 2 Pos(L) + Pos([b]).
+                if let (Ok((l, a1)), Ok((bit, a2))) = (self.pos(graph, values, x), self.pos(graph, values, c)) {
+                    if let Some(l) = extend(l, bit) {
+                        return Ok(Known { form: BitForm::Pos(l), assumed: a1 || a2 || ta });
                     }
                 }
                 // Zero-based: 2 Zero(L) + Zero([b]).
-                if let (Some((l, a1)), Some((bit, a2))) =
-                    (self.zero_form(graph, values, x), self.zero_form(graph, values, c))
-                {
-                    if bit.len() == 1 && l.len() < MAX_PATH_BITS {
-                        let mut l = l;
-                        l.push(bit[0]);
-                        return Ok(Known { form: BitForm::Zero(l), assumed: a1 || a2 });
+                if let (Ok((l, a1)), Ok((bit, a2))) = (self.zero_form(graph, values, x), self.zero_form(graph, values, c)) {
+                    if let Some(l) = extend(l, bit) {
+                        return Ok(Known { form: BitForm::Zero(l), assumed: a1 || a2 || ta });
                     }
                 }
-                Err(format!(
-                    "multiply_add is neither 2 Pos + bit nor 2 Zero + (2 - bit): factor: {}; addend: {}",
-                    why(x),
-                    why(c)
-                ))
+                Err("multiply_add is neither 2 Pos + bit nor 2 Zero + (2 - bit)".into())
             }
             _ => Err(format!("{:?} is not AND, SHR, SUB or multiply_add", op.opcode)),
         }
     }
 
-    /// Why `v` has no form: the first failing step down its definition.
+    /// Why `v` has no form (its stored reason), or that it has one.
     pub fn why_no_form(&self, graph: &SsaGraph, values: &ValueFacts, v: VReg) -> String {
-        if graph.is_redefined(v) {
-            return format!("{:?} is defined more than once", v);
-        }
-        if let Some(k) = self.known(graph, values, v) {
-            return format!("has the form {:?}", k.form);
-        }
-        let Some(i) = graph.def_index(v) else { return "no definer (vector group or lane)".into() };
-        match self.evaluate(graph, values, i) {
-            Ok(_) => "has a form".into(),
-            Err(e) => {
-                let op = &graph.ops[i];
-                if matches!(op.opcode, Opcode::Vload | Opcode::Load) {
-                    // The base of a zero-based chain: say why it is not shown to be 0.
-                    return format!("chain base: {}", values.why_not_zero(graph, v, &self.layout, &self.assumptions));
-                }
-                e
-            }
+        match self.known(graph, values, v) {
+            Ok(k) => format!("has the form {:?}", k.form),
+            Err(e) => e,
         }
     }
 }
@@ -296,6 +316,9 @@ pub struct SelectBitsRule {
     /// Declared assumptions (`InitialIndicesZero` lets a zero-based chain start at the
     /// loaded input index).
     pub assumptions: Vec<Assumption>,
+    /// The program's zero register, for `Rule::match_site` (which gets only the graph);
+    /// `find_sites` takes it as an argument and falls back to this.
+    pub zero: Option<VReg>,
 }
 
 impl SelectBitsRule {
@@ -307,7 +330,21 @@ impl SelectBitsRule {
     /// # Returns
     /// The rule, assuming `InitialIndicesZero`.
     pub fn for_problem(batch_size: usize) -> Self {
-        SelectBitsRule { layout: MemoryLayout::problem(batch_size), assumptions: vec![Assumption::InitialIndicesZero] }
+        SelectBitsRule { layout: MemoryLayout::problem(batch_size), assumptions: vec![Assumption::InitialIndicesZero], zero: None }
+    }
+
+    /// The same rule for a program whose zero register is `zero` (so `match_site` sees the
+    /// zeros `find_sites` sees, e.g. the wrap round's broadcasts of it).
+    pub fn with_zero(mut self, zero: Option<VReg>) -> Self {
+        self.zero = zero;
+        self
+    }
+
+    /// The value facts and bit-path forms of `graph`, as every entry point computes them.
+    fn analyses(&self, graph: &SsaGraph, zero: Option<VReg>) -> (ValueFacts, BitPaths) {
+        let values = ValueFacts::compute(graph, zero, &self.layout, &self.assumptions);
+        let paths = BitPaths::compute(graph, &values, &self.layout, &self.assumptions);
+        (values, paths)
     }
 }
 
@@ -345,11 +382,12 @@ impl SelectBitsRule {
         let reject = |s: String| Err(Rejection(s));
         let op = &graph.ops[i];
         let Some(output) = op.dest else { return reject("op without a dest".into()) };
-        let known = match paths.evaluate(graph, values, i) {
-            Ok(k) => k,
-            Err(e) => return reject(e),
+        let form = match paths.result(i) {
+            Ok(f) => f,
+            Err(e) => return reject(e.to_string()),
         };
-        let bit = match &known.form {
+        let assumed = paths.assumed(i);
+        let bit = match &form {
             BitForm::Pos(l) if l.len() == 1 => l[0],
             BitForm::Pos(l) => return reject(format!("a position of {} bits, not one bit", l.len())),
             BitForm::Zero(l) => return reject(format!("a zero-based index of {} bits, not a bit", l.len())),
@@ -370,22 +408,42 @@ impl SelectBitsRule {
             return reject("op keeps other values live (keep_live)".into());
         }
         let Some(bit_def) = graph.def_index(bit) else { return reject("the bit has no definer".into()) };
+        // The rewrite can make the index-derived ops behind the site dead. If one of them is
+        // named in another op's keep_live, removing it would leave that list dangling: refuse
+        // (conservatively: any index-derived ancestor, whether or not it would die).
+        {
+            let mut stack: Vec<usize> = vec![i];
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(j) = stack.pop() {
+                if !seen.insert(j) || j == bit_def {
+                    continue;
+                }
+                let derived = matches!(paths.result(j), Ok(BitForm::Pos(l)) | Ok(BitForm::Zero(l)) if !l.is_empty());
+                if !derived {
+                    continue;
+                }
+                if j != i && graph.ops[j].dest.map_or(false, |d| graph.is_kept_live(d)) {
+                    return reject("an index-derived op the rewrite may make dead is kept live by another op".into());
+                }
+                stack.extend(graph.ops[j].srcs.iter().filter_map(|s| s.as_vreg()).filter_map(|v| graph.def_index(v)));
+            }
+        }
         let label = |f: fn(&crate::types::RegionTag) -> Option<u32>| op.region.and_then(|t| f(&t));
         let mut facts = vec![
             Fact { name: "equals_bit", value: format!("{:?} op {} equals the bit of op {}", op.opcode, i, bit_def), source: FactSource::Structure },
             Fact { name: "boolean", value: format!("op {} is x & 1 (R6)", bit_def), source: FactSource::Structure },
         ];
-        if known.assumed {
+        if assumed {
             facts.push(self.layout.fact());
             facts.push(Assumption::InitialIndicesZero.fact());
         }
         Ok(SelectBitsSite { op: i, output, bit, bit_def, round: label(|t| t.round), group: label(|t| t.group), facts })
     }
 
-    /// Candidate ops: vector AND and SHR whose non-constant operand is defined by a
-    /// multiply_add, SUB, SHR or AND (an index or a value derived from one), and SUB of a
-    /// constant (the zero-based mirroring). Branch bits `v & 1` of a hash output are not
-    /// candidates.
+    /// Candidate ops: vector AND, SHR, SUB and multiply_add with an operand defined by one of
+    /// those (a cheap structural filter; hash ops pass it too). `find_sites` counts a
+    /// rejection only for a candidate with an operand shown to be index-derived
+    /// (`index_derived`), so rejections are about index-derived ops, not hash stages.
     fn is_candidate(graph: &SsaGraph, i: usize) -> bool {
         let op = &graph.ops[i];
         if op.engine != Engine::Valu || !matches!(op.opcode, Opcode::And | Opcode::Shr | Opcode::Sub | Opcode::MultiplyAdd) {
@@ -395,6 +453,15 @@ impl SelectBitsRule {
             graph.def_op(v).map_or(false, |d| {
                 d.engine == Engine::Valu && matches!(d.opcode, Opcode::MultiplyAdd | Opcode::Sub | Opcode::Shr | Opcode::And)
             })
+        })
+    }
+
+    /// Whether some operand of op `i` is index-derived: a position or zero-based index of at
+    /// least one bit, or a chain that fails only at its base (a loaded index not shown to be 0).
+    fn index_derived(graph: &SsaGraph, values: &ValueFacts, paths: &BitPaths, i: usize) -> bool {
+        graph.ops[i].srcs.iter().filter_map(|s| s.as_vreg()).any(|v| match paths.known(graph, values, v) {
+            Ok(Known { form: BitForm::Pos(l), .. }) | Ok(Known { form: BitForm::Zero(l), .. }) => !l.is_empty(),
+            Err(e) => e.starts_with("chain base"),
         })
     }
 
@@ -408,8 +475,7 @@ impl SelectBitsRule {
     /// `(sites, rejections)`. Candidates whose form is a position or a zero-based index of
     /// more than one bit are intermediate steps, not rejections, and are not counted.
     pub fn find_sites(&self, graph: &SsaGraph, zero: Option<VReg>) -> (Vec<SelectBitsSite>, BTreeMap<String, usize>) {
-        let values = ValueFacts::compute(graph, zero, &self.layout, &self.assumptions);
-        let paths = BitPaths::compute(graph, &values, &self.layout, &self.assumptions);
+        let (values, paths) = self.analyses(graph, zero.or(self.zero));
         let mut sites = Vec::new();
         let mut rejected: BTreeMap<String, usize> = BTreeMap::new();
         for p in self.propose(graph) {
@@ -417,7 +483,8 @@ impl SelectBitsRule {
                 match self.match_at(graph, &values, &paths, i) {
                     Ok(s) => sites.push(s),
                     Err(e) if e.0.starts_with("a position of") || e.0.starts_with("a zero-based index of") => {}
-                    Err(e) => *rejected.entry(e.0).or_default() += 1,
+                    Err(e) if Self::index_derived(graph, &values, &paths, i) => *rejected.entry(e.0).or_default() += 1,
+                    Err(_) => {}
                 }
             }
         }
@@ -453,10 +520,10 @@ impl Rule for SelectBitsRule {
             .collect()
     }
 
-    /// Computes the facts for every call; use `find_sites` for a whole program.
+    /// Computes the analyses for every call (with `self.zero`, as `find_sites` does); use
+    /// `find_sites` for a whole program.
     fn match_site(&self, graph: &SsaGraph, proposal: &Proposal) -> Result<SelectBitsSite, Rejection> {
-        let values = ValueFacts::compute(graph, None, &self.layout, &self.assumptions);
-        let paths = BitPaths::compute(graph, &values, &self.layout, &self.assumptions);
+        let (values, paths) = self.analyses(graph, self.zero);
         let mut last = Rejection("empty proposal".into());
         for &i in &proposal.ops {
             match self.match_at(graph, &values, &paths, i) {

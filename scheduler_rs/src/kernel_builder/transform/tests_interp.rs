@@ -34,7 +34,7 @@ impl Rng {
 ///
 /// # Returns
 /// `(mem, indices_p, values_p)`.
-fn memory(spec: &ProblemSpec, seed: u64) -> (Vec<u32>, usize, usize) {
+pub(super) fn memory(spec: &ProblemSpec, seed: u64) -> (Vec<u32>, usize, usize) {
     let mut rng = Rng(seed);
     let (n_nodes, batch) = (spec.n_nodes, spec.batch_size);
     let header = 8;

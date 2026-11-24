@@ -277,6 +277,23 @@ impl Surgery {
                 }
             }
         }
+        // A vector with its own definer whose lanes are also listed as a group (a decomposed
+        // vector, read lane by lane) must not have a lane written by another op: its value would
+        // then be two things, and no rule's analysis (which reads the vector's definer) sees the
+        // lane write. Keys are checked in sorted order so the message is deterministic.
+        let mut keys: Vec<&VReg> = program.vector_group_lanes.keys().collect();
+        keys.sort_by_key(|v| (v.id, v.is_vector()));
+        for key in keys {
+            if !defined.contains(key) {
+                continue;
+            }
+            if let Some(lane) = program.vector_group_lanes[key].iter().find(|l| defined.contains(l)) {
+                return Err(format!(
+                    "{:?} is defined as a vector and its lane {:?} is written separately: a lane written twice",
+                    key, lane
+                ));
+            }
+        }
         check_def_before_use(&program.ops, program)
     }
 
