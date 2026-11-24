@@ -108,6 +108,7 @@ impl Pass for CpSatSchedulePass {
                 live_through_vregs: None,
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                ..Default::default()
             },
             Some(!greedy_budget_exceeded),
         )

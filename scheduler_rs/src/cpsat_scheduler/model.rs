@@ -472,6 +472,8 @@ pub fn schedule_ssa_cpsat(
     });
     let initial_live = entry_reads.as_deref();
     let cse_groups = hints.cse_groups;
+    let alu_lane_hints = hints.alu_lane_hints;
+    let window = hints.window;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -641,18 +643,22 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
+    // A window can also supply lane cycles from a previous feasible CP-SAT solution.
     // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
     // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
     // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
     // size and start hints), so what is hinted is exactly what the check counted.
     let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        if !shift_hints.is_some_and(|ids| ids.contains(&op_id)) {
+            return None;
+        }
         let lo = *asap.get(&op_id).unwrap_or(&0);
         let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
         hints
             .shifted_lane_cycle_hints
             .and_then(|m| m.get(&op_id))
-            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
-            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
+            .filter(|lanes| lanes.len() == VLEN && lanes.iter().all(|&c| c >= lo && c <= hi))
+            .or_else(|| alu_lane_hints.and_then(|m| m.get(&op_id)).filter(|lanes| lanes.len() == VLEN))
     };
 
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
@@ -856,6 +862,40 @@ pub fn schedule_ssa_cpsat(
                 "  Greedy hint domain widening: {} bound(s) widened to include greedy values",
                 widened_count
             );
+        }
+    }
+
+    // 2d. Window probe: the reference must stay inside every domain, and so must each cycle
+    // the block after the window can move to. 2c covers ops with a hint; dead stores (hint
+    // -1) are pinned at the reference too but got no widening, and tightening computed on a
+    // reduced op list need not cover the moved block.
+    if let Some(window) = window {
+        let mut widened = 0usize;
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(&cycle) = window.reference.cycles.get(idx) else { continue };
+            if cycle < 0 {
+                continue;
+            }
+            let lowest = if window.region(idx, op) == super::window::WindowRegion::After {
+                cycle - window.len.max(0)
+            } else {
+                cycle
+            };
+            if let Some(a) = final_asap.get_mut(&op.id) {
+                if lowest < *a {
+                    *a = lowest.max(0);
+                    widened += 1;
+                }
+            }
+            if let Some(a) = final_alap.get_mut(&op.id) {
+                if cycle > *a {
+                    *a = cycle;
+                    widened += 1;
+                }
+            }
+        }
+        if widened > 0 {
+            eprintln!("[window probe]   widened {} domain bound(s) to cover the reference", widened);
         }
     }
 
@@ -1363,6 +1403,17 @@ pub fn schedule_ssa_cpsat(
                     } else {
                         0 // Load
                     };
+                    // Window probe: a reference from an earlier solution may use an ALU-derived
+                    // encoding, which the add_imm hint set cannot say.
+                    let hint_idx = match window.and_then(|w| w.reference.const_choice_encoding.get(&ops[idx].id)) {
+                        Some(crate::types::ConstChoiceEncoding::AluDerive(info)) => alu_info
+                            .iter()
+                            .position(|&(l, r, opcode)| {
+                                ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                            })
+                            .map_or(hint_idx, |k| k + 2),
+                        _ => hint_idx,
+                    };
                     for (i, &var) in use_vars.iter().enumerate() {
                         model.add_hint(var, if i == hint_idx { 1 } else { 0 });
                     }
@@ -1625,6 +1676,15 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, _)| idx)
         .collect();
 
+    // Window probe: ops whose intervals no movable interval can meet are left out of the
+    // engine and scratch cumulatives (see CpsatWindow::pruned_ops). Empty otherwise.
+    let window_pruned: HashSet<usize> =
+        window.map_or_else(HashSet::new, |w| w.pruned_ops(ops, cse_groups.map_or(0, |g| g.len())));
+    let in_cumulative = |idx: usize| !window_pruned.contains(&idx);
+    if verbose && window.is_some() {
+        eprintln!("  Window: {} ops left out of the cumulatives", window_pruned.len());
+    }
+
     // VALU cumulative: non-shiftable VALU (always present except eliminable vb) + optional vb + shiftable + SelectChoice
     {
         let eliminable_vb_set: HashSet<usize> =
@@ -1634,14 +1694,14 @@ pub fn schedule_ssa_cpsat(
 
         // Add non-shiftable VALU ops that are not eliminable vbroadcasts (always present)
         for &idx in &non_shiftable_valu {
-            if eliminable_vb_set.contains(&idx) {
+            if eliminable_vb_set.contains(&idx) || !in_cumulative(idx) {
                 continue;
             }
             valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             valu_demands.push(1);
         }
         // Add optional VALU intervals for eliminable vbroadcasts (presence = !eliminate_vb)
-        for (vb_idx, _, _) in &eliminable_vbs {
+        for (vb_idx, _, _) in eliminable_vbs.iter().filter(|(i, _, _)| in_cumulative(*i)) {
             if let Some(&iv) = valu_optional_vb_intervals.get(vb_idx) {
                 valu_intervals.push(iv);
                 valu_demands.push(1);
@@ -1649,7 +1709,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add VALU intervals for shiftable ops: ForceValu => required; ForceAlu => none; Optimize => optional
-        for &idx in &shiftable_valu {
+        for &idx in shiftable_valu.iter().filter(|&&i| in_cumulative(i)) {
             match valu_shift_mode {
                 ValuShiftMode::ForceValu => {
                     valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
@@ -1666,7 +1726,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional VALU intervals from SelectChoice ops (when choice_var = true, i.e., FMA path)
-        for &idx in &select_choice_ops {
+        for &idx in select_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = select_valu_intervals.get(&idx) {
                 for &iv in intervals {
                     valu_intervals.push(iv);
@@ -1700,13 +1760,13 @@ pub fn schedule_ssa_cpsat(
         let mut alu_demands: Vec<i64> = Vec::new();
 
         // Add regular ALU ops (demand = 1)
-        for &idx in &alu_ops {
+        for &idx in alu_ops.iter().filter(|&&i| in_cumulative(i)) {
             alu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             alu_demands.push(1);
         }
 
         // Add ALU intervals for shifted VALU ops: ForceAlu => required intervals; Optimize => optional
-        for &idx in &shiftable_valu {
+        for &idx in shiftable_valu.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = alu_optional_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
@@ -1716,7 +1776,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional ALU intervals from ConstChoice ops (when ALU-derived encoding is chosen)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = const_choice_alu_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
@@ -1751,13 +1811,13 @@ pub fn schedule_ssa_cpsat(
         let mut load_demands: Vec<i64> = Vec::new();
 
         // Add regular Load ops
-        for &idx in &regular_load_ops {
+        for &idx in regular_load_ops.iter().filter(|&&i| in_cumulative(i)) {
             load_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             load_demands.push(1);
         }
 
         // Add optional Load intervals from ConstChoice ops (when choice_var = false)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = const_load_intervals.get(&idx) {
                 load_intervals.push(iv);
                 load_demands.push(1);
@@ -1782,7 +1842,7 @@ pub fn schedule_ssa_cpsat(
         let store_ops: Vec<usize> = ops
             .iter()
             .enumerate()
-            .filter(|(_, op)| op.engine == Engine::Store)
+            .filter(|(idx, op)| op.engine == Engine::Store && in_cumulative(*idx))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -1831,13 +1891,13 @@ pub fn schedule_ssa_cpsat(
         let mut flow_demands: Vec<i64> = Vec::new();
 
         // Add regular Flow ops
-        for &idx in &regular_flow_ops {
+        for &idx in regular_flow_ops.iter().filter(|&&i| in_cumulative(i)) {
             flow_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             flow_demands.push(1);
         }
 
         // Add optional Flow intervals from ConstChoice ops (when choice_var = true)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = const_flow_intervals.get(&idx) {
                 flow_intervals.push(iv);
                 flow_demands.push(1);
@@ -1845,7 +1905,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional Flow intervals from SelectChoice ops (when choice_var = false, i.e., vselect path)
-        for &idx in &select_choice_ops {
+        for &idx in select_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = select_flow_intervals.get(&idx) {
                 flow_intervals.push(iv);
                 flow_demands.push(1);
@@ -2151,6 +2211,9 @@ pub fn schedule_ssa_cpsat(
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
+            // The value of each size_vars entry (not every live VReg gets one: the window
+            // probe leaves some out).
+            let mut size_var_vregs: Vec<VReg> = Vec::new();
 
             // Scratch model `pools`: a write group (alias with no definer, lanes written one by
             // one) is one 8-word value for address assignment, so it is one vector here, live
@@ -2221,6 +2284,11 @@ pub fn schedule_ssa_cpsat(
                 let readers: &[usize] = scratch_readers.get(vreg).map_or(&[], |r| r.as_slice());
                 if initial_live.is_none() {
                     scratch_values.push((*vreg, def_idx, readers.to_vec()));
+                }
+                // Window probe: a value defined and read only by pruned ops is live only at
+                // cycles nothing can move to (the post-solve check still covers it).
+                if !in_cumulative(def_idx) && readers.iter().all(|&r| !in_cumulative(r)) {
+                    continue;
                 }
                 let (end_expr, end_for_interval) = if is_live_out {
                     let seg_end = segment_end_var.expect("segment_end when live_out");
@@ -2316,6 +2384,7 @@ pub fn schedule_ssa_cpsat(
                 model.set_constraint_name(c, &format!("scratch_live_size_{}", vreg.id));
 
                 size_vars.push((size, def_idx, last_use_idx));
+                size_var_vregs.push(*vreg);
                 if let Some(group) = pool_group_of_lane.get(vreg) {
                     let (group_end, end_hint) = if is_live_out {
                         (end_for_interval + i64::from(group_live_out_offset),
@@ -2574,7 +2643,7 @@ pub fn schedule_ssa_cpsat(
                     continue;
                 }
                 // Skip CSE consumers - they use shared sub_temp instead of individual sub_temp
-                if cse_consumer_set.contains(&idx) {
+                if cse_consumer_set.contains(&idx) || !in_cumulative(idx) {
                     continue;
                 }
                 let start = times[idx].issue();
@@ -2767,7 +2836,7 @@ pub fn schedule_ssa_cpsat(
 
                 // Now add size hints (live-out VRegs: use segment end = max_hint)
                 for (i, (size_var, def_idx, last_use_idx)) in size_vars.iter().enumerate() {
-                    let vreg = &live_vregs[i];
+                    let vreg = &size_var_vregs[i];
                     let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
                     if *def_idx >= hints.len() {
                         continue;
@@ -3303,6 +3372,31 @@ pub fn schedule_ssa_cpsat(
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
     }
 
+    // 10a. Window optimality probe (analysis only, hints.window): hold every op outside the
+    // window at its reference cycle (ops after it move as one block) and keep the ops inside
+    // it in the window. See cpsat_scheduler::window.
+    if let Some(window) = window {
+        let counts = super::window::apply_window_constraints(
+            &mut model,
+            ops,
+            window,
+            &op_vars,
+            &const_choice_alu_encoding_info,
+        );
+        if verbose {
+            eprintln!(
+                "  Window [{}, {}): {} ops before (fixed), {} inside (free{}), {} after (move as one block), {} free",
+                window.start,
+                window.start + window.len,
+                counts.before,
+                counts.inside,
+                if window.fix_window_encodings { ", encodings fixed" } else { "" },
+                counts.after,
+                counts.free
+            );
+        }
+    }
+
     // 10b. Makespan interval (tuning.makespan_interval): one interval [makespan, horizon) that
     // takes the whole capacity of every engine cumulative, as in OR-Tools' rcpsp_sat.py. It
     // excludes nothing (every interval of those cumulatives is present only for work that runs
@@ -3788,14 +3882,14 @@ pub fn schedule_ssa_cpsat(
                     ops[idx].id, idx, c, clamped, lb, ub
                 );
             }
-            if let Some(completion_var) = times[idx].completion() {
-                model.add_hint(completion_var, clamped);
-            }
             let lanes = hinted_lanes(ops[idx].id);
+            if let Some(completion_var) = times[idx].completion() {
+                let done = lanes.map_or(clamped, |lanes| lanes.iter().copied().max().unwrap_or(0) as i64);
+                model.add_hint(completion_var, done);
+            }
             for (lane, &alu_var) in times[idx].lanes().iter().enumerate() {
-                // A split shift hints each lane at its own cycle, unclamped: hinted_lanes
-                // only returns lanes inside the lane variables' domain, and the capacity
-                // check counted these exact cycles. Otherwise all lanes run in the op's cycle.
+                // Match the lane cycles used in the capacity check. A whole shift
+                // uses the same cycle for every lane.
                 let lane_hint = lanes.map_or(clamped, |l| l[lane] as i64);
                 model.add_hint(alu_var, lane_hint);
             }
@@ -3943,6 +4037,11 @@ pub fn schedule_ssa_cpsat(
                     .min();
                 earliest_fma_consumer.map_or(after_producers, |t| t.max(after_producers))
             });
+            // Window probe: the reference gives the SUB's cycle (it is pinned there).
+            let sub_cycle_hint = window
+                .and_then(|w| w.reference.cse_sub_cycles.get(g).copied())
+                .filter(|_| window.is_some_and(|w| w.reference.cse_sub_cycles.len() == groups.len()))
+                .unwrap_or(sub_cycle_hint);
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
             model.add_hint(cse_subs[g].cycle(), clamped);
             // The shared SUB's scratch interval: it ends one cycle after the SUB, or two
@@ -4249,7 +4348,21 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 14. Solve
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   model built in {:.1}s: {} variables, {} constraints",
+            start_time.elapsed().as_secs_f64(),
+            model.proto().variables.len(),
+            model.proto().constraints.len()
+        );
+    }
     let response = model.solve_with_parameters(&params);
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   solve: {:.1}s wall, {:.1} deterministic time",
+            response.wall_time, response.deterministic_time
+        );
+    }
     let solve_time = start_time.elapsed().as_secs_f64();
     // A deterministic budget only makes the run reproducible if the solve ended on it (or on
     // optimality). If the wall-clock backstop fired first, how far the search got depended on
