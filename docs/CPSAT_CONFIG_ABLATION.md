@@ -835,7 +835,9 @@ uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --budget 20 --
 uv run python -m verification.makespan_rows
 ```
 
-## 10. Group symmetry at 4 rounds, batch 64
+## 10. Group symmetry modes
+
+### Initial comparison at 4 rounds, batch 64
 
 With the makespan-only objective and solver seed 2, the `none` configuration reached 118 cycles,
 `checked` reached 126 and `declared` reached 129. The greedy scheduler reported 143 cycles.
@@ -884,10 +886,63 @@ All nine solves returned a feasible schedule with a solver lower bound of 95.
 Each kernel passed symbolic dataflow replay and reference simulator validation.
 For each matched seed, `none` improved on `declared` by 9–12 cycles and
 `checked` improved by 3–6 cycles. This comparison covers one instance and
-objective. The weighted objective and the 6-round case remain to be measured.
+objective. The next subsection reports the complete sweep on the composed code.
 
 ```bash
 uv run python -m scripts.run_symmetry_measurement --instances 4x64 --jobs 1 --time-limit 600 \
     --only declared-mk-s1,declared-mk-s2,declared-mk-s3,none-mk-s1,none-mk-s2,none-mk-s3,checked-mk-s1,checked-mk-s2,checked-mk-s3 \
     --out-dir build/symmetry_4x64_seeds --name matched_4x64_makespan
 ```
+
+### Complete matched sweep after scratch accounting and window probes
+
+The 36-cell sweep used the source tree published in `b3f2511`, which included
+the final #58 artifact safeguards, #64 scratch phase accounting and the #66 window probe.
+The release scheduler extension used Homebrew OR-Tools `9.15_16` on macOS arm64.
+Each cell used batch size 64, eight interleaved solver workers, a deterministic-time limit
+of 20 and a 3,600-second wall-clock backstop. Three cells ran concurrently. Each symmetry
+mode was paired with the same seeds (1, 2 and 3) for both objectives and round counts.
+
+All 36 cells had a complete feasible hint and returned `FEASIBLE`. Symbolic dataflow
+replay proved each kernel and reference simulator validation passed. Solver wall times
+ranged from 52.6 to 107.7 seconds, with no wall-clock backstop hits. The table reports
+schedule cycles by seed and the final solver lower bound within each configuration's domains.
+
+| Rounds | Objective | Symmetry rows | Seed 1 | Seed 2 | Seed 3 | Median | Solver bound |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 4 | `makespan+tiebreak` | `declared` | 137 | 134 | 137 | 137 | 95 |
+| 4 | `makespan+tiebreak` | `none` | 137 | 138 | 134 | 137 | 95 |
+| 4 | `makespan+tiebreak` | `checked` | 137 | 138 | 137 | 137 | 95 |
+| 4 | `makespan` | `declared` | 132 | 130 | 133 | 132 | 95 |
+| 4 | `makespan` | `none` | 118 | 113 | 118 | 118 | 95 |
+| 4 | `makespan` | `checked` | 121 | 116 | 119 | 119 | 95 |
+| 6 | `makespan+tiebreak` | `declared` | 232 | 233 | 233 | 233 | 155 |
+| 6 | `makespan+tiebreak` | `none` | 228 | 228 | 229 | 228 | 152 |
+| 6 | `makespan+tiebreak` | `checked` | 233 | 233 | 234 | 233 | 152 |
+| 6 | `makespan` | `declared` | 229 | 231 | 230 | 230 | 155 |
+| 6 | `makespan` | `none` | 221 | 222 | 219 | 221 | 152 |
+| 6 | `makespan` | `checked` | 223 | 225 | 221 | 223 | 152 |
+
+With makespan-only, `checked` improved on `declared` by 6–14 cycles across the six
+matched pairs. `none` improved on `declared` by 8–17 cycles and on `checked` by 1–3.
+With the weighted objective, `checked` tied `declared` in three pairs and took 1–4
+more cycles in the other three. `none` improved in four pairs, tied once and took
+four more cycles once. These are incumbent results for two sizes and three seeds,
+with `declared` retained as the default.
+
+Under energetic tightening, `none` removes explicit symmetry rows and still uses the
+declared ordering during ASAP tightening. `checked` bypasses that ordering and
+unifies corresponding domains, so the sweep measures each mode as a whole. At both
+sizes, `checked` found one orbit of five interchangeable groups among eight and added
+four anchor rows. A pinned window probe can distinguish otherwise interchangeable groups,
+so the scheduler skips those anchor rows and domain unions in window probes.
+Per-section solves retain their existing defaults.
+
+```bash
+./scripts/build_scheduler_rs.sh --release
+uv run python -m scripts.run_symmetry_measurement --jobs 3 --time-limit 3600 \
+    --out-dir build/symmetry-seeds-6a82e15
+```
+
+The output directory contains the `symmetry_seeds.json` index and generated
+`symmetry_seeds.md` report alongside each cell's result JSON, log, schedule and kernel.
