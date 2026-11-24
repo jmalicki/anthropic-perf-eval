@@ -430,6 +430,22 @@ def check_index_update_from_root(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+def check_fma_zero_factor(ctx=None) -> tuple[str, str, float, dict]:
+    """R12-fma-zero-factor: multiply_add(0, m, c) = multiply_add(m, 0, c) = c for all m, c.
+
+    The identity the `prune-index` rewrite rule (scheduler_rs transform/prune_index.rs)
+    applies to any multiply_add with a factor it shows to be 0; R12-index-update-from-root is
+    its instance on the zero-based index update.
+    """
+    m, c = _bv("m"), _bv("c")
+    return _refute(
+        "R12-fma-zero-factor",
+        _const(0) * m + c != c,
+        m * _const(0) + c != c,
+        ctx=ctx,
+    )
+
+
 def check_index_update_from_root_needs_zero(ctx=None) -> tuple[str, str, float, dict]:
     """R12-needs-zero: for a nonzero index the offset alone is not the new index (SAT)."""
     v, idx = _bv("v"), _bv("idx")
@@ -630,6 +646,7 @@ REWRITE_CHECKS = [
     ("R11-mirrored-index-range", "Mirrored index range per depth and the level constants", check_mirrored_index_range),
     ("R12-index-update-from-root", "From idx = 0 the index update is its offset", check_index_update_from_root),
     ("R12-index-update-from-root-needs-zero", "The offset alone is wrong for a nonzero index (SAT)", check_index_update_from_root_needs_zero),
+    ("R12-fma-zero-factor", "multiply_add with a zero factor is its addend", check_fma_zero_factor),
     ("R13-select-by-path-bits", "Select tree driven by the branch bits yields the reference node", check_select_by_path_bits),
     ("R13-select-by-path-bits-needs-bit-order", "Select tree with the bits in the wrong order is wrong (SAT)", check_select_by_path_bits_needs_bit_order),
     ("R14-mobius-select", "2^d - 1 multiply_adds over Mobius coefficients equal the select tree", check_mobius_select),

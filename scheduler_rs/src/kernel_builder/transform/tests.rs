@@ -259,7 +259,7 @@ fn test_gather_tag_on_partial_region_is_rejected() {
 
 /// Every op printed with VRegs renamed in order of first appearance (lanes of a vector group
 /// named right after the group), and region ids dropped (they are dense per emission).
-fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<String> {
+pub(super) fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<String> {
     use crate::types::{Operand, VReg};
     use std::collections::HashMap;
     let mut names: HashMap<VReg, usize> = HashMap::new();
@@ -380,7 +380,7 @@ fn test_apply_rejects_a_choice_outside_the_cached_levels() {
 // Hash merge: a peephole on the finished program
 // ----------------------------------------------------------------------------
 
-fn raw_program(spec: &ProblemSpec) -> crate::kernel_builder::SsaProgram {
+pub(super) fn raw_program(spec: &ProblemSpec) -> crate::kernel_builder::SsaProgram {
     let config = KernelConfig { spec: spec.clone(), ..KernelConfig::new(spec.forest_height, spec.n_nodes, spec.batch_size, spec.rounds) };
     SsaTickTockKernelBuilder::new(config).build()
 }
@@ -389,7 +389,7 @@ fn merge_rule(source: ProposalSource) -> HashMergeRule {
     HashMergeRule { source }
 }
 
-fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder::SsaProgram {
+pub(super) fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder::SsaProgram {
     crate::kernel_builder::SsaProgram {
         ops: p.ops.clone(),
         vreg_def: p.vreg_def.clone(),
@@ -411,7 +411,7 @@ fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder
 ///
 /// # Returns
 /// The first other difference, and the indices of ops differing only by the leaked label.
-fn first_difference(a: &[String], b: &[String]) -> (Option<String>, Vec<usize>) {
+pub(super) fn first_difference(a: &[String], b: &[String]) -> (Option<String>, Vec<usize>) {
     let mut leaked = Vec::new();
     for i in 0..a.len().min(b.len()) {
         if a[i] == b[i] {
@@ -449,7 +449,7 @@ fn check_hash_merge_parity(spec: &ProblemSpec, label: &str) -> HashMergeReport {
 }
 
 /// The flow90 plan (docs/emission_plans/flow90.json), read from the file.
-fn flow90_plan(spec: &ProblemSpec) -> Vec<Vec<AccessEncoding>> {
+pub(super) fn flow90_plan(spec: &ProblemSpec) -> Vec<Vec<AccessEncoding>> {
     use AccessEncoding::*;
     let named = |s: &str| AccessEncoding::from_str(s).unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/emission_plans/flow90.json");

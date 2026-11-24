@@ -24,23 +24,40 @@
 //! - `interp` - concrete interpreter of SSA programs, to test that rewrites keep values
 //! - `hash_merge` - rule `hash-merge` (hash stages 2+3), a peephole on finished SSA that
 //!   reads no emitter state
+//! - `values` - constant propagation, the problem's memory layout, declared assumptions
+//! - `prune_index` - rule `prune-index` (shared wrap zero, depth-0 index update from a
+//!   provably zero index, initial index load dead)
+//! - `values_only` - rule `values-only`: the output contract "indices not observed"
+//! - `report` - per-site and cascade cost deltas of a rewrite
 
 pub mod apply;
 pub mod cost;
 pub mod graph;
 pub mod hash_merge;
 pub mod interp;
+pub mod prune_index;
+pub mod report;
 pub mod rule;
 pub mod surgery;
 pub mod tree_access;
+pub mod values;
+pub mod values_only;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_index;
+#[cfg(test)]
+mod tests_interp;
 
 pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};
 pub use graph::SsaGraph;
 pub use hash_merge::{apply_hash_merge, HashMergeReport, HashMergeRule, HashMergeSite, ProposalSource};
+pub use prune_index::{apply_prune_index, PruneIndexRule, PruneIndexSite, PruneKind};
+pub use report::RuleReport;
 pub use rule::{Fact, FactSource, Proposal, Rejection, Rule};
 pub use surgery::{Stamp, Surgery, SurgeryReport};
 pub use tree_access::{TreeAccessInstantiation, TreeAccessRule, TreeAccessSite};
+pub use values::{Address, Assumption, MemoryLayout, ValueFacts};
+pub use values_only::{apply_values_only, IndexStoreSite, ValuesOnlyRule};

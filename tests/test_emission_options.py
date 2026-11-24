@@ -39,11 +39,13 @@ def build(tmp_path, rounds, **options):
         sched = json.load(f)
     report = check({"instrs": instrs}, sched)
     assert report.ok, report.findings[:2]  # PROVED: kernel equals the SSA program
-    values_only = bool(options.get("values_only"))
+    values_only = bool(options.get("values_only")) or "values-only" in (options.get("transform") or [])
     # PASSED: values and indices match the reference (values only for --values-only kernels).
     assert validate_kernel(instrs, 10, BATCH, rounds, SEED, values_only=values_only)
-    if values_only:
-        # The flag changes the output: the indices in memory are not the reference's.
+    if values_only and rounds % 11 != 0:
+        # The flag changes the output: the indices in memory are not the reference's (unless
+        # the last round is the wrap round, height 10: then every final index is 0, as the
+        # untouched input indices are).
         assert not validate_kernel(instrs, 10, BATCH, rounds, SEED)
     return sr.analyze(sched), sched
 
@@ -86,6 +88,27 @@ def test_hash_merge_transform_equals_merge_hash_stages(tmp_path, rounds):
     for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
         assert rewritten["emission"][key] == merged["emission"][key], key
     assert len(rewritten_sched["ssa_ops"]) == len(merged_sched["ssa_ops"])
+
+
+TRANSFORM_FLAGS = {"hash-merge": "merge_hash_stages", "prune-index": "prune_dead_index", "values-only": "values_only"}
+
+
+@pytest.mark.parametrize("rounds", [3, 11])
+@pytest.mark.parametrize("index_form", ["zero-based", "mirrored"])
+@pytest.mark.parametrize("transforms", [["prune-index"], ["values-only"], ["values-only", "prune-index"],
+                                        ["prune-index", "values-only", "hash-merge"]], ids="+".join)
+def test_index_transforms_equal_their_flags(tmp_path, rounds, index_form, transforms):
+    """--transform prune-index / values-only rewrite the default program into the one the flags
+    emit: PROVED, PASSED (values only with values-only), same op counts. 11 rounds end on the
+    wrap round, so the shared zero vector is the stored index."""
+    flags = {TRANSFORM_FLAGS[t]: True for t in transforms}
+    emitted, emitted_sched = build(tmp_path, rounds, index_form=index_form, **flags)
+    rewritten, rewritten_sched = build(tmp_path, rounds, index_form=index_form, transform=transforms)
+    for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
+        assert rewritten["emission"][key] == emitted["emission"][key], key
+    assert len(rewritten_sched["ssa_ops"]) == len(emitted_sched["ssa_ops"])
+    for engine in ("load", "store"):
+        assert rewritten["engines"][engine]["ops"] == emitted["engines"][engine]["ops"], engine
 
 
 def test_transform_rejects_unknown_rule():

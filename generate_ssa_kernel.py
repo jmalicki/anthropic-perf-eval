@@ -89,6 +89,9 @@ def main():
                         help="Suppress verbose output from Rust scheduler")
 
     args = parser.parse_args()
+    # --values-only (emitter flag) and --transform values-only (declared output contract) both
+    # leave the final indices unwritten: validation then compares the values only.
+    indices_unobserved = args.values_only or "values-only" in (getattr(args, "transform", None) or [])
 
     # Validate-only: load kernel and run validation, then exit
     if args.validate_only:
@@ -240,7 +243,7 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=args.values_only,
+            values_only=indices_unobserved,
             relaxed_scratch_size=simulator_scratch_size(scratch_size, stats.get("max_addr")) if relaxed else None,
         )
         marked = " [RELAXED SCRATCH: not valid on the machine]" if relaxed else ""
@@ -268,11 +271,11 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=args.values_only,
+            values_only=indices_unobserved,
             scratch_size=sim_scratch,
         )
         if correct:
-            print(f"  {passed_message(args.values_only)}")
+            print(f"  {passed_message(indices_unobserved)}")
         else:
             print(f"  FAILED - kernel produces incorrect output")
             return 1
@@ -283,8 +286,8 @@ def main():
 def passed_message(values_only):
     """The validation verdict line; says so when only the values were compared."""
     if values_only:
-        return ("PASSED (values only) - kernel produces correct values; --values-only kernels do not "
-                "store the final indices, so indices were not compared")
+        return ("PASSED (values only) - kernel produces correct values; --values-only and --transform "
+                "values-only kernels do not store the final indices, so indices were not compared")
     return "PASSED - kernel produces correct output"
 
 

@@ -806,6 +806,7 @@ impl SsaTickTockKernelBuilder {
         let mut config = PipelineConfig {
             compiler: super::config::CompilerConfig {
                 enable_valu_shift,
+                transform_batch_size: Some(self.config.spec.batch_size),
                 ..self.config.compiler.clone()
             },
             scratch_budget: scratch_budget_override
@@ -944,6 +945,7 @@ impl SsaTickTockKernelBuilder {
         let config = PipelineConfig {
             compiler: super::config::CompilerConfig {
                 enable_valu_shift,
+                transform_batch_size: Some(self.config.spec.batch_size),
                 ..self.config.compiler.clone()
             },
             scratch_budget: self.config.compiler.scratch_size,
