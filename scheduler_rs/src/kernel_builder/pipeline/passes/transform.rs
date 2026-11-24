@@ -5,8 +5,8 @@
 //! emitter state (see `kernel_builder::transform`). With no transforms configured it does
 //! nothing, so default output is unchanged.
 //!
-//! Rules apply in the order given. `prune-index` and `select-bits-path` declare the input
-//! precondition `InitialIndicesZero` and `values-only` the output contract `IndicesNotObserved`
+//! Rules apply in the order given. `prune-index`, `select-bits-path` and `mirror-index`
+//! declare the input precondition `InitialIndicesZero` and `values-only` the output contract `IndicesNotObserved`
 //! (`transform::values::Assumption`).
 //!
 //! Op ids are renumbered by a transform, so ids that refer to the program (for example the
@@ -17,8 +17,8 @@
 use crate::kernel_builder::config::TransformKind;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext};
 use crate::kernel_builder::transform::{
-    apply_hash_merge, apply_prune_index, apply_select_bits, apply_values_only, HashMergeRule, PruneIndexRule,
-    SelectBitsRule, ValuesOnlyRule,
+    apply_hash_merge, apply_mirror_index, apply_prune_index, apply_select_bits, apply_values_only, HashMergeRule,
+    MirrorIndexRule, PruneIndexRule, SelectBitsRule, ValuesOnlyRule,
 };
 use crate::kernel_builder::SsaProgram;
 
@@ -67,6 +67,11 @@ pub fn apply_transform(
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
             (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
         }
+        TransformKind::MirrorIndex => {
+            let (p, r) = apply_mirror_index(program, &MirrorIndexRule::for_problem(batch()?))?;
+            let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
+            (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
+        }
         TransformKind::SelectBitsPath => {
             let (p, r) = apply_select_bits(program, &SelectBitsRule::for_problem(batch()?), |_| true)?;
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
@@ -112,6 +117,7 @@ impl Pass for TransformPass {
                         (None, TransformKind::HashMerge) => " (already merged, e.g. with --merge-hash-stages?)".into(),
                         (None, TransformKind::PruneIndex) => " (mirrored index or --prune-dead-index?)".into(),
                         (None, TransformKind::ValuesOnly) => " (--values-only already set?)".into(),
+                        (None, TransformKind::MirrorIndex) => " (already mirrored, e.g. with --index-form mirrored?)".into(),
                         (None, TransformKind::SelectBitsPath) => {
                             " (no bit-driven access at depth 3 or more, or --select-bit-source path already set?)".into()
                         }

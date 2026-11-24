@@ -662,6 +662,39 @@ def check_bit_path_steps(ctx=None) -> tuple[str, str, float, dict]:
     return _refute("R15-bit-path-steps", *violations, ctx=ctx)
 
 
+def check_mirror_uses_general(ctx=None) -> tuple[str, str, float, dict]:
+    """R10-mirror-uses-general: every use the mirror-index rule rewrites, for any constants.
+
+    The rule (scheduler_rs transform/mirror_index.rs) knows idx = L - n for every index value
+    (the bit-path forms, R15-bit-path-steps) and rewrites each use to read n. For all 32-bit
+    L, n, s, c:
+
+    * gather address: s + (L - n) = (s + L) - n (either operand order);
+    * compare: (L - n == c) iff (n == L - c), and so the 0/1 results are equal;
+    * level position: (L - n) - c = (L - c) - n;
+    * mirror: L - (L - n) = n;
+    * index step: 2 (L - n) + (2 - b) = (2L + 2) - (2n + b) (the zero-based step is the
+      mirrored step 2n + b under L -> 2L + 2).
+
+    R10-mirrored-index-uses is the instance at the emitter's constants; this is the general
+    form the rule relies on, since it reads the constants from the program.
+    """
+    big_l, n, s, c, x = _bv("L"), _bv("n"), _bv("s"), _bv("c"), _bv("x")
+    b = x & _const(1)
+    eq = lambda p, q: If(p == q, _const(1), _const(0))  # noqa: E731
+    return _refute(
+        "R10-mirror-uses-general",
+        s + (big_l - n) != (s + big_l) - n,
+        (big_l - n) + s != (s + big_l) - n,
+        eq(big_l - n, c) != eq(n, big_l - c),
+        eq(c, big_l - n) != eq(big_l - c, n),
+        (big_l - n) - c != (big_l - c) - n,
+        big_l - (big_l - n) != n,
+        (big_l - n) * _const(2) + (_const(2) - b) != (big_l * _const(2) + _const(2)) - (n * _const(2) + b),
+        ctx=ctx,
+    )
+
+
 def check_bit_path_steps_needs_boolean(ctx=None) -> tuple[str, str, float, dict]:
     """R15-bit-path-steps-needs-boolean: with an addend that is not 0/1, AND no longer reads it (SAT)."""
     n, b = _bv("n"), _bv("b")
@@ -696,6 +729,7 @@ REWRITE_CHECKS = [
     ("R14-mobius-select-needs-boolean", "Mobius form is wrong for a non-0/1 bit (SAT)", check_mobius_select_needs_boolean),
     ("R15-bits-from-index", "Older branch bits read back from the index", check_bits_from_index),
     ("R15-bits-from-index-needs-range", "Unmasked top bit is not 0/1 outside the index range (SAT)", check_bits_from_index_needs_range),
+    ("R10-mirror-uses-general", "Mirror-index use rewrites hold for any constants", check_mirror_uses_general),
     ("R15-bit-path-steps", "Bit-path forms: each step of the select-bits-path analysis is an identity", check_bit_path_steps),
     ("R15-bit-path-steps-needs-boolean", "AND reads the addend back only if it is 0/1 (SAT)", check_bit_path_steps_needs_boolean),
 ]

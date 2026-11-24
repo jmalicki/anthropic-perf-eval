@@ -1106,7 +1106,9 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 /// `values_only` emits after dead code elimination); see transform/values_only.rs.
 /// "select-bits-path": bit-driven tree access reads the earlier branch bits instead of
 /// extracting them from the index (the program `select_bit_source="path"` emits), from forms
-/// proved on the ops; see transform/select_bits.rs.
+/// proved on the ops; see transform/select_bits.rs. "mirror-index": every index value to the
+/// mirrored form n = L_d - idx, or none (the program `index_form="mirrored"` emits); see
+/// transform/mirror_index.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,

@@ -66,6 +66,7 @@ fn with_flags(spec: &ProblemSpec, transforms: &[TransformKind]) -> ProblemSpec {
             TransformKind::PruneIndex => s.prune_dead_index = true,
             TransformKind::ValuesOnly => s.values_only = true,
             TransformKind::SelectBitsPath => s.select_bit_source = SelectBitSource::Path,
+            TransformKind::MirrorIndex => s.index_form = IndexForm::Mirrored,
         }
     }
     s
@@ -102,6 +103,7 @@ pub(super) fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], lab
         prune_dead_index: false,
         values_only: false,
         select_bit_source: SelectBitSource::Index,
+        index_form: if transforms.contains(&TransformKind::MirrorIndex) { IndexForm::ZeroBased } else { spec.index_form },
         ..spec.clone()
     };
     let mut p = raw_program(&base);

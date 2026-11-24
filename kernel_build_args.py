@@ -267,7 +267,7 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "group in every round, as written by scripts/emission_structure.py (format: "
                             "solver/emission_plan.py). Replaces --cached-select, --tree-reduce-max-depth and "
                             "--depth4-select-rounds for the tree access. See docs/EMISSION_STRUCTURE_MODEL.md")
-    group.add_argument("--transform", action="append", choices=["hash-merge", "prune-index", "values-only", "select-bits-path"], default=EMISSION_DEFAULTS["transform"],
+    group.add_argument("--transform", action="append", choices=["hash-merge", "prune-index", "values-only", "select-bits-path", "mirror-index"], default=EMISSION_DEFAULTS["transform"],
                        metavar="RULE",
                        help="Rewrite the finished SSA program with RULE before scheduling (repeatable; applied in "
                             "order). hash-merge: find hash stages x = a*m + c; (x + d) ^ (x << k) from the ops "
@@ -282,7 +282,9 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "at depth 3 or more reads the earlier branch bits instead of extracting them from the "
                             "index (the program --select-bit-source path emits; fewer ops, more scratch), from "
                             "forms proved on the ops, assuming the input indices start at 0 (proofs: R15). "
-                            "Off by default")
+                            "mirror-index: rewrite every index value of a zero-based program to the mirrored "
+                            "form n = L_d - idx (the program --index-form mirrored emits), or none if some index "
+                            "use is not one of the proved forms (proofs: R10, R15). Off by default")
     return group
 
 
