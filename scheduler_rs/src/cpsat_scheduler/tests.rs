@@ -2132,6 +2132,482 @@ mod ssa_tests {
         assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution: {:?}", result.err());
     }
 
+    /// Same-cycle reuse in the CP-SAT scratch model: a chain of vector ops where each input dies
+    /// as the next value is written needs one 8-word block plus the broadcast's scalar source
+    /// (address assignment reuses the block every cycle). `ScratchTime::Phase` accepts it at a
+    /// 10-word budget; `ScratchTime::Cycle` counts the dying and the new vector together (16
+    /// words at every step) and finds nothing. The phase solution gets addresses within the
+    /// budget.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_phase_scratch_allows_same_cycle_reuse() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+        use crate::cpsat_scheduler::ScratchTime;
+
+        let build = || {
+            let mut emit = SsaEmitContext::new();
+            let s = emit.emit_const(3);
+            let mut v = emit.emit_vbroadcast(s);
+            for _ in 0..4 {
+                v = emit.emit_valu(Opcode::Add, v, v);
+            }
+            emit.emit_vstore_imm(100, v);
+            let vreg_def = std::mem::take(&mut emit.vreg_def);
+            compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+            emit
+        };
+        let solve = |emit: &SsaEmitContext, time: ScratchTime| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: 10,
+                    scratch_time: time,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints::default(),
+                None,
+            )
+            .expect("solve")
+        };
+        let emit = build();
+        assert!(solve(&emit, ScratchTime::Cycle).is_none(), "cycle count: 16 words at every step");
+        let solution = solve(&emit, ScratchTime::Phase).expect("phase count: 9 words suffice");
+        let mut scheduled = emit.ops.clone();
+        for (op, &c) in scheduled.iter_mut().zip(&solution.cycle_assignments) {
+            op.cycle = c;
+        }
+        let config = AddressAssignConfig { budget: 11, ..Default::default() };
+        let assigned = assign_addresses(&scheduled, &config).unwrap();
+        assert!(!assigned.budget_exceeded, "max_addr {} with 10 assignable words", assigned.max_addr);
+    }
+
+    /// Per-section solves: a live-in value must stay live until the last of its readers in the
+    /// segment, not until the reader `initial_live` names. `v` (8 words, live into the segment)
+    /// is read by `early` (named as its last use) and by `late`, which must wait for a chain
+    /// whose widest point holds 24 words. So `v` is live across that point: 32 words, which a
+    /// 28-word budget cannot hold. With only `early` counted the model accepted it.
+    /// Two 8-word values live into a segment and both read (stored) as early as cycle 0 hold
+    /// 16 words in the first cycle's read phase, before anything is written: a 15-word budget
+    /// is infeasible on the phase timeline too. (Ending live-ins at the last read alone gave
+    /// a live-in read at cycle 0 the empty interval [0, 0).)
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_phase_live_ins_read_at_cycle_zero_hold_their_words() {
+        let mut emit = SsaEmitContext::new();
+        let k0 = emit.emit_const(9);
+        let a = emit.emit_vbroadcast_force(k0);
+        let b = emit.emit_vbroadcast_force(k0);
+        emit.emit_vstore_imm(100, a);
+        emit.emit_vstore_imm(108, b);
+        // Only stores remain in the section; both scratch values arrive from outside.
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let removed: Vec<usize> = emit
+            .ops
+            .iter()
+            .filter(|o| o.dest == Some(a) || o.dest == Some(b) || o.dest == Some(k0))
+            .map(|o| o.id)
+            .collect();
+        emit.ops.retain(|o| !removed.contains(&o.id));
+        for op in &mut emit.ops {
+            op.dep_ids.retain(|d| !removed.contains(d));
+        }
+        let reader = |v: VReg| {
+            emit.ops.iter().position(|o| o.srcs.iter().any(|s| s.as_vreg() == Some(v))).unwrap()
+        };
+        let initial_live = vec![(a, reader(a)), (b, reader(b))];
+        let solve = |budget: usize, scratch_pools: bool| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    scratch_pools,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints { initial_live: Some(&initial_live), ..Default::default() },
+                Some(false),
+            )
+            .expect("solve")
+        };
+        for pools in [false, true] {
+            assert!(solve(15, pools).is_none(), "both live-ins hold their words at entry");
+            assert!(solve(16, pools).is_some());
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_live_in_wider_than_budget_is_infeasible() {
+        let mut emit = SsaEmitContext::new();
+        let incoming = VReg::vector(100);
+        emit.emit_vstore_imm(100, incoming);
+        let initial_live = [(incoming, 0)];
+        for scratch_pools in [false, true] {
+            for budget in [7, 8] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        verbose: false,
+                        scratch_budget: budget,
+                        scratch_pools,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&initial_live),
+                        ..Default::default()
+                    },
+                    Some(false),
+                )
+                .expect("an undersized budget must not cause a model error");
+                assert_eq!(solution.is_some(), budget == 8);
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_shifted_live_out_starts_at_first_lane() {
+        let mut emit = SsaEmitContext::new();
+        let incoming = VReg::vector(100);
+        let result = emit.emit_valu(Opcode::Add, incoming, incoming);
+        let initial_live = [(incoming, 0)];
+        let live_out = [result].into_iter().collect();
+        let machine = crate::types::MachineConfig {
+            alu_slots: 4,
+            ..Default::default()
+        };
+        for scratch_pools in [false, true] {
+            for budget in [8, 16] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        time_limit_secs: 5.0,
+                        verbose: false,
+                        enable_valu_shift: true,
+                        valu_shift_mode: ValuShiftMode::ForceAlu,
+                        scratch_budget: budget,
+                        scratch_pools,
+                        machine,
+                        asap_alap_tightening: AsapAlapTightening::None,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&initial_live),
+                        live_out_vregs: Some(&live_out),
+                        ..Default::default()
+                    },
+                    Some(false),
+                )
+                .expect("valid scratch intervals");
+                assert_eq!(solution.is_some(), budget == 16);
+                if let Some(solution) = solution {
+                    let lanes = &solution.shifted_alu_cycles[&emit.ops[0].id];
+                    assert!(lanes.iter().min() < lanes.iter().max(), "must use two or more cycles");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_live_ins_with_one_optional_fma_reader() {
+        let mut emit = SsaEmitContext::new();
+        let args = [VReg::vector(100), VReg::vector(101), VReg::vector(102)];
+        let result = emit.emit_select_choice(args[0], args[1], args[2]);
+        let reader = emit.ops.iter().position(|op| op.dest == Some(result)).unwrap();
+        assert!(emit.ops[reader].sub_temp_vreg.is_some(), "needs a two-stage FMA path");
+        let initial_live = args.map(|vreg| (vreg, reader));
+        let live_out = [result].into_iter().collect();
+        let live_through = [VReg::vector(103)].into_iter().collect();
+
+        for scratch_pools in [false, true] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    select_choice_mode: SelectChoiceMode::Optimize,
+                    scratch_budget: 64,
+                    scratch_pools,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&initial_live),
+                    live_out_vregs: Some(&live_out),
+                    live_through_vregs: Some(&live_through),
+                    ..Default::default()
+                },
+                Some(false),
+            )
+            .expect("OR-Tools accepts the interval endpoints");
+            assert!(solution.is_some());
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_live_through_without_incoming_reads() {
+        let mut emit = SsaEmitContext::new();
+        let result = emit.emit_vload_imm(0);
+        let incoming = VReg::vector(200);
+        let live_out = [result].into_iter().collect();
+        let live_through = [incoming].into_iter().collect();
+        for pools in [false, true] {
+            for budget in [15, 16] {
+                let solution = schedule_ssa_cpsat(
+                    &emit.ops,
+                    SsaCpsatConfig {
+                        verbose: false,
+                        scratch_budget: budget,
+                        scratch_pools: pools,
+                        ..Default::default()
+                    },
+                    SsaCpsatHints {
+                        initial_live: Some(&[]),
+                        live_out_vregs: Some(&live_out),
+                        live_through_vregs: Some(&live_through),
+                        ..Default::default()
+                    },
+                    Some(false),
+                ).expect("solve");
+                assert_eq!(solution.is_some(), budget >= 16);
+            }
+        }
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_pooled_lane_live_out() {
+        let mut emit = SsaEmitContext::new();
+        let addr = emit.emit_const(64);
+        let (group, lanes) = emit.fresh_vector_group();
+        for lane in &lanes {
+            emit.emit_load_into(addr, *lane);
+        }
+        let result = emit.emit_valu(Opcode::Xor, group, group);
+        // The XOR reads the gathered vector at the last cycle and writes its result.
+        // A later section reads one of its lanes, so the whole contiguous block survives.
+        let live_out = [result, lanes[0]].into_iter().collect();
+        let groups = emit.take_vector_group_lanes();
+        let defs = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &defs, emit.zero_vreg, Some(&groups));
+        for budget in [9, 17] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: budget,
+                    scratch_pools: true,
+                    enable_valu_shift: false,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&[]),
+                    live_out_vregs: Some(&live_out),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert_eq!(solution.is_some(), budget >= 17);
+        }
+    }
+
+    /// With no local reads, eight lanes escaping together occupy one vector pool slot.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_unread_pooled_lanes() {
+        let mut emit = SsaEmitContext::new();
+        let addr = emit.emit_const(64);
+        let (_, lanes) = emit.fresh_vector_group();
+        for lane in &lanes {
+            emit.emit_load_into(addr, *lane);
+        }
+        let live_out = lanes.iter().copied().collect();
+        let groups = emit.take_vector_group_lanes();
+        let defs = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &defs, emit.zero_vreg, Some(&groups));
+        for budget in [8, 9] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: budget,
+                    scratch_pools: true,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    // One address load followed by four pairs of lane loads.
+                    greedy_hints: Some(&[0, 1, 1, 2, 2, 3, 3, 4, 4]),
+                    initial_live: Some(&[]),
+                    live_out_vregs: Some(&live_out),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert_eq!(solution.is_some(), budget >= 9);
+        }
+    }
+
+    /// A vector is loaded before the section and stored both within it and afterwards.
+    /// Its entry and exit metadata refer to one resident vector.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_segment_scratch_reads_live_through_once() {
+        let mut emit = SsaEmitContext::new();
+        let value = emit.emit_vload_imm(16);
+        emit.emit_vstore_imm(32, value);
+        emit.emit_vstore_imm(48, value);
+        let live_through = [value].into_iter().collect();
+        for pools in [false, true] {
+            let solution = schedule_ssa_cpsat(
+                &emit.ops[1..2],
+                SsaCpsatConfig {
+                    verbose: false,
+                    scratch_budget: 8,
+                    scratch_pools: pools,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&[(value, 0)]),
+                    live_through_vregs: Some(&live_through),
+                    greedy_hints: Some(&[0]),
+                    ..Default::default()
+                },
+                Some(false),
+            ).expect("solve");
+            assert!(solution.is_some(), "one 8-word vector fits the section budget");
+        }
+    }
+
+    /// A live-in decomposed vector is live until the last reader of the vector or of any of
+    /// its lanes: `early` reads `v`, `late` reads a lane of `v` after a chain whose widest
+    /// point holds 24 words, so `v` (8 words) is live across it and 28 words do not suffice.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_live_in_interval_covers_lane_readers() {
+        let mut emit = SsaEmitContext::new();
+        let k0 = emit.emit_const(9);
+        let v = emit.emit_vbroadcast_force(k0);
+        let v_lanes = emit.decompose_vector(v);
+        let k = emit.emit_const(5);
+        let c0 = emit.emit_vbroadcast(k);
+        let c1 = emit.emit_valu(Opcode::Add, c0, c0);
+        let w1 = emit.emit_valu(Opcode::Add, c1, c1);
+        let w2 = emit.emit_valu(Opcode::Xor, c1, c1);
+        let w3 = emit.emit_valu(Opcode::Shl, c1, c1);
+        let m = emit.emit_valu(Opcode::Add, w1, w2);
+        let n = emit.emit_valu(Opcode::Add, m, w3);
+        let n_lanes = emit.decompose_vector(n);
+        let late = emit.emit_alu(Opcode::Add, v_lanes[3], n_lanes[0]);
+        emit.emit_store_imm(200, late);
+        let early = emit.emit_valu(Opcode::Add, v, v);
+        emit.emit_vstore_imm(108, early);
+        let groups = emit.take_vector_group_lanes();
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, Some(&groups));
+        let removed: Vec<usize> = emit
+            .ops
+            .iter()
+            .filter(|o| o.dest == Some(v) || o.dest == Some(k0))
+            .map(|o| o.id)
+            .collect();
+        emit.ops.retain(|o| !removed.contains(&o.id));
+        for op in &mut emit.ops {
+            op.dep_ids.retain(|d| !removed.contains(d));
+        }
+        let early_idx = emit.ops.iter().position(|o| o.dest == Some(early)).unwrap();
+        let initial_live = vec![(v, early_idx)];
+        let solve = |budget: usize| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints {
+                    initial_live: Some(&initial_live),
+                    vector_group_lanes: Some(&groups),
+                    ..Default::default()
+                },
+                Some(false),
+            )
+            .expect("solve")
+        };
+        assert!(solve(28).is_none(), "v is live until its lane is read by `late`");
+        assert!(solve(48).is_some());
+    }
+
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_live_in_interval_covers_every_reader() {
+        let mut emit = SsaEmitContext::new();
+        // `v` is defined here only so dependencies resolve; its definer (and the constant it
+        // broadcasts) is then removed, as if it ran in an earlier section.
+        let k0 = emit.emit_const(9);
+        let v = emit.emit_vbroadcast_force(k0);
+        let k = emit.emit_const(5);
+        let c0 = emit.emit_vbroadcast(k);
+        let c1 = emit.emit_valu(Opcode::Add, c0, c0);
+        let w1 = emit.emit_valu(Opcode::Add, c1, c1);
+        let w2 = emit.emit_valu(Opcode::Xor, c1, c1);
+        let w3 = emit.emit_valu(Opcode::Shl, c1, c1);
+        let m = emit.emit_valu(Opcode::Add, w1, w2);
+        let n = emit.emit_valu(Opcode::Add, m, w3);
+        let late = emit.emit_valu(Opcode::Xor, v, n);
+        emit.emit_vstore_imm(100, late);
+        let early = emit.emit_valu(Opcode::Add, v, v);
+        emit.emit_vstore_imm(108, early);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let removed: Vec<usize> = emit
+            .ops
+            .iter()
+            .filter(|o| o.dest == Some(v) || o.dest == Some(k0))
+            .map(|o| o.id)
+            .collect();
+        emit.ops.retain(|o| !removed.contains(&o.id));
+        for op in &mut emit.ops {
+            op.dep_ids.retain(|d| !removed.contains(d));
+        }
+        let early_idx = emit.ops.iter().position(|o| o.dest == Some(early)).unwrap();
+        let initial_live = vec![(v, early_idx)];
+        let solve = |budget: usize| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints { initial_live: Some(&initial_live), ..Default::default() },
+                Some(false),
+            )
+            .expect("solve")
+        };
+        assert!(solve(28).is_none(), "v is live until `late`: 32 words at the widest point");
+        assert!(solve(40).is_some());
+    }
+
     /// Regression: a value's scratch interval must cover every reader, not one reader picked
     /// before solving. `v` has two readers: `early` (emitted last, so the old model took it as
     /// "the last use") can run at once, `late` must wait for a chain whose widest point holds
@@ -2166,33 +2642,45 @@ mod ssa_tests {
         let vreg_def = std::mem::take(&mut emit.vreg_def);
         compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
 
-        let result = schedule_ssa_cpsat(
-            &emit.ops,
-            SsaCpsatConfig {
-                time_limit_secs: 10.0,
-                verbose: false,
-                enable_valu_shift: false,
-                scratch_budget: 36,
-                asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
-                ..Default::default()
-            },
-            SsaCpsatHints::default(),
-            None,
-        );
-        let solution = result.expect("solve").expect("a schedule that creates v late fits in 36 words");
+        // The widest point is 32 words on the cycle timeline (c3 is counted with the three
+        // results written in the cycle that reads it) and 24 on the phase timeline (c3's words
+        // are free once it is read). With v (8 words) on top, neither fits: 36 and 28.
+        for (scratch_time, budget) in [
+            (crate::cpsat_scheduler::ScratchTime::Cycle, 36usize),
+            (crate::cpsat_scheduler::ScratchTime::Phase, 28usize),
+        ] {
+            let result = schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    scratch_budget: budget,
+                    scratch_time,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints::default(),
+                None,
+            );
+            let solution = result
+                .expect("solve")
+                .unwrap_or_else(|| panic!("{:?}: a schedule that creates v late fits in {} words", scratch_time, budget));
 
-        // Independent recount: v is live from its definition to its last reader.
-        let idx_of = |vreg| emit.ops.iter().position(|o| o.dest == Some(vreg)).unwrap();
-        let cycle = |vreg| solution.cycle_assignments[idx_of(vreg)];
-        let wide = cycle(w1).max(cycle(w2)).max(cycle(w3));
-        assert!(
-            cycle(v) > wide.min(cycle(w1)) || cycle(late) < cycle(w1),
-            "v (cycle {}) must not be live across the wide point (cycles {}..{}), late reader at {}",
-            cycle(v),
-            cycle(w1),
-            wide,
-            cycle(late)
-        );
+            // Independent recount: v is live from its definition to its last reader.
+            let idx_of = |vreg| emit.ops.iter().position(|o| o.dest == Some(vreg)).unwrap();
+            let cycle = |vreg| solution.cycle_assignments[idx_of(vreg)];
+            let wide = cycle(w1).max(cycle(w2)).max(cycle(w3));
+            assert!(
+                cycle(v) > wide.min(cycle(w1)) || cycle(late) < cycle(w1),
+                "{:?}: v (cycle {}) must not be live across the wide point (cycles {}..{}), late reader at {}",
+                scratch_time,
+                cycle(v),
+                cycle(w1),
+                wide,
+                cycle(late)
+            );
+        }
     }
 
     /// The scratch model's reader lists must include liveness-only uses (`keep_live`) and

@@ -311,6 +311,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Add full-problem subsolvers, e.g. objective_lb_search,objective_shaving")
     group.add_argument("--cpsat-ignore-subsolvers", type=_name_list, default=None, metavar="NAME,...",
                        help="Remove subsolvers (full-problem or LNS) by name")
+    group.add_argument("--cpsat-scratch-time", choices=["phase", "cycle"], default="phase",
+                       help="Timeline of the CP-SAT scratch cumulative. 'phase' (default): read and write "
+                            "phases of each cycle, so a word last read at cycle C can hold a value written "
+                            "at C, exactly as address assignment reuses it. 'cycle': each value counted over "
+                            "[write, last read + 1), which also counts values dying at C together with "
+                            "values born at C (the earlier overcount, kept for ablation)")
     group.add_argument("--cpsat-objective", choices=["makespan+tiebreak", "makespan"], default=None,
                        help="CP-SAT objective (default: makespan+tiebreak = scale*makespan + sum of op "
                             "completion cycles). 'makespan' drops the tie-breaker: the solve stops once the "
@@ -565,6 +571,7 @@ def args_to_build_kwargs(
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
         "cpsat_deterministic_time": cpsat_deterministic_time,
+        "cpsat_scratch_time": get("cpsat_scratch_time", "phase"),
         "cpsat_tuning": cpsat_tuning_effective,
         "disabled_cpsat_constraints": [group.name for group in optional_constraint_groups_to_disable or []],
         "per_section_optimize_secs": per_section_optimize,
@@ -617,6 +624,7 @@ def args_to_build_kwargs(
         "use_cpsat": use_cpsat,
         "cpsat_time_limit": cpsat_time_limit,
         "cpsat_deterministic_time": cpsat_deterministic_time,
+        "cpsat_scratch_time": get("cpsat_scratch_time", "phase"),
         "cpsat_tuning_json": cpsat_tuning_json,
         "per_section_optimize_secs": per_section_optimize,
         "output_json": out_path,

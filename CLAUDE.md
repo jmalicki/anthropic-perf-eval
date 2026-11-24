@@ -207,6 +207,9 @@ Output options:
 - `--seed N` - Random seed for validation (default: 123)
 - `-q, --quiet` - Suppress verbose Rust scheduler output
 
+CP-SAT scratch accounting (full-kernel and per-section solves, recorded under `run_options.cpsat_scratch_time`):
+- `--cpsat-scratch-time {phase,cycle}` - `phase` (default) lets address assignment reuse a scratch word in the cycle of its last read. A value written and read within the section occupies `[def, last_read)` on the write-slot timeline (proof A8 in verification/allocation_conjectures.py). Live-ins also occupy the initial read phase, and live-through values retain their words through the section's final write. `cycle` counts through the last read cycle, adding 46–80 words on measured schedules. Compare the timelines with `uv run python -m scripts.scratch_time_overcount sched.json` (requires full liveness detail, the default).
+
 CP-SAT tuning switches (full-kernel solve only; per-section feasibility solves are unaffected). Each is off / unchanged by default, independent of the others, and recorded with its effective value under `run_options.cpsat_tuning` in the scheduler JSON. They travel to Rust as one JSON object (`cpsat_tuning_json` → `CpsatTuning` in `scheduler_rs/src/cpsat_scheduler/config.rs`, which owns the defaults):
 - `--cpsat-workers N` - `num_workers` (default: 8).
 - `--cpsat-interleave` / `--no-cpsat-interleave` - `interleave_search` (default: on). On = deterministic round-robin of subsolvers: the same command gives the same kernel provided the solve ends on the `--cpsat-deterministic-time` budget or on optimality (if the wall-clock limit fires first, the result depends on machine load, as above); OR-Tools 9.15 then starts no probing, shaving, `lb_tree_search` or `objective_lb_search` worker. **`--no-cpsat-interleave` makes the result non-reproducible** (ordinary parallel portfolio): report the spread over several runs, never a single run.
