@@ -4610,3 +4610,295 @@ fn test_wavefront_shared_load_admits_its_store() {
     schedule_with_shape(&mut emit.ops, &wavefront_shape(0, Some(1)));
     check_memory_edges(&emit.ops, |i| emit.ops[i].cycle).unwrap();
 }
+
+// =========================================================================
+// Shift policies and load priority (docs/GREEDY_SHAPE_ABLATION.md section 11)
+// =========================================================================
+
+/// Vector ops per cycle left on the vector ALU, and scalar slots per cycle (shifted lanes
+/// plus native scalar ops). Panics if an op is unscheduled.
+fn vector_and_scalar_use(
+    ops: &[SsaOp],
+    shifted: &HashSet<usize>,
+    lane_cycles: &HashMap<usize, Vec<i32>>,
+) -> (HashMap<i32, usize>, HashMap<i32, usize>) {
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    let mut alu = shifted_alu_use(ops, shifted, lane_cycles);
+    for op in ops {
+        assert!(op.cycle >= 0, "op {} is unscheduled", op.id);
+        match op.engine {
+            Engine::Valu if !shifted.contains(&op.id) => *valu.entry(op.cycle).or_default() += 1,
+            Engine::Alu => *alu.entry(op.cycle).or_default() += 1,
+            _ => {}
+        }
+    }
+    (valu, alu)
+}
+
+/// Every op runs after each of its operands completes (a split shift starts at its first
+/// lane).
+fn assert_dependencies_respected(ops: &[SsaOp], lane_cycles: &HashMap<usize, Vec<i32>>) {
+    let by_id: HashMap<usize, &SsaOp> = ops.iter().map(|op| (op.id, op)).collect();
+    for op in ops {
+        let start = lane_cycles.get(&op.id).map_or(op.cycle, |l| *l.iter().min().unwrap());
+        for dep in &op.dep_ids {
+            if let Some(producer) = by_id.get(dep) {
+                assert!(
+                    start > producer.cycle,
+                    "op {} at {} reads op {} at {}",
+                    op.id,
+                    start,
+                    dep,
+                    producer.cycle
+                );
+            }
+        }
+    }
+}
+
+/// Chains that alternate a shiftable add and a multiply_add, which cannot shift.
+fn emit_mixed_chains(chains: usize, levels: usize) -> SsaEmitContext {
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(scalar);
+    let addr = emit.emit_const(100);
+    let mut value: Vec<VReg> = vec![shared; chains];
+    for level in 0..levels {
+        for chain in 0..chains {
+            value[chain] = if level % 2 == 0 {
+                emit.emit_valu(Opcode::Add, value[chain], shared)
+            } else {
+                emit.emit_fma(value[chain], shared, shared)
+            };
+        }
+    }
+    for chain in 0..chains {
+        emit.emit_vstore(addr, value[chain]);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    emit
+}
+
+#[test]
+fn test_balanced_shift_target() {
+    // flow90 at 16 rounds: 7,426 vector ops, 4,844 shiftable, 208 scalar ops.
+    assert_eq!(balanced_shift_target(7426, 4844, 208), 1465);
+    // Clamped to the shiftable ops, and never negative.
+    assert_eq!(balanced_shift_target(100, 5, 0), 5);
+    assert_eq!(balanced_shift_target(10, 10, 500), 0);
+}
+
+/// Every shift policy, with and without split shifts, keeps at most 6 vector ops and 12
+/// scalar slots per cycle, schedules every op and respects every dependency.
+#[test]
+fn test_shift_policies_keep_slot_limits() {
+    let policies = [
+        ShiftPolicy::WhenFull,
+        ShiftPolicy::Reserve,
+        ShiftPolicy::Pace { target: None },
+        ShiftPolicy::ReservePace { target: Some(40) },
+    ];
+    for &shift_policy in &policies {
+        for split_shift in [false, true] {
+            let shape = GreedyShape { split_shift, shift_policy, ..Default::default() };
+            let mut emit = emit_mixed_chains(12, 10);
+            let (_, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &shape);
+            let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
+            assert!(
+                valu.values().all(|&n| n <= 6),
+                "{:?} split={}: vector ALU {:?}",
+                shift_policy,
+                split_shift,
+                valu
+            );
+            assert!(
+                alu.values().all(|&n| n <= 12),
+                "{:?} split={}: scalar ALU {:?}",
+                shift_policy,
+                split_shift,
+                alu
+            );
+            assert_dependencies_respected(&emit.ops, &lanes);
+            if !split_shift {
+                assert!(lanes.is_empty());
+            }
+        }
+    }
+}
+
+/// Two adds and six multiply_adds ready together. Shifting only when the vector slots are
+/// full puts both adds on the vector ALU and two multiply_adds wait a cycle; `reserve`
+/// shifts the adds (one whole, one split) so all six multiply_adds run at once.
+#[test]
+fn test_shift_reserve_leaves_vector_slots_to_multiply_adds() {
+    let emit_one_cycle = || {
+        let mut emit = SsaEmitContext::new();
+        let scalar = emit.emit_const(3);
+        let shared = emit.emit_vbroadcast(scalar);
+        let addr = emit.emit_const(100);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(emit.emit_valu(Opcode::Add, shared, shared));
+        }
+        let mut fmas = HashSet::new();
+        for _ in 0..6 {
+            results.push(emit.emit_fma(shared, shared, shared));
+            fmas.insert(emit.ops.last().unwrap().id);
+        }
+        for r in results {
+            emit.emit_vstore(addr, r);
+        }
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+        (emit, fmas)
+    };
+    let fma_cycles = |policy: ShiftPolicy| {
+        let (mut emit, fmas) = emit_one_cycle();
+        let shape = GreedyShape { split_shift: true, shift_policy: policy, ..Default::default() };
+        let (_, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &shape);
+        let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
+        assert!(valu.values().all(|&n| n <= 6) && alu.values().all(|&n| n <= 12));
+        let cycles: std::collections::BTreeSet<i32> =
+            emit.ops.iter().filter(|op| fmas.contains(&op.id)).map(|op| op.cycle).collect();
+        (cycles, shifted.len())
+    };
+    let (when_full, when_full_shifted) = fma_cycles(ShiftPolicy::WhenFull);
+    assert_eq!(when_full.len(), 2, "two multiply_adds wait a cycle: {:?}", when_full);
+    assert_eq!(when_full_shifted, 0);
+    let (reserve, reserve_shifted) = fma_cycles(ShiftPolicy::Reserve);
+    assert_eq!(reserve.len(), 1, "all multiply_adds in one cycle: {:?}", reserve);
+    assert_eq!(reserve_shifted, 2);
+}
+
+/// `pace` shifts toward its target even where the vector slots never fill; `when-full`
+/// shifts nothing there.
+#[test]
+fn test_shift_pace_reaches_its_target() {
+    for (policy, lo, hi) in [
+        (ShiftPolicy::WhenFull, 0, 0),
+        (ShiftPolicy::Pace { target: Some(12) }, 11, 13),
+    ] {
+        let (mut emit, _) = emit_independent_chains(2, 30);
+        let shape = GreedyShape { shift_policy: policy, ..Default::default() };
+        let (_, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &shape);
+        let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
+        assert!(valu.values().all(|&n| n <= 6) && alu.values().all(|&n| n <= 12));
+        assert!((lo..=hi).contains(&shifted.len()), "{:?}: {} shifted", policy, shifted.len());
+    }
+}
+
+/// Force-schedule path (tight budget, adaptive policy): the proactive shift policies keep
+/// the slot limits there too.
+#[test]
+fn test_shift_policies_keep_slot_limits_when_force_scheduling() {
+    for shift_policy in [ShiftPolicy::Reserve, ShiftPolicy::ReservePace { target: None }] {
+        for split_shift in [false, true] {
+            let mut emit = emit_mixed_chains(10, 6);
+            let shape = GreedyShape { split_shift, shift_policy, ..Default::default() };
+            let mut shifted = HashSet::new();
+            let mut lanes = HashMap::new();
+            let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+                &mut emit.ops,
+                true,
+                &mut shifted,
+                48,
+                None,
+                None,
+                None,
+                None,
+                &GreedyBoundsUsage::None,
+                &AdaptivePolicy::default(),
+                None,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                &mut GreedyDiagnostics::new(false),
+                &shape,
+                &mut lanes,
+            )
+            .expect("greedy completes past the budget");
+            assert!(budget_exceeded, "the budget is tight enough to force-schedule");
+            let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
+            assert!(valu.values().all(|&n| n <= 6), "{:?}: vector ALU {:?}", shift_policy, valu);
+            assert!(alu.values().all(|&n| n <= 12), "{:?}: scalar ALU {:?}", shift_policy, alu);
+            assert_dependencies_respected(&emit.ops, &lanes);
+        }
+    }
+}
+
+/// Chains of load -> add -> load -> add -> load -> store: the last load of each chain is
+/// final (no later load depends on it).
+fn emit_load_chains(chains: usize) -> (SsaEmitContext, HashSet<usize>) {
+    let mut emit = SsaEmitContext::new();
+    let mut finals = HashSet::new();
+    for chain in 0..chains {
+        let mut addr = emit.emit_const(10 * chain as i64);
+        for step in 0..3 {
+            let value = emit.emit_load(addr);
+            if step == 2 {
+                finals.insert(emit.ops.last().unwrap().id);
+                emit.emit_store_imm(1000 + chain as i64, value);
+            } else {
+                addr = emit.emit_alu_imm(Opcode::Add, value, 1);
+            }
+        }
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, finals)
+}
+
+/// Number of final loads that took a load slot while a non-final load was ready and
+/// waiting. Also checks the load slot limit.
+fn final_loads_ahead_of_ready_feeders(ops: &[SsaOp], finals: &HashSet<usize>) -> usize {
+    let by_id: HashMap<usize, &SsaOp> = ops.iter().map(|op| (op.id, op)).collect();
+    let ready = |op: &SsaOp| op.dep_ids.iter().map(|d| by_id[d].cycle + 1).max().unwrap_or(0);
+    let loads: Vec<&SsaOp> = ops.iter().filter(|op| op.engine == Engine::Load).collect();
+    let mut per_cycle: HashMap<i32, usize> = HashMap::new();
+    for op in &loads {
+        *per_cycle.entry(op.cycle).or_default() += 1;
+    }
+    assert!(per_cycle.values().all(|&n| n <= 2), "load slots over capacity: {:?} {:?}", per_cycle, loads.iter().map(|o| (o.id, o.opcode, o.cycle)).collect::<Vec<_>>());
+    loads
+        .iter()
+        .filter(|op| finals.contains(&op.id))
+        .filter(|f| {
+            loads
+                .iter()
+                .any(|l| !finals.contains(&l.id) && ready(l) <= f.cycle && l.cycle > f.cycle)
+        })
+        .count()
+}
+
+/// `final-last`: a final load never takes a load slot while a load that feeds later loads
+/// is ready; with the wavefront key alone it does.
+#[test]
+fn test_load_priority_final_last() {
+    let shape = |load_priority| GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 6, groups_in_flight: None },
+        load_priority,
+        ..Default::default()
+    };
+    let (mut keyed, finals) = emit_load_chains(8);
+    schedule_with_shape(&mut keyed.ops, &shape(LoadPriority::Key));
+    assert!(final_loads_ahead_of_ready_feeders(&keyed.ops, &finals) > 0);
+
+    let (mut final_last, finals) = emit_load_chains(8);
+    schedule_with_shape(&mut final_last.ops, &shape(LoadPriority::FinalLast));
+    assert_eq!(final_loads_ahead_of_ready_feeders(&final_last.ops, &finals), 0);
+    assert_dependencies_respected(&final_last.ops, &HashMap::new());
+}
+
+/// The wavefront marks exactly the loads no later load depends on as final.
+#[test]
+fn test_wavefront_feeds_load() {
+    let (emit, finals) = emit_load_chains(3);
+    let w = wavefront_for(&emit.ops, 6, None);
+    for (idx, op) in emit.ops.iter().enumerate() {
+        if op.engine == Engine::Load {
+            assert_eq!(w.feeds_load(idx), !finals.contains(&op.id), "load {}", op.id);
+        }
+    }
+}
