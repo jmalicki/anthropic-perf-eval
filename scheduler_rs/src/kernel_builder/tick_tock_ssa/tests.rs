@@ -4596,3 +4596,111 @@ fn test_dependency_pass_keeps_index_war_at_wrap() {
             && op.mem_deps.iter().any(|&(_, kind)| kind == MemEdgeKind::War)
     }));
 }
+
+// ============================================================================
+// Region tags
+// ============================================================================
+
+/// 16 rounds, 4 groups, merged hash, mirrored index; round 4 mixes gather, bits-flow and
+/// mobius, round 12 uses bits, every other round the plannable default (bits at the root,
+/// gather elsewhere).
+fn region_tag_test_config() -> KernelConfig {
+    use crate::kernel_builder::config::IndexForm;
+    let mut config = KernelConfig::new(10, 2047, 32, 16);
+    let mut plan: Vec<Vec<AccessEncoding>> = (0..16)
+        .map(|r| {
+            let depth = config.spec.round_depth(r);
+            vec![if depth == 0 { AccessEncoding::Bits } else { AccessEncoding::Gather }; 4]
+        })
+        .collect();
+    plan[4] = vec![AccessEncoding::Gather, AccessEncoding::BitsFlow, AccessEncoding::Gather, AccessEncoding::Mobius];
+    plan[12] = vec![AccessEncoding::Bits; 4];
+    config.spec.merge_hash_stages = true;
+    config.spec.index_form = IndexForm::Mirrored;
+    config.spec.access_plan = Some(plan);
+    config
+}
+
+#[test]
+fn test_region_tags_follow_the_phases_and_groups() {
+    use crate::types::{EmissionPhase, RegionKind, RegionTag};
+    use std::collections::BTreeMap;
+    let ops = SsaTickTockKernelBuilder::new(region_tag_test_config()).build_ops();
+
+    for op in &ops {
+        let info = op.source_info.as_ref().unwrap();
+        if op.opcode == Opcode::Barrier {
+            assert!(op.region.is_none(), "round barriers belong to no region");
+            continue;
+        }
+        match info.phase {
+            EmissionPhase::TreeAccess | EmissionPhase::Xor | EmissionPhase::Hash | EmissionPhase::Branch => {
+                let tag = op.region.unwrap_or_else(|| panic!("untagged op in a round: {:?}", op));
+                assert_eq!(tag.round, info.round.map(|r| r as u32), "{:?}", op);
+                assert_eq!(tag.depth, info.tree_depth.map(|d| d as u32), "{:?}", op);
+                let kind_ok = matches!(
+                    (info.phase, tag.kind),
+                    (EmissionPhase::TreeAccess, RegionKind::TreeAccess(_))
+                        | (EmissionPhase::Xor, RegionKind::NodeXor)
+                        | (EmissionPhase::Hash, RegionKind::Hash)
+                        | (EmissionPhase::Branch, RegionKind::IndexStep)
+                );
+                assert!(kind_ok, "phase {:?} tagged {:?}", info.phase, tag.kind);
+                if tag.kind != RegionKind::TreeAccess(AccessEncoding::Gather) {
+                    assert!(tag.group.is_some(), "only the gather's base is shared: {:?}", op);
+                }
+            }
+            EmissionPhase::ValuSelectionInit => {
+                if let Some(tag) = op.region {
+                    assert_eq!(tag.kind, RegionKind::CachedLevelSetup);
+                    assert!(tag.round.is_none() && tag.group.is_none() && tag.depth.is_some());
+                }
+            }
+            _ => assert!(op.region.is_none(), "tagged op outside the rounds: {:?}", op),
+        }
+    }
+
+    // Round 4 (depth 4): per group the encoding of the plan; gathering groups have one
+    // address op, 8 loads and the XOR with the hash constant.
+    let in_region = |round: u32, group: Option<u32>| -> Vec<&SsaOp> {
+        ops.iter()
+            .filter(|o| {
+                o.region.map_or(false, |t| {
+                    matches!(t.kind, RegionKind::TreeAccess(_)) && t.round == Some(round) && t.group == group
+                })
+            })
+            .collect()
+    };
+    let round4 = [AccessEncoding::Gather, AccessEncoding::BitsFlow, AccessEncoding::Gather, AccessEncoding::Mobius];
+    for (g, want) in round4.into_iter().enumerate() {
+        let region = in_region(4, Some(g as u32));
+        assert!(region.iter().all(|o| o.region.unwrap().kind == RegionKind::TreeAccess(want)));
+        if want == AccessEncoding::Gather {
+            assert_eq!(region.len(), 10, "group {}: {:?}", g, region);
+            assert_eq!(region.iter().filter(|o| o.opcode == Opcode::Load).count(), 8);
+        } else if want == AccessEncoding::Mobius {
+            assert_eq!(region.iter().filter(|o| o.opcode == Opcode::MultiplyAdd).count(), 15);
+        }
+    }
+    // The gather's per-round base (level-end constant, pointer add, broadcast) is shared.
+    let shared: Vec<Opcode> = in_region(4, None).iter().map(|o| o.opcode).collect();
+    assert_eq!(shared, vec![Opcode::ConstChoice, Opcode::Add, Opcode::Vbroadcast]);
+
+    // Ids are dense in order of first emission, one per (kind, round, group, depth).
+    let mut by_id: BTreeMap<u32, RegionTag> = BTreeMap::new();
+    for op in &ops {
+        let Some(tag) = op.region else { continue };
+        match by_id.get(&tag.id) {
+            Some(first) => assert_eq!(
+                (first.kind, first.round, first.group, first.depth),
+                (tag.kind, tag.round, tag.group, tag.depth)
+            ),
+            None => {
+                assert_eq!(tag.id as usize, by_id.len(), "ids are allocated in order");
+                by_id.insert(tag.id, tag);
+            }
+        }
+    }
+    let keys: HashSet<_> = by_id.values().map(|t| (t.kind, t.round, t.group, t.depth)).collect();
+    assert_eq!(keys.len(), by_id.len(), "one id per key");
+}
