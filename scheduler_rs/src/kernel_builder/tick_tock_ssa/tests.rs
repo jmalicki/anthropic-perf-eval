@@ -4045,6 +4045,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
             live_through_vregs: None,
             cse_groups: None,
             vector_group_lanes: None,
+            ..Default::default()
         },
         Some(!greedy_budget_exceeded),
     );
