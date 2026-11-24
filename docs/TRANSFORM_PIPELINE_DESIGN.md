@@ -22,6 +22,11 @@ The catalogue that backs these classes is
 [TRANSFORM_RULE_CATALOGUE.md](TRANSFORM_RULE_CATALOGUE.md). It lists every branch with
 file:line, every coupling, and the proof ids. This document describes the mechanism.
 
+**North star.** The end goal is wider than this document. It is a compiler that takes the
+original scalar baseline kernel (147,734 cycles) and produces our best kernel with no
+strategy flags. [BASELINE_TO_BEST_GAP.md](BASELINE_TO_BEST_GAP.md) maps what lies between
+the two. This document covers the near-term part: canonical SSA to best.
+
 Status: design. Nothing here is implemented except where a file is cited. Statements about
 current code cite file:line. Statements marked *(inferred)* are my reading, not checked by
 running anything.

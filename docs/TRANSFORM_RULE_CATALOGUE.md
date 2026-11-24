@@ -704,3 +704,20 @@ path.
 | 8 | Switch to canonical emission (gather at every depth including 0, zero-based, indices stored, 11-op hash); delete flag branches | Canonical + rules chosen to match each flag set == that flag set's emission, for every row of EMISSION_ABLATION.md | Needs the depth-0 gather check (Not determined, item 1) |
 | 9 | Optional: reference-form hash (18 ops) and rule 1 as a peephole; SSA recovery from lifted kernels | Rule 1 output == today's canonical hash | First step on the untagged path (design doc §7) |
 | 10 | N2, then N1 | No parity (new emission): PROVED with store forwarding in `kernel_dataflow`, PASSED, exact memory edges | Needs the IR additions above |
+
+PRs 1–8 and 10 are what the benchmark number needs. PR 9 serves only the north-star goal
+below.
+
+### Later phase: input is the lifted baseline, no flags (goal only)
+
+This phase is separate from, and after, the order above. Pass names refer to
+[BASELINE_TO_BEST_GAP.md](BASELINE_TO_BEST_GAP.md) §3. None of these steps is needed for the
+benchmark number.
+
+| Step | Contents | Gate |
+|---|---|---|
+| L1 | B0 + B1: SSA recovery from `kernel_lift` output (straight-line renaming, vector-group recovery), producing an `SsaProgram` with `MemLocation`s from `memory_alias` address terms | `kernel_dataflow`: original kernel against the recovered program, on the baseline and on our own saved kernels |
+| L2 | B2–B4: header specialisation, memory-to-register promotion of idx and val, dead-store elimination | SSA-to-SSA equivalence with memory (`verification/ssa_equivalence.py` or `SymbolicKernel` forwarding); `--validate` |
+| L3 | B5–B9: if-conversion, bounds-check elimination, multiply-add formation, R1 fusion, R2 deferral | per-rule Z3 (MA2, R7, R1, R2, R3) + certificate |
+| L4 | B10 + B11: SLP vectorisation into 32 groups of 8; CSE | SSA-to-SSA with a lane mapping; result equals today's canonical program after renumbering |
+| L5 | Feed L4's output into PRs 1–10 instead of the emitter | lifted baseline + no flags == our best kernel's SSA program (or better on the floor) |
