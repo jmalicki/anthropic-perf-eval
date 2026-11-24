@@ -7,6 +7,7 @@ round to minimise the capacity floor, then emit and schedule the chosen plan.
     uv run python -m scripts.emission_structure solve --out plan.json # best plan for the floor
     uv run python -m scripts.emission_structure predict --plan plan.json
     uv run python -m scripts.emission_structure measure --plan plan.json --shaped --upstream
+    uv run python -m scripts.emission_structure derive                # table by instantiation == calibrated?
 
 Design: docs/EMISSION_STRUCTURE_MODEL.md. In short:
 
@@ -554,6 +555,47 @@ def default_table_path(ctx: Context) -> str:
     return os.path.join(ROOT, "artifacts", "emission_structure", f"costs_{ctx.key()}.json")
 
 
+def derive_table(ctx: Context) -> tuple[CostTable, dict]:
+    """Cost table derived by instantiation in scheduler_rs (`derive_tree_access_cost_table`):
+    the canonical program with every alternative of every site built next to it, and each
+    op's liveness reduced to the features of `feature_names`. No probe builds, no fit.
+
+    Returns:
+        (the table, the full JSON document: sites, resources, facts, problems).
+
+    Raises:
+        RuntimeError: if the derivation reports problems (something that does not fit the
+            features) or produces a feature the model does not have.
+    """
+    import scheduler_rs
+    from kernel_build_args import n_nodes_for_height
+
+    doc = json.loads(scheduler_rs.derive_tree_access_cost_table(
+        ctx.forest_height, n_nodes_for_height(ctx.forest_height), ctx.batch_size, ctx.rounds,
+        merge_hash_stages=ctx.merge_hash_stages, index_form=ctx.index_form,
+        select_bit_source=ctx.select_bit_source, values_only=ctx.values_only))
+    if doc["problems"]:
+        raise RuntimeError(f"derived cost table does not fit the features ({len(doc['problems'])} problems): "
+                           + "; ".join(doc["problems"][:5]))
+    names = feature_names(ctx)
+    unknown = sorted(set(doc["coefficients"]) - set(names))
+    if unknown:
+        raise RuntimeError(f"derived cost table has features the model lacks: {unknown}")
+    coefficients = {n: {c: int(doc["coefficients"].get(n, {}).get(c, 0)) for c in CATEGORIES} for n in names}
+    return CostTable(ctx, coefficients, notes=["derived by instantiation (scheduler_rs)"]), doc
+
+
+def table_differences(a: CostTable, b: CostTable) -> list[str]:
+    """Entries (feature, category) where two cost tables differ, as readable lines."""
+    diffs = []
+    for name in sorted(set(a.coefficients) | set(b.coefficients)):
+        for c in CATEGORIES:
+            va, vb = a.coefficients.get(name, {}).get(c, 0), b.coefficients.get(name, {}).get(c, 0)
+            if va != vb:
+                diffs.append(f"{name} {c}: {va} vs {vb}")
+    return diffs
+
+
 def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -> CostTable:
     path = path or default_table_path(ctx)
     if os.path.exists(path):
@@ -1028,7 +1070,7 @@ def _print_counts(label, counts):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["calibrate", "check", "predict", "solve", "sweep", "measure", "table",
-                                        "scatter"])
+                                        "scatter", "derive"])
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--forest-height", type=int, default=10)
@@ -1124,6 +1166,27 @@ def main(argv=None):
             for e in result["skipped"][:3]:
                 print("  did not build: " + e)
             return 1 if bad or not result["compared"] else 0
+        if args.command == "derive":
+            derived, doc = derive_table(ctx)
+            if args.json:
+                write_json_atomic(args.json, doc)
+            print(f"Derived by instantiation (scheduler_rs): {len(doc['sites'])} sites, "
+                  f"{len(doc['resources'])} shared-resource groups")
+            print("| Feature | " + " | ".join(CATEGORIES) + " |")
+            print("|---|" + "---|" * len(CATEGORIES))
+            for name, coef in derived.coefficients.items():
+                if any(coef.values()):
+                    print(f"| {name} | " + " | ".join(f"{coef[c]:,}" if coef[c] else "" for c in CATEGORIES) + " |")
+            diffs = table_differences(derived, table)
+            entries = len(derived.coefficients) * len(CATEGORIES)
+            if diffs:
+                print(f"DIFFERS from the calibrated table in {len(diffs)} of {entries} entries (derived vs calibrated):")
+                for d in diffs:
+                    print("  " + d)
+                return 1
+            print(f"Equal to the calibrated table in all {entries} entries "
+                  f"({len(derived.coefficients)} features x {len(CATEGORIES)} categories).")
+            return 0
         if args.command == "table":
             print("| Feature | " + " | ".join(CATEGORIES) + " |")
             print("|---|" + "---|" * len(CATEGORIES))

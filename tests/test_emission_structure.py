@@ -83,6 +83,20 @@ def test_calibration_is_exact_on_unseen_plans(table, tmp_path):
     assert result["compared"] >= 1 and result["bad"] == []
 
 
+def test_table_by_instantiation_equals_calibrated(table):
+    """The binding's cost table, derived from one program holding every alternative, equals
+    the table fitted from probe builds entry for entry, products of shared constants included."""
+    derived, doc = es.derive_table(CTX)
+    assert es.table_differences(derived, table) == []
+    assert any(derived.coefficients[name]["alu"] for name in es.feature_names(CTX) if name.startswith("and:"))
+    assert doc["problems"] == [] and doc["rule"] == "tree-access"
+    choice_rounds = len(CTX.choice_rounds())
+    assert len(doc["sites"]) == choice_rounds * CTX.n_groups
+    site = doc["sites"][0]
+    assert set(site["alternatives"]) == {"gather", "bits", "bits-flow", "mobius"}
+    assert {f["name"]: f["source"] for f in site["facts"]}["depth"] == "structure"
+
+
 def test_counts_cover_every_ssa_op(tmp_path):
     rows = es.flag_plan(CTX, "bits-flow", "after-wrap")
     _, _, sched, _ = es.build_emission(rows, CTX, str(tmp_path))

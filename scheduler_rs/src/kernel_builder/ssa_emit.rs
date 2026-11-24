@@ -692,6 +692,9 @@ impl SsaTickTockKernelBuilder {
         }
         self.access_groups = None;
         self.emit.clear_region();
+        if self.instantiation.is_some() && (1..=MAX_TREE_REDUCE_DEPTH as usize).contains(&tree_depth) {
+            self.instantiate_tree_access_round(rnd);
+        }
 
         // XOR
         self.emit.set_phase(EmissionPhase::Xor);
@@ -925,10 +928,13 @@ impl SsaTickTockKernelBuilder {
     /// there (with `high` if `BitsFlow` is), then the Mobius coefficients if `Mobius` is.
     pub(super) fn emit_cached_select_init(&mut self) {
         let max_depth = MAX_TREE_REDUCE_DEPTH as usize;
+        // When instantiating alternatives, every visited level above the root gets every table.
+        let instantiating = self.instantiation.is_some();
         let used: Vec<[bool; 3]> = (0..=max_depth)
             .map(|depth| {
+                let visited = (0..self.config.spec.rounds).any(|r| self.config.spec.round_depth(r) == depth);
                 [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius]
-                    .map(|e| self.config.spec.uses_access(depth, e))
+                    .map(|e| self.config.spec.uses_access(depth, e) || (instantiating && depth >= 1 && visited))
             })
             .collect();
         if used.iter().all(|u| u.iter().all(|&x| !x)) {
@@ -1021,12 +1027,36 @@ impl SsaTickTockKernelBuilder {
     /// `tree_depth` 0/1 vectors, oldest first.
     fn emit_select_bits(&mut self, g: usize, tree_depth: usize) -> Vec<crate::types::VReg> {
         let path = self.ctx.path_bits[g].clone();
+        let prev = self.ctx.prev_idx[g];
+        let v_1 = self.ctx.v_1.unwrap();
+        self.emit_select_bits_from(&path, prev, v_1, tree_depth)
+    }
+
+    /// `emit_select_bits` on explicit operands: what one group's bit-driven tree access
+    /// needs from its index step, without reading the builder's per-group state.
+    ///
+    /// # Arguments
+    /// * `path` - The `tree_depth` branch bits since the last wrap, oldest first.
+    /// * `prev` - The index before the last update; read only when the older bits are
+    ///   extracted (`SelectBitSource::Index` at depth 3 or more).
+    /// * `v_1` - Vector of ones.
+    /// * `tree_depth` - Depth the indices are at.
+    ///
+    /// # Returns
+    /// `tree_depth` 0/1 vectors, oldest first (as `emit_select_bits`).
+    pub(crate) fn emit_select_bits_from(
+        &mut self,
+        path: &[crate::types::VReg],
+        prev: Option<crate::types::VReg>,
+        v_1: crate::types::VReg,
+        tree_depth: usize,
+    ) -> Vec<crate::types::VReg> {
+        let path = path.to_vec();
         if self.config.spec.select_bit_source == SelectBitSource::Path || tree_depth <= 2 {
             return path;
         }
         let older = tree_depth - 1;
-        let prev = self.ctx.prev_idx[g].unwrap();
-        let v_1 = self.ctx.v_1.unwrap();
+        let prev = prev.expect("the index before the last update, to extract the older bits from");
         let mut cur = if self.mirrored_index() {
             prev
         } else {
@@ -1071,7 +1101,6 @@ impl SsaTickTockKernelBuilder {
         let table = self.ctx.cached_tables[tree_depth]
             .clone()
             .unwrap_or_else(|| panic!("no select constants for cached depth {}", tree_depth));
-        let missing = format!("no {:?} select constants for cached depth {}", mode, tree_depth);
 
         for it in 0..n_iters {
             let base_g = it * UNROLL;
@@ -1082,57 +1111,80 @@ impl SsaTickTockKernelBuilder {
                 }
                 self.emit.set_iter_group(it, g);
                 let bits = self.emit_select_bits(g, tree_depth);
-                assert_eq!(bits.len(), tree_depth, "one branch bit per level above depth {}", tree_depth);
-                // Bit that selects at level `level` of the select tree (0 = leaves): oldest first.
-                let bit_at = |level: usize| bits[level];
-
-                let node = if tree_depth == 0 {
-                    table.root.expect(&missing)
-                } else if mode != CachedSelect::Mobius {
-                    let pairs = table.pairs.as_ref().expect(&missing);
-                    self.emit.set_symmetry_hint(0);
-                    let mut cur: Vec<crate::types::VReg> = Vec::with_capacity(pairs.len());
-                    for pair in pairs {
-                        self.emit.set_next_var_type(VarType::Temporary);
-                        cur.push(if mode == CachedSelect::BitsFlow {
-                            // vselect(bit, high, base) or bit * delta + base.
-                            let high = pair.high.expect(&missing);
-                            self.emit
-                                .emit_select_choice_shared_delta(bit_at(0), high, pair.delta, pair.base)
-                        } else {
-                            // bit * delta + base (R4-fma-select).
-                            self.emit.emit_fma(bit_at(0), pair.delta, pair.base)
-                        });
-                    }
-                    for level in 1..tree_depth {
-                        self.emit.set_symmetry_hint(level as u8);
-                        let mut next = Vec::with_capacity(cur.len() / 2);
-                        for k in 0..cur.len() / 2 {
-                            self.emit.set_next_var_type(VarType::Temporary);
-                            next.push(self.select_2way(bit_at(level), cur[2 * k + 1], cur[2 * k]));
-                        }
-                        cur = next;
-                    }
-                    self.emit.clear_symmetry_hint();
-                    cur[0]
-                } else {
-                    let mut cur = table.coefficients.clone().expect(&missing);
-                    for level in 0..tree_depth {
-                        self.emit.set_symmetry_hint(level as u8);
-                        let mut next = Vec::with_capacity(cur.len() / 2);
-                        for k in 0..cur.len() / 2 {
-                            self.emit.set_next_var_type(VarType::Temporary);
-                            next.push(self.emit.emit_fma(bit_at(level), cur[2 * k + 1], cur[2 * k]));
-                        }
-                        cur = next;
-                    }
-                    self.emit.clear_symmetry_hint();
-                    cur[0]
-                };
+                let node = self.emit_select_from_table(mode, &bits, &table, tree_depth);
                 self.ctx.v_nv[it][i] = Some(node);
             }
         }
         self.emit.clear_iter_group();
+    }
+
+    /// Select one group's node value among a cached level's constants with its branch bits:
+    /// the per-group body of `emit_cached_level_select`, on explicit operands.
+    ///
+    /// # Arguments
+    /// * `mode` - `Bits`, `BitsFlow` or `Mobius` (not `Standard`).
+    /// * `bits` - `tree_depth` 0/1 vectors, oldest first (`emit_select_bits_from`).
+    /// * `table` - The level's select constants; must hold what `mode` needs.
+    /// * `tree_depth` - The level.
+    ///
+    /// # Returns
+    /// The node value, already XORed with the deferred stage-5 constant.
+    pub(crate) fn emit_select_from_table(
+        &mut self,
+        mode: CachedSelect,
+        bits: &[crate::types::VReg],
+        table: &CachedLevelTable,
+        tree_depth: usize,
+    ) -> crate::types::VReg {
+        assert_ne!(mode, CachedSelect::Standard, "standard selection has its own emitters");
+        let missing = format!("no {:?} select constants for cached depth {}", mode, tree_depth);
+        assert_eq!(bits.len(), tree_depth, "one branch bit per level above depth {}", tree_depth);
+        // Bit that selects at level `level` of the select tree (0 = leaves): oldest first.
+        let bit_at = |level: usize| bits[level];
+
+        if tree_depth == 0 {
+            table.root.expect(&missing)
+        } else if mode != CachedSelect::Mobius {
+            let pairs = table.pairs.as_ref().expect(&missing);
+            self.emit.set_symmetry_hint(0);
+            let mut cur: Vec<crate::types::VReg> = Vec::with_capacity(pairs.len());
+            for pair in pairs {
+                self.emit.set_next_var_type(VarType::Temporary);
+                cur.push(if mode == CachedSelect::BitsFlow {
+                    // vselect(bit, high, base) or bit * delta + base.
+                    let high = pair.high.expect(&missing);
+                    self.emit
+                        .emit_select_choice_shared_delta(bit_at(0), high, pair.delta, pair.base)
+                } else {
+                    // bit * delta + base (R4-fma-select).
+                    self.emit.emit_fma(bit_at(0), pair.delta, pair.base)
+                });
+            }
+            for level in 1..tree_depth {
+                self.emit.set_symmetry_hint(level as u8);
+                let mut next = Vec::with_capacity(cur.len() / 2);
+                for k in 0..cur.len() / 2 {
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    next.push(self.select_2way(bit_at(level), cur[2 * k + 1], cur[2 * k]));
+                }
+                cur = next;
+            }
+            self.emit.clear_symmetry_hint();
+            cur[0]
+        } else {
+            let mut cur = table.coefficients.clone().expect(&missing);
+            for level in 0..tree_depth {
+                self.emit.set_symmetry_hint(level as u8);
+                let mut next = Vec::with_capacity(cur.len() / 2);
+                for k in 0..cur.len() / 2 {
+                    self.emit.set_next_var_type(VarType::Temporary);
+                    next.push(self.emit.emit_fma(bit_at(level), cur[2 * k + 1], cur[2 * k]));
+                }
+                cur = next;
+            }
+            self.emit.clear_symmetry_hint();
+            cur[0]
+        }
     }
 
     // =========================================================================
