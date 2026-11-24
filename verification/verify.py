@@ -59,6 +59,7 @@ from .lane_model import EXPECT_SAT as LANE_EXPECT_SAT, LANE_CHECKS
 from .rewrites import EXPECT_SAT as REWRITE_EXPECT_SAT, REWRITE_CHECKS
 from .allocation_conjectures import ALLOCATION_CHECKS, EXPECT_SAT as ALLOCATION_EXPECT_SAT
 from .static_bounds_proof import STATIC_BOUND_CHECKS, EXPECT_SAT as STATIC_BOUND_EXPECT_SAT
+from .memory_alias import MEMORY_ALIAS_CHECKS
 from .makespan_rows import MAKESPAN_ROW_CHECKS, EXPECT_SAT as MAKESPAN_ROW_EXPECT_SAT
 
 THEOREM_CHECKS = [
@@ -207,6 +208,9 @@ THEOREM_CHECKS += LANE_CHECKS
 
 # Static head/tail makespan rows of scripts/static_bounds.py (verification/static_bounds_proof.py).
 THEOREM_CHECKS += STATIC_BOUND_CHECKS
+
+# Rules behind the exact memory-alias analysis of lifted kernels (verification/memory_alias.py).
+THEOREM_CHECKS += MEMORY_ALIAS_CHECKS
 
 # Soundness of the CP-SAT makespan rows (verification/makespan_rows.py).
 THEOREM_CHECKS += MAKESPAN_ROW_CHECKS
