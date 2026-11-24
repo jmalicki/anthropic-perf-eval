@@ -801,6 +801,7 @@ pub(crate) fn verify_scratch_budget_all_readers(
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
     select_choice_encoding: &HashMap<usize, SelectChoiceEncoding>,
     scratch_budget: usize,
+    scratch_time: super::config::ScratchTime,
 ) {
     let times = ScheduledTimes::new(ops, cycle_assignments, shifted_ops, shifted_alu_cycles, select_choice_encoding);
     let mut events: Vec<(i32, i64)> = Vec::new();
@@ -811,10 +812,21 @@ pub(crate) fn verify_scratch_budget_all_readers(
             continue;
         };
         let words = vreg.size() as i64;
-        events.push((start, words));
-        events.push((end.max(start + 1), -words));
+        let end = end.max(start + 1);
+        match scratch_time {
+            super::config::ScratchTime::Cycle => {
+                events.push((start, words));
+                events.push((end, -words));
+            }
+            // Same-cycle reuse: the words are free for a value written in the cycle of the
+            // last read (end - 1), i.e. [start, last read) half-open.
+            super::config::ScratchTime::Phase => {
+                events.push((start, words));
+                events.push((end - 1, -words));
+            }
+        }
     }
-    // Frees before allocations at the same cycle: intervals are half-open.
+    // Frees before allocations at the same time: intervals are half-open.
     events.sort_unstable();
     let mut live = 0i64;
     let mut peak = (0i64, 0i32);
