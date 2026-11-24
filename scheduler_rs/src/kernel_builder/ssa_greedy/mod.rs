@@ -71,6 +71,84 @@ pub struct GreedyShape {
     /// Pool capacities `(vectors, scalars)` the run must keep (set by the pools retry in
     /// [`schedule_ssa_greedy_shaped`]); `None` = live words against the budget.
     pub pool_caps: Option<(usize, usize)>,
+    /// When a shiftable vector op is run as 8 scalar ops (see [`ShiftPolicy`]).
+    pub shift_policy: ShiftPolicy,
+    /// Wavefront only: which ready loads get the load slots (see [`LoadPriority`]).
+    pub load_priority: LoadPriority,
+}
+
+/// Wavefront only: the order in which ready loads are offered the two load slots. Other
+/// engines always keep the wavefront order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadPriority {
+    /// Wavefront key (default).
+    #[default]
+    Key,
+    /// Longest tail first (longest dependency path to the end of the program), then key.
+    Tail,
+    /// Final loads (no later load depends on them, e.g. the last gather round) after all
+    /// other loads, then key: a final load has a short tail, while a load that feeds later
+    /// gathers holds up the load engine's future work.
+    FinalLast,
+}
+
+// ============================================================================
+// ShiftPolicy: when the greedy runs a shiftable vector op on the scalar ALU
+// ============================================================================
+
+/// When the greedy runs a shiftable vector op as 8 scalar ops.
+///
+/// The historical rule ([`ShiftPolicy::WhenFull`]) shifts only an op that finds the six
+/// vector slots full. Ready ops are tried in priority order, so shiftable ops early in the
+/// order take vector slots and `multiply_add`s (which cannot shift) later in the order wait,
+/// while the scalar ALU idles (docs/GREEDY_SHAPE_ABLATION.md section 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShiftPolicy {
+    /// Shift only when the vector slots are full (default).
+    #[default]
+    WhenFull,
+    /// Also shift when the vector slots left in this cycle are wanted by non-shiftable
+    /// vector ops later in this cycle's ready order.
+    Reserve,
+    /// Also shift whenever the run is behind a pace: `shifted / vector ops placed` below
+    /// `target / vector ops`. `target = None` uses the balanced split of the emitted counts,
+    /// `(2 V - A) / 10` (vector ALU and scalar ALU floors equal).
+    Pace { target: Option<usize> },
+    /// Either `Reserve` or `Pace`.
+    ReservePace { target: Option<usize> },
+}
+
+impl ShiftPolicy {
+    fn reserve(&self) -> bool {
+        matches!(self, ShiftPolicy::Reserve | ShiftPolicy::ReservePace { .. })
+    }
+
+    /// `Some(explicit target or None for the balanced split)` when the policy paces.
+    fn pace(&self) -> Option<Option<usize>> {
+        match *self {
+            ShiftPolicy::Pace { target } | ShiftPolicy::ReservePace { target } => Some(target),
+            _ => None,
+        }
+    }
+}
+
+/// Shifted vector ops that balance the vector and scalar ALU floors:
+/// `(V - s) / 6 = (A + 8 s) / 12`, i.e. `s = (2 V - A) / 10`, rounded up and clamped to
+/// `[0, shiftable]`.
+///
+/// # Arguments
+/// * `vector_ops` - Vector ops the greedy places on the vector ALU unless shifted
+/// * `shiftable` - How many of them may run as 8 scalar ops
+/// * `scalar_ops` - Native scalar ALU ops
+///
+/// # Returns
+/// The balanced number of shifts.
+pub(crate) fn balanced_shift_target(vector_ops: usize, shiftable: usize, scalar_ops: usize) -> usize {
+    let num = 2 * vector_ops as i64 - scalar_ops as i64;
+    if num <= 0 {
+        return 0;
+    }
+    (((num + 9) / 10) as usize).min(shiftable)
 }
 
 // ============================================================================
@@ -2031,6 +2109,49 @@ fn schedule_ssa_greedy_core(
         && enable_valu_shift
         && fixed_shifted_ops.is_none()
         && !valu_shift_fixed_to_none;
+    // Shift policy: proactive shifts (before the vector slots are full) only when the
+    // scheduler itself decides shifts.
+    let proactive_shift_enabled = shape.shift_policy != ShiftPolicy::WhenFull
+        && enable_valu_shift
+        && fixed_shifted_ops.is_none()
+        && !valu_shift_fixed_to_none;
+    // Pace: (vector ops placed so far, of them shifted, total, target).
+    let pace_total_vector = ops
+        .iter()
+        .enumerate()
+        .filter(|(i, op)| op.engine == Engine::Valu && !dead_store_indices.contains(i))
+        .count();
+    let pace_target: Option<usize> = if proactive_shift_enabled {
+        shape.shift_policy.pace().map(|explicit| {
+            explicit.unwrap_or_else(|| {
+                let shiftable = (0..ops.len())
+                    .filter(|i| shiftable_set.contains(i) && !dead_store_indices.contains(i))
+                    .count();
+                let scalar = ops
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, op)| op.engine == Engine::Alu && !dead_store_indices.contains(i))
+                    .count();
+                balanced_shift_target(pace_total_vector, shiftable, scalar)
+            })
+        })
+    } else {
+        None
+    };
+    if diagnostics.verbose {
+        if let Some(t) = pace_target {
+            eprintln!(
+                "Greedy shift pace: target {} of {} vector ops shifted",
+                t, pace_total_vector
+            );
+        }
+    }
+    // Vector ops that cannot shift (multiply_add, vbroadcast, SelectChoice on the vector path).
+    let fixed_vector: Vec<bool> = (0..ops.len())
+        .map(|i| ops[i].engine == Engine::Valu && !shiftable_set.contains(&i))
+        .collect();
+    let mut pace_vector_placed: usize = 0;
+    let mut pace_shifted: usize = 0;
     // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
     // It is not in `scheduled` until it completes, so the loop below keeps running for it.
     let mut split_carry: Option<SplitShift> = None;
@@ -2266,6 +2387,21 @@ fn schedule_ssa_greedy_core(
         // Wavefront priority overrides the queue order; the policy's order breaks key ties.
         if let Some(w) = wavefront.as_ref() {
             ready_this_cycle.sort_by_key(|&idx| w.key(idx));
+            if shape.load_priority != LoadPriority::Key {
+                // Reorder the loads among the positions loads hold; every other op keeps its
+                // place in the wavefront order.
+                let positions: Vec<usize> = (0..ready_this_cycle.len())
+                    .filter(|&p| ops[ready_this_cycle[p]].engine == Engine::Load)
+                    .collect();
+                let mut loads: Vec<usize> = positions.iter().map(|&p| ready_this_cycle[p]).collect();
+                match shape.load_priority {
+                    LoadPriority::Tail => loads.sort_by_key(|&idx| (-w.height(idx), w.key(idx), idx)),
+                    _ => loads.sort_by_key(|&idx| (!w.feeds_load(idx), w.key(idx), idx)),
+                }
+                for (&p, idx) in positions.iter().zip(loads) {
+                    ready_this_cycle[p] = idx;
+                }
+            }
         }
 
         // Keep retrying as long as we make progress (schedule something or free VRegs)
@@ -2427,9 +2563,22 @@ fn schedule_ssa_greedy_core(
                 })
                 .count();
 
+            // Shift policy `reserve`: non-shiftable vector ops still to be tried this pass.
+            let mut pending_fixed_vector = if proactive_shift_enabled && shape.shift_policy.reserve() {
+                ops_to_try
+                    .iter()
+                    .filter(|&&idx| !scheduled.contains(&idx) && fixed_vector[idx])
+                    .count()
+            } else {
+                0
+            };
+
             for idx in ops_to_try {
                 if scheduled.contains(&idx) {
                     continue;
+                }
+                if pending_fixed_vector > 0 && fixed_vector[idx] {
+                    pending_fixed_vector -= 1;
                 }
 
                 // ConstChoice: use add_imm (Flow) only if there is a free Flow slot and no
@@ -2480,6 +2629,27 @@ fn schedule_ssa_greedy_core(
                 };
                 let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
+                // Proactive shift (shift policy other than `when-full`): run this op on the
+                // scalar ALU although a vector slot is free.
+                let prefer_shift = proactive_shift_enabled
+                    && can_shift
+                    && engine == Engine::Valu
+                    && slots.valu_used < 6
+                    && ((shape.shift_policy.reserve()
+                        && pending_fixed_vector > 0
+                        && pending_fixed_vector >= 6 - slots.valu_used)
+                        || pace_target.is_some_and(|t| {
+                            (pace_shifted as u128) * (pace_total_vector as u128)
+                                < (t as u128) * ((pace_vector_placed + 1) as u128)
+                        }))
+                    && strategy.allow_shift(
+                        pools.words_needed(&live, scratch_budget),
+                        slots.alu_used,
+                        scratch_budget,
+                    );
+                // Whole shift does not fit: try a split shift, else run on the vector ALU.
+                let prefer_split = prefer_shift && split_shift_enabled && slots.alu_used + VLEN > 12;
+
                 // Check slot availability
                 if must_place_shifted {
                     if slots.alu_used + VLEN > 12 {
@@ -2491,11 +2661,12 @@ fn schedule_ssa_greedy_core(
                         ready_heap.push(Reverse((next_priority, idx)));
                         continue;
                     }
-                } else if !slots.fits(engine, can_shift) {
-                    // Split shift: the vector slots are full and a whole shifted op does not
-                    // fit, but scalar slots are left. Run the first lanes now and the rest
-                    // next cycle. The destination block is reserved now; operands are
-                    // released when the op completes, so nothing is freed in this cycle.
+                } else if !slots.fits(engine, can_shift) || prefer_split {
+                    // Split shift: the vector slots are full (or the shift policy prefers the
+                    // scalar ALU) and a whole shifted op does not fit, but scalar slots are
+                    // left. Run the first lanes now and the rest next cycle. The destination
+                    // block is reserved now; operands are released when the op completes, so
+                    // nothing is freed in this cycle.
                     let free_alu = 12 - slots.alu_used;
                     if split_shift_enabled
                         && can_shift
@@ -2534,18 +2705,23 @@ fn schedule_ssa_greedy_core(
                                 );
                                 vreg_def_cycle.insert(d, cycle as i32);
                                 peak_live_words = peak_live_words.max(live.words);
+                                pace_vector_placed += 1;
+                                pace_shifted += 1;
                                 continue;
                             }
                         }
                     }
-                    // Reinsert to heap for next cycle
-                    let next_priority = bounds_usage
-                        .core_bounds()
-                        .and_then(|(a, _)| a.get(&op_id).copied())
-                        .map(|lb| ((cycle + 1) as i32).max(lb))
-                        .unwrap_or_else(|| (cycle + 1) as i32);
-                    ready_heap.push(Reverse((next_priority, idx)));
-                    continue;
+                    // A preferred split that could not start: the op still fits a vector slot.
+                    if !prefer_split {
+                        // Reinsert to heap for next cycle
+                        let next_priority = bounds_usage
+                            .core_bounds()
+                            .and_then(|(a, _)| a.get(&op_id).copied())
+                            .map(|lb| ((cycle + 1) as i32).max(lb))
+                            .unwrap_or_else(|| (cycle + 1) as i32);
+                        ready_heap.push(Reverse((next_priority, idx)));
+                        continue;
+                    }
                 }
 
                 // Check scratch budget with same-cycle reuse model:
@@ -2590,9 +2766,17 @@ fn schedule_ssa_greedy_core(
                 let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
                 let place_result = if must_place_shifted {
                     slots.try_place_shifted_only()
+                } else if prefer_shift && slots.alu_used + VLEN <= 12 {
+                    slots.try_place_shifted_only()
                 } else {
                     slots.try_place(engine, can_shift, allow_shift)
                 };
+                if engine == Engine::Valu && place_result != SlotResult::NoRoom {
+                    pace_vector_placed += 1;
+                    if place_result == SlotResult::Shifted {
+                        pace_shifted += 1;
+                    }
+                }
                 match place_result {
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&idx) {

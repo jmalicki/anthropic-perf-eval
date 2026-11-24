@@ -177,6 +177,12 @@ def main():
         note = "" if args.use_greedy else (" (hinted to CP-SAT lane by lane)" if hinted
                                            else " (ignored: CP-SAT follows the greedy)")
         print("  greedy_split_shift=True" + note)
+    if getattr(args, "greedy_shift_policy", "when-full") != "when-full":
+        target = getattr(args, "greedy_shift_target", None)
+        print(f"  greedy_shift_policy={args.greedy_shift_policy}"
+              + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
+    if getattr(args, "greedy_load_priority", "key") != "key":
+        print(f"  greedy_load_priority={args.greedy_load_priority}")
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):

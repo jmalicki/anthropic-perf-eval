@@ -1097,7 +1097,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None,
-    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase"))]
+    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase", greedy_shift_policy="when-full", greedy_shift_target=None, greedy_load_priority="key"))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1165,6 +1165,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     scratch_model: &str,
     cpsat_split_shift_hint: bool,
     cpsat_scratch_time: &str,
+    greedy_shift_policy: &str,
+    greedy_shift_target: Option<usize>,
+    greedy_load_priority: &str,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let cpsat_tuning = crate::cpsat_scheduler::CpsatTuning::from_json(cpsat_tuning_json)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1317,6 +1320,22 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             cpsat_scratch_constraint: scratch_constraint,
             scratch_model,
             cpsat_split_shift_hint,
+            greedy_shift_policy: crate::kernel_builder::config::GreedyShiftPolicyKind::from_str(
+                greedy_shift_policy,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            greedy_shift_target,
+            greedy_load_priority: match greedy_load_priority {
+                "key" => crate::kernel_builder::ssa_greedy::LoadPriority::Key,
+                "tail" => crate::kernel_builder::ssa_greedy::LoadPriority::Tail,
+                "final-last" => crate::kernel_builder::ssa_greedy::LoadPriority::FinalLast,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid greedy_load_priority '{}': must be 'key', 'tail' or 'final-last'",
+                        other
+                    )))
+                }
+            },
         },
     };
     config
