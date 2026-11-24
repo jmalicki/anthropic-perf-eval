@@ -260,7 +260,7 @@ vbroadcast (`vec_fixed`). `A` is a scalar ALU op. `L` is a load, `S` a store.
     In the wrap round, nothing (`n = None`).
   - Gather: `V-(B(forest_p + L_d), n)`, plus per gathered round 1 K + 1 A + 1 B for the base.
     The A and the B are not CSE'd between the two visits of a level: `emit_alu` has no
-    cache *(read: no cache lookup in `emit_alu`)*; `ssa_emit.rs:1451-1456`.
+    cache (`emit_ssa.rs:413-424`); `ssa_emit.rs:1451-1456`.
   - Compares: against `L_d - k` instead of `k`.
   - Level position: `V-(first, n)`.
   - Final store: `V-(B(L_d), n)` (+1 V per group).
@@ -437,7 +437,7 @@ The rule the other agent is building. Listed here for the couplings and the cano
 ## 13. `depth4_select_rounds` (all / after-wrap)
 
 - **Branches.** `config.rs:308-312, 396-400`; CLI `kernel_build_args.py:256-261`; binding
-  check `python.rs` (rejects it with a plan).
+  check `python.rs:1250-1258` (rejects it with a plan).
 - **Class.** Not a rewrite: a stage-1 pin. Round 4 sites are fixed to gather.
 
 ## 14. `scripts/emission_structure.py --fix ROUND=ENCODING`
