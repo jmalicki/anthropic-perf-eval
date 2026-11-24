@@ -172,6 +172,7 @@ pub mod model;
 pub(crate) mod op_times;
 pub(crate) mod makespan_rows;
 pub(crate) mod symmetry_ordering;
+pub mod window;
 #[cfg(test)]
 mod tests;
 
@@ -180,7 +181,7 @@ pub use config::{
     ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning,
     CumulativePropagator, MakespanRows,
     OptionalConstraintGroup,
-    SelectChoiceMode, ValuShiftMode,
+    ScratchTime, SelectChoiceMode, ValuShiftMode,
 };
 pub use legacy::{compute_asap, compute_alap};
 pub use cse_groups::{build_cse_groups, CseGroup, CseGroupResult};
@@ -193,6 +194,7 @@ pub use bounds::{
 #[cfg(feature = "cpsat")]
 pub use bounds::compute_ssa_asap_alap_bounds;
 pub use model::schedule_ssa_cpsat;
+pub use window::{CpsatWindow, WindowReference, WindowRegion, WindowRegionCounts};
 
 // Re-exports needed by tests (via `use super::*;` in test modules)
 #[cfg(test)]

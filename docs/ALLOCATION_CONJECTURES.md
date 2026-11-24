@@ -22,7 +22,8 @@ This is Dynamic Storage Allocation (DSA): rectangles with fixed time extent, pac
 
 The checks prove:
 - `A3-real-conflict-is-overlap`: the expiry rule (in Python, cross-checked against a port of the Rust rule in `tests/test_allocation_conjectures.py`) forbids sharing exactly when the doubled intervals overlap.
-- `A3-real-load-bound`: a closed per-cycle count bounds the doubled-time load. This is the count the CP-SAT scratch cumulative uses, `[def, last_read + 1)` half-open.
+- `A3-real-load-bound`: a closed per-cycle count bounds the doubled-time load from above. This is the count the CP-SAT scratch cumulative used before `--cpsat-scratch-time phase` (still available as `--cpsat-scratch-time cycle`): `[def, last_read + 1)` half-open, which at cycle C counts both the values last read at C and the values written at C.
+- `A8-phase-interval-is-allocator-span`: the interval the CP-SAT cumulative now uses by default, `[def, last_read)` half-open on the cycle time line, counts a value at cycle t exactly when `real_phase_interval` holds it in the write phase of t, and at t - 1 exactly when it holds it in the read phase of t. This holds for every value read after it is written (`def < last_read`, which the model's precedences guarantee). So the cumulative's peak equals the allocator's per-cycle same-cycle-reuse peak, and the cumulative fits B exactly when that peak does. No doubled time line is needed in the model. `A8-phase-peak-exhaustive-T4-n4` (and `-T5-n5` under `--slow`, 324,631 instances) checks the peaks directly on every small instance, together with phase peak <= cycle-count peak.
 - `A3-real-embedding`: mapping abstract `[s, e]` to real `[2s, 2e+1]` keeps both conflicts and per-cycle loads.
 
 So every abstract result below holds for the real allocator. Every abstract counterexample becomes a real one with cycles doubled.

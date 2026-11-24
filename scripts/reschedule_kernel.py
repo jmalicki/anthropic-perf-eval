@@ -31,9 +31,10 @@ CP-SAT here is the OR-Tools Python wheel. Do not import it into a process that h
 ``scheduler_rs`` (which links the Homebrew OR-Tools library): the two crash together; run
 this script as its own process.
 
-Every schedule is checked against the graph and run on the upstream simulator against the
-reference for ``--seeds`` random inputs. ``--save-kernel`` writes a kernel JSON for
-``scripts/check_upstream.sh --kernel``.
+Every emitted schedule is run on the upstream simulator against the reference for
+``--seeds`` random inputs. Use ``--seeds 0`` for a scheduler-only run. ``--save-kernel``
+writes a kernel JSON for ``scripts/check_upstream.sh --kernel`` after a pass or an
+explicit scheduler-only run.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import asdict
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,7 +56,7 @@ from scripts.kernel_lift import (  # noqa: E402
     CAP, ENGINES, NON_SHIFTABLE, VLEN, asap, check_schedule, condense, heights, lift, load_graph, value_dependency_graph,
 )
 from scripts.kernel_memory_use import peak_live_words, scratch_values  # noqa: E402
-from verification.memory_alias import MemLayout, load_bundles, trace_memory  # noqa: E402
+from verification.memory_alias import MemLayout, load_kernel, trace_memory  # noqa: E402
 
 
 # =============================================================================
@@ -235,16 +237,25 @@ def main() -> int:
                     help="drop the write-after-read/write-after-write scratch edges (needs --graph): "
                          "a relaxation that would need new addresses, so no kernel is emitted; reports "
                          "cycles and the schedule's peak live scratch words")
-    ap.add_argument("--seeds", type=int, default=8, help="random inputs to validate on")
-    ap.add_argument("--save-kernel", help="write the rescheduled kernel JSON here")
+    ap.add_argument("--seeds", type=int, default=8, help="random inputs to validate on (0 skips validation)")
+    ap.add_argument("--save-kernel", help="write the kernel JSON after validation passes or is explicitly skipped")
     ap.add_argument("--json", help="write a result summary JSON here")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args()
 
-    data = json.load(open(args.kernel))
-    bundles = data["instrs"] if isinstance(data, dict) else data
+    if args.seeds < 0:
+        ap.error("--seeds must be nonnegative")
+    try:
+        bundles, layout = load_kernel(args.kernel)
+    except ValueError as e:
+        ap.error(f"{args.kernel}: {e}")
     if args.graph:
-        g = load_graph(args.graph)
+        try:
+            g = load_graph(args.graph)
+        except ValueError as e:
+            ap.error(f"{args.graph}: {e}")
+        if g.layout != layout:
+            ap.error("saved graph layout does not match the supplied kernel; regenerate the graph from this kernel")
         # A saved graph carries the instructions that will actually be scheduled.
         # Verify the original cycles and slots before attributing it to this input.
         source_ops = ((cycle, engine, slot) for cycle, bundle in enumerate(bundles)
@@ -254,7 +265,7 @@ def main() -> int:
         if any(source != cached for source, cached in zip_longest(source_ops, cached_ops)):
             ap.error("saved graph does not match the supplied kernel's original cycles and slots")
     else:
-        g = lift(bundles)
+        g = lift(bundles, layout)
     original = [o.cycle for o in g.ops]
     if args.value_deps:
         if not args.graph:
@@ -307,15 +318,21 @@ def main() -> int:
             print(f"INVALID schedule: {bad[:5]}", file=sys.stderr)
             return 1
     out = emit(g, sched, shifted)
-    ok = validate(out, args.seeds)
-    result.update(cycles=len(out), validated_seeds=args.seeds, valid=ok)
-    print(f"rescheduled: {len(out)} cycles; simulator vs reference on {args.seeds} inputs: {'PASS' if ok else 'FAIL'}")
-    if args.save_kernel:
-        meta = {k: data.get(k) for k in ("forest_height", "batch_size", "rounds")} if isinstance(data, dict) else {}
-        json.dump(meta | {"instrs": out}, open(args.save_kernel, "w"))
+    ok = validate(out, args.seeds, layout) if args.seeds else None
+    if ok is None:
+        validation = "skipped"
+        print(f"rescheduled: {len(out)} cycles; simulator validation SKIPPED (--seeds 0)")
+    else:
+        validation = "passed" if ok else "failed"
+        print(f"rescheduled: {len(out)} cycles; simulator vs reference on {args.seeds} inputs: {'PASS' if ok else 'FAIL'}")
+    result.update(cycles=len(out), validated_seeds=args.seeds, valid=ok, validation=validation)
+    if args.save_kernel and ok is not False:
+        with open(args.save_kernel, "w") as f:
+            json.dump(asdict(layout) | {"instrs": out}, f)
     if args.json:
-        json.dump(result, open(args.json, "w"), indent=1)
-    return 0 if ok else 1
+        with open(args.json, "w") as f:
+            json.dump(result, f, indent=1)
+    return int(ok is False)
 
 
 if __name__ == "__main__":

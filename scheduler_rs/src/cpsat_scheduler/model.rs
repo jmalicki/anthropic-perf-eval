@@ -20,7 +20,7 @@ use super::symmetry_ordering::SymmetryOrdering;
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
     ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
-    OptionalConstraintGroup, SelectChoiceMode, ValuShiftMode,
+    OptionalConstraintGroup, ScratchTime, SelectChoiceMode, ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
@@ -224,6 +224,75 @@ fn sorted_by_key<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
     entries
 }
 
+/// Where a scratch interval starts: at its value's write, or at the start of the segment
+/// (a value live into a per-section solve).
+#[cfg(feature = "cpsat")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchFrom {
+    Write,
+    SegmentStart,
+}
+
+/// Where a scratch interval ends: after its value's last read, or after the segment (a value
+/// live out of a per-section solve, still held after the segment's last cycle).
+#[cfg(feature = "cpsat")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchTo {
+    LastRead,
+    SegmentEnd,
+}
+
+/// A scratch interval for the cumulative, on the timeline `time` selects.
+///
+/// `start`, `size` and `end` describe the value on the cycle timeline as the model builds it:
+/// half-open `[start, end)` with `end` = last read + 1 (`ScratchTo::LastRead`) or segment end +
+/// 1 (`ScratchTo::SegmentEnd`), and `start + size == end` already constrained.
+///
+/// - `ScratchTime::Cycle`: that interval as is. At cycle C it counts both the values read for
+///   the last time at C and the values written at C.
+/// - `ScratchTime::Phase`: address assignment's same-cycle reuse (reads happen before writes in
+///   a cycle, so a word read for the last time at C can take a value written at C). On the
+///   doubled timeline of `address_assign::interval_span` (read phase 2C, write phase 2C + 1) a
+///   value written at S and last read at L > S holds its words over phases `2S + 1 ..= 2L`.
+///   The set of values holding words in the write phase of C is `{S <= C < L}`, and in the read
+///   phase of C it is the write-phase set of C - 1, so the phase peak equals the peak of the
+///   half-open `[S, L)` on the cycle timeline: the interval ends at the last read instead of
+///   one cycle after it. A value held to the segment end keeps `[S, segment end + 1)`.
+///   (Proof: verification/allocation_conjectures.py, A8-phase-interval-is-allocator-span and
+///   A8-phase-peak-exhaustive.) Values read at their own write cycle (L == S) would vanish
+///   here; the model's precedences never schedule a reader in its producer's cycle.
+///   A value live from the segment start (`ScratchFrom::SegmentStart`) also holds its words
+///   in the read phase of the first cycle, before anything is written; on this timeline the
+///   read phase of cycle t is slot t - 1, so such an interval starts at -1. Without that a
+///   live-in last read at cycle 0 would get the empty `[0, 0)`.
+///
+/// # Returns
+/// The interval (optional when `presence` is given).
+#[cfg(feature = "cpsat")]
+fn scratch_interval(
+    model: &mut CpModelBuilder,
+    time: ScratchTime,
+    start: LinearExpr,
+    size: LinearExpr,
+    end: LinearExpr,
+    from: ScratchFrom,
+    to: ScratchTo,
+    presence: Option<BoolVar>,
+) -> IntervalVar {
+    let (start, size, end) = match time {
+        ScratchTime::Cycle => (start, size, end),
+        ScratchTime::Phase => {
+            let s_off = if from == ScratchFrom::SegmentStart { -1 } else { 0 };
+            let e_off = if to == ScratchTo::LastRead { -1 } else { 0 };
+            (start + s_off, size + (e_off - s_off), end + e_off)
+        }
+    };
+    match presence {
+        Some(p) => model.new_optional_interval_var(start, size, end, p),
+        None => model.new_interval_var(start, size, end),
+    }
+}
+
 /// Readers of every defined VReg, with vector-group aliases resolved.
 ///
 /// An op that reads a lane of a decomposed vector (read group) is a reader of that vector;
@@ -249,38 +318,15 @@ pub(crate) fn scratch_readers_by_vreg(
     vreg_def_op: &HashMap<VReg, usize>,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
 ) -> HashMap<VReg, Vec<usize>> {
-    let mut lane_to_group: HashMap<VReg, VReg> = HashMap::new();
-    let mut alias_to_lanes: HashMap<VReg, &Vec<VReg>> = HashMap::new();
-    if let Some(groups) = vector_group_lanes {
-        for (group, lanes) in groups {
-            if vreg_def_op.contains_key(group) {
-                for lane in lanes {
-                    lane_to_group.insert(*lane, *group);
-                }
-            } else {
-                alias_to_lanes.insert(*group, lanes);
-            }
-        }
-    }
+    use crate::kernel_builder::round_budget::ScratchAliases;
+    let aliases = vector_group_lanes.map_or_else(ScratchAliases::default, |groups| {
+        ScratchAliases::new(groups, |v| vreg_def_op.contains_key(v))
+    });
     let mut readers: HashMap<VReg, Vec<usize>> = HashMap::new();
-    let mut add = |vreg: VReg, idx: usize| {
-        if vreg_def_op.contains_key(&vreg) {
-            readers.entry(vreg).or_default().push(idx);
-        }
-    };
     for (idx, op) in ops.iter().enumerate() {
-        // `keep_live` entries are liveness-only uses: the value must stay allocated until this
-        // op runs even though it is not an operand (see `SsaOp::keep_live`).
-        let held = op.keep_live.iter().flatten().copied();
-        for vreg in op.reads().chain(op.delta_vreg).chain(held) {
-            if let Some(group) = lane_to_group.get(&vreg) {
-                add(*group, idx);
-            } else if let Some(lanes) = alias_to_lanes.get(&vreg) {
-                for lane in lanes.iter() {
-                    add(*lane, idx);
-                }
-            } else {
-                add(vreg, idx);
+        for vreg in aliases.reads(op) {
+            if vreg_def_op.contains_key(&vreg) {
+                readers.entry(vreg).or_default().push(idx);
             }
         }
     }
@@ -383,6 +429,7 @@ pub fn schedule_ssa_cpsat(
         enable_valu_shift,
         scratch_budget,
         scratch_pools,
+        scratch_time,
         ref model_name,
         ref machine,
         const_choice_mode,
@@ -413,10 +460,20 @@ pub fn schedule_ssa_cpsat(
     let const_add_imm_hints = hints.const_add_imm_hints;
     let select_choice_hints = hints.select_choice_hints;
     let eliminate_vbroadcast_hints = hints.eliminate_vbroadcast_hints;
-    let initial_live = hints.initial_live;
     let live_out_vregs = hints.live_out_vregs;
     let live_through_vregs = hints.live_through_vregs;
+    // An incoming value read here and again later is already charged for the entire
+    // section. Use only the other incoming values for last-reader intervals and hints.
+    // Preserve Some(empty) because it still identifies a section solve.
+    let entry_reads = hints.initial_live.map(|inputs| {
+        inputs.iter().copied()
+            .filter(|(vreg, _)| !live_through_vregs.is_some_and(|values| values.contains(vreg)))
+            .collect::<Vec<_>>()
+    });
+    let initial_live = entry_reads.as_deref();
     let cse_groups = hints.cse_groups;
+    let alu_lane_hints = hints.alu_lane_hints;
+    let window = hints.window;
     let start_time = std::time::Instant::now();
     let n = ops.len();
 
@@ -586,18 +643,22 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
+    // A window can also supply lane cycles from a previous feasible CP-SAT solution.
     // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
     // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
     // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
     // size and start hints), so what is hinted is exactly what the check counted.
     let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        if !shift_hints.is_some_and(|ids| ids.contains(&op_id)) {
+            return None;
+        }
         let lo = *asap.get(&op_id).unwrap_or(&0);
         let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
         hints
             .shifted_lane_cycle_hints
             .and_then(|m| m.get(&op_id))
-            .filter(|lanes| lanes.len() == VLEN && shift_hints.is_some_and(|s| s.contains(&op_id)))
-            .filter(|lanes| lanes.iter().all(|&c| c >= lo && c <= hi))
+            .filter(|lanes| lanes.len() == VLEN && lanes.iter().all(|&c| c >= lo && c <= hi))
+            .or_else(|| alu_lane_hints.and_then(|m| m.get(&op_id)).filter(|lanes| lanes.len() == VLEN))
     };
 
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
@@ -659,7 +720,8 @@ pub fn schedule_ssa_cpsat(
         current_alap = slot_alap;
     }
 
-    if enable_scratch_tightening {
+    // scratch_budget == 0 means the model has no scratch constraint: nothing to tighten by.
+    if enable_scratch_tightening && scratch_budget > 0 {
         let (scratch_asap, scratch_alap) = tighten_asap_alap_by_scratch(
             ops,
             &current_asap,
@@ -800,6 +862,40 @@ pub fn schedule_ssa_cpsat(
                 "  Greedy hint domain widening: {} bound(s) widened to include greedy values",
                 widened_count
             );
+        }
+    }
+
+    // 2d. Window probe: the reference must stay inside every domain, and so must each cycle
+    // the block after the window can move to. 2c covers ops with a hint; dead stores (hint
+    // -1) are pinned at the reference too but got no widening, and tightening computed on a
+    // reduced op list need not cover the moved block.
+    if let Some(window) = window {
+        let mut widened = 0usize;
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(&cycle) = window.reference.cycles.get(idx) else { continue };
+            if cycle < 0 {
+                continue;
+            }
+            let lowest = if window.region(idx, op) == super::window::WindowRegion::After {
+                cycle - window.len.max(0)
+            } else {
+                cycle
+            };
+            if let Some(a) = final_asap.get_mut(&op.id) {
+                if lowest < *a {
+                    *a = lowest.max(0);
+                    widened += 1;
+                }
+            }
+            if let Some(a) = final_alap.get_mut(&op.id) {
+                if cycle > *a {
+                    *a = cycle;
+                    widened += 1;
+                }
+            }
+        }
+        if widened > 0 {
+            eprintln!("[window probe]   widened {} domain bound(s) to cover the reference", widened);
         }
     }
 
@@ -1307,6 +1403,17 @@ pub fn schedule_ssa_cpsat(
                     } else {
                         0 // Load
                     };
+                    // Window probe: a reference from an earlier solution may use an ALU-derived
+                    // encoding, which the add_imm hint set cannot say.
+                    let hint_idx = match window.and_then(|w| w.reference.const_choice_encoding.get(&ops[idx].id)) {
+                        Some(crate::types::ConstChoiceEncoding::AluDerive(info)) => alu_info
+                            .iter()
+                            .position(|&(l, r, opcode)| {
+                                ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                            })
+                            .map_or(hint_idx, |k| k + 2),
+                        _ => hint_idx,
+                    };
                     for (i, &var) in use_vars.iter().enumerate() {
                         model.add_hint(var, if i == hint_idx { 1 } else { 0 });
                     }
@@ -1569,6 +1676,15 @@ pub fn schedule_ssa_cpsat(
         .map(|(idx, _)| idx)
         .collect();
 
+    // Window probe: ops whose intervals no movable interval can meet are left out of the
+    // engine and scratch cumulatives (see CpsatWindow::pruned_ops). Empty otherwise.
+    let window_pruned: HashSet<usize> =
+        window.map_or_else(HashSet::new, |w| w.pruned_ops(ops, cse_groups.map_or(0, |g| g.len())));
+    let in_cumulative = |idx: usize| !window_pruned.contains(&idx);
+    if verbose && window.is_some() {
+        eprintln!("  Window: {} ops left out of the cumulatives", window_pruned.len());
+    }
+
     // VALU cumulative: non-shiftable VALU (always present except eliminable vb) + optional vb + shiftable + SelectChoice
     {
         let eliminable_vb_set: HashSet<usize> =
@@ -1578,14 +1694,14 @@ pub fn schedule_ssa_cpsat(
 
         // Add non-shiftable VALU ops that are not eliminable vbroadcasts (always present)
         for &idx in &non_shiftable_valu {
-            if eliminable_vb_set.contains(&idx) {
+            if eliminable_vb_set.contains(&idx) || !in_cumulative(idx) {
                 continue;
             }
             valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             valu_demands.push(1);
         }
         // Add optional VALU intervals for eliminable vbroadcasts (presence = !eliminate_vb)
-        for (vb_idx, _, _) in &eliminable_vbs {
+        for (vb_idx, _, _) in eliminable_vbs.iter().filter(|(i, _, _)| in_cumulative(*i)) {
             if let Some(&iv) = valu_optional_vb_intervals.get(vb_idx) {
                 valu_intervals.push(iv);
                 valu_demands.push(1);
@@ -1593,7 +1709,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add VALU intervals for shiftable ops: ForceValu => required; ForceAlu => none; Optimize => optional
-        for &idx in &shiftable_valu {
+        for &idx in shiftable_valu.iter().filter(|&&i| in_cumulative(i)) {
             match valu_shift_mode {
                 ValuShiftMode::ForceValu => {
                     valu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
@@ -1610,7 +1726,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional VALU intervals from SelectChoice ops (when choice_var = true, i.e., FMA path)
-        for &idx in &select_choice_ops {
+        for &idx in select_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = select_valu_intervals.get(&idx) {
                 for &iv in intervals {
                     valu_intervals.push(iv);
@@ -1644,13 +1760,13 @@ pub fn schedule_ssa_cpsat(
         let mut alu_demands: Vec<i64> = Vec::new();
 
         // Add regular ALU ops (demand = 1)
-        for &idx in &alu_ops {
+        for &idx in alu_ops.iter().filter(|&&i| in_cumulative(i)) {
             alu_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             alu_demands.push(1);
         }
 
         // Add ALU intervals for shifted VALU ops: ForceAlu => required intervals; Optimize => optional
-        for &idx in &shiftable_valu {
+        for &idx in shiftable_valu.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = alu_optional_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
@@ -1660,7 +1776,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional ALU intervals from ConstChoice ops (when ALU-derived encoding is chosen)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(intervals) = const_choice_alu_intervals.get(&idx) {
                 for iv in intervals {
                     alu_intervals.push(*iv);
@@ -1695,13 +1811,13 @@ pub fn schedule_ssa_cpsat(
         let mut load_demands: Vec<i64> = Vec::new();
 
         // Add regular Load ops
-        for &idx in &regular_load_ops {
+        for &idx in regular_load_ops.iter().filter(|&&i| in_cumulative(i)) {
             load_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             load_demands.push(1);
         }
 
         // Add optional Load intervals from ConstChoice ops (when choice_var = false)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = const_load_intervals.get(&idx) {
                 load_intervals.push(iv);
                 load_demands.push(1);
@@ -1726,7 +1842,7 @@ pub fn schedule_ssa_cpsat(
         let store_ops: Vec<usize> = ops
             .iter()
             .enumerate()
-            .filter(|(_, op)| op.engine == Engine::Store)
+            .filter(|(idx, op)| op.engine == Engine::Store && in_cumulative(*idx))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -1775,13 +1891,13 @@ pub fn schedule_ssa_cpsat(
         let mut flow_demands: Vec<i64> = Vec::new();
 
         // Add regular Flow ops
-        for &idx in &regular_flow_ops {
+        for &idx in regular_flow_ops.iter().filter(|&&i| in_cumulative(i)) {
             flow_intervals.push(model.new_fixed_size_interval_var(times[idx].issue(), 1));
             flow_demands.push(1);
         }
 
         // Add optional Flow intervals from ConstChoice ops (when choice_var = true)
-        for &idx in &const_choice_ops {
+        for &idx in const_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = const_flow_intervals.get(&idx) {
                 flow_intervals.push(iv);
                 flow_demands.push(1);
@@ -1789,7 +1905,7 @@ pub fn schedule_ssa_cpsat(
         }
 
         // Add optional Flow intervals from SelectChoice ops (when choice_var = false, i.e., vselect path)
-        for &idx in &select_choice_ops {
+        for &idx in select_choice_ops.iter().filter(|&&i| in_cumulative(i)) {
             if let Some(&iv) = select_flow_intervals.get(&idx) {
                 flow_intervals.push(iv);
                 flow_demands.push(1);
@@ -1973,19 +2089,29 @@ pub fn schedule_ssa_cpsat(
         // read only through a vector-group alias have no direct reader at all.
         let scratch_readers =
             scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes);
-        // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
-        let hinted_read_end = |idx: usize| -> Option<i32> {
-            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
-            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
-            let fma = ops[idx].opcode == Opcode::SelectChoice
+        let hinted_fma = |idx: usize| {
+            ops[idx].opcode == Opcode::SelectChoice
                 && match select_choice_mode {
                     SelectChoiceMode::ForceFma => true,
                     SelectChoiceMode::ForceVselect => false,
                     SelectChoiceMode::Optimize => {
                         select_choice_hints.is_some_and(|h| h.contains(&ops[idx].id))
                     }
-                };
-            Some(cycle + 1 + i32::from(fma))
+                }
+        };
+        let hinted_first_write = |idx: usize| -> Option<i32> {
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
+            Some(
+                hinted_lanes(ops[idx].id)
+                    .and_then(|lanes| lanes.iter().copied().min())
+                    .unwrap_or(cycle),
+            )
+        };
+        // Cycle after the last read by reader `idx` under the greedy hint (None without hints).
+        let hinted_read_end = |idx: usize| -> Option<i32> {
+            // Dead stores have no hint (cycle -1): they do not contribute to the hinted end.
+            let cycle = greedy_hints?.get(idx).copied().filter(|c| *c >= 0)?;
+            Some(cycle + 1 + i32::from(hinted_fma(idx)))
         };
         // Hinted end of each value's interval: the latest hinted read end over all readers.
         let hinted_live_end: HashMap<VReg, i32> = scratch_readers
@@ -2032,6 +2158,23 @@ pub fn schedule_ssa_cpsat(
         // Sorted so scratch intervals are created in the same order on every run.
         live_vregs.sort();
 
+        let hinted_segment_finish = greedy_hints.map(|cycles| {
+            cycles
+                .iter()
+                .zip(times.iter())
+                .enumerate()
+                .filter(|(_, (&cycle, _))| cycle >= 0)
+                .map(|(idx, (&cycle, time))| {
+                    cycle + i32::from(
+                        scratch_time == ScratchTime::Phase
+                            && time.fma_cycle().is_some()
+                            && hinted_fma(idx),
+                    )
+                })
+                .max()
+                .unwrap_or(0)
+        });
+
         // Segment mode with live-out or live-through: need segment_end so we can model
         // VRegs live until end of segment (live-out = defined here, used later; live-through = defined in prev section, used later).
         let segment_end_var: Option<IntVar> = if initial_live.is_some()
@@ -2039,24 +2182,38 @@ pub fn schedule_ssa_cpsat(
                 || live_through_vregs.is_some_and(|s| !s.is_empty()))
         {
             let m = model.new_int_var_with_name([(0, horizon)], "segment_end");
-            for (cv_idx, t) in times.iter().enumerate() {
-                let c = model.add_ge(LinearExpr::from(m), LinearExpr::from(t.issue()));
-                model.set_constraint_name(c, &format!("segment_end_ge_c_{}", cv_idx));
+            for (idx, time) in times.iter().enumerate() {
+                if scratch_time == ScratchTime::Phase {
+                    // A live-through value still occupies scratch at the last write slot.
+                    for finish in time.finish_alternatives() {
+                        let c = model.add_ge(m, finish.value);
+                        if let Some(when) = finish.when {
+                            model.only_enforce_if(c, [when]);
+                        }
+                        model.set_constraint_name(c, &format!("segment_end_ge_{}_{}", finish.label, idx));
+                    }
+                } else {
+                    let c = model.add_ge(m, time.issue());
+                    model.set_constraint_name(c, &format!("segment_end_ge_c_{}", idx));
+                }
             }
-            // Hint segment_end to greedy makespan so hint is complete (per-section mode).
-            if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().max().copied().unwrap_or(0);
-                model.add_hint(m, max_hint as i64);
+            if let Some(finish) = hinted_segment_finish {
+                model.add_hint(m, i64::from(finish));
             }
             Some(m)
         } else {
             None
         };
 
-        if !live_vregs.is_empty() {
+        // Section live-ins, live-through values and temporary intervals can consume scratch
+        // even when no locally produced value is read within the section.
+        {
             let mut scratch_intervals: Vec<IntervalVar> = Vec::new();
             let mut scratch_demands: Vec<i64> = Vec::new();
             let mut size_vars: Vec<(IntVar, usize, usize)> = Vec::new(); // (var, def_idx, last_use_idx)
+            // The value of each size_vars entry (not every live VReg gets one: the window
+            // probe leaves some out).
+            let mut size_var_vregs: Vec<VReg> = Vec::new();
 
             // Scratch model `pools`: a write group (alias with no definer, lanes written one by
             // one) is one 8-word value for address assignment, so it is one vector here, live
@@ -2080,24 +2237,31 @@ pub fn schedule_ssa_cpsat(
             let mut pool_group_lanes: std::collections::BTreeMap<VReg, Vec<(IntVar, LinearExpr, usize, Option<i32>)>> =
                 std::collections::BTreeMap::new();
 
+            // Group ends are expressed as last-read ends for scratch_interval. In phase
+            // mode it subtracts one from such ends; a lane held through the section keeps
+            // the final write slot, so compensate before taking the maximum over lanes.
+            let group_live_out_offset = i32::from(scratch_time == ScratchTime::Phase);
+            let hinted_segment_end = hinted_segment_finish.map(|finish| finish + 1);
+
             // =========================================================================
             // CP-SAT LIVENESS MODEL: Matches Address Assignment Logic
             // =========================================================================
             //
-            // The cumulative constraint models scratch usage over time. We use
-            // `end = last_use_cycle + 1` so intervals are half-open: [start, end).
+            // Each value is built on the cycle timeline as [start, end) with
+            // `end = last_use_cycle + 1`, then turned into the cumulative's interval by
+            // `scratch_interval` on the timeline `scratch_time` selects.
             //
-            // KEY DIFFERENCE FROM GREEDY/ADDRESS_ASSIGN (half-open vs closed intervals):
-            // - Here: interval [0,5] has end=6, and [5,10] has start=5, end=11
-            //   These OVERLAP in the cumulative constraint (both include the 5-6 region)
-            // - In address_assign.rs: intervals [0,5] and [5,10] do NOT overlap
-            //   because we use `end_cycle <= start_cycle` for expiration (same-cycle reuse)
-            //
-            // This makes CP-SAT slightly more conservative than greedy allocation.
-            // In practice, this rarely matters because:
-            // 1. Same-cycle reuse is only possible for def/use at exact same cycle
-            // 2. CP-SAT's goal is to avoid exceeding budget, not minimize peak
-            // 3. The greedy scheduler's peak is an upper bound; CP-SAT can improve it
+            // Within a cycle every read happens before every write, so a word whose value is
+            // last read at cycle C can be rewritten at cycle C. Address assignment and the
+            // greedy counter use that (same-cycle reuse). `ScratchTime::Cycle` does not: at
+            // cycle C it counts both the values dying at C and the values born at C. That is
+            // not rare: every op whose input dies as its output is written is this case, so it
+            // happens along every dependency chain (16-round greedy schedules: 46-64 words at
+            // the peak, up to 80 in one cycle; scripts/scratch_time_overcount.py).
+            // `ScratchTime::Phase` (default) ends each value at its last read, `[def, last_read)`,
+            // which is exactly the allocator's per-cycle peak on its read/write phases
+            // (verification/allocation_conjectures.py: A8-phase-interval-is-allocator-span,
+            // A8-phase-peak-exhaustive).
             //
             // CRITICAL FIXES (to match address_assign.rs logic):
             // 1. Shifted VALU dests: start = min(alu_cycles), not completion_cycle (max).
@@ -2120,6 +2284,11 @@ pub fn schedule_ssa_cpsat(
                 let readers: &[usize] = scratch_readers.get(vreg).map_or(&[], |r| r.as_slice());
                 if initial_live.is_none() {
                     scratch_values.push((*vreg, def_idx, readers.to_vec()));
+                }
+                // Window probe: a value defined and read only by pruned ops is live only at
+                // cycles nothing can move to (the post-solve check still covers it).
+                if !in_cumulative(def_idx) && readers.iter().all(|&r| !in_cumulative(r)) {
+                    continue;
                 }
                 let (end_expr, end_for_interval) = if is_live_out {
                     let seg_end = segment_end_var.expect("segment_end when live_out");
@@ -2215,27 +2384,91 @@ pub fn schedule_ssa_cpsat(
                 model.set_constraint_name(c, &format!("scratch_live_size_{}", vreg.id));
 
                 size_vars.push((size, def_idx, last_use_idx));
+                size_var_vregs.push(*vreg);
                 if let Some(group) = pool_group_of_lane.get(vreg) {
-                    // Pools: counted in the group's vector interval (built below).
-                    let end_hint = greedy_hints.map(|h| {
-                        hinted_live_end.get(vreg).copied().unwrap_or_else(|| {
-                            h.get(last_use_idx).copied().unwrap_or(0) + 1
-                        })
-                    });
-                    pool_group_lanes.entry(*group).or_default().push((
-                        start,
-                        end_for_interval,
-                        def_idx,
-                        end_hint,
-                    ));
+                    let (group_end, end_hint) = if is_live_out {
+                        (end_for_interval + i64::from(group_live_out_offset),
+                         hinted_segment_end.map(|e| e + group_live_out_offset))
+                    } else {
+                        (end_for_interval, hinted_live_end.get(vreg).copied())
+                    };
+                    pool_group_lanes.entry(*group).or_default().push((start, group_end, def_idx, end_hint));
                     continue;
                 }
-                let interval = model.new_interval_var(start, size, end_for_interval);
+                let interval = scratch_interval(
+                    &mut model,
+                    scratch_time,
+                    LinearExpr::from(start),
+                    LinearExpr::from(size),
+                    end_for_interval,
+                    ScratchFrom::Write,
+                    if is_live_out { ScratchTo::SegmentEnd } else { ScratchTo::LastRead },
+                    None,
+                );
                 scratch_intervals.push(interval);
 
                 // Demand = size of VReg (1 for scalar, VLEN for vector)
                 let demand = vreg.size() as i64;
                 scratch_demands.push(demand);
+            }
+
+            // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
+            // These VRegs are not in live_vregs (because vreg_last_use only includes uses within the segment),
+            // but they must be accounted for in scratch since they're live until segment end.
+            if let Some(lo) = live_out_vregs {
+                if let Some(seg_end) = segment_end_var {
+                    let mut lo: Vec<&VReg> = lo.iter().collect();
+                    lo.sort();
+                    for vreg in lo {
+                        // Only add if not already processed (not in live_vregs)
+                        if !live_vregs.contains(vreg) {
+                            // This VReg is defined in segment but only used after
+                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
+                                let (start, start_aux) =
+                                    times[def_idx].first_write(&mut model, def_idx, horizon);
+                                if let Some(start_var) = start_aux {
+                                    scratch_shifted_start_vars.push((start_var, def_idx));
+                                }
+                                let end_expr = LinearExpr::from(seg_end) + 1;
+                                if let Some(group) = pool_group_of_lane.get(vreg) {
+                                    pool_group_lanes.entry(*group).or_default().push((
+                                        start,
+                                        end_expr + i64::from(group_live_out_offset),
+                                        def_idx,
+                                        hinted_segment_end.map(|e| e + group_live_out_offset),
+                                    ));
+                                    continue;
+                                }
+                                let size = model.new_int_var_with_name(
+                                    [(1, horizon + 1)],
+                                    format!("live_out_size_{}", vreg.id),
+                                );
+                                if let (Some(start), Some(end)) =
+                                    (hinted_first_write(def_idx), hinted_segment_end)
+                                {
+                                    model.add_hint(size, i64::from((end - start).max(1)));
+                                }
+                                let c = model.add_eq(
+                                    LinearExpr::from(start) + LinearExpr::from(size),
+                                    end_expr.clone(),
+                                );
+                                model.set_constraint_name(c, &format!("scratch_live_out_size_{}", vreg.id));
+                                let interval = scratch_interval(
+                                    &mut model,
+                                    scratch_time,
+                                    LinearExpr::from(start),
+                                    LinearExpr::from(size),
+                                    end_expr,
+                                    ScratchFrom::Write,
+                                    ScratchTo::SegmentEnd,
+                                    None,
+                                );
+                                scratch_intervals.push(interval);
+                                scratch_demands.push(vreg.size() as i64);
+                            }
+                        }
+                    }
+                }
             }
 
             // Pools: one vector interval per write group, [min lane start, max lane end).
@@ -2263,13 +2496,22 @@ pub fn schedule_ssa_cpsat(
                     LinearExpr::from(g_end),
                 );
                 model.set_constraint_name(c, &format!("pool_group_size_{}", group.id));
-                let interval = model.new_interval_var(g_start, g_size, g_end);
+                let interval = scratch_interval(
+                    &mut model,
+                    scratch_time,
+                    LinearExpr::from(g_start),
+                    LinearExpr::from(g_size),
+                    LinearExpr::from(g_end),
+                    ScratchFrom::Write,
+                    ScratchTo::LastRead,
+                    None,
+                );
                 scratch_intervals.push(interval);
                 scratch_demands.push(VLEN as i64);
-                if let Some(h) = greedy_hints {
+                if greedy_hints.is_some() {
                     let start_hint = lanes
                         .iter()
-                        .map(|(_, _, d, _)| h.get(*d).copied().unwrap_or(0))
+                        .map(|(_, _, d, _)| hinted_first_write(*d).unwrap_or(0))
                         .min()
                         .unwrap_or(0);
                     let end_hint = lanes
@@ -2285,73 +2527,71 @@ pub fn schedule_ssa_cpsat(
                 }
             }
 
-            // Segment mode: add live_out VRegs that are defined in segment but not used within segment.
-            // These VRegs are not in live_vregs (because vreg_last_use only includes uses within the segment),
-            // but they must be accounted for in scratch since they're live until segment end.
-            if let Some(lo) = live_out_vregs {
-                if let Some(seg_end) = segment_end_var {
-                    let mut lo: Vec<&VReg> = lo.iter().collect();
-                    lo.sort();
-                    for vreg in lo {
-                        // Only add if not already processed (not in live_vregs)
-                        if !live_vregs.contains(vreg) {
-                            // This VReg is defined in segment but only used after
-                            if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let start = times[def_idx].issue();
-                                let end_expr = LinearExpr::from(seg_end) + 1;
-                                let size = model.new_int_var_with_name(
-                                    [(1, horizon + 1)],
-                                    format!("live_out_size_{}", vreg.id),
-                                );
-                                // Hint: size = seg_end - def_cycle + 1 (live until segment end)
-                                if let Some(hints) = greedy_hints {
-                                    if def_idx < hints.len() {
-                                        let def_cycle = hints[def_idx];
-                                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
-                                        let size_hint = (seg_end_hint - def_cycle + 1).max(1);
-                                        model.add_hint(size, size_hint as i64);
-                                    }
-                                }
-                                let c = model.add_eq(
-                                    LinearExpr::from(start) + LinearExpr::from(size),
-                                    end_expr.clone(),
-                                );
-                                model.set_constraint_name(c, &format!("scratch_live_out_size_{}", vreg.id));
-                                let interval = model.new_interval_var(start, size, end_expr);
-                                scratch_intervals.push(interval);
-                                scratch_demands.push(vreg.size() as i64);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Segment mode: add fixed [0, last_use_cycle+1] intervals for live-in VRegs
+            // Segment mode: live-in VRegs are live from the segment start until the last of
+            // their readers in the segment has read them: [0, max over readers of read + 1),
+            // with the same per-reader rules as values defined here (a shifted reader's
+            // completion cycle, +1 for a SelectChoice on the multiply-add path). A single reader
+            // picked from the greedy schedule (`last_use_idx`) is not enough: the solve can move
+            // another reader later. The cycle timeline's same-cycle overcount used to hide this.
+            let mut incoming_hinted_ends = Vec::new();
             if let Some(il) = initial_live {
                 let zero_var = model.new_int_var_with_name([(0, 0)], "zero_seg");
+                // Include external owners when resolving aliases. An incoming assembled
+                // lane may have several readers of the vector alias, while an incoming
+                // decomposed vector may have several independent scalar lane readers.
+                let mut known_defs = vreg_def_op.clone();
+                known_defs.extend(il.iter().copied());
+                let incoming_readers = scratch_readers_by_vreg(ops, &known_defs, hints.vector_group_lanes);
                 for (vreg, last_use_idx) in il {
                     if *last_use_idx >= times.len() {
                         continue;
                     }
-                    // Issue cycle + 1, not last_read_end: see op_times.rs.
-                    let end_expr = LinearExpr::from(times[*last_use_idx].issue()) + 1;
+                    let fallback = [*last_use_idx];
+                    let readers = incoming_readers.get(vreg).map_or(fallback.as_slice(), Vec::as_slice);
+                    let read_end = |r: usize| times[r].last_read_end();
+                    // OR-Tools interval endpoints must be affine in a single variable.
+                    // An optional FMA read adds its path literal to the issue cycle.
+                    let end = model.new_int_var_with_name(
+                        [(1, horizon + 2)],
+                        format!("init_live_end_{}", vreg.id),
+                    );
+                    let end_expr = LinearExpr::from(end);
+                    let c = if readers.len() == 1 {
+                        model.add_eq(end_expr.clone(), read_end(readers[0]))
+                    } else {
+                        model.add_max_eq(end, readers.iter().map(|&r| read_end(r)))
+                    };
+                    model.set_constraint_name(c, &format!("scratch_init_live_end_{}", vreg.id));
+                    let hinted_end = greedy_hints.map(|_| {
+                        readers.iter().filter_map(|&r| hinted_read_end(r)).max().unwrap_or(1)
+                    });
+                    if let Some(hint) = hinted_end {
+                        model.add_hint(end, i64::from(hint));
+                        incoming_hinted_ends.push((*vreg, hint));
+                    }
                     let size = model.new_int_var_with_name(
-                        [(1, horizon + 1)],
+                        [(1, horizon + 2)],
                         format!("init_live_size_{}", vreg.id),
                     );
-                    // Hint: size = last_use_cycle + 1 (start is 0, end is last_use_cycle + 1)
-                    if let Some(hints) = greedy_hints {
-                        if *last_use_idx < hints.len() {
-                            let size_hint = (hints[*last_use_idx] + 1).max(1);
-                            model.add_hint(size, size_hint as i64);
-                        }
+                    // Hint: size = end (start is 0)
+                    if let Some(e) = hinted_end {
+                        model.add_hint(size, e.max(1) as i64);
                     }
                     let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
                     );
                     model.set_constraint_name(c, &format!("scratch_init_live_size_{}", vreg.id));
-                    let interval = model.new_interval_var(zero_var, size, end_expr);
+                    let interval = scratch_interval(
+                        &mut model,
+                        scratch_time,
+                        LinearExpr::from(zero_var),
+                        LinearExpr::from(size),
+                        end_expr,
+                        ScratchFrom::SegmentStart,
+                        ScratchTo::LastRead,
+                        None,
+                    );
                     scratch_intervals.push(interval);
                     scratch_demands.push(vreg.size() as i64);
                 }
@@ -2369,17 +2609,24 @@ pub fn schedule_ssa_cpsat(
                         format!("live_through_size_{}", vreg.id),
                     );
                     // Hint: size = seg_end + 1 (start is 0, end is seg_end + 1)
-                    if let Some(hints) = greedy_hints {
-                        let seg_end_hint = hints.iter().max().copied().unwrap_or(0);
-                        let size_hint = (seg_end_hint + 1).max(1);
-                        model.add_hint(size, size_hint as i64);
+                    if let Some(end) = hinted_segment_end {
+                        model.add_hint(size, i64::from(end));
                     }
                     let c = model.add_eq(
                         LinearExpr::from(zero_var) + LinearExpr::from(size),
                         end_expr.clone(),
                     );
                     model.set_constraint_name(c, &format!("scratch_live_through_size_{}", vreg.id));
-                    let interval = model.new_interval_var(zero_var, size, end_expr);
+                    let interval = scratch_interval(
+                        &mut model,
+                        scratch_time,
+                        LinearExpr::from(zero_var),
+                        LinearExpr::from(size),
+                        end_expr,
+                        ScratchFrom::SegmentStart,
+                        ScratchTo::SegmentEnd,
+                        None,
+                    );
                     scratch_intervals.push(interval);
                     scratch_demands.push(vreg.size() as i64);
                 }
@@ -2396,20 +2643,38 @@ pub fn schedule_ssa_cpsat(
                     continue;
                 }
                 // Skip CSE consumers - they use shared sub_temp instead of individual sub_temp
-                if cse_consumer_set.contains(&idx) {
+                if cse_consumer_set.contains(&idx) || !in_cumulative(idx) {
                     continue;
                 }
                 let start = times[idx].issue();
                 match select_choice_mode {
+                    // Written by the subtract at C, read by the multiply_add at C + 1.
                     SelectChoiceMode::ForceFma => {
-                        let interval = model.new_fixed_size_interval_var(start, 2);
+                        let interval = scratch_interval(
+                            &mut model,
+                            scratch_time,
+                            LinearExpr::from(start),
+                            LinearExpr::from(2),
+                            LinearExpr::from(start) + 2,
+                            ScratchFrom::Write,
+                            ScratchTo::LastRead,
+                            None,
+                        );
                         scratch_intervals.push(interval);
                         scratch_demands.push(8);
                     }
                     SelectChoiceMode::Optimize => {
                         if let Some(&choice_var) = select_choice_vars.get(&idx) {
-                            let interval =
-                                model.new_optional_fixed_size_interval_var(start, 2, choice_var);
+                            let interval = scratch_interval(
+                                &mut model,
+                                scratch_time,
+                                LinearExpr::from(start),
+                                LinearExpr::from(2),
+                                LinearExpr::from(start) + 2,
+                                ScratchFrom::Write,
+                                ScratchTo::LastRead,
+                                Some(choice_var),
+                            );
                             scratch_intervals.push(interval);
                             scratch_demands.push(8);
                         }
@@ -2484,24 +2749,22 @@ pub fn schedule_ssa_cpsat(
                     // Only enforce size constraint when sub_active
                     model.only_enforce_if(c_size, [sub_active_var]);
                     
-                    let interval = model.new_optional_interval_var(
-                        sub_cycle_var,
-                        size_var,
+                    let interval = scratch_interval(
+                        &mut model,
+                        scratch_time,
+                        LinearExpr::from(sub_cycle_var),
+                        LinearExpr::from(size_var),
                         LinearExpr::from(end_cycle_var),
-                        sub_active_var,
+                        ScratchFrom::Write,
+                        ScratchTo::LastRead,
+                        Some(sub_active_var),
                     );
                     scratch_intervals.push(interval);
                     scratch_demands.push(8); // Vector VReg (8 words)
                 }
             }
 
-            let max_demand = scratch_demands.iter().copied().max().unwrap_or(0);
-            debug_assert!(
-                max_demand <= scratch_budget as i64,
-                "cumul_scratch: max demand {} > budget {}",
-                max_demand,
-                scratch_budget
-            );
+            // The cumulative rejects mandatory intervals wider than the scratch budget.
             if scratch_pools {
                 // Two pools: vectors (demand VLEN) and scalars (demand 1), with capacities
                 // N_v and N_s and 8 * N_v + N_s <= budget. Address assignment needs at most
@@ -2538,7 +2801,7 @@ pub fn schedule_ssa_cpsat(
 
             // Add hints for size variables if we have greedy hints
             if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                let max_hint = hinted_segment_finish.unwrap_or(0);
                 // segment_end_var is already hinted where it's created (line ~3633); don't duplicate.
                 let mut bad_size_count = 0;
                 for vreg in &live_vregs {
@@ -2573,15 +2836,13 @@ pub fn schedule_ssa_cpsat(
 
                 // Now add size hints (live-out VRegs: use segment end = max_hint)
                 for (i, (size_var, def_idx, last_use_idx)) in size_vars.iter().enumerate() {
-                    let vreg = &live_vregs[i];
+                    let vreg = &size_var_vregs[i];
                     let is_live_out = live_out_vregs.is_some_and(|s| s.contains(vreg));
                     if *def_idx >= hints.len() {
                         continue;
                     }
                     // A split shift reserves its destination from its first lane.
-                    let def_cycle = hinted_lanes(ops[*def_idx].id)
-                        .and_then(|lanes| lanes.iter().copied().min())
-                        .unwrap_or(hints[*def_idx]);
+                    let def_cycle = hinted_first_write(*def_idx).unwrap_or(hints[*def_idx]);
                     let expected_size = if is_live_out {
                         (max_hint - def_cycle + 1).max(1)
                     } else {
@@ -2610,39 +2871,53 @@ pub fn schedule_ssa_cpsat(
             // CRITICAL: Verify hints are feasible before solving
             // If hints are infeasible, there's a bug in our model - fail immediately
             if let Some(hints) = greedy_hints {
-                let max_hint = hints.iter().copied().max().unwrap_or(0);
+                let max_hint = hinted_segment_finish.unwrap_or(0);
                 // Compute peak liveness from hints (live-out VRegs extend to segment end = max_hint)
                 let mut events: Vec<(i32, i64)> = Vec::new();
-                if let Some(il) = initial_live {
-                    for (vreg, last_use_idx) in il.iter() {
-                        if *last_use_idx < hints.len() {
-                            let size = vreg.size() as i64;
-                            events.push((0, size));
-                            events.push((hints[*last_use_idx] + 1, -size));
-                        }
-                    }
+                // Same timeline as the cumulative (`scratch_interval`): times of a start at a
+                // write / the segment start and of an end after a last read / the segment end.
+                let (at_write, at_seg_start, after_read, after_seg) = match scratch_time {
+                    ScratchTime::Cycle => (
+                        (|c: i32| c) as fn(i32) -> i32,
+                        (|c: i32| c) as fn(i32) -> i32,
+                        (|e: i32| e) as fn(i32) -> i32,
+                        (|e: i32| e) as fn(i32) -> i32,
+                    ),
+                    ScratchTime::Phase => (
+                        (|c: i32| c) as fn(i32) -> i32,
+                        (|c: i32| c - 1) as fn(i32) -> i32,
+                        (|e: i32| e - 1) as fn(i32) -> i32,
+                        (|e: i32| e) as fn(i32) -> i32,
+                    ),
+                };
+                for &(vreg, end) in &incoming_hinted_ends {
+                    let size = vreg.size() as i64;
+                    events.push((at_seg_start(0), size));
+                    events.push((after_read(end), -size));
                 }
                 if let Some(lt) = live_through_vregs {
                     for vreg in lt {
                         let size = vreg.size() as i64;
-                        events.push((0, size));
-                        events.push((max_hint + 1, -size));
+                        events.push((at_seg_start(0), size));
+                        events.push((after_seg(max_hint + 1), -size));
                     }
                 }
                 for vreg in &live_vregs {
                     let def_idx = vreg_def_op[vreg];
                     let last_use_idx = vreg_last_use[vreg];
-                    let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                    let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                     let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
-                        max_hint + 1
+                        after_seg(max_hint + 1)
                     } else {
-                        hinted_live_end
-                            .get(vreg)
-                            .copied()
-                            .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1)
+                        after_read(
+                            hinted_live_end
+                                .get(vreg)
+                                .copied()
+                                .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1),
+                        )
                     };
                     let size = vreg.size() as i64;
-                    events.push((def_cycle, size)); // VReg becomes live
+                    events.push((at_write(def_cycle), size)); // VReg becomes live
                     events.push((live_end, -size)); // VReg dies after its last read
                 }
                 // Add live_out VRegs that are defined in segment but not used within segment
@@ -2651,10 +2926,10 @@ pub fn schedule_ssa_cpsat(
                         if !live_vregs.contains(vreg) {
                             // This VReg is defined in segment but only used after
                             if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                                let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                                 let size = vreg.size() as i64;
-                                events.push((def_cycle, size)); // VReg becomes live
-                                events.push((max_hint + 1, -size)); // VReg dies at segment end
+                                events.push((at_write(def_cycle), size)); // VReg becomes live
+                                events.push((after_seg(max_hint + 1), -size)); // VReg dies at segment end
                             }
                         }
                     }
@@ -2668,8 +2943,8 @@ pub fn schedule_ssa_cpsat(
                             && op_idx < hints.len()
                         {
                             let c = hints[op_idx];
-                            events.push((c, 8));
-                            events.push((c + 2, -8));
+                            events.push((at_write(c), 8));
+                            events.push((after_read(c + 2), -8));
                         }
                     }
                 }
@@ -2691,16 +2966,12 @@ pub fn schedule_ssa_cpsat(
                         pool_events.push((start, dv, ds));
                         pool_events.push((end, -dv, -ds));
                     };
-                    if let Some(il) = initial_live {
-                        for (vreg, last_use_idx) in il.iter() {
-                            if *last_use_idx < hints.len() {
-                                push(0, hints[*last_use_idx] + 1, vreg.is_vector());
-                            }
-                        }
+                    for &(vreg, end) in &incoming_hinted_ends {
+                        push(at_seg_start(0), after_read(end), vreg.is_vector());
                     }
                     if let Some(lt) = live_through_vregs {
                         for vreg in lt {
-                            push(0, max_hint + 1, vreg.is_vector());
+                            push(at_seg_start(0), after_seg(max_hint + 1), vreg.is_vector());
                         }
                     }
                     for vreg in &live_vregs {
@@ -2709,28 +2980,34 @@ pub fn schedule_ssa_cpsat(
                         }
                         let def_idx = vreg_def_op[vreg];
                         let last_use_idx = vreg_last_use[vreg];
-                        let def_cycle = hints.get(def_idx).copied().unwrap_or(0);
+                        let def_cycle = hinted_first_write(def_idx).unwrap_or(0);
                         let live_end = if live_out_vregs.is_some_and(|s| s.contains(vreg)) {
-                            max_hint + 1
+                            after_seg(max_hint + 1)
                         } else {
-                            hinted_live_end
-                                .get(vreg)
-                                .copied()
-                                .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1)
+                            after_read(
+                                hinted_live_end
+                                    .get(vreg)
+                                    .copied()
+                                    .unwrap_or(hints.get(last_use_idx).copied().unwrap_or(def_cycle) + 1),
+                            )
                         };
-                        push(def_cycle, live_end, vreg.is_vector());
+                        push(at_write(def_cycle), live_end, vreg.is_vector());
                     }
                     if let Some(lo) = live_out_vregs {
                         for vreg in lo {
-                            if !live_vregs.contains(vreg) {
+                            if !pool_group_of_lane.contains_key(vreg) && !live_vregs.contains(vreg) {
                                 if let Some(&def_idx) = vreg_def_op.get(vreg) {
-                                    push(hints.get(def_idx).copied().unwrap_or(0), max_hint + 1, vreg.is_vector());
+                                    push(
+                                        at_write(hinted_first_write(def_idx).unwrap_or(0)),
+                                        after_seg(max_hint + 1),
+                                        vreg.is_vector(),
+                                    );
                                 }
                             }
                         }
                     }
                     for &(s, e) in &pool_group_hints {
-                        push(s, e, true);
+                        push(at_write(s), after_read(e), true);
                     }
                     if let Some(fma_ids) = select_choice_hints {
                         for (op_idx, op) in ops.iter().enumerate() {
@@ -2739,7 +3016,7 @@ pub fn schedule_ssa_cpsat(
                                 && op.sub_temp_vreg.is_some()
                                 && op_idx < hints.len()
                             {
-                                push(hints[op_idx], hints[op_idx] + 2, true);
+                                push(at_write(hints[op_idx]), after_read(hints[op_idx] + 2), true);
                             }
                         }
                     }
@@ -3093,6 +3370,31 @@ pub fn schedule_ssa_cpsat(
     for (idx, fma_last) in times.iter().enumerate().filter_map(|(i, t)| t.fma_cycle().map(|v| (i, v))) {
         let c = model.add_ge(max_cycle, LinearExpr::from(fma_last));
         model.set_constraint_name(c, &format!("max_cycle_ge_fma_last_{}", idx));
+    }
+
+    // 10a. Window optimality probe (analysis only, hints.window): hold every op outside the
+    // window at its reference cycle (ops after it move as one block) and keep the ops inside
+    // it in the window. See cpsat_scheduler::window.
+    if let Some(window) = window {
+        let counts = super::window::apply_window_constraints(
+            &mut model,
+            ops,
+            window,
+            &op_vars,
+            &const_choice_alu_encoding_info,
+        );
+        if verbose {
+            eprintln!(
+                "  Window [{}, {}): {} ops before (fixed), {} inside (free{}), {} after (move as one block), {} free",
+                window.start,
+                window.start + window.len,
+                counts.before,
+                counts.inside,
+                if window.fix_window_encodings { ", encodings fixed" } else { "" },
+                counts.after,
+                counts.free
+            );
+        }
     }
 
     // 10b. Makespan interval (tuning.makespan_interval): one interval [makespan, horizon) that
@@ -3580,14 +3882,14 @@ pub fn schedule_ssa_cpsat(
                     ops[idx].id, idx, c, clamped, lb, ub
                 );
             }
-            if let Some(completion_var) = times[idx].completion() {
-                model.add_hint(completion_var, clamped);
-            }
             let lanes = hinted_lanes(ops[idx].id);
+            if let Some(completion_var) = times[idx].completion() {
+                let done = lanes.map_or(clamped, |lanes| lanes.iter().copied().max().unwrap_or(0) as i64);
+                model.add_hint(completion_var, done);
+            }
             for (lane, &alu_var) in times[idx].lanes().iter().enumerate() {
-                // A split shift hints each lane at its own cycle, unclamped: hinted_lanes
-                // only returns lanes inside the lane variables' domain, and the capacity
-                // check counted these exact cycles. Otherwise all lanes run in the op's cycle.
+                // Match the lane cycles used in the capacity check. A whole shift
+                // uses the same cycle for every lane.
                 let lane_hint = lanes.map_or(clamped, |l| l[lane] as i64);
                 model.add_hint(alu_var, lane_hint);
             }
@@ -3735,6 +4037,11 @@ pub fn schedule_ssa_cpsat(
                     .min();
                 earliest_fma_consumer.map_or(after_producers, |t| t.max(after_producers))
             });
+            // Window probe: the reference gives the SUB's cycle (it is pinned there).
+            let sub_cycle_hint = window
+                .and_then(|w| w.reference.cse_sub_cycles.get(g).copied())
+                .filter(|_| window.is_some_and(|w| w.reference.cse_sub_cycles.len() == groups.len()))
+                .unwrap_or(sub_cycle_hint);
             let clamped = (sub_cycle_hint as i64).max(0).min(horizon_i64 - 1);
             model.add_hint(cse_subs[g].cycle(), clamped);
             // The shared SUB's scratch interval: it ends one cycle after the SUB, or two
@@ -4041,7 +4348,21 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 14. Solve
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   model built in {:.1}s: {} variables, {} constraints",
+            start_time.elapsed().as_secs_f64(),
+            model.proto().variables.len(),
+            model.proto().constraints.len()
+        );
+    }
     let response = model.solve_with_parameters(&params);
+    if window.is_some() {
+        eprintln!(
+            "[window probe]   solve: {:.1}s wall, {:.1} deterministic time",
+            response.wall_time, response.deterministic_time
+        );
+    }
     let solve_time = start_time.elapsed().as_secs_f64();
     // A deterministic budget only makes the run reproducible if the solve ended on it (or on
     // optimality). If the wall-clock backstop fired first, how far the search got depended on
@@ -4638,6 +4959,7 @@ pub fn schedule_ssa_cpsat(
                     &shifted_alu_cycles,
                     &select_choice_encoding,
                     scratch_budget,
+                    scratch_time,
                 );
             }
             // Shared CSE subs read true_val/false_val at sub_cycle; those must be visible by then.

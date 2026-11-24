@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import kernel_lift, reschedule_kernel
 from scripts.capture_public_kernel import capture, check_bundles
 from scripts.kernel_memory_use import memory_use, peak_live_words, scratch_report, scratch_values
 from scripts.kernel_lift import check_schedule, condense, heights, lift, load_graph, report, save_graph, scratch_edges, value_dependency_graph
@@ -265,6 +266,90 @@ def test_rescheduler_rejects_graph_for_another_kernel(tmp_path):
     assert "graph does not match" in result.stderr
 
 
+@pytest.mark.parametrize("rounds", [0, 1])
+def test_lift_table_checks_use_kernel_metadata(tmp_path, monkeypatch, capsys, rounds):
+    # The batch size in header word 2 is 8, so the store and final load both touch word 8.
+    bundles = _kernel(
+        [("load", ("const", 3, 2))],
+        [("load", ("load", 5, 3))],
+        [("store", ("store", 5, 5))],
+        [("load", ("const", 6, 8))],
+        [("load", ("load", 8, 6))],
+    )
+    layout = MemLayout(forest_height=3, batch_size=8, rounds=rounds)
+    kernel = tmp_path / "kernel.json"
+    kernel.write_text(json.dumps(vars(layout) | {"instrs": bundles}))
+    monkeypatch.setattr(sys, "argv", ["kernel_lift", f"sample={kernel}", "--table", "--concrete-runs", "1",
+                                     "--save-graph-dir", str(tmp_path)])
+    assert kernel_lift.main() == int(rounds != 0)
+    output = capsys.readouterr()
+    assert "| sample |" in output.out and "concrete check" not in output.out
+    assert f"sample: concrete check (1 random inputs): {'PASS' if rounds == 0 else 'FAIL'}" in output.err
+    graph = load_graph(str(tmp_path / "sample.graph.json"))
+    assert graph.layout == layout and graph.memory == {(2, 4): 1}
+
+
+def test_rescheduler_requires_matching_graph_layout(tmp_path, monkeypatch, capsys):
+    bundles = _chain_kernel()
+    layout = MemLayout(forest_height=4, batch_size=16, rounds=0)
+    path = tmp_path / "graph.json"
+    save_graph(lift(bundles, layout), str(path))
+    graph_data = json.loads(path.read_text())
+    kernel = tmp_path / "kernel.json"
+    kernel.write_text(json.dumps(vars(layout) | {"instrs": bundles}))
+    monkeypatch.setattr(sys, "argv", ["reschedule_kernel", str(kernel), "--graph", str(path), "--scheduler", "greedy",
+                                     "--seeds", "1"])
+    assert reschedule_kernel.main() == 0
+    assert "on 1 inputs: PASS" in capsys.readouterr().out
+    for incompatible in (vars(MemLayout()), None):
+        if incompatible is None:
+            del graph_data["layout"]
+        else:
+            graph_data["layout"] = incompatible
+        path.write_text(json.dumps(graph_data))
+        with pytest.raises(SystemExit, match="2"):
+            reschedule_kernel.main()
+        assert "graph layout does not match" in capsys.readouterr().err
+    # An old graph remains usable for a kernel with the old default layout.
+    kernel.write_text(json.dumps(bundles))
+    monkeypatch.setattr(sys, "argv", [*sys.argv[:-1], "0"])
+    assert reschedule_kernel.main() == 0
+
+
+def test_rescheduler_reports_skipped_validation_and_keeps_previous_output_on_failure(tmp_path, monkeypatch, capsys):
+    kernel = tmp_path / "kernel.json"
+    out = tmp_path / "out.json"
+    summary = tmp_path / "summary.json"
+    layout = {"forest_height": 3, "batch_size": 8, "rounds": 0}
+    kernel.write_text(json.dumps(layout | {"instrs": _chain_kernel()}))
+    base = ["reschedule_kernel", str(kernel), "--scheduler", "greedy", "--save-kernel", str(out), "--json", str(summary)]
+    monkeypatch.setattr(sys, "argv", [*base, "--seeds", "1"])
+    assert reschedule_kernel.main() == 0
+    assert "on 1 inputs: PASS" in capsys.readouterr().out
+    previous = out.read_bytes()
+
+    layout["rounds"] = 1
+    kernel.write_text(json.dumps(layout | {"instrs": _chain_kernel()}))
+    assert reschedule_kernel.main() == 1
+    assert "on 1 inputs: FAIL" in capsys.readouterr().out
+    assert out.read_bytes() == previous
+    result = json.loads(summary.read_text())
+    assert result["validation"] == "failed" and result["valid"] is False
+
+    monkeypatch.setattr(sys, "argv", [*base, "--seeds", "0"])
+    assert reschedule_kernel.main() == 0
+    assert "validation SKIPPED" in capsys.readouterr().out
+    result = json.loads(summary.read_text())
+    assert result["validation"] == "skipped" and result["valid"] is None and result["validated_seeds"] == 0
+    saved = json.loads(out.read_text())
+    assert {k: saved[k] for k in layout} == layout and saved["instrs"]
+
+    monkeypatch.setattr(sys, "argv", [*base, "--seeds", "-1"])
+    with pytest.raises(SystemExit, match="2"):
+        reschedule_kernel.main()
+    assert "--seeds must be nonnegative" in capsys.readouterr().err
+
+
 def test_valu_shift_emits_eight_alu_lanes():
     k = _kernel([("valu", ("vbroadcast", 16, 0))], [("valu", ("^", 24, 16, 16))])
     g = lift(k)
@@ -324,6 +409,9 @@ def test_capture_sandbox_blocks_writes_and_repo_imports(tmp_path):
     with pytest.raises(RuntimeError):
         capture(builder, timeout=120)
     assert not outside.exists()
+    builder.write_text("open('extra.txt', 'w').write('x')\n" + BUILDER)
+    with pytest.raises(RuntimeError):
+        capture(builder, timeout=120)
     builder.write_text("import scripts.kernel_lift\n" + BUILDER)
     with pytest.raises(RuntimeError):
         capture(builder, timeout=120)
@@ -334,7 +422,7 @@ def test_graph_json_roundtrip_is_plain_data(tmp_path):
     path = tmp_path / "g.json"
     save_graph(lk, str(path))
     data = json.loads(path.read_text())
-    assert set(data) == {"name", "ops", "edges", "memory_edges", "raw", "memory"}
+    assert set(data) == {"name", "ops", "edges", "memory_edges", "raw", "memory", "layout"}
     g = load_graph(str(path))
     assert g.raw == lk.raw and [o.reads for o in g.ops] == [o.reads for o in lk.ops]
 
@@ -361,6 +449,25 @@ def test_memory_use_classifies_a_scatter_then_load():
     assert p["address"].startswith("data-dependent (2 bases")
     assert p["value"].startswith("working value") and p["readers"] == ["load"] and p["loads"] == 1
     assert scratch_report(sym)["peak_parked_working_words"] == 1
+
+
+@pytest.mark.parametrize("base, working", [(VAL_P, True), (L.forest_p, False)])
+def test_memory_use_classifies_dynamic_loads_by_their_source_region(base, working):
+    k = _kernel(
+        [("load", ("const", 3, VAL_P)), ("load", ("const", 4, 1))],
+        [("load", ("load", 1, 3)), ("load", ("const", 5, base))],
+        [("alu", ("&", 2, 1, 4)), ("load", ("const", 6, VAL_P + 4))],
+        [("alu", ("+", 7, 5, 2))],
+        [("load", ("load", 8, 7))],
+        [("store", ("store", 6, 8))],
+        [("load", ("load", 9, 6))],
+    )
+    sym = SymbolicKernel(k).run()
+    value = memory_use(sym)["patterns"][0]["value"]
+    assert value.startswith("working value" if working else "function of tree values")
+    scratch = scratch_report(sym)
+    assert scratch["peak_parked_working_words"] == int(working)
+    assert scratch["peak_parked_tree_or_constant_words"] == int(not working)
 
 
 def test_peak_live_words_counts_value_lifetimes():

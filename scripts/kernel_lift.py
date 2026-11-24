@@ -32,14 +32,14 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.kernel_memory_use import format_memory_use, memory_use, scratch_report  # noqa: E402
 from scripts.schedule_report import emission_floor  # noqa: E402
-from verification.memory_alias import KOp, MemLayout, SymbolicKernel, concrete_check, load_bundles  # noqa: E402
+from verification.memory_alias import KOp, MemLayout, SymbolicKernel, concrete_check, load_kernel  # noqa: E402
 
 ENGINES = ("alu", "valu", "load", "store", "flow")
 CAP = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
@@ -62,6 +62,10 @@ class LiftedKernel:
     @property
     def memory(self) -> dict[tuple[int, int], int]:
         return self.sym.mem_edges
+
+    @property
+    def layout(self) -> MemLayout:
+        return self.sym.layout
 
     def preds(self) -> list[list[tuple[int, int]]]:
         out: list[list[tuple[int, int]]] = [[] for _ in self.ops]
@@ -121,10 +125,10 @@ def lift(bundles: list[dict], layout: MemLayout | None = None) -> LiftedKernel:
 
 
 def save_graph(lk: LiftedKernel, path: str, name: str = "") -> None:
-    """Write the lifted graph (ops with their original cycle, and edges) as JSON, so a
-    rescheduler can read it without repeating the alias analysis."""
+    """Write the lifted graph and its upstream layout for reuse by the rescheduler."""
     data = {
         "name": name,
+        "layout": asdict(lk.layout),
         "ops": [{"cycle": o.cycle, "engine": o.engine, "slot": o.slot, "reads": o.reads, "writes": o.writes}
                 for o in lk.ops],
         "edges": [[s, d, lat] for (s, d), lat in sorted(lk.edges.items())],
@@ -145,6 +149,7 @@ class Graph:
     mem_edges: int
     raw: set[tuple[int, int]]
     memory: dict[tuple[int, int], int]
+    layout: MemLayout = MemLayout()
 
     n = LiftedKernel.n
     preds = LiftedKernel.preds
@@ -156,9 +161,11 @@ def load_graph(path: str) -> Graph:
         data = json.load(f)
     ops = [KOp(i, o["cycle"], o["engine"], o["slot"], o.get("reads", []), o.get("writes", []))
            for i, o in enumerate(data["ops"])]
+    # Graphs saved by the old CLI were always lifted with the default layout.
+    layout = MemLayout.from_metadata(data["layout"], require_complete=True) if "layout" in data else MemLayout()
     return Graph(ops, {(s, d): lat for s, d, lat in data["edges"]}, data["memory_edges"],
                  {tuple(e) for e in data.get("raw", [])},
-                 {(s, d): lat for s, d, lat in data.get("memory", [])})
+                 {(s, d): lat for s, d, lat in data.get("memory", [])}, layout)
 
 
 def value_dependency_graph(g) -> Graph:
@@ -168,7 +175,7 @@ def value_dependency_graph(g) -> Graph:
     edges = {e: 1 for e in g.raw}
     for e, lat in g.memory.items():
         edges[e] = max(edges.get(e, 0), lat)
-    return Graph(g.ops, edges, len(g.memory), set(g.raw), dict(g.memory))
+    return Graph(g.ops, edges, len(g.memory), set(g.raw), dict(g.memory), g.layout)
 
 
 # =============================================================================
@@ -412,14 +419,18 @@ def format_report(r: dict) -> str:
         "  load % by decile:                 " + " ".join(f"{d['load']:.0f}" for d in f["deciles"]),
     ]
     if "concrete_check" in r:
-        c = r["concrete_check"]
-        lines.append(f"  concrete check ({c['runs']} random inputs): {c['observed_alias_pairs']} aliasing pairs seen "
-                     f"({c['observed_ordered_transitively']} ordered through a must-alias store), "
-                     f"{c['observed_without_edge']} not ordered, {c['edges_never_observed']} memory edges never seen, "
-                     f"{c['addresses_outside_value_set']} addresses outside their value set, outputs ok={c['outputs_ok']}")
+        lines.append("  " + format_concrete_check(r["concrete_check"]))
     if r["original_schedule_violations"]:
         lines.append(f"  WARNING: the kernel's own schedule violates {r['original_schedule_violations']} lifted constraints")
     return "\n".join(lines)
+
+
+def format_concrete_check(c: dict) -> str:
+    return (f"concrete check ({c['runs']} random inputs): {'PASS' if c['passed'] else 'FAIL'}; "
+            f"{c['observed_alias_pairs']} aliasing pairs seen "
+            f"({c['observed_ordered_transitively']} ordered through a must-alias store), "
+            f"{c['observed_without_edge']} not ordered, {c['edges_never_observed']} memory edges never seen, "
+            f"{c['addresses_outside_value_set']} addresses outside their value set, outputs ok={c['outputs_ok']}")
 
 
 def table_row(r: dict) -> str:
@@ -446,12 +457,18 @@ def main() -> int:
     ap.add_argument("--save-graph-dir", help="write NAME.graph.json for each kernel here "
                                              "(input to scripts/reschedule_kernel.py)")
     args = ap.parse_args()
+    if args.concrete_runs < 0:
+        ap.error("--concrete-runs must be nonnegative")
     reports = []
+    failed = False
     for spec in args.kernels:
         name, _, path = spec.rpartition("=")
         name = name or os.path.basename(path)
-        bundles = load_bundles(path)
-        lk = lift(bundles)
+        try:
+            bundles, layout = load_kernel(path)
+        except ValueError as e:
+            ap.error(f"{path}: {e}")
+        lk = lift(bundles, layout)
         if args.save_graph_dir:
             save_graph(lk, os.path.join(args.save_graph_dir, f"{name}.graph.json"), name)
         r = report(lk, bundles, name)
@@ -459,12 +476,16 @@ def main() -> int:
         r["scratch"] = scratch_report(lk.sym)
         if args.concrete_runs:
             c = concrete_check(lk.sym, args.concrete_runs)
+            passed = c.outputs_ok and not (c.missing_edges or c.outside_value_set)
             r["concrete_check"] = {"runs": c.runs, "observed_alias_pairs": c.observed_pairs,
                                    "observed_ordered_transitively": c.ordered_transitively,
                                    "observed_without_edge": len(c.missing_edges),
                                    "edges_never_observed": c.unseen_edges,
                                    "addresses_outside_value_set": len(c.outside_value_set),
-                                   "outputs_ok": c.outputs_ok}
+                                   "outputs_ok": c.outputs_ok, "passed": passed}
+            failed |= not passed
+            if args.table:
+                print(f"{name}: {format_concrete_check(r['concrete_check'])}", file=sys.stderr)
         reports.append(r)
         if not args.table:
             print(format_report(r), flush=True)
@@ -479,7 +500,7 @@ def main() -> int:
     if args.json:
         with open(args.json, "w") as f:
             json.dump(reports, f, indent=1)
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":

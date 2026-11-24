@@ -383,6 +383,15 @@ struct SsaScheduleOutput {
     /// the emitted op set and its encoding choices, not the kernel problem itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     lb_scope: Option<&'static str>,
+    /// Scratch words the allocator was allowed (1,536 on the machine). Larger only for the
+    /// relaxed-scratch reference, whose kernel is not valid on the machine.
+    scratch_size: usize,
+    /// True when `scratch_size` exceeds the machine's or the CP-SAT model had no scratch
+    /// constraint: this run is an analysis reference, never a recorded result.
+    scratch_relaxed: bool,
+    /// Scratch budget of the full-kernel CP-SAT model (0 = no scratch constraint). CP-SAT only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpsat_scratch_budget: Option<usize>,
     /// Vector group key/alias VReg id → lane VReg ids, in lane order. Always written (even
     /// when empty) so checkers can tell "no groups" from "JSON predates this field".
     vector_group_lanes: std::collections::BTreeMap<u32, Vec<u32>>,
@@ -737,6 +746,9 @@ pub fn write_ssa_schedule_json(
         comment,
         lb_cycles: result.lb_cycles,
         lb_scope: result.lb_cycles.map(|_| "emission"),
+        scratch_size: result.address_result.budget,
+        scratch_relaxed: result.scratch_relaxed,
+        cpsat_scratch_budget: result.cpsat_scratch_budget,
         vector_group_lanes: result
             .vector_group_lanes
             .iter()

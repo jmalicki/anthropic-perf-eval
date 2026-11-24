@@ -96,6 +96,21 @@ class MemLayout:
     batch_size: int = 256
     rounds: int = 16
 
+    @classmethod
+    def from_metadata(cls, data: dict, *, require_complete: bool = False) -> MemLayout:
+        """Read upstream layout fields, defaulting absent or null kernel metadata."""
+        if not isinstance(data, dict):
+            raise ValueError("layout metadata must be a JSON object")
+        fields = {}
+        for name, minimum in (("forest_height", 0), ("batch_size", 1), ("rounds", 0)):
+            value = data.get(name)
+            if value is None and not require_complete:
+                continue
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+            fields[name] = value
+        return cls(**fields)
+
     @property
     def n_nodes(self) -> int:
         return 2 ** (self.forest_height + 1) - 1
@@ -984,12 +999,24 @@ def load_bundles(path: str) -> list[dict]:
     return data["instrs"] if isinstance(data, dict) else data
 
 
+def load_kernel(path: str) -> tuple[list[dict], MemLayout]:
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data["instrs"], MemLayout.from_metadata(data)
+    return data, MemLayout()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("kernel", help="kernel JSON (bundles under 'instrs')")
     ap.add_argument("--concrete-runs", type=int, default=8)
     args = ap.parse_args()
-    sym = SymbolicKernel(load_bundles(args.kernel)).run()
+    try:
+        bundles, layout = load_kernel(args.kernel)
+    except ValueError as e:
+        ap.error(str(e))
+    sym = SymbolicKernel(bundles, layout).run()
     s = sym.stats
     print(f"{s.mem_ops} memory ops; {s.op_pairs_total} ordered op pairs with a store")
     print(f"  memory edges: {s.op_edges}; all other pairs proved disjoint or ordered through a must-alias store")

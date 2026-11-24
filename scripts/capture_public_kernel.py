@@ -12,9 +12,9 @@ BUILDER.py is a public take-home solution: a `perf_takehome.py` replacement that
   `-I -S -B` and a minimal environment, with an import path for the standard library
   and the copied sources.
 * The macOS profile restricts file reads to the capture directory, Python installation,
-  and selected system runtime paths. It restricts file writes to the capture directory
-  and `/dev/null`, denies networking and fork, and allows only the configured Python executable
-  and, for a framework launcher, the corresponding framework executable.
+  and selected system runtime paths. Writes by path are limited to the precreated,
+  size-limited result and `/dev/null`. The profile denies networking, signals, and fork, and allows
+  only the configured Python executable and its framework executable when applicable.
 * The parent reads a bounded JSON result from a regular file and checks the bundle schema
   before writing the capture.
 
@@ -57,7 +57,7 @@ with open({result!r}, "w") as f:
 """
 
 
-def sandbox_profile(sandbox: str, python_prefix: str, python: str) -> str:
+def sandbox_profile(sandbox: str, python_prefix: str, python: str, result: str) -> str:
     """Allow Python to read its runtime and the capture directory on macOS."""
     executable = Path(python)
     allowed_executables = [executable]
@@ -78,11 +78,12 @@ def sandbox_profile(sandbox: str, python_prefix: str, python: str) -> str:
         "(version 1)",
         "(allow default)",
         "(deny network*)",
+        "(deny signal)",
         "(deny process-fork)",
         "(deny process-exec)",
         f"(allow process-exec {python_exec_literals})",
         "(deny file-write*)",
-        f"(allow file-write* (subpath {json.dumps(sandbox, ensure_ascii=False)}))",
+        f"(allow file-write-data (literal {json.dumps(result, ensure_ascii=False)}))",
         '(allow file-write* (literal "/dev/null"))',
         "(deny file-read*)",
         # Python startup needs an operation on the root directory itself.
@@ -142,6 +143,8 @@ def capture(builder: Path, params=DEFAULT_PARAMS, timeout: float = 600.0, sandbo
         shutil.copyfile(builder, os.path.join(sandbox, "perf_takehome.py"))
         shutil.copyfile(FROZEN_PROBLEM, os.path.join(sandbox, "problem.py"))
         result = os.path.join(sandbox, "result.json")
+        # The builder can write the result's contents but cannot create other files.
+        Path(result).touch(exist_ok=False)
         driver = os.path.join(sandbox, "_capture_driver.py")
         fh, nn, bs, r = params
         Path(driver).write_text(DRIVER.format(
@@ -149,7 +152,7 @@ def capture(builder: Path, params=DEFAULT_PARAMS, timeout: float = 600.0, sandbo
         ))
         cmd = [python, "-I", "-S", "-B", driver]
         if use_sbx:
-            cmd = ["sandbox-exec", "-p", sandbox_profile(sandbox, python_prefix, python)] + cmd
+            cmd = ["sandbox-exec", "-p", sandbox_profile(sandbox, python_prefix, python, result)] + cmd
         env = {"PATH": "/usr/bin:/bin", "HOME": sandbox, "TMPDIR": sandbox, "LANG": "C.UTF-8"}
         with tempfile.TemporaryFile() as diagnostics:
             proc = subprocess.run(

@@ -1097,7 +1097,7 @@ use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None,
-    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_model="words", cpsat_split_shift_hint=false))]
+    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, energetic_alap_pulls=false, energetic_bounded_push=false, energetic_bounded_push_k=None, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase"))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1160,8 +1160,11 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     pressure_critical_threshold: Option<f64>,
     pressure_inflation_threshold: Option<f64>,
     greedy_budget_headroom: usize,
+    scratch_size: Option<usize>,
+    scratch_constraint: bool,
     scratch_model: &str,
     cpsat_split_shift_hint: bool,
+    cpsat_scratch_time: &str,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let cpsat_tuning = crate::cpsat_scheduler::CpsatTuning::from_json(cpsat_tuning_json)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1186,6 +1189,21 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 dtime
             )));
         }
+    }
+    // Relaxed-scratch reference (analysis only): scratch_size above the machine's 1,536 words,
+    // or no CP-SAT scratch constraint (then the greedy and the allocator get an effectively
+    // unbounded scratch unless scratch_size says otherwise).
+    let scratch_size = match scratch_size {
+        Some(words) => words,
+        None if !scratch_constraint => crate::kernel_builder::config::UNBOUNDED_SCRATCH_WORDS,
+        None => crate::kernel_builder::config::SCRATCH_SIZE,
+    };
+    if scratch_size < 2 * VLEN {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "scratch_size must be at least {} words, got {}",
+            2 * VLEN,
+            scratch_size
+        )));
     }
     if batch_size == 0 || batch_size % VLEN != 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1295,6 +1313,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             greedy_split_shift,
             pressure_thresholds,
             greedy_budget_headroom,
+            scratch_size,
+            cpsat_scratch_constraint: scratch_constraint,
             scratch_model,
             cpsat_split_shift_hint,
         },
@@ -1303,10 +1323,38 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .spec
         .check_access_plan()
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let scratch_relaxed = config.compiler.is_relaxed_scratch();
+    if scratch_relaxed {
+        // Keep the protected names in sync with kernel_build_args.NORMAL_KERNEL_PATHS.
+        let output_basename = output_json.as_deref().and_then(|path| {
+            std::path::Path::new(path).file_name().and_then(|name| name.to_str())
+        });
+        if matches!(
+            output_basename,
+            Some("scheduler_output.json" | "kernel_to_validate.json"
+                | "kernel_upstream_check.json" | "scheduler_output_upstream_check.json")
+        ) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Relaxed scratch requires an output_json path separate from normal kernel artifacts.",
+            ));
+        }
+    }
+    if scratch_relaxed && verbose {
+        println!(
+            "RELAXED SCRATCH (analysis only): scratch_size={} words{}; the kernel is NOT valid on \
+             the {}-word machine.",
+            scratch_size,
+            if scratch_constraint { "" } else { ", no CP-SAT scratch constraint" },
+            crate::kernel_builder::config::SCRATCH_SIZE
+        );
+    }
 
     let mut builder = SsaTickTockKernelBuilder::new(config);
     builder.cpsat_deterministic_time = cpsat_deterministic_time;
     builder.cpsat_tuning = cpsat_tuning;
+    builder.cpsat_scratch_time = cpsat_scratch_time
+        .parse::<crate::cpsat_scheduler::ScratchTime>()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     if use_cpsat && !builder.config.compiler.enable_ssa_dce {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1449,6 +1497,12 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("peak_live", result.address_result.peak_live)?;
     stats.set_item("max_addr", result.address_result.max_addr)?;
     stats.set_item("budget_exceeded", result.budget_exceeded)?;
+    stats.set_item("scratch_size", result.address_result.budget)?;
+    stats.set_item("scratch_constraint", scratch_constraint)?;
+    stats.set_item("relaxed_scratch", result.scratch_relaxed)?;
+    if let Some(b) = result.cpsat_scratch_budget {
+        stats.set_item("cpsat_scratch_budget", b)?;
+    }
     stats.set_item("valu_shifted", result.valu_shifted)?;
     if let Some(ec) = result.empty_cycle_count {
         stats.set_item("empty_cycle_count", ec)?;

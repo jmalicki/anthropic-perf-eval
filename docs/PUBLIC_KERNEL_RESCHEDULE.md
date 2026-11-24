@@ -7,16 +7,17 @@ good is their emission (which ops, which encodings), and how good is their sched
 
 ## What this means
 
-**The public kernels' remaining advantage is emission, not scheduling.** All three public
-kernels sit 4 to 8 cycles (0.4 to 0.8%) above the capacity floor of their own ops. Their
-schedules are essentially optimal for their op sets: there is nothing left for a scheduler to
-win. Rescheduling their exact ops with fixed addresses, our tools reproduce their cycle
-counts but do not beat them. CP-SAT proves the 880 and 899 schedules optimal for their ops at
-their addresses (bounds 880 and 899). It proves 982 is within 3 cycles of the best possible
-schedule (bound 979). Their VALU/ALU splits are also already balanced: letting any VALU op
-move to the ALU lowers their floors by only 1 to 2 cycles (874 → 873, 895 → 893, 974 → 973).
-So the optional VALU-shift experiment on their ops has at most 2 cycles to find, and was not
-run.
+**Emission accounts for most of the gap to the public kernels.** All three public kernels
+sit 4 to 8 cycles (0.4 to 0.8%) above the capacity floor of their own ops at fixed encodings.
+Our tools reproduce those cycle counts with fixed addresses. On the lifted graphs, CP-SAT
+proves the 880 and 899 schedules optimal and puts 982 within 3 cycles of optimal (bound 979).
+Those claims apply to the lifted graphs with fixed encodings and addresses. Assumption A can
+add conservative memory edges, which can raise a graph's optimum.
+
+Allowing eligible VALU ops to move to the ALU lowers the capacity floors by 1 to 2 cycles
+(874 → 873, 895 → 893, 974 → 973). The shifted floors leave room for at most 7, 6, and 9 cycles
+of improvement over the existing 880, 899, and 982 schedules. The optional shift experiment
+remains unrun, and the CP-SAT results above cover the fixed-encoding case.
 
 **Our 1,099-cycle kernel is the opposite case.** It sits 105 cycles above the floor of its own
 ops (994 with the VALU→ALU split free). That breaks into two parts:
@@ -30,11 +31,10 @@ ops (994 with the VALU→ALU split free). That breaks into two parts:
 
 How much of that a better schedule could recover, on our ops with the split free and the
 addresses re-allocated (value-dependency schedule, CP-SAT, dtime 200):
-- CP-SAT proves a lower bound of 1,009 cycles. So at least 15 cycles above the 994 floor are
-  forced by the dependency structure (start-up and tail), and at most 89 of the 105 are
-  recoverable by scheduling.
-- CP-SAT itself found no better schedule than the 1,098 it was warm-started from, so how many
-  of those 89 a real scheduler would recover is still open.
+- CP-SAT proves a lower bound of 1,009 cycles for the value-dependency graph, which retains
+  the inferred memory edges. The bound is 15 cycles above the capacity floor of 994.
+- CP-SAT kept its 1,098-cycle warm start, leaving a gap of 89 cycles to that graph bound.
+  The number of cycles a scheduler can actually recover remains open.
 
 The gap to the leaders' level is therefore mostly emission:
 
@@ -49,11 +49,10 @@ The gap to the leaders' level is therefore mostly emission:
 98 from scheduling and the VALU/ALU split.
 
 **Does this make a CP-SAT-based design credible?** Partly.
-- As a source of proofs it works. It proved two hand-tuned 20,000-op leaderboard schedules
-  optimal: 880 in 10 s, and 899 within its budget. Its LP bound reached the capacity floor
-  for 982 (979) in a few minutes, so it can say how close a schedule is to optimal. It is also
-  exact about constraints: the same model carries exact memory aliasing, latency-0
-  anti-dependences and co-issue groups.
+- CP-SAT proved optimality on two lifted graphs of about 20,000 ops, reaching 880 in 10 s
+  and 899 within its budget. For the 982-cycle schedule, its bound reached 979 in a few
+  minutes. The model carries the inferred memory edges, latency-0 anti-dependencies, and
+  co-issue groups from each graph.
 - As a stand-alone improver of 20,000-op schedules at makespan granularity it is weak. It
   never improved a warm start by a single cycle in these budgets: from the greedy's 996 for
   982 it stayed at 996, and from 982 it stayed at 982. Construction has to come from
@@ -101,8 +100,9 @@ What the critical-path columns show:
 "Fixed addresses" keeps every op, encoding and scratch/memory address; the kernel is emitted
 and validated on the upstream simulator (8 random inputs, plus `./scripts/check_upstream.sh
 --kernel` for the CP-SAT and greedy outputs). "Value deps" is the value-dependency schedule
-with addresses re-allocated: a relaxation, not emitted; its CP-SAT bound holds for any
-re-allocation.
+with addresses re-allocated. It relaxes scratch reuse constraints, so its CP-SAT bound
+applies to re-allocations that respect the retained memory edges. Only the fixed-address
+treatment emits a kernel.
 
 Both greedy columns are our Python list scheduler; both CP-SAT columns are "CP-SAT on their
 ops" (`scripts/reschedule_kernel.py`), not our Rust SSA pipeline.
@@ -121,8 +121,8 @@ ops" (`scripts/reschedule_kernel.py`), not our Rust SSA pipeline.
 Notes:
 - The first 982 CP-SAT run started from the critical-path greedy (996). It ended on its
   wall-clock backstop (5,400 s), so it is not deterministic. Its result, 996 with bound 979,
-  is reported only as context. All recorded rows use `interleave_search` and a
-  deterministic-time budget, and end on that budget.
+  is reported only as context. The recorded rows use `interleave_search` and a
+  deterministic-time budget. The 880 and 899 graph solves ended on optimality.
 - The value-dependency greedy keeps the peak of live scratch words close to the kernel's own:
   880 1,231 (own 1,230), 899 1,214 (own 1,241), 982 1,596 (own 1,503; over 1,536, so not
   allocatable as is), ours 1,185 (own 1,033).
@@ -140,16 +140,17 @@ How to read the table:
 - Pairs not listed as edges were proved disjoint, either by value sets (nearly all of them)
   or by Z3, or they are ordered through a store that must alias both.
 - No address fell outside its value set, and every kernel's outputs matched the reference on
-  all inputs.
-- Edges never seen to alias are mostly pairs that alias only for particular branch-bit
-  combinations. In the 880 kernel many bit-addressed stores share one dead word, so they can
-  alias on any input whose bits send both there.
+  all eight sampled inputs.
+- Edges never seen to alias can come from conservative edges under Assumption A or rare
+  branch-bit combinations. In the 880 kernel many bit-addressed stores share one dead word,
+  so they can alias on any input whose bits send both there.
 
 ### How the 880 and 899 kernels use main memory mid-kernel
 
 Main memory is the only place this ISA addresses by a register value. The patterns below come
-from the exact store-to-load flow of the alias analysis (`scripts/kernel_memory_use.py`). They
-are described at the level the authors describe them; no addresses or code are reproduced.
+from the store-to-load flow inferred by the alias analysis (`scripts/kernel_memory_use.py`).
+They are described at the level the authors describe them; no addresses or code are
+reproduced.
 
 1. **Tree repacking at start-up** (pattern (a)).
    - What it does: early `vstore`s write tree values, XOR-adjusted by the deferred hash
@@ -235,11 +236,12 @@ unmodified upstream simulator (`upstream/tests/frozen_problem.py`, importable as
 It runs as `python -I -S -B` (no site-packages, no `PYTHON*` variables, no script directory
 on the path) with a minimal environment. On macOS, the profile allows reads within the
 capture directory, Python installation, and selected system runtime paths. It also allows
-access to the root directory itself, and limits writes to the capture directory and
-`/dev/null`. It denies networking and fork and allows only the configured Python executable.
-The parent reads at most 16 MiB from a regular, single-link result file and validates the
-bundle schema before writing the requested JSON. Use a disposable isolated environment
-for builders from untrusted sources.
+access to the root directory itself. By path, only the precreated result file and
+`/dev/null` are writable. The child caps regular-file output with `RLIMIT_FSIZE`. The profile
+denies networking, signals, and fork and allows execution of the configured Python, including
+supported framework Python installations. The parent reads at most 16 MiB from a regular,
+single-link result file and validates the bundle schema before writing the requested JSON.
+Use a disposable isolated environment for builders from untrusted sources.
 
 ### Lifting (`scripts/kernel_lift.py`)
 
@@ -252,7 +254,8 @@ Every slot is one op. An edge `src -> dst` with latency `L` means `cycle[dst] >=
   reader's cycle. Write-after-write from the last writer, latency 1. A word that is read before
   any write reads the machine's initial 0, and its first writer is ordered after those reads.
   The edges are the minimal exact set: only the last writer, never blanket ordering.
-- **Main memory**, exact, from `verification/memory_alias.py` (next section). Same latencies:
+- **Main memory**, inferred by `verification/memory_alias.py` under Assumption A (next
+  section). Latencies are
   store to load 1, load to store 0, store to store 0 (a cycle's memory writes commit in
   slot order, so a later store may share the cycle if it stays later in the bundle; the
   rescheduler emits each cycle in program order).
@@ -265,16 +268,18 @@ Every slot is one op. An edge `src -> dst` with latency `L` means `cycle[dst] >=
 The kernel's own schedule satisfies its lifted graph for all four kernels (checked by the
 report: `original_schedule_violations = 0`).
 
-### Exact memory dependencies (`verification/memory_alias.py`)
+### Memory dependency analysis (`verification/memory_alias.py`)
 
-A memory edge is added only if the two addresses **can be equal for some valid input**,
-never because they cannot be told apart.
+The analysis adds a memory edge when the addresses can be equal in the abstract model under
+Assumption A, except where an intervening must-alias store already supplies the ordering.
+The abstraction preserves real aliasing possibilities and can introduce additional ones,
+so the resulting graph may conservatively order pairs that are disjoint on valid inputs.
 
 1. The kernel is executed symbolically with the term store of `verification/kernel_dataflow.py`,
    extended with an exact memory model. A load returns the value of the latest earlier store
    that must alias it, wrapped in `ite(addr == store_addr, store_value, …)` for every later
-   store that only may alias it, over the initial memory. Addresses computed from loaded
-   values are therefore exact too, which matters for kernels that store pointers.
+   store that only may alias it, over the initial memory. This models addresses computed from
+   loaded values, which matters for kernels that store pointers.
 2. **Preconditions**, from the upstream generator (`build_mem_image`, `Tree.generate`,
    `Input.generate` in `upstream/tests/frozen_problem.py`):
    - header words 0..6 are `rounds=16, n_nodes=2047, batch_size=256, forest_height=10,
@@ -287,8 +292,8 @@ never because they cannot be told apart.
    memory address becomes a term over tree values and input values.
 3. **Per pair.** First a value-set over-approximation (constants, `x & c`, `x % c`, `x >> c`,
    selects, arithmetic on small sets): disjoint sets prove the pair disjoint. Otherwise Z3
-   over 32-bit bit-vectors: SAT means the addresses can be equal (edge), UNSAT means they never
-   are (no edge). `unknown` raises an error; it is never turned into an edge. To keep this
+   over 32-bit bit-vectors: SAT permits aliasing in the abstraction and UNSAT proves
+   disjointness under the input preconditions. `unknown` raises an error. To keep this
    fast, the query's formula is first evaluated on 1,024 fixed assignments of its free
    variables with the same operations as the Z3 expression; a satisfying assignment is a Z3
    model, so SAT is decided without the solver, and only the remaining queries (in practice
@@ -298,20 +303,19 @@ never because they cannot be told apart.
    and stores the same way.
 4. **Assumption A.** A subterm whose value set is unbounded (a hash value, a tree value) is
    replaced by a fresh 32-bit variable, shared by all occurrences of that subterm. This only
-   adds behaviours, so UNSAT is a proof for the real kernel. A SAT witness is an assignment of
-   those variables, in practice of the branch bits `h & 1` of different hashes; assuming those
-   bits are independent is the one assumption. In practice the addresses depend on the hashes
-   only through such bits.
+   adds behaviours, so UNSAT proves disjointness for the real kernel. A SAT witness assigns
+   values to the fresh variables. In practice these values often determine branch bits
+   `h & 1` of different hashes. The abstraction treats those bits as independent, so some
+   witnesses can describe combinations that no valid kernel input produces.
 5. **Lemmas** (Z3, in `./scripts/test.sh proofs`): MA1, the word-range overlap test
    `a - b + (wa - 1) <u wa + wb - 1` is exactly "some word of one range equals some word of the
    other", with wrap-around, for widths 1 and 8; MA2, the value-set rules (`x & c` is a submask
    of `c`, `x % c < c` for each `c <= 64`, `x >> s < 2^(32-s)` for `s` in [20, 32),
    `x % 2 == x & 1`); MA3, an instance of the branch-bit abstraction.
 6. **Cross-check.** Each kernel is run on random inputs on the upstream simulator with address
-   tracing. Every pair seen to alias must have an edge (a missing one would mean the
-   preconditions are wrong), and every concrete address must lie in its value set. Memory edges
-   never seen to alias are counted: they are the slack of Assumption A (or aliasing that random
-   inputs rarely hit).
+   tracing. Every observed aliasing pair with at least one store must be ordered by a direct
+   edge or through a must-alias store. Every concrete address must lie in its value set.
+   Edges whose endpoints never alias in the sample can reflect the abstraction or rare inputs.
 
 ### Rescheduling (`scripts/reschedule_kernel.py`)
 
@@ -331,8 +335,8 @@ change.
   "CP-SAT on their ops": the same solver and constraint form as our model, not our SSA pipeline.
 - **Value-dependency schedule, addresses re-allocated** (`--value-deps`): the same schedulers on value edges and memory edges only,
   without the edges that reusing scratch addresses adds. Such a schedule needs a new address
-  assignment, so no kernel is emitted. It is a relaxation: its CP-SAT bound is a lower bound
-  for any reschedule with re-allocated addresses. The schedule's peak live scratch words show
+  assignment, so the result is a schedule only. Its CP-SAT bound holds for re-allocations
+  that respect the retained memory edges. The schedule's peak live scratch words show
   whether it could plausibly be allocated in 1,536 words.
 - Every emitted schedule is checked against the graph and slot limits, run on the upstream
   simulator against the reference on 8 random inputs, and run through the unmodified upstream
@@ -356,7 +360,7 @@ uv run python -I scripts/kernel_lift.py k880=k/880.json k899=k/899.json k982=k/9
 # reschedule
 uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json --scheduler greedy
 uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json \
-    --cpsat-deterministic-time 300 --save-kernel k/982_cpsat.json
+    --hint original --cpsat-deterministic-time 100 --save-kernel k/982_cpsat.json
 uv run python -I scripts/reschedule_kernel.py k/982.json --graph graphs/k982.graph.json --value-deps \
     --cpsat-deterministic-time 300
 ./scripts/check_upstream.sh --kernel k/982_cpsat.json

@@ -32,7 +32,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from verification.memory_alias import SymbolicKernel, load_bundles  # noqa: E402
+from verification.memory_alias import SymbolicKernel, load_kernel  # noqa: E402
 
 VLEN = 8
 
@@ -113,7 +113,11 @@ def _leaf_kinds(sym: SymbolicKernel):
             if term[0] == "mem":
                 a = terms.const_value(term[1])
                 if a is None:
-                    memo[cur] = frozenset(["gathered"])
+                    addresses = sym.vsets.get(term[1])
+                    # The value comes from the regions addressed, even if an input value
+                    # chooses the address of a tree node.
+                    reads_input = addresses is not None and any(layout.region(v) == "values" for v in addresses)
+                    memo[cur] = frozenset({"gathered", "input"} if reads_input else {"gathered"})
                 else:
                     region = layout.region(a)
                     memo[cur] = frozenset([{"tree": "tree", "values": "input"}.get(region, region)])
@@ -288,7 +292,11 @@ def main() -> int:
     for spec in args.kernels:
         name, _, path = spec.rpartition("=")
         name = name or os.path.basename(path)
-        sym = SymbolicKernel(load_bundles(path)).run()
+        try:
+            bundles, layout = load_kernel(path)
+        except ValueError as e:
+            ap.error(f"{path}: {e}")
+        sym = SymbolicKernel(bundles, layout).run()
         out[name] = {"memory_use": memory_use(sym), "scratch": scratch_report(sym)}
         print(format_memory_use(name, out[name]["memory_use"], out[name]["scratch"]), flush=True)
         if args.json:

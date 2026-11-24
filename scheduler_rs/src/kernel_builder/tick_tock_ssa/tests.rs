@@ -2469,7 +2469,7 @@ fn test_greedy_budget_error_reports_headroom_adjusted_budget() {
     let mut config = KernelConfig::new(10, 2047, 16, 2);
     let headroom = 1500;
     config.compiler.greedy_budget_headroom = headroom;
-    let raw_budget = effective_scratch_budget(true);
+    let raw_budget = effective_scratch_budget(SCRATCH_BUDGET_HW, true);
     let error = SsaTickTockKernelBuilder::new(config)
         .build_and_schedule()
         .expect_err("35 words cannot hold this kernel");
@@ -2478,6 +2478,137 @@ fn test_greedy_budget_error_reports_headroom_adjusted_budget() {
             assert_eq!(budget, raw_budget - headroom);
         }
         other => panic!("expected the greedy scheduler's budget error, got {:?}", other),
+    }
+}
+
+// =========================================================================
+// Relaxed-scratch reference: scratch_size and cpsat_scratch_constraint
+// =========================================================================
+
+/// The scratch settings give the greedy/allocator budget and the CP-SAT budget: the machine's
+/// by default, the configured size when it is changed, and no CP-SAT scratch section (0) when
+/// the constraint is dropped. Only sizes above the machine's, or no constraint, are relaxed.
+#[test]
+fn test_scratch_settings_budgets() {
+    use crate::kernel_builder::config::{CompilerConfig, UNBOUNDED_SCRATCH_WORDS};
+    let mut compiler = CompilerConfig::default();
+    assert_eq!(compiler.scratch_size, SCRATCH_BUDGET_HW);
+    assert!(compiler.cpsat_scratch_constraint);
+    assert!(!compiler.is_relaxed_scratch());
+    assert_eq!(compiler.effective_scratch_budget(true), SCRATCH_BUDGET_HW - 1);
+    assert_eq!(compiler.cpsat_scratch_budget(true), SCRATCH_BUDGET_HW - 1);
+
+    compiler.scratch_size = 1024;
+    assert!(!compiler.is_relaxed_scratch(), "a smaller scratch still fits the machine");
+    compiler.scratch_size = 3072;
+    assert!(compiler.is_relaxed_scratch());
+    assert_eq!(compiler.cpsat_scratch_budget(true), 3071);
+    assert_eq!(compiler.cpsat_scratch_budget(false), 3072);
+
+    compiler.scratch_size = UNBOUNDED_SCRATCH_WORDS;
+    compiler.cpsat_scratch_constraint = false;
+    assert!(compiler.is_relaxed_scratch());
+    assert_eq!(compiler.cpsat_scratch_budget(true), 0, "0 = no scratch section in the model");
+    assert_eq!(compiler.effective_scratch_budget(true), UNBOUNDED_SCRATCH_WORDS - 1);
+}
+
+/// The greedy and address assignment use `scratch_size`. A headroom of 1,500 words leaves 35
+/// words of the machine's scratch and fails (`test_greedy_budget_error_reports_headroom_adjusted_budget`);
+/// on a 3,072-word scratch the same headroom leaves 1,571 and succeeds, and the allocator
+/// reports 3,072 as its budget. A smaller size is honoured too: the build fails against it.
+#[test]
+fn test_scratch_size_reaches_greedy_and_address_assignment() {
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    config.compiler.greedy_budget_headroom = 1500;
+    config.compiler.scratch_size = 3072;
+    let result = SsaTickTockKernelBuilder::new(config)
+        .build_and_schedule()
+        .expect("1,571 words hold this kernel");
+    assert_eq!(result.address_result.budget, 3072);
+    assert!(!result.budget_exceeded);
+    assert!(result.address_result.peak_live <= 3072 - 1500);
+    assert_slot_limits_hold(&result);
+
+    let mut config = KernelConfig::new(10, 2047, 16, 2);
+    config.compiler.scratch_size = 100;
+    let error = SsaTickTockKernelBuilder::new(config)
+        .build_and_schedule()
+        .expect_err("100 words cannot hold this kernel");
+    // Both accountings trip; address assignment's is reported, with the configured size.
+    match error {
+        KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::AddressLiveness, .. } => {
+            assert_eq!(budget, 100);
+        }
+        KernelBuilderError::BudgetExceeded { budget, accounting: BudgetAccounting::GreedyScheduler { .. }, .. } => {
+            assert_eq!(budget, effective_scratch_budget(100, true));
+        }
+        other => panic!("expected a scratch budget error against 100 words, got {:?}", other),
+    }
+}
+
+/// Run the full CP-SAT pipeline on a small kernel with the given scratch settings.
+#[cfg(feature = "cpsat")]
+fn cpsat_with_scratch(scratch_size: usize, scratch_constraint: bool) -> SsaScheduleResult {
+    use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
+    use crate::kernel_builder::config::ProblemSpec;
+
+    let mut config = KernelConfig {
+        spec: ProblemSpec {
+            forest_height: 5,
+            n_nodes: 63,
+            batch_size: 64,
+            rounds: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.compiler.scratch_size = scratch_size;
+    config.compiler.cpsat_scratch_constraint = scratch_constraint;
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.cpsat_deterministic_time = Some(2.0);
+    builder
+        .build_and_schedule_cpsat(
+            120.0, // time limit
+            false, // verbose
+            true,  // enable_valu_shift
+            false, // enable_vbroadcast_elimination
+            None,  // per_section_optimize_secs
+            None,  // forced_shifts
+            ConstChoiceMode::Optimize,
+            SelectChoiceMode::Optimize,
+            ValuShiftMode::Optimize,
+            false, // force_zero_gap
+            crate::cpsat_scheduler::AsapAlapTightening::Energetic,
+            false, // enable_scratch_tightening
+            false, // symmetry_precedence_integrated
+            false, // energetic_alap_pulls
+            None,  // energetic_bounded_push_k
+            false, // precedence_neutral_horizon
+            None,  // disable_optional_constraint_groups
+            true,  // enable_cse_groups
+            false, // enable_bulk_move
+        )
+        .unwrap_or_else(|e| panic!("CP-SAT with scratch_size={} failed: {}", scratch_size, e))
+}
+
+/// The scratch settings reach the full-kernel CP-SAT model (its scratch cumulative gets the
+/// configured size less the zero word, or is left out when the constraint is dropped) and
+/// address assignment (its budget is the configured size), and the schedule stays valid.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_scratch_settings_reach_cpsat_model_and_address_assignment() {
+    use crate::kernel_builder::config::UNBOUNDED_SCRATCH_WORDS;
+    for (scratch_size, constraint, cpsat_budget) in [
+        (SCRATCH_BUDGET_HW, true, SCRATCH_BUDGET_HW - 1),
+        (3072, true, 3071),
+        (UNBOUNDED_SCRATCH_WORDS, false, 0),
+    ] {
+        let result = cpsat_with_scratch(scratch_size, constraint);
+        assert_eq!(result.cpsat_scratch_budget, Some(cpsat_budget), "scratch_size={}", scratch_size);
+        assert_eq!(result.address_result.budget, scratch_size);
+        assert!(!result.budget_exceeded);
+        assert!((result.address_result.max_addr as usize) < scratch_size);
+        assert_slot_limits_hold(&result);
     }
 }
 
@@ -4045,6 +4176,7 @@ fn test_greedy_cpsat_roundtrip_budget_check() {
             live_through_vregs: None,
             cse_groups: None,
             vector_group_lanes: None,
+            ..Default::default()
         },
         Some(!greedy_budget_exceeded),
     );

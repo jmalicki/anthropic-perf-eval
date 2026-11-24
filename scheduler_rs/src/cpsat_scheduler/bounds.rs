@@ -351,6 +351,9 @@ pub struct SsaCpsatConfig {
     /// with capacity `N_s`, and `8 * N_v + N_s <= scratch_budget`. Address assignment always
     /// fits such a schedule (`address_assign::assign_two_pass`).
     pub scratch_pools: bool,
+    /// Timeline of the scratch cumulative: `Phase` (default, same-cycle reuse as address
+    /// assignment) or `Cycle` (the earlier overcount, for ablation).
+    pub scratch_time: super::config::ScratchTime,
     /// Optional name for the model (appears in solver log, e.g. "Presolved optimization model 'name'").
     pub model_name: Option<String>,
     /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
@@ -408,6 +411,7 @@ impl Default for SsaCpsatConfig {
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
             scratch_pools: false,
+            scratch_time: super::config::ScratchTime::default(),
             model_name: None,
             machine: MachineConfig::default(),
             const_choice_mode: ConstChoiceMode::default(),
@@ -619,6 +623,13 @@ pub struct SsaCpsatHints<'a> {
     /// Vector group key/alias → lane VRegs. The scratch model needs it to see that reading a
     /// lane keeps a decomposed vector live and reading an alias keeps its lanes live.
     pub vector_group_lanes: Option<&'a HashMap<VReg, Vec<VReg>>>,
+    /// Op ID -> the eight ALU lane cycles to hint for an op hinted as shifted (`shift_hints`).
+    /// Without an entry all eight lanes are hinted at the op's cycle (the greedy's convention).
+    /// Used to warm-start from an earlier CP-SAT solution whose lanes differ.
+    pub alu_lane_hints: Option<&'a HashMap<usize, Vec<i32>>>,
+    /// Window optimality probe (analysis only): hold every op outside the window at its
+    /// reference cycle and let the ops inside move. See `cpsat_scheduler::window`.
+    pub window: Option<&'a super::window::CpsatWindow>,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
@@ -1805,7 +1816,7 @@ pub fn compute_ssa_asap_alap_bounds(
         }
     }
 
-    if config.enable_scratch_tightening {
+    if config.enable_scratch_tightening && scratch_budget > 0 {
         if let Some((scratch_asap, scratch_alap)) = tighten_asap_alap_by_scratch(
             ops,
             &current_asap,
