@@ -229,6 +229,12 @@ def window_floor(counts: Mapping[str, int], cap: Mapping[str, int] = CAP, vlen: 
 SHAPED_GREEDY = {"greedy_barriers": "none", "greedy_priority": "wavefront", "greedy_split_shift": True,
                  "pressure_inflation_threshold": 0.95}
 
+# Added on top of SHAPED_GREEDY for load-bound plans (docs/GREEDY_SHAPE_ABLATION.md section 11):
+# round-15 gathers yield load slots to earlier rounds' gathers, 32 groups in flight, stagger 9.
+# Raises peak live scratch to about 1,430 of 1,536 words; some emissions overflow the budget.
+LOAD_TAIL_GREEDY = {"greedy_load_priority": "final-last", "greedy_groups_in_flight": 32,
+                    "greedy_stagger_cycles": 9}
+
 
 # Calibration and check builds only read the SSA program, which the scheduler does not change;
 # the shaped greedy is used because it fits the scratch budget for every plan tried.
@@ -999,14 +1005,17 @@ NAMED_PLANS = {
 # Evaluation: emit, schedule, prove, validate
 # ----------------------------------------------------------------------------
 def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstream: bool,
-             cpsat_deterministic_time: float | None = None, keep_kernel: str | None = None) -> dict:
-    """Build a plan, prove and validate it, and compare predicted with emitted numbers."""
+             cpsat_deterministic_time: float | None = None, keep_kernel: str | None = None,
+             greedy_extra: Mapping | None = None) -> dict:
+    """Build a plan, prove and validate it, and compare predicted with emitted numbers.
+    `greedy_extra` is applied after the shaped flags (e.g. LOAD_TAIL_GREEDY)."""
     from generate_ssa_kernel import save_kernel_to_json, simulator_cycles, validate_kernel
     from scripts import schedule_report as sr
     from verification.kernel_dataflow import check
 
     ctx = table.context
     extra = dict(SHAPED_GREEDY) if shaped else {}
+    extra.update(greedy_extra or {})
     if cpsat_deterministic_time is not None:
         extra.update(use_greedy=False, cpsat_deterministic_time=cpsat_deterministic_time)
     instrs, stats, sched, path = build_emission(rows, ctx, workdir, name=name, extra=extra)
@@ -1028,6 +1037,8 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
         "cycles": stats["cycles"],
         "simulator_cycles": simulator_cycles(instrs)[0],
         "peak_live": stats.get("peak_live"),
+        "max_addr": stats.get("max_addr"),
+        "scratch_size": stats.get("scratch_size"),
         "proved": proved,
         "passed": passed,
         "upstream": None,

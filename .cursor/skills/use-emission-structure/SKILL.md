@@ -46,10 +46,19 @@ $L report --state a.json --extra-state b.json --caps flow=0.92                # 
 | `caps` / `caps-underfilled` | learned `max_util`: cap the engine the schedule saturates / under-fills relative to the plan | heuristic; `caps-underfilled` rediscovers flow 0.9 in 3 builds |
 | `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form proved (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes |
 
-Result to remember: nothing beats `flow90.json` (1,104). Five plans tie at 1,104. Among
-near-optimal plans the floor and every lower bound do not rank (Spearman rho about 0 or
-negative); only the capped floor does (+0.64). Do not trust stage 1 to choose between plans
-within about 20 cycles: build them. A run builds at most `--max-builds` (default 60) new plans
+Use `--load-tail` for the current greedy (adds `--greedy-load-priority final-last
+--greedy-groups-in-flight 32 --greedy-stagger-cycles 9`; stored in the state, which then refuses
+other flags) and `--select-bit-source path` for path bits. A plan that overflows the scratch
+budget is recorded as a failed build with its peak, and `report` lists it; `report --near N`
+adds a near-optimal subset to the correlations.
+
+Result to remember (section 10.0, load-tail greedy): nothing beats the hand-made plans under
+identical flags (index bits: `flow90.json` 1,039, five loop plans tie; path bits:
+`path_flow90.json` 1,033, best loop plan 1,099). The 1,104 plateau is gone, but among plans within
+30 cycles of the best the floor and every lower bound do not rank (Spearman -0.54 to -0.29). The
+ranking follows the vector work the greedy leaves on the VALU after shifting, which stage 1 does
+not model. Do not trust stage 1 to choose between plans within about 35 cycles, nor for the
+round-4 encoding with path bits: build them. A run builds at most `--max-builds` (default 60) new plans
 in total; builds are about 0.3 s each, but the machine budget is the limit.
 
 The cost table is cached per context (rounds, batch, global emission options) in

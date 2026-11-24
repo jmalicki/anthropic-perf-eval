@@ -154,3 +154,36 @@ def test_loop_end_to_end(table, tmp_path):
     # A second run reuses the state: the seed is not rebuilt.
     assert el.main(["report", "--batch-size", "32", "--state", str(state), "--table", str(table_path)]) == 0
     assert len(json.loads(state.read_text())["builds"]) == n
+
+
+def test_greedy_options_are_part_of_the_state(table, tmp_path):
+    """Builds with the load-tail flags are recorded with them, and a state refuses other flags."""
+    state = str(tmp_path / "state.json")
+    stage2 = el.Stage2(table, str(tmp_path), state, log=None, greedy_extra=es.LOAD_TAIL_GREEDY)
+    rec, built = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert built and rec["valid"] and rec["proved"] and rec["passed"]
+    assert rec["peak_live"] and rec["peak_live"] <= 1536 and rec["budget_exceeded"] is False
+    assert json.loads((tmp_path / "state.json").read_text())["greedy_extra"] == es.LOAD_TAIL_GREEDY
+    with pytest.raises(ValueError, match="greedy options"):
+        el.Stage2(table, str(tmp_path), state, log=None, greedy_extra={})
+    # None (report) accepts the stored options.
+    assert el.Stage2(table, str(tmp_path), state, log=None).greedy_extra == es.LOAD_TAIL_GREEDY
+
+
+def test_scratch_budget_failure_is_a_recorded_outcome(table, tmp_path, monkeypatch):
+    def over_budget(*a, **k):
+        raise RuntimeError("Scratch budget exceeded: peak_live 1600 > budget 1536")
+
+    monkeypatch.setattr(es, "measure", over_budget)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+    rec, built = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert built and not rec["valid"] and rec["budget_exceeded"] and rec["peak_live"] == 1600
+    assert stage2.best() is None
+    assert el.failed_builds(stage2)[0]["peak_live"] == 1600
+
+    def other_error(*a, **k):
+        raise RuntimeError("something else")
+
+    monkeypatch.setattr(es, "measure", other_error)
+    with pytest.raises(RuntimeError, match="something else"):
+        stage2.evaluate(el.resolve_plan("gather", CTX)[1], "seed gather")
