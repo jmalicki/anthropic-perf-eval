@@ -1043,17 +1043,19 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5b. Symmetry breaking (ordering groups): use the canonical ordering built earlier.
-    // Validate that final bounds are consistent with the ordering, then add cycle[i] <= cycle[j].
+    // 5b. Symmetry breaking (ordering groups): normally use the canonical order built earlier.
+    // When forced modes rule out the greedy schedule, use the final domains to choose an order.
+    let rejected_ordering_hint = greedy_hints.is_some() && bound_hints.is_none();
     if tuning.symmetry_rows == SymmetryRows::Declared {
-        let ordering_pairs: Vec<(usize, usize)> = if let Some(ref ord) = symmetry_ordering {
-            ord.validate_bounds(ops, &final_asap, &final_alap, greedy_hints);
-            ord.ordering_pairs()
-        } else {
-            super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints)
+        let ordering_pairs = match &symmetry_ordering {
+            Some(ord) if !rejected_ordering_hint => {
+                ord.validate_bounds(ops, &final_asap, &final_alap, bound_hints);
+                ord.ordering_pairs()
+            }
+            _ => super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, bound_hints),
         };
         let n_ordering = ordering_pairs.len();
-        let order_source = if greedy_hints.is_some() { "greedy" } else { "ALAP" };
+        let order_source = if bound_hints.is_some() { "greedy" } else { "ALAP" };
         for (i, j) in &ordering_pairs {
             let c = model.add_le(times[*i].issue(), times[*j].issue());
             model.set_constraint_name(c, &format!("sym_ord_{}_{}", i, j));
@@ -1067,7 +1069,7 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 5c. Symmetry breaking (lexicographic streams): for each stream_key, items ordered by item_key
-    // get first_op[item_i] <= first_op[item_{i+1}]. When greedy hints are available, order items
+    // get first_op[item_i] <= first_op[item_{i+1}]. When eligible greedy hints are available, order items
     // by greedy cycle of their first op so constraints match the hint. Verify domain consistency.
     if tuning.symmetry_rows == SymmetryRows::Declared {
         use std::collections::{BTreeMap, HashMap};
@@ -1095,7 +1097,7 @@ pub fn schedule_ssa_cpsat(
         for stream_key in stream_keys {
             let by_item = &streams[stream_key];
             let mut ordered: Vec<Vec<usize>> = by_item.values().cloned().collect();
-            if let Some(hints) = greedy_hints {
+            if let Some(hints) = bound_hints {
                 // Sort items by greedy cycle of their first op so lex constraints match the hint.
                 // Tiebreaker: ALAP of first op for determinism and domain consistency.
                 ordered.sort_by_key(|group| {
@@ -1104,8 +1106,10 @@ pub fn schedule_ssa_cpsat(
                     let alap_val = *final_alap.get(&ops[first].id).unwrap_or(&0);
                     (greedy, alap_val)
                 });
+            } else if rejected_ordering_hint {
+                ordered.sort_by_key(|group| *final_alap.get(&ops[group[0]].id).unwrap_or(&0));
             }
-            // else: already ordered by item_key (BTreeMap preserves key order)
+            // With no greedy schedule, preserve the BTreeMap's item_key order.
             for w in ordered.windows(2) {
                 let first_op_cur = w[0][0];
                 let first_op_next = w[1][0];
@@ -1118,8 +1122,8 @@ pub fn schedule_ssa_cpsat(
                          but ASAP[{}]={} > ALAP[{}]={}. Greedy hints: cur={}, next={}.",
                         stream_key, first_op_cur, first_op_next,
                         first_op_cur, asap_cur, first_op_next, alap_next,
-                        greedy_hints.and_then(|h| h.get(first_op_cur).copied()).unwrap_or(-1),
-                        greedy_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
+                        bound_hints.and_then(|h| h.get(first_op_cur).copied()).unwrap_or(-1),
+                        bound_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
                     );
                 }
                 let c = model.add_le(times[first_op_cur].issue(), times[first_op_next].issue());
@@ -1128,7 +1132,13 @@ pub fn schedule_ssa_cpsat(
             }
         }
         if verbose && lex_constraints > 0 {
-            let lex_source = if greedy_hints.is_some() { "greedy" } else { "item_key" };
+            let lex_source = if bound_hints.is_some() {
+                "greedy"
+            } else if rejected_ordering_hint {
+                "ALAP"
+            } else {
+                "item_key"
+            };
             eprintln!(
                 "  Symmetry breaking (lex streams): {} streams, {} constraints (order from {})",
                 n_streams, lex_constraints, lex_source
@@ -1159,7 +1169,7 @@ pub fn schedule_ssa_cpsat(
             }
         }
         // Declared rows, classified against the orbits (for the record; none are added).
-        let declared = super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints);
+        let declared = super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, bound_hints);
         let (justified, same_group, other) = super::group_symmetry::classify_pairs(orbits, &declared);
         let sizes: Vec<usize> = orbits.orbits.iter().map(Vec::len).collect();
         eprintln!(

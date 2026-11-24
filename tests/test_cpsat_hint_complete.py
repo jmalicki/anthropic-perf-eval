@@ -87,12 +87,15 @@ def test_greedy_hint_is_complete(tmp_path, extra):
         f"{len(missing)} of {len(model.variables)} variables have no hint; by family: "
         + ", ".join(f"{count} x {family}" for family, count in families.most_common(8))
     )
-    # Complete is not enough: the greedy schedule must also satisfy the model, or CP-SAT
-    # repairs it instead of starting from it.
-    assert "The solution hint is complete and is feasible" in log, (
-        "CP-SAT did not accept the greedy hint as a solution: "
-        + " | ".join(line for line in log.splitlines() if "solution hint" in line)
-    )
+    # For checked symmetry, test the exported full-kernel model directly. A section solve
+    # can also report a feasible hint before these rows are applied.
+    if "--cpsat-symmetry-rows" in extra:
+        check_hint_is_feasible(tmp_path / "model.pb")
+    else:
+        assert "The solution hint is complete and is feasible" in log, (
+            "CP-SAT did not accept the greedy hint as a solution: "
+            + " | ".join(line for line in log.splitlines() if "solution hint" in line)
+        )
 
 
 def test_cse_groups_are_present_in_the_three_round_model(tmp_path):

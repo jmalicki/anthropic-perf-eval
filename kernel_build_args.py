@@ -396,8 +396,8 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "prefix-end/suffix-start variables per bucket of heads that follow the solution. "
                             "See scheduler_rs/src/cpsat_scheduler/makespan_rows.rs.")
     group.add_argument("--cpsat-random-seed", type=int, default=None, metavar="N",
-                       help="CP-SAT random_seed (default: CP-SAT's own). Another seed gives another reproducible "
-                            "search, for repeating a measurement.")
+                       help="Set the CP-SAT solver seed (default: CP-SAT's own). Reproducible parallel search "
+                            "requires deterministic interleaving and must finish before the wall-clock limit.")
     group.add_argument("--cpsat-symmetry-rows", choices=["declared", "none", "checked"], default=None,
                        help="Symmetry-breaking ordering rows (default: declared = the sym_ord/sym_lex rows emission "
                             "declares, unchecked). none = no ordering rows. checked = only orderings justified by a "

@@ -275,13 +275,26 @@ fn check_identical(cx: &Context<'_>, groups: &[Vec<usize>], a: usize, b: usize) 
             }
         }
     }
-    let lane_sets: Vec<(Vec<VReg>, VReg)> =
-        cx.alias_of_lanes.iter().map(|(l, al)| (l.clone(), *al)).filter(|(l, _)| l.iter().all(|v| vmap.contains_key(v))).collect();
-    for (lanes, alias) in lane_sets {
-        let mapped: Vec<VReg> = lanes.iter().map(|v| vmap[v]).collect();
-        let other = cx.alias_of_lanes.get(&mapped).ok_or_else(|| format!("alias {:?} has no image", alias))?;
-        vmap.insert(alias, *other);
+    // A swap must preserve write aliases on both sides, including aliases that no op
+    // reads directly: scratch pools still account for their lanes as one vector.
+    let mapped_values: HashSet<_> = vmap.values().copied().collect();
+    let mut alias_images = HashSet::new();
+    let mut mapped_aliases = Vec::new();
+    for (lanes, &alias) in &cx.alias_of_lanes {
+        if lanes.iter().all(|v| vmap.contains_key(v)) {
+            let mapped: Vec<VReg> = lanes.iter().map(|v| vmap[v]).collect();
+            let &other = cx.alias_of_lanes.get(&mapped)
+                .ok_or_else(|| format!("alias {:?} has no image", alias))?;
+            alias_images.insert(other);
+            mapped_aliases.push((alias, other));
+        }
     }
+    for (lanes, &alias) in &cx.alias_of_lanes {
+        if lanes.iter().all(|v| mapped_values.contains(v)) && !alias_images.contains(&alias) {
+            return Err(format!("alias {:?} has no preimage", alias));
+        }
+    }
+    vmap.extend(mapped_aliases);
     let in_group = |v: &VReg, g: usize| cx.vreg_def.get(v).and_then(|&d| cx.group_of[d]) == Some(g);
     let map_value = |v: VReg| -> Result<VReg, String> {
         if let Some(&w) = vmap.get(&v) {
@@ -585,11 +598,37 @@ mod tests {
         let mut ops = program(2, |_, _| {});
         let mut reader = SsaOp::new(100, Engine::Alu, Opcode::Add, Some(VReg::scalar(99)), vec![]);
         reader.dep_ids = [2].into_iter().collect(); // the add of group 0
-        let mut reader2 = SsaOp::new(101, Engine::Alu, Opcode::Add, Some(VReg::scalar(98)), vec![]);
-        reader2.dep_ids = [5, 100].into_iter().collect();
-        ops.extend([reader, reader2]);
-        let o = group_orbits(&ops, None, &[]);
-        assert!(o.orbits.is_empty(), "groups {:?}", o.groups);
+        ops.push(reader);
+        let groups = [vec![1, 2, 3], vec![4, 5, 6]];
+        let group_of = [None, Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), None];
+        let cx = Context::new(&ops, &group_of, None, &[]);
+        let rejection = check_identical(&cx, &groups, 0, 1).unwrap_err();
+        assert_eq!(rejection, "shared op 100 reads op 2 but not op 5");
+    }
+
+    #[test]
+    fn test_a_write_alias_on_only_one_group_breaks_the_symmetry() {
+        let ops: Vec<_> = (0..2 * crate::types::VLEN)
+            .map(|i| SsaOp::new(
+                i,
+                Engine::Alu,
+                Opcode::Add,
+                Some(VReg::scalar(i as u32)),
+                vec![],
+            ))
+            .collect();
+        let lanes = crate::types::VLEN;
+        let groups = [(0..lanes).collect(), (lanes..2 * lanes).collect()];
+        let group_of: Vec<_> = (0..2 * lanes).map(|i| Some(i / lanes)).collect();
+        let write_lanes = |start| (start..start + lanes).map(|i| VReg::scalar(i as u32)).collect();
+        let mut aliases = HashMap::from([(VReg::vector(100), write_lanes(lanes))]);
+        let cx = Context::new(&ops, &group_of, Some(&aliases), &[]);
+        assert!(check_identical(&cx, &groups, 0, 1).unwrap_err().contains("has no preimage"));
+        assert!(check_identical(&cx, &groups, 1, 0).unwrap_err().contains("has no image"));
+
+        aliases.insert(VReg::vector(101), write_lanes(0));
+        let cx = Context::new(&ops, &group_of, Some(&aliases), &[]);
+        assert_eq!(check_identical(&cx, &groups, 0, 1), Ok(()));
     }
 
     #[test]

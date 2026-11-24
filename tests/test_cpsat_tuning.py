@@ -19,6 +19,7 @@ sys.path.insert(0, ROOT)
 import kernel_build_args  # noqa: E402
 import scheduler_rs  # noqa: E402
 from scripts import diff_cpsat_models  # noqa: E402
+from test_cpsat_hint_complete import check_hint_is_feasible, unhinted_variables  # noqa: E402
 
 SMALL = ["--rounds", "2", "--batch-size", "16", "--cpsat-deterministic-time", "0.3", "--cpsat-time-limit", "100"]
 
@@ -551,11 +552,14 @@ def test_symmetry_rows_none_and_checked(tmp_path):
     _, none_path, _, _ = _run(tmp_path, "none", SYMMETRY + ["--cpsat-symmetry-rows", "none"])
     names = _constraint_names(diff_cpsat_models.load(str(none_path)))
     assert not any(n.startswith(("sym_ord_", "sym_lex_", "group_sym_")) for n in names)
-    output, checked_path, _, _ = _run(tmp_path, "checked", SYMMETRY + ["--cpsat-symmetry-rows", "checked"], quiet=False)
-    names = _constraint_names(diff_cpsat_models.load(str(checked_path)))
+    _, checked_path, _, _ = _run(tmp_path, "checked", SYMMETRY + ["--cpsat-symmetry-rows", "checked"])
+    checked_model = diff_cpsat_models.load(str(checked_path))
+    names = _constraint_names(checked_model)
     assert not any(n.startswith(("sym_ord_", "sym_lex_")) for n in names)
     assert any(n.startswith("group_sym_") for n in names), "4x64 has an orbit of identical groups"
-    assert "Group symmetry:" in output and "solution hint is complete and is feasible" in output
+    assert checked_model.solution_hint.vars
+    assert not unhinted_variables(checked_model)
+    check_hint_is_feasible(checked_path)
 
 
 def test_random_seed_reaches_the_solver(tmp_path):

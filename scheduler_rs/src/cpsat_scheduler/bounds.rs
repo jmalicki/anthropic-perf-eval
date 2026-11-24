@@ -1589,9 +1589,8 @@ pub(crate) fn tighten_asap_by_symmetry_ordering(
 /// Build ordering pairs (i, j) for symmetry breaking: cycle[i] <= cycle[j].
 ///
 /// Sort each group by greedy cycle (primary, when available) then ALAP (tiebreaker).
-/// After sorting, verify that ASAP[i] <= ALAP[j] for each consecutive pair — this is
-/// required for the constraint `cycle[i] <= cycle[j]` to be satisfiable. If greedy and
-/// ASAP/ALAP are inconsistent, panic (indicates a bug in greedy or bounds computation).
+/// Skip a pair whose final domains cannot satisfy its proposed order. This helper is
+/// also used to classify declared pairs for diagnostics, so it must not abort a solve.
 pub(crate) fn build_ordering_pairs_from_bounds(
     ops: &[SsaOp],
     asap: &HashMap<usize, i32>,
@@ -1613,7 +1612,7 @@ pub(crate) fn build_ordering_pairs_from_bounds(
             .push(idx);
     }
     let mut pairs = Vec::new();
-    for (group_key, indices) in &groups {
+    for indices in groups.values() {
         let mut sorted: Vec<usize> = indices.clone();
         if let Some(hints) = greedy_hints {
             // Primary: greedy cycle. Tiebreaker: ALAP (for determinism and domain consistency).
@@ -1631,20 +1630,35 @@ pub(crate) fn build_ordering_pairs_from_bounds(
             let j = w[1];
             let asap_i = *asap.get(&ops[i].id).unwrap_or(&0);
             let alap_j = *alap.get(&ops[j].id).unwrap_or(&0);
-            if asap_i > alap_j {
-                panic!(
-                    "Symmetry ordering inconsistency: ordering group {:?} requires cycle[{}] <= cycle[{}], \
-                     but ASAP[{}]={} > ALAP[{}]={}. The constraint cycle[i] <= cycle[j] is unsatisfiable. \
-                     Greedy hints: i={}, j={}. Fix: greedy or ASAP/ALAP bounds are inconsistent.",
-                    group_key, i, j, i, asap_i, j, alap_j,
-                    greedy_hints.and_then(|h| h.get(i).copied()).unwrap_or(-1),
-                    greedy_hints.and_then(|h| h.get(j).copied()).unwrap_or(-1),
-                );
+            if asap_i <= alap_j {
+                pairs.push((i, j));
             }
-            pairs.push((i, j));
         }
     }
     pairs
+}
+
+#[cfg(test)]
+#[test]
+fn test_ordering_pairs_skip_incompatible_hint_order() {
+    use crate::types::SymmetryHint;
+
+    let mut ops = [
+        SsaOp::new(3, Engine::Alu, Opcode::Add, None, vec![]),
+        SsaOp::new(4, Engine::Alu, Opcode::Add, None, vec![]),
+    ];
+    for op in &mut ops {
+        op.symmetry_hint = Some(SymmetryHint {
+            ordering_group: vec![0],
+            lexicographic_stream: None,
+        });
+    }
+
+    let asap = HashMap::from([(3, 4), (4, 1)]);
+    let alap = HashMap::from([(3, 5), (4, 2)]);
+    assert!(build_ordering_pairs_from_bounds(&ops, &asap, &alap, Some(&[1, 4])).is_empty());
+    assert_eq!(build_ordering_pairs_from_bounds(&ops, &asap, &alap, None), vec![(1, 0)]);
+    assert_eq!(build_ordering_pairs_from_bounds(&ops, &asap, &alap, Some(&[4, 1])), vec![(1, 0)]);
 }
 
 /// Fixpoint pass to repair precedence violations in ASAP/ALAP bounds.

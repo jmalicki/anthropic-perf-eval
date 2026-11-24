@@ -28,7 +28,7 @@ from __future__ import annotations
 import random
 import time
 
-from z3 import If, Int, Optimize, Or, Solver, Sum, sat
+from z3 import If, Int, Optimize, Solver, Sum, unknown, unsat
 
 CAPS = {"valu": 1, "alu": 1, "load": 1}
 
@@ -89,26 +89,39 @@ def _optimum(constraints, M):
     o = Optimize()
     o.add(constraints)
     o.minimize(M)
-    assert o.check() == sat
-    return o.model()[M].as_long()
+    outcome = o.check()
+    if outcome == unknown:
+        return None, o.reason_unknown()
+    if outcome == unsat:
+        raise RuntimeError("generated group-symmetry instance has no baseline schedule")
+    return o.model()[M].as_long(), None
 
 
 def _check(name, seeds, rows_of):
-    """SAT if some instance's optimum rises with the rows, UNSAT otherwise."""
+    """Find a counterexample (SAT), rule them out on the checked seeds (UNSAT), or report UNKNOWN."""
     start = time.time()
     for seed in seeds:
         rng = random.Random(seed)
         inst = _instance(rng)
         horizon = sum(1 for _ in inst[0]) * inst[3] + len(inst[1]) + 2
         cons, M, c = _encode(inst, horizon)
-        best = _optimum(cons, M)
+        best, reason = _optimum(cons, M)
+        if reason is not None:
+            return name, "unknown", time.time() - start, {
+                "unresolved_seed": seed, "stage": "baseline optimum", "reason": reason,
+            }
         rows = rows_of(inst, c, rng)
         if rows is None:
             continue
         s = Solver()
         s.add(cons + rows + [M <= best])
-        if s.check() != sat:
+        outcome = s.check()
+        if outcome == unsat:
             return name, "sat", time.time() - start, {"counterexample_seed": seed, "instance": inst, "optimum": best}
+        if outcome == unknown:
+            return name, "unknown", time.time() - start, {
+                "unresolved_seed": seed, "stage": "schedule with ordering rows", "reason": s.reason_unknown(),
+            }
     return name, "unsat", time.time() - start, {"instances": len(seeds)}
 
 

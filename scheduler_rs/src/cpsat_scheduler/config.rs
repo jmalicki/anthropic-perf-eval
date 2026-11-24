@@ -385,8 +385,9 @@ pub struct CpsatTuning {
     pub makespan_rows: MakespanRows,
     /// Symmetry-breaking ordering rows (default: the ones emission declares). See [`SymmetryRows`].
     pub symmetry_rows: SymmetryRows,
-    /// CP-SAT `random_seed` (default: `None`, CP-SAT's own default). A different seed gives a
-    /// different but still reproducible search, for repeating a measurement.
+    /// Seed for CP-SAT (default: `None`, CP-SAT's own default).
+    /// Reproducible parallel search requires deterministic interleaving and a solve that
+    /// finishes before the wall-clock limit.
     pub random_seed: Option<i32>,
 }
 
