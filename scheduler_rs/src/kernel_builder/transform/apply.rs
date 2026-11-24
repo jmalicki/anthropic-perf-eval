@@ -8,10 +8,17 @@
 //! 2. Order: within each round's tree access, ops are put in the order the emitter writes a
 //!    mixed round (encodings in order of the first group using each, groups in order).
 //! 3. Lazy constants: a constant of a gather's per-round base that the emitter creates on
-//!    first use (the level-end index `L_d`) moves to the first round that still gathers at
-//!    that depth, and its scheduling alternatives are recomputed against the constants that
-//!    exist there.
-//! 4. Dead code elimination removes the unchosen candidates and unused setup.
+//!    first use (the level-end index `L_d`) moves to its first user that is still live (the
+//!    base of the next round that gathers at that depth, or the final index conversion when
+//!    the last round is at that depth), taking that user's round context, and every
+//!    constant's scheduling alternatives are recomputed against the constants that exist
+//!    before it in the planned program.
+//! 4. Shared broadcast: a level's first table entry is broadcast once and shared by the leaf
+//!    pairs and the Mobius coefficients. The emitter creates it with the first pair; at a
+//!    level with Mobius but no pairs, with the coefficients (just before coefficient 1).
+//! 5. Dead code elimination removes the unchosen candidates and unused setup, and vector
+//!    groups none of whose VRegs is still defined are dropped from the lane map (address
+//!    assignment would otherwise reserve 8 words for each).
 //!
 //! The result is op for op the program the emitter writes for the plan, up to VReg and op
 //! numbering (tested against `--emission-plan` emission in `tests.rs`).
@@ -51,6 +58,18 @@ pub fn apply_tree_access_plan(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) 
     let (mut program, inst) = instantiate_tree_access(spec)?;
     if let Some((p, e)) = inst.rejections.first() {
         return Err(format!("round {:?} group {:?}: {}", p.round, p.group, e.0));
+    }
+    // Every choice site must have matched: a missed site would silently stay a gather.
+    let sites: HashSet<(u32, u32)> = inst.sites.iter().map(|s| (s.round, s.group)).collect();
+    for r in (0..spec.rounds).filter(|&r| choice(r)) {
+        for g in 0..spec.n_groups() {
+            if !sites.contains(&(r as u32, g as u32)) {
+                return Err(format!("round {} group {}: no tree-access site matched", r, g));
+            }
+        }
+    }
+    if sites.len() != inst.sites.len() {
+        return Err("a tree-access site was matched twice".into());
     }
 
     // 1. Rewire.
@@ -132,7 +151,8 @@ pub fn apply_tree_access_plan(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) 
         start = end;
     }
 
-    // 3. Lazy constants of gather bases whose round no longer gathers.
+    // 3. Lazy constants of gather bases whose round no longer gathers: created at their first
+    // live user instead (or never).
     let gathers = |r: usize| plan[r].contains(&AccessEncoding::Gather);
     let is_base = |op: &SsaOp, r: u32| {
         op.region.map_or(false, |t| {
@@ -145,32 +165,25 @@ pub fn apply_tree_access_plan(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) 
     {
         let graph = SsaGraph::new(&ops, &lanes);
         let users = graph.users();
+        // Liveness of the rewired program (what DCE will keep).
+        let live = graph.live();
         for (i, op) in ops.iter().enumerate() {
             let Some(r) = op.region.and_then(|t| t.round) else { continue };
             if op.opcode != Opcode::ConstChoice || !is_base(op, r) || gathers(r as usize) || !choice(r as usize) {
                 continue;
             }
-            let target = users[i].iter().copied().find(|&u| {
-                ops[u].region.and_then(|ut| ut.round).map_or(false, |ur| is_base(&ops[u], ur) && gathers(ur as usize))
-            });
-            match target {
+            // E.g. the base of a later round that gathers, or the final index conversion,
+            // which reads L_d when the last round is at depth d (mirrored index).
+            match users[i].iter().copied().find(|&u| live[u]) {
                 Some(u) => moves.push((i, u)),
                 None => phantoms.push(i),
             }
         }
 
-        // 3b. The broadcast of a level's first table entry is shared (CSE) by the leaf pairs
+        // 4. The broadcast of a level's first table entry is shared (CSE) by the leaf pairs
         // and the Mobius coefficients. The emitter creates it with the first pair; at a level
         // with Mobius but no pairs, with the coefficients: just before the next live broadcast
         // of the level (coefficient 1).
-        let mut live = vec![false; ops.len()];
-        for i in (0..ops.len()).rev() {
-            let root = matches!(
-                ops[i].opcode,
-                Opcode::Store | Opcode::Vstore | Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier
-            );
-            live[i] = root || users[i].iter().any(|&u| live[u]);
-        }
         let pairs_used = |d: usize| {
             (0..spec.rounds).any(|r| {
                 spec.round_depth(r) == d
@@ -207,7 +220,7 @@ pub fn apply_tree_access_plan(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) 
             let anchor = old[idx].as_ref().unwrap().0.clone();
             for &i in firsts {
                 let (mut op, phantom) = old[i].take().unwrap();
-                // It is now created in the anchor's round.
+                // It is now created in the anchor's context (round, phase, region).
                 op.source_info = anchor.source_info.clone();
                 op.region = anchor.region;
                 op.symmetry_hint = anchor.symmetry_hint.clone();
@@ -252,6 +265,11 @@ pub fn apply_tree_access_plan(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) 
         program.zero_vreg,
         Some(&lanes),
     );
+    // 5. Vector groups of removed ops: keep a group only if its key (a decomposed vector) or
+    // one of its lanes (an assembled group) is still defined. Address assignment gives every
+    // entry of the map an interval, so a dead group would reserve 8 words.
+    let mut lanes = lanes;
+    lanes.retain(|key, ls| vreg_def.contains_key(key) || ls.iter().any(|l| vreg_def.contains_key(l)));
     Ok(SsaProgram {
         ops,
         vreg_def,
