@@ -9,7 +9,7 @@ use super::graph::SsaGraph;
 use super::select_bits::{apply_select_bits, SelectBitsRule, SelectBitsSite};
 use super::tests::{canonical_ops, clone_program, flow90_plan, raw_program};
 use super::tests_index::check_parity;
-use super::tests_interp::outputs;
+use super::tests_interp::{memory, outputs, run};
 use crate::kernel_builder::config::{CachedSelect, IndexForm, ProblemSpec, SelectBitSource, TransformKind};
 use crate::kernel_builder::pipeline::passes::transform::apply_transform;
 use crate::kernel_builder::SsaProgram;
@@ -162,6 +162,25 @@ fn assert_same_outputs(before: &SsaProgram, after: &SsaProgram, spec: &ProblemSp
     }
 }
 
+/// `after` computes the same final indices and values as `before` on random inputs. Unlike
+/// `assert_same_outputs` it does not require `before` to be the kernel (a perturbed program
+/// computes something else; the rewrite must still keep it).
+fn assert_unchanged_outputs(before: &SsaProgram, after: &SsaProgram, spec: &ProblemSpec, label: &str) {
+    let seeds = [11u64, 4242];
+    let (b, a) = (outputs(before, spec, &seeds), outputs(after, spec, &seeds));
+    for (k, ((bo, _), (ao, _))) in b.iter().zip(&a).enumerate() {
+        assert_eq!(ao, bo, "{}: outputs differ after the rewrite (seed {})", label, seeds[k]);
+    }
+}
+
+/// Apply the rule to a perturbed program and check the rewrite kept its outputs.
+fn apply_and_compare(p: &SsaProgram, spec: &ProblemSpec, rule: &SelectBitsRule, label: &str) -> super::report::RuleReport {
+    let (after, report) = apply_select_bits(clone_program(p), rule, |_| true).unwrap();
+    assert!(report.refused.is_none(), "{}: {:?}", label, report.refused);
+    assert_unchanged_outputs(p, &after, spec, label);
+    report
+}
+
 #[test]
 fn test_select_bits_preserves_outputs() {
     for rounds in [5, 16] {
@@ -223,6 +242,7 @@ fn test_select_bits_refuses_a_wrong_shift_amount() {
     assert_eq!(found.len(), 160 - 1);
     assert!(!found.iter().any(|s| s.op == shr.op));
     assert_eq!(reason_count(&rejected, "shift right by Some(2), not by the constant 1"), 1, "{:?}", rejected);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "wrong shift").n_sites(), 159);
 }
 
 #[test]
@@ -235,6 +255,7 @@ fn test_select_bits_refuses_a_wrong_and_mask() {
     let (found, rejected) = sites(&p, &rule());
     assert_eq!(found.len(), 159);
     assert_eq!(reason_count(&rejected, "AND with neither operand the constant 1"), 1, "{:?}", rejected);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "wrong mask").n_sites(), 159);
 }
 
 #[test]
@@ -253,9 +274,8 @@ fn test_select_bits_refuses_a_wrong_index_multiplier() {
     p.ops[step].srcs[k] = Operand::VReg(v1);
     let (found, rejected) = sites(&p, &rule());
     assert_eq!(found.len(), 160 - 5, "{:?}", rejected);
-    assert!(reason_count(&rejected, "multiply_add with no factor the constant 2") >= 2, "{:?}", rejected);
-    let (_, report) = apply_select_bits(clone_program(&p), &rule(), |_| true).unwrap();
-    assert_eq!(report.n_sites(), 155);
+    assert!(reason_count(&rejected, "multiply_add with no factor the constant 2") >= 1, "{:?}", rejected);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "wrong multiplier").n_sites(), 155);
 }
 
 #[test]
@@ -275,21 +295,31 @@ fn test_select_bits_refuses_a_bit_that_is_not_boolean() {
     let (found, rejected) = sites(&p, &rule());
     assert_eq!(found.len(), 155, "{:?}", rejected);
     assert!(reason_count(&rejected, "AND with neither operand the constant 1") >= 1, "{:?}", rejected);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "non-boolean bit").n_sites(), 155);
 }
 
 #[test]
 fn test_select_bits_checks_the_constant_annotation() {
     // The scalar constant 1 says 1 in its annotation and 3 in its immediate: the matcher reads
-    // the immediate (through `const_value`), so no AND with it is a bit and nothing matches.
+    // the immediate (constant propagation, `ValueFacts`, uses an annotation only where it
+    // agrees with the immediate), so no AND with it is a bit and nothing matches.
+    // No index-derived op is left (every bit failed), so the reason is read from the old
+    // site op directly.
+    use super::rule::{Proposal, Rule};
     let spec = spec5(IndexForm::Mirrored);
     let mut p = raw_program(&spec);
+    let (and, _) = first_sites(&p);
     let v1 = vconst(&p, 1);
     let s1 = p.ops[def(&p, v1)].srcs[0].as_vreg().unwrap();
     let c = def(&p, s1);
     p.ops[c].srcs[0] = Operand::Imm(3);
-    let (found, rejected) = sites(&p, &rule());
+    let (found, _) = sites(&p, &rule());
     assert!(found.is_empty(), "{:?}", &found[..1]);
-    assert!(reason_count(&rejected, "AND with neither operand the constant 1") > 0, "{:?}", rejected);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let proposal = Proposal { region_id: None, round: None, group: None, depth: None, ops: vec![and.op] };
+    let why = rule().with_zero(p.zero_vreg).match_site(&g, &proposal).unwrap_err().0;
+    assert!(why.contains("AND with neither operand the constant 1"), "{}", why);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "annotation").n_sites(), 0);
 }
 
 #[test]
@@ -322,7 +352,8 @@ fn test_select_bits_refuses_a_wrong_mirroring_constant() {
     p.vreg_def = p.ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect();
     let (found, rejected) = sites(&p, &rule());
     assert_eq!(found.len(), 158, "{:?}", rejected);
-    assert!(reason_count(&rejected, "SUB constant 7 is not L_2 = 6") >= 2, "{:?}", rejected);
+    assert!(reason_count(&rejected, "SUB constant 7 is not L_2 = 6") >= 1, "{:?}", rejected);
+    assert_eq!(apply_and_compare(&p, &spec, &rule(), "mirroring constant").n_sites(), 158);
 }
 
 #[test]
@@ -435,4 +466,191 @@ fn test_select_bits_on_some_sites_keeps_the_extraction() {
     let left = sites(&after, &rule()).0;
     assert_eq!(left.len(), 96);
     assert!(left.iter().all(|s| s.round == Some(4)));
+}
+
+
+// ----------------------------------------------------------------------------
+// Review of #80: assumptions, nonzero inputs, cost, candidates, entry points, lanes, keep_live
+// ----------------------------------------------------------------------------
+
+/// Final (indices, values) of `p` on the problem.py image with random input values and
+/// initial indices drawn from {0, 1} (nonzero: the input precondition does not hold).
+fn outputs_nonzero_indices(p: &SsaProgram, spec: &ProblemSpec, seed: u64) -> (Vec<u32>, Vec<u32>) {
+    let (mut mem, ip, vp) = memory(spec, seed);
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for k in 0..spec.batch_size {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        mem[ip + k] = (x & 1) as u32;
+    }
+    assert!(mem[ip..ip + spec.batch_size].iter().any(|&i| i != 0));
+    run(p, &mut mem);
+    let b = spec.batch_size;
+    (mem[ip..ip + b].to_vec(), mem[vp..vp + b].to_vec())
+}
+
+#[test]
+fn test_select_bits_without_the_assumption_on_nonzero_initial_indices() {
+    // With no assumption declared, only sites that hold for every input may be rewritten: on
+    // inputs whose initial indices are not 0 the program before and after must agree.
+    let unassumed = SelectBitsRule { assumptions: vec![], ..rule() };
+    for (label, spec) in bit_configs(5).into_iter().chain(bit_configs(16)) {
+        let p = raw_program(&spec);
+        let (q, report) = apply_select_bits(clone_program(&p), &unassumed, |_| true).unwrap();
+        // Zero-based at 5 rounds has only first-pass sites, all refused without the assumption.
+        let first_pass_only = label.contains("zero-based") && label.starts_with("5r");
+        assert_eq!(report.n_sites() == 0, first_pass_only, "{}: {}", label, report.n_sites());
+        for seed in [1u64, 2, 3] {
+            assert_eq!(outputs_nonzero_indices(&q, &spec, seed), outputs_nonzero_indices(&p, &spec, seed), "{} seed {}", label, seed);
+        }
+    }
+}
+
+#[test]
+fn test_select_bits_constant_relying_on_the_assumption_is_recorded() {
+    // The 1 of a site's AND is `vbroadcast(loaded_idx + 1)`: 1 only under InitialIndicesZero.
+    // The site must record the assumption; without the assumption it is not a site.
+    let spec = spec5(IndexForm::Mirrored);
+    let mut p = raw_program(&spec);
+    let (and, _) = first_sites(&p);
+    let k = p.ops[and.op].srcs.iter().position(|s| s.as_vreg() == Some(vconst(&p, 1))).unwrap();
+    let mut front: Vec<SsaOp> = Vec::new();
+    let mut fresh = |vector: bool| {
+        p.vreg_count += 1;
+        if vector { VReg::vector(p.vreg_count - 1) } else { VReg::scalar(p.vreg_count - 1) }
+    };
+    let (c5, ptr, idx, c1, sum, one) = (fresh(false), fresh(false), fresh(false), fresh(false), fresh(false), fresh(true));
+    let mut k5 = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(c5), vec![Operand::Imm(5)]);
+    k5.produces_constant = Some(5);
+    let mut k1 = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(c1), vec![Operand::Imm(1)]);
+    k1.produces_constant = Some(1);
+    front.push(k5);
+    front.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(ptr), vec![Operand::VReg(c5)]));
+    front.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(idx), vec![Operand::VReg(ptr)]));
+    front.push(k1);
+    front.push(SsaOp::new(0, Engine::Alu, Opcode::Add, Some(sum), vec![Operand::VReg(idx), Operand::VReg(c1)]));
+    front.push(SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(one), vec![Operand::VReg(sum)]));
+    let shift = front.len();
+    p.ops[and.op].srcs[k] = Operand::VReg(one);
+    front.append(&mut p.ops);
+    p.ops = front;
+    for (i, op) in p.ops.iter_mut().enumerate() {
+        op.id = i;
+    }
+    p.vreg_def = p.ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect();
+    let site = sites(&p, &rule()).0.into_iter().find(|s| s.op == and.op + shift).expect("still a site under the assumption");
+    assert!(site.facts.iter().any(|f| f.name == "initial-indices-zero"), "{:?}", site.facts);
+    let unassumed = SelectBitsRule { assumptions: vec![], ..rule() };
+    assert!(!sites(&p, &unassumed).0.iter().any(|s| s.op == and.op + shift));
+}
+
+#[test]
+fn test_bit_paths_are_linear_and_reasons_name_no_vreg() {
+    // v_(i+1) = multiply_add(v_i, 2, v_i) from a formless v_0, 200 deep: a recursive reason
+    // would cost 2^200; stored results cost one step per op. The rejection keys are short and
+    // the same for every op of the chain.
+    let spec = spec5(IndexForm::Mirrored);
+    let mut p = raw_program(&spec);
+    let two = vconst(&p, 2);
+    let v0 = p.ops.iter().find(|o| o.opcode == Opcode::Vload).unwrap().dest.unwrap();
+    let mut v = v0;
+    for _ in 0..200 {
+        let d = VReg::vector(p.vreg_count);
+        p.vreg_count += 1;
+        let mut op = SsaOp::new(0, Engine::Valu, Opcode::MultiplyAdd, Some(d), vec![Operand::VReg(v), Operand::VReg(two), Operand::VReg(v)]);
+        op.id = p.ops.len();
+        p.ops.push(op);
+        v = d;
+    }
+    p.vreg_def = p.ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect();
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let r = rule();
+    let values = super::values::ValueFacts::compute(&g, p.zero_vreg, &r.layout, &r.assumptions);
+    let paths = super::select_bits::BitPaths::compute(&g, &values, &r.layout, &r.assumptions);
+    let reason = paths.why_no_form(&g, &values, v);
+    assert!(!reason.contains("VReg"), "{}", reason);
+    let (_, rejected) = sites(&p, &rule());
+    assert!(rejected.keys().all(|k| !k.contains("VReg")), "{:?}", rejected);
+}
+
+#[test]
+fn test_select_bits_rejections_are_about_index_derived_ops() {
+    // Hash stages (x >> 19, x >> 16 of a multiply_add, multiply_adds by 4097, ...) are not
+    // index-derived and are not counted as rejections.
+    for (label, spec) in bit_configs(16) {
+        let p = raw_program(&spec);
+        let (_, rejected) = sites(&p, &rule());
+        for key in rejected.keys() {
+            assert!(!key.contains("Some(19)") && !key.contains("Some(16)") && !key.contains("Some(4097)"), "{}: {}", label, key);
+        }
+        eprintln!("{}: rejections {:?}", label, rejected);
+    }
+}
+
+#[test]
+fn test_select_bits_match_site_agrees_with_find_sites() {
+    use super::rule::{Proposal, Rule};
+    // Zero-based, 16 rounds: the sites after the wrap start at broadcasts of the zero register.
+    let spec = ProblemSpec { cached_select: CachedSelect::Bits, tree_reduce_max_depth: 4, ..Default::default() };
+    let p = raw_program(&spec);
+    let found = sites(&p, &rule()).0;
+    assert!(found.iter().any(|s| s.round == Some(15)));
+    let r = rule().with_zero(p.zero_vreg);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    for s in found.iter().filter(|s| s.group == Some(0)) {
+        let proposal = Proposal { region_id: None, round: None, group: None, depth: None, ops: vec![s.op] };
+        assert_eq!(r.match_site(&g, &proposal).as_ref(), Ok(s));
+    }
+}
+
+#[test]
+fn test_surgery_refuses_a_lane_written_separately() {
+    // A decomposed vector (gather address) whose lane is also written by a scalar op: its value
+    // is two things. Every rule's surgery refuses the program, which is left unchanged.
+    let spec = ProblemSpec { rounds: 6, cached_select: CachedSelect::Bits, tree_reduce_max_depth: 3, ..Default::default() };
+    let mut p = raw_program(&spec);
+    let defined: std::collections::HashSet<VReg> = p.ops.iter().filter_map(|o| o.dest).collect();
+    let mut keys: Vec<VReg> = p.vector_group_lanes.keys().copied().filter(|k| defined.contains(k)).collect();
+    keys.sort_by_key(|v| v.id);
+    let lane = p.vector_group_lanes[&keys[0]][3];
+    let c = p.ops.iter().find(|o| o.opcode == Opcode::ConstChoice).unwrap().dest.unwrap();
+    let mut op = SsaOp::new(0, Engine::Alu, Opcode::Add, Some(lane), vec![Operand::VReg(c), Operand::VReg(c)]);
+    op.id = p.ops.len();
+    p.ops.push(op);
+    let before = canonical_ops(&p);
+    let (after, report) = apply_select_bits(p, &rule(), |_| true).unwrap();
+    assert!(report.refused.as_deref().map_or(false, |r| r.contains("written separately")), "{:?}", report.refused);
+    assert_eq!(canonical_ops(&after), before);
+}
+
+#[test]
+fn test_select_bits_keeps_an_intermediate_named_in_keep_live() {
+    // A depth-4 extraction intermediate (x >> 1, not a site) named in another op's keep_live:
+    // the rewrite must not make it dead (which would fail the surgery); the sites that would
+    // are refused, the rest rewritten, and outputs are unchanged.
+    let spec = spec5(IndexForm::Mirrored);
+    let mut p = raw_program(&spec);
+    let found = sites(&p, &rule()).0;
+    let r4: Vec<_> = found.iter().filter(|s| s.round == Some(4) && s.group == Some(0)).collect();
+    let inter = p
+        .ops
+        .iter()
+        .position(|o| o.opcode == Opcode::Shr && r4.iter().any(|s| p.ops[s.op].srcs.first().and_then(|x| x.as_vreg()) == o.dest))
+        .unwrap();
+    let y = p.ops[inter].dest.unwrap();
+    p.ops.last_mut().unwrap().keep_live = Some(vec![y]);
+    let report = apply_and_compare(&p, &spec, &rule(), "kept-live intermediate");
+    assert!(report.n_sites() < 160 && report.n_sites() >= 157, "{}", report.n_sites());
+    assert!(report.rejections.keys().any(|k| k.contains("kept live")), "{:?}", report.rejections);
+}
+
+#[test]
+fn test_level_last_matches_the_proof_constants() {
+    // R15-bit-path-steps uses L_(k+1) = 2 L_k + 2 with L_0 = 0.
+    use super::select_bits::level_last;
+    assert_eq!(level_last(0), 0);
+    for k in 0..31 {
+        assert_eq!(level_last(k + 1), 2 * level_last(k) + 2, "k = {}", k);
+    }
 }
