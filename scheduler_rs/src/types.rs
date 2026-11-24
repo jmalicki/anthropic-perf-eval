@@ -1491,7 +1491,8 @@ pub struct SsaOp {
     /// tree access, node XOR, hash or index step of one group in one round, or the cached
     /// level setup. `None` for init, data load/store and anything emitted outside a region.
     /// A hint for transforms to propose where to look; it is never the semantics of the op
-    /// (`kernel_builder::transform` verifies every site structurally).
+    /// and never its ownership (a transform must verify a site from the ops' definitions).
+    /// See `RegionTag` for exactly what a tag records.
     pub region: Option<RegionTag>,
 }
 
@@ -1535,12 +1536,25 @@ impl RegionKind {
     }
 }
 
-/// Emitter tag on an op: which region of the program it was emitted for.
+/// Emitter tag on an op: the region that was active when the emitter first created it.
 ///
-/// Every op emitted for the same (kind, round, group, depth) carries the same `id`; ids are
-/// dense, in order of first emission. Tags are emitted alongside the program and change
-/// nothing about it. Transforms may use them only to propose candidate sites; a rewrite must
-/// be justified by the structure of the ops (see `kernel_builder::transform`).
+/// That is all a tag means. In particular:
+/// * Ops the emitter deduplicates (constants, broadcasts and other vectors created on first
+///   use and then shared through its caches) carry the tag of whichever region first needed
+///   them, and may be read by other regions: e.g. with the zero-based index and
+///   `prune_dead_index`, the one vector of zeros every group uses in the wrap round is tagged
+///   `index_step` of the first group.
+/// * The shared part of a region (`group: None`) holds what was first created there, so its
+///   contents differ between the first and later visits of a depth (a level's end constant
+///   is created on the first visit that gathers; lazily initialised broadcasts on the first
+///   visit that selects).
+/// * Nothing may derive ownership or semantics from a tag. Transforms use tags only to
+///   propose candidate sites and must justify a rewrite by the structure of the ops.
+///
+/// Every op created for the same (kind, round, group, depth) carries the same `id`; ids are
+/// dense in order of first emission. The scheduler JSON is written after dead code
+/// elimination, so ids of regions whose ops were all removed are missing there (ids can have
+/// gaps). Tags are emitted alongside the program and change nothing about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RegionTag {
     /// Dense region id (order of first emission).
