@@ -53,7 +53,7 @@ fn emitted_counts(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) -> Counts {
     c
 }
 
-/// Deterministic plans: canonical, every encoding everywhere, each cached level alone, and
+/// Deterministic plans: canonical, each encoding on every subset of the cached levels, and
 /// pseudo-random mixes (the shapes of `design_plans` / `random_rows` in the Python model).
 fn test_plans(spec: &ProblemSpec, n_random: usize) -> Vec<Vec<Vec<AccessEncoding>>> {
     use AccessEncoding::*;
@@ -64,10 +64,12 @@ fn test_plans(spec: &ProblemSpec, n_random: usize) -> Vec<Vec<Vec<AccessEncoding
     };
     let canonical = |_: usize, d: usize| if d == 0 { Bits } else { Gather };
     let mut plans = vec![uniform(&canonical)];
+    // Every subset of the cached levels 1 to 4 bit-driven (the rest gathering), with each
+    // encoding: pins every `table:d` and every `and:table:*` product against real emission.
     for e in [Bits, BitsFlow, Mobius] {
-        plans.push(uniform(&|_, d| if d <= 4 { e } else { Gather }));
-        for level in 1..=4 {
-            plans.push(uniform(&|_, d| if d == 0 || d == level { if d == 0 { Bits } else { e } } else { Gather }));
+        for subset in 1u32..16 {
+            let on = move |d: usize| (1..=4).contains(&d) && subset & (1 << (d - 1)) != 0;
+            plans.push(uniform(&|_, d| if d == 0 { Bits } else if on(d) { e } else { Gather }));
         }
     }
     let mut state: u64 = 0x9E3779B97F4A7C15;
@@ -235,14 +237,30 @@ fn test_hash_tagged_as_tree_access_is_rejected() {
 
 #[test]
 fn test_gather_tag_on_partial_region_is_rejected() {
-    // The tag covers only the XOR and the loads of a gather, but the shape is still checked
-    // from definitions: the matcher binds the address op through the loads, so dropping it
-    // from the tag does not change the site. Dropping the XOR (the anchor) rejects.
+    // The shape is checked from definitions: the matcher binds the address op through the
+    // loads, so a tag without the address op still gives the same site. A tag without the
+    // XOR (the anchor) is rejected.
     let spec = context(32, SelectBitSource::Index);
-    let mut program = canonical_program(&spec);
     let target = |t: &crate::types::RegionTag| {
         t.kind == RegionKind::TreeAccess(AccessEncoding::Gather) && t.round == Some(3) && t.group == Some(0)
     };
+    let full = canonical_program(&spec);
+    let full_graph = SsaGraph::new(&full.ops, &full.vector_group_lanes);
+    let full_site = rule()
+        .match_site(&full_graph, &rule().propose(&full_graph).into_iter().find(|p| p.round == Some(3) && p.group == Some(0)).unwrap())
+        .unwrap();
+    let mut no_address = canonical_program(&spec);
+    for op in &mut no_address.ops {
+        if op.region.map_or(false, |t| target(&t)) && op.opcode == crate::types::Opcode::Sub {
+            op.region = None;
+        }
+    }
+    let graph = SsaGraph::new(&no_address.ops, &no_address.vector_group_lanes);
+    let p = rule().propose(&graph).into_iter().find(|p| p.round == Some(3) && p.group == Some(0)).unwrap();
+    assert_eq!(p.ops.len(), 9);
+    assert_eq!(rule().match_site(&graph, &p).unwrap(), full_site);
+
+    let mut program = canonical_program(&spec);
     for op in &mut program.ops {
         if op.region.map_or(false, |t| target(&t)) && op.opcode == crate::types::Opcode::Xor {
             op.region = None;
@@ -291,13 +309,31 @@ pub(super) fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<
             let keep: Option<Vec<String>> =
                 op.keep_live.as_ref().map(|k| k.iter().map(|v| name(*v, &mut names)).collect());
             let delta = op.delta_vreg.map(|v| name(v, &mut names));
+            let sub_temp = op.sub_temp_vreg.map(|v| name(v, &mut names));
             let dest = op.dest.map(|v| name(v, &mut names));
             format!(
-                "{:?} {:?} {:?} <- {:?} keep={:?} delta={:?} sub={} vt={:?} src={:?} sym={:?} mem={:?} alts={:?} k={:?} region={:?}",
-                op.engine, op.opcode, dest, srcs, keep, delta, op.needs_subtraction, op.var_type, op.source_info,
-                op.symmetry_hint, op.mem_loc, op.const_alternatives, op.produces_constant,
-                op.region.map(|t| (t.kind, t.round, t.group, t.depth)),
+                "{:?} {:?} {:?} <- {:?} keep={:?} delta={:?} sub={} sub_temp={:?} vt={:?} src={:?} sym={:?} mem={:?} \
+                 alts={:?} k={:?} trace={:?} region={:?}",
+                op.engine, op.opcode, dest, srcs, keep, delta, op.needs_subtraction, sub_temp, op.var_type,
+                op.source_info, op.symmetry_hint, op.mem_loc, op.const_alternatives, op.produces_constant,
+                op.trace_id, op.region.map(|t| (t.kind, t.round, t.group, t.depth)),
             )
+        })
+        .collect::<Vec<String>>()
+        .into_iter()
+        .chain({
+            // The lane map: every group with its key and lanes named as in the ops; a group
+            // no op references is listed as such (it would still reserve scratch).
+            let mut groups: Vec<String> = program
+                .vector_group_lanes
+                .iter()
+                .map(|(key, lanes)| match names.get(key) {
+                    Some(k) => format!("group v{} = {:?}", k, lanes.iter().map(|l| names.get(l).copied()).collect::<Vec<_>>()),
+                    None => "group not referenced by any op".to_string(),
+                })
+                .collect();
+            groups.sort();
+            groups
         })
         .collect()
 }
@@ -349,23 +385,57 @@ fn test_apply_reproduces_the_planned_program_32_groups() {
 #[test]
 fn test_applied_program_schedules_like_the_emitted_one() {
     // Downstream of the apply pass the pipeline runs unchanged: the greedy schedule of the
-    // rewritten program has the emitted program's cycles and ops.
+    // rewritten program has the emitted program's cycles, ops, peak live and budget flags
+    // (shaped greedy, as the recorded results use).
+    use crate::kernel_builder::config::{GreedyBarrierMode, GreedyPriorityKind};
     use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
     use AccessEncoding::*;
-    let spec = context(32, SelectBitSource::Index);
-    let mut plan = super::cost::canonical_plan(&spec);
+    let schedule = |program| {
+        let mut config = PipelineConfig::default();
+        config.compiler.greedy_barriers = GreedyBarrierMode::None;
+        config.compiler.greedy_priority = GreedyPriorityKind::Wavefront;
+        config.compiler.greedy_split_shift = true;
+        let mut ctx = PipelineContext::new(program, config);
+        ctx.run_greedy_pipeline(true).unwrap();
+        let greedy_exceeded = ctx.greedy_metrics.budget_exceeded;
+        let r = ctx.into_result().unwrap();
+        (r.cycles, r.ops.len(), r.address_result.peak_live, r.address_result.budget_exceeded, greedy_exceeded)
+    };
+    let small = context(32, SelectBitSource::Index);
+    let mut plan = super::cost::canonical_plan(&small);
     plan[2] = vec![Mobius, Bits, Gather, BitsFlow];
     plan[4] = vec![Gather, Gather, BitsFlow, BitsFlow];
     plan[13] = vec![Bits; 4];
-    let schedule = |program| {
-        let mut ctx = PipelineContext::new(program, PipelineConfig::default());
-        ctx.run_greedy_pipeline(true).unwrap();
-        let r = ctx.into_result().unwrap();
-        (r.cycles, r.ops.len())
-    };
-    let applied = schedule(super::apply::apply_tree_access_plan(&spec, &plan).unwrap());
-    let emitted = schedule(emitted_program(&spec, &plan));
-    assert_eq!(applied, emitted);
+    let large = context(256, SelectBitSource::Index);
+    let mut flow90 = super::cost::canonical_plan(&large);
+    for r in [1, 2, 12, 13] {
+        flow90[r] = vec![Bits; 32];
+    }
+    for r in [3, 14] {
+        flow90[r] = vec![BitsFlow; 32];
+    }
+    flow90[4] = (0..32).map(|g| if g < 17 { Gather } else { BitsFlow }).collect();
+    for (label, spec, plan) in [("4 groups", &small, &plan), ("32 groups, flow90-like", &large, &flow90)] {
+        let applied = schedule(super::apply::apply_tree_access_plan(spec, plan).unwrap());
+        let emitted = schedule(emitted_program(spec, plan));
+        assert_eq!(
+            applied, emitted,
+            "{}: (cycles, ops, peak live, address budget exceeded, greedy budget exceeded)",
+            label
+        );
+    }
+}
+
+#[test]
+fn test_apply_reproduces_the_planned_program_at_other_shapes() {
+    // Rounds 15: the last round is at depth 4, so the final index conversion reads L_4; a
+    // plan with no gather at depth 4 creates L_4 there (not in round 4). Also height 8 and
+    // 26 rounds (more visits per level).
+    for spec in [shape(15, 10, 32), shape(15, 8, 32), shape(26, 10, 32)] {
+        for (i, plan) in test_plans(&spec, 4).iter().enumerate() {
+            check_apply(&spec, plan, &format!("rounds {} height {} plan {}", spec.rounds, spec.forest_height, i));
+        }
+    }
 }
 
 #[test]
@@ -1095,4 +1165,107 @@ fn test_hash_merge_checks_the_constant_annotation() {
     });
     assert!(err.unwrap().contains("shift amount is not a broadcast constant"));
     assert_eq!(n, 0);
+}
+
+// ----------------------------------------------------------------------------
+// The graph view against dead code elimination; other shapes; unsupported contexts
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_graph_liveness_equals_dead_code_elimination() {
+    use crate::kernel_builder::config::CachedSelect;
+    let mut zero_prune_bits = ProblemSpec { rounds: 16, batch_size: 32, prune_dead_index: true, ..Default::default() };
+    zero_prune_bits.cached_select = CachedSelect::Bits;
+    zero_prune_bits.tree_reduce_max_depth = 4;
+    let mut programs = vec![
+        ("default 4 rounds", SsaTickTockKernelBuilder::new(KernelConfig::new(10, 2047, 32, 4)).build()),
+        ("zero-based prune bits", SsaTickTockKernelBuilder::new(KernelConfig { spec: zero_prune_bits, ..KernelConfig::new(10, 2047, 32, 16) }).build()),
+        ("canonical mirrored", canonical_program(&context(32, SelectBitSource::Index))),
+        ("instantiated", super::cost::instantiate_tree_access(&context(32, SelectBitSource::Index)).unwrap().0),
+        ("instantiated, path bits", super::cost::instantiate_tree_access(&context(32, SelectBitSource::Path)).unwrap().0),
+    ];
+    let mut values_only = context(32, SelectBitSource::Index);
+    values_only.values_only = true;
+    programs.push(("values only", canonical_program(&values_only)));
+    for (label, mut program) in programs {
+        let graph = SsaGraph::new(&program.ops, &program.vector_group_lanes);
+        let by_graph: Vec<usize> =
+            graph.live().iter().enumerate().filter(|(_, l)| **l).map(|(i, _)| program.ops[i].id).collect();
+        let (kept, _, _) = eliminate_ssa_dead_code(
+            std::mem::take(&mut program.ops),
+            &mut program.vreg_def,
+            &mut program.const_alternatives,
+            program.zero_vreg,
+            Some(&program.vector_group_lanes),
+        );
+        let by_dce: Vec<usize> = kept.iter().map(|o| o.id).collect();
+        assert_eq!(by_graph, by_dce, "{}", label);
+    }
+}
+
+fn shape(rounds: usize, forest_height: usize, batch_size: usize) -> ProblemSpec {
+    ProblemSpec {
+        rounds,
+        forest_height,
+        n_nodes: (1 << (forest_height + 1)) - 1,
+        batch_size,
+        merge_hash_stages: true,
+        index_form: IndexForm::Mirrored,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_derived_table_predicts_emitted_counts_at_other_shapes() {
+    // Rounds 15 (the final index is at depth 4 and reads L_4), height 8 (wrap after level 8,
+    // so levels 1 to 4 are visited twice in 15 rounds), 26 rounds (three visits of some levels).
+    for spec in [shape(15, 10, 32), shape(15, 8, 32), shape(26, 10, 32), shape(9, 6, 16)] {
+        let table = derive_tree_access_costs(&spec).unwrap();
+        if !table.problems.is_empty() {
+            // Reported, not fitted: the prediction must then not be trusted, so nothing to compare.
+            eprintln!("rounds {} height {}: {:?}", spec.rounds, spec.forest_height, table.problems);
+            continue;
+        }
+        for (i, plan) in test_plans(&spec, 6).iter().enumerate() {
+            assert_eq!(table.predict(plan), emitted_counts(&spec, plan), "rounds {} height {} plan {}", spec.rounds, spec.forest_height, i);
+        }
+    }
+}
+
+#[test]
+fn test_unsupported_contexts_report_problems() {
+    let zero_based = ProblemSpec { rounds: 16, batch_size: 32, merge_hash_stages: true, ..Default::default() };
+    let table = derive_tree_access_costs(&zero_based).unwrap();
+    assert!(table.problems.iter().any(|p| p.contains("zero-based")), "{:?}", table.problems.first());
+    let mut values_only = context(32, SelectBitSource::Index);
+    values_only.values_only = true;
+    let table = derive_tree_access_costs(&values_only).unwrap();
+    assert!(table.problems.iter().any(|p| p.contains("per-group")), "{:?}", table.problems.first());
+}
+
+#[test]
+fn test_plan_dependent_const_category_is_reported() {
+    // 14 = 6 + 8 is ALU-derivable only if the lazy constant 6 (a gather base's
+    // level-end constant in a choice round) was created before it, which depends on the plan.
+    use super::cost::{plan_dependent_const_categories, Liveness, Shape};
+    use crate::types::{Engine, Opcode, RegionTag};
+    let spec = context(32, SelectBitSource::Index);
+    let mut emit = crate::kernel_builder::SsaEmitContext::new();
+    emit.reserve_zero_vreg();
+    emit.emit_const_choice(8);
+    emit.set_round_context(2, 2);
+    emit.set_region(RegionKind::TreeAccess(AccessEncoding::Gather), None);
+    emit.emit_const_choice(6);
+    emit.clear_region();
+    emit.clear_round_context();
+    emit.emit_const_choice(14);
+    let ops = emit.take_ops();
+    assert!(ops.iter().all(|o| o.engine == Engine::Load && o.opcode == Opcode::ConstChoice));
+    let tag: Option<RegionTag> = ops[1].region;
+    assert!(tag.is_some());
+    let live = vec![Liveness::Always; ops.len()];
+    let users = vec![Vec::new(); ops.len()];
+    let problems = plan_dependent_const_categories(&ops, &live, &users, true, &Shape::new(&spec));
+    assert_eq!(problems.len(), 1, "{:?}", problems);
+    assert!(problems[0].starts_with("constant 14"), "{:?}", problems);
 }

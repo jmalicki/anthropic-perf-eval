@@ -1609,7 +1609,8 @@ struct SsaOpBulkMoveIn {
 /// Emits the canonical program (root from the shared vector, every other round gathering)
 /// with every alternative of every choice site (round at depth 1 to 4, group) built next
 /// to it, and reduces each op's liveness to the features of `scripts/emission_structure.py`.
-/// The emission options are the context; no tree-access option may be given.
+/// The emission options are the context; no tree-access option may be given. Defaults are the
+/// structure model's context (merged hash, mirrored index); other contexts may report problems.
 ///
 /// Returns a JSON string: `rule`, `context` (as the Python `Context`), `alternatives` (names
 /// and proof ids), `coefficients` (feature -> category -> count, the `CostTable` layout),
@@ -1617,7 +1618,7 @@ struct SsaOpBulkMoveIn {
 /// sources), `resources` (shared setup grouped by the OR of features it lives under) and
 /// `problems` (anything that does not fit the feature model; empty when exact).
 #[pyfunction]
-#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, *, merge_hash_stages=false, index_form="zero-based", select_bit_source="index", values_only=false))]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, *, merge_hash_stages=true, index_form="mirrored", select_bit_source="index", values_only=false))]
 pub fn derive_tree_access_cost_table(
     forest_height: usize,
     n_nodes: usize,
