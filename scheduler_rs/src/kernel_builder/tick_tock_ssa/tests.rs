@@ -4596,3 +4596,65 @@ fn test_dependency_pass_keeps_index_war_at_wrap() {
             && op.mem_deps.iter().any(|&(_, kind)| kind == MemEdgeKind::War)
     }));
 }
+
+/// After dead code elimination every ALU-derived ConstChoice alternative reads constants that
+/// a kept op produces (BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it
+/// removed"). Before the fix DCE kept them in every emission measured: e.g. 8 = 1 + 7 and
+/// 9 = 2 + 7 at batch 256 (7 dies), and with `--values-only` and the mirrored index (or
+/// `--prune-dead-index --values-only`) also 6 = 1 + 5 and 9 = 4 + 5, because the pointer load
+/// of header word 5 dies and with it its address constant 5.
+#[test]
+fn test_dce_keeps_no_const_alternative_without_producer() {
+    use crate::kernel_builder::config::IndexForm;
+    use crate::types::ConstEncoding;
+    use std::collections::HashSet;
+
+    type Variant = (&'static str, fn(&mut KernelConfig));
+    let variants: [Variant; 5] = [
+        ("default", |_| {}),
+        ("mirrored", |c| c.spec.index_form = IndexForm::Mirrored),
+        ("values-only", |c| c.spec.values_only = true),
+        ("values-only mirrored", |c| {
+            c.spec.values_only = true;
+            c.spec.index_form = IndexForm::Mirrored;
+        }),
+        ("values-only prune-dead-index", |c| {
+            c.spec.values_only = true;
+            c.spec.prune_dead_index = true;
+        }),
+    ];
+    for rounds in [2usize, 16] {
+        for batch in [8usize, 256] {
+            for (name, apply) in variants.iter() {
+                let mut config = KernelConfig::new(10, 2047, batch, rounds);
+                apply(&mut config);
+                let mut program = SsaTickTockKernelBuilder::new(config).build();
+                let (ops, _, _) = eliminate_ssa_dead_code(
+                    std::mem::take(&mut program.ops),
+                    &mut program.vreg_def,
+                    &mut program.const_alternatives,
+                    program.zero_vreg,
+                    Some(&program.vector_group_lanes),
+                );
+                let produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+                for op in &ops {
+                    for enc in op.const_alternatives.iter().flatten() {
+                        assert!(
+                            enc.dependencies().iter().all(|v| produced.contains(v)),
+                            "{} {}r batch {}: constant {:?} keeps {:?}",
+                            name, rounds, batch, op.produces_constant, enc
+                        );
+                    }
+                }
+                // The reported case: constant 5 dies, 6 loses 1 + 5 and keeps its other encodings.
+                if name.starts_with("values-only m") && batch == 256 {
+                    assert!(!produced.contains(&5));
+                    let six = ops.iter().find(|op| op.produces_constant == Some(6)).unwrap();
+                    let alts = six.const_alternatives.as_ref().unwrap();
+                    assert!(!alts.contains(&ConstEncoding::Add { a_value: 1, b_value: 5 }));
+                    assert!(alts.len() >= 2 && alts[0] == ConstEncoding::Load);
+                }
+            }
+        }
+    }
+}

@@ -65,6 +65,85 @@ mod ssa_tests {
         // There is no precedence constraint requiring zero to be scheduled before AddImm.
     }
 
+    /// Seven constants: 1, 2, 100..=103 with only Load / AddImm, and 6 with Load, AddImm and
+    /// one ALU derivation `1 + operand`. Load (2) and Flow (1) materialise three constants per
+    /// cycle, so without the derivation the ops need three cycles; deriving 6 on the scalar
+    /// ALU in cycle 1 (after 1 and the operand) fits them in two. `section` solves it as a
+    /// section (segment mode, no live-in values).
+    #[cfg(feature = "cpsat")]
+    fn solve_seven_constants_with_derived_six(
+        operand: i64,
+        section: bool,
+    ) -> Result<Option<SsaCpsatResult>, String> {
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        for v in [1, 2, 100, 101, 102, 103, 6] {
+            emit.emit_const_choice(v);
+        }
+        for op in emit.ops.iter_mut() {
+            let v = op.produces_constant.unwrap();
+            let mut alts = vec![ConstEncoding::Load, ConstEncoding::AddImm { value: v }];
+            if v == 6 {
+                alts.push(ConstEncoding::Add { a_value: 1, b_value: operand });
+            }
+            op.const_alternatives = Some(alts);
+        }
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let no_live_in: Vec<(crate::types::VReg, usize)> = Vec::new();
+        schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                ..Default::default()
+            },
+            SsaCpsatHints {
+                initial_live: section.then_some(&no_live_in[..]),
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    /// Cycles the ops occupy and the number of ALU-derived constants.
+    #[cfg(feature = "cpsat")]
+    fn cycles_and_alu_derived(r: &SsaCpsatResult) -> (i32, usize) {
+        let derived = r
+            .const_choice_encoding
+            .values()
+            .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AluDerive(_)))
+            .count();
+        (r.cycle_assignments.iter().max().unwrap() + 1, derived)
+    }
+
+    /// A derivation whose operands are produced is chosen: it saves a cycle.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_alu_derivation_with_live_operands_is_chosen() {
+        for section in [false, true] {
+            let r = solve_seven_constants_with_derived_six(2, section).unwrap().unwrap();
+            assert_eq!(cycles_and_alu_derived(&r), (2, 1), "section={}", section);
+        }
+    }
+
+    /// BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it removed": an
+    /// alternative reading a value no op produces used to take the constant itself as the
+    /// operand's producer (`unwrap_or(&idx)`), i.e. `cycle >= cycle + 1` under its literal, so
+    /// the solver could never choose it (the ops then took three cycles, not two). It is now
+    /// an error in a whole-kernel model; in a section solve (operand produced in an earlier
+    /// section) the alternative is switched off explicitly.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_alternative_without_producer() {
+        let err = solve_seven_constants_with_derived_six(5, false).unwrap_err();
+        assert!(err.contains("reads a value no op produces"), "{}", err);
+        let r = solve_seven_constants_with_derived_six(5, true).unwrap().unwrap();
+        assert_eq!(cycles_and_alu_derived(&r), (3, 0));
+    }
+
     /// Sanity check: ForceAddImm must be feasible. If this fails, AddImm constraints are wrong.
     #[cfg(feature = "cpsat")]
     #[test]

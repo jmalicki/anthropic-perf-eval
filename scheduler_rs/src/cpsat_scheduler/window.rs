@@ -253,7 +253,7 @@ pub(crate) fn apply_window_constraints(
     ops: &[SsaOp],
     window: &CpsatWindow,
     vars: &super::op_times::OpVariables,
-    const_choice_alu_encoding_info: &HashMap<usize, Vec<(usize, usize, Opcode)>>,
+    const_choice_alu_encoding_info: &HashMap<usize, Vec<Option<(usize, usize, Opcode)>>>,
 ) -> WindowRegionCounts {
     use cp_sat::builder::{BoolVar, IntVar, LinearExpr};
     use super::op_times::ConstChoiceVars;
@@ -330,10 +330,12 @@ pub(crate) fn apply_window_constraints(
                     Some(ConstChoiceEncoding::AluDerive(info)) => const_choice_alu_encoding_info
                         .get(&idx)
                         .and_then(|alts| {
-                            alts.iter().position(|&(l, r, opcode)| {
-                                Some(&l) == id_to_idx.get(&info.left_op_id)
-                                    && Some(&r) == id_to_idx.get(&info.right_op_id)
-                                    && opcode == info.opcode
+                            alts.iter().position(|alt| {
+                                alt.is_some_and(|(l, r, opcode)| {
+                                    Some(&l) == id_to_idx.get(&info.left_op_id)
+                                        && Some(&r) == id_to_idx.get(&info.right_op_id)
+                                        && opcode == info.opcode
+                                })
                             })
                         })
                         .map(|k| k + 2),

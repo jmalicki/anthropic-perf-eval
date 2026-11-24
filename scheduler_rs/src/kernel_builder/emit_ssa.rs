@@ -1257,6 +1257,30 @@ pub fn compute_ssa_dependencies_with_barriers(
     super::memory_deps::add_barrier_dependencies(ops);
 }
 
+/// Drop every ALU-derived `ConstChoice` alternative that names a value no op in `ops`
+/// produces (`produces_constant`).
+///
+/// The emitter lists derivations from the constants written so far (`emit_const_choice`);
+/// when dead code elimination removes one of those constants, the derivations that read it
+/// have no producer left. The CP-SAT model looks each operand up among the ops and refuses
+/// an alternative without a producer, so this must run after every removal of ops.
+/// Load and AddImm have no operands and are always kept; the order of the rest is kept.
+///
+/// # Returns
+/// The number of alternatives dropped.
+pub fn drop_alternatives_without_producer(ops: &mut [SsaOp]) -> usize {
+    let produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+    let mut dropped = 0;
+    for op in ops.iter_mut() {
+        if let Some(alts) = op.const_alternatives.as_mut() {
+            let before = alts.len();
+            alts.retain(|enc| enc.dependencies().iter().all(|v| produced.contains(v)));
+            dropped += before - alts.len();
+        }
+    }
+    dropped
+}
+
 /// Eliminate SSA dead code: remove ops whose result has no users.
 ///
 /// This reduces cycles, optimizer time, and scratch pressure. Roots (always live)
@@ -1424,6 +1448,8 @@ pub fn eliminate_ssa_dead_code(
         }
     }
 
+    drop_alternatives_without_producer(&mut new_ops);
+
     // Rebuild vreg_def from remaining ops only (so ConstChoice's single remaining encoding is the definer)
     let mut new_vreg_def: HashMap<VReg, usize> = HashMap::new();
     for op in &new_ops {
@@ -1555,6 +1581,37 @@ mod tests {
         );
         let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
         assert!(!has_dead_const, "const(99) should be removed by DCE");
+    }
+
+    /// A constant DCE removes takes the ALU derivations that read it with it: 6 = 1 + 5 goes
+    /// when 5 is dead, the derivations of 6 from live constants stay.
+    #[test]
+    fn test_dce_drops_const_alternatives_reading_a_removed_constant() {
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        let one = emit.emit_const_choice(1);
+        let _five = emit.emit_const_choice(5); // never used -> removed by DCE
+        let three = emit.emit_const_choice(3);
+        let six = emit.emit_const_choice(6);
+        let sum = emit.emit_alu(Opcode::Add, one, three);
+        let total = emit.emit_alu(Opcode::Add, sum, six);
+        emit.emit_store(one, total); // root
+        let alts_of_six = |ops: &[SsaOp]| {
+            ops.iter().find(|op| op.produces_constant == Some(6)).unwrap().const_alternatives.clone().unwrap()
+        };
+        let emitted = alts_of_six(&emit.ops);
+        assert!(emitted.contains(&ConstEncoding::Add { a_value: 1, b_value: 5 }), "{:?}", emitted);
+
+        let mut vreg_def = std::mem::take(&mut emit.vreg_def);
+        let mut const_alternatives = emit.take_const_alternatives();
+        let ops = emit.take_ops();
+        let (new_ops, _, _) =
+            eliminate_ssa_dead_code(ops, &mut vreg_def, &mut const_alternatives, emit.zero_vreg, None);
+        assert!(!new_ops.iter().any(|op| op.produces_constant == Some(5)));
+        let kept = alts_of_six(&new_ops);
+        let expected: Vec<ConstEncoding> =
+            emitted.into_iter().filter(|e| !e.dependencies().contains(&5)).collect();
+        assert_eq!(kept, expected);
     }
 
     #[test]

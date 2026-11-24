@@ -1380,7 +1380,10 @@ pub fn schedule_ssa_cpsat(
     let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     // N-way ConstChoice (Load | AddImm | ALU_0 | ALU_1 | ...): encoding vars and ALU option info for extraction
     let mut const_choice_encoding_vars: HashMap<usize, Vec<BoolVar>> = HashMap::new();
-    let mut const_choice_alu_encoding_info: HashMap<usize, Vec<(usize, usize, Opcode)>> =
+    // Per ALU alternative k: `Some((left producer, right producer, opcode))`, or `None` when
+    // the alternative is switched off (a section solve whose operand is produced in an
+    // earlier section).
+    let mut const_choice_alu_encoding_info: HashMap<usize, Vec<Option<(usize, usize, Opcode)>>> =
         HashMap::new();
     let mut const_choice_alu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
 
@@ -1453,7 +1456,7 @@ pub fn schedule_ssa_cpsat(
                     );
                     const_flow_intervals.insert(idx, add_imm_interval);
 
-                    let mut alu_info: Vec<(usize, usize, Opcode)> = Vec::new();
+                    let mut alu_info: Vec<Option<(usize, usize, Opcode)>> = Vec::new();
                     for (k, enc) in alts[2..].iter().enumerate() {
                         let use_alu_k = use_vars[2 + k];
                         let alu_interval = model.new_optional_fixed_size_interval_var(
@@ -1466,10 +1469,34 @@ pub fn schedule_ssa_cpsat(
 
                         let deps = enc.dependencies();
                         if deps.len() >= 2 {
-                            let left_idx = *value_to_producer_idx.get(&deps[0]).unwrap_or(&idx);
-                            let right_idx = *value_to_producer_idx.get(&deps[1]).unwrap_or(&idx);
+                            // Each operand must be produced by an op of this model. Dead code
+                            // elimination drops alternatives naming a constant it removed
+                            // (`drop_alternatives_without_producer`), so in a whole-kernel
+                            // model a missing producer is a bug upstream. A section solve
+                            // sees only its own ops: an operand produced in an earlier
+                            // section has no producer here, and the alternative is off.
+                            let producers = (
+                                value_to_producer_idx.get(&deps[0]).copied(),
+                                value_to_producer_idx.get(&deps[1]).copied(),
+                            );
+                            let (left_idx, right_idx) = match producers {
+                                (Some(l), Some(r)) => (l, r),
+                                _ if initial_live.is_some() => {
+                                    let c = model.add_eq(LinearExpr::from(use_alu_k), 0);
+                                    model.set_constraint_name(c, &format!("const_choice_off_{}_k_{}", idx, k));
+                                    alu_info.push(None);
+                                    continue;
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "ConstChoice op {} (value {:?}): ALU alternative {:?} reads a value no op produces; \
+                                         alternatives must be dropped when their operands die (DCE)",
+                                        ops[idx].id, ops[idx].produces_constant, enc
+                                    ));
+                                }
+                            };
                             if let Some(opcode) = enc.alu_opcode() {
-                                alu_info.push((left_idx, right_idx, opcode));
+                                alu_info.push(Some((left_idx, right_idx, opcode)));
                                 let c_left = model.add_ge(times[idx].issue(), times[left_idx].visible());
                                 model.only_enforce_if(c_left, [use_alu_k]);
                                 model.set_constraint_name(c_left, &format!("const_choice_prec_{}_k_{}_left", idx, k));
@@ -1493,8 +1520,10 @@ pub fn schedule_ssa_cpsat(
                     let hint_idx = match window.and_then(|w| w.reference.const_choice_encoding.get(&ops[idx].id)) {
                         Some(crate::types::ConstChoiceEncoding::AluDerive(info)) => alu_info
                             .iter()
-                            .position(|&(l, r, opcode)| {
-                                ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                            .position(|alt| {
+                                alt.is_some_and(|(l, r, opcode)| {
+                                    ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                                })
                             })
                             .map_or(hint_idx, |k| k + 2),
                         _ => hint_idx,
@@ -4591,8 +4620,7 @@ pub fn schedule_ssa_cpsat(
                                     Some(k) if k >= 2 => {
                                         if let Some(info) = const_choice_alu_encoding_info.get(&idx) {
                                             let i = k - 2;
-                                            if i < info.len() {
-                                                let (li, ri, opcode) = info[i];
+                                            if let Some(&Some((li, ri, opcode))) = info.get(i) {
                                                 crate::types::ConstChoiceEncoding::AluDerive(
                                                     crate::types::AluDeriveInfo {
                                                         left_op_id: ops[li].id,
