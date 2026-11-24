@@ -746,6 +746,10 @@ pub struct CompilerConfig {
     /// array ends). Set by the kernel builder from `ProblemSpec::batch_size`; `None` makes
     /// `prune-index` and `values-only` refuse to run.
     pub transform_batch_size: Option<usize>,
+    /// Tree size of the problem, for the transforms' memory layout (the tree's extent, so a
+    /// tree access can be shown not to alias the indices). `None`: no tree access is taken to
+    /// be inside the tree (sound, less precise).
+    pub transform_n_nodes: Option<usize>,
 }
 
 /// A rewrite rule the pipeline can apply to the finished program (`--transform`).
@@ -835,6 +839,7 @@ impl Default for CompilerConfig {
             scratch_model: ScratchModel::default(),
             transforms: Vec::new(),
             transform_batch_size: None,
+            transform_n_nodes: None,
         }
     }
 }

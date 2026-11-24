@@ -1342,6 +1342,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             cpsat_split_shift_hint,
             transforms,
             transform_batch_size: Some(batch_size),
+            transform_n_nodes: Some(n_nodes),
         },
     };
     config
@@ -1529,6 +1530,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         stats.set_item("cpsat_scratch_budget", b)?;
     }
     stats.set_item("valu_shifted", result.valu_shifted)?;
+    // Sites each `--transform` rewrote, in order: callers decide from the outcome (e.g. whether
+    // values-only removed the index stores), not from the request.
+    let transform_sites = PyList::empty(py);
+    for (name, sites) in &result.transform_sites {
+        transform_sites.append((name.as_str(), *sites))?;
+    }
+    stats.set_item("transform_sites", transform_sites)?;
     if let Some(ec) = result.empty_cycle_count {
         stats.set_item("empty_cycle_count", ec)?;
     }

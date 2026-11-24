@@ -270,8 +270,9 @@ impl MirrorIndexRule {
             .enumerate()
             .filter(|(_, o)| o.opcode == Opcode::Vstore)
             .filter(|(_, o)| {
+                // Inside the array `word` points to (`MemoryLayout::located`).
                 o.srcs.first().and_then(|s| s.as_vreg()).and_then(|a| values.address(graph, a)).map_or(false, |a| {
-                    a.word == word && a.offset >= 0 && a.offset + 8 <= self.layout.batch_size
+                    a.word == word && self.layout.located(a, 8)
                 })
             })
             .map(|(i, _)| i)

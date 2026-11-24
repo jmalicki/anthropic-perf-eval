@@ -20,6 +20,7 @@ use crate::kernel_builder::transform::{
     apply_hash_merge, apply_mirror_index, apply_prune_index, apply_select_bits, apply_values_only, HashMergeRule,
     MirrorIndexRule, PruneIndexRule, SelectBitsRule, ValuesOnlyRule,
 };
+use crate::kernel_builder::transform::MemoryLayout;
 use crate::kernel_builder::SsaProgram;
 
 /// What one transform did.
@@ -47,9 +48,27 @@ pub fn apply_transform(
     t: TransformKind,
     batch_size: Option<usize>,
 ) -> Result<(SsaProgram, TransformOutcome), String> {
-    let batch = || {
-        batch_size.ok_or_else(|| {
+    apply_transform_with(program, t, batch_size, None)
+}
+
+/// `apply_transform` with the tree's size known (`MemoryLayout::n_nodes`), as the pass runs it.
+///
+/// # Arguments
+/// * `program`, `t`, `batch_size` - As `apply_transform`.
+/// * `n_nodes` - Words in the tree, if known.
+pub fn apply_transform_with(
+    program: SsaProgram,
+    t: TransformKind,
+    batch_size: Option<usize>,
+    n_nodes: Option<usize>,
+) -> Result<(SsaProgram, TransformOutcome), String> {
+    let layout = || -> Result<MemoryLayout, String> {
+        let b = batch_size.ok_or_else(|| {
             format!("transform {} needs the batch size (CompilerConfig::transform_batch_size)", t.as_str())
+        })?;
+        Ok(match n_nodes {
+            Some(n) => MemoryLayout::problem_with_tree(n, b),
+            None => MemoryLayout::problem(b),
         })
     };
     Ok(match t {
@@ -58,22 +77,22 @@ pub fn apply_transform(
             (p, TransformOutcome { summary: r.summary(), sites: r.sites, refused: r.refused.clone() })
         }
         TransformKind::PruneIndex => {
-            let (p, r) = apply_prune_index(program, &PruneIndexRule::for_problem(batch()?), |_| true)?;
+            let (p, r) = apply_prune_index(program, &PruneIndexRule { layout: layout()?, ..PruneIndexRule::for_problem(0) }, |_| true)?;
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
             (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
         }
         TransformKind::ValuesOnly => {
-            let (p, r) = apply_values_only(program, &ValuesOnlyRule::for_problem(batch()?), |_| true)?;
+            let (p, r) = apply_values_only(program, &ValuesOnlyRule { layout: layout()?, ..ValuesOnlyRule::for_problem(0) }, |_| true)?;
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
             (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
         }
         TransformKind::MirrorIndex => {
-            let (p, r) = apply_mirror_index(program, &MirrorIndexRule::for_problem(batch()?))?;
+            let (p, r) = apply_mirror_index(program, &MirrorIndexRule { layout: layout()?, ..MirrorIndexRule::for_problem(0) })?;
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
             (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
         }
         TransformKind::SelectBitsPath => {
-            let (p, r) = apply_select_bits(program, &SelectBitsRule::for_problem(batch()?), |_| true)?;
+            let (p, r) = apply_select_bits(program, &SelectBitsRule { layout: layout()?, ..SelectBitsRule::for_problem(0) }, |_| true)?;
             let sites = if r.refused.is_some() { 0 } else { r.n_sites() };
             (p, TransformOutcome { summary: r.summary(), sites, refused: r.refused.clone() })
         }
@@ -94,6 +113,7 @@ impl Pass for TransformPass {
             return Ok("none".into());
         }
         let batch_size = ctx.config.compiler.transform_batch_size;
+        let n_nodes = ctx.config.compiler.transform_n_nodes;
         let mut summaries = Vec::new();
         for t in transforms {
             let program = SsaProgram {
@@ -104,7 +124,7 @@ impl Pass for TransformPass {
                 zero_vreg: ctx.zero_vreg,
                 vector_group_lanes: std::mem::take(&mut ctx.vector_group_lanes),
             };
-            let (program, outcome) = apply_transform(program, t, batch_size)?;
+            let (program, outcome) = apply_transform_with(program, t, batch_size, n_nodes)?;
             if outcome.sites == 0 {
                 // Always shown: a requested rewrite that does nothing is usually a configuration
                 // mistake (the flag it stands for is also set, or, for prune-index, the mirrored
@@ -124,6 +144,7 @@ impl Pass for TransformPass {
                     }
                 );
             }
+            ctx.transform_sites.push((t.as_str().to_string(), outcome.sites));
             let summary = outcome.summary;
             ctx.ops = program.ops;
             ctx.vreg_def = program.vreg_def;

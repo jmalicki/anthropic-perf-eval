@@ -116,14 +116,10 @@ impl ValuesOnlyRule {
             if !later.reads_memory() {
                 continue;
             }
+            // Disjoint only if both accesses are proved inside their own arrays
+            // (`MemoryLayout::may_overlap`); a different header word alone proves nothing.
             let a = later.srcs.first().and_then(|s| s.as_vreg()).and_then(|a| values.address(graph, a));
-            let overlaps = match a {
-                None => true,
-                Some(a) => {
-                    a.word == address.word && a.offset < address.offset + w && address.offset < a.offset + width(later)
-                }
-            };
-            if overlaps {
+            if self.layout.may_overlap(Some(address), w, a, width(later)) {
                 return reject(format!("op {} ({:?}) may read the stored indices back", j, later.opcode));
             }
         }
