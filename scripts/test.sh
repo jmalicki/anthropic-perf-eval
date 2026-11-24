@@ -43,7 +43,7 @@ run_python() {
       tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
       tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
       tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
-      tests/test_cpsat_lane_model.py tests/test_emission_options.py tests/test_emission_ablation.py tests/test_emission_plan.py tests/test_emission_structure.py tests/test_static_bounds.py tests/test_test_slot.py \
+      tests/test_cpsat_lane_model.py tests/test_emission_options.py tests/test_emission_ablation.py tests/test_emission_plan.py tests/test_emission_structure.py tests/test_scratch_time_overcount.py tests/test_static_bounds.py tests/test_test_slot.py \
       solver/test_slot_utilization.py
   fi
   uv run pytest -q "$@"

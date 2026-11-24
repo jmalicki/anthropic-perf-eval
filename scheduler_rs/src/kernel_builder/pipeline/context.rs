@@ -182,6 +182,8 @@ pub struct CpSatPipelineConfig {
     /// Default false: CP-SAT should do it; bulk-move masks bugs and is buggy.
     /// Use --bulk-move only for experimenting, not production.
     pub enable_bulk_move: bool,
+    /// Timeline of the scratch cumulative in every CP-SAT solve (full kernel and per-section).
+    pub scratch_time: crate::cpsat_scheduler::ScratchTime,
 }
 
 #[cfg(feature = "cpsat")]
@@ -208,6 +210,7 @@ impl Default for CpSatPipelineConfig {
             disable_optional_constraint_groups: HashSet::new(),
             enable_cse_groups: true,
             enable_bulk_move: false, // off by default: buggy (same-cycle scratch conflicts)
+            scratch_time: crate::cpsat_scheduler::ScratchTime::default(),
         }
     }
 }
@@ -225,6 +228,7 @@ impl CpSatPipelineConfig {
             enable_valu_shift: false, // set by caller from pipeline config
             enable_vbroadcast_elimination: self.enable_vbroadcast_elimination,
             scratch_budget,
+            scratch_time: self.scratch_time,
             model_name: Some("full_kernel_optimization".to_string()),
             machine: MachineConfig::default(),
             const_choice_mode: self.const_choice_mode,

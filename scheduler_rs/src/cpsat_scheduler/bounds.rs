@@ -351,6 +351,9 @@ pub struct SsaCpsatConfig {
     /// with capacity `N_s`, and `8 * N_v + N_s <= scratch_budget`. Address assignment always
     /// fits such a schedule (`address_assign::assign_two_pass`).
     pub scratch_pools: bool,
+    /// Timeline of the scratch cumulative: `Phase` (default, same-cycle reuse as address
+    /// assignment) or `Cycle` (the earlier overcount, for ablation).
+    pub scratch_time: super::config::ScratchTime,
     /// Optional name for the model (appears in solver log, e.g. "Presolved optimization model 'name'").
     pub model_name: Option<String>,
     /// Machine definition: slot capacities per engine per cycle. Default matches hardware (ALU 12, VALU 6, Load 2, Store 2, Flow 1).
@@ -408,6 +411,7 @@ impl Default for SsaCpsatConfig {
             enable_valu_shift: false,
             scratch_budget: 1536, // Default hardware limit
             scratch_pools: false,
+            scratch_time: super::config::ScratchTime::default(),
             model_name: None,
             machine: MachineConfig::default(),
             const_choice_mode: ConstChoiceMode::default(),
