@@ -13,7 +13,8 @@ BUILDER.py is a public take-home solution: a `perf_takehome.py` replacement that
   and the copied sources.
 * The macOS profile restricts file reads to the capture directory, Python installation,
   and selected system runtime paths. It restricts file writes to the capture directory
-  and `/dev/null`, denies networking and fork, and allows only the configured Python executable.
+  and `/dev/null`, denies networking and fork, and allows only the configured Python executable
+  and, for a framework launcher, the corresponding framework executable.
 * The parent reads a bounded JSON result from a regular file and checks the bundle schema
   before writing the capture.
 
@@ -58,19 +59,35 @@ with open({result!r}, "w") as f:
 
 def sandbox_profile(sandbox: str, python_prefix: str, python: str) -> str:
     """Allow Python to read its runtime and the capture directory on macOS."""
+    executable = Path(python)
+    allowed_executables = [executable]
+    framework_app = executable.parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+    framework_rules = []
+    if executable.parent.name == "bin" and framework_app.is_file():
+        allowed_executables.append(framework_app.resolve())
+        # A framework launcher realpaths its bin directory before loading Python.
+        # That lookup needs metadata for ancestors above the runtime prefix too.
+        parents = " ".join(
+            f"(literal {json.dumps(str(path), ensure_ascii=False)})" for path in executable.parents
+        )
+        framework_rules.append(f"(allow file-read-metadata {parents})")
+    python_exec_literals = " ".join(
+        f"(literal {json.dumps(str(path), ensure_ascii=False)})" for path in allowed_executables
+    )
     return "\n".join([
         "(version 1)",
         "(allow default)",
         "(deny network*)",
         "(deny process-fork)",
         "(deny process-exec)",
-        f"(allow process-exec (literal {json.dumps(python, ensure_ascii=False)}))",
+        f"(allow process-exec {python_exec_literals})",
         "(deny file-write*)",
         f"(allow file-write* (subpath {json.dumps(sandbox, ensure_ascii=False)}))",
         '(allow file-write* (literal "/dev/null"))',
         "(deny file-read*)",
         # Python startup needs an operation on the root directory itself.
         '(allow file-read-data (literal "/"))',
+        *framework_rules,
         '(allow file-read* (subpath "/System/Library") (subpath "/usr/lib")'
         ' (literal "/dev/null") (literal "/dev/urandom"))',
         f"(allow file-read* (subpath {json.dumps(python_prefix, ensure_ascii=False)}))",
