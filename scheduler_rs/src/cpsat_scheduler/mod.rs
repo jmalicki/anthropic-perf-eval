@@ -180,7 +180,7 @@ pub use config::{
     ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning,
     CumulativePropagator, MakespanRows,
     OptionalConstraintGroup,
-    SelectChoiceMode, ValuShiftMode,
+    ScratchTime, SelectChoiceMode, ValuShiftMode,
 };
 pub use legacy::{compute_asap, compute_alap};
 pub use cse_groups::{build_cse_groups, CseGroup, CseGroupResult};
