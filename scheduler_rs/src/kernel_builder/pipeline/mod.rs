@@ -420,6 +420,7 @@ impl PipelineContext {
                 .collect(),
             lb_cycles: self.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
             cpsat_scratch_budget: self.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
+            scratch_relaxed: self.config.compiler.is_relaxed_scratch(),
             vector_group_lanes: self.vector_group_lanes,
         })
     }

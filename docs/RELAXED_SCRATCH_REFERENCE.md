@@ -120,15 +120,13 @@ below the best real 4-round result here (425).
   inflation throttle: relaxed gains 56 cycles (2,007 → 1,951) and 33 with main's best emission,
   with peaks of 1,620 to 1,628. That shape is far from the floor for other reasons (rounds run
   one after another), so this is not where to spend effort.
-- **The most any scratch-saving technique could buy this greedy is about 15 to 20 cycles at 16
-  rounds** (best real 1,308 at stagger 10 and 20 in flight in GREEDY_SHAPE_ABLATION.md, or 1,313
-  shaped; best relaxed 1,293 at stagger 6, which needs 2,009 words). That is spilling, a better
-  allocator or more groups in flight, combined, for this scheduler. The remaining 22 to 42
-  cycles to the 1,271 floor are not scratch.
+- **The best observed relaxed greedy schedule saved 15 to 20 cycles at 16 rounds.**
+  It reached 1,293 cycles at stagger 6 with a 2,009-word peak. The best real schedules reached
+  1,308 at stagger 10 and 20 groups in flight, and 1,313 with the shaped greedy configuration.
+  The relaxed schedule was still 22 cycles above the 1,271-cycle floor.
 - **CP-SAT does find shorter schedules without scratch from the round-barrier hint** at 4
-  rounds: 405 against 455 with scratch and 425 for the best real run. So with CP-SAT,
-  scratch-saving could be worth up to 20 cycles (5%) at 4 rounds. Whether this carries to 16
-  rounds is what the queued runs measure.
+  rounds: 405 against 455 with scratch, and 20 cycles (5%) faster than the best real run of 425.
+  The 16-round comparison is still queued.
 - **The CP-SAT bound does not move without scratch** at 4 rounds (357 in every run, the
   capacity floor), and 1,271 (the floor) with scratch at 16 rounds. So the bound gap is not a
   scratch artefact.

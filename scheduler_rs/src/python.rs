@@ -1323,7 +1323,23 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .spec
         .check_access_plan()
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    if config.compiler.is_relaxed_scratch() && verbose {
+    let scratch_relaxed = config.compiler.is_relaxed_scratch();
+    if scratch_relaxed {
+        // Keep the protected names in sync with kernel_build_args.NORMAL_KERNEL_PATHS.
+        let output_basename = output_json.as_deref().and_then(|path| {
+            std::path::Path::new(path).file_name().and_then(|name| name.to_str())
+        });
+        if matches!(
+            output_basename,
+            Some("scheduler_output.json" | "kernel_to_validate.json"
+                | "kernel_upstream_check.json" | "scheduler_output_upstream_check.json")
+        ) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Relaxed scratch requires an output_json path separate from normal kernel artifacts.",
+            ));
+        }
+    }
+    if scratch_relaxed && verbose {
         println!(
             "RELAXED SCRATCH (analysis only): scratch_size={} words{}; the kernel is NOT valid on \
              the {}-word machine.",
@@ -1483,7 +1499,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("budget_exceeded", result.budget_exceeded)?;
     stats.set_item("scratch_size", result.address_result.budget)?;
     stats.set_item("scratch_constraint", scratch_constraint)?;
-    stats.set_item("relaxed_scratch", builder.config.compiler.is_relaxed_scratch())?;
+    stats.set_item("relaxed_scratch", result.scratch_relaxed)?;
     if let Some(b) = result.cpsat_scratch_budget {
         stats.set_item("cpsat_scratch_budget", b)?;
     }

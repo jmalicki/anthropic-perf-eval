@@ -40,9 +40,8 @@ What I could not determine: what the 863 to 866 entries do beyond the 880 kernel
 write-up exists. The 880 kernel's floor is 873, so 863 needs about 70 fewer vector-op
 equivalents (1%) on the same design, which is plausible but not shown.
 
-A second kind of reference, the same pipeline with the scratch limit removed (what spilling,
-allocation or more groups in flight could buy at most), is in
-[RELAXED_SCRATCH_REFERENCE.md](RELAXED_SCRATCH_REFERENCE.md).
+The same pipeline with the scratch limit removed measures the gains observed when more
+scratch is available. See [RELAXED_SCRATCH_REFERENCE.md](RELAXED_SCRATCH_REFERENCE.md).
 
 ## 2. Is the bound right for our op set?
 

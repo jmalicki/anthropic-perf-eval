@@ -101,6 +101,8 @@ pub struct SsaScheduleResult {
     /// scratch constraint, `--no-scratch-constraint`). The allocator's limit is
     /// `address_result.budget`.
     pub cpsat_scratch_budget: Option<usize>,
+    /// Whether the build was configured for relaxed scratch analysis.
+    pub scratch_relaxed: bool,
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
@@ -619,6 +621,7 @@ pub fn export_partial_result_on_error(
         eliminated_vbroadcast_ops: ctx.final_decisions.eliminated_vbroadcast_ops.iter().copied().collect(),
         lb_cycles: ctx.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
         cpsat_scratch_budget: ctx.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
+        scratch_relaxed: ctx.config.compiler.is_relaxed_scratch(),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
     };
 

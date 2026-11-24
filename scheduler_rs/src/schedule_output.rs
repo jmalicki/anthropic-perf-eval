@@ -747,8 +747,7 @@ pub fn write_ssa_schedule_json(
         lb_cycles: result.lb_cycles,
         lb_scope: result.lb_cycles.map(|_| "emission"),
         scratch_size: result.address_result.budget,
-        scratch_relaxed: result.address_result.budget > crate::kernel_builder::config::SCRATCH_SIZE
-            || result.cpsat_scratch_budget == Some(0),
+        scratch_relaxed: result.scratch_relaxed,
         cpsat_scratch_budget: result.cpsat_scratch_budget,
         vector_group_lanes: result
             .vector_group_lanes

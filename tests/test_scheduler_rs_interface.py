@@ -7,6 +7,8 @@ functionality—that belongs in Rust tests. Each test: build via the binding →
 on Machine → assert output matches reference_kernel2. Small configs only so runs stay fast.
 """
 
+import json
+
 import pytest
 
 from problem import (
@@ -396,7 +398,7 @@ def test_depth4_validates():
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
 
 
-def test_scratch_size_and_scratch_constraint():
+def test_scratch_size_and_scratch_constraint(tmp_path):
     """PyO3: scratch_size / scratch_constraint reach the allocator, are reported in stats and
     give correct kernels (relaxed ones on a simulator with that much scratch)."""
     import scheduler_rs
@@ -419,6 +421,12 @@ def test_scratch_size_and_scratch_constraint():
     smaller = build(use_cpsat=False, scratch_size=1024)
     assert (smaller["scratch_size"], smaller["relaxed_scratch"]) == (1024, False)
 
+    relaxed_path = tmp_path / "relaxed.json"
+    relaxed_greedy = build(use_cpsat=False, scratch_size=1024, scratch_constraint=False,
+                           output_json=str(relaxed_path))
+    assert relaxed_greedy["relaxed_scratch"] is True
+    assert json.loads(relaxed_path.read_text())["scratch_relaxed"] is True
+
     larger = build(use_cpsat=False, scratch_size=3072)
     assert (larger["scratch_size"], larger["relaxed_scratch"]) == (3072, True)
 
@@ -432,3 +440,22 @@ def test_scratch_size_and_scratch_constraint():
     with pytest.raises(ValueError, match="scratch_size"):
         scheduler_rs.build_tick_tock_kernel_ssa(
             FOREST_HEIGHT, N_NODES, BATCH_SIZE, 2, verbose=False, use_cpsat=False, scratch_size=4)
+
+
+def test_direct_binding_protects_normal_outputs_from_relaxed_scratch(tmp_path):
+    import scheduler_rs
+    from kernel_build_args import NORMAL_KERNEL_PATHS
+
+    for name in sorted(NORMAL_KERNEL_PATHS):
+        normal_path = tmp_path / name
+        normal_path.write_text("existing artifact")
+        with pytest.raises(ValueError, match="separate from normal kernel artifacts"):
+            scheduler_rs.build_tick_tock_kernel_ssa(
+                FOREST_HEIGHT, N_NODES, 16, 2, verbose=False,
+                output_json=str(normal_path), scratch_size=3072)
+        assert normal_path.read_text() == "existing artifact"
+
+    normal_path = tmp_path / "scheduler_output.json"
+    scheduler_rs.build_tick_tock_kernel_ssa(
+        FOREST_HEIGHT, N_NODES, 16, 2, verbose=False, output_json=str(normal_path))
+    assert json.loads(normal_path.read_text())["scratch_relaxed"] is False
