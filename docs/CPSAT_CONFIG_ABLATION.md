@@ -867,3 +867,27 @@ uv run python -m scripts.run_symmetry_measurement --instances 4x64 \
     --only declared-mk-s2,none-mk-s2,checked-mk-s2 --jobs 1 --time-limit 180 \
     --out-dir build/symmetry_pickup_4x64 --name seed2_makespan
 ```
+
+### Three-seed makespan comparison
+
+The 4-round, batch-64 comparison was repeated on `63e0a66`, which preserves
+memory ordering in the checked symmetry mode. Each run used eight interleaved
+workers, a deterministic budget of 20, and a 600-second wall-clock backstop.
+
+| Symmetry mode | Seed 1 cycles | Seed 2 cycles | Seed 3 cycles | Median cycles |
+|---|---:|---:|---:|---:|
+| declared | 130 | 129 | 133 | 130 |
+| none | 121 | 118 | 121 | 121 |
+| checked | 125 | 126 | 127 | 126 |
+
+All nine solves returned a feasible schedule with a solver lower bound of 95.
+Each kernel passed symbolic dataflow replay and reference simulator validation.
+For each matched seed, `none` improved on `declared` by 9–12 cycles and
+`checked` improved by 3–6 cycles. This comparison covers one instance and
+objective. The weighted objective and the 6-round case remain to be measured.
+
+```bash
+uv run python -m scripts.run_symmetry_measurement --instances 4x64 --jobs 1 --time-limit 600 \
+    --only declared-mk-s1,declared-mk-s2,declared-mk-s3,none-mk-s1,none-mk-s2,none-mk-s3,checked-mk-s1,checked-mk-s2,checked-mk-s3 \
+    --out-dir build/symmetry_4x64_seeds --name matched_4x64_makespan
+```
