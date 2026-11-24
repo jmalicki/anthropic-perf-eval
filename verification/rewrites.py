@@ -594,6 +594,128 @@ def check_bits_from_index_needs_range(ctx=None) -> tuple[str, str, float, dict]:
     return ("R15-bits-from-index-needs-range", str(solver.check()), 0.0, _stats(solver))
 
 
+# =============================================================================
+# Normal forms used by the SSA equivalence checker (verification/ssa_equivalence.py)
+# =============================================================================
+#
+# The checker builds terms in normal form: sums of constant multiples (linear forms), XOR
+# sets, equality as a difference compared with zero, and selects. Each rule below is one of
+# the rewrites its constructors apply; constructors cite these ids.
+
+
+def check_linear_normal_form(ctx=None) -> tuple[str, str, float, dict]:
+    """R16: +, -, multiplication by a constant and shifts left by a constant are linear forms.
+
+    Z/2^32 is a commutative ring, so any expression built from +, - and multiplication by
+    constants equals c + sum(k_i * x_i) with one coefficient per distinct atom x_i. A left
+    shift by a constant k is multiplication by 2^k (by 0 for k >= 32, as the machine reduces
+    modulo 2^32), and multiply_add(a, b, c) with a constant factor is a linear form too.
+    """
+    x, y, z, k, c1, c2 = (_bv(n) for n in ("x", "y", "z", "k", "c1", "c2"))
+    from z3 import UGE, ULT
+
+    return _refute(
+        "R16-linear-normal-form",
+        And(ULT(k, _const(WIDTH)), (x << k) != x * (_const(1) << k)),
+        And(UGE(k, _const(WIDTH)), (x << k) != _const(0)),
+        (x + y) + z != x + (y + z),
+        x + y != y + x,
+        c1 * x + c2 * x != (c1 + c2) * x,
+        c1 * (x + y) != c1 * x + c1 * y,
+        c1 * (c2 * x) != (c1 * c2) * x,
+        x - y != x + _const(2**WIDTH - 1) * y,
+        _const(1) * x != x,
+        _const(0) * x != _const(0),
+        ctx=ctx,
+    )
+
+
+def check_xor_normal_form(ctx=None) -> tuple[str, str, float, dict]:
+    """R17: XOR is associative and commutative, x ^ x = 0 and x ^ 0 = x, so any XOR
+    expression equals c ^ (XOR of a set of atoms)."""
+    x, y, z = _bv("x"), _bv("y"), _bv("z")
+    return _refute(
+        "R17-xor-normal-form",
+        (x ^ y) ^ z != x ^ (y ^ z),
+        x ^ y != y ^ x,
+        x ^ x != _const(0),
+        x ^ _const(0) != x,
+        ctx=ctx,
+    )
+
+
+def check_equality_as_difference(ctx=None) -> tuple[str, str, float, dict]:
+    """R18: (a == b) iff (a - b == 0) iff (b - a == 0) modulo 2^32, so an equality test is
+    normalised to one linear form compared with zero, with a canonical sign."""
+    a, b = _bv("a"), _bv("b")
+    return _refute(
+        "R18-equality-as-difference",
+        (a == b) != (a - b == _const(0)),
+        (a - b == _const(0)) != (b - a == _const(0)),
+        ctx=ctx,
+    )
+
+
+def check_select_forms(ctx=None) -> tuple[str, str, float, dict]:
+    """R19: the select forms the normaliser produces.
+
+    select(c, t, t) = t for every c; for cond in {0, 1}, multiply_add(cond, d, f) =
+    select(cond, f + d, f) (R4 with t = f + d, R5) and cond * d = select(cond, d, 0).
+    """
+    c, t, f, d = _bv("c"), _bv("t"), _bv("f"), _bv("d")
+    boolean = Or(c == _const(0), c == _const(1))
+
+    def sel(cond, if_true, if_false):
+        return If(cond != _const(0), if_true, if_false)
+
+    return _refute(
+        "R19-select-forms",
+        sel(c, t, t) != t,
+        And(boolean, c * d + f != sel(c, f + d, f)),
+        And(boolean, c * d != sel(c, d, _const(0))),
+        ctx=ctx,
+    )
+
+
+def check_interval_transfer(ctx=None) -> tuple[str, str, float, dict]:
+    """R20: the interval rules of the normaliser are sound (unsigned 32-bit).
+
+    Used to recognise 0/1 conditions (R4 and R19 need them), to bound load addresses, and
+    as facts on cut points. For an operand x in [lo, hi]:
+      * x & y <= min(x, y);  x | y >= max(x, y);
+      * x, y < 2^m implies x | y < 2^m and x ^ y < 2^m;
+      * x >> k lies in [lo >> k, hi >> k];
+      * a comparison is 0 or 1; select(c, t, f) is t or f;
+      * a linear form: the 32-bit result equals the integer value of c + sum(k_i x_i)
+        modulo 2^32 (addition and multiplication commute with reduction modulo 2^32), so if
+        that integer lies in [0, 2^32) the result is that integer.
+    Division and remainder get no interval rule (the checker treats them as unbounded):
+    with a symbolic divisor Z3 does not decide their monotonicity within a minute.
+    """
+    from z3 import Extract, If as ZIf, ULE, ULT, ZeroExt
+
+    x, y, lo, hi, k, m = (_bv(n) for n in ("x", "y", "lo", "hi", "k", "m"))
+    in_range = And(ULE(lo, x), ULE(x, hi))
+    p = _const(1) << m
+    xw, yw, kw = ZeroExt(WIDTH, x), ZeroExt(WIDTH, y), ZeroExt(WIDTH, k)
+    return _refute(
+        "R20-interval-transfer",
+        Not(And(ULE(x & y, x), ULE(x & y, y))),
+        Not(And(ULE(x, x | y), ULE(y, x | y))),
+        And(ULT(m, _const(WIDTH)), ULT(x, p), ULT(y, p), Not(And(ULT(x | y, p), ULT(x ^ y, p)))),
+        And(in_range, Not(And(ULE(LShR(lo, k), LShR(x, k)), ULE(LShR(x, k), LShR(hi, k))))),
+        Not(ULE(ZIf(ULT(x, y), _const(1), _const(0)), _const(1))),
+        Not(ULE(ZIf(x == y, _const(1), _const(0)), _const(1))),
+        And(in_range, ULE(lo, y), ULE(y, hi), Not(And(ULE(lo, ZIf(k != _const(0), x, y)),
+                                                      ULE(ZIf(k != _const(0), x, y), hi)))),
+        # Reduction modulo 2^32 commutes with + and *: the low 32 bits of the exact (64-bit,
+        # no overflow) sum and product are the 32-bit sum and product.
+        Extract(WIDTH - 1, 0, xw + yw) != x + y,
+        Extract(WIDTH - 1, 0, kw * xw) != k * x,
+        ctx=ctx,
+    )
+
+
 REWRITE_CHECKS = [
     ("R1-hash-fma-fusion", "Hash stages 0/2/4 equal one multiply_add", check_hash_fma_fusion),
     ("R2-stage5-xor-deferral", "Stage-5 constant deferred into the next round's node XOR", check_stage5_xor_deferral),
@@ -618,6 +740,11 @@ REWRITE_CHECKS = [
     ("R14-mobius-select-needs-boolean", "Mobius form is wrong for a non-0/1 bit (SAT)", check_mobius_select_needs_boolean),
     ("R15-bits-from-index", "Older branch bits read back from the index", check_bits_from_index),
     ("R15-bits-from-index-needs-range", "Unmasked top bit is not 0/1 outside the index range (SAT)", check_bits_from_index_needs_range),
+    ("R16-linear-normal-form", "+, -, constant multiples and constant left shifts form linear forms", check_linear_normal_form),
+    ("R17-xor-normal-form", "XOR expressions are a constant XOR a set of atoms", check_xor_normal_form),
+    ("R18-equality-as-difference", "a == b is a - b == 0 (either sign)", check_equality_as_difference),
+    ("R19-select-forms", "select(c,t,t) = t; boolean multiply_add and product are selects", check_select_forms),
+    ("R20-interval-transfer", "Interval rules used for 0/1 conditions, load addresses and cut facts", check_interval_transfer),
 ]
 
 # Checks that are expected to find a counterexample.
