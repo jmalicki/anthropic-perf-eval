@@ -928,7 +928,7 @@ impl SsaTickTockKernelBuilder {
             passes::{
                 ComputeBoundsPass, ConstChoiceHintPass, ComputeDependenciesPass, DcePass,
                 ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass, LowerToOpsPass,
-                ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
+                ScheduleWithFixedChoicesPass, SelectChoiceHintPass, TransformPass, ValuShiftHintPass,
             },
         };
         use crate::cpsat_scheduler::{
@@ -986,7 +986,10 @@ impl SsaTickTockKernelBuilder {
         };
         let mut ctx = PipelineContext::new(program, config);
 
-        // Phase 1: Dependencies + DCE + Bounds + Greedy (via pipeline passes)
+        // Phase 1: [Transforms] + Dependencies + DCE + Bounds + Greedy (via pipeline passes)
+        if !ctx.config.compiler.transforms.is_empty() {
+            run_pass_with_error_export!(&mut ctx, &TransformPass);
+        }
         run_pass_with_error_export!(&mut ctx, &ComputeDependenciesPass);
         if self.config.compiler.enable_ssa_dce {
             run_pass_with_error_export!(&mut ctx, &DcePass);

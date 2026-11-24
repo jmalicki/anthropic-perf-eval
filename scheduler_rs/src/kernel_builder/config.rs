@@ -737,6 +737,41 @@ pub struct CompilerConfig {
     /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
     /// split shifts).
     pub cpsat_split_shift_hint: bool,
+    /// Rewrite rules applied to the finished SSA program before dependency computation
+    /// (`TransformPass`), in this order (default: none, the program is scheduled as emitted).
+    /// Unlike the other fields these change the ops; they are compiler passes, not emission
+    /// options, because they read only the program, never emitter state.
+    pub transforms: Vec<TransformKind>,
+}
+
+/// A rewrite rule the pipeline can apply to the finished program (`--transform`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransformKind {
+    /// Hash stages 2+3 in three ops (`transform::hash_merge`, catalogue rule 3, proof R8).
+    HashMerge,
+}
+
+impl TransformKind {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"hash-merge"`
+    ///
+    /// # Returns
+    /// The transform, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "hash-merge" => Ok(TransformKind::HashMerge),
+            other => Err(format!("Invalid transform '{}': must be 'hash-merge'", other)),
+        }
+    }
+
+    /// The CLI/binding spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransformKind::HashMerge => "hash-merge",
+        }
+    }
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -766,6 +801,7 @@ impl Default for CompilerConfig {
             scratch_size: SCRATCH_SIZE,
             cpsat_scratch_constraint: true,
             scratch_model: ScratchModel::default(),
+            transforms: Vec::new(),
         }
     }
 }

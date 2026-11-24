@@ -6,7 +6,8 @@
 //! definers, and a read of a decomposed lane depends on the decomposed vector's definer.
 //! Maps are used for lookup only and never iterated, so results do not depend on hash order.
 
-use std::collections::HashMap;
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{Opcode, SsaOp, VReg};
 
@@ -20,6 +21,10 @@ pub struct SsaGraph<'a> {
     lanes: &'a HashMap<VReg, Vec<VReg>>,
     /// Lane VReg of a decomposed vector (read group) -> (vector, lane).
     element_of: HashMap<VReg, (VReg, usize)>,
+    /// `users()`, computed on first use of `readers`.
+    users_cache: OnceCell<Vec<Vec<usize>>>,
+    /// VRegs some op names in `keep_live`, computed on first use of `is_kept_live`.
+    kept_live_cache: OnceCell<HashSet<VReg>>,
 }
 
 impl<'a> SsaGraph<'a> {
@@ -60,7 +65,7 @@ impl<'a> SsaGraph<'a> {
                 }
             }
         }
-        SsaGraph { ops, def, lanes, element_of }
+        SsaGraph { ops, def, lanes, element_of, users_cache: OnceCell::new(), kept_live_cache: OnceCell::new() }
     }
 
     /// Index of the op defining `v`, if any (a write-group alias and the zero VReg have none).
@@ -141,5 +146,29 @@ impl<'a> SsaGraph<'a> {
             }
         }
         users
+    }
+
+    /// Readers of op `idx` (its `users()` entry), from a cache built on first call.
+    ///
+    /// # Arguments
+    /// * `idx` - Op index.
+    ///
+    /// # Returns
+    /// Indices of the ops depending on op `idx`, increasing.
+    pub fn readers(&self, idx: usize) -> &[usize] {
+        &self.users_cache.get_or_init(|| self.users())[idx]
+    }
+
+    /// Whether some op lists `v` in its `keep_live` (lifetime extension, not a read).
+    ///
+    /// # Arguments
+    /// * `v` - The VReg.
+    ///
+    /// # Returns
+    /// True if a rewrite that removes `v` would leave a dangling `keep_live` entry.
+    pub fn is_kept_live(&self, v: VReg) -> bool {
+        self.kept_live_cache
+            .get_or_init(|| self.ops.iter().filter_map(|o| o.keep_live.as_ref()).flatten().copied().collect())
+            .contains(&v)
     }
 }

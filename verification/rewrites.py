@@ -152,6 +152,23 @@ def check_hash_stage_merge(ctx=None) -> tuple[str, str, float, dict]:
     )
 
 
+def check_hash_stage_merge_general(ctx=None) -> tuple[str, str, float, dict]:
+    """R8-general: for all a, m, c, d and every shift 0 <= k < 32,
+    x = a*m + c gives (x + d) ^ (x << k) = (a*m + (c+d)) ^ (a*(m << k) + (c << k)) mod 2^32.
+
+    The identity the `hash-merge` rewrite rule (scheduler_rs transform/hash_merge.rs) applies
+    to any site it matches, whatever its constants; R8-hash-stage-merge is its instance for
+    hash stages 2 and 3. One obligation per k (the rule rejects k outside 0..32).
+    """
+    a, m, c, d = _bv("a"), _bv("m"), _bv("c"), _bv("d")
+    x = a * m + c
+    violations = []
+    for k in range(WIDTH):
+        kk = _const(k)
+        violations.append(((x + d) ^ (x << kk)) != ((a * m + (c + d)) ^ (a * (m << kk) + (c << kk))))
+    return _refute("R8-hash-stage-merge-general", *violations, ctx=ctx)
+
+
 def check_hash_stage_merge_needs_left_shift(ctx=None) -> tuple[str, str, float, dict]:
     """R8-needs-left-shift: the same merge is wrong when the second stage shifts right (SAT).
 
@@ -605,6 +622,7 @@ REWRITE_CHECKS = [
     ("R6-boolean-forms", "Forms the dataflow checker accepts as 0/1 are 0/1", check_comparison_is_boolean),
     ("R7-index-range-by-depth", "Index range per depth: no bounds check before the last level, always wrap after", check_index_range_by_depth),
     ("R8-hash-stage-merge", "Hash stages 2+3 equal two multiply_adds and an XOR", check_hash_stage_merge),
+    ("R8-hash-stage-merge-general", "Stage merge holds for any constants m, c, d and shift 0 <= k < 32", check_hash_stage_merge_general),
     ("R8-hash-stage-merge-needs-left-shift", "Stage merge fails across a right shift (SAT)", check_hash_stage_merge_needs_left_shift),
     ("R9-mirrored-index-step", "Mirrored index n = L - idx updates as 2n + (v' & 1)", check_mirrored_index_step),
     ("R9-mirrored-index-step-needs-odd-constant", "Mirrored update fails for an even deferred constant (SAT)", check_mirrored_index_step_needs_odd_constant),

@@ -6,8 +6,8 @@
 //!
 //! ## Pipeline Variants
 //!
-//! - **Greedy pipeline**: Dependencies → DCE → Greedy → Barriers → Filter → Addresses → Lower
-//! - **CP-SAT pipeline**: Dependencies → DCE → Bounds → Greedy (hints) → Per-section feasibility
+//! - **Greedy pipeline**: [Transforms] → Dependencies → DCE → Greedy → Barriers → Filter → Addresses → Lower
+//! - **CP-SAT pipeline**: [Transforms] → Dependencies → DCE → Bounds → Greedy (hints) → Per-section feasibility
 //!   → Barriers → CP-SAT → Filter → Addresses → Lower
 //!
 //! ## Design
@@ -32,7 +32,7 @@ use super::tick_tock_ssa::SsaScheduleResult;
 
 use passes::{
     AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
-    FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass,
+    FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass, TransformPass,
 };
 use passes::{
     ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
@@ -239,13 +239,16 @@ impl PipelineContext {
 
     /// Run the greedy-only scheduling pipeline.
     ///
-    /// Pipeline: Dependencies → [DCE → Dependencies] → Bounds → Greedy(PolicyOnly) → Barriers → Filter → Addresses → Lower
+    /// Pipeline: [Transforms] → Dependencies → [DCE → Dependencies] → Bounds → Greedy(PolicyOnly) → Barriers → Filter → Addresses → Lower
     ///
     /// Bounds are computed so ASAP inflation can work in greedy-only mode.
     /// The greedy scheduler receives `GreedyBoundsUsage::PolicyOnly`, which enables
     /// inflation (policy decisions) without activating ASAP deferral or cycle
     /// clamping (core loop mechanics).
     pub fn run_greedy_pipeline(&mut self, enable_dce: bool) -> Result<(), String> {
+        if !self.config.compiler.transforms.is_empty() {
+            self.run_pass(&TransformPass)?;
+        }
         self.run_pass(&ComputeDependenciesPass)?;
         if enable_dce {
             self.run_pass(&DcePass)?;
@@ -294,6 +297,9 @@ impl PipelineContext {
     ///   → [Per-section feasibility] → Barriers → CP-SAT → Filter → Addresses → Lower
     #[cfg(feature = "cpsat")]
     pub fn run_cpsat_pipeline(&mut self, enable_dce: bool) -> Result<(), String> {
+        if !self.config.compiler.transforms.is_empty() {
+            self.run_pass(&TransformPass)?;
+        }
         self.run_pass(&ComputeDependenciesPass)?;
         if enable_dce {
             self.run_pass(&DcePass)?;
