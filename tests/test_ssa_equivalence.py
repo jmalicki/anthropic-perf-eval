@@ -251,3 +251,172 @@ def test_memory_order_is_checked():
     bad = se.check_equivalence(_program(False), _program(False), shape=(2, 8, 2))
     assert bad.verdict == "unproved"
     assert any("not ordered before the store" in u for u in bad.unproved)
+
+
+# =============================================================================
+# Small synthetic programs: A computes values[0] + 7 and stores it to values[0]
+# =============================================================================
+
+TINY = (2, 8, 2)
+TINY_LAYOUT = se.Layout.from_params(*TINY)
+
+
+class _Prog:
+    """Scalar SSA program builder: x = values[0]; ...; store(result)."""
+
+    def __init__(self):
+        self.ops = []
+        self.vp = self.const(TINY_LAYOUT.values_p)
+        self.x = self.op("load", self.vp)
+
+    def _add(self, opcode, srcs, dest=True):
+        vid = 100 + len(self.ops)
+        self.ops.append({"id": len(self.ops), "opcode": opcode, "dest": f"v{vid}_s" if dest else None,
+                         "cycle": 0, "source_info": {}, "srcs": srcs})
+        return vid
+
+    def const(self, c):
+        return self._add("const_choice", [{"Imm": c}])
+
+    def op(self, opcode, *srcs):
+        return self._add(opcode, [{"VReg": {"id": s, "width": "scalar"}} for s in srcs])
+
+    def plus7(self):
+        return self.op("+", self.x, self.const(7))
+
+    def store(self, value, addr=None):
+        self._add("store", [{"VReg": {"id": self.vp if addr is None else addr, "width": "scalar"}},
+                            {"VReg": {"id": value, "width": "scalar"}}], dest=False)
+        return {"ssa_ops": self.ops, "vector_group_lanes": {}}
+
+
+def _a():
+    p = _Prog()
+    return p.store(p.plus7())
+
+
+def _samples_agree(a, b):
+    """The final memories agree on every sample input the checker uses, so a verdict on these
+    programs comes from the prover, not from sampling."""
+    for image in TINY_LAYOUT.sample_images(32, 0):
+        image = [int(v) for v in image]
+        if se.final_memory(a, image) != se.final_memory(b, image):
+            return False
+    return True
+
+
+def _check(b):
+    return se.check_equivalence(_a(), b, shape=TINY)
+
+
+def test_z3_rejects_select_on_a_rare_value():
+    p = _Prog()
+    r = p.plus7()
+    b = p.store(p.op("select", p.op("==", p.x, p.const(0x12345)), p.op("+", p.x, p.const(8)), r))
+    assert _samples_agree(_a(), b)
+    result = _check(b)
+    assert result.verdict == "unproved" and result.stats.sat > 0
+
+
+def test_z3_rejects_multiply_add_of_a_rare_comparison():
+    p = _Prog()
+    b = p.store(p.op("multiply_add", p.op("==", p.x, p.const(0x777)), p.const(1), p.plus7()))
+    assert _samples_agree(_a(), b)
+    assert _check(b).verdict == "unproved"
+
+
+def test_z3_rejects_xor_of_a_rare_masked_comparison():
+    p = _Prog()
+    masked = p.op("&", p.x, p.const(0xFFFFF))
+    b = p.store(p.op("^", p.plus7(), p.op("==", masked, p.const(0x1234))))
+    assert _samples_agree(_a(), b)
+    assert _check(b).verdict == "unproved"
+
+
+def test_difference_only_outside_the_precondition_is_proved():
+    """x == 2^30 is never true for inputs below 2^30: proved by the interval fact on the load."""
+    p = _Prog()
+    b = p.store(p.op("+", p.plus7(), p.op("==", p.x, p.const(1 << 30))))
+    assert _samples_agree(_a(), b)
+    result = _check(b)
+    assert result.verdict == "proved", se.format_result(result)
+    assert result.stats.queries > 0
+
+
+def test_case_split_proves_a_select_identity():
+    """sel(x & 1, x + 8, x + 7) == x + 7 + (x & 1): needs the split on the 0/1 condition."""
+    p = _Prog()
+    bit = p.op("&", p.x, p.const(1))
+    b = p.store(p.op("select", bit, p.op("+", p.x, p.const(8)), p.plus7()))
+    q = _Prog()
+    bit_q = q.op("&", q.x, q.const(1))
+    a = q.store(q.op("+", q.plus7(), bit_q))
+    result = se.check_equivalence(a, b, shape=TINY)
+    assert result.verdict == "proved", se.format_result(result)
+    assert result.stats.split_cases > 0
+
+
+def test_memo_does_not_share_answers_across_ranges():
+    """(c & 1) == c holds for c in [0, 1] but not for c in [0, 3]: same structure, different
+    cut-point ranges, so the two queries must not share a memo entry."""
+    T = se.NormTerms(TINY_LAYOUT, TINY_LAYOUT.sample_images(4, 0))
+    x = T.mem(T.const(TINY_LAYOUT.values_p))
+    sweeper = se.Sweeper(T, 5000, 100)
+    answers = []
+    for mask in (1, 3):
+        c = T.binop("&", x, T.const(mask))
+        sweeper.mask[c] = se.BOTH  # shared by both programs: a cut point
+        answers.append(sweeper._prove(T.binop("&", c, T.const(1)), c, False))
+    assert answers == ["unsat", "sat"]
+    assert len(sweeper.memo) == 2
+
+
+def test_dangling_vreg_is_an_error():
+    p = _Prog()
+    b = p.store(p.op("+", p.plus7(), 999))
+    with pytest.raises(se.EquivalenceError, match="undefined VReg"):
+        _check(b)
+
+
+def test_value_dead_division_that_may_trap_is_not_proved():
+    p = _Prog()
+    divisor = p.op("-", p.x, p.const(5))
+    b = p.store(p.op("multiply_add", p.op("//", p.x, divisor), p.const(0), p.plus7()))
+    result = _check(b)
+    assert result.verdict == "unproved"
+    assert any("may be 0" in u for u in result.unproved)
+
+
+def test_value_dead_load_outside_memory_is_not_proved():
+    p = _Prog()
+    wild = p.op("load", p.op("+", p.vp, p.x))
+    b = p.store(p.op("multiply_add", wild, p.const(0), p.plus7()))
+    result = _check(b)
+    assert result.verdict == "unproved"
+    assert any("outside memory" in u for u in result.unproved)
+
+
+def test_word_stored_twice_is_an_error():
+    p = _Prog()
+    r = p.plus7()
+    p.store(r)
+    b = p.store(r)
+    with pytest.raises(se.EquivalenceError, match="more than once"):
+        _check(b)
+
+
+def test_non_constant_store_address_is_an_error():
+    p = _Prog()
+    b = p.store(p.plus7(), addr=p.op("+", p.vp, p.op("&", p.x, p.const(1))))
+    with pytest.raises(se.EquivalenceError, match="non-constant address"):
+        _check(b)
+
+
+def test_shape_must_match_recorded_run_options():
+    a = dict(_a(), run_options={"rounds": 2, "batch_size": 8, "forest_height": 2})
+    with pytest.raises(se.EquivalenceError, match="disagree"):
+        se.check_equivalence(a, _a(), shape=(2, 16, 2))
+    b = dict(_a(), run_options={"rounds": 2, "batch_size": 16, "forest_height": 2})
+    with pytest.raises(se.EquivalenceError, match="disagree"):
+        se.check_equivalence(a, b)
+    assert se.check_equivalence(a, _a()).verdict == "proved"

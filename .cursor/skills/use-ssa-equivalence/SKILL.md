@@ -28,22 +28,24 @@ uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/vo.json --values-
 uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/bad.json --counterexample-out /tmp/cex.json
 ```
 
-JSONs written by the binding directly (no `run_options`) need `--shape ROUNDS BATCH HEIGHT`. Exit status: 0 PROVED, 1 COUNTEREXAMPLE, 2 NOT PROVED or input error.
+JSONs written by the binding directly (no `run_options`) need `--shape ROUNDS BATCH HEIGHT`; a JSON that records its shape must match `--shape` and the other JSON. Exit status: 0 PROVED, 1 COUNTEREXAMPLE, 2 NOT PROVED, 3 input error (undefined VReg read, non-constant store address, a word stored twice, shapes disagree) or checker bug.
 
 ## Reading the output
 
 | Verdict | Meaning |
 |---|---|
-| `PROVED` | Every compared word has the same final value for every input satisfying the preconditions |
+| `PROVED` | For every input satisfying the preconditions: no op of either program traps, and every compared word has the same final value |
 | `COUNTEREXAMPLE` | The lowest-address word that differs, with both values, on an input confirmed by a plain concrete SSA interpreter. Run both kernels on that image to reproduce |
-| `NOT PROVED` | No sample input separates the programs, but some word was not proved (Z3 unknown/timeout, a query over the node budget, or a load the memory model cannot order). Never a pass |
+| `NOT PROVED` | No sample input separates the programs, but some word was not proved (Z3 sat on the abstraction, unknown/timeout, a query over the node budget), a load the memory model cannot order, or an op that may trap. The reasons are listed. Never a pass |
 
-Compared words: every word either program stores (a word not stored keeps its initial value), or with `--values-only` the output values only.
+Compared words: every word either program stores (a word not stored keeps its initial value), or with `--values-only` the output values only (no other word, indices included).
 
 ## What is assumed
 
 - **Preconditions** (`problem.build_mem_image`): header words fixed by the shape, every input index 0, tree and input values in [0, 2^30), extra room 0.
 - **SSA semantics**: ops are pure with machine semantics modulo 2^32; loads read the initial memory; stores write the final memory (same model as `kernel_dataflow`). Checked, not assumed: a constant-address load of a stored word must feed that store; other loads must have an address interval inside memory and away from stored words.
+- **No traps** (checked): every op of both programs, including value-dead ones still in the program, must provably not trap: load addresses inside memory and divisors (`//`, `%`, `cdiv`) nonzero, by intervals (R20). Otherwise NOT PROVED with the op named.
+- **Well-formed input** (checked, else input error): only the reserved zero VReg `v0` may be read without a definition; store addresses are constants; no word is stored twice.
 
 ## How it works (for when it does not prove)
 
@@ -57,4 +59,4 @@ All of: merge-hash, mirrored, prune-dead-index, bits, bits-flow, mobius, bits + 
 
 ## Tests
 
-`uv run --extra dev pytest tests/test_ssa_equivalence.py`: each emission option and a combination prove; a wrong hash constant, swapped select arms (default and bits emission) and an off-by-one load address, applied to the SSA program and the kernel alike, are rejected, and the counterexample input makes the two kernels write different words on `problem.Machine`; Z3 unknown is not a pass; the memory-order check rejects an unordered load.
+`uv run --extra dev pytest tests/test_ssa_equivalence.py`: each emission option and a combination prove; a wrong hash constant, swapped select arms (default and bits emission) and an off-by-one load address, applied to the SSA program and the kernel alike, are rejected, and the counterexample input makes the two kernels write different words on `problem.Machine`. Small synthetic programs on which every sample agrees check that Z3, not sampling, decides: differences on rare values are NOT PROVED, a difference only outside the precondition is PROVED. Also: Z3 unknown is not a pass; case splitting; the memo keeps queries with different ranges apart; value-dead traps; undefined VRegs, double stores, non-constant store addresses and mismatched shapes are errors; the memory-order check rejects an unordered load.

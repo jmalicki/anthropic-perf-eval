@@ -34,6 +34,16 @@ schedule orders it first), and a load with a non-constant address must have an a
 interval (R20) inside memory and disjoint from the stored words. A program that fails the
 check is reported UNPROVED.
 
+NO TRAPS: PROVED also requires that no op of either program can trap under the
+preconditions, including ops whose value is dead but that are still in the program: every
+load address must be provably inside memory and every divisor (//, %, cdiv) provably
+nonzero, both by intervals (R20). Otherwise the result is UNPROVED with the reason. Reads of
+undefined VRegs (other than the reserved zero VReg v0, which reads scratch[0] = 0), stores
+to non-constant addresses and two stores of one word are input errors.
+
+So PROVED states: on every valid input neither program traps, and both leave the same value
+in every compared word.
+
 How
 ---
 1. Normalised symbolic execution. Both programs are executed into one hash-consed term store
@@ -64,7 +74,7 @@ Usage:
     uv run python -m verification.ssa_equivalence a.json b.json [--values-only]
         [--samples 32] [--seed 0] [--timeout-ms 20000] [--counterexample-out cex.json]
 
-Exit status: 0 proved, 1 counterexample, 2 not proved (or an input error).
+Exit status: 0 proved, 1 counterexample, 2 not proved, 3 input error or checker bug.
 """
 
 from __future__ import annotations
@@ -90,6 +100,7 @@ VALUE_BOUND = 1 << 30  # input values and tree values are drawn from [0, 2^30)
 TOP = (0, MASK)
 SIGNED_HALF = 1 << 31
 PROGRAM_A, PROGRAM_B, BOTH = 1, 2, 3
+ZERO_VREG = 0  # the reserved VReg at scratch[0], which is never written and reads 0
 _COMMUTATIVE_ATOMS = {"&", "|", "*"}
 
 
@@ -169,17 +180,25 @@ class Layout:
         return images
 
 
-def layout_of(sched: dict, shape: tuple[int, int, int] | None = None) -> Layout:
-    """Layout for `sched`: from `shape` (rounds, batch_size, forest_height) if given, else from
-    the run_options the generator writes."""
-    if shape is not None:
-        return Layout.from_params(*shape)
+def recorded_shape(sched: dict) -> tuple[int, int, int] | None:
+    """(rounds, batch_size, forest_height) from the run_options the generator writes, or None."""
     opts = sched.get("run_options") or {}
-    try:
-        return Layout.from_params(int(opts["rounds"]), int(opts["batch_size"]), int(opts["forest_height"]))
-    except KeyError as missing:
-        raise EquivalenceError(f"scheduler JSON lacks run_options[{missing}]; regenerate it with the "
-                               "current generator (--output-json) or give the shape") from None
+    if not all(k in opts for k in ("rounds", "batch_size", "forest_height")):
+        return None
+    return (int(opts["rounds"]), int(opts["batch_size"]), int(opts["forest_height"]))
+
+
+def layout_of(sched_a: dict, sched_b: dict, shape: tuple[int, int, int] | None = None) -> Layout:
+    """The one layout both programs are for. A recorded shape must agree with the other
+    program's and with `shape` (a wrong shape would fold real input words to constants);
+    `shape` is required only when neither JSON records one."""
+    shapes = {s for s in (recorded_shape(sched_a), recorded_shape(sched_b), shape) if s is not None}
+    if len(shapes) > 1:
+        raise EquivalenceError(f"problem shapes disagree (rounds, batch_size, forest_height): {sorted(shapes)}")
+    if not shapes:
+        raise EquivalenceError("neither scheduler JSON records run_options (rounds, batch_size, forest_height); "
+                               "regenerate with the generator (--output-json) or give the shape")
+    return Layout.from_params(*shapes.pop())
 
 
 # =============================================================================
@@ -248,8 +267,9 @@ class NormTerms(Terms):
         self.rows = np.arange(images.shape[0])
         self.vals: list[np.ndarray] = []
         self.iv: list[tuple[int, int]] = []
-        self.out_of_range_loads = 0
-        self.zero_divisions = 0
+        self.program = ""  # name of the program being built, for trap messages
+        self.traps: list[str] = []  # ops that may trap under the preconditions
+        self._trap_seen: set[tuple[str, int]] = set()
 
     # ---- interning, values, intervals ------------------------------------------------
 
@@ -285,13 +305,8 @@ class NormTerms(Terms):
         if kind == "mem":
             addr = vals[term[1]]
             bad = addr >= self.layout.mem_size
-            if bad.any():
-                self.out_of_range_loads += 1
             return np.where(bad, np.uint64(0), self.images[self.rows, np.where(bad, 0, addr).astype(np.int64)])
-        a, b = vals[term[1]], vals[term[2]]
-        if kind in ("//", "%", "cdiv") and (b == 0).any():
-            self.zero_divisions += 1
-        return _raw(kind, a, b)
+        return _raw(kind, vals[term[1]], vals[term[2]])
 
     def _lin_interval(self, c: int, coeffs) -> tuple[int, int]:
         lo = hi = 0
@@ -428,9 +443,16 @@ class NormTerms(Terms):
 
     # ---- the Terms interface used by kernel_dataflow.ssa_values -------------------------
 
+    def _trap(self, key: int, message: str) -> None:
+        if (self.program, key) not in self._trap_seen:
+            self._trap_seen.add((self.program, key))
+            self.traps.append(f"{self.program}: {message}")
+
     def binop(self, op: str, a: int, b: int) -> int:
         if op not in _FOLD:
             raise EquivalenceError(f"unknown binary op {op!r}")
+        if op in ("//", "%", "cdiv") and self.iv[b][0] == 0:
+            self._trap(b, f"{op} by {self.show(b)}, which may be 0 (interval {list(self.iv[b])})")
         return self._checked(self._binop(op, a, b), _raw(op, self.vals[a], self.vals[b]), op)
 
     def _binop(self, op: str, a: int, b: int) -> int:
@@ -479,7 +501,11 @@ class NormTerms(Terms):
         lo, hi = (a, b) if a < b else (b, a)
         return self.add(self._intern(("*", lo, hi)), c)
 
-    def mem(self, addr: int) -> int:
+    def mem(self, addr: int, record: bool = True) -> int:
+        """A load. From the SSA program (`record`), its address must be provably in memory."""
+        if record and self.iv[addr][1] >= self.layout.mem_size:
+            self._trap(addr, f"load address {self.show(addr)} may be outside memory "
+                             f"(interval {list(self.iv[addr])}, memory has {self.layout.mem_size} words)")
         ca = self.const_value(addr)
         if ca is not None and self.layout.fixed_word(ca) is not None:
             tid = self.const(self.layout.fixed_word(ca))
@@ -525,6 +551,10 @@ def build_program(sched: dict, terms: Terms, name: str) -> tuple[dict[int, tuple
     at most once (an SSA program has no order between two stores of one word).
     """
     values = ssa_values(sched, terms)
+    dangling = sorted(set(values.undefined_vregs) - {ZERO_VREG})
+    if dangling:
+        raise EquivalenceError(f"{name}: reads undefined VReg(s) {['v%d' % v for v in dangling[:5]]}; only "
+                               f"v{ZERO_VREG} (scratch[0], always 0) may be read without a definition")
     stores: dict[int, tuple[int, str]] = {}
     for addr_tid, (val, where) in values.stores.items():
         addr = terms.const_value(addr_tid) if isinstance(terms, NormTerms) else addr_tid[0]
@@ -631,6 +661,7 @@ class SweepStats:
     z3_seconds: float = 0.0
     max_query_seconds: float = 0.0
     max_query_nodes: int = 0
+    split_cases: int = 0
 
 
 class Sweeper:
@@ -678,7 +709,7 @@ class Sweeper:
         if kind == "sel":
             return T.sel(f(term[1]), f(term[2]), f(term[3]))
         if kind == "mem":
-            return T.mem(f(term[1]))
+            return T.mem(f(term[1]), record=False)
         if kind == "*":
             return T._fma(f(term[1]), f(term[2]), T.const(0))
         return T._binop(kind, f(term[1]), f(term[2]))
@@ -719,7 +750,9 @@ class Sweeper:
 
         Returns (nodes, root indices, node intervals) or None if it exceeds the node budget.
         Node indices are assigned in DFS order, so queries equal up to renaming of cut points
-        serialise alike (intervals are a function of the structure and the cut intervals).
+        serialise alike. The intervals of inner nodes are not a function of that structure (a
+        node interned before a child was merged keeps the interval computed from the old
+        child), and they decide the case split, so the memo key includes them.
         """
         T = self.terms
         index: dict[int, int] = {}
@@ -836,7 +869,7 @@ class Sweeper:
             self.stats.too_large += 1
             return "too-large"
         nodes, (rx, ry), ivs = query
-        key = (tuple(nodes), rx, ry)
+        key = (tuple(nodes), rx, ry, tuple(ivs))
         if key in self.memo:
             self.stats.cache_hits += 1
             return self.memo[key]
@@ -848,6 +881,7 @@ class Sweeper:
         conds = sorted({n[1] for n in nodes if n[0] == "sel" and ivs[n[1]][1] <= 1})
         if len(conds) > self.max_split_bits:
             conds = []
+        self.stats.split_cases += (1 << len(conds)) if conds else 0
         t0 = time.perf_counter()
         result = "unsat"
         for case in range(1 << len(conds)):
@@ -926,31 +960,31 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
 
     # Arguments
     * `sched_a`, `sched_b` - scheduler JSONs (``--output-json``) of one problem shape
-    * `values_only` - compare only the output values, not the indices
+    * `values_only` - compare only the output values; no other word (indices included)
     * `samples` - random valid inputs used to pair terms and to find counterexamples
     * `seed` - seed of those inputs
     * `timeout_ms` - Z3 timeout per query (a timeout is "not proved", never a pass)
     * `node_budget` - largest query (term nodes) handed to Z3
-    * `shape` - (rounds, batch_size, forest_height) for JSONs without run_options (both
-      programs must be for this shape)
+    * `shape` - (rounds, batch_size, forest_height); required when neither JSON records
+      run_options, and must match any JSON that does
 
     # Returns
     A Result whose verdict is "proved", "counterexample" (with the first differing word and
     an input image that shows it, confirmed by a concrete interpreter) or "unproved".
     """
     t0 = time.perf_counter()
-    layout = layout_of(sched_a, shape)
-    if shape is None and layout != layout_of(sched_b):
-        raise EquivalenceError("the two programs are for different problem shapes (rounds, batch_size, forest_height)")
+    layout = layout_of(sched_a, sched_b, shape)
     images = layout.sample_images(max(samples, 2), seed)
     terms = NormTerms(layout, images)
+    terms.program = "A"
     stores_a, n_a = build_program(sched_a, terms, "A")
+    terms.program = "B"
     stores_b, n_b = build_program(sched_b, terms, "B")
 
     words = layout.value_words() if values_only else sorted(set(stores_a) | set(stores_b))
 
     def final(stores, addr):
-        return stores[addr][0] if addr in stores else terms.mem(terms.const(addr))
+        return stores[addr][0] if addr in stores else terms.mem(terms.const(addr), record=False)
 
     pairs = [(addr, final(stores_a, addr), final(stores_b, addr)) for addr in words]
     reach_a = _reach(terms, [a for _, a, _ in pairs] + [v for v, _ in stores_a.values()])
@@ -959,7 +993,8 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
               for t in reach_a | reach_b}
 
     result = Result("unproved", layout, values_only, len(words), 0, ops=(n_a, n_b))
-    problems = (memory_order_problems(sched_a, terms, stores_a, reach_a, layout, "A")
+    problems = (list(terms.traps)
+                + memory_order_problems(sched_a, terms, stores_a, reach_a, layout, "A")
                 + memory_order_problems(sched_b, terms, stores_b, reach_b, layout, "B"))
 
     sweeper = Sweeper(terms, timeout_ms, node_budget)
@@ -1005,7 +1040,8 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
 
 def format_result(result: Result, name_a: str = "A", name_b: str = "B", limit: int = 5) -> str:
     L, s = result.layout, result.stats
-    what = "values only (indices not compared)" if result.values_only else "every stored word"
+    what = ("the output values only (no other word is compared, indices included)" if result.values_only
+            else "every word either program stores")
     lines = [f"ssa equivalence: {name_a} ({result.ops[0]} ops) vs {name_b} ({result.ops[1]} ops); "
              f"{L.rounds} rounds, batch {L.batch_size}, height {L.forest_height}",
              f"  compared {result.compared} words: {what}"]
@@ -1017,7 +1053,8 @@ def format_result(result: Result, name_a: str = "A", name_b: str = "B", limit: i
                      f"A writes {d.value_a:#x}, B writes {d.value_b:#x}")
         lines.append(f"    on sample input {d.sample} (write it with --counterexample-out)")
     else:
-        lines.append(f"  NOT PROVED - {result.proved_words}/{result.compared} words proved; no sample input separates the rest")
+        lines.append(f"  NOT PROVED - {result.proved_words}/{result.compared} words proved, no sample input separates "
+                     "the rest; reasons:")
         lines += [f"    {u}" for u in result.unproved[:limit]]
         if len(result.unproved) > limit:
             lines.append(f"    … {len(result.unproved) - limit} more")
@@ -1033,7 +1070,8 @@ def main(argv=None) -> int:
     ap.add_argument("a", help="scheduler JSON of the reference program (e.g. the default emission)")
     ap.add_argument("b", help="scheduler JSON of the transformed program")
     ap.add_argument("--values-only", action="store_true",
-                    help="compare only the output values (for --values-only builds, which do not store indices)")
+                    help="compare only the output values; no other word, indices included, is compared "
+                         "(for --values-only builds, which do not store indices)")
     ap.add_argument("--samples", type=int, default=32, help="random valid inputs (default 32)")
     ap.add_argument("--seed", type=int, default=0, help="seed of the sample inputs")
     ap.add_argument("--timeout-ms", type=int, default=20000, help="Z3 timeout per query")
@@ -1052,8 +1090,11 @@ def main(argv=None) -> int:
                                    args.timeout_ms, args.node_budget,
                                    tuple(args.shape) if args.shape else None)
     except EquivalenceError as e:
-        print(f"ssa equivalence: error: {e}", file=sys.stderr)
-        return 2
+        print(f"ssa equivalence: input error: {e}", file=sys.stderr)
+        return 3
+    except AssertionError as e:
+        print(f"ssa equivalence: checker bug: {e}", file=sys.stderr)
+        return 3
     print(format_result(result, args.a, args.b))
     if result.difference is not None and args.counterexample_out:
         d = result.difference
