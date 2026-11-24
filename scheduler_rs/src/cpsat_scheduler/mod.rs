@@ -171,6 +171,7 @@ pub mod bounds;
 pub mod model;
 pub(crate) mod op_times;
 pub(crate) mod makespan_rows;
+pub(crate) mod group_symmetry;
 pub(crate) mod symmetry_ordering;
 pub mod window;
 #[cfg(test)]
@@ -179,7 +180,7 @@ mod tests;
 // Re-exports: all public items from sub-modules
 pub use config::{
     ConstChoiceMode, CpsatLaneModel, CpsatObjective, CpsatResult, CpsatStatus, CpsatTuning,
-    CumulativePropagator, MakespanRows,
+    CumulativePropagator, MakespanRows, SymmetryRows,
     OptionalConstraintGroup,
     ScratchTime, SelectChoiceMode, ValuShiftMode,
 };

@@ -20,7 +20,7 @@ use super::symmetry_ordering::SymmetryOrdering;
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
 use super::config::{
     ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
-    OptionalConstraintGroup, ScratchTime, SelectChoiceMode, ValuShiftMode,
+    OptionalConstraintGroup, ScratchTime, SelectChoiceMode, SymmetryRows, ValuShiftMode,
 };
 #[cfg(feature = "cpsat")]
 use super::makespan_rows::{add_makespan_rows, static_paths, OpClasses, RowCaps, WorkContext};
@@ -173,6 +173,9 @@ pub(crate) fn build_sat_parameters(
     params.cp_model_presolve = Some(true);
     params.cp_model_probing_level = Some(tuning.probing_level);
     params.randomize_search = Some(true);
+    if let Some(seed) = tuning.random_seed {
+        params.random_seed = Some(seed);
+    }
     // interleave_search: runs the subsolvers round-robin in deterministic batches, so the
     // result does not depend on thread timing. OR-Tools 9.15 does not start the probing,
     // shaving, lb_tree_search and objective_lb_search workers in this mode; turning it off
@@ -643,30 +646,15 @@ pub fn schedule_ssa_cpsat(
         alap
     };
 
-    // A window can also supply lane cycles from a previous feasible CP-SAT solution.
-    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
-    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
-    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
-    // size and start hints), so what is hinted is exactly what the check counted.
-    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
-        if !shift_hints.is_some_and(|ids| ids.contains(&op_id)) {
-            return None;
-        }
-        let lo = *asap.get(&op_id).unwrap_or(&0);
-        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
-        hints
-            .shifted_lane_cycle_hints
-            .and_then(|m| m.get(&op_id))
-            .filter(|lanes| lanes.len() == VLEN && lanes.iter().all(|&c| c >= lo && c <= hi))
-            .or_else(|| alu_lane_hints.and_then(|m| m.get(&op_id)).filter(|lanes| lanes.len() == VLEN))
-    };
-
     // 1b. Tighten ASAP/ALAP bounds if enabled. Build canonical symmetry ordering once when
     // symmetry-aware or energetic tightening is used; use it for both passes and model constraints.
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering() {
+    // With checked symmetry rows the emission-declared ordering is not trusted, here either.
+    let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering()
+        && tuning.symmetry_rows != SymmetryRows::Checked
+    {
         Some(SymmetryOrdering::from_bounds(
             ops,
             &current_asap,
@@ -865,6 +853,34 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
+    // 2d. Checked symmetry rows: find the orbits of identical vector groups and give
+    // corresponding ops of an orbit one domain (group_symmetry.rs), so that every swap within
+    // an orbit is an automorphism of the model.
+    // Section liveness, per-op shift restrictions, window pins, and dead-store hints can distinguish
+    // otherwise identical groups. The structural check does not model those restrictions.
+    let group_orbits = if tuning.symmetry_rows == SymmetryRows::Checked
+        && window.is_none()
+        && !forced_shifts.is_some_and(|ids| !ids.is_empty())
+        && initial_live.is_none()
+        && !live_out_vregs.is_some_and(|vregs| !vregs.is_empty())
+        && !live_through_vregs.is_some_and(|vregs| !vregs.is_empty())
+        && !greedy_hints.is_some_and(|cycles| cycles.iter().any(|&cycle| cycle < 0))
+    {
+        let orbits = super::group_symmetry::group_orbits(ops, hints.vector_group_lanes, cse_groups.unwrap_or(&[]));
+        super::group_symmetry::symmetric_domains(ops, &orbits, &mut [&mut final_asap, &mut final_alap]);
+        Some(orbits)
+    } else {
+        None
+    };
+    let (asap, alap) = match &group_orbits {
+        Some(orbits) => {
+            let (mut asap, mut alap) = (asap, alap);
+            super::group_symmetry::symmetric_domains(ops, orbits, &mut [&mut asap, &mut alap]);
+            (asap, alap)
+        }
+        None => (asap, alap),
+    };
+
     // 2d. Window probe: the reference must stay inside every domain, and so must each cycle
     // the block after the window can move to. 2c covers ops with a hint; dead stores (hint
     // -1) are pinned at the reference too but got no widening, and tightening computed on a
@@ -898,6 +914,25 @@ pub fn schedule_ssa_cpsat(
             eprintln!("[window probe]   widened {} domain bound(s) to cover the reference", widened);
         }
     }
+
+    // A window can also supply lane cycles from a previous feasible CP-SAT solution.
+    // Lane cycles of a hinted split shift: only for ops hinted as shifted, with one cycle per
+    // lane, and only if every lane lies in the lane variables' domain ([asap, alap] above, see
+    // op_times::create_op_variables). Otherwise the op is treated as a whole shift everywhere (capacity check, lane,
+    // size and start hints), so what is hinted is exactly what the check counted.
+    let hinted_lanes = |op_id: usize| -> Option<&Vec<i32>> {
+        if !shift_hints.is_some_and(|ids| ids.contains(&op_id)) {
+            return None;
+        }
+        let lo = *asap.get(&op_id).unwrap_or(&0);
+        let hi = *alap.get(&op_id).unwrap_or(&((horizon - 1) as i32));
+        hints
+            .shifted_lane_cycle_hints
+            .and_then(|m| m.get(&op_id))
+            .filter(|lanes| lanes.len() == VLEN && lanes.iter().all(|&c| c >= lo && c <= hi))
+            .or_else(|| alu_lane_hints.and_then(|m| m.get(&op_id)).filter(|lanes| lanes.len() == VLEN))
+    };
+
 
     // 3. Build the CP model
     let mut model = CpModelBuilder::default();
@@ -1008,17 +1043,19 @@ pub fn schedule_ssa_cpsat(
         }
     }
 
-    // 5b. Symmetry breaking (ordering groups): use the canonical ordering built earlier.
-    // Validate that final bounds are consistent with the ordering, then add cycle[i] <= cycle[j].
-    {
-        let ordering_pairs: Vec<(usize, usize)> = if let Some(ref ord) = symmetry_ordering {
-            ord.validate_bounds(ops, &final_asap, &final_alap, greedy_hints);
-            ord.ordering_pairs()
-        } else {
-            super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, greedy_hints)
+    // 5b. Symmetry breaking (ordering groups): normally use the canonical order built earlier.
+    // When forced modes rule out the greedy schedule, use the final domains to choose an order.
+    let rejected_ordering_hint = greedy_hints.is_some() && bound_hints.is_none();
+    if tuning.symmetry_rows == SymmetryRows::Declared {
+        let ordering_pairs = match &symmetry_ordering {
+            Some(ord) if !rejected_ordering_hint => {
+                ord.validate_bounds(ops, &final_asap, &final_alap, bound_hints);
+                ord.ordering_pairs()
+            }
+            _ => super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, bound_hints),
         };
         let n_ordering = ordering_pairs.len();
-        let order_source = if greedy_hints.is_some() { "greedy" } else { "ALAP" };
+        let order_source = if bound_hints.is_some() { "greedy" } else { "ALAP" };
         for (i, j) in &ordering_pairs {
             let c = model.add_le(times[*i].issue(), times[*j].issue());
             model.set_constraint_name(c, &format!("sym_ord_{}_{}", i, j));
@@ -1032,9 +1069,9 @@ pub fn schedule_ssa_cpsat(
     }
 
     // 5c. Symmetry breaking (lexicographic streams): for each stream_key, items ordered by item_key
-    // get first_op[item_i] <= first_op[item_{i+1}]. When greedy hints are available, order items
+    // get first_op[item_i] <= first_op[item_{i+1}]. When eligible greedy hints are available, order items
     // by greedy cycle of their first op so constraints match the hint. Verify domain consistency.
-    {
+    if tuning.symmetry_rows == SymmetryRows::Declared {
         use std::collections::{BTreeMap, HashMap};
         let mut streams: HashMap<Vec<i64>, BTreeMap<i64, Vec<usize>>> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
@@ -1060,7 +1097,7 @@ pub fn schedule_ssa_cpsat(
         for stream_key in stream_keys {
             let by_item = &streams[stream_key];
             let mut ordered: Vec<Vec<usize>> = by_item.values().cloned().collect();
-            if let Some(hints) = greedy_hints {
+            if let Some(hints) = bound_hints {
                 // Sort items by greedy cycle of their first op so lex constraints match the hint.
                 // Tiebreaker: ALAP of first op for determinism and domain consistency.
                 ordered.sort_by_key(|group| {
@@ -1069,8 +1106,10 @@ pub fn schedule_ssa_cpsat(
                     let alap_val = *final_alap.get(&ops[first].id).unwrap_or(&0);
                     (greedy, alap_val)
                 });
+            } else if rejected_ordering_hint {
+                ordered.sort_by_key(|group| *final_alap.get(&ops[group[0]].id).unwrap_or(&0));
             }
-            // else: already ordered by item_key (BTreeMap preserves key order)
+            // With no greedy schedule, preserve the BTreeMap's item_key order.
             for w in ordered.windows(2) {
                 let first_op_cur = w[0][0];
                 let first_op_next = w[1][0];
@@ -1083,8 +1122,8 @@ pub fn schedule_ssa_cpsat(
                          but ASAP[{}]={} > ALAP[{}]={}. Greedy hints: cur={}, next={}.",
                         stream_key, first_op_cur, first_op_next,
                         first_op_cur, asap_cur, first_op_next, alap_next,
-                        greedy_hints.and_then(|h| h.get(first_op_cur).copied()).unwrap_or(-1),
-                        greedy_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
+                        bound_hints.and_then(|h| h.get(first_op_cur).copied()).unwrap_or(-1),
+                        bound_hints.and_then(|h| h.get(first_op_next).copied()).unwrap_or(-1),
                     );
                 }
                 let c = model.add_le(times[first_op_cur].issue(), times[first_op_next].issue());
@@ -1093,11 +1132,57 @@ pub fn schedule_ssa_cpsat(
             }
         }
         if verbose && lex_constraints > 0 {
-            let lex_source = if greedy_hints.is_some() { "greedy" } else { "item_key" };
+            let lex_source = if bound_hints.is_some() {
+                "greedy"
+            } else if rejected_ordering_hint {
+                "ALAP"
+            } else {
+                "item_key"
+            };
             eprintln!(
                 "  Symmetry breaking (lex streams): {} streams, {} constraints (order from {})",
                 n_streams, lex_constraints, lex_source
             );
+        }
+    }
+
+    // 5e. Checked symmetry rows: in each orbit of identical groups, the anchor ops' issue
+    // cycles in a chain, groups ordered by the anchor's greedy cycle so the hint satisfies it.
+    if let Some(orbits) = &group_orbits {
+        let mut rows = 0usize;
+        for o in 0..orbits.orbits.len() {
+            let Some(anchor) = super::group_symmetry::anchor_position(ops, orbits, o, &shiftable_set) else {
+                continue;
+            };
+            let mut members: Vec<(i32, usize, usize)> = orbits.orbits[o]
+                .iter()
+                .map(|&g| {
+                    let idx = orbits.groups[g][anchor];
+                    (greedy_hints.and_then(|h| h.get(idx).copied()).unwrap_or(0), g, idx)
+                })
+                .collect();
+            members.sort();
+            for w in members.windows(2) {
+                let c = model.add_le(times[w[0].2].issue(), times[w[1].2].issue());
+                model.set_constraint_name(c, &format!("group_sym_{}_{}_{}", o, w[0].1, w[1].1));
+                rows += 1;
+            }
+        }
+        // Declared rows, classified against the orbits (for the record; none are added).
+        let declared = super::bounds::build_ordering_pairs_from_bounds(ops, &final_asap, &final_alap, bound_hints);
+        let (justified, same_group, other) = super::group_symmetry::classify_pairs(orbits, &declared);
+        let sizes: Vec<usize> = orbits.orbits.iter().map(Vec::len).collect();
+        eprintln!(
+            "  Group symmetry: {} groups, orbits of sizes {:?}, {} chain rows; declared ordering pairs: {} justified by a group swap, {} within one group, {} other",
+            orbits.groups.len(),
+            sizes,
+            rows,
+            justified,
+            same_group,
+            other
+        );
+        for why in &orbits.rejections {
+            eprintln!("    not identical: {}", why);
         }
     }
 

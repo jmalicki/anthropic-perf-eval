@@ -834,3 +834,115 @@ uv run python -m scripts.run_cpsat_ablation --instances 4x64,6x64 --budget 20 --
     --config "L2+bucketed+P0:--cpsat-makespan-rows bucketed --cpsat-probing-level 0"
 uv run python -m verification.makespan_rows
 ```
+
+## 10. Group symmetry modes
+
+### Initial comparison at 4 rounds, batch 64
+
+With the makespan-only objective and solver seed 2, the `none` configuration reached 118 cycles,
+`checked` reached 126 and `declared` reached 129. The greedy scheduler reported 143 cycles.
+CP-SAT accepted a complete feasible hint with objective 140 in each of the three solves.
+
+| Symmetry mode | Schedule cycles | Lower bound | Total solver deterministic time | Solver wall time (s) | Peak live words |
+|---|---:|---:|---:|---:|---:|
+| declared | 129 | 95 | 20.5330 | 110.2420 | 538 |
+| none | 118 | 95 | 23.1028 | 123.4560 | 575 |
+| checked | 126 | 95 | 21.7012 | 72.5203 | 570 |
+
+All three ran sequentially at commit `f720de5` with eight interleaved workers, a deterministic
+limit of 20 and a 180-second wall-clock backstop. Each completed within the backstop with
+status FEASIBLE. Symbolic dataflow replay proved each kernel and numeric validation passed.
+The runner also retained its seed-1 control with the weighted objective and declared rows.
+It reached 139 cycles, bound 95, in 20.3109 total deterministic time and 104.132 seconds.
+
+These results compare the three modes for one instance and seed. Under default energetic
+tightening, `none` drops the explicit ordering rows but still uses declared ordering during
+ASAP tightening. `checked` bypasses that ordering and widens corresponding operation domains
+to their union before adding one anchor chain per orbit. It found five interchangeable groups
+among eight and added four ordering rows. The three modes therefore change both the constraints
+and the search domains, and their total solver work differs as shown above.
+
+The study runner accepts this subset once the branch's scheduler extension is built.
+
+```bash
+uv run python -m scripts.run_symmetry_measurement --instances 4x64 \
+    --only declared-mk-s2,none-mk-s2,checked-mk-s2 --jobs 1 --time-limit 180 \
+    --out-dir build/symmetry_pickup_4x64 --name seed2_makespan
+```
+
+### Three-seed makespan comparison
+
+The 4-round, batch-64 comparison was repeated on `63e0a66`, which preserves
+memory ordering in the checked symmetry mode. Each run used eight interleaved
+workers, a deterministic budget of 20, and a 600-second wall-clock backstop.
+
+| Symmetry mode | Seed 1 cycles | Seed 2 cycles | Seed 3 cycles | Median cycles |
+|---|---:|---:|---:|---:|
+| declared | 130 | 129 | 133 | 130 |
+| none | 121 | 118 | 121 | 121 |
+| checked | 125 | 126 | 127 | 126 |
+
+All nine solves returned a feasible schedule with a solver lower bound of 95.
+Each kernel passed symbolic dataflow replay and reference simulator validation.
+For each matched seed, `none` improved on `declared` by 9–12 cycles and
+`checked` improved by 3–6 cycles. This comparison covers one instance and
+objective. The next subsection reports the complete sweep on the composed code.
+
+```bash
+uv run python -m scripts.run_symmetry_measurement --instances 4x64 --jobs 1 --time-limit 600 \
+    --only declared-mk-s1,declared-mk-s2,declared-mk-s3,none-mk-s1,none-mk-s2,none-mk-s3,checked-mk-s1,checked-mk-s2,checked-mk-s3 \
+    --out-dir build/symmetry_4x64_seeds --name matched_4x64_makespan
+```
+
+### Complete matched sweep after scratch accounting and window probes
+
+The 36-cell sweep used the source tree published in `b3f2511`, which included
+the final #58 artifact safeguards, #64 scratch phase accounting and the #66 window probe.
+The release scheduler extension used Homebrew OR-Tools `9.15_16` on macOS arm64.
+Each cell used batch size 64, eight interleaved solver workers, a deterministic-time limit
+of 20 and a 3,600-second wall-clock backstop. Three cells ran concurrently. Each symmetry
+mode was paired with the same seeds (1, 2 and 3) for both objectives and round counts.
+
+All 36 cells had a complete feasible hint and returned `FEASIBLE`. Symbolic dataflow
+replay proved each kernel and reference simulator validation passed. Solver wall times
+ranged from 52.6 to 107.7 seconds, with no wall-clock backstop hits. The table reports
+schedule cycles by seed and the final solver lower bound within each configuration's domains.
+
+| Rounds | Objective | Symmetry rows | Seed 1 | Seed 2 | Seed 3 | Median | Solver bound |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 4 | `makespan+tiebreak` | `declared` | 137 | 134 | 137 | 137 | 95 |
+| 4 | `makespan+tiebreak` | `none` | 137 | 138 | 134 | 137 | 95 |
+| 4 | `makespan+tiebreak` | `checked` | 137 | 138 | 137 | 137 | 95 |
+| 4 | `makespan` | `declared` | 132 | 130 | 133 | 132 | 95 |
+| 4 | `makespan` | `none` | 118 | 113 | 118 | 118 | 95 |
+| 4 | `makespan` | `checked` | 121 | 116 | 119 | 119 | 95 |
+| 6 | `makespan+tiebreak` | `declared` | 232 | 233 | 233 | 233 | 155 |
+| 6 | `makespan+tiebreak` | `none` | 228 | 228 | 229 | 228 | 152 |
+| 6 | `makespan+tiebreak` | `checked` | 233 | 233 | 234 | 233 | 152 |
+| 6 | `makespan` | `declared` | 229 | 231 | 230 | 230 | 155 |
+| 6 | `makespan` | `none` | 221 | 222 | 219 | 221 | 152 |
+| 6 | `makespan` | `checked` | 223 | 225 | 221 | 223 | 152 |
+
+With makespan-only, `checked` improved on `declared` by 6–14 cycles across the six
+matched pairs. `none` improved on `declared` by 8–17 cycles and on `checked` by 1–3.
+With the weighted objective, `checked` tied `declared` in three pairs and took 1–4
+more cycles in the other three. `none` improved in four pairs, tied once and took
+four more cycles once. These are incumbent results for two sizes and three seeds,
+with `declared` retained as the default.
+
+Under energetic tightening, `none` removes explicit symmetry rows and still uses the
+declared ordering during ASAP tightening. `checked` bypasses that ordering and
+unifies corresponding domains, so the sweep measures each mode as a whole. At both
+sizes, `checked` found one orbit of five interchangeable groups among eight and added
+four anchor rows. A pinned window probe can distinguish otherwise interchangeable groups,
+so the scheduler skips those anchor rows and domain unions in window probes.
+Per-section solves retain their existing defaults.
+
+```bash
+./scripts/build_scheduler_rs.sh --release
+uv run python -m scripts.run_symmetry_measurement --jobs 3 --time-limit 3600 \
+    --out-dir build/symmetry-seeds-6a82e15
+```
+
+The output directory contains the `symmetry_seeds.json` index and generated
+`symmetry_seeds.md` report alongside each cell's result JSON, log, schedule and kernel.

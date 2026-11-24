@@ -19,6 +19,7 @@ sys.path.insert(0, ROOT)
 import kernel_build_args  # noqa: E402
 import scheduler_rs  # noqa: E402
 from scripts import diff_cpsat_models  # noqa: E402
+from test_cpsat_hint_complete import check_hint_is_feasible, unhinted_variables  # noqa: E402
 
 SMALL = ["--rounds", "2", "--batch-size", "16", "--cpsat-deterministic-time", "0.3", "--cpsat-time-limit", "100"]
 
@@ -529,3 +530,42 @@ def test_makespan_rows_reach_the_model(tmp_path, mode, rounds):
     assert "makespan rows cut off the hint" not in output
     bound = re.search(r"Static head/tail bound: makespan >= (\d+) .*capacity floor (\d+)\)", output)
     assert bound and int(bound.group(1)) >= int(bound.group(2))
+
+
+# ----------------------------------------------------------------------------
+# Symmetry rows
+# ----------------------------------------------------------------------------
+
+SYMMETRY = ["--rounds", "4", "--batch-size", "64"]
+
+
+def test_symmetry_rows_declared_is_the_default_model(tmp_path):
+    _, base, _, _ = _run(tmp_path, "base", SYMMETRY)
+    _, explicit, sched, _ = _run(tmp_path, "declared", SYMMETRY + ["--cpsat-symmetry-rows", "declared"])
+    assert not _model_diff(base, explicit)
+    assert any(n.startswith("sym_ord_") for n in _constraint_names(diff_cpsat_models.load(str(base)))), "the instance has declared rows"
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["symmetry_rows"] == "declared"
+
+
+def test_symmetry_rows_none_and_checked(tmp_path):
+    _, none_path, _, _ = _run(tmp_path, "none", SYMMETRY + ["--cpsat-symmetry-rows", "none"])
+    names = _constraint_names(diff_cpsat_models.load(str(none_path)))
+    assert not any(n.startswith(("sym_ord_", "sym_lex_", "group_sym_")) for n in names)
+    _, checked_path, _, _ = _run(tmp_path, "checked", SYMMETRY + ["--cpsat-symmetry-rows", "checked"])
+    checked_model = diff_cpsat_models.load(str(checked_path))
+    names = _constraint_names(checked_model)
+    assert not any(n.startswith(("sym_ord_", "sym_lex_")) for n in names)
+    assert any(n.startswith("group_sym_") for n in names), "4x64 has an orbit of identical groups"
+    assert checked_model.solution_hint.vars
+    assert not unhinted_variables(checked_model)
+    check_hint_is_feasible(checked_path)
+
+
+def test_random_seed_reaches_the_solver(tmp_path):
+    output, model_path, sched, _ = _run(tmp_path, "seed", ["--cpsat-random-seed", "7"], quiet=False)
+    assert "random_seed: 7" in _solver_parameters(output)
+    _, base_path, _, _ = _run(tmp_path, "base", [])
+    assert not _model_diff(base_path, model_path), "a solver parameter, not a model change"
+    with open(sched) as f:
+        assert json.load(f)["run_options"]["cpsat_tuning"]["random_seed"] == 7
