@@ -267,7 +267,7 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "group in every round, as written by scripts/emission_structure.py (format: "
                             "solver/emission_plan.py). Replaces --cached-select, --tree-reduce-max-depth and "
                             "--depth4-select-rounds for the tree access. See docs/EMISSION_STRUCTURE_MODEL.md")
-    group.add_argument("--transform", action="append", choices=["hash-merge", "prune-index", "values-only"], default=EMISSION_DEFAULTS["transform"],
+    group.add_argument("--transform", action="append", choices=["hash-merge", "prune-index", "values-only", "select-bits-path"], default=EMISSION_DEFAULTS["transform"],
                        metavar="RULE",
                        help="Rewrite the finished SSA program with RULE before scheduling (repeatable; applied in "
                             "order). hash-merge: find hash stages x = a*m + c; (x + d) ^ (x << k) from the ops "
@@ -278,7 +278,11 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "update at depth 0) by their addend, assuming the input indices start at 0; the initial "
                             "index load then dies (proofs: R12). values-only: declare the final indices unobserved, "
                             "so the index stores stop being roots and dead code elimination does the rest; "
-                            "validation then compares values only. Off by default")
+                            "validation then compares values only. select-bits-path: a bit-driven tree access "
+                            "at depth 3 or more reads the earlier branch bits instead of extracting them from the "
+                            "index (the program --select-bit-source path emits; fewer ops, more scratch), from "
+                            "forms proved on the ops, assuming the input indices start at 0 (proofs: R15). "
+                            "Off by default")
     return group
 
 

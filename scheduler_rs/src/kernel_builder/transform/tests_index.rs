@@ -65,6 +65,7 @@ fn with_flags(spec: &ProblemSpec, transforms: &[TransformKind]) -> ProblemSpec {
             TransformKind::HashMerge => s.merge_hash_stages = true,
             TransformKind::PruneIndex => s.prune_dead_index = true,
             TransformKind::ValuesOnly => s.values_only = true,
+            TransformKind::SelectBitsPath => s.select_bit_source = SelectBitSource::Path,
         }
     }
     s
@@ -72,21 +73,21 @@ fn with_flags(spec: &ProblemSpec, transforms: &[TransformKind]) -> ProblemSpec {
 
 /// Outcome of a parity check.
 #[derive(Debug)]
-struct Parity {
+pub(super) struct Parity {
     /// The raw programs (before DCE) are equal op for op.
-    raw_exact: bool,
+    pub raw_exact: bool,
     /// Ops differing between the raw programs (first few, printed).
-    raw_diff: Option<String>,
+    pub raw_diff: Option<String>,
     /// Ops that differ only by the emitter's leaked `HashState` label (after DCE).
-    leaked: usize,
+    pub leaked: usize,
     /// Constants whose ALU-derived alternatives differ after DCE before recomputing them:
     /// `(value, rewritten, emitted)`. The emitted program keeps alternatives that name a
     /// constant DCE removed (stale, BUGS.md); the rewrite recomputes them (C13).
-    stale_alternatives: Vec<(i64, String, String)>,
+    pub stale_alternatives: Vec<(i64, String, String)>,
     /// Summaries of each transform.
-    summaries: Vec<String>,
+    pub summaries: Vec<String>,
     /// The rewritten raw program, printed by `canonical_ops`.
-    program: Vec<String>,
+    pub program: Vec<String>,
 }
 
 /// Gate 1: apply `transforms` in order to the emission of `spec` without the flags, and
@@ -95,8 +96,14 @@ struct Parity {
 /// one leaked label of BUGS.md); the raw programs are compared too and the difference
 /// reported (the emitter writes ops it knows are dead, such as the last round's index update
 /// under `--values-only`, which the rewrite removes with what it made dead).
-fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], label: &str) -> Parity {
-    let base = ProblemSpec { merge_hash_stages: false, prune_dead_index: false, values_only: false, ..spec.clone() };
+pub(super) fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], label: &str) -> Parity {
+    let base = ProblemSpec {
+        merge_hash_stages: false,
+        prune_dead_index: false,
+        values_only: false,
+        select_bit_source: SelectBitSource::Index,
+        ..spec.clone()
+    };
     let mut p = raw_program(&base);
     let mut summaries = Vec::new();
     for &t in transforms {

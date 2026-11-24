@@ -28,6 +28,8 @@
 //! - `prune_index` - rule `prune-index` (shared wrap zero, depth-0 index update from a
 //!   provably zero index, initial index load dead)
 //! - `values_only` - rule `values-only`: the output contract "indices not observed"
+//! - `select_bits` - rule `select-bits-path`: read the branch bits instead of extracting them
+//!   from the index (catalogue rule 11), from bit-path forms proved on the ops
 //! - `report` - per-site and cascade cost deltas of a rewrite
 
 pub mod apply;
@@ -38,6 +40,7 @@ pub mod interp;
 pub mod prune_index;
 pub mod report;
 pub mod rule;
+pub mod select_bits;
 pub mod surgery;
 pub mod tree_access;
 pub mod values;
@@ -49,6 +52,8 @@ mod tests;
 mod tests_index;
 #[cfg(test)]
 mod tests_interp;
+#[cfg(test)]
+mod tests_select_bits;
 
 pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};
@@ -57,6 +62,7 @@ pub use hash_merge::{apply_hash_merge, HashMergeReport, HashMergeRule, HashMerge
 pub use prune_index::{apply_prune_index, PruneIndexRule, PruneIndexSite, PruneKind};
 pub use report::RuleReport;
 pub use rule::{Fact, FactSource, Proposal, Rejection, Rule};
+pub use select_bits::{apply_select_bits, BitForm, BitPaths, SelectBitsRule, SelectBitsSite};
 pub use surgery::{Stamp, Surgery, SurgeryReport};
 pub use tree_access::{TreeAccessInstantiation, TreeAccessRule, TreeAccessSite};
 pub use values::{Address, Assumption, MemoryLayout, ValueFacts};

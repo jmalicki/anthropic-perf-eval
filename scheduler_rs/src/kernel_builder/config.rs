@@ -760,13 +760,18 @@ pub enum TransformKind {
     /// Declares the output contract "final indices are not observed": index stores stop being
     /// roots and dead code elimination does the rest (`transform::values_only`, rule 9).
     ValuesOnly,
+    /// Bit-driven tree access reads the branch bits of earlier rounds instead of extracting
+    /// them from the index (`transform::select_bits`, rule 11, proofs R15): the program
+    /// `select_bit_source = path` emits. Declares the input precondition "initial indices are
+    /// 0" (the zero-based chain of the first pass starts at the loaded index).
+    SelectBitsPath,
 }
 
 impl TransformKind {
     /// Parse the CLI/binding spelling.
     ///
     /// # Arguments
-    /// * `s` - `"hash-merge"`, `"prune-index"` or `"values-only"`
+    /// * `s` - `"hash-merge"`, `"prune-index"`, `"values-only"` or `"select-bits-path"`
     ///
     /// # Returns
     /// The transform, or an error message naming the valid values.
@@ -775,8 +780,9 @@ impl TransformKind {
             "hash-merge" => Ok(TransformKind::HashMerge),
             "prune-index" => Ok(TransformKind::PruneIndex),
             "values-only" => Ok(TransformKind::ValuesOnly),
+            "select-bits-path" => Ok(TransformKind::SelectBitsPath),
             other => Err(format!(
-                "Invalid transform '{}': must be 'hash-merge', 'prune-index' or 'values-only'",
+                "Invalid transform '{}': must be 'hash-merge', 'prune-index', 'values-only' or 'select-bits-path'",
                 other
             )),
         }
@@ -788,6 +794,7 @@ impl TransformKind {
             TransformKind::HashMerge => "hash-merge",
             TransformKind::PruneIndex => "prune-index",
             TransformKind::ValuesOnly => "values-only",
+            TransformKind::SelectBitsPath => "select-bits-path",
         }
     }
 }

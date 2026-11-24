@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import sys
 
-from z3 import And, BitVec, BitVecVal, If, Int, LShR, Not, Or, Solver, URem
+from z3 import And, BitVec, BitVecVal, If, Int, LShR, Not, Or, Solver, ULT, URem
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -627,6 +627,49 @@ def check_bits_from_index_needs_range(ctx=None) -> tuple[str, str, float, dict]:
     return ("R15-bits-from-index-needs-range", str(solver.check()), 0.0, _stats(solver))
 
 
+def check_bit_path_steps(ctx=None) -> tuple[str, str, float, dict]:
+    """R15-bit-path-steps: the induction steps of the select-bits-path rule's bit-path forms.
+
+    The rule (scheduler_rs transform/select_bits.rs) gives values two forms over earlier
+    branch bits b_j = x_j & 1: Pos(b_0..b_(k-1)) = sum b_j 2^(k-1-j) (k <= 31) and
+    Zero(L) = L_k - Pos(L) with L_k = 2^(k+1) - 2. Each step it takes is an identity on
+    32-bit words, for every n, x and every L_k (symbolic, so the steps hold at every depth):
+
+    * multiply_add(n, 2, b) and multiply_add(2, n, b) are 2n + b (Pos extends by b);
+    * (2n + b) & 1 = b and, for n < 2^31, (2n + b) >> 1 = n (AND reads the newest bit, SHR
+      drops it);
+    * Pos stays below 2^31: n < 2^k and k <= 30 give 2n + b < 2^(k+1);
+    * L - (L - n) = n (Sub(L_k, Zero) is Pos), and 2 - b is L_1 - Pos([b]) (the offset);
+    * 2 (L - n) + (2 - b) = (2L + 2) - (2n + b), and L_(k+1) = 2 L_k + 2 (Zero extends by b).
+    """
+    n, x, big_l = _bv("n"), _bv("x"), _bv("L")
+    b = x & _const(1)
+    two, one = _const(2), _const(1)
+    violations = [
+        n * two + b != two * n + b,
+        (n * two + b) & one != b,
+        big_l - (big_l - n) != n,
+        (big_l - n) * two + (two - b) != (big_l * two + two) - (n * two + b),
+    ]
+    # The bound per path length (unsigned compares).
+    for k in range(0, 31):
+        violations.append(And(ULT(n, _const(1 << k)), Not(ULT(n * two + b, _const(1 << (k + 1))))))
+    # L_(k+1) = 2 L_k + 2 for the level constants the rule uses (`select_bits::level_last`).
+    for k in range(0, 31):
+        violations.append(_const((1 << (k + 2)) - 2) != _const(2 * ((1 << (k + 1)) - 2) + 2))
+    # The SHR step under the bound, unsigned.
+    violations.append(And(ULT(n, _const(1 << 31)), LShR(n * two + b, one) != n))
+    return _refute("R15-bit-path-steps", *violations, ctx=ctx)
+
+
+def check_bit_path_steps_needs_boolean(ctx=None) -> tuple[str, str, float, dict]:
+    """R15-bit-path-steps-needs-boolean: with an addend that is not 0/1, AND no longer reads it (SAT)."""
+    n, b = _bv("n"), _bv("b")
+    solver = Solver(ctx=ctx)
+    solver.add(b != _const(0), b != _const(1), (n * _const(2) + b) & _const(1) != b)
+    return ("R15-bit-path-steps-needs-boolean", str(solver.check()), 0.0, _stats(solver))
+
+
 REWRITE_CHECKS = [
     ("R1-hash-fma-fusion", "Hash stages 0/2/4 equal one multiply_add", check_hash_fma_fusion),
     ("R2-stage5-xor-deferral", "Stage-5 constant deferred into the next round's node XOR", check_stage5_xor_deferral),
@@ -653,6 +696,8 @@ REWRITE_CHECKS = [
     ("R14-mobius-select-needs-boolean", "Mobius form is wrong for a non-0/1 bit (SAT)", check_mobius_select_needs_boolean),
     ("R15-bits-from-index", "Older branch bits read back from the index", check_bits_from_index),
     ("R15-bits-from-index-needs-range", "Unmasked top bit is not 0/1 outside the index range (SAT)", check_bits_from_index_needs_range),
+    ("R15-bit-path-steps", "Bit-path forms: each step of the select-bits-path analysis is an identity", check_bit_path_steps),
+    ("R15-bit-path-steps-needs-boolean", "AND reads the addend back only if it is 0/1 (SAT)", check_bit_path_steps_needs_boolean),
 ]
 
 # Checks that are expected to find a counterexample.
@@ -665,6 +710,7 @@ EXPECT_SAT = {
     "R13-select-by-path-bits-needs-bit-order",
     "R14-mobius-select-needs-boolean",
     "R15-bits-from-index-needs-range",
+    "R15-bit-path-steps-needs-boolean",
 }
 
 

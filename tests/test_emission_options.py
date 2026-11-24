@@ -111,6 +111,23 @@ def test_index_transforms_equal_their_flags(tmp_path, rounds, index_form, transf
         assert rewritten["engines"][engine]["ops"] == emitted["engines"][engine]["ops"], engine
 
 
+@pytest.mark.parametrize("rounds", [5, 16])
+@pytest.mark.parametrize("index_form", ["zero-based", "mirrored"])
+@pytest.mark.parametrize("cached_select", ["bits", "mobius"])
+def test_select_bits_transform_equals_select_bit_source_path(tmp_path, rounds, index_form, cached_select):
+    """--transform select-bits-path rewrites the index-extraction emission into the one
+    --select-bit-source path emits: PROVED, PASSED, same op counts, and fewer vector ops than
+    the extraction (rounds 3, 4, 14, 15 select at depths 3 and 4)."""
+    common = dict(index_form=index_form, cached_select=cached_select, tree_reduce_max_depth=4)
+    extracted, _ = build(tmp_path, rounds, **common)
+    emitted, emitted_sched = build(tmp_path, rounds, select_bit_source="path", **common)
+    rewritten, rewritten_sched = build(tmp_path, rounds, transform=["select-bits-path"], **common)
+    for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
+        assert rewritten["emission"][key] == emitted["emission"][key], key
+    assert len(rewritten_sched["ssa_ops"]) == len(emitted_sched["ssa_ops"])
+    assert vector_op_equivalents(rewritten) < vector_op_equivalents(extracted)
+
+
 def test_transform_rejects_unknown_rule():
     with pytest.raises(ValueError, match="hash-merge"):
         scheduler_rs.build_tick_tock_kernel_ssa(10, 2047, BATCH, 2, verbose=False, transform=["nope"])
