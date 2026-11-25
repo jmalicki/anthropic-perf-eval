@@ -249,8 +249,9 @@ What the numbers say:
   floor").
 
 **Where the gap goes** (`scripts.schedule_report` on the 1,104-cycle schedule of `flow90.json`;
-superseded by docs/GREEDY_SHAPE_ABLATION.md section 11, which finds the load engine's tail, not
-the shift split, binding, and takes this plan to 1,039 cycles with the greedy):
+see docs/GREEDY_SHAPE_ABLATION.md section 11: shifting toward the floor's split does not shorten
+the schedule (PR #76: the shift count follows the schedule's length), and retuning the window and
+stagger plus `--greedy-load-priority final-last` takes this plan to 1,039 cycles with the greedy):
 the vector ALU is 100% busy from cycle 111 to about 994 and the loads nearly so, but the greedy
 ran only 1,039 vector ops as 8 scalar ops, while the floor's balance needs about 1,465. The scalar
 ALU is 64% used. The vector ALU's own term is then 6,387 / 6 = 1,065, only 39 below the schedule.

@@ -134,6 +134,18 @@ pub enum LoadPriority {
     /// Final loads (no later load depends on them, e.g. the last gather round) after all
     /// other loads, then key: a final load has a short tail, while a load that feeds later
     /// gathers holds up the load engine's future work.
+    ///
+    /// Exactly what it does: once per cycle, before the first placement pass, the ops whose
+    /// own engine is `Load` are re-sorted among the positions they hold in the wavefront order
+    /// by `(final, key)`. Limitations, all measured with this behaviour (the
+    /// docs/GREEDY_SHAPE_ABLATION.md section 11 numbers):
+    /// - Constants (`Const`, `ConstChoice`) are `Load`-engine ops and are sorted too. A
+    ///   constant no load depends on counts as final, even when it is then lowered to a flow
+    ///   `add_imm`.
+    /// - Only the first pass is ordered. A feeder load deferred for the scratch budget in that
+    ///   pass is retried after the final loads of the same pass, so a final load can take a
+    ///   load slot ahead of a budget-deferred feeder
+    ///   (`test_load_priority_final_last_budget_deferral`).
     FinalLast,
 }
 
@@ -523,6 +535,8 @@ pub(crate) struct GreedyDiagnostics {
     pub worst_over_budget: Option<(usize, usize)>,
     /// Number of detailed breakdown dumps written to stderr (0 unless `verbose`; at most 2).
     pub dumps_emitted: usize,
+    /// Shifts (whole or split) made by a proactive shift policy while a vector slot was free.
+    pub proactive_shifts: usize,
     /// Breakdown for the worst cycle so far, printed by `finish` (only kept when `verbose`).
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
@@ -2160,7 +2174,12 @@ fn schedule_ssa_greedy_core(
         && enable_valu_shift
         && fixed_shifted_ops.is_none()
         && !valu_shift_fixed_to_none;
-    // Pace: (vector ops placed so far, of them shifted, total, target).
+    // Pace accounting. "Vector ops" are ops whose own engine is `Valu` (not dead stores): the
+    // same set in the total and in the placed count, so a SelectChoice placed on the vector
+    // path counts in neither. `pace_vector_placed` and `pace_shifted` count placements on
+    // every path (normal, split start, force-schedule). The pace is a floor on shifting, not
+    // a cap: a pace policy shifts proactively while `shifted / placed < target / total`, and
+    // the `when-full` shifts (vector slots full) still happen once the target is reached.
     let pace_total_vector = ops
         .iter()
         .enumerate()
@@ -2195,6 +2214,12 @@ fn schedule_ssa_greedy_core(
     let fixed_vector: Vec<bool> = (0..ops.len())
         .map(|i| ops[i].engine == Engine::Valu && !shiftable_set.contains(&i))
         .collect();
+    if shape.load_priority != LoadPriority::Key && wavefront.is_none() {
+        eprintln!(
+            "Warning: greedy load priority {:?} applies only with the wavefront priority; ignored",
+            shape.load_priority
+        );
+    }
     let mut pace_vector_placed: usize = 0;
     let mut pace_shifted: usize = 0;
     // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
@@ -2773,6 +2798,9 @@ fn schedule_ssa_greedy_core(
                                 peak_live_words = peak_live_words.max(live.words);
                                 pace_vector_placed += 1;
                                 pace_shifted += 1;
+                                if prefer_split {
+                                    diagnostics.proactive_shifts += 1;
+                                }
                                 continue;
                             }
                         }
@@ -2837,10 +2865,13 @@ fn schedule_ssa_greedy_core(
                 } else {
                     slots.try_place(engine, can_shift, allow_shift)
                 };
-                if engine == Engine::Valu && place_result != SlotResult::NoRoom {
+                if ops[idx].engine == Engine::Valu && place_result != SlotResult::NoRoom {
                     pace_vector_placed += 1;
                     if place_result == SlotResult::Shifted {
                         pace_shifted += 1;
+                        if prefer_shift {
+                            diagnostics.proactive_shifts += 1;
+                        }
                     }
                 }
                 match place_result {
@@ -3059,6 +3090,7 @@ fn schedule_ssa_greedy_core(
                 } else {
                     slots.try_place(engine, can_shift, allow_shift)
                 };
+                let mut force_shifted = false;
                 #[allow(unused_assignments)]
                 match force_place_result {
                     SlotResult::Placed => {
@@ -3067,6 +3099,7 @@ fn schedule_ssa_greedy_core(
                         }
                     }
                     SlotResult::Shifted => {
+                        force_shifted = true;
                         if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
@@ -3074,9 +3107,16 @@ fn schedule_ssa_greedy_core(
                     SlotResult::NoRoom => {
                         if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
                             if let SlotResult::Shifted = slots.try_place(engine, can_shift, true) {
+                                force_shifted = true;
                                 shifted_ops.insert(op_id);
                             }
                         }
+                    }
+                }
+                if ops[force_idx].engine == Engine::Valu {
+                    pace_vector_placed += 1;
+                    if force_shifted {
+                        pace_shifted += 1;
                     }
                 }
 
