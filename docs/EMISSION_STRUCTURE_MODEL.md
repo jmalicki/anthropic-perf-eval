@@ -16,11 +16,14 @@ the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 c
 on this structure: once loads stop binding, the vector work binds near 975 (section 6).
 
 A closed loop between this model and the shaped greedy (section 10, Benders-style feedback with
-no-goods, learned caps, and proved time-aware rows) **found no plan better than `flow90.json`**.
+no-goods, learned caps, and time-aware rows whose form is proved but whose per-class table is
+only observed) **found no plan better than `flow90.json`**.
 Four other plans tie it at 1,104 / 1,106, and nothing goes below. No lower bound stage 1 can
 compute ranks the near-optimal plans: over 26 loop plans the floor has Spearman rho +0.03 against
 scheduled cycles, the floor with time-aware rows -0.41, and the exact static bound of each built
-kernel -0.42. Only the capped floor ranks them (rho +0.64), and it is a heuristic, not a bound.
+kernel -0.42. Only the capped floor ranks them (rho +0.64), and it is a heuristic, not a bound;
+its cap was learned on the same builds it is scored on, so that rho is in-sample (section 10.4
+lists the caveats).
 So stage 1 cannot yet be trusted to pick among plans within about 20 cycles of each other. The
 remaining spread comes from the greedy.
 
@@ -423,7 +426,9 @@ uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate --merge-hash-s
 beat `docs/emission_plans/flow90.json` (1,104 / 1,106, development greedy measurement). The best
 loop found **ties** it: the learned-cap loop reaches 1,104 / 1,106 in 3 builds with no manual
 sweep, and five different plans with floors 994 to 997 all land at exactly 1,104 / 1,106.
-Nothing in 32 loop-state builds went below. The time-aware rows are proved in form, but over
+Nothing in 32 loop-state builds went below. The time-aware rows are proved in form (section
+10.3: a Z3 lemma for the engine coupling, a hand argument for the windows, a randomized check of
+the whole), but over
 the plans near the optimum no lower bound stage 1 can compute ranks them, and the rows rank them
 worse than the bare floor. So stage 1 should not be trusted to choose among plans within about
 20 cycles of each other. Its floor and the learned caps get within that distance of the best
@@ -446,12 +451,27 @@ buckets (start-up, steady state, tail), the scheduler's own floor and binding en
 static head-body-tail bound, and per op class the work, head and tail; (4) feedback; (5) stop on
 the iteration budget, `--patience` iterations without improvement, or an infeasible stage 1.
 Builds are cached in a state file, so a plan is never built twice and modes can share seeds.
+The state records the SHA-256 of the scheduler extension that made its builds and `run` refuses a
+state from another build. Stage-1 solves take a deterministic-time budget (`--deterministic-time`,
+default 20; at 16 rounds and 32 groups each solve proves optimality in under 0.2 units, so the
+budget never binds and the plan does not depend on machine load); the trace records, per
+stage-1 call, every CP-SAT solve (main, windows floor, tie-break) with its status, wall and
+deterministic time and whether it stopped on the wall clock.
+
+The traces in `docs/emission_plans/loop_report.json` predate three of these changes; none
+changes them. They were run with the wall-clock limit only (every solve in them reports
+`optimal`, so they ended on optimality, not on the clock). Rows mode cut with `M < 1,104`, which
+never closed a run and is far above the M of every plan it picked (995, 996). And the no-goods
+of the seeds `bits-flow+depth4` and `mobius+depth4`, which select the root with bits-flow /
+mobius and so are not the arrangement stage 1 emits (it keeps the root on bits), cut their model
+points unbuilt. Those points have floors 1,077 and 1,219, above every objective any recorded
+iteration picked (at most 1,049), so the cuts never changed a pick.
 
 | Feedback | What it adds to stage 1 | Bound or heuristic |
 |---|---|---|
-| (a) `nogood` | A no-good cut per built plan (on the group counts per round and encoding, which determine the plan) and `floor < best cycles` | Sound: the floor is a lower bound on every schedule. Weak: the incumbent never prunes (floors 989 to 1,000 against 1,104) |
+| (a) `nogood` | A no-good cut per built model point (`plan_model_key`: the group counts per round and encoding, plus tail patterns with `--values-only`) and `floor < best cycles`. A point is cut only once the arrangement stage 1 emits for it (`canonical_rows`) is built; a seed built in another arrangement leaves the point open | Sound: the floor is a lower bound on every schedule. Weak: the incumbent never prunes (floors 989 to 1,000 against 1,104) |
 | (b) `caps` | Learned `max_util` per engine. From the best plan, cap an engine the plan uses at >= 90% at its use minus a step (0.04, halved when nothing is left); keep it if cycles improve. Rule `saturated`: an engine the schedule runs at >= 97% in its steady state. Rule `underfilled`: an engine the schedule fills less than the plan needs, largest shortfall first | Heuristic. It generalises `--max-util flow=0.9` |
-| (c) `rows` | Objective M >= T and, per window (t, q), M >= t + q + `window_floor`(work with head >= t and tail >= q), as linear rows over the plan variables; no-goods; `M < best cycles` | Row form proved; the per-class table it is fed is observed (section 10.3) |
+| (c) `rows` | Objective M >= T and, per window (t, q), M >= t + q + `window_floor`(work with head >= t and tail >= q), as linear rows over the plan variables; no-goods; `floor < best cycles` (default `--rows-cut sound`) | Row form proved; the per-class table it is fed is observed (section 10.3), so M is not a bound on an unbuilt plan and `M < best cycles` would be a heuristic cut. It is used only with `--rows-cut heuristic`, as `M < best + e` (e the largest overestimate seen so far), and its closing is reported as the heuristic cut closing, never as exhaustion |
 | (a) under (b)'s cap | No-good enumeration of plans in capped-floor order (`--nogood-caps flow=0.92`) | Heuristic (a capped floor is not a bound, so no incumbent cut) |
 
 The window rows need work per op class as a function of the plan. SSA ops carry
@@ -545,13 +565,14 @@ flow90.
 
 | Claim | Status |
 |---|---|
-| WR1: for any op set, makespan >= t + q + `window_floor`(ops with head >= t and tail >= q), with heads and tails as in `scripts/static_bounds.py` (minimum latency over encodings). Selects are charged one flow slot or one fixed VALU slot, shiftable vector ops one VALU slot or 8 ALU slots, consts and eliminable broadcasts nothing | **Proved** with Z3 against the reference schedule model of `verification/static_bounds_proof.py`: 2,000 random instances with no violation (150 in the proofs suite). WR2 (non-vacuity): adding 1 to every non-trivial window is violated on 1,736 of 2,000, and the window row beats every per-engine row on 39. `verification/window_rows_proof.py`, registered in `verification/verify.py` |
+| Row form: for any op set, makespan >= t + q + `window_floor`(ops with head >= t and tail >= q), with heads and tails as in `scripts/static_bounds.py` (minimum latency over encodings). Selects are charged one flow slot or one fixed VALU slot, shiftable vector ops one VALU slot or 8 ALU slots, consts and eliminable broadcasts nothing | Three parts (`verification/window_rows_proof.py`, registered in `verification/verify.py`). (1) Every slot of a window op lies in [t, M - 1 - q]: **argued by hand** (induction along edges of latency >= 1 out of every slot, for every encoding: vselect, two-op FMA select, one-op delta select, shifted lanes). (2) WR3, the engine coupling: any per-engine split of the window's ops that fits in S cycles passes `_window_fits(S)`, which is monotone in S: **proved by Z3 for all counts and spans** on the real machine and the six scaled machines, with the transcription checked against the Python function. (3) WR1, the composition: a **randomized check**, not a proof, against the reference model of `verification/static_bounds_proof.py`, which now includes the one-op delta select that bits-flow plans emit (multiply_add at x, visible at x + 1; before, it could not represent it): 2,000 random 3-7 op DAGs at VLEN 2, 815 with a delta select, no violation (150 in the proofs suite). WR1c: 400 instances drawn so that the window row is above every per-engine row (the coupling binds), no violation (40 in the suite); before, the coupling bound on 39 of 2,000 instances. WR2 (non-vacuity): adding 1 to every non-trivial window is violated on 1,763 of 2,000 |
 | `window_floor` is exact for its counts and monotone | Brute force over every resolution (`tests/test_emission_loop.py`) |
 | The class table: every plan's per-group class counts, heads and tails are >= the table's (minimum over built plans) | **Observed, and false in general.** A class's head and tail depend on the encodings of the group's other rounds. The first plan that gathers in a round after selecting in earlier rounds lowers them by 5 to 22 cycles. Over 26 loop plans, 2 contradicted the table they were checked against (9 class fields). For one of them (`rows` iteration 0) the plan's own row bound was overestimated: 995 at solve time, 993 from its own classes. Among the seeds, the floor-optimal plan was overestimated by 9 (1,020 against 1,011). The final table never puts a plan's row bound above its cycles (0 of 32) |
 | Floor (whole emission, `choice_floor`) | Bound (section 4) |
 | Capped floor | Not a bound: a heuristic objective |
 
-So (c) as built is "proved row form over an observed table". Making the table a proved bound
+So (c) as built is "row form proved (parts 1 and 2) and checked (part 3), over an observed
+table". Making the table a proved bound
 would need class heads and tails computed as a minimum over the encodings of the neighbouring
 rounds, not as a minimum over plans seen so far.
 
@@ -561,6 +582,21 @@ Over every valid build (32 distinct plans across the loop states, seeds included
 26 plans the loops proposed. "Loop plans" are the regime that matters: everything there is
 within 110 cycles of the best. Every point and the full trace:
 `docs/emission_plans/loop_report.json`.
+
+Caveats, which apply to every coefficient below:
+
+- The plans are not a random sample. Each loop plan was chosen by one of these surrogates
+  (the floor, the capped floor or the rows), so the range of each surrogate is restricted
+  (floors 989 to 1,049 among loop plans, 20 of 26 within 989 to 997) and ties are heavy (the
+  26 loop plans take 12 distinct floors, 5 each at 989 and 995; 15 distinct cycle values, 4 at
+  1,104 and 4 at 1,125). Rank correlations on such data are unstable: a few plans move rho a
+  lot.
+- The learned cap `flow=0.92` was learned by the caps loop on these same builds, and it is
+  scored on them: its rho is in-sample. `flow=0.9` was set by hand before the loop, but on
+  earlier builds of the same structure, so it is not out-of-sample either.
+- "floor + window rows" uses the final row table, learned from all builds including the one
+  scored; at solve time each plan saw an earlier, partly different table.
+- None of these is evidence that a surrogate will rank plans it has not seen.
 
 | Surrogate | All builds (n = 32): Pearson / Spearman | Loop plans (n = 26): Pearson / Spearman |
 |---|---|---|
@@ -610,5 +646,5 @@ $L run --state artifacts/benders/nogoodcap.json --modes nogood --nogood-caps flo
 $L report --state artifacts/benders/rows.json --extra-state artifacts/benders/nogood.json \
   --extra-state artifacts/benders/caps.json --extra-state artifacts/benders/capsu.json \
   --extra-state artifacts/benders/nogoodcap.json --caps flow=0.92               # 10.4
-uv run --extra verify python -m verification.window_rows_proof --count 2000 --seed 1   # WR1, WR2
+uv run --extra verify python -m verification.window_rows_proof --count 2000 --coupled 400   # WR1, WR1c, WR2, WR3
 ```
