@@ -171,9 +171,27 @@ index **1,033** (1,035), the lowest of the sweep, with or without `alu-first`. P
 `--greedy-budget-force stall` at inflation 0.95 and 0.98 (best path / index rows above):
 1,016 / 1,038 in both, unchanged.
 
-Not yet done (follow-up commits on the same PR): `check_upstream.sh --strict` on the 1,012 /
-1,033 kernels, their neighbouring staggers, a pin test for them, and whether a justified
-schedule passes the CP-SAT all-fixed check (window probe).
+**The new bests and their neighbours** (R18 first-pass + R16 + R17 final, justify 10; path
+with chain-first + native-first unless noted):
+
+| Setting | path | index |
+|---|---|---|
+| stagger 9, 32 in flight (best) | **1,012 / 1,014** | **1,033 / 1,035** |
+| stagger 8 | 1,012 | 1,033 |
+| stagger 10 | 1,012 | 1,035 |
+| 28 in flight | 1,014 | 1,040 |
+| 24 in flight | 1,026 | 1,061 |
+| path without the priorities / index with them | 1,012 | 1,033 |
+| same, **justify 0** (measured by removal) | 1,044 | 1,047 |
+
+Both best kernels pass `./scripts/check_upstream.sh --strict` (path 1,014 simulated, 145.7x;
+index 1,035, 142.7x). Path 1,012 holds at staggers 8 to 10 and with or without the
+priorities; the gain needs 32 groups in flight (28: +2, 24: +14). Justification is worth 32
+cycles on path and 14 on index with these rewrites: without it the rewrites run slower than
+the baseline (section 3), with it they give the best kernels. Pinned by
+`tests/test_justify_on_best_pin.py` (ci_only).
+
+Not yet done: whether a justified schedule passes the CP-SAT all-fixed check (window probe).
 
 ```bash
 # 1,016 (path, R16, alu-first optional)
@@ -184,6 +202,7 @@ uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate \
   --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path \
   --greedy-alu-priority native-first --greedy-flow-priority chain-first \
   --reassociate-gather-xor --greedy-justify 10 --save-kernel k.json
-# 1,012: add --index-early-terms final --select-xor-pushdown first-pass
+# 1,012 (path) / 1,033 (index, flow90.json, no priorities, no path bits): add
+#   --index-early-terms final --select-xor-pushdown first-pass
 ./scripts/check_upstream.sh --strict --kernel k.json
 ```
