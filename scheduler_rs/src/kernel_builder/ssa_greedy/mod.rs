@@ -80,6 +80,30 @@ pub struct GreedyShape {
     /// Where a SelectChoice that has a one-op `multiply_add` form may run (see
     /// [`SelectOverflow`]).
     pub select_overflow: SelectOverflow,
+    /// When an op the scratch budget check deferred is forced past the budget (see
+    /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
+    pub budget_force: BudgetForce,
+}
+
+/// Scratch model `words`: when the greedy forces an op that the budget check deferred.
+///
+/// The budget check defers an op whose destination would take the live words over the
+/// budget. With `SameCycle` (default, the historical behaviour) the deferred op with the
+/// highest last-use count is then forced in the same cycle whenever it has a slot, even if
+/// other ops were placed in that cycle, so the check holds one op per cycle at most and
+/// any run that reaches the budget overshoots it (address assignment then rejects the
+/// kernel). The pressure policy's inflation and shift suppression are what keep a default
+/// run below the budget, which is why passing runs stop short of it.
+/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
+/// in this one may have freed words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetForce {
+    /// Force one deferred op per cycle whenever it has a slot (default).
+    #[default]
+    SameCycle,
+    /// Force only when nothing else was placed in the cycle.
+    Stall,
 }
 
 /// Wavefront only: the order in which ready flow ops are offered the flow slot. Other
@@ -2984,7 +3008,12 @@ fn schedule_ssa_greedy_core(
         // the op waits for a later cycle, and the force path runs only when nothing at all
         // was scheduled this cycle. (Without capacities the historical behaviour is kept: a
         // deferred op that has a slot is forced in the same cycle.)
-        if !budget_deferred.is_empty() && (pools.caps.is_none() || scheduled_this_cycle == 0) {
+        //
+        // `BudgetForce::Stall` gives the words model the same rule: an op the budget check
+        // deferred waits while anything else is placed, and is forced only in a cycle where
+        // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
+        let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
+        if !budget_deferred.is_empty() && (force_same_cycle || scheduled_this_cycle == 0) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(

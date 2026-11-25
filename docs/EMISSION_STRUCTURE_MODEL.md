@@ -595,8 +595,9 @@ The path "near" subset has 3 plans, too few to report. Reading:
   failed plan with its peak (it raised before), and the report lists such plans.
 - With path bits, 7 of 16 builds sit at exactly 1,505 words, 31 below the budget, and all of
   them run 1,099 cycles or more; the three fastest path plans peak at 1,449 to 1,473. This is
-  consistent with the greedy being held back by scratch on those plans; what sets the 1,505
-  ceiling was not checked.
+  consistent with the greedy being held back by scratch on those plans. What sets the 1,505
+  ceiling: docs/SCRATCH_CEILING_DIAGNOSIS.md (the pressure policy, not a limit; with
+  `--greedy-budget-force stall` and a higher inflation threshold these plans run 1,049 to 1,098).
 - No plan-level proxy predicts the peak. Over the index-bit builds the best plan features
   reach |Spearman| 0.62 (vector-op count, negative), table words +0.41, selected group-rounds
   -0.43. Over the path-bit builds, `bits-flow` group-rounds -0.59 and `mobius` group-rounds

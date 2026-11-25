@@ -748,6 +748,8 @@ pub struct CompilerConfig {
     pub greedy_flow_priority: super::ssa_greedy::FlowPriority,
     /// Where a SelectChoice with a one-op multiply_add form may run (default: `Never`, flow).
     pub greedy_select_overflow: super::ssa_greedy::SelectOverflow,
+    /// Scratch model `words`: when a budget-deferred op is forced (default: `SameCycle`).
+    pub greedy_budget_force: super::ssa_greedy::BudgetForce,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -777,6 +779,7 @@ impl Default for CompilerConfig {
             greedy_load_priority: super::ssa_greedy::LoadPriority::Key,
             greedy_flow_priority: super::ssa_greedy::FlowPriority::Key,
             greedy_select_overflow: super::ssa_greedy::SelectOverflow::Never,
+            greedy_budget_force: super::ssa_greedy::BudgetForce::SameCycle,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -880,6 +883,7 @@ impl CompilerConfig {
             load_priority: self.greedy_load_priority,
             flow_priority: self.greedy_flow_priority,
             select_overflow: self.greedy_select_overflow,
+            budget_force: self.greedy_budget_force,
             shift_policy: {
                 use super::ssa_greedy::ShiftPolicy;
                 let target = self.greedy_shift_target;

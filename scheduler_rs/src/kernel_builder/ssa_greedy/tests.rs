@@ -4517,6 +4517,83 @@ fn test_pools_greedy_same_schedule_when_pools_do_not_bind() {
     assert_eq!(cycles(&words.ops), cycles(&pools.ops));
 }
 
+/// Three broadcasts of one scalar are ready in the same cycle, and the budget fits only two
+/// (plus the scalar and the store address). The add of the first two frees both one cycle later.
+fn emit_three_broadcasts() -> SsaEmitContext {
+    let mut emit = SsaEmitContext::new();
+    let s = emit.emit_const(1);
+    let v1 = emit.emit_vbroadcast_force(s);
+    let v2 = emit.emit_vbroadcast_force(s);
+    let v3 = emit.emit_vbroadcast_force(s);
+    let w = emit.emit_valu(Opcode::Add, v1, v2);
+    let x = emit.emit_valu(Opcode::Add, w, v3);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, x);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    emit
+}
+
+/// Schedule with the given budget-force rule (words model, no shifting).
+///
+/// # Returns
+/// `(budget_exceeded, peak live words)`.
+fn schedule_with_budget_force(emit: &mut SsaEmitContext, budget: usize, force: BudgetForce) -> (bool, usize) {
+    let shape = GreedyShape { budget_force: force, ..Default::default() };
+    let ((_, budget_exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the broadcasts");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (budget_exceeded, peak)
+}
+
+/// `--greedy-budget-force stall`: a budget-deferred op waits while other ops are placed in
+/// the cycle, so the run stays within the budget. The default (`same-cycle`) forces the
+/// third broadcast in the cycle the first two were placed and goes over: the control shows
+/// the program exercises the difference.
+#[test]
+fn test_budget_force_stall_keeps_words_budget_where_same_cycle_does_not() {
+    let budget = 2 * VLEN + 2;
+    let (same_exceeded, same_peak) =
+        schedule_with_budget_force(&mut emit_three_broadcasts(), budget, BudgetForce::SameCycle);
+    assert!(
+        same_exceeded && same_peak > budget,
+        "control: same-cycle should force the third broadcast over the budget (peak {})",
+        same_peak
+    );
+    let (stall_exceeded, stall_peak) =
+        schedule_with_budget_force(&mut emit_three_broadcasts(), budget, BudgetForce::Stall);
+    assert!(!stall_exceeded, "stall forced an op although the cycle placed others");
+    assert!(stall_peak <= budget, "stall peak {} > budget {}", stall_peak, budget);
+}
+
+/// A real deadlock still forces with `stall`: the scheduler completes and reports it.
+#[test]
+fn test_budget_force_stall_still_breaks_deadlock() {
+    let (exceeded, _) = schedule_with_budget_force(&mut emit_three_broadcasts(), VLEN, BudgetForce::Stall);
+    assert!(exceeded, "budget below two vectors: the add can only run over budget");
+}
+
 /// The greedy scheduler respects kept memory edges: a load after a store to its word runs at
 /// least one cycle later (RAW), a store over a word read earlier runs no earlier than the
 /// read (WAR, latency 0), and two stores to one word are a cycle apart (WAW). Without the
