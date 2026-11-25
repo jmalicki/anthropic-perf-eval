@@ -186,6 +186,8 @@ def main():
         if getattr(args, "greedy_priority", "fifo") != "wavefront":
             print("  WARNING: --greedy-load-priority applies only with --greedy-priority wavefront; "
                   "it is ignored here", file=sys.stderr)
+    if getattr(args, "greedy_justify", 0):
+        print(f"  greedy_justify={args.greedy_justify}")
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):
