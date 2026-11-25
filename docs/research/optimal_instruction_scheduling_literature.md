@@ -544,6 +544,15 @@ exists:
    Langevin and Cerny's abstract anticipates this ("other constraints such as the number of
    ... registers").
 
+   > **Editor's note (2026-11-24, from review of the pull request that added this note).**
+   > The formula as written is not a valid bound when the sum runs over all values: it
+   > subtracts the words live throughout from the capacity but keeps their area in the
+   > numerator. Counterexample: 768 words live for all 10 cycles of a schedule and another
+   > 768 words live for 9 cycles fit in 1,536 words, yet the formula gives
+   > `ceil((768 * 10 + 768 * 9) / (1536 - 768)) = 19 > 10`. Leaving the values that are live
+   > throughout out of the sum gives `ceil(768 * 9 / 768) = 9` on this example. Neither form
+   > has been implemented or proved; the derivation above is kept as it was written.
+
 ## 7. Search and solver configuration lessons
 
 - **Destructive lower bound** (Malik, van Beek, Shobaki): prove infeasibility of `m`, then

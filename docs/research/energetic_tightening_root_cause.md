@@ -181,6 +181,16 @@ produced (export the bounds from Rust for the instance), not a hand-derived excl
   Take the max over the distinct ASAP values `a` in the cone. The mirror with descendants gives a
   sound ALAP and a sound per-op tail for the makespan bound. Both pass the Z3 shape in 4(b) by
   construction; add the property test.
+
+  > **Editor's note (2026-11-24).** This proposal was superseded and is not sound as stated
+  > for shifted lanes. Counting a shiftable ancestor from its ASAP is wrong because its lanes
+  > can run before its issue cycle (Z3 check `RB-issue-bound-for-shifted-ancestor` finds a
+  > violating schedule), and the full mirror over descendants is wrong because the lanes of a
+  > shifted reader can run before a shiftable producer completes (`RB-full-tail-for-shiftable`).
+  > The rule in the code counts shiftable ancestors from a separate lane bound and, in the tail
+  > of a shiftable op, only descendants that cannot be shifted: see
+  > [ENERGETIC_REASONING_FOR_UNIT_TASKS.md](../ENERGETIC_REASONING_FOR_UNIT_TASKS.md) section 5.
+  > The gate on `symmetry_rows == Declared` recommended above is in `model.rs`.
 - [I] If declared rows are kept, the only count-based rule they justify is positional:
   `k-th op of the chain >= (min ASAP of the chain) + ceil(k/C) - 1`, pushing the last ops, and
   only when the rows are in the model.

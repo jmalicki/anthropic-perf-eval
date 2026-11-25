@@ -61,11 +61,19 @@ Options:
 ## Resource-aware issue-cycle bounds (RB*)
 
 `--asap-alap-tightening energetic` computes, for every op, an earliest issue cycle from the slots
-its ancestors need and a latest completion from the slots its descendants need
+its ancestors need and a latest execution end (the completion of a shiftable op, the issue cycle
+of any other) from the slots its descendants need
 (`scheduler_rs/src/cpsat_scheduler/resource_bounds.rs`). `verification/resource_bounds.py` encodes
 the schedules of the CP-SAT model (issue cycles, lanes and completion of shiftable ops, selects,
 ConstChoice, an eliminable vbroadcast, slot capacities) and asks Z3 for a schedule with an op
 outside its bounds.
+
+Scope: the checks cover the resource-aware pass only. `energetic` also runs the symmetry-aware
+pass, whose bounds are valid only together with the declared ordering rows
+(`--cpsat-symmetry-rows declared`; those rows are not justified by a proven symmetry, see
+BUGS.md). `schedule_ssa_cpsat` skips that pass when the rows are not in the model
+(`--cpsat-symmetry-rows none` or `checked`). For a select on the multiply-add path the bounded
+end is the issue cycle, not the multiply_add at issue + 1.
 
 | Check | Expected | Meaning |
 |---|---|---|

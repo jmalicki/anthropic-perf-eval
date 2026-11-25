@@ -16,11 +16,15 @@
 //! issue(o) >= r + ceil(W / cap)        for every r and every engine
 //! ```
 //!
-//! The mirror image bounds the last cycle `o` occupies from above by the work of its
-//! descendants, counted from the horizon.
+//! The mirror image bounds the execution end of `o` (the completion of a shiftable op, the
+//! issue cycle of any other, as in `op_times.rs`) from above by the work of its descendants,
+//! counted from the horizon. For a select on the multiply-add path that is the issue cycle,
+//! not the multiply_add at issue + 1; only issue-cycle domains are tightened.
 //!
 //! The rule never decides which op of a crowded cycle has to move, so it needs no ordering
-//! between ops and holds with or without symmetry rows. (The rule it replaces counted the ops
+//! between ops and holds with or without symmetry rows. (`energetic` also runs the
+//! symmetry-aware pass, which does depend on the declared ordering rows and is skipped when
+//! they are not in the model; see `model.rs`.) (The rule it replaces counted the ops
 //! of an ordering group with the same earliest cycle and pushed the first of them; a schedule
 //! that runs those first is then cut off. `verification/resource_bounds.py`, check
 //! `RB-old-counting-rule`, has the four-op counterexample.)
@@ -66,7 +70,11 @@ pub(crate) struct ResourceBounds {
     /// Every slot the op occupies (issue cycle when not shifted, each lane when shifted) is
     /// at least this. Equal to `issue_lb` for an op that cannot be shifted.
     pub(crate) lane_lb: Vec<i32>,
-    /// The last cycle the op occupies (its completion) is at most `horizon - 1 - finish_tail`.
+    /// The op's execution end as `op_times.rs` defines it (the completion of a shiftable op,
+    /// the issue cycle of any other) is at most `horizon - 1 - finish_tail`. This is not the
+    /// last cycle the op occupies in one case: a select on the multiply-add path also
+    /// occupies issue + 1, which this bound does not cover. The caller tightens only the
+    /// domain of the issue cycle.
     pub(crate) finish_tail: Vec<i32>,
 }
 
