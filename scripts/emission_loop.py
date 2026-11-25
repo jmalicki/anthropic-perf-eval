@@ -437,7 +437,8 @@ class Stage2:
             "counts_match": row["counts_match"], "cycles": row["cycles"],
             "simulator_cycles": row["simulator_cycles"], "proved": row["proved"], "passed": row["passed"],
             "valid": bool(row["counts_match"] and row["proved"] and row["passed"]),
-            "peak_live": row["peak_live"], "max_addr": row.get("max_addr"), "budget_exceeded": False,
+            "peak_live": row["peak_live"], "max_addr": row.get("max_addr"),
+            "budget_exceeded": row["budget_exceeded"],
             "summary": summary,
             "row_violations_on_merge": violations, "kernel": row["kernel"],
             # The plan's window bound with the row table before it was merged (what a solve
@@ -514,28 +515,90 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
     return best
 
 
-def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str) -> dict:
-    """Plain selection: the k best plans by a stage-1 score that are not built yet, each built
-    and judged by the greedy; the best build wins. `objective` "floor" (the capacity floor, a
-    bound) or "greedy-model" (GREEDY_MODEL, a fitted heuristic). No incumbent bound and no
-    patience stop: all k are built, so the result says how far down the score ranking the
-    greedy's best plan sits."""
+def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_level: int = 1,
+              deterministic_time: float | None = None, retries: int = 20) -> dict:
+    """Plain selection by a stage-1 score: build plans in order of increasing score and judge
+    each with the greedy. `objective` "floor" (the capacity floor, a bound) or
+    "greedy-model" (GREEDY_MODEL, a fitted heuristic).
+
+    The score has large tie plateaus (many plans share the optimum), so "the k best plans"
+    is not well defined: this enumerates **score levels**. For level L (starting at the
+    lowest score among unbuilt plans) it asks the solver for an unbuilt plan with score <= L
+    and objective >= L, computes the plan's own score (`plan_score`: the objective variable
+    is only an upper relaxation of it) and builds it if it is exactly L; a plan below L is
+    excluded and the solve repeated (at most `retries` times, then the level is skipped).
+    After `per_level` plans, or when no unbuilt plan scores at most L, it moves to L + 1.
+    Each record carries its score and level index (1 = the first level of this run).
+    No-goods exclude plans by their per-(round, encoding) group counts (`plan_group_counts`):
+    plans that differ only in which groups use an encoding are one plan here. No incumbent
+    bound, no patience stop: all k builds are made."""
     if objective not in ("floor", "greedy-model"):
         raise ValueError(f"topk objective {objective!r}")
+    if per_level < 1:
+        raise ValueError("per_level must be at least 1")
     mode = f"topk-{objective}"
+    gm = {} if objective == "greedy-model" else None
     best = stage2.best()
-    for it in range(k):
-        res = solve(stage2.table, nogoods=_built_nogoods(stage2), time_limit=time_limit,
-                    greedy_model={} if objective == "greedy-model" else None)
-        if res["status"] == "infeasible":
-            _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
-            break
+    rejected: list = []
+    level, levels_seen, at_level, builds, it = None, 0, 0, 0, 0
+    while builds < k:
+        if level is None:
+            res = solve(stage2.table, nogoods=_built_nogoods(stage2), time_limit=time_limit, greedy_model=gm,
+                        tie_break=False, deterministic_time=deterministic_time)
+            if res["status"] == "infeasible":
+                _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
+                break
+            level = es.plan_score(stage2.table, res["rows"], objective)
+        else:
+            res = None
+            for _ in range(retries + 1):
+                res = solve(stage2.table, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                            greedy_model=gm, tie_break=False, incumbent=level + 1, min_objective=level,
+                            deterministic_time=deterministic_time)
+                if res["status"] == "infeasible" or es.plan_score(stage2.table, res["rows"], objective) == level:
+                    break
+                rejected.append(es.plan_group_counts(res["rows"], stage2.ctx))
+            else:
+                res = {"status": "skipped"}
+            if res["status"] != "optimal" and res["status"] != "feasible":
+                _record(stage2, mode, it, res, None, False,
+                        f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
+                                              else f"no plan of exactly this score in {retries} tries"))
+                level, at_level, it = level + 1, 0, it + 1
+                if level > 10 ** 6:
+                    break
+                continue
+        if at_level == 0:
+            levels_seen += 1
+        at_level += 1
         rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
+        builds += 1
         improved = rec["valid"] and (best is None or rec["cycles"] < best["cycles"])
         best = rec if improved else best
         _record(stage2, mode, it, res, rec, built,
-                f"rank {it + 1} by {objective}" + (" (new best)" if improved else ""))
+                f"score {level} ({objective}), level {levels_seen} of this run, plan {at_level} at that level"
+                + (" (new best)" if improved else ""),
+                extra={"score": level, "level": levels_seen, "at_level": at_level})
+        it += 1
+        if at_level >= per_level:
+            level, at_level = level + 1, 0
     return best
+
+
+def topk_summary(stage2: Stage2, objective: str, limit: int = 200, deterministic_time: float = 5.0) -> dict:
+    """Where the greedy's best known plan sits in the score order: its score, and how many
+    plans (distinct group counts) score at most that, counted up to `limit`."""
+    best = stage2.best()
+    if best is None:
+        return {}
+    score = es.plan_score(stage2.table, best["rows"], objective)
+    counted = es.count_plans_at_most_isolated(stage2.table, score=score, objective=objective, limit=limit,
+                                              deterministic_time=deterministic_time)
+    built = [b for b in stage2.builds.values() if b["valid"]]
+    scores = sorted(es.plan_score(stage2.table, b["rows"], objective) for b in built)
+    return {"objective": objective, "best_plan": best["plan"], "best_cycles": best["cycles"],
+            "best_score": score, "plans_at_or_below_score": counted["count"],
+            "count_complete": counted["complete"], "lowest_score_built": scores[0] if scores else None}
 
 
 def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, step: float = 0.04,
@@ -770,6 +833,41 @@ def parse_greedy_options(specs: Sequence[str]) -> dict:
     return out
 
 
+# Options the loop's context or pipeline fixes: a --greedy-option may not change them.
+LOOP_FIXED_OPTIONS = frozenset({"use_greedy", "rounds", "batch_size", "forest_height", "n_nodes", "emission_plan",
+                                "output_json", "cached_select", "tree_reduce_max_depth", "depth4_select_rounds"})
+
+
+def build_option_names() -> frozenset:
+    """Every option name `kernel_build_args.args_to_build_kwargs` reads (the build accepts
+    nothing else; an unread name is silently ignored there)."""
+    from kernel_build_args import args_to_build_kwargs
+
+    names = set()
+
+    class _Recorder:
+        def __getattr__(self, name):
+            names.add(name)
+            raise AttributeError(name)  # getattr(args, name, default) then uses the default
+
+    args_to_build_kwargs(_Recorder(), use_git_sha=False)
+    return frozenset(names)
+
+
+def validate_greedy_options(options: Mapping, ctx: es.Context) -> None:
+    """Reject --greedy-option keys the build would ignore (a typo would otherwise build with
+    the default judge while the state records the option) and keys the loop fixes."""
+    known = build_option_names()
+    fixed = LOOP_FIXED_OPTIONS | set(ctx.build_options())
+    unknown = sorted(k for k in options if k not in known)
+    clashing = sorted(k for k in options if k in fixed)
+    if unknown:
+        raise ValueError(f"--greedy-option: unknown build option(s) {unknown}; the build reads "
+                         f"{len(known)} names, e.g. greedy_budget_force, pressure_inflation_threshold")
+    if clashing:
+        raise ValueError(f"--greedy-option: {clashing} are fixed by the loop's context or pipeline")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="emission_structure loop", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -782,6 +880,12 @@ def main(argv=None) -> int:
                     help="add the load-tail greedy flags to the shaped ones: " +
                     " ".join(f"{k}={v}" for k, v in es.LOAD_TAIL_GREEDY.items()) +
                     " (stored in the state; a state refuses a different setting)")
+    ap.add_argument("--per-level", type=int, default=1,
+                    help="topk modes: plans built per score level before moving to the next level")
+    ap.add_argument("--solve-dtime", type=float, default=None,
+                    help="stage-1 CP-SAT deterministic-time budget per solve (reproducible), on top of --time-limit")
+    ap.add_argument("--count-limit", type=int, default=200,
+                    help="topk modes: count plans at or below the best plan's score up to this many")
     ap.add_argument("--greedy-option", action="append", default=[], metavar="KEY=VALUE",
                     help="greedy build option on top of the shaped (and load-tail) flags, e.g. "
                          "greedy_budget_force=stall or pressure_inflation_threshold=0.98 (stored in the "
@@ -813,8 +917,10 @@ def main(argv=None) -> int:
     table = es.load_or_calibrate(ctx, args.table, workdir)
     greedy_extra = dict(es.LOAD_TAIL_GREEDY) if args.load_tail else ({} if args.command == "run" else None)
     if args.greedy_option:
+        extra_options = parse_greedy_options(args.greedy_option)
+        validate_greedy_options(extra_options, ctx)
         greedy_extra = dict(greedy_extra or {})
-        greedy_extra.update(parse_greedy_options(args.greedy_option))
+        greedy_extra.update(extra_options)
     stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra)
     if args.max_axis:
         stage2.rowtable.max_axis = args.max_axis
@@ -842,7 +948,17 @@ def main(argv=None) -> int:
                 rule = "saturated" if m == "caps" else "underfilled"
                 caps_found = loop_caps(stage2, n_iter, args.patience, args.time_limit, rule=rule, mode=m)["caps"]
             elif m.startswith("topk-"):
-                loop_topk(stage2, n_iter, args.time_limit, m[len("topk-"):])
+                obj = m[len("topk-"):]
+                loop_topk(stage2, n_iter, args.time_limit, obj, per_level=args.per_level,
+                          deterministic_time=args.solve_dtime)
+                summary = topk_summary(stage2, obj, limit=args.count_limit)
+                stage2.trace.append({"mode": m, "iter": "summary", "built": False, "summary": summary,
+                                     "feedback": "best known plan: score {best_score}, {plans_at_or_below_score}{plus} "
+                                                 "plans at or below it".format(
+                                                     plus="" if summary.get("count_complete") else "+", **summary)
+                                     if summary else "no valid build"})
+                stage2.save()
+                print(f"  {m} summary: {summary}")
             else:
                 loop_rows(stage2, n_iter, args.patience, args.time_limit)
         print(f"{stage2.built_now} plans built in this run, {len(stage2.builds)} in the state")

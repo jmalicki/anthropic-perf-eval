@@ -199,15 +199,43 @@ def test_parse_greedy_options():
 
 
 @pytest.mark.parametrize("objective", ["floor", "greedy-model"])
-def test_topk_builds_distinct_plans_in_score_order(table, tmp_path, objective):
-    """topk builds k different plans, best score first, each PROVED and PASSED under the
-    stall judge, and none over the scratch budget."""
+def test_topk_enumerates_score_levels(table, tmp_path, objective):
+    """topk builds distinct plans with non-decreasing scores, moving up a level after
+    `per_level` plans, each PROVED and PASSED under the stall judge and within the 1,535
+    assignable words; the recorded score is the plan's own score. Deterministic-time solves."""
     judge = dict(es.LOAD_TAIL_GREEDY, greedy_budget_force="stall", pressure_inflation_threshold=0.98)
     stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None, greedy_extra=judge)
-    el.loop_topk(stage2, 2, 20.0, objective)
+    el.loop_topk(stage2, 3, 60.0, objective, per_level=1, deterministic_time=2.0)
     entries = [e for e in stage2.trace if e["mode"] == f"topk-{objective}"]
-    assert len(entries) == 2
-    assert entries[0]["plan"] != entries[1]["plan"]
-    assert entries[0]["objective"] <= entries[1]["objective"]
+    assert len(entries) == 3
+    assert len({e["plan"] for e in entries}) == 3
+    scores = [e["score"] for e in entries]
+    assert scores == sorted(scores) and len(set(scores)) == 3, scores  # one plan per level
+    assert [e["level"] for e in entries] == [1, 2, 3]
     for b in stage2.builds.values():
-        assert b["valid"] and b["peak_live"] <= 1536 and not b["budget_exceeded"]
+        assert b["valid"] and b["peak_live"] <= 1535 and b["budget_exceeded"] is False
+        assert es.plan_score(table, b["rows"], objective) in scores
+
+
+def test_budget_exceeded_is_recorded_from_the_build(table, tmp_path, monkeypatch):
+    """Stage2 records the build's own budget flag (it used to write False)."""
+    real = es.measure
+
+    def flagged(*a, **k):
+        row = real(*a, **k)
+        row["budget_exceeded"] = True
+        return row
+
+    monkeypatch.setattr(es, "measure", flagged)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+    rec, _ = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert rec["budget_exceeded"] is True
+
+
+def test_greedy_options_are_validated():
+    el.validate_greedy_options({"greedy_budget_force": "stall", "pressure_inflation_threshold": 0.98}, CTX)
+    with pytest.raises(ValueError, match="unknown"):
+        el.validate_greedy_options({"greedy_budgt_force": "stall"}, CTX)  # typo
+    for fixed in ({"rounds": 4}, {"use_greedy": False}, {"select_bit_source": "path"}):
+        with pytest.raises(ValueError, match="fixed"):
+            el.validate_greedy_options(fixed, CTX)

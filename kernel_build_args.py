@@ -477,9 +477,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
     group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
-                       help="Wavefront: 'key' (default) native scalar ops and shiftable vector ops in one "
-                            "wavefront order; 'native-first' native scalar-ALU ops (e.g. address adds) before "
-                            "the cycle's vector ops, so shifts never take their slots "
+                       help="Wavefront only (an error otherwise): 'key' (default) native scalar ops and "
+                            "shiftable vector ops in one wavefront order; 'native-first' native scalar-ALU ops "
+                            "(e.g. address adds) are tried before the cycle's vector ops (lanes of a split shift "
+                            "carried from the previous cycle are still placed first and can take scalar slots) "
                             "(docs/STARTUP_AND_STALL_LOOP.md)")
     group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first", "chain-first"], default="key",
                        help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "

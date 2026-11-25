@@ -44,10 +44,14 @@ schedule's slots without a counterfactual build.
      6 setup ops (header pointer load, address add, root load, xor with the deferred constant,
      broadcast) or the hash depth could shorten it: emission changes, not scheduling.
 
-What is left of the 21 cycles at 1,030 (accounted, `scratch_ceiling_diagnosis gap`): 9.5 cycles
-of the load engine starved by setup loads before t (110 setup loads in cycles 0 to 44, 34 of them
-ConstChoices), 7 cycles of VALU-full upstream of early gathers, 3 cycles of a ready load waiting,
-1 cycle scalar ALU, 0.5 cycle of setup loads in the window.
+What is left of the 21 cycles at 1,030 (exact split, then attribution with `scratch_ceiling_diagnosis
+gap`): 20.5 cycles of idle load slots and 0.5 cycle of setup loads in the window; the idle slots
+are attributed to 9.5 cycles of a delayed load with no load slot (setup loads before t: 110 in
+cycles 0 to 44, 34 of them ConstChoices), 8 cycles of a delayed vector op with no room, and 3
+cycles of a ready load waiting. Attribution is accounting, not a counterfactual: the 9.5 flow
+cycles attributed at 1,033 were removed by chain-first and bought 2 measured cycles
+(docs/GREEDY_CONST_CHOICE.md shows the same for the setup loads: moving 23 constants off the
+load engine bought 0).
 
 ## A. The loop under the stall judge
 
@@ -96,18 +100,21 @@ backwards.
 both orderings on `path_flow90.json`: stagger 8 1,030 (U), stagger 10 1,045, `stall` + 0.98
 1,035; index with native-first + `stall` + 0.98 1,039.
 
-Where the cycles go (accounted with the blame chain of `scratch_ceiling_diagnosis gap`; t 51,
-q 14, W 1,888; cycles):
+Where the cycles go. Gap, idle and extra columns are an exact, checked split
+(`scratch_ceiling_diagnosis gap`, row t 51, q 14, W 1,888); the cause columns **attribute** the
+idle slots (accounting, not a counterfactual; deterministic, fractional; "no room": the op's
+engine had no room in every cycle it waited). Cycles:
 
-| `path_flow90.json` | gap | setup loads in window | flow full | VALU full | load full | ALU full | ready load waited |
+| `path_flow90.json` | gap (measured) | extra (setup) loads in window | flow no room | vector no room | load no room | ALU no room | ready load waited |
 |---|---|---|---|---|---|---|---|
 | default | 24 | 5.0 | 9.5 | 0 | 2.5 | 4.0 | 3.0 |
-| chain-first | 22 | 5.0 | 0 | 6.5 | 5.5 | 1.0 | 4.0 |
-| both | 21 | 0.5 | 0 | 7.0 | 9.5 | 1.0 | 3.0 |
+| chain-first | 22 | 5.0 | 0 | 7.5 | 5.5 | 0 | 4.0 |
+| both | 21 | 0.5 | 0 | 8.0 | 9.5 | 0 | 3.0 |
 
-chain-first removes the flow starvation, but most of it reappears on the VALU and the load
-engine; native-first removes the setup loads from the window, and they reappear as load
-starvation before t. The start-up is close to a zero-sum among engines: the load engine has
+The measured differences are 2 and 1 cycles; the attributed flow term was 9.5. chain-first
+removes the flow attribution, but most of it reappears on the vector ALU and the load engine;
+native-first removes the setup loads from the window, and they reappear as load starvation
+before t. The start-up is close to a zero-sum among engines: the load engine has
 about 120 setup loads for 102 slots before t = 51 (accounted), so some must land after t
 unless setup loads leave the load engine.
 
@@ -144,7 +151,9 @@ xor would take 1 cycle off the setup.
 | Flag | Default | What |
 |---|---|---|
 | `--greedy-flow-priority chain-first` | `key` | Flow ops by chain rank (shared first), then key. Test: `test_flow_chain_first_lets_the_first_chain_through` (control: key is later) |
-| `--greedy-alu-priority {key,native-first}` | `key` | Native scalar-ALU ops before the cycle's vector ops. Test: `test_alu_native_first_keeps_scalar_slots_for_natives` (control: under the key shifts split the natives over two cycles) |
+| (both orderings, and `--greedy-load-priority`) | | Wavefront only: with another `--greedy-priority` they are an error (they were silently ignored). Test: `tests/test_wavefront_only_options.py` |
+| headline pin | | `tests/test_startup_orderings_pin.py` (CI only, 16-round builds): default 1,033, chain-first 1,031, native-first 1,033, both 1,030 |
+| `--greedy-alu-priority {key,native-first}` | `key` | Native scalar-ALU ops are tried before the cycle's vector ops (lanes of a split shift carried from the previous cycle are still placed first and can take scalar slots). Test: `test_alu_native_first_keeps_scalar_slots_for_natives` (control: under the key shifts split the natives over two cycles). The reorder also puts natives first in the ASAP-inflation scan, whose last 3 ops are exempt: measured on `path_flow90.json` with chain-first, total inflation deferrals 299 -> 206; alone it gives the default kernel (231 -> 231) |
 | `emission_structure loop --greedy-option KEY=VALUE` | none | Greedy build option for the judge, stored in the state |
 | loop modes `topk-floor`, `topk-greedy-model` | - | Build the k best unbuilt plans by floor / greedy model |
 

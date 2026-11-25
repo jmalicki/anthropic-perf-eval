@@ -1187,6 +1187,26 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let greedy_priority = crate::kernel_builder::config::GreedyPriorityKind::from_str(greedy_priority)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    // These orderings reorder the wavefront's ready list; under the FIFO priority they would be
+    // silently ignored, so ask for the wavefront explicitly.
+    if greedy_priority != crate::kernel_builder::config::GreedyPriorityKind::Wavefront {
+        let wavefront_only: Vec<String> = [
+            ("greedy_load_priority", greedy_load_priority),
+            ("greedy_flow_priority", greedy_flow_priority),
+            ("greedy_alu_priority", greedy_alu_priority),
+        ]
+        .iter()
+        .filter(|(_, v)| *v != "key")
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
+        if !wavefront_only.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} only take effect with greedy_priority=wavefront (got {:?})",
+                wavefront_only.join(", "),
+                greedy_priority
+            )));
+        }
+    }
     if let Some(dtime) = cpsat_deterministic_time {
         if !(dtime.is_finite() && dtime > 0.0) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
