@@ -115,6 +115,17 @@ pub struct SsaScratchContext {
     /// [n_groups] - the tracked index as it was before the latest branch update, i.e. at the
     /// depth of the round just emitted (same form and `None` convention as `all_idx`).
     pub prev_idx: Vec<Option<VReg>>,
+    /// Per group: `(n, bit)` when the current mirrored index is `madd(n, 2, bit)` (the last
+    /// branch updated a known index); `None` otherwise. For `IndexEarlyTerms`.
+    pub idx_update: Vec<Option<(VReg, VReg)>>,
+    /// Per group: the last round in which it gathered (for `IndexEarlyTerms::FirstGather`).
+    pub last_gather_round: Vec<Option<usize>>,
+    /// `[n_iters][UNROLL]`: `v_nv` is the raw loaded node, the deferred constant still to be
+    /// XORed (into the value) by `emit_xor` (`reassociate_gather_xor`).
+    pub nv_raw: Vec<Vec<bool>>,
+    /// `[n_iters][UNROLL]`: `(bit, hi, lo)` of a top select left for `emit_xor`, which emits
+    /// `select(bit, val ^ hi, val ^ lo)` (`select_xor_pushdown`); `v_nv` is unused then.
+    pub select_pushdown: Vec<Vec<Option<(VReg, VReg, VReg)>>>,
     /// [depth] - select constants per cached level (bit-driven `AccessEncoding`s).
     pub cached_tables: Vec<Option<CachedLevelTable>>,
     pub v_nv: Vec<Vec<Option<VReg>>>, // [n_iters][UNROLL] - tree value vectors
@@ -214,6 +225,10 @@ impl SsaScratchContext {
             all_val: vec![None; n_groups],
             path_bits: vec![Vec::new(); n_groups],
             prev_idx: vec![None; n_groups],
+            idx_update: vec![None; n_groups],
+            last_gather_round: vec![None; n_groups],
+            nv_raw: (0..n_iters).map(|_| vec![false; unroll]).collect(),
+            select_pushdown: (0..n_iters).map(|_| vec![None; unroll]).collect(),
             v_nv: (0..n_iters).map(|_| vec![None; unroll]).collect(),
             v_t: (0..n_iters).map(|_| vec![None; unroll]).collect(),
             v_tr_s1: (0..n_iters).map(|_| vec![None; unroll]).collect(),

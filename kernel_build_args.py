@@ -220,6 +220,9 @@ EMISSION_DEFAULTS = {
     # Per round and group tree-access encodings (solver/emission_plan.py): a path, a plan dict,
     # or an expanded list. Passed to the binding expanded; None = choose from the flags above.
     "emission_plan": None,
+    "reassociate_gather_xor": False,
+    "index_early_terms": "none",
+    "select_xor_pushdown": "none",
 }
 
 
@@ -271,6 +274,24 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "cached nodes instead of gathering. all (default): every visit (rounds 4 and 15 of "
                             "16). after-wrap: only visits after the first wrap (round 15); round 4 gathers. "
                             "Selecting costs 15 selects per group and saves 8 loads per group")
+    group.add_argument("--reassociate-gather-xor", action="store_true",
+                       default=EMISSION_DEFAULTS["reassociate_gather_xor"],
+                       help="Gather rounds: XOR the deferred hash constant into the value, not the loaded node: "
+                            "val ^ (node ^ K) = (val ^ K) ^ node, so one XOR instead of two follows the load "
+                            "(same op count; proof: R16-gather-xor-reassociation; docs/CRITICAL_PATH.md)")
+    group.add_argument("--index-early-terms", choices=["none", "final", "first-gather"],
+                       default=EMISSION_DEFAULTS["index_early_terms"],
+                       help="Mirrored index only: write consumers of n' = 2n + bit as madd(n, -2, V) - bit, so "
+                            "only one op follows the newest branch bit. 'final': the final index store (same op "
+                            "count); 'first-gather': also each group's first gather address after rounds "
+                            "without a gather (+1 op per such gather). Proof: R17-index-early-terms")
+    group.add_argument("--select-xor-pushdown", choices=["none", "first-pass", "all"],
+                       default=EMISSION_DEFAULTS["select_xor_pushdown"],
+                       help="Push the round XOR below the top select of a cached-level select tree: "
+                            "val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo), one cycle off the "
+                            "chain per select round, one more vector op per group and round; only where the top "
+                            "is a SelectChoice (bits-flow; bits from depth 2). 'first-pass': rounds before the "
+                            "wrap (the chain to the first gather). Proof: R18-select-xor-pushdown")
     group.add_argument("--emission-plan", default=EMISSION_DEFAULTS["emission_plan"], metavar="PATH",
                        help="JSON plan of the tree-access encoding (gather, bits, bits-flow, mobius) of every "
                             "group in every round, as written by scripts/emission_structure.py (format: "

@@ -33,6 +33,40 @@ pub const MAX_TREE_REDUCE_DEPTH: u32 = 4;
 /// (`R7-index-range-by-depth`). `Mirrored` tracks `n = L_d - idx` with
 /// `L_d = 2^(d+1) - 2` (`level_last_index`): the node's position in its level counted from
 /// the right. Proofs: `R9` to `R11` in `verification/rewrites.py`.
+/// Rounds whose round XOR is pushed below the top select of a cached-level select tree:
+/// `val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo)` (`R18-select-xor-pushdown`).
+/// The two XORs run in parallel with the branch bit's AND, so the chain from one round's
+/// hash to the next is one cycle shorter; one more vector op per group and round. Only where
+/// the top of the tree is a SelectChoice (`bits-flow`; `bits` from depth 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectXorPushdown {
+    /// Never (default).
+    #[default]
+    None,
+    /// Rounds before the first wrap (the start-up: on the chain to the first gather).
+    FirstPass,
+    /// Every cached-level select round.
+    All,
+}
+
+/// Which consumers of the mirrored index `n' = 2n + bit` use the early form
+/// `V - n' = madd(n, -2, V) - bit` (`R17-index-early-terms`): the multiply_add depends only on
+/// the previous index, so after the newest branch bit only the subtraction remains on the
+/// dependency chain (one cycle shorter). Mirrored index form only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexEarlyTerms {
+    /// Never (default).
+    #[default]
+    None,
+    /// The final index store `L_d - n'`: same op count (`n'` is then dead), one cycle off
+    /// the tail.
+    Final,
+    /// The final index store, and the gather address `(forest_p + L_d) - n'` of a group's
+    /// first gather after rounds without one: one more vector op per such gather (`n'` is
+    /// still needed), one cycle off the chain to it.
+    FirstGather,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexForm {
     /// The reference index. Update per round: AND, SUB, multiply_add (3 vector ops).
@@ -315,6 +349,14 @@ pub struct ProblemSpec {
     /// `depth4_select_after_wrap_only` for the choice of tree access (`access_encoding`);
     /// check it with `check_access_plan`. Default `None`: the emission is unchanged.
     pub access_plan: Option<Vec<Vec<AccessEncoding>>>,
+    /// Gather rounds: XOR the deferred hash constant into the value instead of into the
+    /// loaded node, `val ^ (node ^ K) = (val ^ K) ^ node` (`R16-gather-xor-reassociation`),
+    /// so one XOR instead of two follows the load. Same op count. Default false.
+    pub reassociate_gather_xor: bool,
+    /// See [`IndexEarlyTerms`]. Default `None`.
+    pub index_early_terms: IndexEarlyTerms,
+    /// See [`SelectXorPushdown`]. Default `None`.
+    pub select_xor_pushdown: SelectXorPushdown,
 }
 
 impl Default for ProblemSpec {
@@ -343,6 +385,9 @@ impl Default for ProblemSpec {
             select_bit_source: SelectBitSource::Index,
             depth4_select_after_wrap_only: false,
             access_plan: None,
+            reassociate_gather_xor: false,
+            index_early_terms: IndexEarlyTerms::None,
+            select_xor_pushdown: SelectXorPushdown::None,
         }
     }
 }

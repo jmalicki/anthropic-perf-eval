@@ -206,10 +206,33 @@ impl SsaTickTockKernelBuilder {
             None => self.v_constant(0),
             Some(n) => {
                 let v_last = self.v_constant(level_last_index(tree_depth));
+                if let (true, Some((prev, bit))) = (
+                    self.config.spec.index_early_terms != crate::kernel_builder::config::IndexEarlyTerms::None,
+                    self.ctx.idx_update[g],
+                ) {
+                    // L - (2 prev + bit) = madd(prev, -2, L) - bit (R17-index-early-terms).
+                    return self.early_index_term(prev, bit, v_last, VarType::BatchData);
+                }
                 self.emit.set_next_var_type(VarType::BatchData);
                 self.emit.emit_valu(Opcode::Sub, v_last, n)
             }
         }
+    }
+
+    /// `v - (2 prev + bit)` as `madd(prev, -2, v) - bit` (`R17-index-early-terms`): the
+    /// multiply_add needs only `prev`, so only the SUB waits for the newest branch bit.
+    fn early_index_term(
+        &mut self,
+        prev: crate::types::VReg,
+        bit: crate::types::VReg,
+        v: crate::types::VReg,
+        var_type: VarType,
+    ) -> crate::types::VReg {
+        let v_minus2 = self.v_constant(0xFFFF_FFFE); // -2 mod 2^32
+        self.emit.set_next_var_type(var_type);
+        let partial = self.emit.emit_fma(prev, v_minus2, v);
+        self.emit.set_next_var_type(var_type);
+        self.emit.emit_valu(Opcode::Sub, partial, bit)
     }
 
     // =========================================================================
@@ -1080,6 +1103,28 @@ impl SsaTickTockKernelBuilder {
                 // Bit that selects at level `level` of the select tree (0 = leaves): oldest first.
                 let bit_at = |level: usize| bits[level];
 
+                // Push the round XOR below the top select (R18) when the top is a SelectChoice.
+                let pushdown = {
+                    use crate::kernel_builder::config::SelectXorPushdown as P;
+                    let round_ok = match self.config.spec.select_xor_pushdown {
+                        P::None => false,
+                        P::FirstPass => self
+                            .emit
+                            .current_round
+                            .map_or(false, |r| (r as usize) <= self.config.spec.forest_height),
+                        P::All => true,
+                    };
+                    round_ok
+                        && tree_depth >= 1
+                        && (mode == CachedSelect::BitsFlow || (mode == CachedSelect::Bits && tree_depth >= 2))
+                };
+                if pushdown && tree_depth == 1 {
+                    // BitsFlow at depth 1: the top select is the leaf pair itself.
+                    let pair = &table.pairs.as_ref().expect(&missing)[0];
+                    self.ctx.select_pushdown[it][i] = Some((bit_at(0), pair.high.expect(&missing), pair.base));
+                    self.ctx.v_nv[it][i] = None;
+                    continue;
+                }
                 let node = if tree_depth == 0 {
                     table.root.expect(&missing)
                 } else if mode != CachedSelect::Mobius {
@@ -1098,7 +1143,8 @@ impl SsaTickTockKernelBuilder {
                             self.emit.emit_fma(bit_at(0), pair.delta, pair.base)
                         });
                     }
-                    for level in 1..tree_depth {
+                    let last_level = if pushdown { tree_depth - 1 } else { tree_depth };
+                    for level in 1..last_level {
                         self.emit.set_symmetry_hint(level as u8);
                         let mut next = Vec::with_capacity(cur.len() / 2);
                         for k in 0..cur.len() / 2 {
@@ -1108,6 +1154,13 @@ impl SsaTickTockKernelBuilder {
                         cur = next;
                     }
                     self.emit.clear_symmetry_hint();
+                    if pushdown {
+                        // Top level left for emit_xor: select(bit, val ^ cur[1], val ^ cur[0]).
+                        debug_assert_eq!(cur.len(), 2);
+                        self.ctx.select_pushdown[it][i] = Some((bit_at(tree_depth - 1), cur[1], cur[0]));
+                        self.ctx.v_nv[it][i] = None;
+                        continue;
+                    }
                     cur[0]
                 } else {
                     let mut cur = table.coefficients.clone().expect(&missing);
@@ -1469,11 +1522,26 @@ impl SsaTickTockKernelBuilder {
                 let idx = self.ctx.all_idx[base_g + i].unwrap();
 
                 // Vector address computation: forest_p + idx[item] for all 8 items
-                self.emit.set_next_var_type(VarType::Address);
-                let v_addr = if mirrored {
-                    self.emit.emit_valu(Opcode::Sub, v_base, idx)
-                } else {
-                    self.emit.emit_valu(Opcode::Add, idx, v_base)
+                let g = base_g + i;
+                let round = self.emit.current_round;
+                let first_gather = round.is_some()
+                    && self.ctx.last_gather_round[g].map_or(true, |r| Some(r + 1) != round);
+                self.ctx.last_gather_round[g] = round;
+                let early = mirrored
+                    && first_gather
+                    && self.config.spec.index_early_terms
+                        == crate::kernel_builder::config::IndexEarlyTerms::FirstGather;
+                let v_addr = match (early, self.ctx.idx_update[g]) {
+                    // (forest_p + L) - (2 prev + bit) = madd(prev, -2, forest_p + L) - bit.
+                    (true, Some((prev, bit))) => self.early_index_term(prev, bit, v_base, VarType::Address),
+                    _ => {
+                        self.emit.set_next_var_type(VarType::Address);
+                        if mirrored {
+                            self.emit.emit_valu(Opcode::Sub, v_base, idx)
+                        } else {
+                            self.emit.emit_valu(Opcode::Add, idx, v_base)
+                        }
+                    }
                 };
 
                 // Decompose address vector into 8 scalar addresses
@@ -1492,10 +1560,16 @@ impl SsaTickTockKernelBuilder {
                     self.emit.emit_load_into(addr_elements[elem], result_elements[elem]);
                 }
 
-                // XOR with stage5 constant
-                self.emit.set_next_var_type(VarType::RoundState);
-                self.ctx.v_nv[it][i] =
-                    Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
+                if self.config.spec.reassociate_gather_xor {
+                    // The deferred constant goes into the value in emit_xor (R16).
+                    self.ctx.v_nv[it][i] = Some(v_nv);
+                    self.ctx.nv_raw[it][i] = true;
+                } else {
+                    // XOR with stage5 constant
+                    self.emit.set_next_var_type(VarType::RoundState);
+                    self.ctx.v_nv[it][i] =
+                        Some(self.emit.emit_valu(Opcode::Xor, v_nv, v_stage5_xor));
+                }
             }
         }
         self.emit.clear_iter_group();
@@ -1520,7 +1594,21 @@ impl SsaTickTockKernelBuilder {
                     continue;
                 }
                 let val = self.ctx.all_val[g].unwrap();
+                if let Some((bit, hi, lo)) = self.ctx.select_pushdown[it][i].take() {
+                    // val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo) (R18).
+                    let x_hi = self.emit.emit_valu(Opcode::Xor, val, hi);
+                    let x_lo = self.emit.emit_valu(Opcode::Xor, val, lo);
+                    self.ctx.all_val[g] = Some(self.select_2way(bit, x_hi, x_lo));
+                    continue;
+                }
                 let v_nv = self.ctx.v_nv[it][i].unwrap();
+                let val = if std::mem::take(&mut self.ctx.nv_raw[it][i]) {
+                    // val ^ (node ^ K) = (val ^ K) ^ node: the node arrives last (R16).
+                    let k = self.ctx.v_stage5_xor.unwrap();
+                    self.emit.emit_valu(Opcode::Xor, val, k)
+                } else {
+                    val
+                };
                 self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_nv));
             }
         }
@@ -1701,6 +1789,7 @@ impl SsaTickTockKernelBuilder {
                     //   wrap round: every index becomes 0, so n = 0 (None), no op;
                     //   depth 0:    n' = bit (n = 0), one op;
                     //   otherwise:  n' = 2n + bit, two ops.
+                    self.ctx.idx_update[g] = None;
                     self.ctx.all_idx[g] = if is_wrap_round {
                         self.ctx.path_bits[g].clear();
                         None
@@ -1708,7 +1797,10 @@ impl SsaTickTockKernelBuilder {
                         let bit = self.emit_branch_bit(g, tree_depth);
                         Some(match self.ctx.all_idx[g] {
                             None => bit,
-                            Some(n) => self.emit.emit_fma(n, v_2, bit),
+                            Some(n) => {
+                                self.ctx.idx_update[g] = Some((n, bit));
+                                self.emit.emit_fma(n, v_2, bit)
+                            }
                         })
                     };
                     continue;
