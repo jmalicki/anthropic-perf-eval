@@ -466,9 +466,10 @@ Before the first iteration one forward pass runs in the order of the greedy's ow
 (the same order without the pressure heuristics). The shorter schedule of each iteration is
 where the next one starts, even when it is no shorter than the last (lengths are not
 monotone); the shortest schedule seen that passes every check is the result. The search
-ends after N iterations, when a schedule reproduces itself, or after 4 iterations in a row
-in which no shorter schedule was accepted (`DEFAULT_MAX_STALLED_ITERATIONS`; without it an
-orbit that never returns to exactly the same schedule runs all N iterations). Only cycles
+ends after N iterations, when a schedule reproduces itself, or after 10 iterations in a row
+in which no shorter schedule was accepted (`DEFAULT_MAX_STALLED_ITERATIONS`). The last only
+bounds a large N, where an orbit that never returns to exactly the same schedule would
+otherwise run all N iterations; up to N = 10 it changes nothing. Only cycles
 and the shift decision (vector slot, 8 scalar lanes, or lanes split over two consecutive
 cycles) change. The greedy's const and select encodings are kept.
 
@@ -511,8 +512,7 @@ Shaped greedy (`--greedy-barriers none --greedy-priority wavefront --greedy-spli
 
 The 16 x 256 kernel (1,281 simulator cycles) passes the strict upstream check (commands
 below), and two builds give the same kernel file. The pass adds about 0.1 s to a 16-round
-build. In every row the shortest schedule is found before the stall limit ends the search
-(16 x 256: in the first iteration; the search stops after iteration 5).
+build. At 16 x 256 the shortest schedule is found in the first iteration.
 
 ### With CP-SAT following
 
@@ -537,14 +537,11 @@ with CP-SAT.
 - **It is not pressure-aware.** The passes ignore scratch and a candidate is only accepted
   or rejected afterwards. From the wavefront schedule this is enough (table above). From a
   schedule that runs all 32 groups abreast every candidate is rejected and nothing changes:
-  16 rounds with the default shape, 9 of 9 candidates rejected before the stall limit ends
-  the search (the last at a peak of 1,603 words against 1,535), result 2,007 cycles as
-  without the pass; 4 rounds with `--greedy-barriers none` alone, 9 of 9 rejected (peak
-  1,649). With `--greedy-budget-headroom 250` on the shaped 16-round build (budget 1,285)
-  8 of 8 candidates are rejected and the result stays at 1,313 cycles; before the stall
-  limit that build ran all 10 iterations, rejected 18 of 19 candidates and accepted one of
-  1,280 cycles, so under scratch pressure the limit can end the search before a late
-  candidate that would fit. Making the list scheduler respect the budget is the follow-up.
+  16 rounds with the default shape, 21 of 21 candidates rejected (peak 1,611 words against
+  1,535), result 2,007 cycles as without the pass; 4 rounds with `--greedy-barriers none`
+  alone, 21 of 21 rejected (peak 1,649). With `--greedy-budget-headroom 250` on the shaped
+  16-round build (budget 1,285) 18 of 19 candidates are rejected and the one accepted has
+  1,280 cycles. Making the list scheduler respect the budget is the follow-up.
 - **Memory edges with latency 0** (a store after a load of the same word) are scheduled with
   latency 1. The verifier checks the real latency, so this can only cost cycles.
 - **CP-SAT pipeline: measured at two small sizes only** (table above). An accepted schedule

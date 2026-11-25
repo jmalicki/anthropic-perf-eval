@@ -55,7 +55,9 @@ const FLOW_SLOTS: usize = 1;
 /// pass stops (`JustifyConfig::max_stalled_iterations`). The iteration lengths are not
 /// monotone, so one iteration without a gain is not the end, but an orbit that never
 /// reproduces its starting schedule exactly would otherwise run all `max_iterations`.
-pub const DEFAULT_MAX_STALLED_ITERATIONS: usize = 4;
+/// The limit only bounds a large `max_iterations`: up to 10 iterations it never fires
+/// before the last one, so those runs find what they found without it.
+pub const DEFAULT_MAX_STALLED_ITERATIONS: usize = 10;
 
 // ============================================================================
 // Configuration and outcome
