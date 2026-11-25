@@ -53,7 +53,7 @@ $L report --state a.json --extra-state b.json --caps flow=0.92                # 
 |---|---|---|
 | `nogood` | no-good cut per built plan, floor < incumbent (`--nogood-caps`: enumerate under caps instead) | sound, weak |
 | `caps` / `caps-underfilled` | learned `max_util`: cap the engine the schedule saturates / under-fills relative to the plan | heuristic; `caps-underfilled` rediscovers flow 0.9 in 3 builds |
-| `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form proved (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes |
+| `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form: engine coupling proved by Z3 for all counts, window containment argued by hand, composition a randomized check (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes, so the default cut is `floor < best` (`--rows-cut heuristic` for `M < best + e`) |
 
 Use `--load-tail` for the current greedy (adds `--greedy-load-priority final-last
 --greedy-groups-in-flight 32 --greedy-stagger-cycles 9`; stored in the state, which then refuses
