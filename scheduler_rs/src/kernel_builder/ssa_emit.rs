@@ -8,7 +8,7 @@
 //! budget model counts one VReg per ConstChoice op; scratch usage is the same whether
 //! we later lower to Load or AddImm, so no extra logic is needed there.
 
-use crate::types::{EmissionPhase, MemLocation, MemRegion, Opcode, VarType, VLEN};
+use crate::types::{EmissionPhase, MemLocation, MemRegion, Opcode, RegionKind, VarType, VLEN};
 
 use super::config::{
     level_last_index, merged_hash_stage_constants, AccessEncoding, CachedSelect, IndexForm,
@@ -673,6 +673,9 @@ impl SsaTickTockKernelBuilder {
         let mixed = order.len() > 1;
         for encoding in order {
             self.access_groups = mixed.then(|| encodings.iter().map(|&e| e == encoding).collect());
+            // Per-group ops take their group from `set_iter_group`; ops emitted before the
+            // group loop are the part shared by the groups using this encoding.
+            self.emit.set_region(RegionKind::TreeAccess(encoding), None);
             if let Some(mode) = encoding.cached_select() {
                 self.emit_cached_level_select(tree_depth, mode, n_iters, n_groups);
                 continue;
@@ -688,6 +691,7 @@ impl SsaTickTockKernelBuilder {
             }
         }
         self.access_groups = None;
+        self.emit.clear_region();
 
         // XOR
         self.emit.set_phase(EmissionPhase::Xor);
@@ -938,6 +942,7 @@ impl SsaTickTockKernelBuilder {
             if !(bits || bits_flow || mobius) {
                 continue;
             }
+            self.emit.set_setup_region(depth);
             // U[m] = tree[L_d - n] ^ C, where n (the position in the level from the right)
             // is m with its `depth` bits reversed.
             let last = level_last_index(depth) as usize;
@@ -996,6 +1001,7 @@ impl SsaTickTockKernelBuilder {
             }
             self.ctx.cached_tables[depth] = Some(level);
         }
+        self.emit.clear_region();
     }
 
     /// The branch bits `b_0 .. b_(d-1)` group `g` selects with at `tree_depth = d`.
@@ -1521,9 +1527,11 @@ impl SsaTickTockKernelBuilder {
                 }
                 let val = self.ctx.all_val[g].unwrap();
                 let v_nv = self.ctx.v_nv[it][i].unwrap();
+                self.emit.set_region(RegionKind::NodeXor, Some(g));
                 self.ctx.all_val[g] = Some(self.emit.emit_valu(Opcode::Xor, val, v_nv));
             }
         }
+        self.emit.clear_region();
     }
 
     // =========================================================================
@@ -1552,6 +1560,7 @@ impl SsaTickTockKernelBuilder {
                         continue;
                     }
                     let val = self.ctx.all_val[g].unwrap();
+                    self.emit.set_region(RegionKind::Hash, Some(g));
 
                     if merge && hi == MERGED_HASH_STAGE {
                         // Stages 2+3 in 3 ops: (val * m1 + c1) ^ (val * m2 + c2)
@@ -1638,6 +1647,7 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         }
+        self.emit.clear_region();
     }
 
     // =========================================================================
@@ -1695,6 +1705,7 @@ impl SsaTickTockKernelBuilder {
 
                 let val = self.ctx.all_val[g].unwrap();
                 self.ctx.prev_idx[g] = self.ctx.all_idx[g];
+                self.emit.set_region(RegionKind::IndexStep, Some(g));
 
                 if self.mirrored_index() {
                     // Mirrored index n = L_d - idx (R9-mirrored-index-step):
@@ -1760,6 +1771,8 @@ impl SsaTickTockKernelBuilder {
                 }
             }
         }
+
+        self.emit.clear_region();
 
         // Partition stores (tick-tock) - only if enabled
         if self.config.spec.enable_partition_stores {

@@ -3234,6 +3234,119 @@ fn test_split_shift_off_without_shift_decisions() {
 }
 
 // =========================================================================
+// VALU shift fixed to none (`valu_shift_fixed_to_none`, set by the VALU-shift hint pass)
+//
+// BUGS.md "Greedy with `valu_shift_fixed_to_none` can place a vector op without a vector
+// slot". The greedy must never shift when the hint pass owns the shift decision, and on
+// every path (normal and force-schedule) no cycle may exceed an engine's slot limit.
+// =========================================================================
+
+/// Policy for the force-path test: like [`GreedyPolicy`] but never allows a shift, so the
+/// normal path cannot place an op on the scalar ALU (it defers instead) and any vector op
+/// beyond six in a cycle can only come from the force-schedule path.
+#[derive(Debug)]
+struct NeverShiftPolicy;
+
+impl PressurePolicy for NeverShiftPolicy {
+    fn sort_ready(
+        &self,
+        candidates: &mut [pressure_policy::SchedulingCandidate],
+        ctx: &pressure_policy::SchedulingContext,
+    ) {
+        GreedyPolicy.sort_ready(candidates, ctx);
+    }
+
+    fn should_defer_for_pressure(&self, _: usize, _: usize, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn allow_shift(&self, _: usize, _: usize, _: usize) -> bool {
+        false
+    }
+}
+
+/// Schedule 30 chains of 12 vector adds with shifting enabled and `valu_shift_fixed_to_none`,
+/// then check the slot invariant: every op is placed, and per cycle at most six vector ops
+/// not recorded as shifted and at most 12 scalar slots (scalar ops plus 8 per recorded shift).
+///
+/// # Returns
+/// `(max unshifted vector ops in a cycle, max scalar slots in a cycle, recorded shifts,
+/// budget exceeded)`.
+fn schedule_with_shift_fixed_to_none(
+    budget: usize,
+    policy: &dyn PressurePolicy,
+) -> (usize, usize, usize, bool) {
+    let (mut emit, _) = emit_independent_chains(30, 12);
+    let mut shifted = HashSet::new();
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut shifted,
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        policy,
+        None,
+        false,
+        false,
+        false,
+        true, // valu_shift_fixed_to_none
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &GreedyShape::default(),
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the chains");
+    assert!(emit.ops.iter().all(|op| op.cycle >= 0), "every op is placed");
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    let mut alu: HashMap<i32, usize> = HashMap::new();
+    for op in &emit.ops {
+        if op.engine == Engine::Valu && shifted.contains(&op.id) {
+            *alu.entry(op.cycle).or_default() += VLEN;
+        } else if op.engine == Engine::Valu {
+            *valu.entry(op.cycle).or_default() += 1;
+        } else if op.engine == Engine::Alu {
+            *alu.entry(op.cycle).or_default() += 1;
+        }
+    }
+    (
+        valu.values().copied().max().unwrap_or(0),
+        alu.values().copied().max().unwrap_or(0),
+        shifted.len(),
+        budget_exceeded,
+    )
+}
+
+/// Normal path: with the six vector slots full the slot tracker used to take 8 scalar slots
+/// for the op (`SlotResult::Shifted`) without recording it in `shifted_ops`, so it lowered as
+/// a seventh vector op. Budget 1536: nothing is forced.
+#[test]
+fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit() {
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(1536, &GreedyPolicy);
+    assert!(!exceeded, "budget 1536 forces nothing");
+    assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
+    assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
+    assert_eq!(shifts, 0, "the hint pass owns the shift decision");
+}
+
+/// Force-schedule path, `SlotResult::NoRoom` arm: the policy never allows a shift (so the
+/// normal path places no unrecorded shift), the budget forces ops through the force path,
+/// and there an op that did not fit used to be marked scheduled with no slot.
+#[test]
+fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit_when_force_scheduling() {
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(80, &NeverShiftPolicy);
+    assert!(exceeded, "budget 80 must force ops through the force path");
+    assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
+    assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
+    assert_eq!(shifts, 0, "the hint pass owns the shift decision");
+}
+
+// =========================================================================
 // SlotTracker unit tests — shared slot-capacity invariants
 //
 // These tests verify the SlotTracker abstraction in isolation, ensuring that:
