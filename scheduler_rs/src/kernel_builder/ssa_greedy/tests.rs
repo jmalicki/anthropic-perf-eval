@@ -5496,3 +5496,71 @@ fn test_load_priority_final_last_budget_deferral() {
         assert_eq!(ahead_at(budget), 0, "budget {}", budget);
     }
 }
+
+/// `stall` under the shaped pipeline's settings: adaptive policy with ASAP inflation (policy
+/// bounds), wavefront priority, VALU shift and split shifts, with budgets that bind. 24
+/// independent chains of vector adds off one broadcast: a running chain holds one vector
+/// and each step frees what it adds, so no budget of at least three vectors deadlocks. The
+/// run must stay within the budget and never force; returns (budget_exceeded, peak,
+/// diagnostics) for `force`.
+fn schedule_chains_shaped(budget: usize, force: BudgetForce, split_shift: bool) -> (bool, usize, GreedyDiagnostics) {
+    let (mut emit, _) = emit_independent_chains(24, 6);
+    let asap = crate::cpsat_scheduler::bounds::compute_ssa_asap(&emit.ops, &HashSet::new());
+    let max_asap = asap.values().copied().max().unwrap_or(0);
+    let alap = crate::cpsat_scheduler::bounds::compute_ssa_alap(&emit.ops, max_asap + 20, &HashSet::new());
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+        split_shift,
+        budget_force: force,
+        ..Default::default()
+    };
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let ((_, exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut HashSet::new(),
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::PolicyOnly { asap: &asap, alap: &alap },
+        &pressure_policy::AdaptivePolicy::default(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the chains");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (exceeded, peak, diagnostics)
+}
+
+#[test]
+fn test_budget_force_stall_holds_the_budget_in_the_shaped_pipeline() {
+    let mut control_overshoots = 0;
+    for budget in [3 * VLEN + 1, 5 * VLEN + 1, 8 * VLEN + 1, 12 * VLEN + 1] {
+        for split_shift in [false, true] {
+            let (exceeded, peak, diag) = schedule_chains_shaped(budget, BudgetForce::Stall, split_shift);
+            assert!(!exceeded && diag.forced_past_budget == 0, "stall forced at budget {} split {}", budget, split_shift);
+            assert!(peak <= budget, "stall peak {} > budget {} (split {})", peak, budget, split_shift);
+            // A split shift starts only with 1 to 7 scalar slots free, i.e. after a counted
+            // placement on the scalar ALU in the same cycle (a carried split's completion, a
+            // native op or a whole shift): a cycle whose only placement is a split start
+            // does not occur. The stall rule still treats one as progress, defensively.
+            assert_eq!(diag.split_only_cycles, 0);
+            let (same_exceeded, same_peak, _) = schedule_chains_shaped(budget, BudgetForce::SameCycle, split_shift);
+            if same_exceeded || same_peak > budget {
+                control_overshoots += 1;
+            }
+        }
+    }
+    assert!(control_overshoots > 0, "control: same-cycle never overshot, so the budgets do not bind");
+}
