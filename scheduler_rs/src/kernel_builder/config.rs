@@ -861,6 +861,8 @@ impl CompilerConfig {
             split_shift: self.greedy_split_shift,
             scratch_pools: self.scratch_model.is_pools(),
             pool_caps: None,
+            // Set by the scheduling passes from the pipeline configuration.
+            forced_shift_ops: Default::default(),
         }
     }
 }

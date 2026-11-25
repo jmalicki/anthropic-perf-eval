@@ -137,6 +137,12 @@ impl Pass for GreedySchedulePass {
         let forced = ForcedEncodings::from_context(ctx);
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         let mut shape = ctx.config.compiler.greedy_shape();
+        // Individually forced shifts (what-if runs) are fixed to 1 in the CP-SAT model, so the
+        // greedy must place those ops shifted too: its shift decisions and cycles become the
+        // hint, the ALAP cap and the horizon, and are only valid for a schedule that honours
+        // them. Under --valu-shift alu|valu the model ignores the set, and so does the greedy
+        // (`forced.shifted_ops` is then a complete encoding).
+        shape.forced_shift_ops = ctx.config.forced_shift_ids();
         // A split shift reaches CP-SAT only as per-lane hints (cpsat_split_shift_hint);
         // without them the hint has one cycle per op and cannot describe it.
         if is_cpsat_pipeline && !ctx.config.compiler.cpsat_split_shift_hint {

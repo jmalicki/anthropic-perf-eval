@@ -254,6 +254,28 @@ pub struct PipelineConfig {
     /// CP-SAT specific configuration (None for greedy-only pipeline).
     #[cfg(feature = "cpsat")]
     pub cpsat: Option<CpSatPipelineConfig>,
+    /// Individually forced shifts for the greedy-only pipeline (ops that must run as 8 scalar
+    /// ALU ops). The CP-SAT pipeline carries them in `cpsat.forced_shifts`; read both through
+    /// [`PipelineConfig::forced_shift_ids`].
+    pub forced_shifts: Option<HashSet<usize>>,
+}
+
+impl PipelineConfig {
+    /// Ids of the individually forced shifts of this run, in id order.
+    ///
+    /// # Returns
+    /// The CP-SAT configuration's forced set when there is one, else the greedy-only set;
+    /// empty when no shift is forced.
+    pub fn forced_shift_ids(&self) -> std::collections::BTreeSet<usize> {
+        #[cfg(feature = "cpsat")]
+        let from_cpsat = self.cpsat.as_ref().and_then(|c| c.forced_shifts.as_ref());
+        #[cfg(not(feature = "cpsat"))]
+        let from_cpsat: Option<&HashSet<usize>> = None;
+        from_cpsat
+            .or(self.forced_shifts.as_ref())
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for PipelineConfig {
@@ -267,6 +289,7 @@ impl Default for PipelineConfig {
             bounds: BoundsConfig::default(),
             #[cfg(feature = "cpsat")]
             cpsat: None,
+            forced_shifts: None,
         }
     }
 }

@@ -32,7 +32,7 @@ pub mod pressure_policy;
 pub mod wavefront;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::kernel_builder::memory_deps::{check_memory_edges, memory_predecessors, memory_successors};
 
@@ -71,6 +71,39 @@ pub struct GreedyShape {
     /// Pool capacities `(vectors, scalars)` the run must keep (set by the pools retry in
     /// [`schedule_ssa_greedy_shaped`]); `None` = live words against the budget.
     pub pool_caps: Option<(usize, usize)>,
+    /// Ids of ops that must run shifted (8 scalar ALU ops, never a vector slot): the
+    /// individually forced shifts of a what-if run, which the CP-SAT model fixes to 1. Not a
+    /// shape switch, but it travels with them to every scheduling run. Only shiftable vector
+    /// ops count, and only when the scheduler decides shifts itself (shifting enabled, no
+    /// `fixed_shifted_ops`); see [`must_shift`]. Empty (the default) changes nothing.
+    pub forced_shift_ops: BTreeSet<usize>,
+}
+
+/// Whether `op` must be placed shifted because its shift is individually forced.
+///
+/// This mirrors the CP-SAT model, which fixes the shift literal of an op in the forced set
+/// only if the op is shiftable and the shift mode is `optimize`: with shifting disabled or a
+/// complete fixed encoding (`fixed_shifted_ops`, i.e. `--valu-shift alu|valu` or the
+/// fixed-choices pass) the forced set is not consulted.
+///
+/// # Arguments
+/// * `op` - The op about to be placed
+/// * `shape` - Carries the forced set
+/// * `enable_valu_shift` - Whether shifting is enabled for this run
+/// * `fixed_shifted_ops` - The complete fixed shift encoding, if any
+///
+/// # Returns
+/// `true` if every scheduling path must give the op 8 scalar slots and record it as shifted.
+fn must_shift(
+    op: &SsaOp,
+    shape: &GreedyShape,
+    enable_valu_shift: bool,
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+) -> bool {
+    enable_valu_shift
+        && fixed_shifted_ops.is_none()
+        && shape.forced_shift_ops.contains(&op.id)
+        && can_ssa_valu_shift_to_alu(op)
 }
 
 // ============================================================================
@@ -2478,7 +2511,11 @@ fn schedule_ssa_greedy_core(
                         && engine == Engine::Valu
                         && can_ssa_valu_shift_to_alu(&ops[idx])
                 };
-                let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
+                // An individually forced shift is placed like a fixed one: 8 scalar slots or
+                // not at all in this cycle, whatever the pressure policy says about shifting.
+                let forced_shift = must_shift(&ops[idx], shape, enable_valu_shift, fixed_shifted_ops);
+                let must_place_shifted =
+                    fixed_shifted_ops.map_or(false, |s| s.contains(&op_id)) || forced_shift;
 
                 // Check slot availability
                 if must_place_shifted {
@@ -2610,7 +2647,9 @@ fn schedule_ssa_greedy_core(
                         }
                     }
                     SlotResult::Shifted => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                        // A forced shift is recorded even when a hint pass owns the other
+                        // shift decisions: the pass only adds shifts and must see this one.
+                        if fixed_shifted_ops.is_none() && (!valu_shift_fixed_to_none || forced_shift) {
                             shifted_ops.insert(op_id);
                         }
                     }
@@ -2774,7 +2813,9 @@ fn schedule_ssa_greedy_core(
                     && engine == Engine::Valu
                     && can_ssa_valu_shift_to_alu(&ops[force_idx])
             };
-            let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
+            // Forced shifts keep their encoding on this path too (see the normal path).
+            let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id))
+                || must_shift(&ops[force_idx], shape, enable_valu_shift, fixed_shifted_ops);
 
             // When must_place_shifted we need ALU room for all lanes.
             let slots_ok = if must_place_shifted {
