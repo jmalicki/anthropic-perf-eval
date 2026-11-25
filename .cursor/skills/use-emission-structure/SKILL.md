@@ -26,10 +26,12 @@ $M solve --what-if gather-without-address-op                        # uncalibrat
 $M solve --greedy-model --out plan.json   # minimise a calibrated HEURISTIC of the load-tail greedy's cycles
 ```
 
-`--greedy-model` (`solve_plan(greedy_model={})`, `es.GREEDY_MODEL`) is fitted on the recorded
-load-tail builds (index bits; leave-one-out MAE 6.2 cycles). It ranks index-bit plans near the
-optimum (Spearman +0.71, floor -0.54), not path-bit plans (scratch), and is optimistic by 20 to
-40 cycles on the plans it chooses. It is not a bound. To see why a built plan is slow, run
+`--greedy-model` (`solve_plan(greedy_model={})`, `es.GREEDY_MODEL`) is grid-fitted on 24
+recorded load-tail builds (index bits; data `docs/emission_plans/greedy_model_data.json`;
+`uv run python -m scripts.greedy_model_fit --check` reproduces it). In-sample it ranks
+index-bit plans near the optimum (Spearman +0.71, floor -0.54), not path-bit plans (scratch);
+out of sample it was optimistic by 20 to 42 cycles on all four plans it chose. It is not a
+bound; refit it (and its data) whenever the greedy changes. To see why a built plan is slow, run
 `uv run python -m scripts.shift_limit_diagnosis sched.json --floor N`: the shift count follows
 from the cycle count (`V - s = 6T - I`), so look at the static bound, select resolution and flow
 waits, and scratch (docs/GREEDY_SHAPE_ABLATION.md section 12).
@@ -53,7 +55,7 @@ $L report --state a.json --extra-state b.json --caps flow=0.92                # 
 |---|---|---|
 | `nogood` | no-good cut per built plan, floor < incumbent (`--nogood-caps`: enumerate under caps instead) | sound, weak |
 | `caps` / `caps-underfilled` | learned `max_util`: cap the engine the schedule saturates / under-fills relative to the plan | heuristic; `caps-underfilled` rediscovers flow 0.9 in 3 builds |
-| `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form proved (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes |
+| `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form: engine coupling proved by Z3 for all counts, window containment argued by hand, composition a randomized check (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes, so the default cut is `floor < best` (`--rows-cut heuristic` for `M < best + e`) |
 
 Use `--load-tail` for the current greedy (adds `--greedy-load-priority final-last
 --greedy-groups-in-flight 32 --greedy-stagger-cycles 9`; stored in the state, which then refuses

@@ -21,7 +21,8 @@ From a scheduler output JSON this prints:
    (`fma1` one op, `fma2` subtract + multiply_add), and the mean wait (issue - ready) of
    flow ops per round: a long wait means the one flow slot is the queue.
 
-"Ready" is operand availability (producer cycle + 1); it ignores the wavefront window.
+"Ready" is operand availability (the producer's last lowered op + 1: the last lane of a
+split-shifted producer, the multiply_add of a two-op select); it ignores the wavefront window.
 
 Usage (from the project root):
     uv run python -m scripts.shift_limit_diagnosis sched.json [more.json ...] [--floor N]
@@ -62,12 +63,13 @@ def analyze(d: dict) -> dict:
     ssa = {o["id"]: o for o in d["ssa_ops"]}
     use = {e: [0] * total for e in CAP}
     shifted = set()
-    start = {}
+    start, finish = {}, {}
     for low, s, lane in lowered_with_ssa(d):
         if low["engine"] in use:
             use[low["engine"]][low["cycle"]] += 1
         if s is not None:
             start[s["id"]] = min(start.get(s["id"], 10 ** 9), low["cycle"])
+            finish[s["id"]] = max(finish.get(s["id"], -1), low["cycle"])
             if lane:
                 shifted.add(s["id"])
     valu_ssa = [o for o in d["ssa_ops"] if o["engine"] == "valu"]
@@ -77,7 +79,9 @@ def analyze(d: dict) -> dict:
             on_valu[o["cycle"]].append(o)
 
     def ready(o):
-        return max((start[x] + 1 for x in o["dep_ids"] if x in start), default=0)
+        # A split-shifted producer's lanes straddle two cycles: its result is complete only
+        # after the last one.
+        return max((finish[x] + 1 for x in o["dep_ids"] if x in finish), default=0)
 
     w_shift, w_fixed = [0] * total, [0] * total
     wait_by_band = collections.Counter()
@@ -150,9 +154,13 @@ def analyze(d: dict) -> dict:
 
 
 def static_bound(d: dict):
+    """The static head/tail bound, or None with a warning on stderr when it cannot be
+    computed (scripts.static_bounds needs numpy)."""
     try:
         from scripts.static_bounds import static_makespan_bound
-    except ImportError:  # numpy missing: the bound is optional
+    except ImportError as e:
+        print(f"warning: static head/tail bound not computed ({type(e).__name__}: {e}); the cycles above "
+              "the floor are not split into forced and scheduling loss", file=sys.stderr)
         return None
     return static_makespan_bound(d, "any")["bound"]
 
@@ -168,6 +176,8 @@ def report(name: str, a: dict, floor: int | None, bound: int | None) -> str:
             forced = max(0, min(bound, a["cycles"]) - floor)
             line += (f"; static head/tail bound {bound}: {forced} of those cycles are needed by any schedule, "
                      f"{a['cycles'] - max(bound, floor)} are scheduling loss")
+        else:
+            line += "; static head/tail bound not computed"
         out.append(line)
     out.append("  idle scalar-ALU slots (shift equivalents = slots / 8):")
     for k in IDLE_CLASSES:

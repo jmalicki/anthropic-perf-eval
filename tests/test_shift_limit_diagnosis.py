@@ -77,3 +77,30 @@ def test_report_and_cli(tmp_path, capsys):
     path.write_text(json.dumps(_schedule()))
     assert main([str(path), "--floor", "2", "--no-static-bound"]) == 0
     assert "inversion (fixed waiting)" in capsys.readouterr().out
+
+
+def test_ready_waits_for_the_last_lane_of_a_split_shift():
+    """A split-shifted producer (lanes in cycles 0 and 1) is ready for its consumer at cycle 2,
+    not 1: the consumer issued at cycle 2 did not wait (review of #76)."""
+    ssa = [{"id": 0, "engine": "valu", "opcode": "^", "dep_ids": [], "cycle": 1, "source_info": _si(0),
+            "srcs": [], "dest": None, "var_type": "x"},
+           {"id": 1, "engine": "valu", "opcode": "^", "dep_ids": [0], "cycle": 2, "source_info": _si(0),
+            "srcs": [], "dest": None, "var_type": "x"}]
+    ops = [{"id": lane, "engine": "alu", "opcode": "^", "cycle": 0 if lane < 4 else 1} for lane in range(8)]
+    ops.append({"id": 1, "engine": "valu", "opcode": "^", "cycle": 2})
+    d = {"total_cycles": 3, "ops": ops, "ssa_ops": ssa, "peak_live_words": 0,
+         "shifted_alu_cycles": {"0": [0, 0, 0, 0, 1, 1, 1, 1]}}
+    a = analyze(d)
+    assert a["shifted"] == 1
+    assert a["bands"]["r0-4"]["ready_wait"] == 0
+
+
+def test_static_bound_import_error_is_reported(monkeypatch, capsys):
+    """Without scripts.static_bounds (e.g. numpy missing) the bound is skipped with a warning,
+    and the report says so instead of silently dropping the forced/loss split."""
+    from scripts import shift_limit_diagnosis as sld
+
+    monkeypatch.setitem(sys.modules, "scripts.static_bounds", None)
+    assert sld.static_bound(_schedule()) is None
+    assert "static head/tail bound not computed" in capsys.readouterr().err
+    assert "static head/tail bound not computed" in report("s", analyze(_schedule()), floor=2, bound=None)

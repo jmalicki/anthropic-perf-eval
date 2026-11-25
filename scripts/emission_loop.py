@@ -20,9 +20,22 @@ into stage 1. Three kinds of feedback, kept apart because they differ in what th
 * ``rows`` (c): time-aware rows added to the stage-1 objective, M >= t + q +
   window_floor(work with head >= t and tail >= q), with the work, heads and tails of each
   op class (round, encoding, phase, op kind) learned from the built plans (`RowTable`), plus
-  no-goods and the incumbent bound "M < best cycles". The row form is proved
-  (verification/window_rows_proof.py); the per-class table it is fed is observed, and every
-  build is checked against the table it was solved with (violations are reported).
+  no-goods and the sound incumbent bound "floor < best cycles". The row form's coupling
+  inequality is proved for all counts and its composition checked on random small DAGs
+  (verification/window_rows_proof.py); the per-class table it is fed is observed, not
+  proved, and every build is checked against the table it was solved with (violations are
+  reported). Since the table can overestimate a plan, "M < best cycles" would be a heuristic
+  cut; it is used only with --rows-cut heuristic, never reported as exhaustion.
+
+No-goods exclude a model point (`es.plan_model_key`: group counts per round, plus tail
+patterns), which `es.solve_plan` always emits in one arrangement (`es.canonical_rows`). A
+built plan is cut only if it is that arrangement; a seed built in another arrangement leaves
+its model point open.
+
+Reproducibility: stage-1 solves take a deterministic-time budget (--deterministic-time,
+default 20) with the wall-clock limit as a backstop; every solve's status is in the trace. The
+state file records the scheduler extension's SHA-256 and refuses to reuse builds made by
+another scheduler build.
 
 Every number here is a greedy development measurement, not a recorded benchmark result.
 """
@@ -60,6 +73,49 @@ def plan_key(rows: Sequence[Sequence[str]]) -> str:
 def counts_key(rows, ctx: es.Context) -> dict[str, int]:
     """`plan_group_counts` with JSON-friendly "round:encoding" keys."""
     return {f"{r}:{e}": v for (r, e), v in es.plan_group_counts(rows, ctx).items()}
+
+
+def scratch_budget_error(e: BaseException) -> dict | None:
+    """{"peak_live", "budget"} if `e` is the builder's typed scratch-budget failure
+    (`scheduler_rs.ScratchBudgetExceeded`, args (message, peak_live, budget)), else None. Any
+    other error, whatever its message, is not a plan outcome and is re-raised by the caller."""
+    import scheduler_rs
+
+    if not isinstance(e, scheduler_rs.ScratchBudgetExceeded):
+        return None
+    _, peak_live, budget = e.args
+    return {"peak_live": int(peak_live), "budget": int(budget)}
+
+
+def is_canonical(rows, ctx: es.Context) -> bool:
+    """True if `solve_plan` emits exactly these rows for their model point."""
+    return [list(r) for r in rows] == es.canonical_rows(rows, ctx)
+
+
+def scheduler_fingerprint() -> dict:
+    """SHA-256 of the installed scheduler_rs extension binary (or {"error": ...}). Builds made
+    with different binaries are not comparable."""
+    import hashlib
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("scheduler_rs")
+    except (ImportError, ValueError) as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    if spec is None:
+        return {"error": "scheduler_rs not installed"}
+    paths = []
+    for loc in spec.submodule_search_locations or []:
+        paths += sorted(os.path.join(loc, f) for f in os.listdir(loc) if f.endswith((".so", ".pyd", ".dylib")))
+    if not paths and spec.origin and spec.origin.endswith((".so", ".pyd")):
+        paths = [spec.origin]
+    if not paths:
+        return {"error": f"no extension binary found for {spec.origin}"}
+    h = hashlib.sha256()
+    for path in paths:
+        with open(path, "rb") as f:
+            h.update(f.read())
+    return {"extension_sha256": h.hexdigest()}
 
 
 # ----------------------------------------------------------------------------
@@ -350,7 +406,8 @@ class Stage2:
     needs in a state file so that later runs reuse the builds."""
 
     def __init__(self, table: es.CostTable, workdir: str, state_path: str | None = None, log=print,
-                 keep_files: bool = False, greedy_extra: Mapping | None = None):
+                 keep_files: bool = False, greedy_extra: Mapping | None = None, fingerprint: Mapping | None = None,
+                 check_scheduler: bool = True):
         self.table = table
         self.ctx = table.context
         self.workdir = workdir
@@ -360,10 +417,15 @@ class Stage2:
         # Scheduler options on top of the shaped flags. Part of the state: builds made with
         # other options are not comparable, so a state file refuses a different setting.
         self.greedy_extra = dict(greedy_extra or {})
+        # Stage-1 CP-SAT deterministic-time budget per solve (None: wall clock only).
+        self.deterministic_time: float | None = None
         self.builds: dict[str, dict] = {}
         self.rowtable = RowTable(self.ctx)
         self.trace: list[dict] = []
         self.built_now = 0
+        # Which scheduler build made the builds; a state from another build is refused
+        # (check_scheduler=False, e.g. for reports, only reads it).
+        self.scheduler = dict(fingerprint) if fingerprint is not None else scheduler_fingerprint()
         if state_path and os.path.exists(state_path):
             with open(state_path) as f:
                 state = json.load(f)
@@ -373,6 +435,12 @@ class Stage2:
                 raise ValueError(f"{state_path} was built with greedy options {state.get('greedy_extra', {})}, "
                                  f"not {self.greedy_extra}")
             self.greedy_extra = state.get("greedy_extra", {})
+            recorded = state.get("scheduler")
+            if check_scheduler and state["builds"] and recorded != self.scheduler:
+                raise ValueError(f"{state_path} holds builds from scheduler {recorded or 'unrecorded'}, not the "
+                                 f"installed {self.scheduler}: they are not comparable; use a new --state")
+            if not check_scheduler and recorded is not None:
+                self.scheduler = recorded
             self.builds = state["builds"]
             self.rowtable = RowTable.from_json(state["row_table"])
             self.trace = state.get("trace", [])
@@ -380,6 +448,7 @@ class Stage2:
     def save(self):
         if self.state_path:
             es.write_json_atomic(self.state_path, {"context": asdict(self.ctx), "greedy_extra": self.greedy_extra,
+                                                   "scheduler": self.scheduler,
                                                    "builds": self.builds, "row_table": self.rowtable.to_json(),
                                                    "trace": self.trace})
 
@@ -387,18 +456,16 @@ class Stage2:
         ok = [b for b in self.builds.values() if b["valid"]]
         return min(ok, key=lambda b: (b["cycles"], b["simulator_cycles"])) if ok else None
 
-    def _failed(self, rows, name: str, key: str, error: str) -> dict:
-        """Record a plan the scheduler could not build (e.g. it overflows the scratch budget)."""
-        import re
-
-        m = re.search(r"peak[_ ]live[^0-9]*(\d+)", error) or re.search(r"(\d+) (?:live )?words", error)
+    def _failed(self, rows, name: str, key: str, error: str, peak_live: int | None = None) -> dict:
+        """Record a plan the scheduler could not build within the scratch budget
+        (`scheduler_rs.ScratchBudgetExceeded`, whose peak_live is passed in)."""
         counts = self.table.predict(rows)
         rec = {
             "name": name, "plan": describe_plan(rows), "rows": [list(r) for r in rows],
             "group_counts": counts_key(rows, self.ctx), "counts": counts,
             "predicted_floor": es.choice_floor(counts)["cycles"], "emitted_floor": None,
             "counts_match": None, "cycles": None, "simulator_cycles": None, "proved": False, "passed": False,
-            "valid": False, "peak_live": int(m.group(1)) if m else None, "budget_exceeded": True,
+            "valid": False, "peak_live": peak_live, "budget_exceeded": True,
             "error": error[:2000], "summary": None, "row_violations_on_merge": [], "kernel": None,
         }
         self.builds[key] = rec
@@ -418,9 +485,10 @@ class Stage2:
             row = es.measure(rows, self.table, self.workdir, name=f"{stem}_b{len(self.builds)}", shaped=True,
                              upstream=False, greedy_extra=self.greedy_extra)
         except Exception as e:  # noqa: BLE001 - only a scratch-budget failure is a plan outcome
-            if "budget" not in str(e).lower():
+            budget = scratch_budget_error(e)
+            if budget is None:
                 raise
-            return self._failed(rows, name, key, f"{type(e).__name__}: {e}"), True
+            return self._failed(rows, name, key, f"{type(e).__name__}: {e}", peak_live=budget["peak_live"]), True
         with open(row["sched_json"]) as f:
             sched = json.load(f)
         obs = observe(rows, sched, self.ctx)
@@ -458,8 +526,10 @@ class Stage2:
         return rec, True
 
 
-def solve(table: es.CostTable, **kwargs) -> dict:
-    return es.solve_plan_isolated(table, **kwargs)
+def solve(stage2: "Stage2", **kwargs) -> dict:
+    """Stage 1 in a child process, with the loop's deterministic-time budget."""
+    kwargs.setdefault("deterministic_time", stage2.deterministic_time)
+    return es.solve_plan_isolated(stage2.table, **kwargs)
 
 
 # ----------------------------------------------------------------------------
@@ -467,7 +537,10 @@ def solve(table: es.CostTable, **kwargs) -> dict:
 # ----------------------------------------------------------------------------
 def _record(stage2: Stage2, mode: str, it: int, res: dict, rec: dict | None, built: bool, feedback: str,
             extra: Mapping | None = None) -> dict:
-    entry = {"mode": mode, "iter": it, "status": res.get("status"), "feedback": feedback, "built": built}
+    entry = {"mode": mode, "iter": it, "status": res.get("status"), "feedback": feedback, "built": built,
+             # Every CP-SAT solve of this stage-1 call (main, windows floor, tie-break): status,
+             # wall and deterministic time, and whether it ended on the wall clock.
+             "solves": res.get("solves", []), "tie_break": res.get("tie_break")}
     if rec is not None:
         entry.update(plan=rec["plan"], floor=rec["predicted_floor"], cycles=rec["cycles"],
                      simulator_cycles=rec["simulator_cycles"], proved=rec["proved"], passed=rec["passed"])
@@ -483,7 +556,11 @@ def _record(stage2: Stage2, mode: str, it: int, res: dict, rec: dict | None, bui
 
 
 def _built_nogoods(stage2: Stage2) -> list[dict]:
-    return [b["group_counts"] for b in stage2.builds.values()]
+    """One no-good per built model point. A build whose rows are not the arrangement the model
+    emits for its point (a hand-made seed) does not cut it: the model's own arrangement of
+    those counts has not been built."""
+    return [es.plan_model_key(b["rows"], stage2.ctx) for b in stage2.builds.values()
+            if is_canonical(b["rows"], stage2.ctx)]
 
 
 def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
@@ -496,7 +573,7 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
     stale = 0
     for it in range(budget):
         incumbent = best["cycles"] if best and not max_util else None
-        res = solve(stage2.table, nogoods=_built_nogoods(stage2), incumbent=incumbent, time_limit=time_limit,
+        res = solve(stage2, nogoods=_built_nogoods(stage2), incumbent=incumbent, time_limit=time_limit,
                     max_util=dict(max_util or {}))
         if res["status"] == "infeasible":
             _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan with floor < incumbent")
@@ -546,7 +623,7 @@ def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, ste
     tried: set[str] = set()
     stale = 0
     for it in range(budget):
-        res = solve(stage2.table, max_util=caps, time_limit=time_limit)
+        res = solve(stage2, max_util=caps, time_limit=time_limit)
         rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
         improved = rec["valid"] and (best_rec is None or rec["cycles"] < best_rec["cycles"])
         if improved:
@@ -582,10 +659,26 @@ def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, ste
     return {"best": best_rec, "caps": best_caps}
 
 
-def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float) -> dict:
-    """(c): minimise M (floor and window rows), every built plan cut off, M < incumbent.
-    After each build the row table is lowered to what the plan showed (a refined cut), and
-    the build is checked against the table its plan was solved with."""
+def rows_overestimate(stage2: Stage2) -> int:
+    """Largest amount by which a row table overestimated a later plan's own window bound
+    (`rows_bound_before_merge - rows_bound_after_merge` over the builds)."""
+    return max((b.get("rows_bound_before_merge", 0) - b.get("rows_bound_after_merge", 0)
+                for b in stage2.builds.values() if b.get("rows_bound_after_merge") is not None), default=0)
+
+
+def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float, cut: str = "sound") -> dict:
+    """(c): minimise M (floor and window rows), every built model point cut off. After each
+    build the row table is lowered to what the plan showed, and the build is checked against
+    the table its plan was solved with.
+
+    The window rows come from an observed table that can overestimate an unbuilt plan, so M
+    is not a lower bound on its cycles. cut="sound" (default) prunes only with the floor
+    ("T < best cycles"), which is one; infeasible then means no unbuilt model point has a
+    floor below the incumbent. cut="heuristic" prunes with "M < best cycles + e", e the largest
+    overestimate seen so far: it can cut a plan with no evidence against it, so its
+    infeasibility is reported as the heuristic cut closing, never as exhaustion."""
+    if cut not in ("sound", "heuristic"):
+        raise ValueError(f"rows cut {cut!r}")
     best = stage2.best()
     stale = 0
     base = es.baseline_rows(stage2.ctx)
@@ -593,12 +686,15 @@ def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float) -> 
         table_then = RowTable.from_json(stage2.rowtable.to_json())
         specs = table_then.window_specs(base)
         incumbent = best["cycles"] if best else None
-        res = solve(stage2.table, windows=specs, nogoods=_built_nogoods(stage2), incumbent=incumbent,
-                    time_limit=time_limit)
+        margin = rows_overestimate(stage2) if cut == "heuristic" else None
+        res = solve(stage2, windows=specs, nogoods=_built_nogoods(stage2), time_limit=time_limit,
+                    floor_incumbent=incumbent,
+                    incumbent=None if incumbent is None or cut == "sound" else incumbent + margin)
         if res["status"] == "infeasible":
-            _record(stage2, "rows", it, res, None, False,
-                    "exhausted: no unbuilt plan with M < incumbent (given the observed row table)",
-                    {"windows": len(specs)})
+            why = ("exhausted: no unbuilt model point with floor < incumbent" if cut == "sound" else
+                   f"heuristic cut closed: no unbuilt model point with M < incumbent + {margin} under the observed "
+                   f"row table (not exhaustion: the table is observed, not proved)")
+            _record(stage2, "rows", it, res, None, False, why, {"windows": len(specs), "cut": cut})
             break
         predicted = table_then.bound(res["rows"])
         rec, built = stage2.evaluate(res["rows"], f"rows{it}")
@@ -608,7 +704,8 @@ def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float) -> 
         best = rec if improved else best
         stale = 0 if improved else stale + 1
         _record(stage2, "rows", it, res, rec, built,
-                f"no-good on this plan; row table refined from it; M < {best['cycles']}"
+                f"no-good on this plan; row table refined from it; "
+                + (f"floor < {best['cycles']}" if cut == "sound" else f"M < {best['cycles']} + overestimate")
                 + (" (new best)" if improved else ""),
                 {"windows": len(specs), "rows_bound": predicted["bound"], "rows_window": [predicted["t"], predicted["q"]],
                  "violations": len(violations),
@@ -749,7 +846,14 @@ def main(argv=None) -> int:
     ap.add_argument("--patience", type=int, default=4, help="stop a mode after this many iterations without improvement")
     ap.add_argument("--nogood-caps", help="nogood: enumerate under these caps (e.g. flow=0.92), no incumbent bound")
     ap.add_argument("--max-builds", type=int, default=60, help="refuse to build more than this many plans in one run")
-    ap.add_argument("--time-limit", type=float, default=60.0, help="stage-1 CP-SAT seconds per solve")
+    ap.add_argument("--time-limit", type=float, default=60.0,
+                    help="stage-1 CP-SAT wall-clock backstop per solve (seconds)")
+    ap.add_argument("--deterministic-time", type=float, default=20.0,
+                    help="stage-1 CP-SAT deterministic-time budget per solve (default 20; 0 = wall clock only, "
+                         "which makes the plan depend on machine load)")
+    ap.add_argument("--rows-cut", choices=["sound", "heuristic"], default="sound",
+                    help="rows: prune with the floor (sound, default) or with M plus the largest observed "
+                         "overestimate (heuristic; its closing is never reported as exhaustion)")
     ap.add_argument("--max-axis", type=int, default=None, help="window row grid: at most this many t and q values")
     ap.add_argument("--caps", help="report: caps for the capped-floor surrogate, e.g. flow=0.9 (default: the caps loop's best)")
     ap.add_argument("--keep-files", action="store_true", help="keep every scheduler JSON and kernel")
@@ -763,7 +867,9 @@ def main(argv=None) -> int:
     os.makedirs(workdir, exist_ok=True)
     table = es.load_or_calibrate(ctx, args.table, workdir)
     greedy_extra = es.LOAD_TAIL_GREEDY if args.load_tail else ({} if args.command == "run" else None)
-    stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra)
+    stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra,
+                    check_scheduler=args.command == "run")
+    stage2.deterministic_time = args.deterministic_time or None
     if args.max_axis:
         stage2.rowtable.max_axis = args.max_axis
 
@@ -790,7 +896,7 @@ def main(argv=None) -> int:
                 rule = "saturated" if m == "caps" else "underfilled"
                 caps_found = loop_caps(stage2, n_iter, args.patience, args.time_limit, rule=rule, mode=m)["caps"]
             else:
-                loop_rows(stage2, n_iter, args.patience, args.time_limit)
+                loop_rows(stage2, n_iter, args.patience, args.time_limit, cut=args.rows_cut)
         print(f"{stage2.built_now} plans built in this run, {len(stage2.builds)} in the state")
     if args.caps:
         caps_found = es.parse_max_util(args.caps)
@@ -798,7 +904,7 @@ def main(argv=None) -> int:
         caps_found = next((e["caps"] for e in reversed(stage2.trace)
                            if e["mode"].startswith("caps") and "(new best)" in e["feedback"]), None)
     for path in args.extra_state:
-        other = Stage2(table, workdir, path, log=None)
+        other = Stage2(table, workdir, path, log=None, check_scheduler=False)
         stage2.builds = {**other.builds, **stage2.builds}
         stage2.rowtable = stage2.rowtable.union(other.rowtable)
         stage2.trace = stage2.trace + other.trace

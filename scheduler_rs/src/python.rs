@@ -1044,6 +1044,28 @@ pub fn optional_constraint_group_names() -> Vec<String> {
 // =============================================================================
 
 use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
+use crate::kernel_builder::tick_tock_ssa::KernelBuilderError;
+
+pyo3::create_exception!(
+    scheduler_rs,
+    ScratchBudgetExceeded,
+    pyo3::exceptions::PyRuntimeError,
+    "The schedule does not fit the scratch budget. args = (message, peak_live, budget): the \
+     numbers of the accounting that raised it (see KernelBuilderError::BudgetExceeded). A \
+     RuntimeError subclass, so callers that catch RuntimeError still do."
+);
+
+/// Python exception for a kernel build error: `ScratchBudgetExceeded` (typed, with peak_live
+/// and budget) for a scratch-budget failure, RuntimeError otherwise. `prefix` names the path.
+fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
+    let msg = format!("{}: {}", prefix, e);
+    match e {
+        KernelBuilderError::BudgetExceeded { peak_live, budget, .. } => {
+            PyErr::new::<ScratchBudgetExceeded, _>((msg, peak_live, budget))
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(msg),
+    }
+}
 
 /// Build a tick-tock kernel using SSA-based emission.
 ///
@@ -1186,6 +1208,17 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let greedy_priority = crate::kernel_builder::config::GreedyPriorityKind::from_str(greedy_priority)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    crate::kernel_builder::config::check_greedy_shape_combinations(
+        greedy_priority,
+        greedy_load_priority,
+        greedy_flow_priority,
+        greedy_select_overflow,
+        greedy_select_overflow_limit,
+        select_choice,
+        enable_select_choice_hint_pass,
+        enable_schedule_with_fixed_choices,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
     if let Some(dtime) = cpsat_deterministic_time {
         if !(dtime.is_finite() && dtime > 0.0) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1460,14 +1493,12 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 enable_cse_groups,
                 enable_bulk_move,
             )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
-            })?
+            .map_err(|e| kernel_build_error_to_py("SSA CP-SAT build failed", e))?
     } else {
         let enable_valu_shift = builder.config.compiler.enable_valu_shift;
-        builder.build_and_schedule_greedy(enable_valu_shift, None, verbose).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
-        })?
+        builder
+            .build_and_schedule_greedy(enable_valu_shift, None, verbose)
+            .map_err(|e| kernel_build_error_to_py("SSA build failed", e))?
     };
 
     if verbose {
