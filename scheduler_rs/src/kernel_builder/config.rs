@@ -782,6 +782,11 @@ pub struct CompilerConfig {
     /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
     /// split shifts).
     pub cpsat_split_shift_hint: bool,
+    /// When CP-SAT follows: the greedy that feeds it uses its bounds only for the pressure
+    /// policy, as the greedy-only pipeline does (`GreedyBoundsUsage::PolicyOnly`), so the warm
+    /// start is the greedy-only schedule (default: false, `Full`: ASAP deferral, clamping and
+    /// capacity deferral, a different and usually longer schedule).
+    pub cpsat_greedy_policy_bounds: bool,
     /// When the greedy shifts a vector op to the scalar ALU (default: `WhenFull`).
     pub greedy_shift_policy: GreedyShiftPolicyKind,
     /// Pace target for `greedy_shift_policy` `Pace`/`ReservePace`: vector ops to run as 8
@@ -839,6 +844,7 @@ impl Default for CompilerConfig {
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
             greedy_split_shift: false,
             cpsat_split_shift_hint: false,
+            cpsat_greedy_policy_bounds: false,
             greedy_shift_policy: GreedyShiftPolicyKind::default(),
             greedy_shift_target: None,
             greedy_load_priority: super::ssa_greedy::LoadPriority::Key,

@@ -336,6 +336,11 @@ struct SsaScheduleOutput {
     /// assignment did not run (e.g. a JSON exported on an earlier error).
     #[serde(skip_serializing_if = "Option::is_none")]
     scratch_pools: Option<crate::address_assign::PoolPeaks>,
+    /// Peak words of the per-section scratch check on the greedy schedule, counted with the
+    /// allocator's intervals (`SsaScheduleResult::section_check_peak`). Absent if the check
+    /// did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    section_check_peak: Option<usize>,
     /// Non-fixed words the allocator used, from the first allocatable address to the highest
     /// word of a non-fixed value (fragmentation = this - `scratch_pools.words`). Absent with
     /// `scratch_pools`.
@@ -717,6 +722,7 @@ pub fn write_ssa_schedule_json(
         peak_live_words: result.address_result.peak_live,
         max_addr: result.address_result.max_addr,
         scratch_pools: result.address_result.pool_peaks.clone(),
+        section_check_peak: result.section_check_peak,
         scratch_words_used: result.address_result.pool_peaks.as_ref().map(|_| result.address_result.words_used),
         scratch_start_addr: result.address_result.start_addr,
         budget_exceeded: result.budget_exceeded,

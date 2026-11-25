@@ -63,10 +63,9 @@ pub struct SectionBudgetResult {
 
 /// Compute peak liveness in each section and which sections exceed the scratch budget.
 ///
-/// Uses the same liveness model as the greedy scheduler / address assignment:
-/// a VReg is live at cycle t if def_cycle <= t <= last_use_cycle (closed interval).
-/// Ops with cycle < 0 (e.g. dead stores) are skipped for def/last_use and for
-/// section cycle range.
+/// Counts on the cycle timeline (a value is live over the closed `[def, last access]` cycles)
+/// with the allocator's intervals; [`section_budget`] states the rules. Ops with cycle < 0
+/// (e.g. dead stores) are skipped.
 ///
 /// * `ops`: Full SSA op list with barriers; each op must have `cycle` set (from greedy).
 /// * `scratch_budget`: Max allowed simultaneous live words.
@@ -95,15 +94,8 @@ pub fn sections_exceeding_budget(
     )
 }
 
-/// [`sections_exceeding_budget`] on the timeline the CP-SAT scratch model uses.
-///
-/// `ScratchTime::Cycle` counts every value over the closed `[def, last use]` at each cycle, as
-/// before. `ScratchTime::Phase` counts the read phase and the write phase of each cycle
-/// separately (a value written at D and last read at L > D holds its words over phases
-/// `2D + 1 ..= 2L`; one with L == D over `2D ..= 2D + 1`) and takes the larger, so a word read
-/// for the last time at a cycle is free for a value written in that cycle, as in address
-/// assignment and in the per-section CP-SAT solve with `ScratchTime::Phase`. With `Cycle` this
-/// check rejected merged per-section schedules that the phase model had accepted.
+/// [`sections_exceeding_budget`] on a chosen timeline (see [`section_budget`]), without
+/// shifted lanes, ALU-derived constants or vector groups.
 pub fn sections_exceeding_budget_with(
     ops: &[SsaOp],
     scratch_budget: usize,
@@ -111,147 +103,164 @@ pub fn sections_exceeding_budget_with(
     section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
     scratch_time: crate::cpsat_scheduler::ScratchTime,
 ) -> SectionBudgetResult {
-    section_budget(ops, scratch_budget, select_fma_op_ids, section_select_fma_overrides, scratch_time, &ScratchAliases::default())
+    section_budget(ops, scratch_budget, select_fma_op_ids, section_select_fma_overrides, scratch_time, &SectionLiveness::default())
+        .expect("schedule reads a value before it is written")
 }
 
+/// What the allocator needs, besides the ops, to compute a schedule's live intervals: the
+/// per-lane cycles of VALU ops run on the ALU, the ConstChoice ops derived on the ALU (their
+/// lowered op reads the producers at its cycle) and the vector groups. With these the
+/// section check counts exactly what `assign_addresses` will see.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SectionLiveness<'a> {
+    /// Per-lane ALU cycles of shifted VALU ops (`SchedulingDecisions::shifted_alu_cycles`).
+    pub shifted_alu_cycles: Option<&'a HashMap<usize, Vec<i32>>>,
+    /// ConstChoice ops lowered as an ALU derivation, by op id.
+    pub const_alu_derive_ops: Option<&'a HashMap<usize, crate::types::AluDeriveInfo>>,
+    /// Vector group alias to its 8 lanes.
+    pub vector_group_lanes: Option<&'a HashMap<VReg, Vec<VReg>>>,
+}
+
+/// Peak live words of each section, counted by the allocator itself: live intervals from
+/// `address_assign::compute_live_intervals` (shifted lanes, multiply-add selects, ALU-derived
+/// constants, vector groups), spans from `compute_value_spans`, then the most words covering
+/// one half-cycle point of the section's range.
+///
+/// `ScratchTime::Phase` uses the allocator's spans as they are (proof A8 in
+/// verification/allocation_conjectures.py: a word read for the last time in a cycle is free
+/// for a value written in that cycle), so with it the check agrees with address assignment
+/// exactly. `ScratchTime::Cycle` widens every span to whole cycles, `[2 start, 2 end + 1]`:
+/// a value counts over every cycle from its first write to its last access, as
+/// `--cpsat-scratch-time cycle` says.
+///
+/// A section's range runs from its first cycle (earliest shifted lane included) through the
+/// cycle before the next section's first cycle, so values that cross a gap are counted.
+/// Section `k`'s multiply-add selects are taken from `section_select_fma_overrides[k]` when
+/// given, otherwise from `select_fma_op_ids`.
+///
+/// # Returns
+/// Per-section peaks, or `Err` if the schedule reads a value before it is written.
 pub(crate) fn section_budget(
     ops: &[SsaOp],
     scratch_budget: usize,
     select_fma_op_ids: Option<&HashSet<usize>>,
     section_select_fma_overrides: Option<&[Option<HashSet<usize>>]>,
     scratch_time: crate::cpsat_scheduler::ScratchTime,
-    aliases: &ScratchAliases,
-) -> SectionBudgetResult {
+    liveness: &SectionLiveness<'_>,
+) -> Result<SectionBudgetResult, String> {
+    use crate::address_assign::{compute_live_intervals, compute_value_spans, last_write_cycles, AddressAssignConfig};
+
     let boundaries = section_boundaries(ops);
+    let empty_shifts = HashMap::new();
+    let shifted = liveness.shifted_alu_cycles.unwrap_or(&empty_shifts);
 
-    // VReg -> defining op index (for cycle); only ops with cycle >= 0
-    let mut vreg_def_cycle: HashMap<VReg, i32> = HashMap::new();
-    for op in ops.iter() {
-        if op.cycle >= 0 {
-            if let Some(dest) = op.dest {
-                vreg_def_cycle.insert(dest, op.cycle);
-            }
+    // Multiply-add selects: each section's own set (override or default), restricted to its ops.
+    let mut select_fma_ops: HashSet<usize> = HashSet::new();
+    for (k, &(start, end)) in boundaries.iter().enumerate() {
+        let fma_ids = section_select_fma_overrides
+            .and_then(|o| o.get(k).and_then(|x| x.as_ref()))
+            .or(select_fma_op_ids);
+        if let Some(fma_ids) = fma_ids {
+            select_fma_ops.extend(ops[start..end].iter().map(|op| op.id).filter(|id| fma_ids.contains(id)));
         }
     }
 
-    // VReg -> last use cycle (max cycle among ops that read it); skip ops with cycle < 0
-    let mut vreg_last_use_cycle: HashMap<VReg, i32> = HashMap::new();
-    for op in ops.iter() {
-        if op.cycle < 0 {
-            continue;
-        }
-        let c = op.cycle;
-        for vreg in aliases.reads(op) {
-            vreg_last_use_cycle
-                .entry(vreg)
-                .and_modify(|m| *m = (*m).max(c))
-                .or_insert(c);
-        }
-    }
+    let scheduled: Vec<SsaOp> = ops
+        .iter()
+        .filter(|op| op.cycle >= 0 && op.opcode != Opcode::Barrier)
+        .cloned()
+        .collect();
+    let scheduled_ids: HashSet<usize> = scheduled.iter().map(|op| op.id).collect();
+    // A group none of whose values is written by a scheduled op occupies nothing
+    // (`compute_live_intervals` would give it a phantom interval).
+    let written: HashSet<VReg> = scheduled.iter().filter_map(|op| op.dest).collect();
+    let vector_group_lanes: HashMap<VReg, Vec<VReg>> = liveness
+        .vector_group_lanes
+        .into_iter()
+        .flatten()
+        .filter(|(key, lanes)| written.contains(*key) || lanes.iter().any(|l| written.contains(l)))
+        .map(|(key, lanes)| (*key, lanes.clone()))
+        .collect();
+    let config = AddressAssignConfig {
+        select_fma_ops,
+        shifted_alu_cycles: shifted
+            .iter()
+            .filter(|(id, _)| scheduled_ids.contains(id))
+            .map(|(id, lanes)| (*id, lanes.clone()))
+            .collect(),
+        const_alu_derive_ops: liveness
+            .const_alu_derive_ops
+            .into_iter()
+            .flatten()
+            .filter(|(id, _)| scheduled_ids.contains(id))
+            .map(|(id, info)| (*id, info.clone()))
+            .collect(),
+        vector_group_lanes,
+        ..Default::default()
+    };
+    let intervals = compute_live_intervals(&config, &scheduled)?;
+    let spans = compute_value_spans(&intervals, &last_write_cycles(&scheduled, &config));
 
-    // Per-section cycle ranges (min/max op cycle). Used to extend section k's sampling
-    // through the gap to the next section so we don't miss the global peak in gap cycles.
+    // Section cycle ranges, earliest shifted lane included.
     let section_ranges: Vec<(i32, i32)> = boundaries
         .iter()
         .map(|&(start, end)| {
-            let mut min_c = i32::MAX;
-            let mut max_c = i32::MIN;
+            let mut range = (i32::MAX, i32::MIN);
             for op in &ops[start..end] {
-                if op.opcode == Opcode::Barrier {
+                if op.opcode == Opcode::Barrier || op.cycle < 0 {
                     continue;
                 }
-                if op.cycle >= 0 {
-                    min_c = min_c.min(op.cycle);
-                    max_c = max_c.max(op.cycle);
+                let lanes = shifted.get(&op.id).map_or(&[][..], |l| l.as_slice());
+                // A multiply-add select writes its result one cycle after its subtract.
+                let fma_write = config.select_fma_ops.contains(&op.id).then_some(op.cycle + 1);
+                for c in std::iter::once(op.cycle).chain(lanes.iter().copied()).chain(fma_write) {
+                    range = (range.0.min(c), range.1.max(c));
                 }
             }
-            (min_c, max_c)
+            range
         })
         .collect();
 
+    // Live words at every half-cycle point (read phase 2c, write phase 2c + 1).
+    let cycle_timeline = scratch_time == crate::cpsat_scheduler::ScratchTime::Cycle;
+    let n_points = spans.values().map(|&(_, hi)| (hi | 1) + 2).max().unwrap_or(0).max(0) as usize;
+    let mut delta: Vec<i64> = vec![0; n_points + 1];
+    for (vreg, &(lo, hi)) in &spans {
+        let (lo, hi) = if cycle_timeline { (lo - lo.rem_euclid(2), hi | 1) } else { (lo, hi) };
+        if lo < 0 {
+            continue;
+        }
+        delta[lo as usize] += vreg.size() as i64;
+        delta[(hi + 1) as usize] -= vreg.size() as i64;
+    }
+    let mut curve: Vec<usize> = Vec::with_capacity(n_points);
+    let mut live = 0i64;
+    for d in delta.iter().take(n_points) {
+        live += d;
+        curve.push(live.max(0) as usize);
+    }
+
     let mut section_peaks = Vec::with_capacity(boundaries.len());
     let mut section_exceeds_budget = Vec::with_capacity(boundaries.len());
-
-    for (k, &(start, end)) in boundaries.iter().enumerate() {
-        // Section-specific FMA set: override (e.g. from per-section CP-SAT) or default
-        let fma_ids: Option<&HashSet<usize>> = section_select_fma_overrides
-            .and_then(|o| o.get(k).and_then(|x| x.as_ref()))
-            .or(select_fma_op_ids);
-
-        // When FMA path is selected for a SelectChoice in this section, count its sub_temp_vreg
-        let mut section_def = vreg_def_cycle.clone();
-        let mut section_last_use = vreg_last_use_cycle.clone();
-        if let Some(fma_ids) = fma_ids {
-            for op in &ops[start..end] {
-                if op.cycle >= 0 && fma_ids.contains(&op.id) {
-                    if let Some(sub_temp) = op.sub_temp_vreg {
-                        section_def.insert(sub_temp, op.cycle);
-                        section_last_use.insert(sub_temp, op.cycle + 1);
-                    }
-                    // On the multiply-add path the operands (cond, true/false values, delta)
-                    // are read again at cycle + 1, as address assignment counts them.
-                    for vreg in aliases.reads(op) {
-                        let e = section_last_use.entry(vreg).or_insert(op.cycle + 1);
-                        *e = (*e).max(op.cycle + 1);
-                    }
-                }
-            }
-        }
-
+    for k in 0..boundaries.len() {
         let (min_c, max_c) = section_ranges[k];
-        // Sample through the gap after this section: from min_c through (next section's first
-        // cycle - 1), so we include liveness in gap cycles where section k's values are still live.
-        let end_c = boundaries.get(k + 1).and_then(|_| {
-            let (next_min, _) = section_ranges[k + 1];
-            if next_min > max_c {
-                Some(next_min - 1)
-            } else {
-                None
-            }
-        }).unwrap_or(max_c);
-
+        // Sample through the gap after this section, up to the next section's first cycle.
+        let end_c = section_ranges
+            .get(k + 1)
+            .and_then(|&(next_min, _)| (next_min != i32::MAX && next_min > max_c).then_some(next_min - 1))
+            .unwrap_or(max_c);
         let peak = if min_c <= end_c {
-            let phase = scratch_time == crate::cpsat_scheduler::ScratchTime::Phase;
-            let mut peak_words = 0usize;
-            for t in min_c..=end_c {
-                // Cycle: one sample per cycle. Phase: the read phase (2t) and the write phase
-                // (2t + 1) of the cycle.
-                let samples: &[i64] = if phase { &[0, 1] } else { &[0] };
-                for &ph in samples {
-                    let p = 2 * t as i64 + ph;
-                    let mut live = 0usize;
-                    for (vreg, &def_c) in &section_def {
-                        let last_c = section_last_use.get(vreg).copied().unwrap_or(def_c);
-                        let covers = if phase {
-                            let (lo, hi) = if last_c > def_c {
-                                (2 * def_c as i64 + 1, 2 * last_c as i64)
-                            } else {
-                                (2 * def_c as i64, 2 * def_c as i64 + 1)
-                            };
-                            lo <= p && p <= hi
-                        } else {
-                            def_c <= t && t <= last_c
-                        };
-                        if covers {
-                            live += vreg.size();
-                        }
-                    }
-                    peak_words = peak_words.max(live);
-                }
-            }
-            peak_words
+            let lo = (2 * min_c as i64).max(0) as usize;
+            let hi = (2 * end_c as i64 + 1) as usize;
+            curve.get(lo..=hi.min(curve.len().saturating_sub(1))).map_or(0, |s| s.iter().copied().max().unwrap_or(0))
         } else {
             0
         };
-
         section_peaks.push(peak);
         section_exceeds_budget.push(peak > scratch_budget);
     }
 
-    SectionBudgetResult {
-        section_peaks,
-        section_exceeds_budget,
-    }
+    Ok(SectionBudgetResult { section_peaks, section_exceeds_budget })
 }
 
 /// VReg -> section index that defines it (from full ops and section boundaries).
@@ -494,8 +503,9 @@ mod tests {
     }
 
     /// A SelectChoice on the multiply-add path reads its operands again at cycle + 1: cond,
-    /// true and false values (8 words each) are live with the subtract temp and the result in
-    /// the read phase of cycle 2, 40 words; on the vselect path the peak is 24.
+    /// true and false values (8 words each) are live with the subtract temp in the read phase
+    /// of cycle 2, 32 words; the result is written in the write phase of cycle 2, after those
+    /// reads, as address assignment counts it. On the vselect path the peak is 24.
     #[test]
     fn test_sections_exceeding_budget_fma_operands_read_at_next_cycle() {
         use crate::cpsat_scheduler::ScratchTime;
@@ -522,7 +532,7 @@ mod tests {
         let fma: HashSet<usize> = [3].into_iter().collect();
         let with_fma = sections_exceeding_budget_with(&ops, 1536, Some(&fma), None, ScratchTime::Phase);
         let vselect = sections_exceeding_budget_with(&ops, 1536, None, None, ScratchTime::Phase);
-        assert_eq!(with_fma.section_peaks, vec![40]);
+        assert_eq!(with_fma.section_peaks, vec![32]);
         assert_eq!(vselect.section_peaks, vec![24]);
     }
 
@@ -718,7 +728,8 @@ mod tests {
         let incoming = aliases.live_in(ops, &boundaries, 2, &defs, &filtered);
         let expected_in: HashMap<_,_> = lanes.iter().map(|&v| (v, 1)).chain([(vector, 0)]).collect();
         assert_eq!(incoming.iter().copied().collect::<HashMap<_, _>>(), expected_in);
-        let measured = section_budget(ops, 15, None, None, crate::cpsat_scheduler::ScratchTime::Phase, &aliases);
+        let liveness = SectionLiveness { vector_group_lanes: Some(&emit.vector_group_lanes), ..Default::default() };
+        let measured = section_budget(ops, 15, None, None, crate::cpsat_scheduler::ScratchTime::Phase, &liveness).unwrap();
         assert!(measured.section_peaks[1] >= 16);
         #[cfg(feature = "cpsat")]
         for budget in [15, 16] {

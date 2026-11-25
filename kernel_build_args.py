@@ -565,6 +565,11 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="With --greedy-split-shift and CP-SAT: keep the greedy's split shifts and hint "
                             "CP-SAT each lane at its own cycle, so the solver starts from the split-shift "
                             "schedule (default: the greedy that feeds CP-SAT makes no split shifts)")
+    group.add_argument("--cpsat-greedy-bounds", choices=["full", "policy-only"], default="full",
+                       help="How the greedy that feeds CP-SAT uses the ASAP/ALAP bounds: 'full' (default) "
+                            "= ASAP deferral, clamping and capacity deferral; 'policy-only' = for the "
+                            "pressure policy only, as with --use-greedy, so CP-SAT starts from the "
+                            "greedy-only schedule")
 
     # Relaxed-scratch reference (analysis only; docs/RELAXED_SCRATCH_REFERENCE.md)
     group.add_argument("--scratch-budget-override", type=_positive_int, default=None, metavar="WORDS",
@@ -781,6 +786,7 @@ def args_to_build_kwargs(
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
         "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
+        "cpsat_greedy_bounds": get("cpsat_greedy_bounds", "full"),
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
@@ -849,6 +855,7 @@ def args_to_build_kwargs(
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
         "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
+        "cpsat_greedy_policy_bounds": get("cpsat_greedy_bounds", "full") == "policy-only",
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),

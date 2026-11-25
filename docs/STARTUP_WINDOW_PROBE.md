@@ -56,10 +56,9 @@ ops is shorter: the start-up's loss is not a local scheduling problem. What it w
   budget check counts liveness on the cycle timeline (1,597 > 1,535 for a schedule whose
   exact peak is 1,483) and starts a no-shift feasibility repair of the whole kernel, which
   found nothing in 600 s (without shifts the vector ALU alone needs 1,220 cycles).
-  `CPSAT_SECTION_CHECK_TIMELINE=model` (analysis only, new) makes the check use the model's own
-  timeline; the section then fits (1,533). The check has no per-lane shifted cycles and can
-  miss an over-budget section; the probe's all-fixed check would then reject the reference,
-  so it cannot produce an invalid kernel unnoticed.
+  These runs used an analysis switch (`CPSAT_SECTION_CHECK_TIMELINE=model`, since removed):
+  the check now counts with the allocator's intervals and needs no switch (BUGS.md,
+  docs/SECTION_CHECK_AND_ROLLING_PROBE.md).
 
 ## The reduced model was wrong here
 
@@ -86,7 +85,6 @@ full model closes them.
 COMMON="--greedy-split-shift --cpsat-split-shift-hint --pressure-inflation-threshold 0.95 \
   --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 \
   --merge-hash-stages --index-form mirrored"
-export CPSAT_SECTION_CHECK_TIMELINE=model
 uv run python -m scripts.window_optimality_probe --rounds 16 --window-sizes 60 110 \
   --stride-fraction 0.5 --cycle-range 0 61 --encodings free --no-rolling --no-prune \
   --deterministic-time 120 --time-limit 1800 --workers 4 --report path_full.json --no-validate \

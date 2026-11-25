@@ -4582,3 +4582,74 @@ fn test_dependency_pass_keeps_index_war_at_wrap() {
             && op.mem_deps.iter().any(|&(_, kind)| kind == MemEdgeKind::War)
     }));
 }
+
+// =========================================================================
+// Per-section scratch check agrees with address assignment
+// =========================================================================
+
+/// Runs the greedy-only pipeline step by step and returns the section check's peak on the
+/// greedy schedule (phase and cycle timelines) and the allocator's peak on the same schedule.
+fn section_check_and_allocator_peaks(configure: impl FnOnce(&mut KernelConfig)) -> (usize, usize, usize, usize) {
+    use crate::cpsat_scheduler::ScratchTime;
+    use crate::kernel_builder::pipeline::passes::{
+        AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
+        FilterDeadStoresPass, GreedySchedulePass,
+    };
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+
+    let mut config = KernelConfig::new(10, 2047, 256, 4);
+    configure(&mut config);
+    let program = SsaTickTockKernelBuilder::new(config.clone()).build();
+    let budget = config.compiler.effective_scratch_budget(program.zero_vreg.is_some());
+    let pipeline = PipelineConfig {
+        compiler: crate::kernel_builder::config::CompilerConfig {
+            enable_valu_shift: true,
+            ..config.compiler.clone()
+        },
+        scratch_budget: budget,
+        ..Default::default()
+    };
+    let mut ctx = PipelineContext::new(program, pipeline);
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&DcePass).unwrap();
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&ComputeBoundsPass).unwrap();
+    ctx.run_pass(&GreedySchedulePass).unwrap();
+    let peak = |r: super::super::round_budget::SectionBudgetResult| r.section_peaks.into_iter().max().unwrap();
+    let phase = peak(ctx.greedy_section_check(budget, ScratchTime::Phase).unwrap());
+    let cycle = peak(ctx.greedy_section_check(budget, ScratchTime::Cycle).unwrap());
+    let n_lanes = ctx.greedy_decisions.shifted_alu_cycles.len();
+    ctx.final_decisions = ctx.greedy_decisions.clone();
+    ctx.run_pass(&ElideBarriersPass).unwrap();
+    ctx.run_pass(&FilterDeadStoresPass).unwrap();
+    ctx.run_pass(&AssignAddressesPass).unwrap();
+    let words = ctx.address_result.unwrap().pool_peaks.unwrap().words;
+    (phase, cycle, words, n_lanes)
+}
+
+/// The per-section check that decides which sections the per-section CP-SAT repairs counts
+/// exactly what address assignment counts on the phase timeline (the CP-SAT default), with
+/// and without split shifts (whose lanes run in two cycles) and with and without round
+/// barriers; the cycle timeline counts at least as much. Before, the check had no lane
+/// cycles and counted on the cycle timeline: 1,597 words against the allocator's 1,483 on
+/// the best 16-round greedy kernel (BUGS.md).
+#[test]
+fn test_section_check_counts_what_the_allocator_counts() {
+    type Configure = fn(&mut KernelConfig);
+    let shapes: [(&str, Configure); 3] = [
+        ("round barriers", |_| {}),
+        ("wavefront", configure_wavefront),
+        ("wavefront + split shifts", |c| {
+            configure_wavefront(c);
+            c.compiler.greedy_split_shift = true;
+        }),
+    ];
+    for (name, configure) in shapes {
+        let (phase, cycle, words, n_lanes) = section_check_and_allocator_peaks(configure);
+        assert_eq!(phase, words, "{}: section check {} vs allocator {}", name, phase, words);
+        assert!(cycle >= words, "{}: cycle timeline {} below allocator {}", name, cycle, words);
+        if name.contains("split") {
+            assert!(n_lanes > 0, "{}: no split shifts to test", name);
+        }
+    }
+}

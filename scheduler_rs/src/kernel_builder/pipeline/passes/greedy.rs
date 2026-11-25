@@ -133,7 +133,8 @@ impl Pass for GreedySchedulePass {
         let is_cpsat_pipeline = ctx.config.cpsat.is_some();
         #[cfg(not(feature = "cpsat"))]
         let is_cpsat_pipeline = false;
-        let use_full_bounds = is_cpsat_pipeline || ctx.config.bounds.greedy_use_full_bounds;
+        let use_full_bounds = (is_cpsat_pipeline && !ctx.config.compiler.cpsat_greedy_policy_bounds)
+            || ctx.config.bounds.greedy_use_full_bounds;
 
         let bounds_usage = match ctx.bounds.as_ref() {
             Some(b) if use_full_bounds => GreedyBoundsUsage::Full {

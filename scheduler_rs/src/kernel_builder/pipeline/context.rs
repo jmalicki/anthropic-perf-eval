@@ -72,6 +72,29 @@ pub struct SchedulingDecisions {
     pub cse_group_results: Vec<CseGroupResult>,
 }
 
+impl SchedulingDecisions {
+    /// ConstChoice ops derived on the ALU, by op id (their lowered op reads the producers at
+    /// its own cycle, which extends the producers' live intervals).
+    pub fn alu_derive_ops(&self) -> HashMap<usize, crate::types::AluDeriveInfo> {
+        self.const_choice_encoding
+            .iter()
+            .filter_map(|(id, enc)| match enc {
+                ConstChoiceEncoding::AluDerive(info) => Some((*id, info.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// SelectChoice ops on the multiply-add path, by op id.
+    pub fn select_fma_ops(&self) -> HashSet<usize> {
+        self.select_choice_encoding
+            .iter()
+            .filter(|(_, e)| matches!(e, SelectChoiceEncoding::Fma))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+}
+
 // ============================================================================
 // Scheduling Metrics
 // ============================================================================

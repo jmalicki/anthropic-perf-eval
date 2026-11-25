@@ -106,6 +106,12 @@ pub struct SsaScheduleResult {
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+    /// Peak words of the per-section scratch check on the greedy schedule (the most over all
+    /// sections), counted with the allocator's intervals; None if the check did not run. The
+    /// greedy-only path counts it on the phase timeline for comparison with
+    /// `address_result.pool_peaks`; the CP-SAT path on the model's timeline, where it decides
+    /// which sections the per-section CP-SAT repairs.
+    pub section_check_peak: Option<usize>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -623,6 +629,7 @@ pub fn export_partial_result_on_error(
         cpsat_scratch_budget: ctx.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
         scratch_relaxed: ctx.config.compiler.is_relaxed_scratch(),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
+        section_check_peak: ctx.section_check_peak,
     };
 
     // Build error message for comment
@@ -896,7 +903,7 @@ impl SsaTickTockKernelBuilder {
             .map_err(KernelBuilderError::Other)?;
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
-            section_budget, ScratchAliases, vreg_def_section,
+            section_budget, ScratchAliases, SectionLiveness, vreg_def_section,
         };
         use super::pipeline::{
             BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
@@ -1059,31 +1066,40 @@ impl SsaTickTockKernelBuilder {
         let boundaries = section_boundaries(&ctx.ops);
         let effective_budget =
             ctx.config.compiler.effective_scratch_budget(ctx.zero_vreg.is_some());
-        // Which sections to repair: counted on the cycle timeline whatever the model's
-        // timeline. This count has no per-lane shifted cycles, so on the
-        // phase timeline it can miss a section whose greedy schedule is
-        // over budget (3x256 with the greedy pressure policy: the greedy force-scheduled, this
-        // check said the section fits, and the full-kernel solve then started from an
-        // infeasible hint). The cycle count's same-cycle overcount makes it the safe side; the
-        // repair itself and the checks of its result use the model's timeline.
+        // Which sections to repair: counted on the model's timeline with the allocator's own
+        // intervals (shifted lanes at their cycles, multiply-add selects, ALU-derived
+        // constants, vector groups), so a section is repaired exactly when address assignment
+        // could not place the greedy schedule. Before, the check had no lane cycles and fell
+        // back to the cycle timeline to stay on the safe side, which overcounted (1,597
+        // words against an exact 1,483 on the best greedy kernels) and sent within-budget
+        // schedules to the repair (BUGS.md).
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
-        // CPSAT_SECTION_CHECK_TIMELINE=model (analysis, e.g. the window probe): decide on the
-        // model's own timeline instead. Its count has no per-lane shifted cycles, so it can
-        // miss an over-budget section; the window probe's all-fixed check then rejects the
-        // reference, so this cannot produce an invalid kernel unnoticed.
-        let check_timeline = if std::env::var("CPSAT_SECTION_CHECK_TIMELINE").as_deref() == Ok("model") {
-            self.cpsat_scratch_time
-        } else {
-            crate::cpsat_scheduler::ScratchTime::Cycle
-        };
-        let budget_result = section_budget(
-            &ctx.ops,
-            effective_budget,
-            Some(&greedy_select_fma_ops),
-            None,
-            check_timeline, &scratch_aliases,
-        );
+        let greedy_alu_derive = ctx.greedy_decisions.alu_derive_ops();
+        macro_rules! section_liveness {
+            () => {
+                SectionLiveness {
+                    shifted_alu_cycles: Some(&ctx.greedy_decisions.shifted_alu_cycles),
+                    const_alu_derive_ops: Some(&greedy_alu_derive),
+                    vector_group_lanes: Some(&ctx.vector_group_lanes),
+                }
+            };
+        }
+        macro_rules! budget_or_export {
+            ($e:expr) => {
+                match $e {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let error = KernelBuilderError::Other(e);
+                        export_partial_result_on_error_safe(&ctx, &error);
+                        return Err(error);
+                    }
+                }
+            };
+        }
+        let budget_result =
+            budget_or_export!(ctx.greedy_section_check(effective_budget, self.cpsat_scratch_time));
+        ctx.section_check_peak = budget_result.section_peaks.iter().copied().max();
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
             .iter()
@@ -1172,16 +1188,18 @@ impl SsaTickTockKernelBuilder {
                 } else {
                     0
                 };
-                let greedy_section_peak = verbose.then(|| {
-                    section_budget(
+                let greedy_section_peak = if verbose {
+                    Some(budget_or_export!(section_budget(
                         &ctx.ops,
                         effective_budget,
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
                         self.cpsat_scratch_time,
-                        &scratch_aliases,
-                    ).section_peaks[k]
-                });
+                        &section_liveness!(),
+                    )).section_peaks[k])
+                } else {
+                    None
+                };
 
                 let section_optimize = per_section_optimize_secs.map_or(false, |t| t > 0.0);
                 if verbose {
@@ -1426,13 +1444,13 @@ impl SsaTickTockKernelBuilder {
                     (seg_result.makespan as i32).max(greedy_section_makespan),
                 );
                 if let Some(greedy_section_peak) = greedy_section_peak {
-                    let after_budget = section_budget(
+                    let after_budget = budget_or_export!(section_budget(
                         &ctx.ops,
                         effective_budget,
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
-                        self.cpsat_scratch_time, &scratch_aliases,
-                    );
+                        self.cpsat_scratch_time, &section_liveness!(),
+                    ));
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
                     let delta_peak = after_peak as i32 - greedy_section_peak as i32;
@@ -1460,12 +1478,12 @@ impl SsaTickTockKernelBuilder {
 
         // Presolve guarantee: merged schedule must be within scratch budget
         let scratch_size = ctx.config.compiler.scratch_size;
-        let post_merge_budget = section_budget(
+        let post_merge_budget = budget_or_export!(section_budget(
             &ctx.ops, scratch_size,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
-            self.cpsat_scratch_time, &scratch_aliases,
-        );
+            self.cpsat_scratch_time, &section_liveness!(),
+        ));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
             .find(|(_, &p)| p > scratch_size)
@@ -1491,9 +1509,9 @@ impl SsaTickTockKernelBuilder {
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
         let effective_budget_hint = effective_budget;
-        let hint_peak = section_budget(
-            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &scratch_aliases,
-        ).section_peaks.iter().copied().max().unwrap_or(0);
+        let hint_peak = budget_or_export!(section_budget(
+            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &section_liveness!(),
+        )).section_peaks.iter().copied().max().unwrap_or(0);
 
         if hint_peak > scratch_size {
             let msg = format!(
