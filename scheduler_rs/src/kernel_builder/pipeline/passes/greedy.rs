@@ -140,8 +140,8 @@ impl Pass for GreedySchedulePass {
         // Individually forced shifts (what-if runs) are fixed to 1 in the CP-SAT model, so the
         // greedy must place those ops shifted too: its shift decisions and cycles become the
         // hint, the ALAP cap and the horizon, and are only valid for a schedule that honours
-        // them. Under --valu-shift alu|valu the model ignores the set, and so does the greedy
-        // (`forced.shifted_ops` is then a complete encoding).
+        // them. Under --valu-shift alu|valu the model ignores the set, and so does the greedy,
+        // with or without CP-SAT: `forced_shift_ids` is empty outside `optimize`.
         shape.forced_shift_ops = ctx.config.forced_shift_ids();
         // A split shift reaches CP-SAT only as per-lane hints (cpsat_split_shift_hint);
         // without them the hint has one cycle per op and cannot describe it.
@@ -304,6 +304,7 @@ impl Pass for GreedyJustifyPass {
         // so they could move a forced op back to a vector slot; the pass does not run. The
         // set is read from the same source as the greedy's (the CP-SAT configuration, or the
         // greedy-only build's own set), so `use_cpsat=False` with forced shifts is covered.
+        // Outside `--valu-shift optimize` the set does not apply and is empty here.
         let has_forced_shifts = !ctx.config.forced_shift_ids().is_empty();
         if has_forced_shifts {
             let summary = "skipped: individually forced shifts are set".to_string();

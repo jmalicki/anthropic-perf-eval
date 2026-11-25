@@ -175,3 +175,17 @@ def test_forced_shifts_are_honoured_by_the_greedy_alone(tmp_path):
     cycles = [{op["cycle"] for op in ops} for ops in lanes]
     assert [len(c) for c in cycles] == [1, 1], cycles
     assert cycles[0].isdisjoint(cycles[1])
+
+
+@pytest.mark.parametrize("valu_shift", ["valu", "alu"])
+def test_forced_shifts_are_ignored_outside_optimize_by_the_greedy_alone(tmp_path, valu_shift):
+    """use_cpsat=False with --valu-shift valu|alu: the forced set is not applied.
+
+    The CP-SAT model reads the forced set only under `optimize`, and the greedy must agree
+    in both pipelines. (Whether the greedy-only build applies `alu` itself is a separate
+    open entry in BUGS.md: today it does not, so nothing is shifted in either mode.)
+    """
+    forced = _two_vector_ops_the_greedy_runs_together(tmp_path)
+    sched, _ = _forced_shift_build(tmp_path, forced, verbose=False, use_cpsat=False, valu_shift=valu_shift)
+    assert [len(_lowered_lanes(sched, op_id)) for op_id in forced] == [0, 0]
+    assert sched["valu_shifted"] == 0
