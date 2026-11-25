@@ -171,6 +171,7 @@ pub mod bounds;
 pub mod model;
 pub(crate) mod op_times;
 pub(crate) mod makespan_rows;
+pub(crate) mod resource_bounds;
 pub(crate) mod group_symmetry;
 pub(crate) mod symmetry_ordering;
 pub mod window;
