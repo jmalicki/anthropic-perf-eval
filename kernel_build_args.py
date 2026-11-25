@@ -68,6 +68,18 @@ _n_nodes = n_nodes_for_height
 # CP-SAT tuning switches (kept together, apart from the other option helpers)
 # ----------------------------------------------------------------------------
 
+def _early_stagger(text):
+    """K:S for --greedy-early-stagger: K >= 1 groups, S >= 0 cycles."""
+    try:
+        k, sep, c = text.partition(":")
+        k, c = int(k), int(c)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected K:S (two integers), got {text!r}")
+    if not sep or k < 1 or c < 0:
+        raise argparse.ArgumentTypeError(f"expected K:S with K >= 1 and S >= 0, got {text!r}")
+    return (k, c)
+
+
 def _positive_int(text: str) -> int:
     """argparse type: an integer greater than zero."""
     try:
@@ -479,6 +491,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
+    group.add_argument("--greedy-early-stagger", type=_early_stagger, default=None, metavar="K:S",
+                       help="Wavefront: the first K groups are staggered S cycles apart instead of "
+                            "--greedy-stagger-cycles (later groups keep that stagger after them); default off "
+                            "(docs/GREEDY_CONST_CHOICE.md)")
+    group.add_argument("--greedy-const-policy", choices=["default", "alu-first", "alu-when-load-full"],
+                       default="default",
+                       help="Greedy-only: where a ConstChoice is materialised. 'default' add_imm when the flow "
+                            "slot is free and idle, else a load; 'alu-first' derive it on the scalar ALU from "
+                            "constants already live when the emitter offers such an alternative, else the "
+                            "default; 'alu-when-load-full' a load while a load slot is free, else ALU "
+                            "derivation, else the default (docs/GREEDY_CONST_CHOICE.md)")
     group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
                        help="Wavefront: 'key' (default) native scalar ops and shiftable vector ops in one "
                             "wavefront order; 'native-first' native scalar-ALU ops (e.g. address adds) before "
@@ -707,6 +730,8 @@ def args_to_build_kwargs(
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -776,6 +801,8 @@ def args_to_build_kwargs(
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

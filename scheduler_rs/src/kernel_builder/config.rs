@@ -752,6 +752,24 @@ pub struct CompilerConfig {
     pub greedy_budget_force: super::ssa_greedy::BudgetForce,
     /// Wavefront: native scalar ops before vector ops on the scalar ALU (default: `Key`).
     pub greedy_alu_priority: super::ssa_greedy::AluPriority,
+    /// Where the greedy materialises ConstChoices (default: `Default`); greedy-only.
+    pub greedy_const_policy: super::ssa_greedy::ConstPolicy,
+    /// Wavefront: a different stagger for the first groups (default: none).
+    pub greedy_early_stagger: Option<super::ssa_greedy::EarlyStagger>,
+    /// Encodings forced by `--const-choice`, `--select-choice`, `--valu-shift` in a greedy-only
+    /// build (with CP-SAT they come from the CP-SAT config). Default: none forced.
+    pub greedy_forced: GreedyForcedChoices,
+}
+
+/// Forced encodings for a greedy-only build. `None` = the greedy decides.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GreedyForcedChoices {
+    /// Every ConstChoice as this encoding (`Load` or `AddImm`).
+    pub const_choice: Option<crate::types::ConstChoiceEncoding>,
+    /// Every SelectChoice as this encoding.
+    pub select_choice: Option<crate::types::SelectChoiceEncoding>,
+    /// `Some(true)`: every shiftable vector op on the scalar ALU; `Some(false)`: none.
+    pub valu_shift: Option<bool>,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -783,6 +801,9 @@ impl Default for CompilerConfig {
             greedy_select_overflow: super::ssa_greedy::SelectOverflow::Never,
             greedy_budget_force: super::ssa_greedy::BudgetForce::SameCycle,
             greedy_alu_priority: super::ssa_greedy::AluPriority::Key,
+            greedy_const_policy: super::ssa_greedy::ConstPolicy::Default,
+            greedy_early_stagger: None,
+            greedy_forced: GreedyForcedChoices::default(),
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -888,6 +909,8 @@ impl CompilerConfig {
             select_overflow: self.greedy_select_overflow,
             budget_force: self.greedy_budget_force,
             alu_priority: self.greedy_alu_priority,
+            const_policy: self.greedy_const_policy,
+            early_stagger: self.greedy_early_stagger,
             shift_policy: {
                 use super::ssa_greedy::ShiftPolicy;
                 let target = self.greedy_shift_target;

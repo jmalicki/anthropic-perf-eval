@@ -184,7 +184,8 @@ def main():
     if getattr(args, "greedy_load_priority", "key") != "key":
         print(f"  greedy_load_priority={args.greedy_load_priority}")
     for name, default in (("greedy_flow_priority", "key"), ("greedy_select_overflow", "never"),
-                          ("greedy_budget_force", "same-cycle"), ("greedy_alu_priority", "key")):
+                          ("greedy_budget_force", "same-cycle"), ("greedy_alu_priority", "key"),
+                          ("greedy_const_policy", "default"), ("greedy_early_stagger", None)):
         if getattr(args, name, default) != default:
             print(f"  {name}={getattr(args, name)}")
     overrides = {name: getattr(args, name, None) for name in

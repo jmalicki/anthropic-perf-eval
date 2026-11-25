@@ -50,6 +50,28 @@ pub enum GreedyPriority {
     },
 }
 
+/// A different stagger for the first chains: chain `rank` starts
+/// `cycles * min(rank, groups) + stagger * max(rank - groups, 0)` cycles after chain 0, so the
+/// first `groups` chains can enter together (or closer) while the rest keep the normal stagger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyStagger {
+    /// How many leading chains use `cycles`.
+    pub groups: usize,
+    /// Stagger between consecutive leading chains.
+    pub cycles: u32,
+}
+
+/// Virtual start delay of chain `rank` (see [`EarlyStagger`]).
+pub(super) fn chain_offset(rank: usize, stagger_cycles: u32, early: Option<EarlyStagger>) -> i64 {
+    match early {
+        None => stagger_cycles as i64 * rank as i64,
+        Some(e) => {
+            let lead = rank.min(e.groups);
+            e.cycles as i64 * lead as i64 + stagger_cycles as i64 * (rank - lead) as i64
+        }
+    }
+}
+
 /// Per-op wavefront keys and the in-flight window over chains.
 #[derive(Debug)]
 pub(super) struct Wavefront {
@@ -82,6 +104,7 @@ impl Wavefront {
     /// * `skipped` - Indices the scheduler will not schedule (dead stores)
     /// * `stagger_cycles` - Virtual start delay between consecutive chains
     /// * `groups_in_flight` - Chains allowed to run at once; `None` = no limit
+    /// * `early` - A different stagger for the first chains (see [`EarlyStagger`]); `None` = none
     ///
     /// # Returns
     /// The wavefront state, or `Err` if the dependency graph has a cycle.
@@ -93,6 +116,7 @@ impl Wavefront {
         skipped: &HashSet<usize>,
         stagger_cycles: u32,
         groups_in_flight: Option<usize>,
+        early: Option<EarlyStagger>,
     ) -> Result<Self, String> {
         let n = ops.len();
         let order = topological_order(ops, consumers, id_to_idx)?;
@@ -206,7 +230,7 @@ impl Wavefront {
         let mut key = vec![i64::MAX; n];
         for idx in 0..n {
             if let Some(rank) = chain[idx] {
-                key[idx] = depth[idx] + stagger_cycles as i64 * rank as i64;
+                key[idx] = depth[idx] + chain_offset(rank, stagger_cycles, early);
             }
         }
         // A shared op is needed just before its most urgent consumer.
