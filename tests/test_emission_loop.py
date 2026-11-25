@@ -170,23 +170,135 @@ def test_greedy_options_are_part_of_the_state(table, tmp_path):
     assert el.Stage2(table, str(tmp_path), state, log=None).greedy_extra == es.LOAD_TAIL_GREEDY
 
 
-def test_scratch_budget_failure_is_a_recorded_outcome(table, tmp_path, monkeypatch):
-    def over_budget(*a, **k):
-        raise RuntimeError("Scratch budget exceeded: peak_live 1600 > budget 1536")
-
-    monkeypatch.setattr(es, "measure", over_budget)
-    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+def test_scratch_budget_failure_is_a_recorded_outcome(table, tmp_path):
+    """A real over-budget build (batch 32 needs about 440 words; give it 300) is recorded as a
+    failed plan with the builder's own peak, from the typed exception."""
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None,
+                       greedy_extra={"scratch_budget_override": 300})
     rec, built = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
-    assert built and not rec["valid"] and rec["budget_exceeded"] and rec["peak_live"] == 1600
+    assert built and not rec["valid"] and rec["budget_exceeded"]
+    assert rec["peak_live"] > 300 and "scratch budget exceeded" in rec["error"]
+    assert rec["error"].startswith("ScratchBudgetExceeded")
     assert stage2.best() is None
-    assert el.failed_builds(stage2)[0]["peak_live"] == 1600
+    assert el.failed_builds(stage2)[0]["peak_live"] == rec["peak_live"]
 
-    def other_error(*a, **k):
-        raise RuntimeError("something else")
 
-    monkeypatch.setattr(es, "measure", other_error)
-    with pytest.raises(RuntimeError, match="something else"):
+def test_only_the_typed_budget_error_is_a_plan_outcome(table, tmp_path, monkeypatch):
+    import scheduler_rs
+
+    assert issubclass(scheduler_rs.ScratchBudgetExceeded, RuntimeError)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+
+    def untyped(*a, **k):  # mentions the budget, but is not the builder's budget failure
+        raise RuntimeError("scratch budget exceeded: peak_live 1600 > budget 1536")
+
+    monkeypatch.setattr(es, "measure", untyped)
+    with pytest.raises(RuntimeError, match="1600"):
         stage2.evaluate(el.resolve_plan("gather", CTX)[1], "seed gather")
+    assert el.scratch_budget_error(scheduler_rs.ScratchBudgetExceeded("m", 1600, 1536)) == {
+        "peak_live": 1600, "budget": 1536}
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups: canonical no-goods, sound rows cut, reproducibility records
+# ----------------------------------------------------------------------------
+def _fake_build(rows, cycles=1000):
+    return {"name": "fake", "plan": "fake", "rows": [list(r) for r in rows], "valid": True, "cycles": cycles,
+            "simulator_cycles": cycles, "predicted_floor": 900, "rows_bound_before_merge": 0,
+            "rows_bound_after_merge": 0}
+
+
+def _non_canonical(rows):
+    """Same model point, another arrangement: the root (not a choice round) selected with mobius."""
+    other = [list(r) for r in rows]
+    other[0] = ["mobius"] * len(other[0])
+    return other
+
+
+def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
+    res = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    assert el.is_canonical(res["rows"], CTX)
+    other = _non_canonical(res["rows"])
+    assert es.plan_model_key(other, CTX) == es.plan_model_key(res["rows"], CTX)
+    assert not el.is_canonical(other, CTX)
+    # A mixed round arranged in another order is the same point but not canonical either.
+    mixed = es.baseline_rows(CTX)
+    r = CTX.choice_rounds()[0]
+    mixed[r] = ["gather", "bits"] * (CTX.n_groups // 2)
+    assert es.canonical_rows(mixed, CTX)[r] == sorted(mixed[r], key=es.ENCODINGS.index)
+    assert not el.is_canonical(mixed, CTX)
+
+
+def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    seed = _non_canonical(first["rows"])
+    stage2.builds[el.plan_key(seed)] = _fake_build(seed)
+    assert el._built_nogoods(stage2) == []
+    # So stage 1 can still return the model's own arrangement of those counts, unbuilt.
+    res = el.solve(stage2, nogoods=el._built_nogoods(stage2), time_limit=20)
+    assert res["rows"] == first["rows"] and el.plan_key(res["rows"]) not in stage2.builds
+    # Once the canonical arrangement is built, the point is cut.
+    stage2.builds[el.plan_key(first["rows"])] = _fake_build(first["rows"])
+    assert el._built_nogoods(stage2) == [es.plan_model_key(first["rows"], CTX)]
+    res = el.solve(stage2, nogoods=el._built_nogoods(stage2), time_limit=20)
+    assert es.plan_model_key(res["rows"], CTX) != es.plan_model_key(first["rows"], CTX)
+
+
+def test_floor_incumbent_is_the_sound_cut(table):
+    first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    res = es.solve_plan_isolated(table, time_limit=20, floor_incumbent=first["floor"]["cycles"])
+    assert res["status"] == "infeasible" and res["solves"][0]["status"] == "INFEASIBLE"
+
+
+@pytest.mark.parametrize("cut", ["sound", "heuristic"])
+def test_rows_cut_is_sound_by_default_and_never_claims_exhaustion_when_heuristic(table, tmp_path, monkeypatch, cut):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    rec = _fake_build(rows, cycles=1000)
+    rec["rows_bound_before_merge"], rec["rows_bound_after_merge"] = 990, 981  # overestimated by 9
+    stage2.builds[el.plan_key(rows)] = rec
+    seen = {}
+
+    def fake_solve(_stage2, **kwargs):
+        seen.update(kwargs)
+        return {"status": "infeasible", "solves": [{"phase": "main", "status": "INFEASIBLE"}]}
+
+    monkeypatch.setattr(el, "solve", fake_solve)
+    el.loop_rows(stage2, 1, 1, 1.0, cut=cut)
+    feedback = stage2.trace[-1]["feedback"]
+    assert seen["floor_incumbent"] == 1000
+    if cut == "sound":
+        assert seen["incumbent"] is None and feedback.startswith("exhausted")
+    else:
+        assert seen["incumbent"] == 1000 + 9 and "exhausted" not in feedback and "heuristic" in feedback
+    assert stage2.trace[-1]["solves"] == [{"phase": "main", "status": "INFEASIBLE"}]
+
+
+def test_solves_are_recorded_and_deterministic(table):
+    a = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
+    b = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
+    assert a["rows"] == b["rows"]
+    phases = [s["phase"] for s in a["solves"]]
+    assert phases[0] == "main" and phases[-1] == "tie_break"
+    for s in a["solves"]:
+        assert s["status"] in ("OPTIMAL", "FEASIBLE", "UNKNOWN") and not s["stopped_on_wall_clock"]
+        assert s["deterministic_time"] <= 5 + 1e-6
+
+
+def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
+    state = tmp_path / "state.json"
+    stage2 = el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "a"})
+    rows = es.baseline_rows(CTX)
+    stage2.builds[el.plan_key(rows)] = _fake_build(rows)
+    stage2.save()
+    assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "a"}).builds
+    with pytest.raises(ValueError, match="not comparable"):
+        el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"})
+    # Reports only read it.
+    assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
+                     check_scheduler=False).scheduler == {"extension_sha256": "a"}
+    assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
 
 
 def test_parse_greedy_options():
@@ -202,10 +314,11 @@ def test_parse_greedy_options():
 def test_topk_enumerates_score_levels(table, tmp_path, objective):
     """topk builds distinct plans with non-decreasing scores, moving up a level after
     `per_level` plans, each PROVED and PASSED under the stall judge and within the 1,535
-    assignable words; the recorded score is the plan's own score. Deterministic-time solves."""
+    assignable words (plus the reserved zero word); the recorded score is the plan's own score. Deterministic-time solves."""
     judge = dict(es.LOAD_TAIL_GREEDY, greedy_budget_force="stall", pressure_inflation_threshold=0.98)
     stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None, greedy_extra=judge)
-    el.loop_topk(stage2, 3, 60.0, objective, per_level=1, deterministic_time=2.0)
+    stage2.deterministic_time = 2.0
+    el.loop_topk(stage2, 3, 60.0, objective, per_level=1)
     entries = [e for e in stage2.trace if e["mode"] == f"topk-{objective}"]
     assert len(entries) == 3
     assert len({e["plan"] for e in entries}) == 3
@@ -213,7 +326,8 @@ def test_topk_enumerates_score_levels(table, tmp_path, objective):
     assert scores == sorted(scores) and len(set(scores)) == 3, scores  # one plan per level
     assert [e["level"] for e in entries] == [1, 2, 3]
     for b in stage2.builds.values():
-        assert b["valid"] and b["peak_live"] <= 1535 and b["budget_exceeded"] is False
+        # peak_live counts the reserved zero word: 1,535 assignable words + it = 1,536.
+        assert b["valid"] and b["peak_live"] - 1 <= 1535 and b["budget_exceeded"] is False
         assert es.plan_score(table, b["rows"], objective) in scores
 
 

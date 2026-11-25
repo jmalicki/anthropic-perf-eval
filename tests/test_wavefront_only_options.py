@@ -14,7 +14,7 @@ from kernel_build_args import build_kernel_with_args  # noqa: E402
                                     {"greedy_flow_priority": "chain-first"},
                                     {"greedy_load_priority": "final-last"}])
 def test_wavefront_only_orderings_need_the_wavefront(option):
-    with pytest.raises(ValueError, match="only take effect with greedy_priority=wavefront"):
+    with pytest.raises(ValueError, match="orders the wavefront priority only"):
         build_kernel_with_args(rounds=2, batch_size=8, use_greedy=True, verbose=False, **option)
     # With the wavefront priority the same option builds.
     instrs, stats = build_kernel_with_args(rounds=2, batch_size=8, use_greedy=True, verbose=False,

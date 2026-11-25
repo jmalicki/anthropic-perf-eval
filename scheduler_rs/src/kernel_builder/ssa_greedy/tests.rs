@@ -4556,7 +4556,7 @@ fn schedule_with_scratch_model(
     )
     .expect("greedy schedules the phases");
     assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
-    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new()).unwrap();
+    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new(), &HashSet::new()).unwrap();
     (budget_exceeded, peaks)
 }
 
@@ -5297,6 +5297,68 @@ fn test_select_overflow_keeps_slot_limits_when_force_scheduling() {
                 .expect("greedy completes past the budget");
         assert!(budget_exceeded, "the budget is tight enough to force-schedule");
         assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, "force");
+    }
+}
+
+/// Regression (review of #76): a select the overflow puts on the vector ALU reads its
+/// operands and its precomputed delta one cycle after its own (address assignment's
+/// `select_fma_ops` rule, address_assign.rs). The counter did not count the delta as read
+/// by the select at all and released the operands at the select's cycle, so with the delta
+/// shared by many selects it undercounted interval liveness by the delta's 8 words over most
+/// of the schedule. Interval liveness here is computed exactly as address assignment does,
+/// with the run's multiply-add selects in `select_fma_ops`.
+#[test]
+fn test_select_overflow_counter_matches_address_assignment_liveness() {
+    for split_shift in [false, true] {
+        for limit in [None, Some(3)] {
+            let shape = GreedyShape {
+                priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+                split_shift,
+                select_overflow: SelectOverflow::Valu { limit },
+                ..Default::default()
+            };
+            let (mut emit, _) = emit_delta_select_chains(24);
+            let mut shifted = HashSet::new();
+            let mut lanes = HashMap::new();
+            let mut fma = HashSet::new();
+            let label = format!("split={} limit={:?}", split_shift, limit);
+            let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+                &mut emit.ops,
+                true,
+                &mut shifted,
+                1536,
+                Some(&mut fma),
+                None,
+                None,
+                None,
+                &GreedyBoundsUsage::None,
+                &GreedyPolicy,
+                None,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                &mut GreedyDiagnostics::new(false),
+                &shape,
+                &mut lanes,
+            )
+            .unwrap_or_else(|e| panic!("{}: {}", label, e));
+            assert!(!fma.is_empty(), "{}: the overflow placed no select on the vector ALU", label);
+            let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+            let config = crate::address_assign::AddressAssignConfig {
+                select_fma_ops: fma.clone(),
+                shifted_alu_cycles: lanes.clone(),
+                ..Default::default()
+            };
+            let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+            let peak = crate::address_assign::compute_peak_liveness(&intervals);
+            assert!(agreement.agrees(), "{}: {}", label, agreement);
+            assert_eq!(agreement.interval_peak, peak, "{}: the check must use the run's multiply-add selects", label);
+            assert_eq!(agreement.counter_cycle_end_peak, peak, "{}: {}", label, agreement);
+        }
     }
 }
 

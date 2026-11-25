@@ -1052,8 +1052,99 @@ pub fn merged_hash_stage_constants(first: usize) -> Option<(i64, i64, i64, i64)>
     Some((mult & MASK, (c + d) & MASK, (mult << k) & MASK, (c << k) & MASK))
 }
 
+/// Reject greedy shape options that would be silently ignored (review of #76).
+///
+/// * `greedy_select_overflow_limit` only means something with `greedy_select_overflow = "valu"`.
+/// * `greedy_flow_priority = "feeds-load-first"` is a wavefront ordering; the FIFO priority
+///   never reads it.
+/// * `greedy_select_overflow = "valu"` decides each select's form in the greedy; a fixed
+///   select encoding (`select_choice` other than `optimize`), the select-choice hint pass or
+///   `schedule_with_fixed_choices` owns that decision, and the greedy then never overflows.
+///
+/// # Returns
+/// `Err` with the offending combination, else `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_greedy_shape_combinations(
+    greedy_priority: GreedyPriorityKind,
+    greedy_load_priority: &str,
+    greedy_flow_priority: &str,
+    greedy_alu_priority: &str,
+    greedy_select_overflow: &str,
+    greedy_select_overflow_limit: Option<usize>,
+    select_choice: &str,
+    enable_select_choice_hint_pass: bool,
+    enable_schedule_with_fixed_choices: bool,
+) -> Result<(), String> {
+    if greedy_select_overflow_limit.is_some() && greedy_select_overflow != "valu" {
+        return Err("greedy_select_overflow_limit (--greedy-select-overflow-limit) needs \
+                    greedy_select_overflow = 'valu' (--greedy-select-overflow valu); otherwise it is ignored"
+            .to_string());
+    }
+    if greedy_load_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_load_priority = '{}' (--greedy-load-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_load_priority
+        ));
+    }
+    if greedy_flow_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_flow_priority = '{}' (--greedy-flow-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_flow_priority
+        ));
+    }
+    if greedy_alu_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_alu_priority = '{}' (--greedy-alu-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_alu_priority
+        ));
+    }
+    if greedy_select_overflow == "valu" {
+        let owner = if select_choice != "optimize" {
+            Some(format!("select_choice = '{}' (--select-choice {})", select_choice, select_choice))
+        } else if enable_select_choice_hint_pass {
+            Some("the select-choice hint pass (--select-choice-hint-pass / --hint-passes)".to_string())
+        } else if enable_schedule_with_fixed_choices {
+            Some("schedule_with_fixed_choices (--schedule-with-fixed-choices)".to_string())
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
+            return Err(format!(
+                "greedy_select_overflow = 'valu' (--greedy-select-overflow valu) is ignored when {} owns \
+                 the select encoding",
+                owner
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_check_greedy_shape_combinations() {
+        use super::{check_greedy_shape_combinations as check, GreedyPriorityKind::*};
+        // Defaults and the documented combinations are accepted.
+        assert!(check(Fifo, "key", "key", "key", "never", None, "optimize", false, false).is_ok());
+        assert!(check(Wavefront, "final-last", "feeds-load-first", "key", "valu", Some(3), "optimize", false, false).is_ok());
+        // Each ignored combination is an error.
+        assert!(check(Wavefront, "key", "key", "key", "never", Some(3), "optimize", false, false).is_err());
+        assert!(check(Fifo, "key", "feeds-load-first", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "final-last", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "tail", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "fma", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "vselect", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", true, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", false, true).is_err());
+        assert!(check(Fifo, "key", "key", "native-first", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "chain-first", "native-first", "never", None, "optimize", false, false).is_ok());
+        // Without overflow, the hint pass and fixed encodings are fine.
+        assert!(check(Wavefront, "key", "key", "key", "never", None, "fma", true, true).is_ok());
+    }
+
     use super::*;
 
     /// Same values as verification/rewrites.py level_last_index (tests/test_rewrite_proofs.py).

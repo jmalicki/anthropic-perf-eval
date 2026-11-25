@@ -808,12 +808,18 @@ pub(super) fn format_live_usage_breakdown(
 /// # Arguments
 /// * `op` - The op being scheduled (reads its `srcs` and holds its `keep_live` values)
 /// * `liveness_aliases` - Lane → group VReg (both group kinds); write-group VReg → lanes
+/// * `delta_read` - The op is a SelectChoice that may take its one-op multiply_add form, so
+///   its precomputed delta counts as read (see [`liveness_read_vregs`])
 ///
 /// # Returns
 /// The VRegs the op reads or keeps live, then their aliases, each exactly once.
-fn liveness_release_vregs(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> Vec<VReg> {
+fn liveness_release_vregs(
+    op: &SsaOp,
+    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
+    delta_read: bool,
+) -> Vec<VReg> {
     let mut released: Vec<VReg> = Vec::with_capacity(op.srcs.len());
-    for vreg in liveness_read_vregs(op) {
+    for vreg in liveness_read_vregs(op, delta_read) {
         if !released.contains(&vreg) {
             released.push(vreg);
         }
@@ -993,18 +999,45 @@ fn release_read_values(
     vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
     trace: &mut CounterTrace,
 ) {
-    for vreg in &liveness_release_vregs(op, liveness_aliases) {
+    let delta_read = trace.delta_readers.contains(&op.id);
+    let fma = trace.fma_selects.contains(&op.id);
+    for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
+        // A vselect does not read the delta: no read, only one holder fewer.
+        if !(delta_read && !fma && op.delta_vreg == Some(*vreg)) {
+            let end = cycle as i32 + i32::from(fma);
+            let e = trace.read_end.entry(*vreg).or_insert(end);
+            *e = (*e).max(end);
+        }
         if *remaining != 0 || !live_vregs.contains(vreg) {
             continue;
         }
         if write_groups.releasable_at(vreg, cycle) {
-            live_vregs.remove(vreg);
-            live.remove(vreg);
-            trace.release(vreg, cycle);
+            match trace.read_end.get(vreg).copied() {
+                // A multiply_add select read it this cycle: held through this cycle.
+                Some(end) if end > cycle as i32 => vreg_expiry_heap.push(Reverse((end, *vreg))),
+                // Held only for selects that took the vselect form: its interval ended at
+                // its last real read. Give the words back from then on (the counter was
+                // conservative in between).
+                Some(end) if end < cycle as i32 => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    let start = trace.spans.get(vreg).map_or(end, |s| s.0);
+                    let end = end.max(start);
+                    for c in end.max(0) as usize..cycle.min(trace.cycle_end_live.len()) {
+                        trace.cycle_end_live[c] -= vreg.size();
+                    }
+                    trace.release(vreg, end as usize);
+                }
+                _ => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    trace.release(vreg, cycle);
+                }
+            }
         } else if let Some(&hold_until) = write_groups.hold_until.get(vreg) {
             // Written out, but an unread lane holds the block one more cycle.
             if write_groups.pending_writes.get(vreg).map_or(true, |&p| p == 0) {
@@ -1016,12 +1049,18 @@ fn release_read_values(
 }
 
 /// VRegs an op holds until it runs: its VReg operands and its `keep_live` list
-/// (the same reads `address_assign`'s `LivenessUse` reports). May contain duplicates.
-fn liveness_read_vregs(op: &SsaOp) -> impl Iterator<Item = VReg> + '_ {
+/// (the same reads `address_assign`'s `LivenessUse` reports), and with `delta_read` the
+/// precomputed delta of a SelectChoice. Address assignment holds the delta (and every
+/// operand) of a select in `select_fma_ops` to the select's cycle + 1; the greedy decides
+/// the select's form only when it places it, so a select that may take the multiply_add form
+/// holds its delta until then (released early again if it takes the vselect form, see
+/// [`release_read_values`]). May contain duplicates.
+fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
         .filter_map(|src| src.as_vreg())
         .chain(op.keep_live.iter().flatten().copied())
+        .chain(op.delta_vreg.filter(|_| delta_read))
 }
 
 // ============================================================================
@@ -1088,6 +1127,15 @@ struct CounterTrace {
     cycle_end_live: Vec<usize>,
     /// Per value: the cycle it was added to the counter and the cycle it was released.
     spans: HashMap<VReg, (i32, Option<i32>)>,
+    /// Op ids of the SelectChoice ops whose precomputed delta the counter treats as read
+    /// (those that may take the one-op multiply_add form in this run).
+    delta_readers: HashSet<usize>,
+    /// Op ids of the SelectChoice ops placed in the one-op multiply_add form. Address
+    /// assignment (`select_fma_ops`) holds their operands and delta to cycle + 1.
+    fma_selects: HashSet<usize>,
+    /// Per value: the cycle its interval ends at given the reads so far (a read at cycle c
+    /// ends it at c, a multiply_add select's read at c + 1).
+    read_end: HashMap<VReg, i32>,
 }
 
 impl CounterTrace {
@@ -1105,6 +1153,8 @@ impl CounterTrace {
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of shifted ops whose lanes are not all in the
 ///   op's cycle (split shifts); empty otherwise
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds (address assignment's
+///   `select_fma_ops`: their reads are held to cycle + 1)
 ///
 /// # Returns
 /// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
@@ -1113,9 +1163,10 @@ pub(super) fn interval_liveness_curve(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
     let (curve, peak, intervals, _, _) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     Ok((curve, peak, intervals))
 }
 
@@ -1126,6 +1177,7 @@ fn interval_liveness_inputs(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>, AddressAssignConfig, Vec<SsaOp>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
@@ -1140,6 +1192,7 @@ fn interval_liveness_inputs(
     let config = AddressAssignConfig {
         vector_group_lanes: groups,
         shifted_alu_cycles: shifted_lane_cycles.clone(),
+        select_fma_ops: select_fma_ops.clone(),
         ..Default::default()
     };
     let intervals = compute_live_intervals(&config, &scheduled)?;
@@ -1182,7 +1235,7 @@ fn compare_counter_with_intervals(
 ) -> Result<LivenessAgreement, String> {
     let cycle_end_live = &trace.cycle_end_live;
     let (curve, interval_peak, intervals) =
-        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &trace.fma_selects)?;
     let mut agreement = LivenessAgreement {
         counter_peak,
         counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
@@ -1596,7 +1649,8 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &words_shape,
         shifted_lane_cycles,
     )?;
-    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles)?;
+    let fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
         return Ok(first);
@@ -1666,6 +1720,7 @@ pub(crate) fn schedule_ssa_greedy_shaped(
 /// * `ops` - Ops with assigned cycles; negative cycles (skipped dead stores) are ignored
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of split shifts
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds
 ///
 /// # Returns
 /// The pool peaks, or the interval computation's error.
@@ -1673,9 +1728,10 @@ pub(super) fn scratch_pool_peaks(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<crate::address_assign::PoolPeaks, String> {
     let (_, _, intervals, config, scheduled) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     let spans = crate::address_assign::compute_value_spans(
         &intervals,
         &crate::address_assign::last_write_cycles(&scheduled, &config),
@@ -1970,6 +2026,18 @@ fn schedule_ssa_greedy_core(
     // Skip AddImm alternatives when building vreg_def (use Load's definition)
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+    // Selects that may take the one-op multiply_add form hold their delta (address
+    // assignment reads it at cycle + 1 when they do): with select overflow, any select with a
+    // delta the hint pass does not own; with fixed encodings, those fixed to the FMA path.
+    trace.delta_readers = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::SelectChoice && op.delta_vreg.is_some())
+        .filter(|op| match fixed_select_choice_encoding {
+            Some(fixed) => matches!(fixed.get(&op.id), Some(SelectChoiceEncoding::Fma)),
+            None => !select_choice_fixed_to_vselect && shape.select_overflow != SelectOverflow::Never,
+        })
+        .map(|op| op.id)
+        .collect();
 
     for (idx, op) in ops.iter().enumerate() {
         if let Some(dest) = op.dest {
@@ -1980,7 +2048,7 @@ fn schedule_ssa_greedy_core(
         }
         // Still track users from AddImm alternatives (they read zero_vreg).
         // `keep_live` values count as read: address assignment holds them until this op.
-        for vreg in liveness_read_vregs(op) {
+        for vreg in liveness_read_vregs(op, trace.delta_readers.contains(&op.id)) {
             vreg_users.entry(vreg).or_default().insert(idx);
         }
     }
@@ -2899,8 +2967,15 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                let freed: Vec<VReg> = liveness_release_vregs(&ops[idx], &liveness_aliases)
+                // A select taking the multiply_add form holds what it reads to cycle + 1.
+                let holds_reads = engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice;
+                let freed: Vec<VReg> = liveness_release_vregs(
+                    &ops[idx],
+                    &liveness_aliases,
+                    trace.delta_readers.contains(&op_id),
+                )
                     .into_iter()
+                    .filter(|_| !holds_reads)
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
@@ -2954,6 +3029,11 @@ fn schedule_ssa_greedy_core(
                             && fixed_select_choice_encoding.is_none()
                         {
                             overflow_select_fma.insert(op_id);
+                        }
+                        if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
+                            && ops[idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
                         }
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
@@ -3183,6 +3263,11 @@ fn schedule_ssa_greedy_core(
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&force_idx) {
                             fma_carry += 1;
+                        }
+                        if engine == Engine::Valu && ops[force_idx].opcode == Opcode::SelectChoice
+                            && ops[force_idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
                         }
                     }
                     SlotResult::Shifted => {
