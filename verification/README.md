@@ -58,7 +58,33 @@ Options:
 
 **Domain-based refutation (T7-domain-based-removes-G):** If we use domain-based demand (count ops whose domain contains `t`) to decide exclusions, the second exclusion can remove G; Z3 shows that after exclusions c1≠0 and c2≠2, the assignment (1, 2) is not feasible (UNSAT).
 
-## Undercounting energetic tightening (T7-undercount-*)
+## Resource-aware issue-cycle bounds (RB*)
+
+`--asap-alap-tightening energetic` computes, for every op, an earliest issue cycle from the slots
+its ancestors need and a latest completion from the slots its descendants need
+(`scheduler_rs/src/cpsat_scheduler/resource_bounds.rs`). `verification/resource_bounds.py` encodes
+the schedules of the CP-SAT model (issue cycles, lanes and completion of shiftable ops, selects,
+ConstChoice, an eliminable vbroadcast, slot capacities) and asks Z3 for a schedule with an op
+outside its bounds.
+
+| Check | Expected | Meaning |
+|---|---|---|
+| RB0-port-matches-rust-tests | UNSAT | The Python port of the rule gives the numbers the Rust unit tests assert |
+| RB1-bounds-sound | UNSAT | No schedule violates an issue, lane or completion bound (70 random graphs) |
+| RB2-bounds-sound-with-vbroadcast | UNSAT | The same with an eliminable vbroadcast (50 graphs) |
+| RB3-bounds-sound-crafted | UNSAT | The same on the two graphs that break the variants below |
+| RB-full-tail-for-shiftable | SAT | Counting shiftable descendants in a shiftable op's tail is unsound |
+| RB-issue-bound-for-shifted-ancestor | SAT | Counting a shiftable ancestor from its issue bound is unsound |
+| RB-old-counting-rule | SAT | The rule this replaced (below) excludes the optimum of a four-op instance |
+
+Design and literature: [docs/ENERGETIC_REASONING_FOR_UNIT_TASKS.md](../docs/ENERGETIC_REASONING_FOR_UNIT_TASKS.md).
+
+## Undercounting energetic tightening (T7-undercount-*) — the rule is no longer in the code
+
+The theorems below are about the rule `energetic` used until November 2026. They hold for the
+small models they state (two or three parallel ops, no reader of the pushed op) but did not cover
+the code: with a reader, pushing "the first" op of a crowded cycle excludes the optimum
+(`RB-old-counting-rule`). They are kept because other T7 results refer to them.
 
 The energetic slot tightening (`--energetic-slot-tightening`) uses **contributing-only undercounting**. At cycle t, `min_demand(t)` = count of ops with `asap[op]==t`. We exclude (O,t) **only when O contributes** (`asap[O]==t`) and `total_min_demand(t) > cap`. We skip the non-contributing case (O has `asap[O] < t`); that case is not proved in Z3. See `scheduler_rs/src/cpsat_scheduler/bounds.rs` and [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](../docs/ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) §7.1.
 

@@ -10,6 +10,8 @@ use crate::cpsat_scheduler::bounds::{
     compute_max_latency_critical_path, compute_ssa_alap, compute_ssa_asap,
     tighten_asap_by_symmetry_ordering,
 };
+use crate::cpsat_scheduler::makespan_rows::RowCaps;
+use crate::cpsat_scheduler::resource_bounds::tighten_asap_alap_by_resources;
 use crate::cpsat_scheduler::symmetry_ordering::SymmetryOrdering;
 use crate::kernel_builder::pipeline::{Pass, PipelineContext, SchedulingBounds};
 use crate::types::Engine;
@@ -96,28 +98,23 @@ impl Pass for ComputeBoundsPass {
         }
 
         if bounds_cfg.asap_alap_tightening.use_energetic() {
-            if let Some((slot_asap, slot_alap)) =
-                crate::cpsat_scheduler::bounds::tighten_asap_alap_by_slots(
-                    &ctx.ops,
-                    &current_asap,
-                    &current_alap,
-                    horizon,
-                    machine.valu_slots as i64,
-                    machine.alu_slots as i64,
-                    machine.load_slots as i64,
-                    machine.store_slots as i64,
-                    machine.flow_slots as i64,
-                    false, // verbose
-                    Some(&shiftable_set),
-                    None, // no greedy cycles in pipeline bounds pass
-                    symmetry_ordering.as_ref(),
-                    bounds_cfg.energetic_alap_pulls,
-                    bounds_cfg.energetic_bounded_push_k,
-                )
-            {
-                current_asap = slot_asap;
-                current_alap = slot_alap;
-            }
+            let caps = RowCaps {
+                valu: machine.valu_slots as i64,
+                alu: machine.alu_slots as i64,
+                load: machine.load_slots as i64,
+                store: machine.store_slots as i64,
+                flow: machine.flow_slots as i64,
+            };
+            let (slot_asap, slot_alap, _) = tighten_asap_alap_by_resources(
+                &ctx.ops,
+                &current_asap,
+                &current_alap,
+                horizon,
+                &caps,
+                &shiftable_set,
+            );
+            current_asap = slot_asap;
+            current_alap = slot_alap;
         }
 
         if bounds_cfg.enable_scratch_tightening {

@@ -11,10 +11,10 @@ use crate::types::{Engine, Opcode, Operand, SsaOp, VReg, VLEN};
 use super::bounds::{
     compute_capacity_lower_bound_global, compute_max_latency_critical_path, compute_ssa_alap,
     compute_ssa_asap, diagnose_precedence_bounds, fix_precedence_bounds_fixpoint,
-    tighten_asap_alap_by_scratch, tighten_asap_alap_by_slots,
-    tighten_asap_by_symmetry_ordering,
+    tighten_asap_alap_by_scratch, tighten_asap_by_symmetry_ordering,
     SsaCpsatConfig, SsaCpsatHints, SsaCpsatResult,
 };
+use super::resource_bounds::tighten_asap_alap_by_resources;
 use super::symmetry_ordering::SymmetryOrdering;
 #[cfg(feature = "cpsat")]
 use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
@@ -443,8 +443,6 @@ pub fn schedule_ssa_cpsat(
         asap_alap_tightening,
         enable_scratch_tightening,
         symmetry_precedence_integrated,
-        energetic_alap_pulls,
-        energetic_bounded_push_k,
         precedence_neutral_horizon,
         debug_fix_precedence_bounds,
         ref disable_optional_constraint_groups,
@@ -684,26 +682,24 @@ pub fn schedule_ssa_cpsat(
         current_alap = sym_alap;
     }
 
-    // Energetic slot loop: symmetry-aware undercounting (sound, never over-tightens).
+    // Resource-aware heads and tails (resource_bounds.rs): everything an op depends on, and
+    // everything that depends on it, needs slots. Excludes no schedule within the horizon.
     if asap_alap_tightening.use_energetic() {
-        let (slot_asap, slot_alap) = tighten_asap_alap_by_slots(
+        let caps = RowCaps { valu: valu_cap, alu: alu_cap, load: load_cap, store: store_cap, flow: flow_cap };
+        let (slot_asap, slot_alap, stats) = tighten_asap_alap_by_resources(
             ops,
             &current_asap,
             &current_alap,
             horizon as i32,
-            valu_cap,
-            alu_cap,
-            load_cap,
-            store_cap,
-            flow_cap,
-            verbose,
-            Some(&shiftable_set),
-            bound_hints,
-            symmetry_ordering.as_ref(),
-            energetic_alap_pulls,
-            energetic_bounded_push_k,
-        )
-        .unwrap_or_else(|| (current_asap.clone(), current_alap.clone()));
+            &caps,
+            &shiftable_set,
+        );
+        if verbose {
+            eprintln!(
+                "  Resource-aware tightening: {} ASAP raised ({} cycles), {} ALAP lowered ({} cycles)",
+                stats.asap_raised, stats.asap_cycles, stats.alap_lowered, stats.alap_cycles
+            );
+        }
         current_asap = slot_asap;
         current_alap = slot_alap;
     }

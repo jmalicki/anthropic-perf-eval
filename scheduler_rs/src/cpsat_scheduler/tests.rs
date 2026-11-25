@@ -3225,196 +3225,87 @@ mod precedence_offset_tests {
 }
 
 // ============================================================================
-// Slot tightening (tighten_asap_alap_by_slots) tests
+// Resource-aware tightening keeps every schedule (resource_bounds.rs)
 // ============================================================================
-//
-// The tightening logic in bounds.rs uses energetic reasoning (per-engine capacity)
-// to push ASAP forward or ALAP backward. It must never change feasibility: we may
-// only remove cycle values that are provably infeasible. If we counted optional-
-// interval ops (SelectChoice on Flow, ConstChoice on Load, shiftable on VALU),
-// we would over-count demand and could create empty domains or presolve INFEASIBLE.
-// See the long comment above tighten_asap_alap_by_slots in bounds.rs.
-//
-// These tests: (1) basic sanity—no empty domains on a simple ALU chain;
-// (2) Flow + SelectChoice—excluding SelectChoice from the Flow profile keeps
-// domains non-empty when flow_cap=1; (3) VALU + shiftable—excluding shiftable ops
-// from the VALU profile when shiftable_valu is provided keeps domains non-empty.
 
-#[cfg(test)]
-mod slot_tightening_tests {
+#[cfg(all(test, feature = "cpsat"))]
+mod resource_tightening_tests {
     use super::*;
-    use crate::cpsat_scheduler::bounds::{compute_ssa_alap, compute_ssa_asap, tighten_asap_alap_by_slots};
-    use crate::types::{Engine, Opcode, SsaOp, VReg};
-    use std::collections::{HashMap, HashSet};
+    use crate::cpsat_scheduler::SymmetryRows;
+    use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+    use crate::types::{Opcode, SymmetryHint};
 
-    fn make_ssa_op(id: usize, engine: Engine, opcode: Opcode, deps: Vec<usize>) -> SsaOp {
-        let mut op = SsaOp::new(
-            id,
-            engine,
-            opcode,
-            Some(VReg::scalar(id as u32)),
-            vec![],
-        );
-        op.dep_ids = deps.into_iter().collect();
-        op
+    /// Two multiply_adds of one ordering group that are ready in the same cycle, on a machine
+    /// with one vector slot; one of them feeds a further op.
+    ///
+    /// The best schedule runs the multiply_add with the reader first: load addresses at 0,
+    /// loads at 1, it at 2, the other multiply_add and the (shifted) reader at 3, four cycles.
+    /// The rule that energetic tightening used before counted two ops with earliest cycle 2
+    /// against one slot and raised the earliest cycle of the first of the group, which is the
+    /// one with the reader, so the model's optimum became five cycles.
+    fn two_ready_multiply_adds() -> Vec<SsaOp> {
+        let mut emit = SsaEmitContext::new();
+        let x = emit.emit_vload_imm(0);
+        let y = emit.emit_vload_imm(8);
+        let with_reader = emit.emit_fma(x, x, y);
+        let _other = emit.emit_fma(y, y, x);
+        let _reader = emit.emit_valu(Opcode::Xor, with_reader, x);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let mut ops = emit.ops;
+        for op in ops.iter_mut().filter(|op| op.opcode == Opcode::MultiplyAdd) {
+            op.symmetry_hint = Some(SymmetryHint { ordering_group: vec![1], lexicographic_stream: None });
+        }
+        ops
     }
 
-    /// Sanity: tightening with required-only ops must never produce empty domains.
-    /// 6 ALU ops, ALU cap 2 => need at least 3 cycles; domains stay non-empty.
+    fn optimum(ops: &[SsaOp], valu_slots: u32, tightening: AsapAlapTightening, symmetry_rows: SymmetryRows) -> usize {
+        let config = SsaCpsatConfig {
+            time_limit_secs: 30.0,
+            verbose: false,
+            enable_valu_shift: true,
+            machine: MachineConfig { valu_slots, ..Default::default() },
+            asap_alap_tightening: tightening,
+            force_zero_gap: true,
+            tuning: CpsatTuning { symmetry_rows, ..Default::default() },
+            ..Default::default()
+        };
+        let result = schedule_ssa_cpsat(ops, config, SsaCpsatHints::default(), None)
+            .expect("post-solve validation")
+            .expect("a schedule");
+        assert_eq!(result.status, CpsatStatus::Optimal);
+        result.makespan
+    }
+
     #[test]
-    fn test_slot_tightening_never_empty_domains() {
-        // Chain of 6 ALU ops; ALU cap 2 => need at least 3 cycles
-        let ops: Vec<SsaOp> = (0..6)
-            .map(|i| {
-                let deps = if i == 0 { vec![] } else { vec![i - 1] };
-                make_ssa_op(i, Engine::Alu, Opcode::Add, deps)
-            })
-            .collect();
-        let shiftable_set = HashSet::new();
-        let asap = compute_ssa_asap(&ops, &shiftable_set);
-        let horizon = 20;
-        let alap = compute_ssa_alap(&ops, horizon, &shiftable_set);
-
-        let result = tighten_asap_alap_by_slots(
-            &ops,
-            &asap,
-            &alap,
-            horizon,
-            6, 1, 2, 2, 1, // valu, alu, load, store, flow
-            false,
-            None::<&HashSet<usize>>,
-            None,
-            None, // no ordering: no-op, bounds unchanged
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
-        )
-        .expect("tightening should return Some");
-
-        for op in &ops {
-            let a = *result.0.get(&op.id).unwrap_or(&0);
-            let b = *result.1.get(&op.id).unwrap_or(&(horizon - 1));
-            assert!(a <= b, "slot tightening must not create empty domain: op id {} asap={} alap={}", op.id, a, b);
+    fn test_energetic_tightening_keeps_the_optimum_when_a_slot_is_contended() {
+        let ops = two_ready_multiply_adds();
+        assert_eq!(ops.iter().filter(|op| op.opcode == Opcode::MultiplyAdd).count(), 2);
+        for symmetry_rows in [SymmetryRows::Declared, SymmetryRows::None] {
+            let reference = optimum(&ops, 1, AsapAlapTightening::None, symmetry_rows);
+            assert_eq!(reference, 4, "{:?}: addresses, loads, the multiply_add with a reader, the rest", symmetry_rows);
+            assert_eq!(
+                optimum(&ops, 1, AsapAlapTightening::Energetic, symmetry_rows),
+                reference,
+                "{:?}: energetic tightening must not exclude the optimum",
+                symmetry_rows
+            );
         }
     }
 
-    /// Regression: 1 required Flow + 3 SelectChoice (optional Flow). If we counted SelectChoice
-    /// in the Flow profile, with flow_cap=1 we'd over-tighten and could get empty domains.
-    /// Excluding SelectChoice keeps the Flow profile correct (only the 1 required op); domains
-    /// stay non-empty. See bounds.rs "optional intervals" rationale.
+    /// On a kernel with selects, constants, vbroadcasts and shiftable ops, the optimum is the
+    /// same with and without tightening (two vector slots, as in the other toy-kernel tests,
+    /// so that every solve is proved well inside the time limit).
     #[test]
-    fn test_slot_tightening_flow_selectchoice_excluded() {
-        // Cond(0) → Sel1(1), Sel2(2), Sel3(3) (3 SelectChoice, same predecessor); then each Sel → user
-        // Flow has 1 required + 3 SelectChoice (optional). We exclude SelectChoice => profile has 1 op.
-        // Add one required Flow op so we have 1 required.
-        let cond = make_ssa_op(0, Engine::Flow, Opcode::Add, vec![]); // required Flow
-        let s1 = make_ssa_op(1, Engine::Flow, Opcode::SelectChoice, vec![0]);
-        let s2 = make_ssa_op(2, Engine::Flow, Opcode::SelectChoice, vec![0]);
-        let s3 = make_ssa_op(3, Engine::Flow, Opcode::SelectChoice, vec![0]);
-        let u1 = make_ssa_op(4, Engine::Alu, Opcode::Add, vec![1]);
-        let u2 = make_ssa_op(5, Engine::Alu, Opcode::Add, vec![2]);
-        let u3 = make_ssa_op(6, Engine::Alu, Opcode::Add, vec![3]);
-        let ops = vec![cond, s1, s2, s3, u1, u2, u3];
-        let shiftable_set = HashSet::new();
-
-        let asap = compute_ssa_asap(&ops, &shiftable_set);
-        let horizon = 30;
-        let alap = compute_ssa_alap(&ops, horizon, &shiftable_set);
-
-        let result = tighten_asap_alap_by_slots(
-            &ops,
-            &asap,
-            &alap,
-            horizon,
-            6, 12, 2, 2, 1, // flow_cap=1
-            false,
-            None::<&HashSet<usize>>,
-            None,
-            None, // no ordering: no-op, bounds unchanged
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
-        )
-        .expect("tightening should return Some");
-
-        for op in &ops {
-            let a = *result.0.get(&op.id).unwrap_or(&0);
-            let b = *result.1.get(&op.id).unwrap_or(&(horizon - 1));
-            assert!(a <= b, "Flow+SelectChoice: no empty domain for op id {}", op.id);
-        }
-    }
-
-    /// Regression: one shiftable VALU op (can move to ALU) and valu_cap=1. If we counted it in the
-    /// VALU profile we'd assume it always uses VALU and could over-tighten. Passing shiftable_valu
-    /// excludes it so the VALU profile is empty for that op; domains stay non-empty. See bounds.rs.
-    #[test]
-    fn test_slot_tightening_valu_shiftable_excluded() {
-        // A(0, shiftable VALU) → B(1) → C(2); A can shift to ALU so we exclude A from VALU profile.
-        let a = make_ssa_op(0, Engine::Valu, Opcode::Add, vec![]);
-        let b = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
-        let c = make_ssa_op(2, Engine::Alu, Opcode::Add, vec![1]);
-        let ops = vec![a, b, c];
-        let shiftable_set: HashSet<usize> = [0].into_iter().collect();
-
-        let asap = compute_ssa_asap(&ops, &shiftable_set);
-        let horizon = 20;
-        let alap = compute_ssa_alap(&ops, horizon, &shiftable_set);
-
-        let result = tighten_asap_alap_by_slots(
-            &ops,
-            &asap,
-            &alap,
-            horizon,
-            1, 8, 2, 2, 1, // valu_cap=1, alu_cap=8
-            false,
-            Some(&shiftable_set),
-            None,
-            None, // no ordering: no-op, bounds unchanged
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
-        )
-        .expect("tightening should return Some");
-
-        for op in &ops {
-            let a = *result.0.get(&op.id).unwrap_or(&0);
-            let b = *result.1.get(&op.id).unwrap_or(&(horizon - 1));
-            assert!(a <= b, "VALU shiftable excluded: no empty domain for op id {}", op.id);
-        }
-    }
-
-    /// Greedy-cap: when greedy_cycles is provided, the canonical cycle for each op must remain
-    /// in the tightened domain (Z3 T7-greedy-cap-preserves-G). 2 ops, greedy at [1, 2].
-    #[test]
-    fn test_slot_tightening_greedy_cap_preserves_canonical_cycle() {
-        let op0 = make_ssa_op(0, Engine::Alu, Opcode::Add, vec![]);
-        let op1 = make_ssa_op(1, Engine::Alu, Opcode::Add, vec![0]);
-        let ops = vec![op0, op1];
-        let shiftable_set = HashSet::new();
-        let asap = compute_ssa_asap(&ops, &shiftable_set);
-        let horizon = 20;
-        let alap = compute_ssa_alap(&ops, horizon, &shiftable_set);
-        let greedy_cycles: Vec<i32> = vec![1, 2];
-
-        let result = tighten_asap_alap_by_slots(
-            &ops,
-            &asap,
-            &alap,
-            horizon,
-            6, 2, 2, 2, 1, // alu_cap=2 so slot reasoning can tighten
-            false,
-            None::<&HashSet<usize>>,
-            Some(&greedy_cycles),
-            None, // no ordering: no-op, bounds unchanged
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
-        )
-        .expect("tightening should return Some");
-
-        let asap_res = &result.0;
-        let alap_res = &result.1;
-        for (idx, op) in ops.iter().enumerate() {
-            let c = greedy_cycles[idx];
-            let a = *asap_res.get(&op.id).unwrap_or(&0);
-            let b = *alap_res.get(&op.id).unwrap_or(&(horizon - 1));
-            assert!(a <= c && c <= b, "greedy-cap: op {} canonical cycle {} must be in [asap={}, alap={}]", op.id, c, a, b);
+    fn test_energetic_tightening_keeps_the_optimum_of_the_toy_kernel() {
+        let ops = super::tuning_objective_tests::toy_ops();
+        for symmetry_rows in [SymmetryRows::Declared, SymmetryRows::None] {
+            assert_eq!(
+                optimum(&ops, 2, AsapAlapTightening::Energetic, symmetry_rows),
+                optimum(&ops, 2, AsapAlapTightening::None, symmetry_rows),
+                "{:?}",
+                symmetry_rows
+            );
         }
     }
 }
