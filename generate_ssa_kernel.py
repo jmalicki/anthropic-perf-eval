@@ -183,6 +183,9 @@ def main():
               + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
     if getattr(args, "greedy_load_priority", "key") != "key":
         print(f"  greedy_load_priority={args.greedy_load_priority}")
+        if getattr(args, "greedy_priority", "fifo") != "wavefront":
+            print("  WARNING: --greedy-load-priority applies only with --greedy-priority wavefront; "
+                  "it is ignored here", file=sys.stderr)
     for name, default in (("greedy_flow_priority", "key"), ("greedy_select_overflow", "never"),
                           ("greedy_budget_force", "same-cycle")):
         if getattr(args, name, default) != default:

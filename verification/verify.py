@@ -63,6 +63,7 @@ from .window_rows_proof import WINDOW_ROW_CHECKS, EXPECT_SAT as WINDOW_ROW_EXPEC
 from .memory_alias import MEMORY_ALIAS_CHECKS
 from .makespan_rows import MAKESPAN_ROW_CHECKS, EXPECT_SAT as MAKESPAN_ROW_EXPECT_SAT
 from .group_symmetry import GROUP_SYMMETRY_CHECKS, EXPECT_SAT as GROUP_SYMMETRY_EXPECT_SAT
+from .resource_bounds import RESOURCE_BOUND_CHECKS, EXPECT_SAT as RESOURCE_BOUND_EXPECT_SAT
 
 THEOREM_CHECKS = [
     ("T2", "Overlap definition", check_t2_overlap_definition),
@@ -220,6 +221,8 @@ THEOREM_CHECKS += MEMORY_ALIAS_CHECKS
 THEOREM_CHECKS += MAKESPAN_ROW_CHECKS
 # Group symmetry breaking (verification/group_symmetry.py).
 THEOREM_CHECKS += GROUP_SYMMETRY_CHECKS
+# Resource-aware issue-cycle bounds of energetic tightening (verification/resource_bounds.py).
+THEOREM_CHECKS += RESOURCE_BOUND_CHECKS
 
 
 def _spec_url(theorem_id: str) -> str:
@@ -280,6 +283,7 @@ def run_verification(
             *WINDOW_ROW_EXPECT_SAT,
             *MAKESPAN_ROW_EXPECT_SAT,
             *GROUP_SYMMETRY_EXPECT_SAT,
+            *RESOURCE_BOUND_EXPECT_SAT,
         )
         # Special handling for multi-result theorems
         if name == "fixpoint-cascade-analysis":

@@ -27,13 +27,23 @@ than 1,039 / 1,033.
 
 ## 0.1 Previous: the load-bound plans (section 11)
 
-On the structure-model plans (`flow90.json` and the PR #69 plans that all landed at 1,104)
-the shaped greedy was held back by the load engine's tail, not by its VALU/ALU split.
-`--greedy-load-priority final-last --greedy-stagger-cycles 9 --greedy-groups-in-flight 32`
-takes `flow90.json` from 1,104 / 1,106 to **1,039 / 1,041** cycles (10 above the emission's
-static head/tail bound of 1,029) and `path_flow90.json` from 1,097 / 1,099 to **1,033 /
-1,035**, PROVED, PASSED and upstream `--strict`. Shifting toward the floor's split
-(`--greedy-shift-policy pace`) reaches that split and is slower: a negative result.
+On `flow90.json`, 16 rounds, the shaped greedy goes from 1,104 / 1,106 to **1,039 / 1,041**
+cycles. Two changes interact to get there:
+- Retuning the existing window and stagger, with no load-priority change, gives 28 cycles:
+  `--greedy-groups-in-flight 32` alone reaches 1,088, and adding `--greedy-stagger-cycles 9`
+  reaches 1,076.
+- `--greedy-load-priority final-last` (new) adds 37 cycles on top of that shape (1,076 to
+  1,039). It adds 9 at stagger 12 (1,088 to 1,079), and alone with the default window of 16
+  it is 83 cycles worse (1,187).
+
+Stagger 9 was picked by a sweep on this one emission. The same flags take
+`path_flow90.json` from 1,097 / 1,099 to **1,033 / 1,035**, and the four other PR #69
+plans from 1,104 to 1,039. All of these are PROVED and PASSED; the two best kernels also pass
+upstream `--strict`.
+
+1,039 is 10 cycles above this emission's static head/tail bound of 1,029 (load row).
+Shifting toward the floor's VALU/ALU split (`--greedy-shift-policy pace`) reaches that split
+and is slower: a negative result.
 
 ## 1. Result
 
@@ -483,24 +493,28 @@ uv run generate_ssa_kernel.py --rounds 3 --cpsat-deterministic-time 20 --validat
 
 ## 11. The load-bound plans: why the shaped greedy stopped at 1,104
 
-**Conclusion.** On the structure-model plans (`docs/emission_plans/flow90.json` and the
-other plans of PR #69 that all landed at 1,104) the shaped greedy was not held back by its
-VALU/ALU split. It was held back by the **load engine's tail**: the loads are 100% busy from
-about cycle 100 to cycle 1,000 under every shift policy, and what is left over is the last
-groups' trip from their last mid-kernel gather (round 10) through the four select rounds to
-their round-15 gather, with the load slots idle. Two changes close most of it, both flag-gated
-and off by default:
+**Conclusion.** On the structure-model plans (`docs/emission_plans/flow90.json`, and the
+other PR #69 plans that all landed at 1,104), two changes take the shaped greedy from 1,104
+to 1,039. They interact, so their effects do not add separately. Both are flag-gated and off
+by default.
 
-- `--greedy-load-priority final-last`: a load that no later load depends on (round 15's
-  gathers) gets a load slot only when no other load is ready. Early groups' round-15 gathers,
-  which have slack, no longer take load slots from later groups' round-5 to round-10
-  gathers, so those groups reach their select rounds earlier and round 15's gathers fill
-  the end of the schedule.
-- `--greedy-groups-in-flight 32 --greedy-stagger-cycles 9`: every group may run (the
-  window of 16 was tuned on main's default emission, whose scratch peak is higher; these
-  plans peak near 1,050 words), with a tighter stagger. `final-last` needs the open window:
-  with 16 in flight a group whose round 15 is deferred holds its place in the window
-  (1,187 cycles).
+| `flow90.json`, shaped greedy plus | stagger 12 (default) | stagger 9 |
+|---|---|---|
+| 16 groups in flight (default) | 1,104 | 1,125 |
+| 16 in flight, `final-last` | 1,187 | |
+| 32 in flight | 1,088 | 1,076 |
+| 32 in flight, `final-last` | 1,079 | **1,039** |
+
+- **Window and stagger retuning, no load-priority change: 28 cycles** (1,104 to 1,076).
+  - The default window of 16 groups was tuned on main's default emission, whose scratch peak
+    is higher; these plans peak near 1,050 words.
+  - Stagger 9 was chosen by a sweep on this one emission (section 11.2).
+- **`--greedy-load-priority final-last`: 9 to 37 more, depending on the shape.**
+  - What it does: loads that no later load depends on (round 15's gathers) are offered the
+    load slots after every other ready load.
+  - It adds 9 cycles at stagger 12 and 37 at stagger 9 (both with 32 in flight).
+  - It needs the open window. With 16 in flight, a group whose round-15 gathers are deferred
+    keeps its place in the window, and the run is 83 cycles slower (1,187).
 
 | Flags on top of the shaped greedy, 16 rounds, batch 256 | Schedule / simulator cycles |
 |---|---|
@@ -508,57 +522,81 @@ and off by default:
 | `path_flow90.json` + `--select-bit-source path` (1,097 / 1,099) | **1,033 / 1,035** |
 | the four other PR #69 plans at 1,104 | 1,039 / 1,041 each |
 
-The 1,039 kernel is 10 cycles above this emission's static head/tail bound of 1,029 (load
-row, t = 51, q = 14; the same with any const/select encoding) and 25 above its capacity
-floor (1,014, load). Every kernel quoted here is PROVED and PASSED; the 1,041 and 1,035
-kernels also pass `./scripts/check_upstream.sh --strict`. Two builds of the 1,039 kernel are
-byte-identical.
+The same flags were used unchanged on the other plans; stagger and window were not re-swept
+there.
 
-The leading hypothesis (give the greedy a target split and shift toward it all along) was
-tested and is a negative result: `--greedy-shift-policy pace` reaches the floor's split
-exactly (1,465 shifted, VALU and ALU both 89.2%) and is 10 cycles *slower* (1,114), because
-the load slots are the bottleneck in the same cycles. `reserve` (shift when the free vector
-slots are wanted by multiply_adds later in the cycle) gains 3 cycles alone and loses 10 on
-top of the new shape.
+The 1,039 kernel is:
+- 10 cycles above this emission's static head/tail bound of 1,029 (load row, t = 51, q = 14;
+  the same with any const/select encoding);
+- 25 cycles above its capacity floor (1,014, load).
 
-### 11.1 Diagnosis
+Every kernel quoted here is PROVED and PASSED. The 1,041 and 1,035 kernels also pass
+`./scripts/check_upstream.sh --strict`. Two builds of the 1,039 kernel are byte-identical.
 
-Measured on the 1,104-cycle schedule (`--output-json`, then `scripts.schedule_report`,
-`scripts.static_bounds` through it, and `scripts/greedy_gap_diagnosis.py`, new):
+**The leading hypothesis is a negative result.** The hypothesis was: give the greedy a target
+split and shift toward it all along.
+- `--greedy-shift-policy pace` reaches the floor's split exactly: 1,465 ops shifted, VALU
+  and ALU both at 89.2%. It is 10 cycles *slower* (1,114).
+- `reserve` shifts when the free vector slots are wanted by multiply_adds later in the
+  cycle. It gains 3 cycles alone and loses 10 on top of the new shape.
 
-1. **Shifting, as asked.** The floor-optimal resolution (`choice_floor`) runs 1,465 shiftable
-   vector ops as 8 scalar ops; the greedy ran 1,039. With the greedy's split the vector ALU
-   needs 6,387 / 6 = 1,065 cycles, so at 1,104 the vector ALU *is* nearly binding.
-2. **Declined shifts, and why.** The greedy never declined a shift it could have made for
-   policy or liveness reasons: the peak is 1,049 words, below the adaptive policy's 85%
-   soft threshold, so `allow_shift` always said yes. It shifts only an op that finds the six
-   vector slots full, and ready ops are tried in wavefront order, so shiftable ops early in
-   the order take vector slots and `multiply_add`s later in the order wait (16 to 20 ready
-   `multiply_add`s waiting on average in cycles 0 to 300, under 0.5 shiftable ones) while
-   the scalar ALU has 344 to 767 idle slots per 100 cycles. That is a priority inversion
-   the `reserve` policy removes.
-3. **But the load engine binds.** Load slots idle per 100 cycles: 56, then 0, 0, 0, 0, 0, 0,
-   4, 4, 0, then 108 and 8 in the last 104 cycles; the vector ALU is 100% busy over the same
-   middle. Of the 146 load slots idle after cycle 51, 124 had no load ready at all. Every
-   shift policy leaves that picture unchanged (load idle after cycle 51: 146, 134, 149 slots
-   for `when-full`, `reserve`, `pace`). Relieving the vector ALU in the middle cannot help
-   while the loads are full there; what is left is the start-up (no gather before about
-   cycle 51, the static bound's head) and the tail.
-4. **The tail.** Per group, the last round-10 gather and the first round-15 gather are about
-   56 cycles apart (the select rounds 11 to 14 have no loads). With the wavefront key, each
-   group's round-15 gather runs as soon as it is ready, ahead of later groups' round-5 to
-   round-10 gathers, so the load engine serves groups roughly one after another (about 28
-   load cycles per group) and the last group's 56-cycle load-free stretch is the end of the
-   schedule. Loads idle from cycle 1,000 on, with the vector ALU also idling there (184
-   slots).
-5. **The plateau at exactly 1,104 across plans.** The PR #69 plans differ in rounds 0 to 4
-   and 11 to 14; the binding stretch is the load stream of rounds 5 to 10 and 15, which is
-   identical in all of them (7 x 256 gathers), and the same wavefront window and stagger
-   pace it. Round 4's 8 extra gathers fall in the start-up, where the load slots have room.
-   After the change the plateau moves with it (1,039 for all five plans); there the vector
-   ALU and the loads are both 100% busy from about cycle 55 to 990 (vector ALU work
-   6,119 / 6 = 1,020 cycles, plus 7 cycles of start-up and 12 of tail idle = 1,039), so
-   which engine sets the last cycles was not separated.
+PR #76 explains why: the shift count follows the schedule's length rather than limiting it
+(see 11.1).
+
+### 11.1 What the measurements show
+
+Measured on the 1,104-cycle schedule with `scripts.schedule_report` (static head/tail bound
+included) and `scripts/greedy_gap_diagnosis.py` (new).
+
+**The diagnosis script's waiting counts are upper bounds.** They use operand readiness only:
+SSA `dep_ids` with unit latency. They ignore the in-flight window, bounds and inflation
+deferral, the scratch budget, memory edges and the extra cycle of a multiply-add select. They
+locate idle capacity and queues; they do not prove that another order would have filled a
+slot.
+
+1. **Shift split.**
+   - The floor-optimal resolution (`choice_floor`) runs 1,465 shiftable vector ops as 8 scalar
+     ops; the greedy ran 1,039.
+   - With the greedy's split the vector ALU needs 6,387 / 6 = 1,065 cycles.
+   - PR #76 shows the identity behind this. Every unshifted vector op takes one vector slot, so
+     V - s = 6T - I exactly (V vector ops, s shifted, T cycles, I idle vector slots), and the
+     vector ALU is busy in every steady-state cycle. A longer schedule therefore shifts fewer
+     ops, whatever made it longer. The missing shifts are a consequence of the length, not
+     shown to be its cause.
+2. **Declined shifts.** The pressure policy never suppressed a shift: the peak, 1,049 words,
+   stays below the adaptive policy's 85% soft threshold. The greedy shifts only an op that
+   finds the six vector slots full, and tries ready ops in wavefront order.
+   - In cycles 0 to 300, on average 17 to 21 operand-ready `multiply_add`s wait, against
+     under 0.5 shiftable ops (upper bounds), while the scalar ALU has 344 to 767 idle slots
+     per 100 cycles.
+   - That pattern is what `reserve` targets. Removing it gains 3 cycles alone (1,101) and costs
+     10 on top of the new shape (1,049).
+3. **Engines over time.**
+   - In the 1,104 schedule the load slots are fully used from cycle 100 to 700 and lose only
+     8 slots between 700 and 1,000. The vector ALU is also 100% busy there.
+   - Of the 146 load slots idle after cycle 51, 116 are in the last 104 cycles. Any
+     schedule's tail looks like that, so the count alone does not identify a cause.
+   - In none of the 146 was a data load operand-ready. The figure of 22 "with a ready load
+     waiting" in the first version of this section counted constants (ConstChoice ops, which
+     the greedy may lower to flow `add_imm`); it is withdrawn.
+   - The idle count barely moves under any shift policy (146 / 134 / 149 for `when-full` /
+     `reserve` / `pace`), and cycles do not improve.
+   - The static head/tail bound of 1,029 comes from the load row.
+4. **What `final-last` changes, as measured.**
+   - In the 1,039 schedule the last data load issues at cycle 1,024 (it was at 1,089), and
+     only 35 load slots are idle after cycle 51 (it was 146).
+   - Under the wavefront key, each group's round-15 gathers run as soon as they are ready, in
+     key order. Per group, the last round-10 gather and the first round-15 gather are about
+     56 cycles apart, since rounds 11 to 14 have no loads.
+   - That `final-last` helps is consistent with this ordering costing load slots late in the
+     schedule, but this was not isolated beyond the ablation in 11.2.
+5. **The plateau.**
+   - The PR #69 plans differ only in rounds 0 to 4 and 11 to 14, and all landed at 1,104
+     before and at 1,039 after.
+   - After the change, the vector ALU and the loads are both 100% busy from about cycle 55 to
+     990. The vector ALU's work is 6,119 / 6 = 1,020 cycles; with 7 cycles of start-up idle
+     and 12 of tail idle that sums to 1,039.
+   - Which engine sets the 1,039 plateau is **open**.
 
 ### 11.2 Ablation (flow90.json)
 
@@ -622,23 +660,51 @@ gives 1,309 to 1,312 with 20 or 24 in flight and fails the scratch budget with 3
 | `--greedy-shift-policy {when-full,reserve,pace,reserve-pace}` | `when-full` | When a shiftable vector op runs as 8 scalar ops. `reserve`: also when the free vector slots are wanted by non-shiftable vector ops later in the cycle's order. `pace`: also whenever the run is behind `shifted / vector ops placed = target / vector ops`. |
 | `--greedy-shift-target N` | balanced split | Target for `pace`: default `(2V - A) / 10` of the counts the greedy sees (1,465 here, as `choice_floor`). |
 
-Both proactive shift policies respect `allow_shift` and use a split shift when a whole one
-does not fit; without a free scalar slot they fall back to the vector ALU. They apply only
-when the greedy decides shifts itself (not with fixed shift encodings). The pace counters
-are not updated on the force-schedule path. Slot limits on every path, the reserve case and
-`final-last` are covered by `ssa_greedy/tests.rs` (`test_shift_policies_*`,
-`test_shift_reserve_*`, `test_shift_pace_*`, `test_load_priority_final_last`).
+Shift policies:
+- Both proactive shift policies respect `allow_shift`. They use a split shift when a whole
+  one does not fit, and fall back to the vector ALU when no scalar slot is free.
+- They apply only when the greedy decides shifts itself, not with fixed shift encodings.
+- Pace accounting (documented at its definition in `ssa_greedy/mod.rs`):
+  - "vector ops" are ops whose own engine is `Valu`, the same set in the total and in the
+    placed count;
+  - placements are counted on every path: normal, split start and force-schedule;
+  - the pace is a floor on shifting, not a cap: shifts made because the vector slots are
+    full continue after the target is reached.
+- `GreedyDiagnostics::proactive_shifts` counts shifts made while a vector slot was free.
+
+`final-last`, exactly:
+- Once per cycle, before the first placement pass, the `Load`-engine ops are re-sorted among
+  the positions they hold in the wavefront order.
+- Constants (`ConstChoice`) are sorted with them. A constant no load depends on counts as
+  final, even if it is then lowered to a flow `add_imm`.
+- Only the first pass is ordered. A feeder load deferred for the scratch budget is retried
+  after the final loads of that pass, so a final load can take a slot ahead of it
+  (`test_load_priority_final_last_budget_deferral`).
+- The 1,039 numbers were measured with exactly this behaviour; changing it needs
+  re-measurement.
+- `--greedy-load-priority` without `--greedy-priority wavefront` has no effect, and the
+  generator and the scheduler print a warning.
+
+Tests in `ssa_greedy/tests.rs`:
+- slot limits on the normal path (`test_shift_policies_keep_slot_limits`);
+- slot limits on runs that both force-schedule and make proactive shifts
+  (`test_shift_policies_keep_slot_limits_when_force_scheduling`, `test_proactive_shift_counter`);
+- `test_shift_reserve_*`, `test_shift_pace_*`;
+- `test_load_priority_final_last` and `..._budget_deferral`.
 
 ### 11.4 Ruled out, and not verified
 
-- **Ruled out:** the VALU/ALU split as the cause of the 1,104 plateau (pace reaches the
-  floor's split and is slower; load idle slots do not change); pressure-policy shift
+- **Ruled out:** shifting toward the floor's VALU/ALU split as a remedy (pace reaches the
+  split and is slower; idle load slots do not change; PR #76: the shift count follows the
+  schedule's length); pressure-policy shift
   suppression (never active below 85% of the budget); `tail` load priority (sorting loads by
   their tail keeps every group's gather of one round abreast and loses the stagger:
   1,204); `final-last` with the 16-group window (1,187).
-- **Not verified:** how many of the last 10 cycles to the 1,029 bound a scheduler can
-  recover; which of the loads and the vector ALU sets the 1,039 plateau (both are saturated
-  from about cycle 55 to 990); the start-up (16 load slots idle before cycle 51 and 7 after,
+- **Not verified:** that the load ordering in the tail is *the* cause of the 1,104 plateau
+  (the ablation shows `final-last` helps only together with the open window, and the
+  idle-slot counts cannot isolate a cause); how many of the last 10 cycles to the 1,029
+  bound a scheduler can recover; which of the loads and the vector ALU sets the 1,039
+  plateau (both are saturated from about cycle 55 to 990; open); the start-up (16 load slots idle before cycle 51 and 7 after,
   while 13 loads of dependency depth below 51 run after cycle 51) was not addressed; no
   CP-SAT run from the new start.
 
