@@ -5626,3 +5626,534 @@ fn test_budget_force_stall_holds_the_budget_in_the_shaped_pipeline() {
     }
     assert!(control_overshoots > 0, "control: same-cycle never overshot, so the budgets do not bind");
 }
+
+// =========================================================================
+// Forward/backward justification (ssa_greedy::justify)
+// =========================================================================
+
+use super::justify::{justify_schedule, verify_schedule, JustifyConfig, JustifyOutcome};
+
+/// Justify the schedule in `ops` with no ConstChoice / SelectChoice decisions and no
+/// vector groups.
+fn justify_plain(
+    ops: &mut [SsaOp],
+    shifted: &mut HashSet<usize>,
+    lanes: &mut HashMap<usize, Vec<i32>>,
+    config: &JustifyConfig,
+) -> JustifyOutcome {
+    justify_schedule(ops, true, shifted, lanes, &HashMap::new(), &HashMap::new(), None, None, config)
+        .expect("liveness of the input schedule can be computed")
+}
+
+/// Options used by most justification tests: shifts may change, hardware budget.
+fn justify_config(max_iterations: usize) -> JustifyConfig {
+    JustifyConfig {
+        max_iterations,
+        allow_shift_changes: true,
+        scratch_budget: 1536,
+        ..Default::default()
+    }
+}
+
+/// Six short load chains emitted before one long chain: the load slots are the bottleneck
+/// and the long chain is critical.
+///
+/// # Returns
+/// `(emit, critical path length)`.
+fn emit_short_chains_before_a_long_one() -> (SsaEmitContext, usize) {
+    let mut emit = SsaEmitContext::new();
+    for k in 0..6 {
+        let value = emit.emit_const(1000 + k);
+        emit.emit_store_imm(200 + k, value);
+    }
+    let mut value = emit.emit_const(7);
+    for step in 0..6 {
+        value = emit.emit_alu_imm(Opcode::Add, value, step + 1);
+    }
+    emit.emit_store_imm(300, value);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, 8) // const, six adds, store
+}
+
+/// The greedy serves the load slots in emission order, so the long chain starts last.
+/// The backward pass finds that the long chain is the urgent one, and the forward pass
+/// then starts it first: the schedule shrinks to the critical path.
+#[test]
+fn test_justify_strictly_improves_greedy_schedule() {
+    let (mut emit, critical_path) = emit_short_chains_before_a_long_one();
+    let (greedy_cycles, mut shifted, mut lanes) =
+        schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    assert!(greedy_cycles > critical_path, "the greedy starts the long chain late: {}", greedy_cycles);
+
+    let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &justify_config(5));
+    assert_eq!(outcome.cycles_before, greedy_cycles);
+    assert_eq!(outcome.cycles_after, critical_path, "{}", outcome.summary());
+    assert_eq!(outcome.verify_rejections, 0);
+    assert_eq!(outcome.scratch_rejections, 0);
+    let verified = verify_schedule(&emit.ops, true, &shifted, &lanes, &HashMap::new(), &HashMap::new());
+    assert_eq!(verified, Ok(critical_path));
+}
+
+/// With zero iterations the pass only measures the schedule.
+#[test]
+fn test_justify_zero_iterations_changes_nothing() {
+    let (mut emit, _) = emit_short_chains_before_a_long_one();
+    let (greedy_cycles, mut shifted, mut lanes) =
+        schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    let before: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
+    let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &justify_config(0));
+    assert_eq!((outcome.cycles_before, outcome.cycles_after), (greedy_cycles, greedy_cycles));
+    assert_eq!(before, emit.ops.iter().map(|op| op.cycle).collect::<Vec<_>>());
+}
+
+/// Twelve broadcasts, each stored once, scheduled one per cycle: one vector is live at a
+/// time. Any shorter schedule runs two stores in some cycle and so holds two vectors at
+/// once. With the input's peak as the budget every shorter candidate is rejected for
+/// scratch and the input is returned untouched; with the hardware budget it is shortened.
+#[test]
+fn test_justify_scratch_budget_rejects_improvement() {
+    let mut emit = SsaEmitContext::new();
+    let scalar = emit.emit_const(3);
+    let mut pairs = Vec::new();
+    for k in 0..12 {
+        let vector = emit.emit_vbroadcast_force(scalar);
+        let broadcast = emit.ops.len() - 1;
+        emit.emit_vstore_imm(64 * (k + 1), vector);
+        pairs.push((broadcast, emit.ops.len() - 1));
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    // Hand-made schedule: const at 0, then broadcast k at 1 + k and its store at 2 + k.
+    emit.ops[0].cycle = 0;
+    for (k, &(broadcast, store)) in pairs.iter().enumerate() {
+        emit.ops[broadcast].cycle = 1 + k as i32;
+        emit.ops[store].cycle = 2 + k as i32;
+    }
+    let input: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
+    let (_, input_peak, _) = interval_liveness_curve(&emit.ops, None, &HashMap::new(), &HashSet::new()).unwrap();
+
+    let mut tight_ops = emit.ops.clone();
+    let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
+    let tight = JustifyConfig { scratch_budget: input_peak, ..justify_config(5) };
+    let outcome = justify_plain(&mut tight_ops, &mut shifted, &mut lanes, &tight);
+    assert_eq!(outcome.cycles_before, 14);
+    assert_eq!(outcome.cycles_after, 14, "{}", outcome.summary());
+    assert!(outcome.scratch_rejections > 0, "{}", outcome.summary());
+    assert_eq!(outcome.scratch_rejections, outcome.candidates_checked);
+    assert_eq!(outcome.peak_live_after, input_peak);
+    assert_eq!(input, tight_ops.iter().map(|op| op.cycle).collect::<Vec<_>>(), "input schedule is kept");
+    assert!(shifted.is_empty() && lanes.is_empty());
+
+    let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &justify_config(5));
+    assert!(outcome.cycles_after < 14, "{}", outcome.summary());
+    assert!(outcome.peak_live_after > input_peak);
+    assert_eq!(outcome.scratch_rejections, 0);
+}
+
+/// Starting from a schedule with whole shifts only, justification with split shifts uses
+/// the scalar slots a whole shift leaves over: the schedule gets shorter, split ops span
+/// two consecutive cycles with their cycle at the last lane, and consumers wait for it.
+/// Without split shifts no lane cycles are produced.
+#[test]
+fn test_justify_split_lanes() {
+    let (mut emit, level_ops) = emit_independent_chains(30, 12);
+    let (whole_cycles, whole_shifted, whole_lanes) =
+        schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    assert!(whole_lanes.is_empty());
+
+    let mut no_split_ops = emit.ops.clone();
+    let (mut shifted, mut lanes) = (whole_shifted.clone(), whole_lanes.clone());
+    let outcome = justify_plain(&mut no_split_ops, &mut shifted, &mut lanes, &justify_config(5));
+    assert!(lanes.is_empty(), "no split shifts unless enabled");
+    assert_eq!(outcome.split, 0);
+    let no_split_cycles = outcome.cycles_after;
+    assert!(no_split_cycles <= whole_cycles);
+
+    let (mut shifted, mut lanes) = (whole_shifted, whole_lanes);
+    let split = JustifyConfig { split_shift: true, ..justify_config(5) };
+    let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &split);
+    assert!(outcome.cycles_after < no_split_cycles, "{}", outcome.summary());
+    assert!(!lanes.is_empty(), "split shifts fill the scalar slots");
+    assert_eq!(outcome.split, lanes.len());
+    assert_eq!(outcome.shifted, shifted.len());
+
+    let alu_use = shifted_alu_use(&emit.ops, &shifted, &lanes);
+    assert!(alu_use.values().all(|&n| n <= 12), "scalar slots over capacity: {:?}", alu_use);
+    assert!(alu_use.values().any(|&n| n > VLEN), "some cycle carries more than one shifted op");
+    let by_id: HashMap<usize, &SsaOp> = emit.ops.iter().map(|op| (op.id, op)).collect();
+    for (op_id, lane) in &lanes {
+        assert!(shifted.contains(op_id));
+        assert_eq!(lane.len(), VLEN);
+        let (first, last) = (*lane.iter().min().unwrap(), *lane.iter().max().unwrap());
+        assert_eq!(last, first + 1, "a split shift spans two consecutive cycles: {:?}", lane);
+        assert!(lane.windows(2).all(|w| w[0] <= w[1]), "low lanes run first: {:?}", lane);
+        assert_eq!(by_id[op_id].cycle, last, "the op completes at its last lane");
+    }
+    for levels in &level_ops {
+        for pair in levels.windows(2) {
+            let (producer, consumer) = (&emit.ops[pair[0]], &emit.ops[pair[1]]);
+            let consumer_start =
+                lanes.get(&consumer.id).map_or(consumer.cycle, |l| *l.iter().min().unwrap());
+            assert!(consumer_start > producer.cycle);
+        }
+    }
+    // The result also satisfies the greedy's own liveness accounting within the budget.
+    let (_, peak, _) = interval_liveness_curve(&emit.ops, None, &lanes, &HashSet::new()).unwrap();
+    assert_eq!(peak, outcome.peak_live_after);
+    assert!(peak <= 1536);
+}
+
+/// The same input gives the same schedule, shift set and lane cycles every time.
+#[test]
+fn test_justify_is_deterministic() {
+    let run = || {
+        let (mut emit, _) = emit_independent_chains(30, 12);
+        let (_, mut shifted, mut lanes) =
+            schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape { split_shift: true, ..Default::default() });
+        let config = JustifyConfig { split_shift: true, ..justify_config(4) };
+        let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &config);
+        let cycles: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
+        let mut shifted: Vec<usize> = shifted.into_iter().collect();
+        shifted.sort_unstable();
+        let mut lanes: Vec<(usize, Vec<i32>)> = lanes.into_iter().collect();
+        lanes.sort();
+        (outcome, cycles, shifted, lanes)
+    };
+    let first = run();
+    for _ in 0..3 {
+        assert_eq!(first, run());
+    }
+}
+
+/// When the shift decision is not the pass's to make, every op keeps its encoding: the
+/// shifted set is unchanged and shifted ops still take VLEN scalar slots in one cycle.
+#[test]
+fn test_justify_keeps_fixed_shift_decisions() {
+    let (mut emit, _) = emit_independent_chains(30, 12);
+    let (_, mut shifted, mut lanes) = schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    assert!(!shifted.is_empty());
+    // Pad the schedule so there is something to gain.
+    for op in emit.ops.iter_mut() {
+        op.cycle *= 2;
+    }
+    let fixed_shifts = shifted.clone();
+    let config = JustifyConfig { allow_shift_changes: false, ..justify_config(5) };
+    let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &config);
+    assert!(outcome.cycles_after < outcome.cycles_before, "{}", outcome.summary());
+    assert_eq!(shifted, fixed_shifts);
+    assert!(lanes.is_empty());
+    let alu_use = shifted_alu_use(&emit.ops, &shifted, &lanes);
+    assert!(alu_use.values().all(|&n| n == VLEN), "one whole shifted op per cycle: {:?}", alu_use);
+}
+
+/// A select on the multiply-add path keeps its two vector slots and its two-cycle latency
+/// in both passes (in the backward pass it is scheduled from its multiply_add).
+#[test]
+fn test_justify_two_cycle_selects() {
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const(1);
+    let c2 = emit.emit_const(2);
+    let v1 = emit.emit_vbroadcast(c1);
+    let v2 = emit.emit_vbroadcast(c2);
+    let mut selects = Vec::new();
+    let mut readers = Vec::new();
+    for _ in 0..12 {
+        let cond = emit.emit_valu(Opcode::Eq, v1, v2);
+        let sel = emit.emit_select_choice(cond, v1, v2);
+        selects.push(emit.ops.len() - 1);
+        let reader = emit.emit_valu(Opcode::Add, sel, v1);
+        readers.push(emit.ops.len() - 1);
+        emit.emit_vstore_imm(64 * readers.len() as i64, reader);
+    }
+    let vreg_def = std::mem::take(&mut emit.vreg_def);
+    compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+    let ops = &mut emit.ops;
+    let fixed: HashMap<usize, SelectChoiceEncoding> =
+        selects.iter().map(|&i| (ops[i].id, SelectChoiceEncoding::Fma)).collect();
+    let mut shifted = HashSet::new();
+    let mut lanes = HashMap::new();
+    let ((greedy_cycles, _, _), _) = schedule_ssa_greedy_shaped(
+        ops,
+        false,
+        &mut shifted,
+        1536,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        Some(&fixed),
+        &mut GreedyDiagnostics::new(false),
+        &GreedyShape::default(),
+        &mut lanes,
+    )
+    .expect("greedy schedules the selects");
+    // The verifier accepts the greedy's schedule, including the second vector slot.
+    let no_consts = HashMap::new();
+    assert!(verify_schedule(ops, false, &shifted, &lanes, &no_consts, &fixed).is_ok());
+    // The verifier adds the multiply_add's cycle to the select's precedence offset. Spread
+    // the schedule by four and move one select and its reader into the empty cycles, so no
+    // slot limit is involved: a reader in the multiply_add's cycle is rejected, a later one
+    // is accepted.
+    let (select, reader) = (selects[0], readers[0]);
+    let mut spread = ops.to_vec();
+    for op in spread.iter_mut() {
+        op.cycle *= 4;
+    }
+    spread[select].cycle += 2;
+    spread[reader].cycle = spread[select].cycle + 1;
+    let err = verify_schedule(&spread, false, &shifted, &lanes, &no_consts, &fixed).unwrap_err();
+    assert!(err.contains("readable from cycle"), "{}", err);
+    spread[reader].cycle = spread[select].cycle + 4;
+    assert!(verify_schedule(&spread, false, &shifted, &lanes, &no_consts, &fixed).is_ok());
+    // Pad it (still valid: every gap only grows) and justify.
+    for op in ops.iter_mut() {
+        op.cycle *= 3;
+    }
+    let config = JustifyConfig { allow_shift_changes: false, ..justify_config(5) };
+    let outcome =
+        justify_schedule(ops, false, &mut shifted, &mut lanes, &no_consts, &fixed, None, None, &config).unwrap();
+    assert!(outcome.cycles_after <= greedy_cycles, "{} (greedy {})", outcome.summary(), greedy_cycles);
+    assert_eq!(outcome.verify_rejections, 0);
+    for (&s, &r) in selects.iter().zip(&readers) {
+        assert!(ops[r].cycle >= ops[s].cycle + 2, "reader at {} of select at {}", ops[r].cycle, ops[s].cycle);
+    }
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if selects.contains(&i) {
+            *valu.entry(op.cycle).or_default() += 1;
+            *valu.entry(op.cycle + 1).or_default() += 1;
+        } else if op.engine == Engine::Valu {
+            *valu.entry(op.cycle).or_default() += 1;
+        }
+    }
+    assert!(valu.values().all(|&n| n <= 6), "vector slots over capacity: {:?}", valu);
+}
+
+/// The verifier reports slot overflow, precedence violations and malformed shift records.
+#[test]
+fn test_justify_verifier_rejects_invalid_schedules() {
+    let none_c = HashMap::new();
+    let none_s = HashMap::new();
+    let (mut emit, level_ops) = emit_independent_chains(8, 2);
+    let (cycles, shifted, lanes) = schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    assert_eq!(verify_schedule(&emit.ops, true, &shifted, &lanes, &none_c, &none_s), Ok(cycles));
+
+    // Seven vector ops in one cycle with nothing shifted.
+    let mut crowded = emit.ops.clone();
+    let cycle = crowded[level_ops[0][0]].cycle;
+    for chain in level_ops.iter().take(7) {
+        crowded[chain[0]].cycle = cycle;
+    }
+    let err = verify_schedule(&crowded, true, &HashSet::new(), &lanes, &none_c, &none_s).unwrap_err();
+    assert!(err.contains("valu slots"), "{}", err);
+
+    // A consumer in its producer's cycle (a scalar chain, so no slot limit is involved).
+    let (mut chain, _) = emit_short_chains_before_a_long_one();
+    let (_, chain_shifted, chain_lanes) = schedule_with_shift_and_shape(&mut chain.ops, &GreedyShape::default());
+    let consumer = chain.ops.iter().position(|op| op.engine == Engine::Alu).expect("the chain has adds");
+    let producer_id = *chain.ops[consumer].dep_ids.iter().next().expect("the add reads a value");
+    let producer_cycle = chain.ops.iter().find(|op| op.id == producer_id).expect("producer exists").cycle;
+    chain.ops[consumer].cycle = producer_cycle;
+    let err = verify_schedule(&chain.ops, true, &chain_shifted, &chain_lanes, &none_c, &none_s).unwrap_err();
+    assert!(err.contains("readable from cycle"), "{}", err);
+
+    // A split whose last lane is not the op's cycle.
+    let op = &emit.ops[level_ops[0][1]];
+    let bad_shift: HashSet<usize> = [op.id].into_iter().collect();
+    let bad_lanes: HashMap<usize, Vec<i32>> = [(op.id, vec![op.cycle + 1; VLEN])].into_iter().collect();
+    let err = verify_schedule(&emit.ops, true, &bad_shift, &bad_lanes, &none_c, &none_s).unwrap_err();
+    assert!(err.contains("last lane"), "{}", err);
+}
+
+/// The verifier checks memory edges with their own latencies: a store over a word in the
+/// cycle of an earlier load of it is accepted (WAR, latency 0), a load in the cycle of the
+/// store it must see is rejected (RAW, latency 1). No slot limit or data dependency is
+/// involved in the rejected schedule.
+#[test]
+fn test_justify_verifier_checks_memory_edges() {
+    use crate::kernel_builder::memory_deps::{compute_memory_dependencies, test_programs::store_load_same_word};
+
+    let (mut ops, ix) = store_load_same_word();
+    assert_eq!(compute_memory_dependencies(&mut ops).unwrap().kept, 3);
+    // The three constants as add_imm (one flow slot each), so the load slots are free.
+    let consts: HashMap<usize, ConstChoiceEncoding> = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::ConstChoice)
+        .map(|op| (op.id, ConstChoiceEncoding::AddImm))
+        .collect();
+    assert_eq!(consts.len(), 3);
+    let none_s = HashMap::new();
+    let (shifted, lanes) = (HashSet::new(), HashMap::new());
+    // p, w, q at 0, 1, 2; the first load and the store over its word both at 2.
+    for (idx, cycle) in [0, 1, 2].into_iter().enumerate() {
+        ops[idx].cycle = cycle;
+    }
+    ops[ix.load_before].cycle = 2;
+    ops[ix.store_word0].cycle = 2;
+    ops[ix.load_before + 1].cycle = 3;
+    ops[ix.first_store].cycle = 4;
+    ops[ix.load_after].cycle = 3;
+    ops[ix.load_after + 1].cycle = 4;
+    ops[ix.load_after + 2].cycle = 5;
+    ops[ix.last_store].cycle = 6;
+    assert!(ops.iter().all(|op| op.cycle >= 0), "every op has a cycle");
+    assert_eq!(verify_schedule(&ops, false, &shifted, &lanes, &consts, &none_s), Ok(7), "same-cycle WAR");
+
+    ops[ix.load_after].cycle = ops[ix.store_word0].cycle;
+    let err = verify_schedule(&ops, false, &shifted, &lanes, &consts, &none_s).unwrap_err();
+    assert!(err.contains("raw"), "{}", err);
+}
+
+/// The verifier counts a split shift's lanes in the cycle each lane runs in: a whole
+/// shifted op plus four lanes of a split one fill the 12 scalar slots, a fifth lane is
+/// one too many.
+#[test]
+fn test_justify_verifier_counts_split_lanes_per_cycle() {
+    let (mut emit, level_ops) = emit_independent_chains(2, 1);
+    let (whole, split) = (level_ops[0][0], level_ops[1][0]);
+    // Constants at 0, the broadcast at 1, both adds from 2, the stores at 4 and 5.
+    for op in emit.ops.iter_mut() {
+        op.cycle = match (op.engine, op.id) {
+            (Engine::Load, _) => 0,
+            (Engine::Valu, _) => 1,
+            _ => 4,
+        };
+    }
+    emit.ops[whole].cycle = 2;
+    emit.ops[split].cycle = 3;
+    let last = emit.ops.len() - 1;
+    emit.ops[last].cycle = 5;
+    let (whole_id, split_id) = (emit.ops[whole].id, emit.ops[split].id);
+    let shifted: HashSet<usize> = [whole_id, split_id].into_iter().collect();
+    let lanes_with = |first: usize| -> HashMap<usize, Vec<i32>> {
+        [(split_id, (0..VLEN).map(|lane| if lane < first { 2 } else { 3 }).collect())].into_iter().collect()
+    };
+    let (none_c, none_s) = (HashMap::new(), HashMap::new());
+    assert_eq!(verify_schedule(&emit.ops, true, &shifted, &lanes_with(4), &none_c, &none_s), Ok(6));
+    let err = verify_schedule(&emit.ops, true, &shifted, &lanes_with(5), &none_c, &none_s).unwrap_err();
+    assert!(err.contains("cycle 2 uses 13 alu slots"), "{}", err);
+}
+
+/// A shorter schedule that moves an op out of its `[ASAP, ALAP]` domain is dropped and
+/// counted as a domain rejection, not as a verification failure.
+#[test]
+fn test_justify_counts_domain_rejections_separately() {
+    let (mut emit, _) = emit_short_chains_before_a_long_one();
+    let (greedy_cycles, mut shifted, mut lanes) =
+        schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape::default());
+    let input: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
+    // Domains that hold every op at its greedy cycle.
+    let pinned: HashMap<usize, i32> = emit.ops.iter().map(|op| (op.id, op.cycle)).collect();
+    let outcome = justify_schedule(
+        &mut emit.ops,
+        true,
+        &mut shifted,
+        &mut lanes,
+        &HashMap::new(),
+        &HashMap::new(),
+        None,
+        Some((&pinned, &pinned)),
+        &justify_config(5),
+    )
+    .unwrap();
+    assert_eq!(outcome.cycles_after, greedy_cycles, "{}", outcome.summary());
+    assert!(outcome.domain_rejections > 0, "{}", outcome.summary());
+    assert_eq!(outcome.domain_rejections, outcome.candidates_checked);
+    assert_eq!((outcome.verify_rejections, outcome.scratch_rejections), (0, 0));
+    assert!(outcome.summary().contains("rejected for ASAP/ALAP domains"));
+    assert_eq!(input, emit.ops.iter().map(|op| op.cycle).collect::<Vec<_>>(), "input schedule is kept");
+}
+
+/// An orbit that never reproduces its starting schedule runs every iteration it is given;
+/// the stall limit ends it after that many iterations in a row without a shorter accepted
+/// schedule, with the same result.
+#[test]
+fn test_justify_stops_after_stalled_iterations() {
+    let run = |max_stalled_iterations: usize| {
+        let (mut emit, _) = emit_independent_chains(30, 12);
+        let (_, mut shifted, mut lanes) =
+            schedule_with_shift_and_shape(&mut emit.ops, &GreedyShape { split_shift: true, ..Default::default() });
+        let config = JustifyConfig { split_shift: true, max_stalled_iterations, ..justify_config(40) };
+        let outcome = justify_plain(&mut emit.ops, &mut shifted, &mut lanes, &config);
+        (outcome, emit.ops.iter().map(|op| op.cycle).collect::<Vec<i32>>())
+    };
+    let (unlimited, unlimited_cycles) = run(0);
+    assert_eq!(unlimited.iterations, 40, "the test needs an orbit: {}", unlimited.summary());
+    assert!(unlimited.cycles_after < unlimited.cycles_before, "{}", unlimited.summary());
+
+    let (limited, limited_cycles) = run(3);
+    // The gain comes in the first iteration; three iterations without one follow.
+    assert_eq!(limited.iterations, 4, "{}", limited.summary());
+    assert_eq!(limited.cycles_after, unlimited.cycles_after);
+    assert_eq!(limited_cycles, unlimited_cycles);
+}
+
+/// Justification after `--greedy-select-overflow valu`: the selects the greedy put on the
+/// vector ALU are multiply-add selects for the pass too (their delta and operands are held to
+/// cycle + 1, as address assignment holds them). The pass's peak equals address
+/// assignment's on its result, the slot limits hold with those selects on the vector ALU, and
+/// a budget one word below the input's interval peak is refused for every candidate (the
+/// input itself is never re-checked, so it stays).
+#[test]
+fn test_justify_after_select_overflow_keeps_fma_liveness() {
+    for split_shift in [false, true] {
+        let shape = GreedyShape {
+            priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+            split_shift,
+            select_overflow: SelectOverflow::Valu { limit: None },
+            ..Default::default()
+        };
+        let (mut emit, _) = emit_delta_select_chains(24);
+        let (_, mut shifted, fma, mut lanes) =
+            schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
+        assert!(!fma.is_empty(), "split={}: the overflow placed no select on the vector ALU", split_shift);
+        let select_choice: HashMap<usize, SelectChoiceEncoding> = emit
+            .ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::SelectChoice)
+            .map(|op| {
+                let enc = if fma.contains(&op.id) { SelectChoiceEncoding::Fma } else { SelectChoiceEncoding::Vselect };
+                (op.id, enc)
+            })
+            .collect();
+        let peak_of = |ops: &[SsaOp], lanes: &HashMap<usize, Vec<i32>>| {
+            let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+            let config = crate::address_assign::AddressAssignConfig {
+                select_fma_ops: fma.clone(),
+                shifted_alu_cycles: lanes.clone(),
+                ..Default::default()
+            };
+            let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+            crate::address_assign::compute_peak_liveness(&intervals)
+        };
+        let input_peak = peak_of(&emit.ops, &lanes);
+        let config = JustifyConfig { split_shift, ..justify_config(5) };
+        let outcome = justify_schedule(
+            &mut emit.ops, true, &mut shifted, &mut lanes, &HashMap::new(), &select_choice, None, None, &config,
+        )
+        .unwrap();
+        assert_eq!(outcome.peak_live_before, input_peak, "split={}", split_shift);
+        assert_eq!(outcome.peak_live_after, peak_of(&emit.ops, &lanes), "split={}", split_shift);
+        assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, &format!("split={}", split_shift));
+
+        let (mut emit, _) = emit_delta_select_chains(24);
+        let (_, mut shifted, _, mut lanes) =
+            schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
+        let before: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
+        let tight = JustifyConfig { scratch_budget: input_peak - 1, split_shift, ..justify_config(5) };
+        let outcome = justify_schedule(
+            &mut emit.ops, true, &mut shifted, &mut lanes, &HashMap::new(), &select_choice, None, None, &tight,
+        )
+        .unwrap();
+        assert_eq!(outcome.cycles_after, outcome.cycles_before, "split={}", split_shift);
+        assert_eq!(emit.ops.iter().map(|op| op.cycle).collect::<Vec<_>>(), before);
+    }
+}
