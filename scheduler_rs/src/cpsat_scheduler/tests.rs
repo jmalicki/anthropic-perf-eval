@@ -144,6 +144,59 @@ mod ssa_tests {
         assert_eq!(cycles_and_alu_derived(&r), (3, 0));
     }
 
+    /// The hardware zero as an ALU operand: with a reserved zero VReg the emitter lists
+    /// `-5 = 0 - 5` (`Sub { a_value: 0, b_value: 5 }`), and no op produces 0. Dead code
+    /// elimination keeps that alternative (it is not stale), and the whole-kernel model
+    /// switches it off instead of refusing it as an alternative without a producer (the
+    /// derivation names its operands by producer op id; the zero has none). Without a reserved
+    /// zero VReg the drop treats 0 like any other missing value.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_zero_operand_is_kept_and_switched_off() {
+        use crate::kernel_builder::emit_ssa::{drop_alternatives_without_producer, eliminate_ssa_dead_code};
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        emit.reserve_zero_vreg();
+        let addr = emit.emit_const_choice(5);
+        let neg = emit.emit_const_choice(-5);
+        emit.emit_store(addr, neg); // root: both constants live
+        let sub = ConstEncoding::Sub { a_value: 0, b_value: 5 };
+        let alts_of_neg = |ops: &[SsaOp]| {
+            ops.iter().find(|op| op.produces_constant == Some(-5)).unwrap().const_alternatives.clone().unwrap()
+        };
+        assert!(alts_of_neg(&emit.ops).contains(&sub), "{:?}", alts_of_neg(&emit.ops));
+
+        let mut without_zero = emit.ops.clone();
+        assert_eq!(drop_alternatives_without_producer(&mut without_zero, false), 1);
+        assert!(!alts_of_neg(&without_zero).contains(&sub));
+
+        let mut vreg_def = std::mem::take(&mut emit.vreg_def);
+        let mut const_alternatives = emit.take_const_alternatives();
+        let zero = emit.zero_vreg;
+        let (mut ops, new_vreg_def, _) =
+            eliminate_ssa_dead_code(emit.take_ops(), &mut vreg_def, &mut const_alternatives, zero, None);
+        assert!(alts_of_neg(&ops).contains(&sub), "DCE keeps the zero-operand alternative");
+        compute_ssa_dependencies(&mut ops, &new_vreg_def, zero, None);
+        let r = schedule_ssa_cpsat(
+            &ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                ..Default::default()
+            },
+            SsaCpsatHints::default(),
+            None,
+        )
+        .expect("a zero operand is not a missing producer")
+        .expect("feasible");
+        assert!(!r
+            .const_choice_encoding
+            .values()
+            .any(|e| matches!(e, crate::types::ConstChoiceEncoding::AluDerive(_))));
+    }
+
     /// Sanity check: ForceAddImm must be feasible. If this fails, AddImm constraints are wrong.
     #[cfg(feature = "cpsat")]
     #[test]

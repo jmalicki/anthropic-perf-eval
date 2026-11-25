@@ -1258,18 +1258,29 @@ pub fn compute_ssa_dependencies_with_barriers(
 }
 
 /// Drop every ALU-derived `ConstChoice` alternative that names a value no op in `ops`
-/// produces (`produces_constant`).
+/// produces (`produces_constant`), except 0 when `zero_reserved`.
 ///
 /// The emitter lists derivations from the constants written so far (`emit_const_choice`);
 /// when dead code elimination removes one of those constants, the derivations that read it
 /// have no producer left. The CP-SAT model looks each operand up among the ops and refuses
-/// an alternative without a producer, so this must run after every removal of ops.
+/// an alternative without a producer (whole-kernel solves), so every removal of ops must
+/// leave none: `eliminate_ssa_dead_code` calls this; a pass that removes constant producers
+/// itself must call it or rebuild the alternatives from the constants that remain.
 /// Load and AddImm have no operands and are always kept; the order of the rest is kept.
+///
+/// With a reserved zero VReg the emitter also counts 0 as available (hardware zero at
+/// scratch address 0, no producing op), so e.g. `Sub { a_value: 0, b_value: n }` for `-n`
+/// is listed; it is kept here, and the CP-SAT model switches it off (an ALU derivation names
+/// its operands by producer op id, and the hardware zero has none), in step with
+/// [`zero_operand_has_no_producer`].
 ///
 /// # Returns
 /// The number of alternatives dropped.
-pub fn drop_alternatives_without_producer(ops: &mut [SsaOp]) -> usize {
-    let produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+pub fn drop_alternatives_without_producer(ops: &mut [SsaOp], zero_reserved: bool) -> usize {
+    let mut produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+    if zero_reserved {
+        produced.insert(0);
+    }
     let mut dropped = 0;
     for op in ops.iter_mut() {
         if let Some(alts) = op.const_alternatives.as_mut() {
@@ -1279,6 +1290,14 @@ pub fn drop_alternatives_without_producer(ops: &mut [SsaOp]) -> usize {
         }
     }
     dropped
+}
+
+/// True when `value` is the hardware zero with no producing op: the one operand of an
+/// ALU-derived `ConstChoice` alternative that [`drop_alternatives_without_producer`] keeps
+/// without a producer (only when the zero VReg is reserved; the emitter lists 0 as an
+/// operand only then).
+pub fn zero_operand_has_no_producer(value: i64, producer: Option<usize>) -> bool {
+    value == 0 && producer.is_none()
 }
 
 /// Eliminate SSA dead code: remove ops whose result has no users.
@@ -1448,7 +1467,7 @@ pub fn eliminate_ssa_dead_code(
         }
     }
 
-    drop_alternatives_without_producer(&mut new_ops);
+    drop_alternatives_without_producer(&mut new_ops, zero_vreg.is_some());
 
     // Rebuild vreg_def from remaining ops only (so ConstChoice's single remaining encoding is the definer)
     let mut new_vreg_def: HashMap<VReg, usize> = HashMap::new();

@@ -1477,9 +1477,15 @@ pub fn schedule_ssa_cpsat(
                                 value_to_producer_idx.get(&deps[0]).copied(),
                                 value_to_producer_idx.get(&deps[1]).copied(),
                             );
+                            // An operand that is the hardware zero (reserved zero VReg, no
+                            // producing op) is kept by DCE but cannot be expressed here: the
+                            // chosen derivation names its operands by producer op id. Off.
+                            use crate::kernel_builder::emit_ssa::zero_operand_has_no_producer;
+                            let only_zero_missing = (producers.0.is_some() || zero_operand_has_no_producer(deps[0], producers.0))
+                                && (producers.1.is_some() || zero_operand_has_no_producer(deps[1], producers.1));
                             let (left_idx, right_idx) = match producers {
                                 (Some(l), Some(r)) => (l, r),
-                                _ if initial_live.is_some() => {
+                                _ if only_zero_missing || initial_live.is_some() => {
                                     let c = model.add_eq(LinearExpr::from(use_alu_k), 0);
                                     model.set_constraint_name(c, &format!("const_choice_off_{}_k_{}", idx, k));
                                     alu_info.push(None);

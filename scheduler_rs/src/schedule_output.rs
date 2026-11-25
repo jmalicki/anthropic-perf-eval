@@ -504,6 +504,13 @@ impl LivenessDetail {
     }
 }
 
+/// The items in ascending order (for serialising hash sets deterministically).
+fn sorted<T: Ord>(items: impl Iterator<Item = T>) -> Vec<T> {
+    let mut v: Vec<T> = items.collect();
+    v.sort_unstable();
+    v
+}
+
 /// Write SSA schedule with usage accounting to JSON file.
 pub fn write_ssa_schedule_json(
     result: &crate::kernel_builder::SsaScheduleResult,
@@ -534,9 +541,11 @@ pub fn write_ssa_schedule_json(
                 engine: op.engine.as_str().to_string(),
                 opcode: slot.first().cloned().unwrap_or_default(),
                 slot,
-                dep_ids: op.dep_ids.iter().copied().collect(),
-                reads: op.reads.iter().copied().collect(),
-                writes: op.writes.iter().copied().collect(),
+                // `reads` / `writes` (and `dep_ids`) are hash sets: sort them so two runs of
+                // the same build write the same JSON.
+                dep_ids: sorted(op.dep_ids.iter().copied()),
+                reads: sorted(op.reads.iter().copied()),
+                writes: sorted(op.writes.iter().copied()),
                 from_const_choice: op.from_const_choice,
                 from_select_choice: op.from_select_choice,
             }
