@@ -664,3 +664,19 @@ fn test_values_only_refuses_a_store_carrying_keep_live() {
     assert!(!sites.iter().any(|s| s.store == store));
     assert_eq!(reason_count(&rejected, "keep_live"), 1, "{:?}", rejected);
 }
+
+#[test]
+fn test_prune_index_match_site_agrees_with_find_sites() {
+    // 16 rounds: round 11's updates and the wrap's shared zeros are sites only with the zero
+    // register known; match_site (rule.with_zero) must see them as find_sites does.
+    use super::rule::{Proposal, Rule};
+    let p = raw_program(&ProblemSpec::default());
+    let rule = PruneIndexRule::for_problem(256).with_zero(p.zero_vreg);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let (sites, _) = rule.find_sites(&g, None);
+    assert_eq!(sites.len(), 31 + 64);
+    for s in &sites {
+        let proposal = Proposal { region_id: None, round: None, group: None, depth: None, ops: vec![s.op] };
+        assert_eq!(rule.match_site(&g, &proposal).as_ref(), Ok(s), "op {}", s.op);
+    }
+}

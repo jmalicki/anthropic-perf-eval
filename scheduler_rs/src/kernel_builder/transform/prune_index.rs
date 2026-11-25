@@ -58,9 +58,24 @@ pub struct PruneIndexRule {
     pub layout: MemoryLayout,
     /// Declared assumptions (`InitialIndicesZero` lets round 0's update fold).
     pub assumptions: Vec<Assumption>,
+    /// The program's zero register, for `Rule::match_site` (which gets only the graph);
+    /// `find_sites` takes it as an argument and falls back to this.
+    pub zero: Option<VReg>,
 }
 
 impl PruneIndexRule {
+    /// The same rule for a program whose zero register is `zero`, so `match_site` sees the
+    /// zeros `find_sites` sees (the wrap round's broadcasts of it).
+    pub fn with_zero(mut self, zero: Option<VReg>) -> Self {
+        self.zero = zero;
+        self
+    }
+
+    /// The value facts of `graph`, as every entry point computes them.
+    fn analyses(&self, graph: &SsaGraph, zero: Option<VReg>) -> ValueFacts {
+        ValueFacts::compute(graph, zero, &self.layout, &self.assumptions)
+    }
+
     /// The rule for the problem's layout, with the input precondition declared.
     ///
     /// # Arguments
@@ -73,6 +88,7 @@ impl PruneIndexRule {
             source: ProposalSource::Ops,
             layout: MemoryLayout::problem(batch_size),
             assumptions: vec![Assumption::InitialIndicesZero],
+            zero: None,
         }
     }
 }
@@ -227,7 +243,7 @@ impl PruneIndexRule {
     /// # Returns
     /// `(sites, rejections)`.
     pub fn find_sites(&self, graph: &SsaGraph, zero: Option<VReg>) -> (Vec<PruneIndexSite>, BTreeMap<String, usize>) {
-        let values = ValueFacts::compute(graph, zero, &self.layout, &self.assumptions);
+        let values = self.analyses(graph, zero.or(self.zero));
         let mut sites = Vec::new();
         let mut rejected: BTreeMap<String, usize> = BTreeMap::new();
         for p in self.propose(graph) {
@@ -277,10 +293,10 @@ impl Rule for PruneIndexRule {
             .collect()
     }
 
-    /// Computes the value facts for every call; use `find_sites` for a whole program.
+    /// Computes the value facts for every call (with `self.zero`, as `find_sites` does); use
+    /// `find_sites` for a whole program.
     fn match_site(&self, graph: &SsaGraph, proposal: &Proposal) -> Result<PruneIndexSite, Rejection> {
-        // No zero register is known here: the zero factor must come from a defined constant.
-        let values = ValueFacts::compute(graph, None, &self.layout, &self.assumptions);
+        let values = self.analyses(graph, self.zero);
         let mut last = Rejection("empty proposal".into());
         for &i in &proposal.ops {
             match self.match_at(graph, &values, i) {
