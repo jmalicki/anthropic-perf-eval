@@ -720,6 +720,9 @@ pub struct CompilerConfig {
     /// work (default: false). When CP-SAT follows it applies only with
     /// `cpsat_split_shift_hint`.
     pub greedy_split_shift: bool,
+    /// Most forward/backward justification iterations applied to the greedy schedule
+    /// (default: 0 = off). See `ssa_greedy::justify`.
+    pub greedy_justify_iterations: usize,
     // === Relaxed-scratch reference (analysis only) ===
     /// Scratch words the greedy, the per-section repair, CP-SAT and address assignment may use
     /// (default: the machine's `SCRATCH_SIZE`, 1,536). Smaller values are valid kernels; larger
@@ -824,6 +827,7 @@ impl Default for CompilerConfig {
             greedy_stagger_cycles: DEFAULT_GREEDY_STAGGER_CYCLES,
             greedy_groups_in_flight: DEFAULT_GREEDY_GROUPS_IN_FLIGHT,
             greedy_split_shift: false,
+            greedy_justify_iterations: 0,
             cpsat_split_shift_hint: false,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
