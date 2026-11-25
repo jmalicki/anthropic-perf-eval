@@ -191,7 +191,18 @@ cycles on path and 14 on index with these rewrites: without it the rewrites run 
 the baseline (section 3), with it they give the best kernels. Pinned by
 `tests/test_justify_on_best_pin.py` (ci_only).
 
-Not yet done: whether a justified schedule passes the CP-SAT all-fixed check (window probe).
+**As a CP-SAT hint.** The justified schedules are solutions of the CP-SAT model. Checked
+with the window probe's all-fixed check (every op pinned) on `section-check-timeline`
+(87f4e80, its scratch-model fix) with this branch merged in locally, best flags plus
+`--greedy-justify 10 --cpsat-split-shift-hint`, `--no-sweep --no-rolling`:
+
+| Plan | greedy (CP-SAT pipeline, full bounds) | justified, inside every ASAP/ALAP domain | all-fixed check |
+|---|---|---|---|
+| path, R16 + R17 final + R18 first-pass | 1,046 | 1,012 (0 domain rejections) | optimal, makespan 1,012 |
+| index, the same rewrites | 1,044 | 1,033 | optimal, makespan 1,033 |
+
+Both final kernels PROVED and PASSED. So the justified schedule survives as the hint of a
+whole-program or windowed CP-SAT solve with these flags; no CP-SAT improvement was run here.
 
 ```bash
 # 1,016 (path, R16, alu-first optional)
