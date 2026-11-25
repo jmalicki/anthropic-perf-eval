@@ -1,5 +1,7 @@
 # Energetic Slot Tightening: Deep Dive
 
+> **Superseded (November 2026).** The rule this document describes (`tighten_asap_alap_by_slots`: count the ops of an ordering group with the same earliest cycle and push the first of them) excluded feasible schedules and has been removed. `--asap-alap-tightening energetic` now computes resource-aware heads and tails over all ancestors and descendants (`cpsat_scheduler/resource_bounds.rs`, checked in `verification/resource_bounds.py`). See [ENERGETIC_REASONING_FOR_UNIT_TASKS.md](ENERGETIC_REASONING_FOR_UNIT_TASKS.md). Kept for the history of the investigation.
+
 This document explains **why** the energetic ASAP/ALAP slot tightening broke, what went wrong at each step, and how to fix it properly. It assumes minimal prior context and builds up from first principles. For the canonical design (safe/unsafe rules, implementation flags) see [ASAP_ALAP_SLOT_TIGHTENING.md](ASAP_ALAP_SLOT_TIGHTENING.md). For the specific 2r/16b counterexample investigation see [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md).
 
 ---
