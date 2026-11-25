@@ -229,8 +229,9 @@ was 153 either way. Four seeds per arm is thin; the runs without rows alone span
 
 Forward/backward justification (list-schedule the reversed graph latest-first, mirror it, list-
 schedule forward again) takes milliseconds and gains more than CP-SAT does in two minutes. These
-figures come from an experiment outside the generator; the justification pass is a separate
-change and is not part of this one.
+figures come from an experiment outside the generator; the pass itself is `--greedy-justify N`,
+with the 16-round figures in
+[GREEDY_SHAPE_ABLATION.md, section 13](GREEDY_SHAPE_ABLATION.md#13-forwardbackward-justification---greedy-justify-n).
 
 ## 7. Why per-op counting cannot see our bottleneck
 
