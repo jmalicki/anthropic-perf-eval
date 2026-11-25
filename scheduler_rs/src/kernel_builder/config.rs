@@ -1058,6 +1058,7 @@ pub fn merged_hash_stage_constants(first: usize) -> Option<(i64, i64, i64, i64)>
 #[allow(clippy::too_many_arguments)]
 pub fn check_greedy_shape_combinations(
     greedy_priority: GreedyPriorityKind,
+    greedy_load_priority: &str,
     greedy_flow_priority: &str,
     greedy_select_overflow: &str,
     greedy_select_overflow_limit: Option<usize>,
@@ -1069,6 +1070,13 @@ pub fn check_greedy_shape_combinations(
         return Err("greedy_select_overflow_limit (--greedy-select-overflow-limit) needs \
                     greedy_select_overflow = 'valu' (--greedy-select-overflow valu); otherwise it is ignored"
             .to_string());
+    }
+    if greedy_load_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_load_priority = '{}' (--greedy-load-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_load_priority
+        ));
     }
     if greedy_flow_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
         return Err(format!(
@@ -1104,17 +1112,19 @@ mod tests {
     fn test_check_greedy_shape_combinations() {
         use super::{check_greedy_shape_combinations as check, GreedyPriorityKind::*};
         // Defaults and the documented combinations are accepted.
-        assert!(check(Fifo, "key", "never", None, "optimize", false, false).is_ok());
-        assert!(check(Wavefront, "feeds-load-first", "valu", Some(3), "optimize", false, false).is_ok());
+        assert!(check(Fifo, "key", "key", "never", None, "optimize", false, false).is_ok());
+        assert!(check(Wavefront, "final-last", "feeds-load-first", "valu", Some(3), "optimize", false, false).is_ok());
         // Each ignored combination is an error.
-        assert!(check(Wavefront, "key", "never", Some(3), "optimize", false, false).is_err());
-        assert!(check(Fifo, "feeds-load-first", "never", None, "optimize", false, false).is_err());
-        assert!(check(Wavefront, "key", "valu", None, "fma", false, false).is_err());
-        assert!(check(Wavefront, "key", "valu", None, "vselect", false, false).is_err());
-        assert!(check(Wavefront, "key", "valu", None, "optimize", true, false).is_err());
-        assert!(check(Wavefront, "key", "valu", None, "optimize", false, true).is_err());
+        assert!(check(Wavefront, "key", "key", "never", Some(3), "optimize", false, false).is_err());
+        assert!(check(Fifo, "key", "feeds-load-first", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "final-last", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "tail", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "valu", None, "fma", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "valu", None, "vselect", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "valu", None, "optimize", true, false).is_err());
+        assert!(check(Wavefront, "key", "key", "valu", None, "optimize", false, true).is_err());
         // Without overflow, the hint pass and fixed encodings are fine.
-        assert!(check(Wavefront, "key", "never", None, "fma", true, true).is_ok());
+        assert!(check(Wavefront, "key", "key", "never", None, "fma", true, true).is_ok());
     }
 
     use super::*;

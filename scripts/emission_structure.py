@@ -192,11 +192,16 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
 # never takes the multiply_add form). The load engine paces the kernel (one group's gathers
 # per ~31 cycles); the flow work of the first and last select rounds of all groups has to keep
 # up with it, and above about 0.9 flow op per load cycle the flow queue delays late groups'
-# entry into the load stream (docs/GREEDY_SHAPE_ABLATION.md section 12). Fitted on the 25
-# index-bit builds under 1,200 cycles in docs/emission_plans/loop_report_load_tail.json
-# (leave-one-out MAE 6.2, max 18 cycles) for 16 rounds, batch 256, `--merge-hash-stages
-# --index-form mirrored`. Scratch is not modelled: path-bit plans that the greedy runs at the
-# scratch ceiling are underpredicted. b_flow is in hundredths.
+# entry into the load stream (docs/GREEDY_SHAPE_ABLATION.md section 12; a hypothesis, not a
+# measured mechanism). Grid-fitted on the 24 index-bit loop builds under 1,200 cycles of
+# docs/emission_plans/greedy_model_data.json; `uv run python -m scripts.greedy_model_fit
+# --check` reproduces these constants and the numbers quoted for them (tests/
+# test_greedy_model_fit.py). Leave-one-out (constants refitted, form fixed, and the form was
+# chosen on the same plans): MAE 6.2, max 18 cycles. Every ranking quoted for it is in-sample.
+# Out of sample it fails: on the four plans stage 1 chose with it, it was optimistic by 20 to
+# 42 cycles. 16 rounds, batch 256, `--merge-hash-stages --index-form mirrored`. Scratch is not
+# modelled: path-bit plans that the greedy runs at the scratch ceiling are underpredicted.
+# b_flow is in hundredths.
 GREEDY_MODEL = {"a_floor": 32, "a_load": 19, "flow0": 900, "b_flow_x100": 75}
 
 
@@ -971,7 +976,7 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         m.Minimize(t)
         for key, val in chosen.items():
             m.AddHint(n[key], val)
-        status_t = run("windows_floor")
+        status_t = run("windows_floor" if windows else "model_floor")
         if status_t in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             best_t = solver.Value(t)
             chosen = {key: solver.Value(var) for key, var in n.items()}

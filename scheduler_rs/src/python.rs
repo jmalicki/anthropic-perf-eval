@@ -1209,6 +1209,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     crate::kernel_builder::config::check_greedy_shape_combinations(
         greedy_priority,
+        greedy_load_priority,
         greedy_flow_priority,
         greedy_select_overflow,
         greedy_select_overflow_limit,

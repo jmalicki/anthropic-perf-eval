@@ -35,12 +35,15 @@ the best, under `flow=0.9` the capped floor ranks `path_flow90.json` first among
 path plans.
 
 Update (section 10, "Update"): the shift count follows from the cycle count, by an exact
-identity. The causes of slow plans are the greedy's select resolution (every select on flow),
-the mid-schedule flow queue, and scratch. A calibrated greedy term (`--greedy-model`,
-heuristic) now ranks index-bit plans: Spearman +0.71 near the best, against -0.54 for the
-floor. It finds no plan better than 1,039 / 1,033. These are greedy
-development measurements; the PR #69 measurement (1,104 plateau) is kept in section 10 as
-history.
+identity. Slow plans were traced to the greedy's select resolution (every select on flow;
+removal: overflow to the VALU, within the budget only with the live-word undercount fixed
+since), scratch (removal: relaxed scratch), and, as a hypothesis from accounting, the
+mid-schedule flow queue (both interventions aimed at it made plans slower). A calibrated
+greedy term (`--greedy-model`, heuristic) ranks index-bit plans in-sample (Spearman +0.71 near
+the best against -0.54 for the floor; reproducible with `scripts/greedy_model_fit.py`), and
+fails out of sample: the four plans stage 1 chose with it ran 20 to 42 cycles slower than
+predicted. It finds no plan better than 1,039 / 1,033. These are greedy development
+measurements; the PR #69 measurement (1,104 plateau) is kept in section 10 as history.
 
 November 2026. Code: `scripts/emission_structure.py` (model, calibration, solve, measurement),
 `solver/emission_plan.py` (plan format), `--emission-plan` (emitter). Skill:
@@ -470,30 +473,47 @@ ranks plans because of an identity, not a mechanism. Vector ops left = 6 x cycle
 vector slots, and the vector ALU is busy in every steady-state cycle. So a schedule that is
 longer for any reason shifts fewer ops.
 
-Of the 158 shifts `flow90.json` misses against the floor's split, 98 cannot be had by any
-schedule of that emission: its static bound is 1,029. The rest are 10 cycles of scheduling
-loss. The measured causes of slower plans are:
+For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
+emission (static bound 1,029); 10 are scheduling loss. Its 158 shifts "missing" against the
+floor's split are a consequence: at 1,029 cycles with the same idle vector slots only 1,367
+shifts fit, but a schedule with more idle slots could shift more, so that count is conditional,
+not a bound. What is known about slower plans, labelled removal (an A/B build) or accounting
+(a decomposition of one schedule):
 
-- The greedy runs every SelectChoice on the one flow slot. With path bits, round-4
-  `bits-flow` is flow-bound at 1,050 or more, and letting selects overflow to the vector ALU
-  gives 1,101 -> 1,054.
-- A longer mid-schedule flow queue delays late groups into the load stream (index bits,
-  depth-1 `bits-flow`).
-- The scratch budget: path `flow90.json` runs 1,046 scratch-relaxed against 1,105.
+- The greedy runs every SelectChoice on the one flow slot. With path bits, round-4 `bits-flow`
+  is flow-bound at 1,050 or more for any schedule that keeps every select on flow (bound on
+  the run's encodings). Removal: letting selects overflow to the vector ALU gave 1,101 -> 1,054,
+  but with a live-word counter that undercounted multiply-add selects; with it fixed, that
+  build exceeds the scratch budget.
+- Index bits, `bits-flow` instead of `bits` in round 1: removal, 14 cycles (1,039 -> 1,053),
+  not scratch (scratch-relaxed leaves 1,053). That a longer mid-schedule flow queue delays late
+  groups into the load stream is a hypothesis from accounting; both interventions aimed at the
+  queue made the plan slower (1,074, 1,067).
+- The scratch budget: removal (analysis only), path `flow90.json` runs 1,046 scratch-relaxed
+  against 1,105.
 
 No valid bound ranks the plans near the optimum. Stage 1 therefore gets a calibrated
 heuristic of the greedy's cycles: `solve_plan(greedy_model={})` / `solve --greedy-model`,
-`max(floor + 32, loads/2 + 19 + 0.75 * max(0, selects + flow ops - 900))`.
+`max(floor + 32, loads/2 + 19 + 0.75 * max(0, selects + flow ops - 900))`, grid-fitted on the
+24 index-bit loop builds under 1,200 cycles. Data and every number below:
+`docs/emission_plans/greedy_model_data.json`, `uv run python -m scripts.greedy_model_fit
+--check` (`tests/test_greedy_model_fit.py`).
 
-- It ranks index-bit plans: leave-one-out MAE 6.2 cycles; Spearman +0.96 over all plans and
-  +0.71 within 30 cycles of the best, where the floor gives -0.54.
+- In-sample it ranks index-bit plans: Spearman +0.95 over 28, +0.71 within 30 cycles of the
+  best (a subset selected on the outcome), where the floor gives -0.54. Refitting the constants
+  leave-one-out gives MAE 6.2 cycles and Spearman +0.96, but the form was chosen on the same
+  plans, so this is not out-of-sample evidence.
 - It does not rank path-bit plans, which are scratch-bound (+0.05).
-- Its path plan runs 1,053, against 1,099 for the best earlier loop plan.
-- It finds nothing below 1,039 / 1,041 (index; its plan runs 1,051) or 1,033 / 1,035 (path).
+- Out of sample it fails: the four plans stage 1 chose with it ran 20 to 42 cycles slower
+  than predicted (index 1,051 and 1,058, predicted 1,030; path 1,053 and 1,054, predicted 1,011
+  and 1,034). Its path plan (1,053) still beats the best earlier loop plan under the learned
+  cap (1,099).
+- It finds nothing below 1,039 / 1,041 (index) or 1,033 / 1,035 (path).
 
 The `bits` / `bits-flow` choice is only partly a select-resolution choice for this greedy.
-Resolution recovers 47 of the 68 round-4 cycles, but no resolution rule tried wins
-everywhere. So it stays a stage-1 choice for now.
+Resolution recovered 47 of the 68 round-4 cycles with the undercounting counter and does not
+fit the budget with the fixed one; no resolution rule tried wins everywhere. So it stays a
+stage-1 choice for now.
 
 The rest of this section, from "History" on, is the PR #69 measurement with the shaped greedy
 before the load-tail flags. Its plateau and its conclusion are superseded by section 10.0.

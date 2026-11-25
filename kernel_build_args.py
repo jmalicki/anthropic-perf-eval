@@ -574,7 +574,8 @@ def check_greedy_shape_combinations(get) -> None:
 
     Raises:
         ValueError: --greedy-select-overflow-limit without --greedy-select-overflow valu;
-            --greedy-flow-priority other than key without --greedy-priority wavefront;
+            --greedy-load-priority or --greedy-flow-priority other than key without
+            --greedy-priority wavefront;
             --greedy-select-overflow valu when a fixed select encoding (--select-choice fma or
             vselect), the select-choice hint pass (--select-choice-hint-pass, --hint-passes) or
             --schedule-with-fixed-choices owns the select encoding.
@@ -582,6 +583,10 @@ def check_greedy_shape_combinations(get) -> None:
     overflow = get("greedy_select_overflow", "never")
     if get("greedy_select_overflow_limit") is not None and overflow != "valu":
         raise ValueError("--greedy-select-overflow-limit needs --greedy-select-overflow valu; otherwise it is ignored")
+    load_priority = get("greedy_load_priority", "key")
+    if load_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-load-priority {load_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
     flow_priority = get("greedy_flow_priority", "key")
     if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
         raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "

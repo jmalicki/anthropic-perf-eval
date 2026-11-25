@@ -280,7 +280,7 @@ def test_greedy_shift_policy_and_load_priority_flags():
     add_kernel_build_args(parser)
     kwargs = args_to_build_kwargs(parser.parse_args(
         ["--use-greedy", "--greedy-shift-policy", "reserve-pace", "--greedy-shift-target", "1300",
-         "--greedy-load-priority", "final-last"]), use_git_sha=False)
+         "--greedy-priority", "wavefront", "--greedy-load-priority", "final-last"]), use_git_sha=False)
     assert (kwargs["greedy_shift_policy"], kwargs["greedy_shift_target"], kwargs["greedy_load_priority"]) == (
         "reserve-pace", 1300, "final-last")
     assert json.loads(kwargs["run_options_json"])["greedy_load_priority"] == "final-last"
@@ -291,6 +291,8 @@ def test_greedy_shift_policy_and_load_priority_flags():
 @pytest.mark.parametrize("argv, message", [
     (["--greedy-select-overflow-limit", "3"], "needs --greedy-select-overflow valu"),
     (["--greedy-flow-priority", "feeds-load-first"], "needs --greedy-priority wavefront"),
+    (["--greedy-load-priority", "final-last"], "needs --greedy-priority wavefront"),
+    (["--greedy-load-priority", "tail"], "needs --greedy-priority wavefront"),
     (["--greedy-select-overflow", "valu", "--select-choice", "fma"], "--select-choice fma owns"),
     (["--greedy-select-overflow", "valu", "--select-choice", "vselect"], "--select-choice vselect owns"),
     (["--greedy-select-overflow", "valu", "--select-choice-hint-pass"], "hint pass"),
@@ -337,3 +339,7 @@ def test_binding_rejects_ignored_greedy_shape_combinations():
         scheduler_rs.build_tick_tock_kernel_ssa(
             forest_height=2, n_nodes=7, batch_size=8, rounds=1, verbose=False, use_cpsat=False,
             greedy_flow_priority="feeds-load-first")
+    with pytest.raises(ValueError, match="greedy_load_priority"):
+        scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height=2, n_nodes=7, batch_size=8, rounds=1, verbose=False, use_cpsat=False,
+            greedy_load_priority="final-last")
