@@ -565,6 +565,13 @@ pub(crate) struct GreedyDiagnostics {
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
     last_cycle: Option<usize>,
+    /// Times the hard budget check (live words after the op > budget) deferred an op; an op
+    /// retried in the same cycle counts once per rejection.
+    pub budget_check_deferrals: usize,
+    /// Ops forced past the budget by the force-schedule path.
+    pub forced_past_budget: usize,
+    /// Cycles whose only placement was the first part of a split shift.
+    pub split_only_cycles: usize,
 }
 
 impl GreedyDiagnostics {
@@ -2350,6 +2357,9 @@ fn schedule_ssa_greedy_core(
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
+        // A split shift started this cycle: its destination block is reserved and scalar
+        // slots are taken, so the cycle is not a deadlock for `BudgetForce::Stall`.
+        let mut split_started_this_cycle = false;
 
         // Finish last cycle's split shift before anything else takes scalar slots: its
         // remaining lanes run now and the op completes in this cycle.
@@ -2806,6 +2816,7 @@ fn schedule_ssa_greedy_core(
                                 vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
                             if has_reader && pools.fits(&live.after(&added, &[]), scratch_budget) {
                                 slots.alu_used += free_alu;
+                                split_started_this_cycle = true;
                                 split_carry = Some(SplitShift {
                                     idx,
                                     first_cycle: cycle as i32,
@@ -2869,6 +2880,7 @@ fn schedule_ssa_greedy_core(
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
                 if !pools.fits(&live.after(&added, &freed), scratch_budget) {
                     // Defer for retry - liveness may decrease after other ops scheduled
+                    diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
                     continue;
                 }
@@ -3049,7 +3061,15 @@ fn schedule_ssa_greedy_core(
         // deferred waits while anything else is placed, and is forced only in a cycle where
         // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
         let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
-        if !budget_deferred.is_empty() && (force_same_cycle || scheduled_this_cycle == 0) {
+        // With `Stall`, a cycle whose only placement was a split-shift start is not a
+        // deadlock either (`pools` keeps its historical rule). Defensive: a split starts only
+        // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
+        // the same cycle (`split_only_cycles` stays 0; checked in the tests).
+        let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
+        if split_started_this_cycle && scheduled_this_cycle == 0 {
+            diagnostics.split_only_cycles += 1;
+        }
+        if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
@@ -3126,6 +3146,7 @@ fn schedule_ssa_greedy_core(
                     format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
+                diagnostics.forced_past_budget += 1;
                 let mut force_shifted = false;
                 match force_place_result {
                     SlotResult::Placed => {
@@ -3397,6 +3418,13 @@ fn schedule_ssa_greedy_core(
             inflation_stats.net_liveness_blocks,
             inflation_stats.pass_through_blocks,
             inflation_stats.breaker_activations,
+        );
+    }
+
+    if diagnostics.verbose {
+        eprintln!(
+            "Greedy budget check: {} deferrals, {} ops forced past the budget",
+            diagnostics.budget_check_deferrals, diagnostics.forced_past_budget
         );
     }
 
