@@ -203,6 +203,12 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
 # modelled: path-bit plans that the greedy runs at the scratch ceiling are underpredicted.
 # b_flow is in hundredths.
 GREEDY_MODEL = {"a_floor": 32, "a_load": 19, "flow0": 900, "b_flow_x100": 75}
+# The same model refitted for the stall judge (LOAD_TAIL_GREEDY + greedy_budget_force=stall,
+# pressure_inflation_threshold=0.98; docs/STARTUP_AND_STALL_LOOP.md section A): 41 index-bit
+# builds under 1,200 cycles, leave-one-out MAE 5.6; held out on 44 later plans it is optimistic
+# (index MAE 14.5, path 62.3). Reproduced by `scripts/greedy_model_fit.py --judge stall-0.98
+# --check`. Pass as `greedy_model=GREEDY_MODEL_STALL` to solve_plan to use it.
+GREEDY_MODEL_STALL = {"a_floor": 52, "a_load": 13, "flow0": 900, "b_flow_x100": 80}
 
 
 def greedy_model_cycles(counts: Mapping[str, int], model: Mapping[str, int] | None = None) -> float:
