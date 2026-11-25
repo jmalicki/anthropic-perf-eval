@@ -182,6 +182,8 @@ def main():
         note = "" if args.use_greedy else (" (hinted to CP-SAT lane by lane)" if hinted
                                            else " (ignored: CP-SAT follows the greedy)")
         print("  greedy_split_shift=True" + note)
+    if getattr(args, "greedy_justify", 0):
+        print(f"  greedy_justify={args.greedy_justify}")
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):
