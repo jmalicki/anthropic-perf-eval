@@ -57,3 +57,17 @@ def test_const_policy_kernels_are_proved_and_valid(policy):
     proves the kernel equals the SSA program, and the simulator validates it (in _build)."""
     encodings, n_const, _ = _build(greedy_const_policy=policy)
     assert sum(encodings.values()) == n_const
+
+
+def test_justify_does_not_run_with_alu_derived_constants():
+    """`--greedy-justify` does not model ALU-derived constants (their reads of producer
+    values), so with `--greedy-const-policy alu-first` it leaves the schedule alone: the kernel
+    equals the one built without it (shaped greedy, where justification otherwise shortens)."""
+    shape = dict(greedy_barriers="none", greedy_priority="wavefront", greedy_split_shift=True,
+                 pressure_inflation_threshold=0.95, greedy_const_policy="alu-first")
+    _, _, plain = _build(**shape)
+    _, _, justified = _build(greedy_justify=10, **shape)
+    assert any(op.get("from_const_choice") is not None and op["engine"] == "alu" for op in plain["ops"]), \
+        "control: alu-first derives a constant on the scalar ALU"
+    cycles = lambda s: [(op["cycle"], op["engine"], op["slot"]) for op in s["ops"]]  # noqa: E731
+    assert cycles(justified) == cycles(plain)
