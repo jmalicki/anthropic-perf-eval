@@ -789,13 +789,14 @@ pub(crate) fn verify_cse_sub_precedence(
 /// exceeds the budget (the model's liveness intervals are too short: model bug).
 ///
 /// # Arguments
-/// * `values` - (VReg, defining op index, reader op indices) for every value in the model
+/// * `values` - (VReg, defining op index, reader op indices, readers that read it only as a
+///   select's delta) for every value in the model
 /// * `cycle_assignments` - Solution cycle per op index
 /// * `scratch_budget` - Words available
 #[cfg(feature = "cpsat")]
 pub(crate) fn verify_scratch_budget_all_readers(
     ops: &[SsaOp],
-    values: &[(crate::types::VReg, usize, Vec<usize>)],
+    values: &[(crate::types::VReg, usize, Vec<usize>, Vec<usize>)],
     cycle_assignments: &[i32],
     shifted_ops: &HashSet<usize>,
     shifted_alu_cycles: &HashMap<usize, Vec<i32>>,
@@ -805,9 +806,14 @@ pub(crate) fn verify_scratch_budget_all_readers(
 ) {
     let times = ScheduledTimes::new(ops, cycle_assignments, shifted_ops, shifted_alu_cycles, select_choice_encoding);
     let mut events: Vec<(i32, i64)> = Vec::new();
-    for (vreg, def_idx, readers) in values {
+    for (vreg, def_idx, readers, delta_only) in values {
         let start = times.first_write(*def_idx);
-        let end = readers.iter().map(|&r| times.last_read_end(r)).max();
+        // A select reading the value only as its delta reads it only on the multiply-add path.
+        let end = readers
+            .iter()
+            .filter(|&&r| !delta_only.contains(&r) || times.on_fma_path(r))
+            .map(|&r| times.last_read_end(r))
+            .max();
         let Some(end) = end else {
             continue;
         };

@@ -43,6 +43,20 @@ impl ScratchAliases {
         self.owners.get(value).map(Vec::as_slice).unwrap_or_else(|| std::slice::from_ref(value))
     }
 
+    /// The values that own `value`'s words (itself, its decomposed vector or its lanes).
+    pub(crate) fn resolve_owned(&self, value: VReg) -> Vec<VReg> {
+        self.resolve(&value).to_vec()
+    }
+
+    /// [`Self::reads`] without the op's `delta_vreg`.
+    pub(crate) fn reads_except_delta<'a>(&'a self, op: &'a SsaOp) -> impl Iterator<Item = VReg> + 'a {
+        op.srcs.iter().filter_map(|operand| match operand {
+            crate::types::Operand::VReg(v) => Some(v),
+            _ => None,
+        }).chain(op.keep_live.iter().flatten())
+            .flat_map(|v| self.resolve(v).iter().copied())
+    }
+
     pub(crate) fn reads<'a>(&'a self, op: &'a SsaOp) -> impl Iterator<Item = VReg> + 'a {
         op.srcs.iter().filter_map(|operand| match operand {
             crate::types::Operand::VReg(v) => Some(v),

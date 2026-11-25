@@ -2132,6 +2132,72 @@ mod ssa_tests {
         assert!(matches!(result, Ok(Some(_))), "CP-SAT should find a solution: {:?}", result.err());
     }
 
+    /// A select that reads a value only as its precomputed delta reads it only on the
+    /// multiply-add path (address assignment counts it only there). The delta here is read
+    /// early by `base + delta` and then only by a select that waits for a 6-op condition chain:
+    /// on the vselect path it dies after the add, on the multiply-add path it lives until the
+    /// select. The smallest feasible budget is 24 words on the vselect path (32 when the delta
+    /// was counted there too), 40 on the multiply-add path, and 24 with `Optimize`;
+    /// the vselect schedule gets addresses within that budget. Before, the model counted the
+    /// delta on both paths (16-round path kernel: 48 words more than the allocator; BUGS.md).
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_ssa_cpsat_delta_read_only_on_the_multiply_add_path() {
+        use crate::address_assign::{assign_addresses, AddressAssignConfig};
+
+        let mut emit = SsaEmitContext::new();
+        let k = emit.emit_const(3);
+        let delta = emit.emit_vbroadcast_force(k);
+        let base = emit.emit_vbroadcast_force(k);
+        let mut cond = emit.emit_vbroadcast_force(k);
+        for _ in 0..6 {
+            cond = emit.emit_valu(Opcode::Add, cond, cond);
+        }
+        let out = emit.emit_select_choice_with_delta(cond, delta, base);
+        emit.emit_vstore_imm(100, out);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+
+        let solve = |mode: SelectChoiceMode, budget: usize| {
+            schedule_ssa_cpsat(
+                &emit.ops,
+                SsaCpsatConfig {
+                    time_limit_secs: 10.0,
+                    verbose: false,
+                    enable_valu_shift: false,
+                    // Feasibility only, one worker (the 8-worker interleaved portfolio
+                    // aborts in OR-Tools' QuickSolveWithHint on this tiny model).
+                    stop_after_first_solution: true,
+                    scratch_budget: budget,
+                    select_choice_mode: mode,
+                    asap_alap_tightening: crate::cpsat_scheduler::AsapAlapTightening::None,
+                    ..Default::default()
+                },
+                SsaCpsatHints::default(),
+                None,
+            )
+            .expect("solve")
+        };
+        let min_budget = |mode: SelectChoiceMode| (1..=80).find(|&b| solve(mode, b).is_some()).expect("some budget fits");
+        let (vselect, fma, optimize) = (
+            min_budget(SelectChoiceMode::ForceVselect),
+            min_budget(SelectChoiceMode::ForceFma),
+            min_budget(SelectChoiceMode::Optimize),
+        );
+        // vselect: cond chain, base, true_val (24 words); the delta dies after the add.
+        // Counting the delta on the vselect path too gave 32.
+        assert_eq!((vselect, fma, optimize), (24, 40, 24));
+
+        let solution = solve(SelectChoiceMode::ForceVselect, vselect).unwrap();
+        let mut scheduled = emit.ops.clone();
+        for (op, &c) in scheduled.iter_mut().zip(&solution.cycle_assignments) {
+            op.cycle = c;
+        }
+        let config = AddressAssignConfig { budget: vselect + 1, ..Default::default() };
+        let assigned = assign_addresses(&scheduled, &config).unwrap();
+        assert!(!assigned.budget_exceeded, "max_addr {} with {} assignable words", assigned.max_addr, vselect);
+    }
+
     /// Same-cycle reuse in the CP-SAT scratch model: a chain of vector ops where each input dies
     /// as the next value is written needs one 8-word block plus the broadcast's scalar source
     /// (address assignment reuses the block every cycle). `ScratchTime::Phase` accepts it at a

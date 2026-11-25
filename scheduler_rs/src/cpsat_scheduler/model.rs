@@ -17,7 +17,7 @@ use super::bounds::{
 use super::resource_bounds::tighten_asap_alap_by_resources;
 use super::symmetry_ordering::SymmetryOrdering;
 #[cfg(feature = "cpsat")]
-use super::op_times::{create_op_variables, ConstChoiceVars, OpKinds, TimeDomains};
+use super::op_times::{create_op_variables, ConstChoiceVars, FmaPath, OpKinds, TimeDomains};
 use super::config::{
     ConstChoiceMode, CpsatObjective, CpsatStatus, CpsatTuning, CumulativePropagator, MakespanRows,
     OptionalConstraintGroup, ScratchTime, SelectChoiceMode, SymmetryRows, ValuShiftMode,
@@ -338,6 +338,47 @@ pub(crate) fn scratch_readers_by_vreg(
         list.dedup();
     }
     readers
+}
+
+/// (value, reader) pairs where the reader is a SelectChoice that reads the value only as its
+/// `delta_vreg`, with vector-group aliases resolved as in [`scratch_readers_by_vreg`].
+///
+/// Only the multiply-add lowering reads the delta (at cycle + 1); the vselect lowering does not
+/// read it at all, and address assignment (`address_assign::OpLiveness::use_cycles`) counts it
+/// only on the multiply-add path. Such a reader must keep the value live only when its select
+/// takes that path.
+///
+/// # Arguments
+/// * `ops` - SSA ops
+/// * `vreg_def_op` - Defining op index per VReg
+/// * `vector_group_lanes` - Group key/alias → lanes (None = no groups)
+///
+/// # Returns
+/// The set of `(value, reader op index)` pairs.
+#[cfg(feature = "cpsat")]
+pub(crate) fn delta_only_readers(
+    ops: &[SsaOp],
+    vreg_def_op: &HashMap<VReg, usize>,
+    vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+) -> HashSet<(VReg, usize)> {
+    use crate::kernel_builder::round_budget::ScratchAliases;
+    let aliases = vector_group_lanes.map_or_else(ScratchAliases::default, |groups| {
+        ScratchAliases::new(groups, |v| vreg_def_op.contains_key(v))
+    });
+    let mut out = HashSet::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if op.opcode != Opcode::SelectChoice {
+            continue;
+        }
+        let Some(delta) = op.delta_vreg else { continue };
+        let other: HashSet<VReg> = aliases.reads_except_delta(op).collect();
+        for vreg in aliases.resolve_owned(delta) {
+            if vreg_def_op.contains_key(&vreg) && !other.contains(&vreg) {
+                out.insert((vreg, idx));
+            }
+        }
+    }
+    out
 }
 
 /// Vbroadcasts that can be eliminated when all their readers are shifted to scalar ALU.
@@ -2066,7 +2107,7 @@ pub fn schedule_ssa_cpsat(
     // Per CSE group: (end, size) of the shared SUB's scratch interval, for hinting.
     let mut cse_sub_scratch_vars: Vec<(IntVar, IntVar)> = Vec::new();
     // Readers per live VReg (def idx, reader idxs), kept for the post-solve scratch check.
-    let mut scratch_values: Vec<(VReg, usize, Vec<usize>)> = Vec::new();
+    let mut scratch_values: Vec<(VReg, usize, Vec<usize>, Vec<usize>)> = Vec::new();
 
     if scratch_budget > 0 {
         // Build VReg -> defining op index mapping
@@ -2172,6 +2213,9 @@ pub fn schedule_ssa_cpsat(
         // read only through a vector-group alias have no direct reader at all.
         let scratch_readers =
             scratch_readers_by_vreg(ops, &vreg_def_op, hints.vector_group_lanes);
+        // Selects that read a value only as their delta keep it live only on the multiply-add
+        // path (`delta_only_readers`).
+        let delta_only = delta_only_readers(ops, &vreg_def_op, hints.vector_group_lanes);
         let hinted_fma = |idx: usize| {
             ops[idx].opcode == Opcode::SelectChoice
                 && match select_choice_mode {
@@ -2200,7 +2244,12 @@ pub fn schedule_ssa_cpsat(
         let hinted_live_end: HashMap<VReg, i32> = scratch_readers
             .iter()
             .filter_map(|(vreg, readers)| {
-                readers.iter().filter_map(|&r| hinted_read_end(r)).max().map(|e| (*vreg, e))
+                readers
+                    .iter()
+                    .filter(|&&r| !delta_only.contains(&(*vreg, r)) || hinted_fma(r))
+                    .filter_map(|&r| hinted_read_end(r))
+                    .max()
+                    .map(|e| (*vreg, e))
             })
             .collect();
         // `vreg_last_use` stays as the representative reader (latest in the hint) for segment
@@ -2365,8 +2414,10 @@ pub fn schedule_ssa_cpsat(
                 // Live-out VRegs (defined here, last-used in a later section) must extend to segment end
                 // so the scratch constraint matches the full-kernel peak.
                 let readers: &[usize] = scratch_readers.get(vreg).map_or(&[], |r| r.as_slice());
+                let delta_only_here: Vec<usize> =
+                    readers.iter().copied().filter(|&r| delta_only.contains(&(*vreg, r))).collect();
                 if initial_live.is_none() {
-                    scratch_values.push((*vreg, def_idx, readers.to_vec()));
+                    scratch_values.push((*vreg, def_idx, readers.to_vec(), delta_only_here.clone()));
                 }
                 // Window probe: a value defined and read only by pruned ops is live only at
                 // cycles nothing can move to (the post-solve check still covers it).
@@ -2377,15 +2428,52 @@ pub fn schedule_ssa_cpsat(
                     let seg_end = segment_end_var.expect("segment_end when live_out");
                     let e = LinearExpr::from(seg_end) + 1;
                     (e.clone(), e)
-                } else if readers.len() > 1 {
+                } else if readers.len() > 1 || !delta_only_here.is_empty() {
                     // Several readers: the value is live until the last of them has read it.
                     // A shifted reader reads at its lane cycles, so use its completion cycle.
+                    // A select that reads the value only as its delta reads it only on the
+                    // multiply-add path: its term is that path's read end when the path is
+                    // taken and 0 otherwise (`delta_only_readers`).
                     let end_var = model.new_int_var_with_name(
                         [(0, horizon + 2)],
                         format!("live_end_{}", vreg.id),
                     );
-                    let read_ends: Vec<LinearExpr> =
-                        readers.iter().map(|&r| times[r].last_read_end()).collect();
+                    let mut read_ends: Vec<LinearExpr> = Vec::with_capacity(readers.len() + 1);
+                    let mut unconditional = false;
+                    for &r in readers {
+                        if !delta_only_here.contains(&r) {
+                            read_ends.push(times[r].last_read_end());
+                            unconditional = true;
+                            continue;
+                        }
+                        match times[r].fma_path() {
+                            Some(FmaPath::Always) => {
+                                read_ends.push(times[r].last_read_end_on_path(true));
+                                unconditional = true;
+                            }
+                            Some(FmaPath::Chosen(fma)) => {
+                                let t = model.new_int_var_with_name(
+                                    [(0, horizon + 2)],
+                                    format!("delta_read_end_{}_{}", vreg.id, r),
+                                );
+                                let c_on = model.add_eq(LinearExpr::from(t), times[r].last_read_end_on_path(true));
+                                model.only_enforce_if(c_on, [fma]);
+                                model.set_constraint_name(c_on, &format!("scratch_delta_end_fma_{}_{}", vreg.id, r));
+                                let c_off = model.add_eq(LinearExpr::from(t), LinearExpr::default());
+                                model.only_enforce_if(c_off, [!fma]);
+                                model.set_constraint_name(c_off, &format!("scratch_delta_end_vselect_{}_{}", vreg.id, r));
+                                if let Some(c) = greedy_hints.and_then(|h| h.get(r).copied()).filter(|c| *c >= 0) {
+                                    model.add_hint(t, if hinted_fma(r) { c as i64 + 2 } else { 0 });
+                                }
+                                read_ends.push(LinearExpr::from(t));
+                            }
+                            Some(FmaPath::Never) | None => {}
+                        }
+                    }
+                    if !unconditional {
+                        // Every read may vanish: keep the value one cycle past its last write.
+                        read_ends.push(times[def_idx].exec_end() + 1);
+                    }
                     let c = model.add_max_eq(end_var, read_ends);
                     model.set_constraint_name(c, &format!("scratch_live_end_{}", vreg.id));
                     if let Some(&end_hint) = hinted_live_end.get(vreg) {
