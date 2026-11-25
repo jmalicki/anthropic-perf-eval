@@ -32,7 +32,7 @@ use super::tick_tock_ssa::SsaScheduleResult;
 
 use passes::{
     AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
-    FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass, TransformPass,
+    FilterDeadStoresPass, GreedyJustifyPass, GreedySchedulePass, LowerToOpsPass, TransformPass,
 };
 use passes::{
     ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
@@ -279,6 +279,10 @@ impl PipelineContext {
         if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
             self.run_pass(&ScheduleWithFixedChoicesPass)?;
         }
+        // Forward/backward justification of the greedy schedule (opt-in).
+        if self.config.compiler.greedy_justify_iterations > 0 {
+            self.run_pass(&GreedyJustifyPass)?;
+        }
 
         // In greedy-only mode, final decisions = greedy decisions
         self.final_decisions = self.greedy_decisions.clone();
@@ -329,6 +333,10 @@ impl PipelineContext {
             || self.config.compiler.enable_valu_shift_hint_pass;
         if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
             self.run_pass(&ScheduleWithFixedChoicesPass)?;
+        }
+        // Forward/backward justification of the greedy schedule (opt-in).
+        if self.config.compiler.greedy_justify_iterations > 0 {
+            self.run_pass(&GreedyJustifyPass)?;
         }
 
         // Per-section feasibility stays in tick_tock_ssa orchestration (not a pass)
