@@ -1035,6 +1035,10 @@ impl SsaTickTockKernelBuilder {
         if any_hint_pass || ctx.config.compiler.enable_schedule_with_fixed_choices {
             run_pass_with_error_export!(&mut ctx, &ScheduleWithFixedChoicesPass);
         }
+        // Forward/backward justification of the greedy schedule (opt-in).
+        if ctx.config.compiler.greedy_justify_iterations > 0 {
+            run_pass_with_error_export!(&mut ctx, &super::pipeline::passes::GreedyJustifyPass);
+        }
 
         let greedy_cycles = ctx.greedy_metrics.cycles;
         let greedy_budget_exceeded = ctx.greedy_metrics.budget_exceeded;
