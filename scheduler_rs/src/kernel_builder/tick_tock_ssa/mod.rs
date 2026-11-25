@@ -1068,12 +1068,21 @@ impl SsaTickTockKernelBuilder {
         // repair itself and the checks of its result use the model's timeline.
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
+        // CPSAT_SECTION_CHECK_TIMELINE=model (analysis, e.g. the window probe): decide on the
+        // model's own timeline instead. Its count has no per-lane shifted cycles, so it can
+        // miss an over-budget section; the window probe's all-fixed check then rejects the
+        // reference, so this cannot produce an invalid kernel unnoticed.
+        let check_timeline = if std::env::var("CPSAT_SECTION_CHECK_TIMELINE").as_deref() == Ok("model") {
+            self.cpsat_scratch_time
+        } else {
+            crate::cpsat_scheduler::ScratchTime::Cycle
+        };
         let budget_result = section_budget(
             &ctx.ops,
             effective_budget,
             Some(&greedy_select_fma_ops),
             None,
-            crate::cpsat_scheduler::ScratchTime::Cycle, &scratch_aliases,
+            check_timeline, &scratch_aliases,
         );
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
