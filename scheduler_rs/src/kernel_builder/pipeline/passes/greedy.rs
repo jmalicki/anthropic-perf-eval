@@ -233,3 +233,139 @@ impl Pass for GreedySchedulePass {
         ))
     }
 }
+
+// ============================================================================
+// GreedyJustifyPass: forward/backward justification of the greedy schedule
+// ============================================================================
+
+/// Shortens the greedy schedule by forward/backward justification
+/// (`ssa_greedy::justify`), keeping the greedy's ConstChoice / SelectChoice encodings.
+///
+/// Runs after `GreedySchedulePass` and the hint passes, only when
+/// `compiler.greedy_justify_iterations > 0`. It rewrites `op.cycle`,
+/// `greedy_decisions.shifted_ops` and `greedy_decisions.shifted_alu_cycles` and updates
+/// `greedy_metrics`, or leaves all of them untouched when no shorter schedule passes its
+/// checks (slot capacities, precedences, memory edges, scratch).
+///
+/// Shift decisions change only when the greedy owned them (shifting enabled, no forced
+/// shift encoding, no hint pass, no fixed-choices reschedule); split shifts are used
+/// under the same condition as in `GreedySchedulePass`. When CP-SAT follows, an accepted
+/// schedule must also keep every op inside its ASAP/ALAP domain, since it becomes the hint.
+/// With individually forced shifts (what-if runs) the pass does not run at all.
+pub struct GreedyJustifyPass;
+
+impl Pass for GreedyJustifyPass {
+    fn name(&self) -> &'static str {
+        "GreedyJustify"
+    }
+
+    fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
+        use crate::address_assign::AddressAssignConfig;
+        use crate::kernel_builder::ssa_greedy::justify::{
+            justify_schedule, JustifyConfig, DEFAULT_MAX_STALLED_ITERATIONS,
+        };
+
+        let compiler = &ctx.config.compiler;
+        if compiler.greedy_justify_iterations == 0 {
+            return Ok("off".to_string());
+        }
+        let announce = |ctx: &PipelineContext, summary: &str| {
+            // The pipeline prints pass summaries only when verbose; the greedy-only path
+            // runs it non-verbose, so print the line here in that case.
+            if ctx.config.greedy_verbose && !ctx.config.verbose {
+                eprintln!("Greedy justify: {}", summary);
+            }
+        };
+        if ctx.greedy_metrics.budget_exceeded {
+            let summary = "skipped: the greedy schedule is over the scratch budget".to_string();
+            announce(ctx, &summary);
+            return Ok(summary);
+        }
+        if !ctx.greedy_decisions.eliminated_vbroadcast_ops.is_empty() {
+            let summary = "skipped: eliminated vbroadcasts are not modelled".to_string();
+            announce(ctx, &summary);
+            return Ok(summary);
+        }
+        #[cfg(feature = "cpsat")]
+        let is_cpsat_pipeline = ctx.config.cpsat.is_some();
+        #[cfg(not(feature = "cpsat"))]
+        let is_cpsat_pipeline = false;
+
+        // Individually forced shifts (what-if runs) are hard constraints of the CP-SAT model
+        // that the greedy does not see: its schedule may not be a schedule of that model, yet
+        // its length still sets the model's horizon and latest cycles. A shorter schedule
+        // would tighten those around encodings the model forbids, so the pass does not run.
+        #[cfg(feature = "cpsat")]
+        let has_forced_shifts =
+            ctx.config.cpsat.as_ref().is_some_and(|c| c.forced_shifts.as_ref().is_some_and(|ids| !ids.is_empty()));
+        #[cfg(not(feature = "cpsat"))]
+        let has_forced_shifts = false;
+        if has_forced_shifts {
+            let summary = "skipped: individually forced shifts are set".to_string();
+            announce(ctx, &summary);
+            return Ok(summary);
+        }
+
+        let forced = ForcedEncodings::from_context(ctx);
+        let allow_shift_changes = compiler.enable_valu_shift
+            && forced.shifted_ops.is_none()
+            && !compiler.enable_valu_shift_hint_pass
+            && !compiler.enable_const_choice_hint_pass
+            && !compiler.enable_select_choice_hint_pass
+            && !compiler.enable_schedule_with_fixed_choices;
+        let split_shift = allow_shift_changes
+            && compiler.greedy_split_shift
+            && (!is_cpsat_pipeline || compiler.cpsat_split_shift_hint);
+
+        // Address assignment as `AssignAddressesPass` will configure it for these decisions.
+        let mut allocator = AddressAssignConfig {
+            budget: compiler.scratch_size,
+            scratch_pools: compiler.scratch_model.is_pools(),
+            vector_group_lanes: ctx.vector_group_lanes.clone(),
+            vreg_def: ctx.vreg_def.clone(),
+            select_fma_ops: ctx
+                .greedy_decisions
+                .select_choice_encoding
+                .iter()
+                .filter(|(_, e)| matches!(e, SelectChoiceEncoding::Fma))
+                .map(|(id, _)| *id)
+                .collect(),
+            ..Default::default()
+        };
+        if let Some(zero) = ctx.zero_vreg {
+            allocator.fixed_vregs.insert(zero, 0);
+            allocator.zero_vreg = Some(zero);
+        }
+        let config = JustifyConfig {
+            max_iterations: compiler.greedy_justify_iterations,
+            max_stalled_iterations: DEFAULT_MAX_STALLED_ITERATIONS,
+            allow_shift_changes,
+            split_shift,
+            scratch_budget: ctx.greedy_budget(),
+            scratch_pools: compiler.scratch_model.is_pools(),
+            allocator: Some(allocator),
+        };
+        let use_full_bounds = is_cpsat_pipeline || ctx.config.bounds.greedy_use_full_bounds;
+        let domains = ctx.bounds.as_ref().filter(|_| use_full_bounds).map(|b| (&b.asap, &b.alap));
+        let vgl = if ctx.vector_group_lanes.is_empty() { None } else { Some(&ctx.vector_group_lanes) };
+        let enable_valu_shift = ctx.config.compiler.enable_valu_shift;
+        let outcome = justify_schedule(
+            &mut ctx.ops,
+            enable_valu_shift,
+            &mut ctx.greedy_decisions.shifted_ops,
+            &mut ctx.greedy_decisions.shifted_alu_cycles,
+            &ctx.greedy_decisions.const_choice_encoding,
+            &ctx.greedy_decisions.select_choice_encoding,
+            vgl,
+            domains,
+            &config,
+        )?;
+        if outcome.cycles_after < outcome.cycles_before {
+            ctx.greedy_metrics.cycles = outcome.cycles_after;
+            ctx.greedy_metrics.peak_live = outcome.peak_live_after;
+        }
+        let summary = outcome.summary();
+        announce(ctx, &summary);
+        Ok(summary)
+    }
+}

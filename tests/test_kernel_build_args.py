@@ -78,6 +78,25 @@ def test_greedy_priority_flags_reach_kwargs_and_run_options():
             parser.parse_args(bad)
 
 
+def test_greedy_justify_flag_reaches_kwargs_and_run_options():
+    """--greedy-justify defaults to 0 (off) and is passed to the binding and recorded."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    assert default["greedy_justify"] == 0
+    assert json.loads(default["run_options_json"])["greedy_justify"] == 0
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    kwargs = args_to_build_kwargs(parser.parse_args(["--use-greedy", "--greedy-justify", "10"]), use_git_sha=False)
+    assert kwargs["greedy_justify"] == 10
+    assert json.loads(kwargs["run_options_json"])["greedy_justify"] == 10
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--greedy-justify", "-1"])
+
+
 def test_greedy_split_shift_flag_reaches_kwargs_and_run_options():
     """--greedy-split-shift defaults to off and is passed to the binding and recorded."""
     import argparse

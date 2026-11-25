@@ -92,6 +92,7 @@ enough, and the throttle is why naive mixing of rounds gets slower instead of fa
 | `--greedy-stagger-cycles N` | 12 | Wavefront: delay between consecutive groups. |
 | `--greedy-groups-in-flight N` | 16 | Wavefront: groups allowed to run at once (0 = no limit). |
 | `--greedy-split-shift` | off | A vector op run as 8 scalar ops may straddle two cycles. Greedy-only. |
+| `--greedy-justify N` | 0 (off) | Forward/backward justification of the finished greedy schedule, at most N iterations (section 13). |
 | `--pressure-inflation-threshold F` | policy's 0.80 | Fraction of the budget above which producers with slack are deferred. |
 | `--pressure-soft-threshold F`, `--pressure-critical-threshold F` | 0.85, 0.95 | The policy's other two thresholds. |
 | `--greedy-budget-headroom W` | 0 | Scratch words the greedy keeps free. |
@@ -700,4 +701,117 @@ uv run generate_ssa_kernel.py --rounds 16 --use-greedy -q --validate \
   --output-json best.json --save-kernel best_kernel.json
 uv run python -m scripts.greedy_gap_diagnosis best.json --from 51 --slice 100
 ./scripts/check_upstream.sh --strict --kernel best_kernel.json
+```
+
+## 13. Forward/backward justification (`--greedy-justify N`)
+
+A pass after the greedy (`GreedyJustify`, `scheduler_rs/src/kernel_builder/ssa_greedy/justify.rs`)
+that shortens the finished schedule with two list-scheduling passes per iteration:
+
+1. **Backward**: schedule the reversed dependency graph, trying the ops that complete latest
+   in the current schedule first, and mirror the times. Every op is now as late as possible.
+2. **Forward**: schedule the original graph in the order of that schedule's start times.
+
+Before the first iteration one forward pass runs in the order of the greedy's own schedule
+(the same order without the pressure heuristics). The shorter schedule of each iteration is
+where the next one starts, even when it is no shorter than the last (lengths are not
+monotone); the shortest schedule seen that passes every check is the result. The search
+ends after N iterations, when a schedule reproduces itself, or after 10 iterations in a row
+in which no shorter schedule was accepted (`DEFAULT_MAX_STALLED_ITERATIONS`). The last only
+bounds a large N, where an orbit that never returns to exactly the same schedule would
+otherwise run all N iterations; up to N = 10 it changes nothing. Only cycles
+and the shift decision (vector slot, 8 scalar lanes, or lanes split over two consecutive
+cycles) change. The greedy's const and select encodings are kept.
+
+The list scheduler is not trusted. Every candidate shorter than the best so far is written
+in the pipeline's schedule representation (`op.cycle`, shifted set, `shifted_alu_cycles`)
+and checked there:
+
+- `verify_schedule`: slot limits in every cycle, every dependency with its precedence
+  offset (two cycles after a select on the multiply-add path), every memory edge with its
+  own latency, shape of the shift records. The greedy's own schedule must pass the same
+  check first, otherwise the pass does nothing.
+- Scratch: peak live words by `interval_liveness_curve` (the accounting the greedy's
+  counter is checked against) within the greedy's budget, the pool condition under
+  `--scratch-model pools`, and a trial run of address assignment within the scratch size.
+
+- Domains, only when CP-SAT follows: every op inside its `[ASAP, ALAP]` domain, since the
+  schedule becomes the solver's hint.
+
+A candidate that fails is dropped. If none passes, the greedy's schedule is kept unchanged.
+The summary line (`Greedy justify: ...`) reports cycles before and after, iterations,
+shifted and split ops, peak live words, candidates checked and how many were rejected for
+scratch, by verification (which would be a bug in the list scheduler) and for ASAP/ALAP
+domains (which is not: the list scheduler does not know the domains), each with its own
+counter. `SCHEDULER_DEBUG=1` prints the length of every pass.
+
+### Measured
+
+Shaped greedy (`--greedy-barriers none --greedy-priority wavefront --greedy-split-shift
+--pressure-inflation-threshold 0.95`), `forest_height=10`, with and without
+`--greedy-justify 10`. Every row was built with `--validate`: PROVED and PASSED.
+
+| Rounds x batch | Capacity floor | Shaped greedy (simulator) | + justify 10 (simulator) | Gap to floor | Scratch peak | Scratch rejections |
+|---|---|---|---|---|---|---|
+| 4 x 64 | 93 | 135 (137) | **105** (107) | 12 | 544 -> 457 | 0 of 3 |
+| 6 x 64 | 130 | 180 (182) | **158** (160) | 28 | 552 -> 542 | 0 of 1 |
+| 4 x 256 | 357 | 423 (425) | **364** (366) | 7 | 827 -> 1,137 | 0 of 6 |
+| 6 x 256 | 503 | 556 (558) | **511** (513) | 8 | 827 -> 1,078 | 0 of 4 |
+| 16 x 256 | 1,271 | 1,313 (1,315) | **1,279** (1,281) | 8 | 1,243 -> 1,321 | 0 of 1 |
+| 16 x 256, stagger 10, 20 groups in flight | 1,271 | 1,308 (1,310) | **1,278** (1,280) | 7 | 1,363 -> 1,394 | 0 of 2 |
+
+The 16 x 256 kernel (1,281 simulator cycles) passes the strict upstream check (commands
+below), and two builds give the same kernel file. The pass adds about 0.1 s to a 16-round
+build. At 16 x 256 the shortest schedule is found in the first iteration.
+
+### With CP-SAT following
+
+The pass also runs when CP-SAT follows the greedy; the justified schedule is then the hint
+(and, through the greedy ALAP cap and the horizon, the neighbourhood) the solver starts
+from. Measured with a deterministic-time budget, `--validate` (PROVED and PASSED), no
+per-section repair needed, and CP-SAT reporting the hint complete and feasible in every
+build:
+
+| Build | Greedy hint | + justify 10 hint | CP-SAT result | CP-SAT result with justify 10 |
+|---|---|---|---|---|
+| 2 x 16, `--greedy-barriers none --greedy-priority wavefront`, `--cpsat-deterministic-time 5` | 42 | 37 | 36 (optimal) | 36 (optimal) |
+| 4 x 64, shaped greedy with `--cpsat-split-shift-hint`, `--cpsat-deterministic-time 10` | 135 | 105 | 135 | 105 |
+
+`tests/test_scheduler_rs_interface.py::test_greedy_justify_with_cpsat` builds the first row
+both ways and checks the replay proof, the reference output, and that the result is no
+longer than the hint or than the build without justification. Nothing larger has been run
+with CP-SAT.
+
+### Limits
+
+- **It is not pressure-aware.** The passes ignore scratch and a candidate is only accepted
+  or rejected afterwards. From the wavefront schedule this is enough (table above). From a
+  schedule that runs all 32 groups abreast every candidate is rejected and nothing changes:
+  16 rounds with the default shape, 21 of 21 candidates rejected (peak 1,611 words against
+  1,535), result 2,007 cycles as without the pass; 4 rounds with `--greedy-barriers none`
+  alone, 21 of 21 rejected (peak 1,649). With `--greedy-budget-headroom 250` on the shaped
+  16-round build (budget 1,285) 18 of 19 candidates are rejected and the one accepted has
+  1,280 cycles. Making the list scheduler respect the budget is the follow-up.
+- **Memory edges with latency 0** (a store after a load of the same word) are scheduled with
+  latency 1. The verifier checks the real latency, so this can only cost cycles.
+- **CP-SAT pipeline: measured at two small sizes only** (table above). An accepted schedule
+  must keep every op inside its ASAP/ALAP domain. Justification can raise peak scratch
+  (4 x 256: 827 to 1,137 words), so at larger sizes a justified hint could send a section
+  to the per-section repair where the greedy's would not; that has not been observed or
+  measured.
+- Shift decisions change only when the greedy owned them (no forced shift encoding, no hint
+  pass); ALU-derived constants, eliminated vbroadcasts and individually forced shifts
+  (what-if runs, whose forced set the greedy does not see) make the pass skip.
+
+```bash
+# 16 x 256: 1,279 cycles (1,281 on the simulator), PROVED and PASSED
+uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate \
+  --greedy-barriers none --greedy-priority wavefront --greedy-split-shift \
+  --pressure-inflation-threshold 0.95 --greedy-justify 10 --save-kernel kernel_justify.json
+# The same kernel on the unmodified upstream simulator and tests
+./scripts/check_upstream.sh --strict --kernel kernel_justify.json
+# CP-SAT following the justified greedy (first row of the CP-SAT table)
+uv run generate_ssa_kernel.py --rounds 2 --batch-size 16 --validate \
+  --greedy-barriers none --greedy-priority wavefront --greedy-justify 10 \
+  --cpsat-deterministic-time 5 --cpsat-time-limit 600
 ```
