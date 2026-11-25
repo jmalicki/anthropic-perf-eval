@@ -22,6 +22,6 @@ reviews:
     # Solver counterexample dumps written by the verification scripts
     - "!verification/*_counterexamples.json"
     # Generated schedule, kernel and analysis outputs at the repository root
-    - "!/*.json"
+    - "!*.json"
     # Exported CP-SAT models
     - "!**/*.pb"
