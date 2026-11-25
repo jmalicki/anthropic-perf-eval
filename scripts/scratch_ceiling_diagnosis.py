@@ -1,130 +1,177 @@
 """Where a load-bound greedy schedule loses cycles against the static head/tail bound.
 
-The static bound of a load-bound schedule (`scripts.schedule_report`, row load) is
-`T >= t + q + ceil(W / 2)`: W loads cannot issue before cycle t and must leave q cycles
-after them. So every cycle of `T - bound` is one of:
+The static bound of a load-bound schedule (`scripts.static_bounds`, the row `schedule_report`
+prints) is `T >= t + q + ceil(W / 2)`: the W loads with head >= t and tail >= q must all issue
+in the window [t, T - q). The script takes t, q, W and the window loads from that same row
+(`static_bounds.ops_from_schedule_json(sched, "run")`), checks that every window load issued in
+the window, and splits the gap exactly:
 
-- **tail**: the last load issues before `T - q - 1` (cycles after it not explained by q);
-- **idle load slots in [t, T - q)**: two idle slots are one cycle;
-- **early loads in the window**: loads whose head is below t (W does not count them) that
-  issued inside the window and took slots W needed. Two are one cycle.
+    2 * (T - bound) = idle + extra - (2 * ceil(W / 2) - W)
 
-Each idle load slot is then classified by a blame chain. Take the load that issued next and
-was dependency-ready (operand-ready by longest path, no resources) at or before the idle
-cycle; walk back through its latest-issued producer until reaching an op that issued later
-than its own operands allowed (`delayed op`). The idle slot is charged to that op's engine,
-split into "engine full" (every slot of that engine was used in every cycle the op waited:
-throughput) and "engine not full" (the op waited although its engine had room: priority,
-wavefront stagger, inflation or scratch policy). If a ready load was waiting at the idle
-cycle the slot is "ordering" (the load engine picked nothing although a load was ready).
+- **idle**: idle load slots in [t, T - q) (a last load before T - q - 1 shows up here: the
+  slots after it are idle; there is no separate tail term);
+- **extra**: loads issued in the window that W does not count (head < t: setup loads issued
+  late; tail < q), which took slots W needed.
 
-"Ready" uses operand availability (producer cycle + 1), like `scripts.greedy_gap_diagnosis`.
+Given the counts the identity is arithmetic; what is checked (and fails loudly) is that every
+window load issued inside [t, T - q) and that W equals the window loads issued, i.e. that the
+row and the schedule agree.
+
+Each idle slot is then **attributed** (accounting, not a counterfactual; removing a cause can
+buy fewer cycles than it is charged, e.g. the 9.5 flow cycles on `path_flow90.json` bought 2):
+
+- "ordering, dependent load ready" / "ordering, dependency-free load ready": a load whose
+  operands were ready (producer cycle + 1) issued later. Dependency-free loads (constants) are
+  kept apart: they are ready from cycle 0 by construction.
+- otherwise "starved": the loads issued at the next cycle with a load whose dependency head
+  (static head, no resources) is <= the idle cycle share the slot equally (fractional, so the
+  result does not depend on which of them is listed first). For each, walk back through its
+  latest-issued producer (ties: smallest op id) to the first op that issued later than its
+  operands allowed, and charge that op's engine: "full" if in every cycle it waited its
+  engine had no room for it, "not full" otherwise (priority, stagger, inflation, scratch). A
+  shiftable vector op has no room when the vector ALU is full and fewer than 8 scalar slots
+  are free (a split shift could start in fewer: an approximation); a non-shiftable vector op
+  when the vector ALU is full. The walk stops at the nearest delayed op; an earlier delay on
+  the chain is not charged.
 
 Usage (from the project root):
-    uv run python -m scripts.scratch_ceiling_diagnosis gap sched.json --t 51 --q 14 --w 1888
+    uv run python -m scripts.scratch_ceiling_diagnosis gap sched.json
     uv run python -m scripts.scratch_ceiling_diagnosis peak sched.json
 
-`peak` prints the liveness peak, the cycles at the top of the curve and what is live at the
-peak by value kind. docs/SCRATCH_CEILING_DIAGNOSIS.md uses both.
+docs/SCRATCH_CEILING_DIAGNOSIS.md and docs/STARTUP_AND_STALL_LOOP.md use both.
 """
 import argparse
 import collections
 import json
 import os
 import sys
+from fractions import Fraction
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _HERE]
 sys.path.insert(0, os.path.dirname(_HERE))
 
+from scripts import static_bounds  # noqa: E402
 from scripts.schedule_report import lowered_with_ssa  # noqa: E402
 
 CAP = {"load": 2, "valu": 6, "alu": 12, "flow": 1, "store": 2}
+VLEN = 8
 
 
-def _engine_use(sched: dict) -> dict:
+def load_row(sched: dict) -> dict:
+    """The static bound's load row for this schedule: t, q, W, the window ops and op heads.
+
+    Raises ValueError when the strongest row is not the load row (the split assumes it)."""
+    bops = static_bounds.ops_from_schedule_json(sched, "run")
+    rows = static_bounds.makespan_rows(bops)
+    if rows["engine"] != "load":
+        raise ValueError(f"the static bound's row is {rows['engine']}, not load: this split is for load-bound schedules")
+    t, q, w = rows["t"], rows["q"], rows["work"]
+    h, tl = static_bounds.heads(bops), static_bounds.tails(bops)
+    window_ids = {o.id for o in bops if o.work.get("load", 0) and h[o.id] >= t and tl[o.id] >= q}
+    return {"t": t, "q": q, "w": w, "bound": rows["bound"], "window_ids": window_ids, "heads": h, "tails": tl}
+
+
+def _uses(sched: dict):
+    """Per-engine slot use per cycle, the lowered load ops with their SSA op, shifted SSA ids."""
     total = sched["total_cycles"]
     use = {e: [0] * (total + 1) for e in CAP}
-    for op in sched["ops"]:
-        if op["engine"] in use:
-            use[op["engine"]][op["cycle"]] += 1
-    return use
-
-
-def _ssa(sched: dict) -> dict:
-    return {o["id"]: o for o in sched["ssa_ops"] if o["cycle"] >= 0}
+    loads = []
+    shifted = set()
+    for low, s, lane in lowered_with_ssa(sched):
+        if low["engine"] in use:
+            use[low["engine"]][low["cycle"]] += 1
+        if lane and s is not None:
+            shifted.add(s["id"])
+        if low["engine"] == "load":
+            loads.append((low["cycle"], s["id"] if s is not None else None))
+    return use, loads, shifted
 
 
 def _operand_ready(op: dict, ops: dict) -> int:
     return max((ops[d]["cycle"] + 1 for d in op["dep_ids"] if d in ops), default=0)
 
 
-def _dep_asap(ops: dict) -> dict:
-    """Longest-path earliest cycle of every op, unit latency (ids are topological)."""
-    asap = {}
-    for i in sorted(ops):
-        asap[i] = max((asap[d] + 1 for d in ops[i]["dep_ids"] if d in asap), default=0)
-    return asap
+def _no_room(op: dict, cycle: int, use: dict) -> bool:
+    """Whether `op`'s engine had no room for it in `cycle` (see the module docstring)."""
+    e = op["engine"]
+    if e == "valu":
+        if use["valu"][cycle] < CAP["valu"]:
+            return False
+        shiftable = op["opcode"] in static_bounds.SHIFTABLE_OPCODES
+        return not shiftable or use["alu"][cycle] > CAP["alu"] - VLEN
+    if e in CAP:
+        return use[e][cycle] >= CAP[e]
+    return False
 
 
-def blame(load: dict, ops: dict, use: dict, shifted: set) -> tuple:
-    """First op on `load`'s latest-producer chain that issued after its operands were ready.
-
-    Returns (engine, engine_full, op) or ("none", False, None) if the chain is tight.
-    """
-    op = load
+def blame(load_id: int, ops: dict, use: dict) -> tuple:
+    """(engine, no_room, op id) of the first delayed op on the load's latest-producer chain, or
+    ("none", False, None) when the chain is tight."""
+    op = ops[load_id]
     while True:
         ready = _operand_ready(op, ops)
         if op["cycle"] > ready:
-            engine = "alu" if op["id"] in shifted else op["engine"]
-            full = all(use[engine][c] >= CAP[engine] for c in range(ready, op["cycle"]))
-            if op["engine"] == "valu" and op["id"] not in shifted:
-                # A vector op could have run on the vector ALU or shifted: full only if both were.
-                full = all(use["valu"][c] >= CAP["valu"] for c in range(ready, op["cycle"]))
-            return engine, full, op
+            full = all(_no_room(op, c, use) for c in range(ready, op["cycle"]))
+            return op["engine"], full, op["id"]
         preds = [ops[d] for d in op["dep_ids"] if d in ops]
         if not preds:
             return "none", False, None
-        op = max(preds, key=lambda p: p["cycle"])
+        op = max(preds, key=lambda p: (p["cycle"], -p["id"]))
 
 
-def gap_report(sched: dict, t: int, q: int, w: int) -> dict:
+def gap_report(sched: dict, row: dict | None = None) -> dict:
+    """The exact split of T - bound (see the module docstring). `row` defaults to `load_row`."""
+    row = row or load_row(sched)
+    t, q, w = row["t"], row["q"], row["w"]
     total = sched["total_cycles"]
-    ops = _ssa(sched)
-    use = _engine_use(sched)
-    asap = _dep_asap(ops)
-    shifted = {s["id"] for _, s, lane in lowered_with_ssa(sched) if lane}
-    loads = sorted((o for o in ops.values() if o["engine"] == "load"), key=lambda o: o["cycle"])
-    last = max(o["cycle"] for o in loads)
-    window = range(t, total - q)
-    idle = {c: CAP["load"] - use["load"][c] for c in window if use["load"][c] < CAP["load"]}
-    in_window = [o for o in loads if t <= o["cycle"] < total - q]
-    early = sum(1 for o in in_window if asap[o["id"]] < t)
-    classes = collections.Counter()
-    examples = {}
-    for c, n in sorted(idle.items()):
-        waiting = [o for o in loads if o["cycle"] > c and _operand_ready(o, ops) <= c]
-        if waiting:
-            classes["ordering (a ready load waited)"] += n
-            continue
-        nxt = [o for o in loads if o["cycle"] > c and asap[o["id"]] <= c]
-        if not nxt:
-            classes["no load could be ready (dependency heads)"] += n
-            continue
-        engine, full, culprit = blame(nxt[0], ops, use, shifted)
-        key = f"starved: delayed {engine} op, engine {'full' if full else 'not full'}"
-        classes[key] += n
-        examples.setdefault(key, (c, culprit["id"] if culprit else None,
-                                  culprit["opcode"] if culprit else None,
-                                  (culprit.get("source_info") or {}).get("group") if culprit else None))
+    ops = {o["id"]: o for o in sched["ssa_ops"] if o["cycle"] >= 0}
+    use, loads, _ = _uses(sched)
+    end = total - q
+    misplaced = [i for c, i in loads if i in row["window_ids"] and not t <= c < end]
+    if misplaced:
+        raise AssertionError(f"window loads outside [t, T - q) = [{t}, {end}): {misplaced[:5]}")
+    in_window = [(c, i) for c, i in loads if t <= c < end]
+    if sum(1 for _, i in in_window if i in row["window_ids"]) != w:
+        raise AssertionError(f"W = {w} but {sum(1 for _, i in in_window if i in row['window_ids'])} window loads issued")
+    extra = [(c, i) for c, i in in_window if i not in row["window_ids"]]
+    extra_head = sum(1 for _, i in extra if i is not None and row["heads"].get(i, 0) < t)
+    idle = {c: CAP["load"] - use["load"][c] for c in range(t, end) if use["load"][c] < CAP["load"]}
+    n_idle = sum(idle.values())
     bound = t + q + -(-w // CAP["load"])
+    gap = total - bound
+    if 2 * gap != n_idle + len(extra) - (2 * -(-w // CAP["load"]) - w):
+        raise AssertionError(f"identity fails: 2*{gap} != {n_idle} + {len(extra)} - {2 * -(-w // 2) - w}")
+
+    # Attribution of the idle slots.
+    load_ops = sorted({i for _, i in loads if i is not None and i in ops}, key=lambda i: (ops[i]["cycle"], i))
+    classes = collections.defaultdict(Fraction)
+    for c, n in sorted(idle.items()):
+        later = [i for i in load_ops if ops[i]["cycle"] > c]
+        ready = [i for i in later if _operand_ready(ops[i], ops) <= c]
+        if any(ops[i]["dep_ids"] for i in ready):
+            classes["ordering, dependent load ready"] += n
+            continue
+        if ready:
+            classes["ordering, dependency-free load ready"] += n
+            continue
+        possible = [i for i in later if row["heads"].get(i, 0) <= c]
+        if not possible:
+            classes["no load's dependency head allows it"] += n
+            continue
+        first = min(ops[i]["cycle"] for i in possible)
+        group = [i for i in possible if ops[i]["cycle"] == first]
+        for i in group:
+            engine, full, _ = blame(i, ops, use)
+            label = "starved: tight chain" if engine == "none" else \
+                f"starved: delayed {engine} op, {'no room' if full else 'room'}"
+            classes[label] += Fraction(n, len(group))
     return {
-        "cycles": total, "bound": bound, "gap": total - bound,
-        "tail_cycles": (total - q - 1) - last,
-        "idle_slots": sum(idle.values()), "idle_cycles": sorted(idle),
-        "early_loads_in_window": early,
-        "loads_in_window": len(in_window), "w": w,
-        "classes": dict(classes), "examples": examples,
+        "cycles": total, "bound": bound, "row_bound": row["bound"], "gap": gap, "t": t, "q": q, "w": w,
+        "idle_slots": n_idle, "idle_cycles": sorted(idle),
+        "extra_loads": len(extra), "extra_head_below_t": extra_head,
+        "last_load": max(c for c, _ in loads),
+        "classes": {k: float(v) for k, v in classes.items()},
     }
 
 
@@ -144,28 +191,24 @@ def peak_report(sched: dict) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("gap", help="split T - static bound into tail, idle load slots, early loads")
+    g = sub.add_parser("gap", help="split T - static bound into idle load slots and extra loads; attribute idle slots")
     g.add_argument("schedule")
-    g.add_argument("--t", type=int, required=True, help="head t of the load row (schedule_report)")
-    g.add_argument("--q", type=int, required=True, help="tail q of the load row")
-    g.add_argument("--w", type=int, required=True, help="W of the load row")
     p = sub.add_parser("peak", help="liveness peak and what is live there")
     p.add_argument("schedule")
     args = parser.parse_args(argv)
     with open(args.schedule) as f:
         sched = json.load(f)
     if args.cmd == "gap":
-        r = gap_report(sched, args.t, args.q, args.w)
-        print(f"{r['cycles']} cycles, static bound {r['bound']}: gap {r['gap']}")
-        print(f"  tail beyond q: {r['tail_cycles']} cycles")
+        r = gap_report(sched)
+        print(f"{r['cycles']} cycles, static bound {r['bound']} (load row t={r['t']}, q={r['q']}, W={r['w']}): "
+              f"gap {r['gap']}  [2*gap = idle + extra - rounding: checked]")
         print(f"  idle load slots in [t, T-q): {r['idle_slots']} = {r['idle_slots'] / 2:.1f} cycles "
-              f"(at cycles {r['idle_cycles']})")
-        print(f"  loads with head < t issued in the window: {r['early_loads_in_window']} = "
-              f"{r['early_loads_in_window'] / 2:.1f} cycles "
-              f"({r['loads_in_window']} loads in the window, W = {r['w']})")
-        print("  idle slots by cause:")
+              f"(last load at {r['last_load']}; idle at cycles {r['idle_cycles']})")
+        print(f"  extra loads in the window (not in W): {r['extra_loads']} = {r['extra_loads'] / 2:.1f} cycles "
+              f"({r['extra_head_below_t']} with head < t)")
+        print("  idle slots by attributed cause (accounting, not counterfactual):")
         for k, n in sorted(r["classes"].items(), key=lambda x: -x[1]):
-            print(f"    {n:4d} slots ({n / 2:5.1f} cycles)  {k}  e.g. {r['examples'].get(k)}")
+            print(f"    {n:6.1f} slots ({n / 2:5.2f} cycles)  {k}")
     else:
         r = peak_report(sched)
         print(f"peak {r['peak']} words at cycle {r['peak_cycle']}; curve values within 32 of the peak: "

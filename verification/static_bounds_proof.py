@@ -19,6 +19,11 @@ bound no schedule here beats is also never beaten by a CP-SAT schedule:
     select_choice       vselect: one flow slot at x, consumers wait x + 1; or FMA: one VALU
                         slot at x + 1 (the subtract may be shared, so it is not charged),
                         consumers wait x + 2.
+    delta select        a select_choice with a precomputed delta (``"delta": true`` on the
+                        instance op; ssa_lower.rs gives it no separate FMA cycle): vselect as
+                        above, or its one multiply_add on a VALU slot at x itself, consumers
+                        wait x + 1 either way. Opt-in kind (``random_instance(kinds=...)``),
+                        used by verification/window_rows_proof.py.
     const_choice        one slot at x on flow (add_imm), load or alu.
     vbroadcast          one VALU slot at x. If eliminable (one dependency on a non-VALU
                         producer, every consumer shiftable) it may be dropped: then it holds
@@ -89,11 +94,25 @@ KINDS = {
 }
 
 
+# Kinds a random instance may use only when asked (random_instance(kinds=...)), so the
+# instances of SB1 stay what they were.
+EXTRA_KINDS = {"delta_select": ("flow", "select_choice")}
+
+
+def _op_kind(o):
+    if o.get("delta"):
+        return "delta_select"
+    return next(k for k, v in KINDS.items() if v == (o["engine"], o["opcode"]))
+
+
 def instance_json(kinds, deps):
-    """A scheduler JSON holding only what the bound reads: ssa_ops with engine, opcode, deps."""
+    """A scheduler JSON holding only what the bound reads: ssa_ops with engine, opcode, deps
+    (and "delta" on a delta select, which the bound does not read)."""
+    all_kinds = {**KINDS, **EXTRA_KINDS}
     return {
         "ssa_ops": [
-            {"id": i, "engine": KINDS[k][0], "opcode": KINDS[k][1], "dep_ids": sorted(deps[i])}
+            {"id": i, "engine": all_kinds[k][0], "opcode": all_kinds[k][1], "dep_ids": sorted(deps[i]),
+             **({"delta": True} if k == "delta_select" else {})}
             for i, k in enumerate(kinds)
         ],
         "ops": [],
@@ -110,7 +129,7 @@ def schedule_exists(inst, cap, vlen, makespan):
     """Z3: does a reference-model schedule with all slots in [0, makespan) exist?"""
     ops = inst["ssa_ops"]
     by_id = {o["id"]: o for o in ops}
-    kind = {o["id"]: next(k for k, v in KINDS.items() if v == (o["engine"], o["opcode"])) for o in ops}
+    kind = {o["id"]: _op_kind(o) for o in ops}
     consumers = {o["id"]: [] for o in ops}
     for o in ops:
         for p in o["dep_ids"]:
@@ -123,6 +142,7 @@ def schedule_exists(inst, cap, vlen, makespan):
     shifted = {i: Bool(f"shift{i}") for i in shiftable}
     lanes = {i: [Int(f"l{i}_{k}") for k in range(vlen)] for i in shiftable}
     fma = {i: Bool(f"fma{i}") for i in kind if kind[i] == "select"}
+    delta_fma = {i: Bool(f"dfma{i}") for i in kind if kind[i] == "delta_select"}
     cchoice = {i: Int(f"cc{i}") for i in kind if kind[i] == "const"}
     elim = {i: Bool(f"elim{i}") for i in eliminable}
     slots = []  # (engine, cycle expr, present)
@@ -136,6 +156,9 @@ def schedule_exists(inst, cap, vlen, makespan):
         elif k == "select":
             slots.append(("flow", x[i], Not(fma[i])))
             slots.append(("valu", x[i] + 1, fma[i]))
+        elif k == "delta_select":
+            slots.append(("flow", x[i], Not(delta_fma[i])))
+            slots.append(("valu", x[i], delta_fma[i]))
         elif k == "const":
             s.add(cchoice[i] >= 0, cchoice[i] <= 2)
             for c, eng in enumerate(("flow", "load", "alu")):
@@ -187,9 +210,12 @@ def optimum(inst, cap, vlen, start):
     return m
 
 
-def random_instance(rng):
+def random_instance(rng, kinds=None):
+    """A random small DAG and machine. `kinds`: the op kinds to draw from (with repeats as
+    weights); default every kind of KINDS."""
+    pool = list(KINDS) if kinds is None else list(kinds)
     n = rng.randint(3, 7)
-    kinds = [rng.choice(list(KINDS)) for _ in range(n)]
+    kinds = [rng.choice(pool) for _ in range(n)]
     deps = []
     for i in range(n):
         d = {j for j in range(i) if rng.random() < 0.35}

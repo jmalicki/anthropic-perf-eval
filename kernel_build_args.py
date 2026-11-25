@@ -438,17 +438,14 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Force 0 integral gap: prove the schedule optimal for the emitted ops (not for the problem)")
     group.add_argument("--asap-alap-tightening", choices=["none", "simple", "symmetry-aware", "energetic"],
                        default="energetic",
-                       help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default)")
+                       help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default: symmetry-aware plus resource-aware earliest/latest cycles). "
+                            "The resource-aware part excludes no schedule of the model; the symmetry-aware part "
+                            "is valid only with the declared ordering rows and is skipped unless "
+                            "--cpsat-symmetry-rows is declared")
     group.add_argument("--enable-scratch-tightening", action="store_true",
                        help="Enable scratch-aware tightening (default: disabled; non-default debugging option)")
     group.add_argument("--symmetry-precedence-integrated", action="store_true",
                        help="Integrate precedence into symmetry ordering tie-breaking (experimental)")
-    group.add_argument("--energetic-alap-pulls", action="store_true",
-                       help="Enable ALAP pulls in energetic tightening (experimental; T7-two-step risk)")
-    group.add_argument("--energetic-bounded-push", action="store_true", dest="energetic_bounded_push",
-                       help="Cap ASAP push / ALAP pull magnitude per iteration (experimental)")
-    group.add_argument("--energetic-bounded-push-k", type=int, default=None, metavar="K",
-                       help="Cap push/pull to K cycles when --energetic-bounded-push (default: 2)")
     group.add_argument("--precedence-neutral-horizon", action="store_true",
                        help="Use precedence-neutral horizon (2x critical path) instead of greedy-based")
     group.add_argument("--scheduling-pressure-policy",
@@ -503,9 +500,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "default; 'alu-when-load-full' a load while a load slot is free, else ALU "
                             "derivation, else the default (docs/GREEDY_CONST_CHOICE.md)")
     group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
-                       help="Wavefront: 'key' (default) native scalar ops and shiftable vector ops in one "
-                            "wavefront order; 'native-first' native scalar-ALU ops (e.g. address adds) before "
-                            "the cycle's vector ops, so shifts never take their slots "
+                       help="Wavefront only (an error otherwise): 'key' (default) native scalar ops and "
+                            "shiftable vector ops in one wavefront order; 'native-first' native scalar-ALU ops "
+                            "(e.g. address adds) are tried before the cycle's vector ops (lanes of a split shift "
+                            "carried from the previous cycle are still placed first and can take scalar slots) "
                             "(docs/STARTUP_AND_STALL_LOOP.md)")
     group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first", "chain-first"], default="key",
                        help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "
@@ -605,6 +603,47 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     return group
 
 
+def check_greedy_shape_combinations(get) -> None:
+    """Reject greedy shape options that would be silently ignored (same rules as Rust's
+    `config::check_greedy_shape_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-select-overflow-limit without --greedy-select-overflow valu;
+            --greedy-load-priority or --greedy-flow-priority other than key without
+            --greedy-priority wavefront;
+            --greedy-select-overflow valu when a fixed select encoding (--select-choice fma or
+            vselect), the select-choice hint pass (--select-choice-hint-pass, --hint-passes) or
+            --schedule-with-fixed-choices owns the select encoding.
+    """
+    overflow = get("greedy_select_overflow", "never")
+    if get("greedy_select_overflow_limit") is not None and overflow != "valu":
+        raise ValueError("--greedy-select-overflow-limit needs --greedy-select-overflow valu; otherwise it is ignored")
+    load_priority = get("greedy_load_priority", "key")
+    if load_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-load-priority {load_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    flow_priority = get("greedy_flow_priority", "key")
+    if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    alu_priority = get("greedy_alu_priority", "key")
+    if alu_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-alu-priority {alu_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    if overflow == "valu":
+        select_choice = get("select_choice", "optimize")
+        if select_choice != "optimize":
+            owner = f"--select-choice {select_choice}"
+        elif get("hint_passes", False) or get("enable_select_choice_hint_pass", False):
+            owner = "the select-choice hint pass (--select-choice-hint-pass / --hint-passes)"
+        elif get("enable_schedule_with_fixed_choices", False):
+            owner = "--schedule-with-fixed-choices"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-select-overflow valu is ignored when {owner} owns the select encoding")
+
+
 def args_to_build_kwargs(
     args=None,
     *,
@@ -632,6 +671,7 @@ def args_to_build_kwargs(
             return getattr(args, name, default)
         return default
 
+    check_greedy_shape_combinations(get)
     forest_height = get("forest_height", 10)
     n_nodes_val = get("n_nodes")
     n_nodes = n_nodes_val if n_nodes_val is not None else _n_nodes(forest_height)
@@ -702,9 +742,6 @@ def args_to_build_kwargs(
         "asap_alap_tightening": get("asap_alap_tightening", "energetic"),
         "enable_scratch_tightening": get("enable_scratch_tightening", False) and use_cpsat,
         "symmetry_precedence_integrated": get("symmetry_precedence_integrated", False),
-        "energetic_alap_pulls": get("energetic_alap_pulls", False),
-        "energetic_bounded_push": get("energetic_bounded_push", False),
-        "energetic_bounded_push_k": get("energetic_bounded_push_k"),
         "precedence_neutral_horizon": get("precedence_neutral_horizon", False),
         "scheduling_pressure_policy": get("scheduling_pressure_policy", "adaptive"),
         "enable_cse_groups": not get("no_cse_groups", False),
@@ -767,9 +804,6 @@ def args_to_build_kwargs(
         "asap_alap_tightening": get("asap_alap_tightening", "energetic"),
         "enable_scratch_tightening": get("enable_scratch_tightening", False) if use_cpsat else None,
         "symmetry_precedence_integrated": get("symmetry_precedence_integrated", False),
-        "energetic_alap_pulls": get("energetic_alap_pulls", False),
-        "energetic_bounded_push": get("energetic_bounded_push", False),
-        "energetic_bounded_push_k": get("energetic_bounded_push_k"),
         "precedence_neutral_horizon": get("precedence_neutral_horizon", False),
         "run_options_json": json.dumps(run_options),
         "git_sha": git_sha,

@@ -1,19 +1,27 @@
-"""Where a schedule loses cycles: idle slots per engine over time, and whether work was waiting.
+"""Where a schedule leaves slots idle, per engine over time, and how much work was waiting.
 
 For each slice of the schedule this prints, from a scheduler output JSON:
 
-- idle slots of the load, vector ALU, scalar ALU and flow engines;
-- for the load engine, how many idle slots had a load that was ready (every operand
-  available) and still unissued, and how many had none: a load slot idle with nothing ready
-  is starved by the work upstream of the loads, one idle with a load ready is the
-  scheduler's ordering;
-- the average number of ready, unissued vector ops that can run as 8 scalar ops
-  ("shiftable") and that cannot (`multiply_add`, `vbroadcast`): many non-shiftable ops
-  waiting while the scalar ALU idles means shiftable ops took vector slots the
-  non-shiftable ones needed.
+- idle slots of the load, vector ALU, scalar ALU and flow engines (all lowered ops count,
+  constants included);
+- for the load engine, how many idle slots had a data load (not a constant) whose operands
+  were available and which had not issued yet ("operand-ready"), and how many had none;
+- the average number of operand-ready, unissued vector ops that can run as 8 scalar ops
+  ("shiftable") and that cannot (`multiply_add`, `vbroadcast`).
 
-"Ready" uses operand availability only (producer cycle + 1). It ignores the wavefront's
-in-flight window, so ops of chains not yet admitted count as ready.
+**What "operand-ready" means, and what it does not.** An op is operand-ready at cycle t when
+every producer in its SSA `dep_ids` issued at t - 1 or earlier (unit latency). That ignores
+what else can hold an op back in the greedy: the wavefront's in-flight window, ASAP/bounds
+and inflation deferral, the scratch budget, memory-ordering edges (not in the JSON), the
+extra cycle of a select on the multiply-add path, and the completion cycle of a split shift
+when it is not the producer's recorded cycle. Every one of these makes an op ready *later*
+than counted here, so the operand-ready counts are upper bounds on the work the scheduler
+could really have placed, and the "none operand-ready" count of idle load slots is a lower
+bound on load slots the scheduler could not have filled. The counts locate idle capacity and
+work queues; they do not show that a different order would have filled a slot.
+
+Constants (`const_choice`, which the greedy lowers to a `const` load or an `add_imm` on the
+flow engine) are excluded from the load queue and reported separately.
 
 Usage (from the project root):
     uv run python -m scripts.greedy_gap_diagnosis sched.json [--slice 50] [--from 51]
@@ -25,6 +33,8 @@ import collections
 import json
 
 NON_SHIFTABLE = {"multiply_add", "vbroadcast"}
+CONSTANT_OPCODES = {"const_choice", "const"}
+CAPACITY = {"load": 2, "valu": 6, "alu": 12, "flow": 1}
 
 
 def engine_use(sched: dict) -> dict:
@@ -36,8 +46,17 @@ def engine_use(sched: dict) -> dict:
     return use
 
 
-def waiting_counts(sched: dict, select) -> list:
-    """Per cycle, SSA ops chosen by `select` that were ready and not yet issued."""
+def is_data_load(op: dict) -> bool:
+    """A load that is not a constant (constants may be lowered to flow add_imm)."""
+    return op["engine"] == "load" and op["opcode"] not in CONSTANT_OPCODES
+
+
+def operand_ready_waiting(sched: dict, select) -> list:
+    """Per cycle, SSA ops chosen by `select` that were operand-ready and not yet issued.
+
+    Operand-ready = every producer in `dep_ids` issued at least one cycle earlier. An upper
+    bound on what was really placeable (see the module docstring).
+    """
     total = sched["total_cycles"]
     by_id = {op["id"]: op for op in sched["ssa_ops"]}
     waiting = [0] * total
@@ -51,35 +70,52 @@ def waiting_counts(sched: dict, select) -> list:
     return waiting
 
 
+def summary(sched: dict, start: int) -> dict:
+    """Idle load slots from `start`, split by whether a data load was operand-ready."""
+    total = sched["total_cycles"]
+    use = engine_use(sched)
+    waiting = operand_ready_waiting(sched, is_data_load)
+    with_ready = without_ready = 0
+    for t in range(start, total):
+        idle = CAPACITY["load"] - use["load"][t]
+        with_ready += min(idle, waiting[t])
+        without_ready += max(0, idle - waiting[t])
+    data_cycles = [op["cycle"] for op in sched["ssa_ops"] if is_data_load(op) and op["cycle"] >= 0]
+    constants = collections.Counter(op["opcode"] for op in sched["ops"]
+                                    if op["opcode"] in ("const", "add_imm"))
+    return {"cycles": total, "last_data_load": max(data_cycles, default=None),
+            "idle_with_operand_ready_load": with_ready,
+            "idle_without_operand_ready_load": without_ready,
+            "constants_as_load": constants.get("const", 0),
+            "constants_as_add_imm": constants.get("add_imm", 0)}
+
+
 def report(sched: dict, slice_len: int, start: int) -> str:
     total = sched["total_cycles"]
     use = engine_use(sched)
-    loads_waiting = waiting_counts(sched, lambda op: op["engine"] == "load")
-    shift_waiting = waiting_counts(
+    shift_waiting = operand_ready_waiting(
         sched, lambda op: op["engine"] == "valu" and op["opcode"] not in NON_SHIFTABLE)
-    fixed_waiting = waiting_counts(
+    fixed_waiting = operand_ready_waiting(
         sched, lambda op: op["engine"] == "valu" and op["opcode"] in NON_SHIFTABLE)
-    cap = {"load": 2, "valu": 6, "alu": 12, "flow": 1}
+    s = summary(sched, start)
 
-    lines = []
-    idle_ready = idle_starved = 0
-    for t in range(start, total):
-        idle = cap["load"] - use["load"][t]
-        idle_ready += min(idle, loads_waiting[t])
-        idle_starved += max(0, idle - loads_waiting[t])
-    load_cycles = [t for t in range(total) if use["load"][t]]
-    lines.append(f"{total} cycles; last load at cycle {load_cycles[-1] if load_cycles else None}")
-    lines.append(f"load slots idle from cycle {start}: {idle_ready} with a ready load waiting, "
-                 f"{idle_starved} with none ready")
-    lines.append("")
-    lines.append(f"{'from':>5} {'load idle':>9} {'(ready)':>7} {'valu idle':>9} {'alu idle':>8} "
-                 f"{'flow idle':>9} {'shiftable waiting':>17} {'non-shiftable waiting':>21}")
+    lines = [
+        f"{s['cycles']} cycles; last data load at cycle {s['last_data_load']}; constants: "
+        f"{s['constants_as_load']} as const loads, {s['constants_as_add_imm']} as flow add_imm",
+        f"load slots idle from cycle {start}: {s['idle_without_operand_ready_load']} with no data "
+        f"load operand-ready (a lower bound on slots no order could fill), "
+        f"{s['idle_with_operand_ready_load']} with one operand-ready (an upper bound; the load may "
+        f"still have been held by the window, deferral, the budget or a memory edge)",
+        "",
+        "Waiting columns: average operand-ready, unissued vector ops (upper bounds).",
+        f"{'from':>5} {'load idle':>9} {'valu idle':>9} {'alu idle':>8} {'flow idle':>9} "
+        f"{'shiftable waiting':>17} {'non-shiftable waiting':>21}",
+    ]
     for b in range(0, total, slice_len):
         rng = range(b, min(total, b + slice_len))
         n = len(rng)
-        idle = {e: sum(cap[e] - use[e][t] for t in rng) for e in cap}
-        ready = sum(min(cap["load"] - use["load"][t], loads_waiting[t]) for t in rng)
-        lines.append(f"{b:>5} {idle['load']:>9} {ready:>7} {idle['valu']:>9} {idle['alu']:>8} "
+        idle = {e: sum(CAPACITY[e] - use[e][t] for t in rng) for e in CAPACITY}
+        lines.append(f"{b:>5} {idle['load']:>9} {idle['valu']:>9} {idle['alu']:>8} "
                      f"{idle['flow']:>9} {sum(shift_waiting[t] for t in rng) / n:>17.1f} "
                      f"{sum(fixed_waiting[t] for t in rng) / n:>21.1f}")
     return "\n".join(lines)

@@ -3236,6 +3236,119 @@ fn test_split_shift_off_without_shift_decisions() {
 }
 
 // =========================================================================
+// VALU shift fixed to none (`valu_shift_fixed_to_none`, set by the VALU-shift hint pass)
+//
+// BUGS.md "Greedy with `valu_shift_fixed_to_none` can place a vector op without a vector
+// slot". The greedy must never shift when the hint pass owns the shift decision, and on
+// every path (normal and force-schedule) no cycle may exceed an engine's slot limit.
+// =========================================================================
+
+/// Policy for the force-path test: like [`GreedyPolicy`] but never allows a shift, so the
+/// normal path cannot place an op on the scalar ALU (it defers instead) and any vector op
+/// beyond six in a cycle can only come from the force-schedule path.
+#[derive(Debug)]
+struct NeverShiftPolicy;
+
+impl PressurePolicy for NeverShiftPolicy {
+    fn sort_ready(
+        &self,
+        candidates: &mut [pressure_policy::SchedulingCandidate],
+        ctx: &pressure_policy::SchedulingContext,
+    ) {
+        GreedyPolicy.sort_ready(candidates, ctx);
+    }
+
+    fn should_defer_for_pressure(&self, _: usize, _: usize, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn allow_shift(&self, _: usize, _: usize, _: usize) -> bool {
+        false
+    }
+}
+
+/// Schedule 30 chains of 12 vector adds with shifting enabled and `valu_shift_fixed_to_none`,
+/// then check the slot invariant: every op is placed, and per cycle at most six vector ops
+/// not recorded as shifted and at most 12 scalar slots (scalar ops plus 8 per recorded shift).
+///
+/// # Returns
+/// `(max unshifted vector ops in a cycle, max scalar slots in a cycle, recorded shifts,
+/// budget exceeded)`.
+fn schedule_with_shift_fixed_to_none(
+    budget: usize,
+    policy: &dyn PressurePolicy,
+) -> (usize, usize, usize, bool) {
+    let (mut emit, _) = emit_independent_chains(30, 12);
+    let mut shifted = HashSet::new();
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut shifted,
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        policy,
+        None,
+        false,
+        false,
+        false,
+        true, // valu_shift_fixed_to_none
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &GreedyShape::default(),
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the chains");
+    assert!(emit.ops.iter().all(|op| op.cycle >= 0), "every op is placed");
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    let mut alu: HashMap<i32, usize> = HashMap::new();
+    for op in &emit.ops {
+        if op.engine == Engine::Valu && shifted.contains(&op.id) {
+            *alu.entry(op.cycle).or_default() += VLEN;
+        } else if op.engine == Engine::Valu {
+            *valu.entry(op.cycle).or_default() += 1;
+        } else if op.engine == Engine::Alu {
+            *alu.entry(op.cycle).or_default() += 1;
+        }
+    }
+    (
+        valu.values().copied().max().unwrap_or(0),
+        alu.values().copied().max().unwrap_or(0),
+        shifted.len(),
+        budget_exceeded,
+    )
+}
+
+/// Normal path: with the six vector slots full the slot tracker used to take 8 scalar slots
+/// for the op (`SlotResult::Shifted`) without recording it in `shifted_ops`, so it lowered as
+/// a seventh vector op. Budget 1536: nothing is forced.
+#[test]
+fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit() {
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(1536, &GreedyPolicy);
+    assert!(!exceeded, "budget 1536 forces nothing");
+    assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
+    assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
+    assert_eq!(shifts, 0, "the hint pass owns the shift decision");
+}
+
+/// Force-schedule path, `SlotResult::NoRoom` arm: the policy never allows a shift (so the
+/// normal path places no unrecorded shift), the budget forces ops through the force path,
+/// and there an op that did not fit used to be marked scheduled with no slot.
+#[test]
+fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit_when_force_scheduling() {
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(80, &NeverShiftPolicy);
+    assert!(exceeded, "budget 80 must force ops through the force path");
+    assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
+    assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
+    assert_eq!(shifts, 0, "the hint pass owns the shift decision");
+}
+
+// =========================================================================
 // SlotTracker unit tests — shared slot-capacity invariants
 //
 // These tests verify the SlotTracker abstraction in isolation, ensuring that:
@@ -4445,7 +4558,7 @@ fn schedule_with_scratch_model(
     )
     .expect("greedy schedules the phases");
     assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
-    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new()).unwrap();
+    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new(), &HashSet::new()).unwrap();
     (budget_exceeded, peaks)
 }
 
@@ -4865,46 +4978,96 @@ fn test_shift_pace_reaches_its_target() {
     }
 }
 
-/// Force-schedule path (tight budget, adaptive policy): the proactive shift policies keep
-/// the slot limits there too.
+/// Schedule `ops` with shifting on, `budget` words and `policy`; returns
+/// (budget exceeded, shifted ops, split lane cycles, diagnostics).
+fn schedule_tight(
+    ops: &mut [SsaOp],
+    shape: &GreedyShape,
+    budget: usize,
+    policy: &dyn PressurePolicy,
+) -> (bool, HashSet<usize>, HashMap<usize, Vec<i32>>, GreedyDiagnostics) {
+    let mut shifted = HashSet::new();
+    let mut lanes = HashMap::new();
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+        ops,
+        true,
+        &mut shifted,
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        policy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        shape,
+        &mut lanes,
+    )
+    .expect("greedy completes past the budget");
+    (budget_exceeded, shifted, lanes, diagnostics)
+}
+
+/// Force-schedule path: budgets tight enough that ops are forced past them, where the pace
+/// policy also makes proactive shifts in the same run (counted by
+/// `GreedyDiagnostics::proactive_shifts`), under both the plain and the adaptive policy.
+/// Slot limits and dependencies hold. `reserve` alone makes no proactive shift on these
+/// budgets (the budget lets too few multiply_adds be ready at once), so it is checked for
+/// the limits only.
 #[test]
 fn test_shift_policies_keep_slot_limits_when_force_scheduling() {
-    for shift_policy in [ShiftPolicy::Reserve, ShiftPolicy::ReservePace { target: None }] {
-        for split_shift in [false, true] {
-            let mut emit = emit_mixed_chains(10, 6);
-            let shape = GreedyShape { split_shift, shift_policy, ..Default::default() };
-            let mut shifted = HashSet::new();
-            let mut lanes = HashMap::new();
-            let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
-                &mut emit.ops,
-                true,
-                &mut shifted,
-                48,
-                None,
-                None,
-                None,
-                None,
-                &GreedyBoundsUsage::None,
-                &AdaptivePolicy::default(),
-                None,
-                false,
-                false,
-                false,
-                false,
-                None,
-                None,
-                None,
-                &mut GreedyDiagnostics::new(false),
-                &shape,
-                &mut lanes,
-            )
-            .expect("greedy completes past the budget");
-            assert!(budget_exceeded, "the budget is tight enough to force-schedule");
-            let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
-            assert!(valu.values().all(|&n| n <= 6), "{:?}: vector ALU {:?}", shift_policy, valu);
-            assert!(alu.values().all(|&n| n <= 12), "{:?}: scalar ALU {:?}", shift_policy, alu);
-            assert_dependencies_respected(&emit.ops, &lanes);
+    let adaptive = AdaptivePolicy::default();
+    let policies: [&dyn PressurePolicy; 2] = [&GreedyPolicy, &adaptive];
+    for budget in [56, 64] {
+        for policy in policies {
+            for shift_policy in [
+                ShiftPolicy::Reserve,
+                ShiftPolicy::Pace { target: None },
+                ShiftPolicy::ReservePace { target: None },
+            ] {
+                for split_shift in [false, true] {
+                    let shape = GreedyShape { split_shift, shift_policy, ..Default::default() };
+                    let mut emit = emit_mixed_chains(10, 6);
+                    let (exceeded, shifted, lanes, diagnostics) =
+                        schedule_tight(&mut emit.ops, &shape, budget, policy);
+                    assert!(exceeded && diagnostics.over_budget_cycles > 0, "budget {} forces", budget);
+                    if shift_policy != ShiftPolicy::Reserve {
+                        assert!(
+                            diagnostics.proactive_shifts > 0,
+                            "{:?} split={} budget {}: no proactive shift on a force-scheduling run",
+                            shift_policy,
+                            split_shift,
+                            budget
+                        );
+                    }
+                    let (valu, alu) = vector_and_scalar_use(&emit.ops, &shifted, &lanes);
+                    assert!(valu.values().all(|&n| n <= 6), "{:?}: vector ALU {:?}", shift_policy, valu);
+                    assert!(alu.values().all(|&n| n <= 12), "{:?}: scalar ALU {:?}", shift_policy, alu);
+                    assert_dependencies_respected(&emit.ops, &lanes);
+                }
+            }
         }
+    }
+}
+
+/// With the hardware budget, `reserve` makes proactive shifts on the mixed chains (the
+/// counter the force-path test relies on is live).
+#[test]
+fn test_proactive_shift_counter() {
+    for (policy, expect_some) in [(ShiftPolicy::WhenFull, false), (ShiftPolicy::Reserve, true)] {
+        let mut emit = emit_mixed_chains(12, 10);
+        let shape = GreedyShape { shift_policy: policy, ..Default::default() };
+        let (exceeded, _, _, diagnostics) = schedule_tight(&mut emit.ops, &shape, 1536, &GreedyPolicy);
+        assert!(!exceeded);
+        assert_eq!(diagnostics.proactive_shifts > 0, expect_some, "{:?}", policy);
     }
 }
 
@@ -5139,6 +5302,68 @@ fn test_select_overflow_keeps_slot_limits_when_force_scheduling() {
     }
 }
 
+/// Regression (review of #76): a select the overflow puts on the vector ALU reads its
+/// operands and its precomputed delta one cycle after its own (address assignment's
+/// `select_fma_ops` rule, address_assign.rs). The counter did not count the delta as read
+/// by the select at all and released the operands at the select's cycle, so with the delta
+/// shared by many selects it undercounted interval liveness by the delta's 8 words over most
+/// of the schedule. Interval liveness here is computed exactly as address assignment does,
+/// with the run's multiply-add selects in `select_fma_ops`.
+#[test]
+fn test_select_overflow_counter_matches_address_assignment_liveness() {
+    for split_shift in [false, true] {
+        for limit in [None, Some(3)] {
+            let shape = GreedyShape {
+                priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+                split_shift,
+                select_overflow: SelectOverflow::Valu { limit },
+                ..Default::default()
+            };
+            let (mut emit, _) = emit_delta_select_chains(24);
+            let mut shifted = HashSet::new();
+            let mut lanes = HashMap::new();
+            let mut fma = HashSet::new();
+            let label = format!("split={} limit={:?}", split_shift, limit);
+            let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+                &mut emit.ops,
+                true,
+                &mut shifted,
+                1536,
+                Some(&mut fma),
+                None,
+                None,
+                None,
+                &GreedyBoundsUsage::None,
+                &GreedyPolicy,
+                None,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                &mut GreedyDiagnostics::new(false),
+                &shape,
+                &mut lanes,
+            )
+            .unwrap_or_else(|e| panic!("{}: {}", label, e));
+            assert!(!fma.is_empty(), "{}: the overflow placed no select on the vector ALU", label);
+            let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+            let config = crate::address_assign::AddressAssignConfig {
+                select_fma_ops: fma.clone(),
+                shifted_alu_cycles: lanes.clone(),
+                ..Default::default()
+            };
+            let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+            let peak = crate::address_assign::compute_peak_liveness(&intervals);
+            assert!(agreement.agrees(), "{}: {}", label, agreement);
+            assert_eq!(agreement.interval_peak, peak, "{}: the check must use the run's multiply-add selects", label);
+            assert_eq!(agreement.counter_cycle_end_peak, peak, "{}: {}", label, agreement);
+        }
+    }
+}
+
 /// A caller that does not collect multiply-add selects cannot use select overflow: lowering
 /// would emit vselects on a flow slot the greedy did not count.
 #[test]
@@ -5282,6 +5507,126 @@ fn test_alu_native_first_keeps_scalar_slots_for_natives() {
     assert_eq!(nf_first, nf_last, "native-first: all natives in one cycle");
     assert!(key_last > key_first, "control: under the key, shifts split the natives ({}..{})", key_first, key_last);
     assert!(nf_last < key_last, "native-first {} vs key {}", nf_last, key_last);
+}
+
+/// `final-last` under scratch-budget deferral (the documented limitation of
+/// `LoadPriority::FinalLast`): only the first placement pass of a cycle is ordered, so a
+/// feeder load deferred for the budget is retried after the final loads of that pass, and a
+/// final load can take a slot while the feeder is operand-ready. With a budget of 6 words
+/// (peak 8 unconstrained) this happens; from 8 words up it does not. Every run keeps the
+/// load slot limit and schedules every op within the budget. A fix that also orders the
+/// retry passes must turn the first assertion around.
+#[test]
+fn test_load_priority_final_last_budget_deferral() {
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 6, groups_in_flight: None },
+        load_priority: LoadPriority::FinalLast,
+        ..Default::default()
+    };
+    let ahead_at = |budget: usize| {
+        let (mut emit, finals) = emit_load_chains(8);
+        let mut shifted = HashSet::new();
+        let ((_, exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+            &mut emit.ops,
+            false,
+            &mut shifted,
+            budget,
+            None,
+            None,
+            None,
+            None,
+            &GreedyBoundsUsage::None,
+            &GreedyPolicy,
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &mut GreedyDiagnostics::new(false),
+            &shape,
+            &mut HashMap::new(),
+        )
+        .expect("greedy schedules the chains");
+        assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+        assert!(!exceeded && peak <= budget, "budget {}: peak {}", budget, peak);
+        assert_dependencies_respected(&emit.ops, &HashMap::new());
+        final_loads_ahead_of_ready_feeders(&emit.ops, &finals)
+    };
+    assert!(ahead_at(6) > 0, "a budget-deferred feeder lets a final load go first");
+    for budget in [8, 16, 1536] {
+        assert_eq!(ahead_at(budget), 0, "budget {}", budget);
+    }
+}
+
+/// `stall` under the shaped pipeline's settings: adaptive policy with ASAP inflation (policy
+/// bounds), wavefront priority, VALU shift and split shifts, with budgets that bind. 24
+/// independent chains of vector adds off one broadcast: a running chain holds one vector
+/// and each step frees what it adds, so no budget of at least three vectors deadlocks. The
+/// run must stay within the budget and never force; returns (budget_exceeded, peak,
+/// diagnostics) for `force`.
+fn schedule_chains_shaped(budget: usize, force: BudgetForce, split_shift: bool) -> (bool, usize, GreedyDiagnostics) {
+    let (mut emit, _) = emit_independent_chains(24, 6);
+    let asap = crate::cpsat_scheduler::bounds::compute_ssa_asap(&emit.ops, &HashSet::new());
+    let max_asap = asap.values().copied().max().unwrap_or(0);
+    let alap = crate::cpsat_scheduler::bounds::compute_ssa_alap(&emit.ops, max_asap + 20, &HashSet::new());
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+        split_shift,
+        budget_force: force,
+        ..Default::default()
+    };
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let ((_, exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut HashSet::new(),
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::PolicyOnly { asap: &asap, alap: &alap },
+        &pressure_policy::AdaptivePolicy::default(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the chains");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (exceeded, peak, diagnostics)
+}
+
+#[test]
+fn test_budget_force_stall_holds_the_budget_in_the_shaped_pipeline() {
+    let mut control_overshoots = 0;
+    for budget in [3 * VLEN + 1, 5 * VLEN + 1, 8 * VLEN + 1, 12 * VLEN + 1] {
+        for split_shift in [false, true] {
+            let (exceeded, peak, diag) = schedule_chains_shaped(budget, BudgetForce::Stall, split_shift);
+            assert!(!exceeded && diag.forced_past_budget == 0, "stall forced at budget {} split {}", budget, split_shift);
+            assert!(peak <= budget, "stall peak {} > budget {} (split {})", peak, budget, split_shift);
+            // A split shift starts only with 1 to 7 scalar slots free, i.e. after a counted
+            // placement on the scalar ALU in the same cycle (a carried split's completion, a
+            // native op or a whole shift): a cycle whose only placement is a split start
+            // does not occur. The stall rule still treats one as progress, defensively.
+            assert_eq!(diag.split_only_cycles, 0);
+            let (same_exceeded, same_peak, _) = schedule_chains_shaped(budget, BudgetForce::SameCycle, split_shift);
+            if same_exceeded || same_peak > budget {
+                control_overshoots += 1;
+            }
+        }
+    }
+    assert!(control_overshoots > 0, "control: same-cycle never overshot, so the budgets do not bind");
 }
 
 // =========================================================================

@@ -202,6 +202,18 @@ pub enum LoadPriority {
     /// Final loads (no later load depends on them, e.g. the last gather round) after all
     /// other loads, then key: a final load has a short tail, while a load that feeds later
     /// gathers holds up the load engine's future work.
+    ///
+    /// Exactly what it does: once per cycle, before the first placement pass, the ops whose
+    /// own engine is `Load` are re-sorted among the positions they hold in the wavefront order
+    /// by `(final, key)`. Limitations, all measured with this behaviour (the
+    /// docs/GREEDY_SHAPE_ABLATION.md section 11 numbers):
+    /// - Constants (`Const`, `ConstChoice`) are `Load`-engine ops and are sorted too. A
+    ///   constant no load depends on counts as final, even when it is then lowered to a flow
+    ///   `add_imm`.
+    /// - Only the first pass is ordered. A feeder load deferred for the scratch budget in that
+    ///   pass is retried after the final loads of the same pass, so a final load can take a
+    ///   load slot ahead of a budget-deferred feeder
+    ///   (`test_load_priority_final_last_budget_deferral`).
     FinalLast,
 }
 
@@ -591,6 +603,8 @@ pub(crate) struct GreedyDiagnostics {
     pub worst_over_budget: Option<(usize, usize)>,
     /// Number of detailed breakdown dumps written to stderr (0 unless `verbose`; at most 2).
     pub dumps_emitted: usize,
+    /// Shifts (whole or split) made by a proactive shift policy while a vector slot was free.
+    pub proactive_shifts: usize,
     /// Breakdown for the worst cycle so far, printed by `finish` (only kept when `verbose`).
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
@@ -598,6 +612,13 @@ pub(crate) struct GreedyDiagnostics {
     /// Out: ConstChoices the scheduler derived on the scalar ALU (op id -> operands), under a
     /// [`ConstPolicy`] other than `Default`. Lowering and address assignment need them.
     pub const_alu_derive: HashMap<usize, crate::types::AluDeriveInfo>,
+    /// Times the hard budget check (live words after the op > budget) deferred an op; an op
+    /// retried in the same cycle counts once per rejection.
+    pub budget_check_deferrals: usize,
+    /// Ops forced past the budget by the force-schedule path.
+    pub forced_past_budget: usize,
+    /// Cycles whose only placement was the first part of a split shift.
+    pub split_only_cycles: usize,
 }
 
 impl GreedyDiagnostics {
@@ -817,12 +838,18 @@ pub(super) fn format_live_usage_breakdown(
 /// # Arguments
 /// * `op` - The op being scheduled (reads its `srcs` and holds its `keep_live` values)
 /// * `liveness_aliases` - Lane → group VReg (both group kinds); write-group VReg → lanes
+/// * `delta_read` - The op is a SelectChoice that may take its one-op multiply_add form, so
+///   its precomputed delta counts as read (see [`liveness_read_vregs`])
 ///
 /// # Returns
 /// The VRegs the op reads or keeps live, then their aliases, each exactly once.
-fn liveness_release_vregs(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> Vec<VReg> {
+fn liveness_release_vregs(
+    op: &SsaOp,
+    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
+    delta_read: bool,
+) -> Vec<VReg> {
     let mut released: Vec<VReg> = Vec::with_capacity(op.srcs.len());
-    for vreg in liveness_read_vregs(op) {
+    for vreg in liveness_read_vregs(op, delta_read) {
         if !released.contains(&vreg) {
             released.push(vreg);
         }
@@ -1002,18 +1029,45 @@ fn release_read_values(
     vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
     trace: &mut CounterTrace,
 ) {
-    for vreg in &liveness_release_vregs(op, liveness_aliases) {
+    let delta_read = trace.delta_readers.contains(&op.id);
+    let fma = trace.fma_selects.contains(&op.id);
+    for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
+        // A vselect does not read the delta: no read, only one holder fewer.
+        if !(delta_read && !fma && op.delta_vreg == Some(*vreg)) {
+            let end = cycle as i32 + i32::from(fma);
+            let e = trace.read_end.entry(*vreg).or_insert(end);
+            *e = (*e).max(end);
+        }
         if *remaining != 0 || !live_vregs.contains(vreg) {
             continue;
         }
         if write_groups.releasable_at(vreg, cycle) {
-            live_vregs.remove(vreg);
-            live.remove(vreg);
-            trace.release(vreg, cycle);
+            match trace.read_end.get(vreg).copied() {
+                // A multiply_add select read it this cycle: held through this cycle.
+                Some(end) if end > cycle as i32 => vreg_expiry_heap.push(Reverse((end, *vreg))),
+                // Held only for selects that took the vselect form: its interval ended at
+                // its last real read. Give the words back from then on (the counter was
+                // conservative in between).
+                Some(end) if end < cycle as i32 => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    let start = trace.spans.get(vreg).map_or(end, |s| s.0);
+                    let end = end.max(start);
+                    for c in end.max(0) as usize..cycle.min(trace.cycle_end_live.len()) {
+                        trace.cycle_end_live[c] -= vreg.size();
+                    }
+                    trace.release(vreg, end as usize);
+                }
+                _ => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    trace.release(vreg, cycle);
+                }
+            }
         } else if let Some(&hold_until) = write_groups.hold_until.get(vreg) {
             // Written out, but an unread lane holds the block one more cycle.
             if write_groups.pending_writes.get(vreg).map_or(true, |&p| p == 0) {
@@ -1025,12 +1079,18 @@ fn release_read_values(
 }
 
 /// VRegs an op holds until it runs: its VReg operands and its `keep_live` list
-/// (the same reads `address_assign`'s `LivenessUse` reports). May contain duplicates.
-fn liveness_read_vregs(op: &SsaOp) -> impl Iterator<Item = VReg> + '_ {
+/// (the same reads `address_assign`'s `LivenessUse` reports), and with `delta_read` the
+/// precomputed delta of a SelectChoice. Address assignment holds the delta (and every
+/// operand) of a select in `select_fma_ops` to the select's cycle + 1; the greedy decides
+/// the select's form only when it places it, so a select that may take the multiply_add form
+/// holds its delta until then (released early again if it takes the vselect form, see
+/// [`release_read_values`]). May contain duplicates.
+fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
         .filter_map(|src| src.as_vreg())
         .chain(op.keep_live.iter().flatten().copied())
+        .chain(op.delta_vreg.filter(|_| delta_read))
 }
 
 // ============================================================================
@@ -1097,6 +1157,15 @@ struct CounterTrace {
     cycle_end_live: Vec<usize>,
     /// Per value: the cycle it was added to the counter and the cycle it was released.
     spans: HashMap<VReg, (i32, Option<i32>)>,
+    /// Op ids of the SelectChoice ops whose precomputed delta the counter treats as read
+    /// (those that may take the one-op multiply_add form in this run).
+    delta_readers: HashSet<usize>,
+    /// Op ids of the SelectChoice ops placed in the one-op multiply_add form. Address
+    /// assignment (`select_fma_ops`) holds their operands and delta to cycle + 1.
+    fma_selects: HashSet<usize>,
+    /// Per value: the cycle its interval ends at given the reads so far (a read at cycle c
+    /// ends it at c, a multiply_add select's read at c + 1).
+    read_end: HashMap<VReg, i32>,
 }
 
 impl CounterTrace {
@@ -1114,6 +1183,8 @@ impl CounterTrace {
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of shifted ops whose lanes are not all in the
 ///   op's cycle (split shifts); empty otherwise
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds (address assignment's
+///   `select_fma_ops`: their reads are held to cycle + 1)
 ///
 /// # Returns
 /// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
@@ -1122,9 +1193,10 @@ pub(super) fn interval_liveness_curve(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
     let (curve, peak, intervals, _, _) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     Ok((curve, peak, intervals))
 }
 
@@ -1135,6 +1207,7 @@ fn interval_liveness_inputs(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>, AddressAssignConfig, Vec<SsaOp>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
@@ -1149,6 +1222,7 @@ fn interval_liveness_inputs(
     let config = AddressAssignConfig {
         vector_group_lanes: groups,
         shifted_alu_cycles: shifted_lane_cycles.clone(),
+        select_fma_ops: select_fma_ops.clone(),
         ..Default::default()
     };
     let intervals = compute_live_intervals(&config, &scheduled)?;
@@ -1191,7 +1265,7 @@ fn compare_counter_with_intervals(
 ) -> Result<LivenessAgreement, String> {
     let cycle_end_live = &trace.cycle_end_live;
     let (curve, interval_peak, intervals) =
-        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &trace.fma_selects)?;
     let mut agreement = LivenessAgreement {
         counter_peak,
         counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
@@ -1605,7 +1679,8 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &words_shape,
         shifted_lane_cycles,
     )?;
-    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles)?;
+    let fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
         return Ok(first);
@@ -1675,6 +1750,7 @@ pub(crate) fn schedule_ssa_greedy_shaped(
 /// * `ops` - Ops with assigned cycles; negative cycles (skipped dead stores) are ignored
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of split shifts
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds
 ///
 /// # Returns
 /// The pool peaks, or the interval computation's error.
@@ -1682,9 +1758,10 @@ pub(super) fn scratch_pool_peaks(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<crate::address_assign::PoolPeaks, String> {
     let (_, _, intervals, config, scheduled) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     let spans = crate::address_assign::compute_value_spans(
         &intervals,
         &crate::address_assign::last_write_cycles(&scheduled, &config),
@@ -2008,6 +2085,18 @@ fn schedule_ssa_greedy_core(
     // Skip AddImm alternatives when building vreg_def (use Load's definition)
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+    // Selects that may take the one-op multiply_add form hold their delta (address
+    // assignment reads it at cycle + 1 when they do): with select overflow, any select with a
+    // delta the hint pass does not own; with fixed encodings, those fixed to the FMA path.
+    trace.delta_readers = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::SelectChoice && op.delta_vreg.is_some())
+        .filter(|op| match fixed_select_choice_encoding {
+            Some(fixed) => matches!(fixed.get(&op.id), Some(SelectChoiceEncoding::Fma)),
+            None => !select_choice_fixed_to_vselect && shape.select_overflow != SelectOverflow::Never,
+        })
+        .map(|op| op.id)
+        .collect();
 
     for (idx, op) in ops.iter().enumerate() {
         if let Some(dest) = op.dest {
@@ -2018,7 +2107,7 @@ fn schedule_ssa_greedy_core(
         }
         // Still track users from AddImm alternatives (they read zero_vreg).
         // `keep_live` values count as read: address assignment holds them until this op.
-        for vreg in liveness_read_vregs(op) {
+        for vreg in liveness_read_vregs(op, trace.delta_readers.contains(&op.id)) {
             vreg_users.entry(vreg).or_default().insert(idx);
         }
     }
@@ -2261,7 +2350,12 @@ fn schedule_ssa_greedy_core(
         && enable_valu_shift
         && fixed_shifted_ops.is_none()
         && !valu_shift_fixed_to_none;
-    // Pace: (vector ops placed so far, of them shifted, total, target).
+    // Pace accounting. "Vector ops" are ops whose own engine is `Valu` (not dead stores): the
+    // same set in the total and in the placed count, so a SelectChoice placed on the vector
+    // path counts in neither. `pace_vector_placed` and `pace_shifted` count placements on
+    // every path (normal, split start, force-schedule). The pace is a floor on shifting, not
+    // a cap: a pace policy shifts proactively while `shifted / placed < target / total`, and
+    // the `when-full` shifts (vector slots full) still happen once the target is reached.
     let pace_total_vector = ops
         .iter()
         .enumerate()
@@ -2296,6 +2390,12 @@ fn schedule_ssa_greedy_core(
     let fixed_vector: Vec<bool> = (0..ops.len())
         .map(|i| ops[i].engine == Engine::Valu && !shiftable_set.contains(&i))
         .collect();
+    if shape.load_priority != LoadPriority::Key && wavefront.is_none() {
+        eprintln!(
+            "Warning: greedy load priority {:?} applies only with the wavefront priority; ignored",
+            shape.load_priority
+        );
+    }
     let mut pace_vector_placed: usize = 0;
     let mut pace_shifted: usize = 0;
     // The op whose first lanes ran last cycle and whose remaining lanes run this cycle.
@@ -2402,6 +2502,9 @@ fn schedule_ssa_greedy_core(
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
+        // A split shift started this cycle: its destination block is reserved and scalar
+        // slots are taken, so the cycle is not a deadlock for `BudgetForce::Stall`.
+        let mut split_started_this_cycle = false;
 
         // Finish last cycle's split shift before anything else takes scalar slots: its
         // remaining lanes run now and the op completes in this cycle.
@@ -2850,10 +2953,14 @@ fn schedule_ssa_greedy_core(
 
                 // When fixed_shifted_ops is Some, can_shift = op is in the set (we place as shifted only those).
                 // When in fixed_shifted_ops we must place as shifted only (never VALU), so we need ALU room.
+                // With valu_shift_fixed_to_none the hint pass owns the shift decision: never shift
+                // here (a shift the slot tracker counted but nobody recorded would lower as a
+                // seventh vector op).
                 let can_shift = if let Some(fixed) = fixed_shifted_ops {
                     fixed.contains(&op_id)
                 } else {
                     enable_valu_shift
+                        && !valu_shift_fixed_to_none
                         && engine == Engine::Valu
                         && can_ssa_valu_shift_to_alu(&ops[idx])
                 };
@@ -2917,6 +3024,7 @@ fn schedule_ssa_greedy_core(
                                 vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
                             if has_reader && pools.fits(&live.after(&added, &[]), scratch_budget) {
                                 slots.alu_used += free_alu;
+                                split_started_this_cycle = true;
                                 split_carry = Some(SplitShift {
                                     idx,
                                     first_cycle: cycle as i32,
@@ -2937,6 +3045,9 @@ fn schedule_ssa_greedy_core(
                                 peak_live_words = peak_live_words.max(live.words);
                                 pace_vector_placed += 1;
                                 pace_shifted += 1;
+                                if prefer_split {
+                                    diagnostics.proactive_shifts += 1;
+                                }
                                 continue;
                             }
                         }
@@ -2965,8 +3076,15 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                let freed: Vec<VReg> = liveness_release_vregs(&ops[idx], &liveness_aliases)
+                // A select taking the multiply_add form holds what it reads to cycle + 1.
+                let holds_reads = engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice;
+                let freed: Vec<VReg> = liveness_release_vregs(
+                    &ops[idx],
+                    &liveness_aliases,
+                    trace.delta_readers.contains(&op_id),
+                )
                     .into_iter()
+                    .filter(|_| !holds_reads)
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
@@ -2977,6 +3095,7 @@ fn schedule_ssa_greedy_core(
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
                 if !pools.fits(&live.after(&added, &freed), scratch_budget) {
                     // Defer for retry - liveness may decrease after other ops scheduled
+                    diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
                     continue;
                 }
@@ -3001,10 +3120,13 @@ fn schedule_ssa_greedy_core(
                 } else {
                     slots.try_place(engine, can_shift, allow_shift)
                 };
-                if engine == Engine::Valu && place_result != SlotResult::NoRoom {
+                if ops[idx].engine == Engine::Valu && place_result != SlotResult::NoRoom {
                     pace_vector_placed += 1;
                     if place_result == SlotResult::Shifted {
                         pace_shifted += 1;
+                        if prefer_shift {
+                            diagnostics.proactive_shifts += 1;
+                        }
                     }
                 }
                 match place_result {
@@ -3021,6 +3143,11 @@ fn schedule_ssa_greedy_core(
                             debug_assert_eq!(engine, Engine::Alu);
                             diagnostics.const_alu_derive.insert(op_id, info);
                         }
+                        if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
+                            && ops[idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
+                        }
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
                             && !const_choice_fixed_to_load
@@ -3033,7 +3160,8 @@ fn schedule_ssa_greedy_core(
                         }
                     }
                     SlotResult::Shifted => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                        // With fixed shifts the caller records them (the op is in the set).
+                        if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
                     }
@@ -3157,7 +3285,15 @@ fn schedule_ssa_greedy_core(
         // deferred waits while anything else is placed, and is forced only in a cycle where
         // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
         let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
-        if !budget_deferred.is_empty() && (force_same_cycle || scheduled_this_cycle == 0) {
+        // With `Stall`, a cycle whose only placement was a split-shift start is not a
+        // deadlock either (`pools` keeps its historical rule). Defensive: a split starts only
+        // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
+        // the same cycle (`split_only_cycles` stays 0; checked in the tests).
+        let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
+        if split_started_this_cycle && scheduled_this_cycle == 0 {
+            diagnostics.split_only_cycles += 1;
+        }
+        if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
@@ -3195,23 +3331,33 @@ fn schedule_ssa_greedy_core(
             let dest = ops[force_idx].dest;
 
             // Check slot availability - we still respect slot limits
+            // Same rule as the normal path: no shifts when the hint pass owns them.
             let can_shift = if let Some(fixed) = fixed_shifted_ops {
                 fixed.contains(&op_id)
             } else {
                 enable_valu_shift
+                    && !valu_shift_fixed_to_none
                     && engine == Engine::Valu
                     && can_ssa_valu_shift_to_alu(&ops[force_idx])
             };
             let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
-            // When must_place_shifted we need ALU room for all lanes.
-            let slots_ok = if must_place_shifted {
-                slots.alu_used + VLEN <= 12
+            // Take the slot first; budget accounting below only runs for an op that has one.
+            // When must_place_shifted use the shift-only path; otherwise try with the strategy
+            // first and, if it blocks the shift, force the shift (the op is over budget anyway).
+            // `None` = no slot this cycle: the op goes back to the deferred list and takes a
+            // later cycle (marking it scheduled without a slot overfilled the cycle).
+            let force_place_result = if must_place_shifted {
+                slots.try_place_shifted_only()
             } else {
-                slots.fits(engine, can_shift)
+                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
+                match slots.try_place(engine, can_shift, allow_shift) {
+                    SlotResult::NoRoom => slots.try_place(engine, can_shift, true),
+                    placed => placed,
+                }
             };
 
-            if slots_ok {
+            if force_place_result != SlotResult::NoRoom {
                 // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
                 // This is intentional behavior - DO NOT REMOVE unless explicitly instructed.
                 // The force-schedule allows progress when retry loops fail to free enough
@@ -3224,32 +3370,32 @@ fn schedule_ssa_greedy_core(
                     format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
-                // When must_place_shifted use shift-only path; else try with strategy first.
-                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
-                #[allow(unused_assignments)]
-                let force_place_result = if must_place_shifted {
-                    slots.try_place_shifted_only()
-                } else {
-                    slots.try_place(engine, can_shift, allow_shift)
-                };
-                #[allow(unused_assignments)]
+                diagnostics.forced_past_budget += 1;
+                let mut force_shifted = false;
                 match force_place_result {
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&force_idx) {
                             fma_carry += 1;
                         }
+                        if engine == Engine::Valu && ops[force_idx].opcode == Opcode::SelectChoice
+                            && ops[force_idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
+                        }
                     }
                     SlotResult::Shifted => {
+                        force_shifted = true;
+                        // With fixed shifts the caller records them (the op is in the set).
                         if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
                     }
-                    SlotResult::NoRoom => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
-                            if let SlotResult::Shifted = slots.try_place(engine, can_shift, true) {
-                                shifted_ops.insert(op_id);
-                            }
-                        }
+                    SlotResult::NoRoom => unreachable!("checked above"),
+                }
+                if ops[force_idx].engine == Engine::Valu {
+                    pace_vector_placed += 1;
+                    if force_shifted {
+                        pace_shifted += 1;
                     }
                 }
 
@@ -3501,6 +3647,13 @@ fn schedule_ssa_greedy_core(
             inflation_stats.net_liveness_blocks,
             inflation_stats.pass_through_blocks,
             inflation_stats.breaker_activations,
+        );
+    }
+
+    if diagnostics.verbose {
+        eprintln!(
+            "Greedy budget check: {} deferrals, {} ops forced past the budget",
+            diagnostics.budget_check_deferrals, diagnostics.forced_past_budget
         );
     }
 
