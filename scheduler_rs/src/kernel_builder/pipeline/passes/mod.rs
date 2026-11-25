@@ -23,7 +23,7 @@ pub use compute_bounds::ComputeBoundsPass;
 pub use dce::DcePass;
 pub use elide_barriers::ElideBarriersPass;
 pub use filter_dead::FilterDeadStoresPass;
-pub use greedy::GreedySchedulePass;
+pub use greedy::{GreedyJustifyPass, GreedySchedulePass};
 pub use hint_passes::{
     ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
 };
