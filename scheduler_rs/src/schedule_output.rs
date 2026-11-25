@@ -765,7 +765,10 @@ pub fn write_ssa_schedule_json(
             .collect(),
     };
 
-    let json = serde_json::to_string_pretty(&output)
+    // Through `serde_json::Value`, whose maps are sorted by key: the output structs hold
+    // `HashMap`s, which would otherwise be written in a per-process random order.
+    let value = serde_json::to_value(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
+    let json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("JSON serialization failed: {}", e))?;
 
     std::fs::write(output_path, &json)
