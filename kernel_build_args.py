@@ -471,6 +471,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="With --use-greedy: let a vector op run as 8 scalar ops spread over two cycles, so "
                             "all 12 scalar slots carry shifted work (3 shifted ops per 2 cycles instead of 2). "
                             "Ignored with CP-SAT unless --cpsat-split-shift-hint is set")
+    group.add_argument("--greedy-justify", type=_non_negative_int, default=0, metavar="N",
+                       help="Shorten the greedy schedule by forward/backward justification, at most N "
+                            "iterations (default 0 = off). Keeps the greedy's const/select encodings; a "
+                            "candidate that breaks a slot limit, a precedence or the scratch budget is dropped")
     group.add_argument("--pressure-soft-threshold", type=_positive_finite_float, default=None, metavar="FRAC",
                        help="Pressure policy: fraction of the scratch budget above which the ready queue blends "
                             "in net pressure and busy-ALU shifts are suppressed (policy default 0.85)")
@@ -664,6 +668,7 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "greedy_justify": get("greedy_justify", 0),
         "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
@@ -722,6 +727,7 @@ def args_to_build_kwargs(
         "greedy_stagger_cycles": get("greedy_stagger_cycles", DEFAULT_GREEDY_STAGGER_CYCLES),
         "greedy_groups_in_flight": get("greedy_groups_in_flight", DEFAULT_GREEDY_GROUPS_IN_FLIGHT),
         "greedy_split_shift": get("greedy_split_shift", False),
+        "greedy_justify": get("greedy_justify", 0),
         "cpsat_split_shift_hint": get("cpsat_split_shift_hint", False),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
