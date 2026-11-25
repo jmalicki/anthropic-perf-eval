@@ -5301,6 +5301,7 @@ fn test_forced_shift_with_split_shifts() {
     assert!(!lanes.is_empty(), "the scheduler still makes split shifts");
     for id in &forced {
         assert!(shifted.contains(id), "forced op {} is not shifted", id);
+        assert!(!lanes.contains_key(id), "forced op {} was split over two cycles", id);
     }
     assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
 }

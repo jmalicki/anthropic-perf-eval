@@ -170,5 +170,8 @@ def test_forced_shifts_are_honoured_by_the_greedy_alone(tmp_path):
     assert sched["valu_shifted"] == 2
     lanes = [_lowered_lanes(sched, op_id) for op_id in forced]
     assert [len(ops) for ops in lanes] == [8, 8]
-    # One whole shift per cycle: the two ops no longer share a cycle.
-    assert {op["cycle"] for op in lanes[0]}.isdisjoint({op["cycle"] for op in lanes[1]})
+    # Each forced op is placed whole (all 8 lanes in one cycle), and one whole shift fits
+    # per cycle, so the two ops no longer share a cycle.
+    cycles = [{op["cycle"] for op in ops} for ops in lanes]
+    assert [len(c) for c in cycles] == [1, 1], cycles
+    assert cycles[0].isdisjoint(cycles[1])
