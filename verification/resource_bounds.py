@@ -9,8 +9,10 @@ bounds with a port of the Rust code, and asks Z3 for a schedule that violates on
 
 * UNSAT on every graph (expected for RB1 to RB3): no schedule violates a bound. Three
   bounds are checked per op: the issue cycle is at least `issue_lb`; every lane of a shifted
-  op is at least `lane_lb`; the last cycle the op occupies is at most
-  `horizon - 1 - finish_tail`.
+  op is at least `lane_lb`; the op's execution end (`end` below: the completion of a
+  shiftable op, the issue cycle of any other) is at most `horizon - 1 - finish_tail`. For a
+  select on the multiply-add path `end` is the issue cycle; its multiply_add at issue + 1 is
+  not bounded and not checked here. Only issue-cycle domains are tightened in the model.
 * SAT (expected) for the variants the rule deliberately avoids, so the checks can tell a
   wrong bound from a right one:
   - RB-full-tail-for-shiftable: counting shiftable descendants in the tail of a shiftable op.
@@ -382,18 +384,29 @@ def check_old_counting_rule_unsound(ctx=None):
     pushed = _old_counting_rule(asap, alap, chain=[a, b], cap=CAPS["valu"])
     pushed[reader] = max(pushed[reader], pushed[a] + 1)
 
+    unresolved = []
+
     def best(lower_bounds):
         """Shortest makespan with A before or with B (the ordering row) and c >= lower bounds."""
         for makespan in range(1, horizon + 1):
             s, terms = _encode(ops, makespan)
             c = terms["c"]
             s.add(c[a] <= c[b], *[c[i] >= lower_bounds[i] for i in range(len(ops))])
-            if s.check() == sat:
+            outcome = s.check()
+            if outcome == sat:
                 return makespan
+            if outcome != unsat:
+                # A timeout proves nothing about this makespan: the check is then unresolved.
+                unresolved.append((makespan, s.reason_unknown()))
+                return None
         return None
 
     free, restricted = best(asap), best(pushed)
-    result = "sat" if restricted is None or restricted > free else "unsat"
+    if unresolved:
+        return "RB-old-counting-rule", "unknown", time.time() - start, {"unresolved": unresolved}
+    # Every makespan below `free` (and below `restricted`, or up to the horizon) is proved
+    # infeasible, so `free` is a witnessed optimum and the comparison is exact.
+    result = "sat" if free is not None and (restricted is None or restricted > free) else "unsat"
     return "RB-old-counting-rule", result, time.time() - start, {
         "counterexample": {"asap": asap, "old rule": pushed, "best makespan": free, "with the old rule": restricted}}
 

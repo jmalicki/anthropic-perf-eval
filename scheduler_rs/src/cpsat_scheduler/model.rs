@@ -649,9 +649,11 @@ pub fn schedule_ssa_cpsat(
     let mut current_asap = asap.clone();
     let mut current_alap = alap.clone();
 
-    // With checked symmetry rows the emission-declared ordering is not trusted, here either.
+    // The bounds the symmetry-aware pass derives from the declared ordering hold only together
+    // with the ordering rows of section 5b, which are in the model only for `Declared`. With
+    // `None` or `Checked` the model has no such rows, so the ordering is not used here either.
     let symmetry_ordering = if asap_alap_tightening.use_symmetry_ordering()
-        && tuning.symmetry_rows != SymmetryRows::Checked
+        && tuning.symmetry_rows == SymmetryRows::Declared
     {
         Some(SymmetryOrdering::from_bounds(
             ops,

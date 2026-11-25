@@ -426,7 +426,10 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Force 0 integral gap: prove the schedule optimal for the emitted ops (not for the problem)")
     group.add_argument("--asap-alap-tightening", choices=["none", "simple", "symmetry-aware", "energetic"],
                        default="energetic",
-                       help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default: symmetry-aware plus resource-aware earliest/latest cycles, which exclude no schedule)")
+                       help="ASAP/ALAP tightening mode: none, simple (precedence only), symmetry-aware, or energetic (default: symmetry-aware plus resource-aware earliest/latest cycles). "
+                            "The resource-aware part excludes no schedule of the model; the symmetry-aware part "
+                            "is valid only with the declared ordering rows and is skipped unless "
+                            "--cpsat-symmetry-rows is declared")
     group.add_argument("--enable-scratch-tightening", action="store_true",
                        help="Enable scratch-aware tightening (default: disabled; non-default debugging option)")
     group.add_argument("--symmetry-precedence-integrated", action="store_true",

@@ -3308,6 +3308,58 @@ mod resource_tightening_tests {
             );
         }
     }
+
+    /// Two constants of one declared ordering group, both ready at cycle 0, on a machine with
+    /// one load slot and one scalar slot. The first in the group's order feeds one flow op,
+    /// the second feeds two scalar ops.
+    ///
+    /// The best schedule runs the second constant first: it at 0, the other constant and one
+    /// scalar op at 1, the other scalar op and the flow op at 2, three cycles. In the group's
+    /// order (the first constant at 0) the scalar ops run at 2 and 3, four cycles.
+    ///
+    /// With `--cpsat-symmetry-rows none` the model has no ordering rows, so the reversed order
+    /// is a schedule of the model. The symmetry-aware pass (which `energetic` includes) raises
+    /// the earliest cycle of the second op of the group to 1; that is valid only together with
+    /// the ordering rows and must not be applied without them.
+    #[test]
+    fn test_tightening_ignores_the_declared_order_when_its_rows_are_not_in_the_model() {
+        let mut emit = SsaEmitContext::new();
+        let first = emit.emit_const_force(3);
+        let second = emit.emit_const_force(5);
+        let _flow_reader = emit.emit_add_imm(first, 1);
+        let _reader_a = emit.emit_alu(Opcode::Add, second, second);
+        let _reader_b = emit.emit_alu(Opcode::Xor, second, second);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let mut ops = emit.ops;
+        for op in ops.iter_mut().filter(|op| op.opcode == Opcode::Const) {
+            op.symmetry_hint = Some(SymmetryHint { ordering_group: vec![1], lexicographic_stream: None });
+        }
+        assert_eq!(ops.iter().filter(|op| op.symmetry_hint.is_some()).count(), 2);
+
+        let optimum = |tightening: AsapAlapTightening| {
+            let config = SsaCpsatConfig {
+                time_limit_secs: 30.0,
+                verbose: false,
+                enable_valu_shift: true,
+                machine: MachineConfig { load_slots: 1, alu_slots: 1, ..Default::default() },
+                asap_alap_tightening: tightening,
+                force_zero_gap: true,
+                tuning: CpsatTuning { symmetry_rows: SymmetryRows::None, ..Default::default() },
+                ..Default::default()
+            };
+            let result = schedule_ssa_cpsat(&ops, config, SsaCpsatHints::default(), None)
+                .expect("post-solve validation")
+                .expect("a schedule");
+            assert_eq!(result.status, CpsatStatus::Optimal);
+            result.makespan
+        };
+        let reference = optimum(AsapAlapTightening::None);
+        assert_eq!(reference, 3, "the second constant of the group first, then its two readers");
+        for tightening in [AsapAlapTightening::SymmetryAware, AsapAlapTightening::Energetic] {
+            assert_eq!(optimum(tightening), reference, "{:?} must not exclude the optimum", tightening);
+        }
+    }
 }
 
 // ============================================================================

@@ -31,7 +31,10 @@ was read), **argument** (our own reasoning, checked by Z3 where stated).
    better schedules at 6 rounds / batch 64. (measured, Z3)
 5. The correct rule is sound for every schedule of the model, but in this model it has to be
    weaker than the textbook statement in two places, because a shifted op runs lane by lane.
-   (argument, Z3 finds a violating schedule for each stronger variant)
+   (argument, Z3 finds a violating schedule for each stronger variant) This is a statement
+   about the resource-aware pass. `energetic` also runs the symmetry-aware pass, which is
+   valid only together with the declared ordering rows and is skipped when they are not in
+   the model (section 5).
 6. Measured effect of the correct rule on CP-SAT in 120 s: none that exceeds run-to-run noise.
    The gain is that the default no longer excludes good schedules. What did move the result by
    20 or more cycles is the warm start (section 6).
@@ -39,9 +42,12 @@ was read), **argument** (our own reasoning, checked by Z3 where stated).
 ## 2. Why stronger cumulative propagation does not help
 
 A cumulative over tasks of duration 1 and demand 1 with capacity `C` says "at most `C` tasks per
-cycle". That is the upper-bound half of a global cardinality constraint, and it is satisfiable
-exactly when, for every window `[a, b)`, the tasks whose whole domain lies inside the window
-number at most `C * (b - a)` (Quimper et al., CP 2003; a Hall-interval condition).
+cycle". That is the upper-bound half of a global cardinality constraint. When every task's
+domain is an interval of cycles, as ours are (`[ASAP, ALAP]`), it is satisfiable exactly when,
+for every window `[a, b)`, the tasks whose whole domain lies inside the window number at most
+`C * (b - a)` (Quimper et al., CP 2003; a Hall-interval condition). For domains with holes the
+condition is necessary but not sufficient: three tasks with domain `{0, 2}` and capacity 1 pass
+it for every window and cannot be scheduled.
 
 Substituting duration 1 into the energy a task must spend inside a window gives "1 if its domain
 lies inside the window, else 0". So for our engine cumulatives:
@@ -136,8 +142,10 @@ Full analysis: [research/energetic_tightening_root_cause.md](research/energetic_
 
 - `issue_lb(o)`: the ancestor rule of section 3, over all ancestors and six engines (VALU, ALU,
   Load, Store, Flow, and VALU+ALU jointly with a vector op as 8 units against `8 * 6 + 12`);
-- `finish_tail(o)`: the mirror image, so that the op's last cycle is at most
-  `horizon - 1 - finish_tail(o)`.
+- `finish_tail(o)`: the mirror image, so that the op's execution end (the completion of a
+  shiftable op, the issue cycle of any other, as `op_times.rs` defines it) is at most
+  `horizon - 1 - finish_tail(o)`. For a select on the multiply-add path that is the issue
+  cycle, not the multiply_add at issue + 1. Only issue-cycle domains are tightened.
 
 Work is counted with the cheapest encoding (`makespan_rows::min_work`): selects, constants and
 vbroadcasts count nothing because their engine, or whether they run at all, is the solver's
@@ -157,6 +165,18 @@ Z3 finds a schedule of the model that violates each of the two stronger variants
 rule in the code (`RB1` to `RB3`, 120 random graphs with every kind of op plus the two graphs
 that break the variants). The Python port the proof uses is pinned to the Rust code by shared
 test instances (`RB0`).
+
+**What `energetic` does besides this rule.** It also runs the symmetry-aware pass
+(`tighten_asap_by_symmetry_ordering`): the k-th op of a declared ordering group on an engine
+with `cap` slots starts at `ceil(k / cap) - 1` or later. That bound holds only together with
+the declared ordering rows (`sym_ord`), which are in the model only with
+`--cpsat-symmetry-rows declared` (the default) and are themselves not justified by a proven
+symmetry (BUGS.md). With `none` or `checked` the rows are absent, and `schedule_ssa_cpsat` now
+skips the pass; before, `none` still applied the bounds and excluded schedules of the model
+(regression test
+`test_tightening_ignores_the_declared_order_when_its_rows_are_not_in_the_model`). So "excludes
+no schedule" is a property of the resource-aware pass, and of `energetic` as a whole only
+relative to the model with its declared rows.
 
 A first prototype that treated a shifted op as one block reported 11.5 % of start-domain values
 removed at 6 rounds / batch 64. Part of that came from the two unsound assumptions above; the

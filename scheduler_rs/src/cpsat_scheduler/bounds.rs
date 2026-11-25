@@ -275,10 +275,14 @@ pub enum AsapAlapTightening {
     None,
     /// Precedence-only: fixpoint after bounds, no symmetry ordering, no slot exclusions.
     Simple,
-    /// Symmetry-aware slot tightening: ordering + symmetry pass + fixpoint. Safe.
+    /// Symmetry-aware slot tightening: ordering + symmetry pass + fixpoint. Its bounds are
+    /// valid only together with the declared ordering rows (`SymmetryRows::Declared`, which
+    /// are not justified by a proven symmetry; see BUGS.md), so `schedule_ssa_cpsat` skips the
+    /// pass when those rows are not in the model.
     SymmetryAware,
-    /// Default: symmetry-aware plus resource-aware heads and tails (`resource_bounds.rs`;
-    /// soundness checks in `verification/resource_bounds.py`).
+    /// Default: symmetry-aware (same condition) plus resource-aware heads and tails
+    /// (`resource_bounds.rs`). The resource-aware pass excludes no schedule of the model
+    /// (soundness checks in `verification/resource_bounds.py`).
     #[default]
     Energetic,
 }
