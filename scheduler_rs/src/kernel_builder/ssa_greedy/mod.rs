@@ -28,6 +28,7 @@
 //! The CP-SAT scheduler (`cpsat_scheduler.rs`) also honors dead stores by
 //! checking for negative cycle hints (-1) from the greedy scheduler.
 
+pub mod justify;
 pub mod pressure_policy;
 pub mod wavefront;
 pub use wavefront::EarlyStagger;
