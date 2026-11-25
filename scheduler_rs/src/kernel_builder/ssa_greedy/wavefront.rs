@@ -259,7 +259,6 @@ impl Wavefront {
     }
 
     /// Chain rank of an op, `None` for shared ops.
-    #[cfg(test)]
     pub(super) fn chain(&self, idx: usize) -> Option<usize> {
         self.chain[idx]
     }

@@ -48,7 +48,7 @@ from scripts import emission_structure as es  # noqa: E402
 from solver.emission_plan import describe_plan, expand_plan, load_plan  # noqa: E402
 
 CAPPABLE = ("load", "flow", "valu")
-MODES = ("nogood", "caps", "caps-underfilled", "rows")
+MODES = ("nogood", "caps", "caps-underfilled", "rows", "topk-floor", "topk-greedy-model")
 DEFAULT_SEEDS = ("gather", "bits+depth4", "bits-flow+depth4", "mobius+depth4",
                  "docs/emission_plans/floor_optimal.json", "docs/emission_plans/flow90.json")
 
@@ -514,6 +514,30 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
     return best
 
 
+def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str) -> dict:
+    """Plain selection: the k best plans by a stage-1 score that are not built yet, each built
+    and judged by the greedy; the best build wins. `objective` "floor" (the capacity floor, a
+    bound) or "greedy-model" (GREEDY_MODEL, a fitted heuristic). No incumbent bound and no
+    patience stop: all k are built, so the result says how far down the score ranking the
+    greedy's best plan sits."""
+    if objective not in ("floor", "greedy-model"):
+        raise ValueError(f"topk objective {objective!r}")
+    mode = f"topk-{objective}"
+    best = stage2.best()
+    for it in range(k):
+        res = solve(stage2.table, nogoods=_built_nogoods(stage2), time_limit=time_limit,
+                    greedy_model={} if objective == "greedy-model" else None)
+        if res["status"] == "infeasible":
+            _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
+            break
+        rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
+        improved = rec["valid"] and (best is None or rec["cycles"] < best["cycles"])
+        best = rec if improved else best
+        _record(stage2, mode, it, res, rec, built,
+                f"rank {it + 1} by {objective}" + (" (new best)" if improved else ""))
+    return best
+
+
 def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, step: float = 0.04,
               min_step: float = 0.01, saturated: float = 97.0, near_full: float = 0.9,
               rule: str = "saturated", mode: str = "caps") -> dict:
@@ -725,6 +749,27 @@ def resolve_plan(spec: str, ctx: es.Context):
     return os.path.basename(spec), expand_plan(load_plan(path), ctx.rounds, ctx.n_groups, ctx.forest_height)
 
 
+def parse_greedy_options(specs: Sequence[str]) -> dict:
+    """KEY=VALUE strings to build options: ints, floats and true/false are converted."""
+    out = {}
+    for spec in specs:
+        key, sep, value = spec.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--greedy-option {spec!r}: expected KEY=VALUE")
+        if value.lower() in ("true", "false"):
+            out[key] = value.lower() == "true"
+            continue
+        for conv in (int, float):
+            try:
+                out[key] = conv(value)
+                break
+            except ValueError:
+                pass
+        else:
+            out[key] = value
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="emission_structure loop", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -737,6 +782,10 @@ def main(argv=None) -> int:
                     help="add the load-tail greedy flags to the shaped ones: " +
                     " ".join(f"{k}={v}" for k, v in es.LOAD_TAIL_GREEDY.items()) +
                     " (stored in the state; a state refuses a different setting)")
+    ap.add_argument("--greedy-option", action="append", default=[], metavar="KEY=VALUE",
+                    help="greedy build option on top of the shaped (and load-tail) flags, e.g. "
+                         "greedy_budget_force=stall or pressure_inflation_threshold=0.98 (stored in the "
+                         "state like --load-tail)")
     ap.add_argument("--near", type=int, default=30,
                     help="report: the near-optimal subset is the valid builds within this many cycles of the best")
     ap.add_argument("--table", help="cost table JSON (default: the calibrated cache of the context)")
@@ -762,7 +811,10 @@ def main(argv=None) -> int:
     workdir = args.workdir or os.path.join(os.path.dirname(os.path.abspath(args.state)), "builds")
     os.makedirs(workdir, exist_ok=True)
     table = es.load_or_calibrate(ctx, args.table, workdir)
-    greedy_extra = es.LOAD_TAIL_GREEDY if args.load_tail else ({} if args.command == "run" else None)
+    greedy_extra = dict(es.LOAD_TAIL_GREEDY) if args.load_tail else ({} if args.command == "run" else None)
+    if args.greedy_option:
+        greedy_extra = dict(greedy_extra or {})
+        greedy_extra.update(parse_greedy_options(args.greedy_option))
     stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra)
     if args.max_axis:
         stage2.rowtable.max_axis = args.max_axis
@@ -789,6 +841,8 @@ def main(argv=None) -> int:
             elif m in ("caps", "caps-underfilled"):
                 rule = "saturated" if m == "caps" else "underfilled"
                 caps_found = loop_caps(stage2, n_iter, args.patience, args.time_limit, rule=rule, mode=m)["caps"]
+            elif m.startswith("topk-"):
+                loop_topk(stage2, n_iter, args.time_limit, m[len("topk-"):])
             else:
                 loop_rows(stage2, n_iter, args.patience, args.time_limit)
         print(f"{stage2.built_now} plans built in this run, {len(stage2.builds)} in the state")

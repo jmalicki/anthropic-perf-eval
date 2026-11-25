@@ -187,3 +187,27 @@ def test_scratch_budget_failure_is_a_recorded_outcome(table, tmp_path, monkeypat
     monkeypatch.setattr(es, "measure", other_error)
     with pytest.raises(RuntimeError, match="something else"):
         stage2.evaluate(el.resolve_plan("gather", CTX)[1], "seed gather")
+
+
+def test_parse_greedy_options():
+    assert el.parse_greedy_options(["greedy_budget_force=stall", "pressure_inflation_threshold=0.98",
+                                    "greedy_groups_in_flight=32", "greedy_split_shift=true"]) == {
+        "greedy_budget_force": "stall", "pressure_inflation_threshold": 0.98,
+        "greedy_groups_in_flight": 32, "greedy_split_shift": True}
+    with pytest.raises(ValueError):
+        el.parse_greedy_options(["stall"])
+
+
+@pytest.mark.parametrize("objective", ["floor", "greedy-model"])
+def test_topk_builds_distinct_plans_in_score_order(table, tmp_path, objective):
+    """topk builds k different plans, best score first, each PROVED and PASSED under the
+    stall judge, and none over the scratch budget."""
+    judge = dict(es.LOAD_TAIL_GREEDY, greedy_budget_force="stall", pressure_inflation_threshold=0.98)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None, greedy_extra=judge)
+    el.loop_topk(stage2, 2, 20.0, objective)
+    entries = [e for e in stage2.trace if e["mode"] == f"topk-{objective}"]
+    assert len(entries) == 2
+    assert entries[0]["plan"] != entries[1]["plan"]
+    assert entries[0]["objective"] <= entries[1]["objective"]
+    for b in stage2.builds.values():
+        assert b["valid"] and b["peak_live"] <= 1536 and not b["budget_exceeded"]

@@ -80,6 +80,8 @@ pub struct GreedyShape {
     /// Where a SelectChoice that has a one-op `multiply_add` form may run (see
     /// [`SelectOverflow`]).
     pub select_overflow: SelectOverflow,
+    /// Wavefront only: native scalar ops before vector ops (see [`AluPriority`]).
+    pub alu_priority: AluPriority,
     /// When an op the scratch budget check deferred is forced past the budget (see
     /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
     pub budget_force: BudgetForce,
@@ -122,6 +124,21 @@ pub enum FlowPriority {
     /// Flow ops that feed a non-final load (a load that some later load depends on, e.g. a
     /// mid-kernel gather) before the other flow ops, then key.
     FeedsLoadFirst,
+    /// Flow ops by chain (group) rank first, then key; shared ops first. The first groups'
+    /// selects of the first rounds are not overtaken by later groups' earlier selects, so they
+    /// reach their first gather sooner (docs/STARTUP_AND_STALL_LOOP.md).
+    ChainFirst,
+}
+
+/// Wavefront only: the order in which ready scalar-ALU work is offered the 12 scalar slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AluPriority {
+    /// Wavefront key (default): native scalar ops and shiftable vector ops in one order.
+    #[default]
+    Key,
+    /// Native scalar-ALU ops (e.g. address adds) before every vector op of the cycle, so a
+    /// vector op shifted to the scalar ALU never takes a slot a ready native op needs.
+    NativeFirst,
 }
 
 /// Where a SelectChoice with a precomputed delta (one `multiply_add` on the vector ALU, or
@@ -2473,6 +2490,20 @@ fn schedule_ssa_greedy_core(
                 for (&p, idx) in positions.iter().zip(loads) {
                     ready_this_cycle[p] = idx;
                 }
+            }
+            if shape.flow_priority == FlowPriority::ChainFirst {
+                let positions: Vec<usize> = (0..ready_this_cycle.len())
+                    .filter(|&p| ops[ready_this_cycle[p]].engine == Engine::Flow)
+                    .collect();
+                let mut flows: Vec<usize> = positions.iter().map(|&p| ready_this_cycle[p]).collect();
+                flows.sort_by_key(|&idx| (w.chain(idx).map_or(0, |r| r + 1), w.key(idx), idx));
+                for (&p, idx) in positions.iter().zip(flows) {
+                    ready_this_cycle[p] = idx;
+                }
+            }
+            if shape.alu_priority == AluPriority::NativeFirst {
+                // Stable: natives keep their order among themselves, as does everything else.
+                ready_this_cycle.sort_by_key(|&idx| ops[idx].engine != Engine::Alu);
             }
             if shape.flow_priority == FlowPriority::FeedsLoadFirst {
                 // Same for the flow ops (ConstChoice is a load-engine op in the SSA).

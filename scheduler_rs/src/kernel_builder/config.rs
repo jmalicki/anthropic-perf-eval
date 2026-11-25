@@ -750,6 +750,8 @@ pub struct CompilerConfig {
     pub greedy_select_overflow: super::ssa_greedy::SelectOverflow,
     /// Scratch model `words`: when a budget-deferred op is forced (default: `SameCycle`).
     pub greedy_budget_force: super::ssa_greedy::BudgetForce,
+    /// Wavefront: native scalar ops before vector ops on the scalar ALU (default: `Key`).
+    pub greedy_alu_priority: super::ssa_greedy::AluPriority,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -780,6 +782,7 @@ impl Default for CompilerConfig {
             greedy_flow_priority: super::ssa_greedy::FlowPriority::Key,
             greedy_select_overflow: super::ssa_greedy::SelectOverflow::Never,
             greedy_budget_force: super::ssa_greedy::BudgetForce::SameCycle,
+            greedy_alu_priority: super::ssa_greedy::AluPriority::Key,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -884,6 +887,7 @@ impl CompilerConfig {
             flow_priority: self.greedy_flow_priority,
             select_overflow: self.greedy_select_overflow,
             budget_force: self.greedy_budget_force,
+            alu_priority: self.greedy_alu_priority,
             shift_policy: {
                 use super::ssa_greedy::ShiftPolicy;
                 let target = self.greedy_shift_target;
