@@ -111,8 +111,8 @@ Surrogate ranking (Spearman of score vs greedy cycles over all builds, full tabl
 | VALU cycles left after the greedy's shifts (post-build) | +0.98 | +0.91 | +0.97 | +0.89 |
 
 **GREEDY_MODEL under this judge** (`scripts/greedy_model_fit.py` on
-`docs/emission_plans/greedy_model_data_stall.json`: the earlier stall-judge loop builds as the
-fit set, the 53 top-k builds made afterwards as a held-out set). Refit on 41 index-bit plans
+`docs/emission_plans/greedy_model_data.json`, judge `stall-0.98`: the earlier stall-judge loop
+builds as the fit set, the top-k builds made afterwards as a held-out set). Refit on 41 index-bit plans
 under 1,200 cycles: a_floor 52, a_load 13, b_flow 0.80, flow0 900 (checked-in, fitted on the
 default judge: 32, 19, 0.75, 900). Leave-one-out MAE 5.6 (max 18), but the model's form was
 chosen on earlier plans of the same kind, and leave-one-out uses the plans the constants are
@@ -120,8 +120,9 @@ scored on. **Held out**: index MAE 14.5 (optimistic by 11.6 on average, 23 plans
 path MAE 62.3 (always optimistic, 21 plans). Checked-in constants on the earlier stall-judge
 index plans: MAE 9.4; constants fitted on the default judge vs refitted on the stall judge
 differ mainly in a_floor (+20). So: the judge change moves the constants; the model is a weak
-ranker near the best under either judge and fails out of sample on path bits. The checked-in
-constants are unchanged (they still describe the default judge).
+ranker near the best under either judge and fails out of sample on path bits. The refit is checked
+in as `es.GREEDY_MODEL_STALL` (reproduced by `greedy_model_fit.py --judge stall-0.98 --check`);
+`es.GREEDY_MODEL` is unchanged (it describes the default judge).
 
 ## B. The start-up
 
@@ -225,7 +226,7 @@ uv run python -m scripts.emission_structure loop run --select-bit-source path --
   --modes topk-floor,topk-greedy-model --budget 14 --per-level 1 --deterministic-time 5 \
   --count-limit 100 --json report.json
 # GREEDY_MODEL under this judge (fit set + held-out set as in section A):
-uv run python -m scripts.greedy_model_fit --data docs/emission_plans/greedy_model_data_stall.json
+uv run python -m scripts.greedy_model_fit --judge stall-0.98 --check
 ```
 
 About 85 loop builds and 30 start-up builds, one at a time.
