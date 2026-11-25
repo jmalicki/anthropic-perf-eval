@@ -2,6 +2,7 @@
 
 This document is the **canonical design reference** for slot-based tightening of scheduling bounds (ASAP/ALAP). It defines the guarantee we want, which rules are safe or unsafe, and how the implementation behaves.
 
+- **What `energetic` does since November 2026, and why:** [ENERGETIC_REASONING_FOR_UNIT_TASKS.md](ENERGETIC_REASONING_FOR_UNIT_TASKS.md). The energetic slot loop described below (contributing-only undercounting over ordering groups) excluded feasible schedules and was replaced by resource-aware heads and tails (`cpsat_scheduler/resource_bounds.rs`), which use no ordering and exclude no schedule (`verification/resource_bounds.py`). Where this document says "energetic slot loop", read it as history.
 - **Deep dive (recommended for newcomers):** [ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md](ENERGETIC_SLOT_TIGHTENING_DEEP_DIVE.md) — explains from first principles why energetic tightening broke, the algorithm in detail, and fix options.
 - **T7 counterexample investigation (2r/16b, 368 vs 36 cycles, Z3 proofs):** [SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md](SLOT_TIGHTENING_T7_COUNTEREXAMPLE.md).
 

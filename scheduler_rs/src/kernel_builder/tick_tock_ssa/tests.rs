@@ -2273,8 +2273,6 @@ fn test_split_shift_ignored_when_cpsat_follows() {
             crate::cpsat_scheduler::AsapAlapTightening::Energetic,
             false, // enable_scratch_tightening
             false, // symmetry_precedence_integrated
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
             false, // precedence_neutral_horizon
             None,  // disable_optional_constraint_groups
             true,  // enable_cse_groups
@@ -2321,8 +2319,6 @@ fn test_split_shift_hint_reaches_cpsat() {
             crate::cpsat_scheduler::AsapAlapTightening::Energetic,
             false, // enable_scratch_tightening
             false, // symmetry_precedence_integrated
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
             false, // precedence_neutral_horizon
             None,  // disable_optional_constraint_groups
             true,  // enable_cse_groups
@@ -2581,8 +2577,6 @@ fn cpsat_with_scratch(scratch_size: usize, scratch_constraint: bool) -> SsaSched
             crate::cpsat_scheduler::AsapAlapTightening::Energetic,
             false, // enable_scratch_tightening
             false, // symmetry_precedence_integrated
-            false, // energetic_alap_pulls
-            None,  // energetic_bounded_push_k
             false, // precedence_neutral_horizon
             None,  // disable_optional_constraint_groups
             true,  // enable_cse_groups
@@ -2641,8 +2635,6 @@ fn test_invalid_pressure_threshold_rejected_by_builder() {
                 crate::cpsat_scheduler::AsapAlapTightening::Energetic,
                 false,
                 false,
-                false,
-                None,
                 false,
                 None,
                 true,
@@ -4261,8 +4253,6 @@ fn test_cpsat_two_phase_hint_schedule_within_budget() {
         crate::cpsat_scheduler::AsapAlapTightening::None,
         false, // enable_scratch_tightening
         false, // symmetry_precedence_integrated
-        false, // energetic_alap_pulls
-        None,  // energetic_bounded_push_k
         false, // precedence_neutral_horizon
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
@@ -4434,8 +4424,6 @@ fn test_depth4_cpsat() {
         crate::cpsat_scheduler::AsapAlapTightening::None,
         false, // enable_scratch_tightening
         false, // symmetry_precedence_integrated
-        false, // energetic_alap_pulls
-        None,  // energetic_bounded_push_k
         false, // precedence_neutral_horizon
         None,  // disable_optional_constraint_groups
         true,  // enable_cse_groups
@@ -4491,8 +4479,6 @@ fn test_makespan_rows_keep_the_greedy_hint() {
             AsapAlapTightening::Energetic,
             false,
             false,
-            false,
-            None,
             false,
             None,
             true,  // enable_cse_groups
