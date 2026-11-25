@@ -109,7 +109,9 @@ pub enum BudgetForce {
     /// Force one deferred op per cycle whenever it has a slot (default).
     #[default]
     SameCycle,
-    /// Force only when nothing else was placed in the cycle.
+    /// Force only when nothing else was placed in the cycle. Not necessarily a deadlock: a
+    /// cycle can be empty because ASAP inflation deferred every op that would free words for a
+    /// few cycles (docs/STALL_DEADLOCK.md).
     Stall,
 }
 
@@ -2318,6 +2320,10 @@ fn schedule_ssa_greedy_core(
     // Ready heap: (priority, op_idx) - min-heap via Reverse
     // Priority is the earliest cycle this op can be scheduled (ASAP)
     let mut ready_heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
+    // SCHEDULER_DEADLOCK_DUMP=path: write the state at the first cycle `stall` forces (see
+    // `dump_deadlock_state`). A debugging aid; off unless the variable is set.
+    let deadlock_dump_path = std::env::var("SCHEDULER_DEADLOCK_DUMP").ok();
+    let mut deadlock_dumped = false;
 
     // Initialize with ops that have no dependencies (excluding dead stores)
     for (idx, op) in ops.iter().enumerate() {
@@ -3294,6 +3300,28 @@ fn schedule_ssa_greedy_core(
             diagnostics.split_only_cycles += 1;
         }
         if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
+            if let (Some(path), false, false) = (deadlock_dump_path.as_ref(), deadlock_dumped, force_same_cycle) {
+                deadlock_dumped = true;
+                let state = serde_json::json!({
+                    "cycle": cycle,
+                    "live_words": live.words,
+                    "budget": scratch_budget,
+                    "live": live_vregs.iter().map(|v| serde_json::json!({
+                        "vreg": v.id, "words": v.size(),
+                        "remaining_users": vreg_remaining_users.get(v).copied().unwrap_or(0),
+                    })).collect::<Vec<_>>(),
+                    "budget_deferred": budget_deferred.iter().map(|&i| ops[i].id).collect::<Vec<_>>(),
+                    "heap": ready_heap.iter().map(|Reverse((pri, i))| serde_json::json!({
+                        "id": ops[*i].id, "ready_at": pri,
+                        "in_window": wavefront.as_ref().map_or(true, |w| w.in_window(*i)),
+                    })).collect::<Vec<_>>(),
+                    "slots": {"valu": slots.valu_used, "alu": slots.alu_used, "load": slots.load_used,
+                              "flow": slots.flow_used, "store": slots.store_used},
+                });
+                if let Err(e) = std::fs::write(path, state.to_string()) {
+                    eprintln!("SCHEDULER_DEADLOCK_DUMP: cannot write {}: {}", path, e);
+                }
+            }
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
