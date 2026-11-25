@@ -288,18 +288,20 @@ def test_greedy_split_shift():
     assert builds[True][1]["cycles"] <= builds[False][1]["cycles"]
 
 
-def test_greedy_justify():
-    """PyO3: greedy_justify=N is accepted, never lengthens the greedy schedule, and the kernel is correct."""
+def test_greedy_justify(capfd):
+    """PyO3: greedy_justify=N reaches the greedy pass, never lengthens the schedule, and the kernel is correct."""
     import scheduler_rs
 
     cycles = {}
+    ran = {}
     for justify in (0, 5):
         forest = Tree.generate(FOREST_HEIGHT)
         inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
         mem = build_mem_image(forest, inp)
+        capfd.readouterr()
         instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
             FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
-            verbose=False,
+            verbose=True,
             use_cpsat=False,
             greedy_barriers="none",
             greedy_priority="wavefront",
@@ -310,6 +312,9 @@ def test_greedy_justify():
         assert max(_alu_slots_per_cycle(instrs)) <= 12
         _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
         cycles[justify] = stats["cycles"]
+        # The pass prints one summary line when it runs ("Greedy justify: A -> B cycles ...").
+        ran[justify] = "Greedy justify:" in "".join(capfd.readouterr())
+    assert ran == {0: False, 5: True}, "the option reaches the greedy pass, which is off by default"
     # Whether a shorter schedule is found is a heuristic outcome (the Rust tests cover a case
     # where one must be); the interface guarantee is that the result is never longer.
     assert cycles[5] <= cycles[0], "justification never lengthens the greedy schedule"
@@ -331,6 +336,7 @@ def test_greedy_justify_with_cpsat(tmp_path, capfd):
     forest_height, n_nodes, batch_size, rounds = 10, 2047, 16, 2
     cycles = {}
     hint = {}
+    solver_hint = {}
     for justify in (0, 10):
         forest = Tree.generate(forest_height)
         inp = Input.generate(forest, batch_size, rounds)
@@ -358,11 +364,17 @@ def test_greedy_justify_with_cpsat(tmp_path, capfd):
         assert report.ok, report.findings[:3]
         cycles[justify] = stats["cycles"]
         hint[justify] = re.search(r"Pass GreedyJustify completed in [^:]*: (\d+) -> (\d+) cycles", log)
+        # What reaches the solver: the hint schedule's length as the model reports it, and
+        # CP-SAT's own verdict on the hint.
+        solver_hint[justify] = int(re.search(r"Before optimization: (\d+) cycles", log).group(1))
+        assert "The solution hint is complete and is feasible" in log
     assert hint[0] is None, "the pass does not run by default"
     assert hint[10] is not None, "the pass runs before CP-SAT"
     before, after = (int(g) for g in hint[10].groups())
     assert after <= before
-    assert cycles[10] <= after, "CP-SAT starts from the justified schedule"
+    assert solver_hint[10] == after, "the justified schedule is the hint CP-SAT receives"
+    assert solver_hint[0] == before, "without the pass CP-SAT receives the greedy schedule"
+    assert cycles[10] <= after, "the result is no longer than the hint"
     assert cycles[10] <= cycles[0], "not longer than the same build without justification"
 
 

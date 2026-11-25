@@ -248,7 +248,8 @@ impl Pass for GreedySchedulePass {
 /// checks (slot capacities, precedences, memory edges, scratch).
 ///
 /// Shift decisions change only when the greedy owned them (shifting enabled, no forced
-/// shift encoding, no hint pass, no fixed-choices reschedule); split shifts are used
+/// shift encoding or individually forced shifts, no hint pass, no fixed-choices
+/// reschedule); split shifts are used
 /// under the same condition as in `GreedySchedulePass`. When CP-SAT follows, an accepted
 /// schedule must also keep every op inside its ASAP/ALAP domain, since it becomes the hint.
 pub struct GreedyJustifyPass;
@@ -290,9 +291,19 @@ impl Pass for GreedyJustifyPass {
         #[cfg(not(feature = "cpsat"))]
         let is_cpsat_pipeline = false;
 
+        // Individually forced shifts (what-if runs) are hard constraints of the CP-SAT model
+        // that the greedy does not see; with any of them set the pass keeps every op's
+        // encoding, so it cannot move a forced op back to a vector slot.
+        #[cfg(feature = "cpsat")]
+        let has_forced_shifts =
+            ctx.config.cpsat.as_ref().is_some_and(|c| c.forced_shifts.as_ref().is_some_and(|ids| !ids.is_empty()));
+        #[cfg(not(feature = "cpsat"))]
+        let has_forced_shifts = false;
+
         let forced = ForcedEncodings::from_context(ctx);
         let allow_shift_changes = compiler.enable_valu_shift
             && forced.shifted_ops.is_none()
+            && !has_forced_shifts
             && !compiler.enable_valu_shift_hint_pass
             && !compiler.enable_const_choice_hint_pass
             && !compiler.enable_select_choice_hint_pass
