@@ -378,6 +378,37 @@ def test_greedy_justify_with_cpsat(tmp_path, capfd):
     assert cycles[10] <= cycles[0], "not longer than the same build without justification"
 
 
+def test_greedy_justify_is_skipped_with_forced_shifts(capfd):
+    """PyO3: with individually forced shifts (what-if runs) the justification pass does not run.
+
+    The greedy does not see forced shifts, and its length sets the CP-SAT horizon and latest
+    cycles; the pass must not shorten a schedule that may not be one of that model.
+    """
+    import scheduler_rs
+
+    forest_height, n_nodes, batch_size, rounds = 10, 2047, 16, 2
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+    capfd.readouterr()
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height, n_nodes, batch_size, rounds,
+        verbose=True,
+        use_cpsat=True,
+        cpsat_time_limit=600.0,
+        cpsat_deterministic_time=5.0,
+        greedy_barriers="none",
+        greedy_priority="wavefront",
+        greedy_justify=10,
+        forced_shifts=[0],
+    )
+    log = "".join(capfd.readouterr())
+    assert "Pass GreedyJustify completed" in log
+    assert "skipped: individually forced shifts are set" in log
+    assert not stats.get("budget_exceeded", False)
+    _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
 def test_cpsat_split_shift_hint():
     """PyO3: with cpsat_split_shift_hint the split-shift greedy schedule is accepted by CP-SAT and the kernel is correct."""
     import scheduler_rs

@@ -550,7 +550,8 @@ with CP-SAT.
   to the per-section repair where the greedy's would not; that has not been observed or
   measured.
 - Shift decisions change only when the greedy owned them (no forced shift encoding, no hint
-  pass); ALU-derived constants and eliminated vbroadcasts make the pass skip.
+  pass); ALU-derived constants, eliminated vbroadcasts and individually forced shifts
+  (what-if runs, whose forced set the greedy does not see) make the pass skip.
 
 ```bash
 # 16 x 256: 1,279 cycles (1,281 on the simulator), PROVED and PASSED
