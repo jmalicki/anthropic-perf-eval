@@ -13,14 +13,25 @@ schedule's slots without a counterfactual build.
 
 ## Answers
 
-- **A, loop under the stall judge: negative.** No plan beats the baselines. Index bits: 45
-  builds, best **1,039** (four plans tie, `flow90.json` among them). Path bits: 40 builds, best
+- **A, loop under the stall judge: negative.** No plan beats the baselines. Index bits: 73
+  builds, best **1,039** (four plans tie, `flow90.json` among them). Path bits: 68 builds, best
   **1,034**, which is `path_flow90.json` itself under this judge (1,033 under the default one).
   The judge changes the path loop's own plans a lot (best non-seed plan 1,099 in the earlier
-  loop, 1,042 now) but not the winner. Top-k selection: the k = 8 best plans by floor run 1,069
-  to 1,074 (index) and 1,064 to 1,108 (path); the 8 best by the greedy model run 1,046 to 1,067
-  and 1,050 to 1,070. **Budget:** none of the 85 builds failed or exceeded the budget; peak 1,465
-  (index) and 1,535 (path, exactly at the 1,535 assignable words) words.
+  loop, 1,042 now) but not the winner.
+  **Top-k by score** (corrected after review: the first version built 8 plans that all shared
+  the optimal score, i.e. members of one tie plateau, not ranks 1 to 8): one plan per score
+  level for 14 levels per objective, each judged by the greedy. Index, floor 989 to 1,002:
+  1,051 to 1,334 cycles; greedy model 1,030 to 1,043: 1,052 to 1,423. Path, floor 973 to 986:
+  1,066 to 1,246; greedy model 1,011 to 1,025: 1,055 to 1,481. None beats the baselines. The
+  best known plans score 997 / 1,043 (index, floor / model) and 980 / 1,023 (path), and **at
+  least 100 plans score at or below each of them** (counted up to 100), so with these scores a
+  top-k needs k > 100 to be guaranteed to include them: stage-1 scores do not rank plans finely
+  enough.
+  **Budget: stall + 0.98 is not safe on every plan.** 3 of the 28 new path-bit builds fail the
+  scratch budget (peaks 1,761, 1,809, 1,817): the greedy reaches a cycle where nothing can be
+  placed at 1,528 live words (a real deadlock), forces an op and stays over budget for 265 to
+  874 cycles. 0 of the index builds and 0 of the 85 earlier builds fail. They are recorded as
+  failed plans, not tuned around.
 - **B, start-up: 1,033 -> 1,030** (1,032 simulated; PROVED, PASSED, `check_upstream.sh
   --strict`) with two wavefront orderings behind new flags, `--greedy-flow-priority chain-first`
   and `--greedy-alu-priority native-first`. Measured by removal: chain-first alone 1,031,
@@ -57,35 +68,60 @@ load engine bought 0).
 
 Judge: shaped flags + load tail (`greedy_load_priority=final-last, greedy_groups_in_flight=32,
 greedy_stagger_cycles=9`) + `greedy_budget_force=stall, pressure_inflation_threshold=0.98`
-(`--greedy-option`, new). Seeds: the six default seeds plus `path_flow90.json` and
-`path_nogood_capped0.json`. Phases: modes `nogood,caps,caps-underfilled,rows` (budget 8 each);
-`nogood` under `flow=0.92`; then `topk-floor,topk-greedy-model` (new, k = 8). Stage-1 solves
-have a 60 s wall-clock limit (as in the earlier loops), so plans past the first may depend on
-machine load; the builds themselves are deterministic.
+(`--greedy-option`, new; keys are validated: an option the build does not read, or one the loop
+fixes such as `rounds` or `use_greedy`, is an error). Seeds: the six default seeds plus
+`path_flow90.json` and `path_nogood_capped0.json`. Phases: modes `nogood,caps,caps-underfilled,
+rows` (budget 8 each); `nogood` under `flow=0.92`; then the top-k rerun below. The first
+phases' stage-1 solves had a 60 s wall-clock limit, so their plans past the first may depend on
+machine load; the top-k rerun uses deterministic-time solves; the builds are deterministic.
 
 | | Index bits | Path bits |
 |---|---|---|
-| builds | 45 | 40 |
+| builds | 73 | 68 |
 | best | 1,039 (`flow90.json`, `caps-underfilled2/3`, `nogood-capped0`) | 1,034 (`path_flow90.json`) |
 | best loop plan (not a seed) | 1,039 | 1,042 (`nogood-capped2`) |
-| top-8 by floor | 1,069 to 1,074 | 1,064 to 1,108 |
-| top-8 by greedy model | 1,046 to 1,067 | 1,050 to 1,070 |
-| failed / over budget | 0 / 0 | 0 / 0 |
-| peak live scratch | 1,057 to 1,465 | 1,057 to 1,535 |
+| top-k, floor, 14 levels | scores 989 to 1,002: 1,051 to 1,334 | scores 973 to 986: 1,066 to 1,246 (1 failed) |
+| top-k, greedy model, 14 levels | scores 1,030 to 1,043: 1,052 to 1,423 | scores 1,011 to 1,025: 1,055 to 1,481 (2 failed, 1 level skipped) |
+| plans scoring at or below the best known plan | floor 997: 100+; model 1,043: 100+ | floor 980: 100+; model 1,023: 100+ |
+| failed / over budget | 0 / 0 | 3 / 3 (peaks 1,761 to 1,817: deadlock at the budget) |
+| peak live scratch (incl. the zero word) | 1,057 to 1,473 | 1,057 to 1,536 |
 
-Surrogate ranking (Spearman of score vs greedy cycles; full tables in
+**Top-k, corrected.** The first version built the 8 unbuilt plans the solver returned in turn;
+all 8 shared the optimal score (989 index floor, 973 path floor, 1,030 / 1,011 by the model),
+so they were 8 members of one tie plateau, not ranks 1 to 8, and `flow90.json` (model score
+1,043) was out of reach. `loop_topk` now enumerates score levels: for level L it asks for an
+unbuilt plan with score <= L and objective >= L and builds it only if the plan's own score
+(`plan_score`) is exactly L. The objective variable is only an upper relaxation of a plan's
+score, so `objective >= L` alone returns plans below L (an earlier attempt asserted on exactly
+that); a plan below L is excluded and the solve repeated, at most 20 times (one path level, 1,024
+by the model, was skipped that way). No-goods are per model point (`plan_model_key`, the
+per-(round, encoding) group counts): plans that differ only in which groups use an encoding
+are one plan. With one plan per level and 14 levels, the greedy's cycles do not fall with the
+score: the floor and the model do not order plans at this resolution, and at least 100 plans
+(the count's limit) score at or below each best known plan.
+
+Surrogate ranking (Spearman of score vs greedy cycles over all builds, full tables in
 `docs/emission_plans/loop_report_stall_{index,path}.json`):
 
-| Surrogate | Index all (45) | Index within 30 (22) | Path all (40) | Path within 30 (18) |
+| Surrogate | Index all (73) | Index within 30 (38) | Path all (65) | Path within 30 (22) |
 |---|---|---|---|---|
-| floor | -0.02 | -0.18 | -0.01 | -0.63 |
-| capped floor `flow=0.9` | +0.46 | +0.08 | +0.66 | +0.35 |
-| greedy model (GREEDY_MODEL) | +0.92 | +0.43 | +0.81 | +0.46 |
-| VALU cycles left after the greedy's shifts (post-build) | +0.99 | - | +0.99 | - |
+| floor | -0.07 | -0.21 | +0.18 | -0.29 |
+| capped floor `flow=0.9` | +0.28 | +0.02 | +0.60 | +0.41 |
+| greedy model (GREEDY_MODEL) | +0.67 | +0.34 | +0.35 | +0.41 |
+| VALU cycles left after the greedy's shifts (post-build) | +0.98 | +0.91 | +0.97 | +0.89 |
 
-The greedy model ranks plans well overall but not near the best, so a top-k by it finds
-good plans (1,046 / 1,050) and not the best one; the floor ranks near-best path plans
-backwards.
+**GREEDY_MODEL under this judge** (`scripts/greedy_model_fit.py` on
+`docs/emission_plans/greedy_model_data_stall.json`: the earlier stall-judge loop builds as the
+fit set, the 53 top-k builds made afterwards as a held-out set). Refit on 41 index-bit plans
+under 1,200 cycles: a_floor 52, a_load 13, b_flow 0.80, flow0 900 (checked-in, fitted on the
+default judge: 32, 19, 0.75, 900). Leave-one-out MAE 5.6 (max 18), but the model's form was
+chosen on earlier plans of the same kind, and leave-one-out uses the plans the constants are
+scored on. **Held out**: index MAE 14.5 (optimistic by 11.6 on average, 23 plans under 1,200),
+path MAE 62.3 (always optimistic, 21 plans). Checked-in constants on the earlier stall-judge
+index plans: MAE 9.4; constants fitted on the default judge vs refitted on the stall judge
+differ mainly in a_floor (+20). So: the judge change moves the constants; the model is a weak
+ranker near the best under either judge and fails out of sample on path bits. The checked-in
+constants are unchanged (they still describe the default judge).
 
 ## B. The start-up
 
@@ -186,7 +222,10 @@ uv run python -m scripts.emission_structure loop run --select-bit-source path --
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
   --nogood-caps flow=0.92 --modes nogood --budget 8
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
-  --modes topk-floor,topk-greedy-model --budget 8 --json report.json
+  --modes topk-floor,topk-greedy-model --budget 14 --per-level 1 --deterministic-time 5 \
+  --count-limit 100 --json report.json
+# GREEDY_MODEL under this judge (fit set + held-out set as in section A):
+uv run python -m scripts.greedy_model_fit --data docs/emission_plans/greedy_model_data_stall.json
 ```
 
 About 85 loop builds and 30 start-up builds, one at a time.
