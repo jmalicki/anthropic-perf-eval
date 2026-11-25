@@ -288,6 +288,84 @@ def test_greedy_split_shift():
     assert builds[True][1]["cycles"] <= builds[False][1]["cycles"]
 
 
+def test_greedy_justify():
+    """PyO3: greedy_justify=N is accepted, never lengthens the greedy schedule, and the kernel is correct."""
+    import scheduler_rs
+
+    cycles = {}
+    for justify in (0, 5):
+        forest = Tree.generate(FOREST_HEIGHT)
+        inp = Input.generate(forest, BATCH_SIZE, ROUNDS)
+        mem = build_mem_image(forest, inp)
+        instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+            FOREST_HEIGHT, N_NODES, BATCH_SIZE, ROUNDS,
+            verbose=False,
+            use_cpsat=False,
+            greedy_barriers="none",
+            greedy_priority="wavefront",
+            greedy_split_shift=True,
+            greedy_justify=justify,
+        )
+        assert not stats.get("budget_exceeded", False)
+        assert max(_alu_slots_per_cycle(instrs)) <= 12
+        _run_kernel_and_assert_matches_reference(instrs, mem, BATCH_SIZE)
+        cycles[justify] = stats["cycles"]
+    # Whether a shorter schedule is found is a heuristic outcome (the Rust tests cover a case
+    # where one must be); the interface guarantee is that the result is never longer.
+    assert cycles[5] <= cycles[0], "justification never lengthens the greedy schedule"
+
+
+def test_greedy_justify_with_cpsat(tmp_path, capfd):
+    """PyO3: with CP-SAT following, the justified greedy schedule is the hint CP-SAT starts from.
+
+    2 rounds, batch 16, deterministic-time budget. The kernel must be proved equal to its SSA
+    program and match the reference, the justified hint must be accepted (the final schedule is
+    no longer than it), and the build must not be longer than the same build without
+    justification.
+    """
+    import re
+
+    import scheduler_rs
+    from verification.kernel_dataflow import check
+
+    forest_height, n_nodes, batch_size, rounds = 10, 2047, 16, 2
+    cycles = {}
+    hint = {}
+    for justify in (0, 10):
+        forest = Tree.generate(forest_height)
+        inp = Input.generate(forest, batch_size, rounds)
+        mem = build_mem_image(forest, inp)
+        sched_path = tmp_path / f"sched_{justify}.json"
+        capfd.readouterr()
+        instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+            forest_height, n_nodes, batch_size, rounds,
+            verbose=True,
+            use_cpsat=True,
+            cpsat_time_limit=600.0,
+            cpsat_deterministic_time=5.0,
+            greedy_barriers="none",
+            greedy_priority="wavefront",
+            greedy_justify=justify,
+            output_json=str(sched_path),
+        )
+        log = "".join(capfd.readouterr())
+        assert "stopped on the wall-clock limit" not in log
+        assert not stats.get("budget_exceeded", False)
+        assert max(_alu_slots_per_cycle(list(instrs))) <= 12
+        _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+        with open(sched_path) as f:
+            report = check({"instrs": json.loads(json.dumps(list(instrs)))}, json.load(f))
+        assert report.ok, report.findings[:3]
+        cycles[justify] = stats["cycles"]
+        hint[justify] = re.search(r"Pass GreedyJustify completed in [^:]*: (\d+) -> (\d+) cycles", log)
+    assert hint[0] is None, "the pass does not run by default"
+    assert hint[10] is not None, "the pass runs before CP-SAT"
+    before, after = (int(g) for g in hint[10].groups())
+    assert after <= before
+    assert cycles[10] <= after, "CP-SAT starts from the justified schedule"
+    assert cycles[10] <= cycles[0], "not longer than the same build without justification"
+
+
 def test_cpsat_split_shift_hint():
     """PyO3: with cpsat_split_shift_hint the split-shift greedy schedule is accepted by CP-SAT and the kernel is correct."""
     import scheduler_rs
