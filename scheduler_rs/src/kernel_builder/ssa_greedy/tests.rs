@@ -3270,14 +3270,15 @@ impl PressurePolicy for NeverShiftPolicy {
 /// not recorded as shifted and at most 12 scalar slots (scalar ops plus 8 per recorded shift).
 ///
 /// # Returns
-/// `(max unshifted vector ops in a cycle, max scalar slots in a cycle, recorded shifts)`.
+/// `(max unshifted vector ops in a cycle, max scalar slots in a cycle, recorded shifts,
+/// budget exceeded)`.
 fn schedule_with_shift_fixed_to_none(
     budget: usize,
     policy: &dyn PressurePolicy,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, bool) {
     let (mut emit, _) = emit_independent_chains(30, 12);
     let mut shifted = HashSet::new();
-    let _ = schedule_ssa_greedy_shaped(
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
         &mut emit.ops,
         true,
         &mut shifted,
@@ -3317,6 +3318,7 @@ fn schedule_with_shift_fixed_to_none(
         valu.values().copied().max().unwrap_or(0),
         alu.values().copied().max().unwrap_or(0),
         shifted.len(),
+        budget_exceeded,
     )
 }
 
@@ -3325,7 +3327,8 @@ fn schedule_with_shift_fixed_to_none(
 /// a seventh vector op. Budget 1536: nothing is forced.
 #[test]
 fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit() {
-    let (valu, alu, shifts) = schedule_with_shift_fixed_to_none(1536, &GreedyPolicy);
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(1536, &GreedyPolicy);
+    assert!(!exceeded, "budget 1536 forces nothing");
     assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
     assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
     assert_eq!(shifts, 0, "the hint pass owns the shift decision");
@@ -3336,7 +3339,8 @@ fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit() {
 /// and there an op that did not fit used to be marked scheduled with no slot.
 #[test]
 fn test_valu_shift_fixed_to_none_keeps_vector_slot_limit_when_force_scheduling() {
-    let (valu, alu, shifts) = schedule_with_shift_fixed_to_none(80, &NeverShiftPolicy);
+    let (valu, alu, shifts, exceeded) = schedule_with_shift_fixed_to_none(80, &NeverShiftPolicy);
+    assert!(exceeded, "budget 80 must force ops through the force path");
     assert!(valu <= 6, "a cycle has {} unshifted vector ops", valu);
     assert!(alu <= 12, "a cycle uses {} scalar slots", alu);
     assert_eq!(shifts, 0, "the hint pass owns the shift decision");
