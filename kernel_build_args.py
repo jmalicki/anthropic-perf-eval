@@ -568,6 +568,38 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     return group
 
 
+def check_greedy_shape_combinations(get) -> None:
+    """Reject greedy shape options that would be silently ignored (same rules as Rust's
+    `config::check_greedy_shape_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-select-overflow-limit without --greedy-select-overflow valu;
+            --greedy-flow-priority other than key without --greedy-priority wavefront;
+            --greedy-select-overflow valu when a fixed select encoding (--select-choice fma or
+            vselect), the select-choice hint pass (--select-choice-hint-pass, --hint-passes) or
+            --schedule-with-fixed-choices owns the select encoding.
+    """
+    overflow = get("greedy_select_overflow", "never")
+    if get("greedy_select_overflow_limit") is not None and overflow != "valu":
+        raise ValueError("--greedy-select-overflow-limit needs --greedy-select-overflow valu; otherwise it is ignored")
+    flow_priority = get("greedy_flow_priority", "key")
+    if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    if overflow == "valu":
+        select_choice = get("select_choice", "optimize")
+        if select_choice != "optimize":
+            owner = f"--select-choice {select_choice}"
+        elif get("hint_passes", False) or get("enable_select_choice_hint_pass", False):
+            owner = "the select-choice hint pass (--select-choice-hint-pass / --hint-passes)"
+        elif get("enable_schedule_with_fixed_choices", False):
+            owner = "--schedule-with-fixed-choices"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-select-overflow valu is ignored when {owner} owns the select encoding")
+
+
 def args_to_build_kwargs(
     args=None,
     *,
@@ -595,6 +627,7 @@ def args_to_build_kwargs(
             return getattr(args, name, default)
         return default
 
+    check_greedy_shape_combinations(get)
     forest_height = get("forest_height", 10)
     n_nodes_val = get("n_nodes")
     n_nodes = n_nodes_val if n_nodes_val is not None else _n_nodes(forest_height)

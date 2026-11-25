@@ -1185,6 +1185,16 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let greedy_priority = crate::kernel_builder::config::GreedyPriorityKind::from_str(greedy_priority)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    crate::kernel_builder::config::check_greedy_shape_combinations(
+        greedy_priority,
+        greedy_flow_priority,
+        greedy_select_overflow,
+        greedy_select_overflow_limit,
+        select_choice,
+        enable_select_choice_hint_pass,
+        enable_schedule_with_fixed_choices,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
     if let Some(dtime) = cpsat_deterministic_time {
         if !(dtime.is_finite() && dtime > 0.0) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
