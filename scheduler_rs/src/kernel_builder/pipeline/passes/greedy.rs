@@ -320,24 +320,6 @@ impl Pass for GreedyJustifyPass {
             announce(ctx, &summary);
             return Ok(summary);
         }
-        // `--greedy-const-policy` derives constants on the scalar ALU from producers that are
-        // still live where the greedy placed the derivation. Justification would move both
-        // without modelling the derivation's reads (precedence on its producers, their
-        // lifetimes in the scratch check and in address assignment), so it does not run.
-        let alu_derived = ctx
-            .greedy_decisions
-            .const_choice_encoding
-            .values()
-            .filter(|e| matches!(e, ConstChoiceEncoding::AluDerive(_)))
-            .count();
-        if alu_derived > 0 {
-            let summary = format!(
-                "skipped: {} ALU-derived constant(s) (--greedy-const-policy) are not modelled",
-                alu_derived
-            );
-            announce(ctx, &summary);
-            return Ok(summary);
-        }
         #[cfg(feature = "cpsat")]
         let is_cpsat_pipeline = ctx.config.cpsat.is_some();
         #[cfg(not(feature = "cpsat"))]

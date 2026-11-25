@@ -4558,7 +4558,7 @@ fn schedule_with_scratch_model(
     )
     .expect("greedy schedules the phases");
     assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
-    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new(), &HashSet::new()).unwrap();
+    let peaks = scratch_pool_peaks(&emit.ops, Some(&lanes), &HashMap::new(), &HashSet::new(), &HashMap::new()).unwrap();
     (budget_exceeded, peaks)
 }
 
@@ -5832,7 +5832,7 @@ fn test_justify_scratch_budget_rejects_improvement() {
         emit.ops[store].cycle = 2 + k as i32;
     }
     let input: Vec<i32> = emit.ops.iter().map(|op| op.cycle).collect();
-    let (_, input_peak, _) = interval_liveness_curve(&emit.ops, None, &HashMap::new(), &HashSet::new()).unwrap();
+    let (_, input_peak, _) = interval_liveness_curve(&emit.ops, None, &HashMap::new(), &HashSet::new(), &HashMap::new()).unwrap();
 
     let mut tight_ops = emit.ops.clone();
     let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
@@ -5900,7 +5900,7 @@ fn test_justify_split_lanes() {
         }
     }
     // The result also satisfies the greedy's own liveness accounting within the budget.
-    let (_, peak, _) = interval_liveness_curve(&emit.ops, None, &lanes, &HashSet::new()).unwrap();
+    let (_, peak, _) = interval_liveness_curve(&emit.ops, None, &lanes, &HashSet::new(), &HashMap::new()).unwrap();
     assert_eq!(peak, outcome.peak_live_after);
     assert!(peak <= 1536);
 }
@@ -6259,4 +6259,175 @@ fn test_justify_after_select_overflow_keeps_fma_liveness() {
         assert_eq!(outcome.cycles_after, outcome.cycles_before, "split={}", split_shift);
         assert_eq!(emit.ops.iter().map(|op| op.cycle).collect::<Vec<_>>(), before);
     }
+}
+
+// =========================================================================
+// Justification with ALU-derived constants (--greedy-const-policy)
+// =========================================================================
+
+/// 8 and 16 loaded, 24 derived as 8 + 16 on the scalar ALU, `(8 + 16) + 24` stored. Returns
+/// the program and the ConstChoice encodings (Load, Load, AluDerive).
+fn emit_derived_constant() -> (SsaEmitContext, HashMap<usize, ConstChoiceEncoding>) {
+    let mut emit = SsaEmitContext::new();
+    let c8 = emit.emit_const_choice(8);
+    let c16 = emit.emit_const_choice(16);
+    let c24 = emit.emit_const_choice(24);
+    let s1 = emit.emit_alu(Opcode::Add, c8, c16);
+    let s2 = emit.emit_alu(Opcode::Add, s1, c24);
+    emit.emit_store_imm(100, s2);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let (i8, i16, i24) = (emit.ops[0].id, emit.ops[1].id, emit.ops[2].id);
+    let encodings = HashMap::from([
+        (i8, ConstChoiceEncoding::Load),
+        (i16, ConstChoiceEncoding::Load),
+        (
+            i24,
+            ConstChoiceEncoding::AluDerive(crate::types::AluDeriveInfo {
+                left_op_id: i8,
+                right_op_id: i16,
+                opcode: Opcode::Add,
+            }),
+        ),
+    ]);
+    (emit, encodings)
+}
+
+/// Address assignment's peak for `ops`, with or without the ALU derivations in `encodings`.
+fn allocator_peak(ops: &[SsaOp], encodings: &HashMap<usize, ConstChoiceEncoding>, with_derives: bool) -> usize {
+    let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+    let derives: HashMap<usize, crate::types::AluDeriveInfo> = encodings
+        .iter()
+        .filter_map(|(id, e)| match e {
+            ConstChoiceEncoding::AluDerive(info) if with_derives => Some((*id, info.clone())),
+            _ => None,
+        })
+        .collect();
+    let config = crate::address_assign::AddressAssignConfig { const_alu_derive_ops: derives, ..Default::default() };
+    let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+    crate::address_assign::compute_peak_liveness(&intervals)
+}
+
+/// A derived constant is an ALU op that reads its two producers at its own cycle. The pass
+/// schedules it after both, keeps both live until then in its scratch accounting (as address
+/// assignment does: the earlier AluDerive bugs were producer lifetimes that were not
+/// extended), and its peak equals address assignment's before and after. Hand-made input:
+/// the derive runs four cycles after the producers' last other read, which only the
+/// extension sees.
+#[test]
+fn test_justify_models_alu_derived_constants() {
+    let (mut emit, encodings) = emit_derived_constant();
+    // 8, 16 at 0 (two loads); 8 + 16 at 1; 24 = 8 + 16 at 5; the sum at 6; the store at 7.
+    for (i, c) in [0, 0, 5, 1, 6, 7].into_iter().enumerate() {
+        emit.ops[i].cycle = c;
+    }
+    let with_ext = allocator_peak(&emit.ops, &encodings, true);
+    assert!(with_ext > allocator_peak(&emit.ops, &encodings, false), "control: the extension must matter here");
+    let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
+    assert_eq!(
+        verify_schedule(&emit.ops, true, &shifted, &lanes, &encodings, &HashMap::new()),
+        Ok(8),
+        "the greedy-style input passes the verifier"
+    );
+    let outcome = justify_schedule(
+        &mut emit.ops, true, &mut shifted, &mut lanes, &encodings, &HashMap::new(), None, None, &justify_config(5),
+    )
+    .unwrap();
+    assert_eq!(outcome.note, None, "{}", outcome.summary());
+    assert_eq!(outcome.peak_live_before, with_ext, "the pass counts the producers live to the derive");
+    assert!(outcome.cycles_after < outcome.cycles_before, "{}", outcome.summary());
+    assert_eq!(outcome.peak_live_after, allocator_peak(&emit.ops, &encodings, true));
+    // The derive runs after both producers are visible, and the reader of 24 after it.
+    let cycle = |i: usize| emit.ops[i].cycle;
+    assert!(cycle(2) > cycle(0) && cycle(2) > cycle(1), "{:?}", emit.ops.iter().map(|o| o.cycle).collect::<Vec<_>>());
+    assert!(cycle(4) > cycle(2));
+    assert!(verify_schedule(&emit.ops, true, &shifted, &lanes, &encodings, &HashMap::new()).is_ok());
+
+    // The verifier refuses a derive in its producer's cycle (the edge is not in dep_ids).
+    let (mut bad, _) = emit_derived_constant();
+    for (i, c) in [0, 1, 1, 2, 3, 4].into_iter().enumerate() {
+        bad.ops[i].cycle = c;
+    }
+    let err = verify_schedule(&bad.ops, true, &HashSet::new(), &HashMap::new(), &encodings, &HashMap::new()).unwrap_err();
+    assert!(err.contains("ALU-derived constant"), "{}", err);
+}
+
+/// A budget below the input's extended peak but at or above its unextended peak: every
+/// candidate is checked with the extension, so the pass cannot accept one that address
+/// assignment would place over the budget.
+#[test]
+fn test_justify_alu_derive_budget_uses_extended_lifetimes() {
+    let (mut emit, encodings) = emit_derived_constant();
+    for (i, c) in [0, 0, 5, 1, 6, 7].into_iter().enumerate() {
+        emit.ops[i].cycle = c;
+    }
+    let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
+    let outcome = justify_schedule(
+        &mut emit.ops, true, &mut shifted, &mut lanes, &encodings, &HashMap::new(), None, None, &justify_config(5),
+    )
+    .unwrap();
+    // Whatever was accepted fits the budget under address assignment's own accounting.
+    assert!(allocator_peak(&emit.ops, &encodings, true) <= 1536);
+    assert_eq!(outcome.peak_live_after, allocator_peak(&emit.ops, &encodings, true));
+}
+
+/// The greedy's own `alu-first` schedule of five derivable constants: the pass accepts it as
+/// input (no note: before, its verifier refused ALU-derived constants), and its peak equals
+/// address assignment's with the derivations, before and after.
+#[test]
+fn test_justify_after_const_policy_alu_first() {
+    let mut emit = emit_derivable_consts();
+    let shape = GreedyShape { const_policy: ConstPolicy::AluFirst, ..Default::default() };
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let mut add_imm = HashSet::new();
+    schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        1536,
+        None,
+        None,
+        None,
+        Some(&mut add_imm),
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the constants");
+    let derived = diagnostics.const_alu_derive;
+    assert!(!derived.is_empty());
+    let encodings: HashMap<usize, ConstChoiceEncoding> = emit
+        .ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::ConstChoice)
+        .map(|op| {
+            let enc = if let Some(info) = derived.get(&op.id) {
+                ConstChoiceEncoding::AluDerive(info.clone())
+            } else if add_imm.contains(&op.id) {
+                ConstChoiceEncoding::AddImm
+            } else {
+                ConstChoiceEncoding::Load
+            };
+            (op.id, enc)
+        })
+        .collect();
+    let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
+    let before = allocator_peak(&emit.ops, &encodings, true);
+    let outcome = justify_schedule(
+        &mut emit.ops, false, &mut shifted, &mut lanes, &encodings, &HashMap::new(), None, None, &justify_config(5),
+    )
+    .unwrap();
+    assert_eq!(outcome.note, None, "{}", outcome.summary());
+    assert_eq!(outcome.peak_live_before, before);
+    assert_eq!(outcome.peak_live_after, allocator_peak(&emit.ops, &encodings, true));
+    assert!(verify_schedule(&emit.ops, false, &shifted, &lanes, &encodings, &HashMap::new()).is_ok());
 }

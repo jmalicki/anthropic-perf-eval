@@ -59,15 +59,15 @@ def test_const_policy_kernels_are_proved_and_valid(policy):
     assert sum(encodings.values()) == n_const
 
 
-def test_justify_does_not_run_with_alu_derived_constants():
-    """`--greedy-justify` does not model ALU-derived constants (their reads of producer
-    values), so with `--greedy-const-policy alu-first` it leaves the schedule alone: the kernel
-    equals the one built without it (shaped greedy, where justification otherwise shortens)."""
+def test_justify_with_alu_derived_constants():
+    """`--greedy-justify` models ALU-derived constants (their reads of producer values): with
+    `--greedy-const-policy alu-first` it runs, keeps every derivation, and the kernel is still
+    proved against its SSA program and validated (in _build)."""
     shape = dict(greedy_barriers="none", greedy_priority="wavefront", greedy_split_shift=True,
                  pressure_inflation_threshold=0.95, greedy_const_policy="alu-first")
     _, _, plain = _build(**shape)
     _, _, justified = _build(greedy_justify=10, **shape)
-    assert any(op.get("from_const_choice") is not None and op["engine"] == "alu" for op in plain["ops"]), \
-        "control: alu-first derives a constant on the scalar ALU"
-    cycles = lambda s: [(op["cycle"], op["engine"], op["slot"]) for op in s["ops"]]  # noqa: E731
-    assert cycles(justified) == cycles(plain)
+    derived = lambda s: sorted(op["from_const_choice"] for op in s["ops"]  # noqa: E731
+                               if op.get("from_const_choice") is not None and op["engine"] == "alu")
+    assert derived(plain), "control: alu-first derives a constant on the scalar ALU"
+    assert derived(justified) == derived(plain)
