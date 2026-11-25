@@ -105,3 +105,85 @@ uv run generate_ssa_kernel.py <best flags> --emission-plan docs/emission_plans/f
 
 Tests: `tests/test_critical_path_rewrites.py` (each rewrite proved, validated, its op-count
 delta, and the chain it shortens, at 6 rounds).
+
+## Justification on the best kernels (`--greedy-justify 10`)
+
+Forward/backward justification (docs/GREEDY_SHAPE_ABLATION.md section 13) applied to the
+best flags above. Justification now models ALU-derived constants (`--greedy-const-policy`):
+a derived constant is scheduled after both producers, and both stay live to its cycle in the
+pass's scratch check and in its address-assignment trial. Before, the pass skipped any
+schedule with one. All rows: 16 rounds, `--use-greedy --validate`, PROVED and PASSED, no
+build over the scratch budget unless marked.
+
+**Measured by removal** (justify on/off, every other flag fixed; best flags + path
+`--reassociate-gather-xor` + chain-first + native-first, index `--index-early-terms final`):
+
+| Configuration | justify 0 | justify 10 | justify 50 |
+|---|---|---|---|
+| index | 1,038 / 1,040 | 1,038 / 1,040 | 1,038 / 1,040 |
+| path, `alu-first` | 1,026 / 1,028 | **1,016 / 1,018** | 1,016 / 1,018 |
+| path, default const policy | 1,031 / 1,033 | **1,016 / 1,018** | 1,016 / 1,018 |
+
+(scheduled / simulator cycles). The 1,026 interaction does not stack with justification:
+both const policies end at 1,016. Peak scratch 1,497 words (alu-first) and 1,520 (default).
+
+**Index plan, why nothing changes:** not a guard. With `SCHEDULER_DEBUG=1` every forward
+pass comes out at exactly 1,038 and the backward passes at 1,038 to 1,046, so no candidate is
+strictly shorter and none is checked. A plateau of the list scheduler, not a proven optimum
+(the static bound is 1,028).
+
+### Sweep (all with `--greedy-justify 10`)
+
+Shape, with each plan's rewrites as above (path also `alu-first`); cycles, "fail" = the
+greedy itself exceeded the scratch budget (peak 1,728), so justification did not run and the
+build failed:
+
+| stagger / in flight | path, prio | path, no prio | index, prio | index, no prio |
+|---|---|---|---|---|
+| 8 / 24 | 1,030 | 1,032 | 1,061 | 1,057 |
+| 8 / 32 | **1,016** | fail | 1,038 | 1,038 |
+| 9 / 24 | 1,027 | 1,033 | 1,061 | 1,061 |
+| 9 / 32 | **1,016** | fail | 1,038 | 1,038 |
+| 10 / 24 | 1,028 | 1,035 | 1,063 | 1,059 |
+| 10 / 32 | **1,016** | 1,018 | 1,038 | 1,038 |
+
+Robustness: with 32 groups in flight and the priorities, path is 1,016 at staggers 8, 9 and
+10 (before justification the same pair gave 1,067 and 1,040 at 8 and 10); index is 1,038 at
+all three. 24 in flight is worse on both plans.
+
+Rewrites (stagger 9, 32 in flight; path with chain-first + native-first, index without);
+cycles, with `alu-first` off / on:
+
+| Rewrites | path | index |
+|---|---|---|
+| none | 1,019 / 1,019 | 1,039 / 1,039 |
+| R16 | 1,016 / 1,016 | 1,036 / 1,036 |
+| R17 final | 1,018 / 1,018 | 1,038 / 1,038 |
+| R16 + R17 final | 1,015 / 1,015 | 1,035 / 1,035 |
+| R18 first-pass | 1,016 / 1,016 | 1,037 / 1,037 |
+| R18 first-pass + R16 + R17 final | **1,012 / 1,012** | **1,033 / 1,033** |
+
+The rewrites lowered the static bound but the plain greedy did not follow (section 3);
+with justification it does: all three together give path **1,012** (1,014 simulated) and
+index **1,033** (1,035), the lowest of the sweep, with or without `alu-first`. Peak scratch
+1,401 to 1,453 words.
+
+`--greedy-budget-force stall` at inflation 0.95 and 0.98 (best path / index rows above):
+1,016 / 1,038 in both, unchanged.
+
+Not yet done (follow-up commits on the same PR): `check_upstream.sh --strict` on the 1,012 /
+1,033 kernels, their neighbouring staggers, a pin test for them, and whether a justified
+schedule passes the CP-SAT all-fixed check (window probe).
+
+```bash
+# 1,016 (path, R16, alu-first optional)
+uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate \
+  --greedy-barriers none --greedy-priority wavefront --greedy-split-shift \
+  --pressure-inflation-threshold 0.95 --greedy-load-priority final-last \
+  --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored \
+  --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path \
+  --greedy-alu-priority native-first --greedy-flow-priority chain-first \
+  --reassociate-gather-xor --greedy-justify 10 --save-kernel k.json
+# 1,012: add --index-early-terms final --select-xor-pushdown first-pass
+./scripts/check_upstream.sh --strict --kernel k.json
+```
