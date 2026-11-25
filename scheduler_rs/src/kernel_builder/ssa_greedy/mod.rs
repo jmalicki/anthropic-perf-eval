@@ -2645,10 +2645,14 @@ fn schedule_ssa_greedy_core(
 
                 // When fixed_shifted_ops is Some, can_shift = op is in the set (we place as shifted only those).
                 // When in fixed_shifted_ops we must place as shifted only (never VALU), so we need ALU room.
+                // With valu_shift_fixed_to_none the hint pass owns the shift decision: never shift
+                // here (a shift the slot tracker counted but nobody recorded would lower as a
+                // seventh vector op).
                 let can_shift = if let Some(fixed) = fixed_shifted_ops {
                     fixed.contains(&op_id)
                 } else {
                     enable_valu_shift
+                        && !valu_shift_fixed_to_none
                         && engine == Engine::Valu
                         && can_ssa_valu_shift_to_alu(&ops[idx])
                 };
@@ -2825,7 +2829,8 @@ fn schedule_ssa_greedy_core(
                         }
                     }
                     SlotResult::Shifted => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
+                        // With fixed shifts the caller records them (the op is in the set).
+                        if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
                     }
@@ -2982,23 +2987,33 @@ fn schedule_ssa_greedy_core(
             let dest = ops[force_idx].dest;
 
             // Check slot availability - we still respect slot limits
+            // Same rule as the normal path: no shifts when the hint pass owns them.
             let can_shift = if let Some(fixed) = fixed_shifted_ops {
                 fixed.contains(&op_id)
             } else {
                 enable_valu_shift
+                    && !valu_shift_fixed_to_none
                     && engine == Engine::Valu
                     && can_ssa_valu_shift_to_alu(&ops[force_idx])
             };
             let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
 
-            // When must_place_shifted we need ALU room for all lanes.
-            let slots_ok = if must_place_shifted {
-                slots.alu_used + VLEN <= 12
+            // Take the slot first; budget accounting below only runs for an op that has one.
+            // When must_place_shifted use the shift-only path; otherwise try with the strategy
+            // first and, if it blocks the shift, force the shift (the op is over budget anyway).
+            // `None` = no slot this cycle: the op goes back to the deferred list and takes a
+            // later cycle (marking it scheduled without a slot overfilled the cycle).
+            let force_place_result = if must_place_shifted {
+                slots.try_place_shifted_only()
             } else {
-                slots.fits(engine, can_shift)
+                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
+                match slots.try_place(engine, can_shift, allow_shift) {
+                    SlotResult::NoRoom => slots.try_place(engine, can_shift, true),
+                    placed => placed,
+                }
             };
 
-            if slots_ok {
+            if force_place_result != SlotResult::NoRoom {
                 // CRITICAL: Force schedule, ignoring budget constraint - this exceeds budget!
                 // This is intentional behavior - DO NOT REMOVE unless explicitly instructed.
                 // The force-schedule allows progress when retry loops fail to free enough
@@ -3011,16 +3026,7 @@ fn schedule_ssa_greedy_core(
                     format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
-                // When must_place_shifted use shift-only path; else try with strategy first.
-                let allow_shift = strategy.allow_shift(pools.words_needed(&live, scratch_budget), slots.alu_used, scratch_budget);
-                #[allow(unused_assignments)]
-                let force_place_result = if must_place_shifted {
-                    slots.try_place_shifted_only()
-                } else {
-                    slots.try_place(engine, can_shift, allow_shift)
-                };
                 let mut force_shifted = false;
-                #[allow(unused_assignments)]
                 match force_place_result {
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&force_idx) {
@@ -3029,18 +3035,12 @@ fn schedule_ssa_greedy_core(
                     }
                     SlotResult::Shifted => {
                         force_shifted = true;
+                        // With fixed shifts the caller records them (the op is in the set).
                         if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
                         }
                     }
-                    SlotResult::NoRoom => {
-                        if fixed_shifted_ops.is_none() && !valu_shift_fixed_to_none {
-                            if let SlotResult::Shifted = slots.try_place(engine, can_shift, true) {
-                                force_shifted = true;
-                                shifted_ops.insert(op_id);
-                            }
-                        }
-                    }
+                    SlotResult::NoRoom => unreachable!("checked above"),
                 }
                 if ops[force_idx].engine == Engine::Valu {
                     pace_vector_placed += 1;
