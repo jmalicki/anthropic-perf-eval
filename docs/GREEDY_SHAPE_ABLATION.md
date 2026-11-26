@@ -12,8 +12,8 @@ The greedy's shift count is a symptom of its cycle count, not a cause. Every vec
 not shift takes one vector slot, so `V - s = 6T - I` exactly (V vector ops, s shifted, T cycles,
 I idle vector slots). The vector ALU is busy in every steady-state cycle, so a schedule that is
 longer for any reason shifts fewer ops. For `flow90.json` (1,039): 32 of its 42 cycles above
-the floor are needed by any schedule of that emission (static head/tail bound 1,029, a proved
-bound); 10 are scheduling loss. In shifts: the floor's split shifts 1,465 ops and the greedy
+the floor are needed by any schedule of that emission (static head/tail bound 1,029, a
+bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are scheduling loss. In shifts: the floor's split shifts 1,465 ops and the greedy
 1,307, 158 fewer. A schedule at 1,029 cycles **with the same 115 idle vector slots** could shift
 at most 1,367; one with more idle slots could shift more, so "98 of the 158 are out of reach" is
 conditional on I, not a bound. Each number below is labelled **removal** (a build with the
@@ -702,8 +702,7 @@ Shift policies:
   (`test_load_priority_final_last_budget_deferral`).
 - The 1,039 numbers were measured with exactly this behaviour; changing it needs
   re-measurement.
-- `--greedy-load-priority` without `--greedy-priority wavefront` has no effect, and the
-  generator and the scheduler print a warning.
+- `--greedy-load-priority` without `--greedy-priority wavefront` is an error (CLI and binding).
 
 Tests in `ssa_greedy/tests.rs`:
 - slot limits on the normal path (`test_shift_policies_keep_slot_limits`);
@@ -755,7 +754,9 @@ The vector ALU is busy in every steady-state cycle (I is 115 to 250 slots, all i
 and the tail). So a schedule that is longer for any reason shifts fewer ops. PR #74 found
 cycles = VALU ops left / 6 + 19 to 32 (Spearman +0.83 to +0.99). That is this identity, not a
 cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes schedules slower.
-The causes are elsewhere. "Needed by any schedule" is a proved bound. In the last column each
+The causes are elsewhere. "Needed by any schedule" is the static head/tail bound, a bound (row arithmetic argued by hand, checked by Z3 on random small DAGs):
+SB1 in verification/static_bounds_proof.py (150 random DAGs of 3 to 7 ops at VLEN 2) and
+makespan_rows.py, not a proof for all graphs. In the last column each
 number is labelled: **removal** = a build with the cause removed or changed (an A/B), the only
 kind that says what removing it buys; **accounting** = a decomposition of one schedule.
 
@@ -795,7 +796,7 @@ the 50-build budget, 31 sixteen-round builds were used, one at a time.
 | Timing mismatch (H2) | round bands, below | Idle scalar slots sit in the round-15 tail and the gather band. Ready shiftable work sits in the select bands. They rarely coincide |
 | Scratch pressure policy: soft (85%) and critical (95%) thresholds | `--pressure-soft-threshold 0.999 --pressure-critical-threshold 0.999` (removal), inflation threshold left at 0.95 | **These two thresholds: no gain** (probe A 1,101 -> 1,106; `r1 bits-flow` plan 1,053 -> 1,055; path `flow90.json` 1,105 -> 1,118). This did **not** test the policy's ASAP inflation (threshold 0.95, the one that matters), so the pressure policy as a whole is not ruled out. PR #82 (`docs/SCRATCH_CEILING_DIAGNOSIS.md`) found that inflation costs 49 to 78 cycles on the plans at the scratch ceiling, because it defers operand-ready gather loads; it is needed today because the `words` budget check force-schedules budget-deferred ops instead of deferring them (`--greedy-budget-force stall`) |
 | The 1,536-word budget itself | `--scratch-budget-override 4096` (analysis) | **Ruled in for path `flow90.json`** (1,105 -> 1,046). Not for probe A (1,093), `path_flow90.json` (1,034), or the index plans (1,039 and 1,053 unchanged) |
-| Flow saturation, all selects on flow (H1) | select resolution per round; `--greedy-select-overflow valu` | **A cause for flow-heavy path plans by bound** (with every select on flow, probe A needs 1,050 cycles); **the flag's measured gain did not survive the counter fix (below)**. The greedy put 1,004 of 1,004 selects on flow. Flow was busy every cycle from 0 to 900, with 90 to 140 flow ops waiting. Overflow puts 348 on the vector ALU: 1,101 -> 1,054, and the shift count rises from 809 to 1,369. **But it is not a default win:** `path_flow90.json` 1,033 -> 1,059, `flow90.json` 1,039 -> 1,066, `r1 bits-flow` plan 1,053 -> 1,067, path floor-optimal plan over the scratch budget. **Counter fix (review of #76):** these overflow numbers were measured with a live-word counter that did not hold a multiply_add select's delta and operands to cycle + 1 as address assignment does; its check was blind to it too. With the base binary the counter read 1,408 to 1,464 words where address assignment needed 1,481 to 1,577. The path floor-optimal plan (`floor_optimal.json`, path bits) failed address assignment at 1,577 words because of that undercount. Rebuilt with the fixed counter (same command, section 12.5, plus `--select-bit-source path --greedy-select-overflow valu`): `path_flow90.json` 1,059 -> 1,061; probe A 1,054 -> over the budget (the greedy force-schedules, peak 1,761); path floor-optimal still over the budget (peak 1,771, now seen by the greedy). Builds without overflow are byte-identical. The index-plan overflow numbers were not rebuilt |
+| Flow saturation, all selects on flow (H1) | select resolution per round; `--greedy-select-overflow valu` | **A cause for flow-heavy path plans by bound** (with every select on flow, probe A needs 1,050 cycles); **the flag's measured gain did not survive the counter fix (below)**. The greedy put 1,004 of 1,004 selects on flow. Flow was busy every cycle from 0 to 900, with 90 to 140 flow ops waiting. Overflow puts 348 on the vector ALU: 1,101 -> 1,054, and the shift count rises from 809 to 1,369. **But it is not a default win:** `path_flow90.json` 1,033 -> 1,059, `flow90.json` 1,039 -> 1,066, `r1 bits-flow` plan 1,053 -> 1,067, path floor-optimal plan over the scratch budget. **Counter fix (review of #76):** these overflow numbers were measured with a live-word counter that did not hold a multiply_add select's delta and operands to cycle + 1 as address assignment does; its check was blind to it too. With the base binary the counter read 1,408 to 1,464 words where address assignment needed 1,481 to 1,577. The path floor-optimal plan (`floor_optimal.json`, path bits) failed address assignment at 1,577 words because of that undercount. Rebuilt with the fixed counter (same command, section 12.5, plus `--select-bit-source path --greedy-select-overflow valu`): `path_flow90.json` 1,059 -> 1,061; probe A 1,054 -> over the budget (the greedy force-schedules, peak 1,761); path floor-optimal still over the budget (peak 1,771, now seen by the greedy). In overflow mode the fixed counter over-counts while scheduling (it holds the delta of every select that may still take the multiply-add form until it is resolved), so "over budget, peak 1,761" means this greedy did not fit it, not that overflow cannot fit. Default flags are byte-identical (no overflow, no change). The index-plan overflow numbers were not rebuilt |
 | Flow order: early-round selects first | `--greedy-flow-priority feeds-load-first` | **Negative:** `r1 bits-flow` plan 1,053 -> 1,074; 1,039 plan -> 1,052 |
 | `--select-choice fma` as a resolution hook | probe A | Ignored by the greedy-only pipeline (same 1,101 kernel). There was no per-op hook before `--greedy-select-overflow` |
 
@@ -881,7 +882,9 @@ fit (minimum total absolute error) on the 24 index-bit loop builds under 1,200 c
 `loop_report_load_tail.json` (their rows and counts are in the data file). Leave-one-out
 (constants refitted without each plan): MAE 6.2 cycles, maximum 18. It covers the constants,
 not the form, which was chosen after looking at these plans; so every number in the table is
-in-sample, and the "near" column is a subset selected on the outcome.
+in-sample, and the "near" column is a subset selected on the outcome. `a_floor` is barely identified: the grid minimum (total absolute
+error 126) is tied between 32 and 36, and the floor branch is active on 1 of the 24 training
+plans, so 32 is the first of a tie, not a measured offset.
 
 | Surrogate (Spearman) | Index, all (28) | Index, loop (22) | Index, near (13) | Path, all (16) |
 |---|---|---|---|---|

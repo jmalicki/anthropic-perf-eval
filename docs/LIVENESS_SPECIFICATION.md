@@ -244,7 +244,7 @@ The greedy scheduler (`ssa_greedy/mod.rs`) does not compute intervals. It keeps 
 - *Property test.* `test_liveness_agreement_property` (400 random programs; 10,000 more with `ci-tests`) covers repeated operands, `keep_live`, both group kinds, direct lane readers, unread values and chains of dead stores, under tight budgets (force-schedule path), with and without VALU shift, under three pressure policies.
 - *Z3.* `T16` proves the rule for one value with up to three readers (present or not, dead or not, one or two operands each). `T16-per-operand-decrement` and `T16-write-group-per-lane` are the two old rules; Z3 returns SAT, a counterexample to each.
 
-**Scope**: The comparison uses the greedy's own view of the schedule: one cycle per op. Effects that exist only after later passes are outside it: the FMA path of a SelectChoice (dest written at `cycle+1`, `sub_temp`), per-lane cycles of shifted VALU ops chosen by CP-SAT, and the reserved zero word. Those are still covered only by address assignment.
+**Scope**: The comparison uses the greedy's own view of the schedule: one cycle per op. Effects that exist only after later passes are outside it: the two-op FMA path of a SelectChoice (no precomputed delta: dest written at `cycle+1`, `sub_temp`; see BUGS.md) — the one-op delta form that `--greedy-select-overflow valu` places is inside the check (its delta and operands held to `cycle+1`), per-lane cycles of shifted VALU ops chosen by CP-SAT, and the reserved zero word. Those are still covered only by address assignment.
 
 **What the check found** (November 2026, all fixed in the same change):
 
