@@ -1148,6 +1148,39 @@ def main(argv=None):
             for note in table.notes:
                 print("  note: " + note)
             return 0
+        if args.command == "derive":
+            # The derivation needs no probe builds: run and report it first, so a cold cache or
+            # a calibration failure cannot hide it. Its report must not overwrite the
+            # reference it is compared with (a later run would then compare it with itself).
+            reference = args.table or default_table_path(ctx)
+            if args.json and os.path.realpath(args.json) == os.path.realpath(reference):
+                ap.error(f"--json {args.json} is the reference cost table ({reference}); "
+                         "write the derivation elsewhere")
+            derived, doc = derive_table(ctx)
+            if args.json:
+                write_json_atomic(args.json, doc)
+            print(f"Derived by instantiation (scheduler_rs): {len(doc['sites'])} sites, "
+                  f"{len(doc['resources'])} shared-resource groups")
+            print("| Feature | " + " | ".join(CATEGORIES) + " |")
+            print("|---|" + "---|" * len(CATEGORIES))
+            for name, coef in derived.coefficients.items():
+                if any(coef.values()):
+                    print(f"| {name} | " + " | ".join(f"{coef[c]:,}" if coef[c] else "" for c in CATEGORIES) + " |")
+            try:
+                table = load_or_calibrate(ctx, args.table, workdir)
+            except Exception as e:  # noqa: BLE001 - reported; the derivation above stands
+                print(f"no calibrated table to compare with: {type(e).__name__}: {e}")
+                return 1
+            diffs = table_differences(derived, table)
+            entries = len(derived.coefficients) * len(CATEGORIES)
+            if diffs:
+                print(f"DIFFERS from the calibrated table in {len(diffs)} of {entries} entries (derived vs calibrated):")
+                for d in diffs:
+                    print("  " + d)
+                return 1
+            print(f"Equal to the calibrated table in all {entries} entries "
+                  f"({len(derived.coefficients)} features x {len(CATEGORIES)} categories).")
+            return 0
         table = load_or_calibrate(ctx, args.table, workdir)
         if args.what_if:
             if args.command not in ("predict", "solve"):
@@ -1170,27 +1203,6 @@ def main(argv=None):
             for e in result["skipped"][:3]:
                 print("  did not build: " + e)
             return 1 if bad or not result["compared"] else 0
-        if args.command == "derive":
-            derived, doc = derive_table(ctx)
-            if args.json:
-                write_json_atomic(args.json, doc)
-            print(f"Derived by instantiation (scheduler_rs): {len(doc['sites'])} sites, "
-                  f"{len(doc['resources'])} shared-resource groups")
-            print("| Feature | " + " | ".join(CATEGORIES) + " |")
-            print("|---|" + "---|" * len(CATEGORIES))
-            for name, coef in derived.coefficients.items():
-                if any(coef.values()):
-                    print(f"| {name} | " + " | ".join(f"{coef[c]:,}" if coef[c] else "" for c in CATEGORIES) + " |")
-            diffs = table_differences(derived, table)
-            entries = len(derived.coefficients) * len(CATEGORIES)
-            if diffs:
-                print(f"DIFFERS from the calibrated table in {len(diffs)} of {entries} entries (derived vs calibrated):")
-                for d in diffs:
-                    print("  " + d)
-                return 1
-            print(f"Equal to the calibrated table in all {entries} entries "
-                  f"({len(derived.coefficients)} features x {len(CATEGORIES)} categories).")
-            return 0
         if args.command == "table":
             print("| Feature | " + " | ".join(CATEGORIES) + " |")
             print("|---|" + "---|" * len(CATEGORIES))
