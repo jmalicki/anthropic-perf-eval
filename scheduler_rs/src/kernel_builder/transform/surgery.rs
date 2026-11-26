@@ -391,9 +391,10 @@ impl Surgery {
     /// * `at` - Original op index they go after.
     ///
     /// # Returns
-    /// An error if an op that stays in place reads one of them, or names its value in
-    /// `keep_live`, at or before `at`, if one is not before `at`, or if one was already moved
-    /// or removed (an op has one placement); then nothing is recorded.
+    /// An error if an op outside the group that is not removed reads one of them, or names its
+    /// value in `keep_live`, and is placed at or before `at` (its own position, or the op an
+    /// earlier `move_after` put it after), if one is not before `at`, or if one was already
+    /// moved or removed (an op has one placement); then nothing is recorded.
     pub fn move_after(&mut self, idxs: &[usize], at: usize) -> Result<(), String> {
         let group: BTreeSet<usize> = idxs.iter().copied().collect();
         let graph = SsaGraph::new(&self.program.ops, &self.program.vector_group_lanes);
@@ -409,12 +410,15 @@ impl Surgery {
             if self.removed.contains(&idx) {
                 return Err(format!("op {} is removed", idx));
             }
-            let stays = |r: &usize| !group.contains(r) && !self.removed.contains(r) && !self.moved.contains_key(r);
-            if let Some(&r) = graph.readers(idx).iter().find(|&&r| r <= at && stays(&r)) {
+            // A reader outside the group that is placed at or before `at`.
+            let before_at = |r: &usize| {
+                !group.contains(r) && !self.removed.contains(r) && self.moved.get(r).copied().unwrap_or(*r) <= at
+            };
+            if let Some(&r) = graph.readers(idx).iter().find(|&r| before_at(r)) {
                 return Err(format!("op {} is read by op {} before op {}", idx, r, at));
             }
-            let keeper = (0..=at).find(|&r| {
-                stays(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
+            let keeper = (0..self.program.ops.len()).find(|&r| {
+                before_at(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
             });
             if let Some(r) = keeper {
                 return Err(format!("op {} is kept live by op {} before op {}", idx, r, at));
@@ -574,20 +578,18 @@ impl Surgery {
 
         // 1. Splice, with the origin of each op.
         let mut seq: Vec<(SsaOp, Option<usize>)> = Vec::with_capacity(program.ops.len());
+        // A moved op that was removed afterwards is not placed anywhere.
         let slot = |s: Slot| match s {
-            Slot::New(op) => (op, None),
-            Slot::Moved(j) => (program.ops[j].clone(), Some(j)),
+            Slot::New(op) => Some((op, None)),
+            Slot::Moved(j) if removed.contains(&j) => None,
+            Slot::Moved(j) => Some((program.ops[j].clone(), Some(j))),
         };
         for (i, op) in program.ops.iter().enumerate() {
-            for s in before.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
+            seq.extend(before.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
             if !removed.contains(&i) && !moved.contains_key(&i) {
                 seq.push((op.clone(), Some(i)));
             }
-            for s in after.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
+            seq.extend(after.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
         }
         // 2. Rewire.
         if !rename.is_empty() {

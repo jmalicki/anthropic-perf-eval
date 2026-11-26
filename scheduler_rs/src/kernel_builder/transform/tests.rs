@@ -1299,6 +1299,47 @@ fn test_surgery_does_not_move_a_kept_live_value_past_its_keeper() {
 }
 
 #[test]
+fn test_surgery_checks_where_moved_readers_and_keepers_are() {
+    use super::surgery::Surgery;
+    let p = one_site_program();
+    // Op 2 (broadcast of M) reads op 1 (M). Moved after op 5, the reader is before op 7:
+    // M cannot follow op 7.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 5).unwrap();
+    let err = surgery.move_after(&[1], 7).unwrap_err();
+    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.finish().unwrap();
+    // The other order is valid: the reader after op 7, its operand after op 5.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 7).unwrap();
+    surgery.move_after(&[1], 5).unwrap();
+    surgery.finish().unwrap();
+    // The same for an op that names M in keep_live: moved after op 5, it is before op 7.
+    let mut q = clone_program(&p);
+    q.ops[3].keep_live = Some(vec![p.ops[1].dest.unwrap()]);
+    let mut surgery = Surgery::new(q).unwrap();
+    surgery.move_after(&[3, 4], 5).unwrap();
+    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
+    assert!(err.contains("kept live by op 3"), "{}", err);
+    surgery.finish().unwrap();
+}
+
+#[test]
+fn test_surgery_drops_a_moved_op_that_is_then_removed() {
+    use super::surgery::{Stamp, Surgery};
+    // Move the broadcast of M after op 7, then replace it there by a new op with the same
+    // destination: the moved copy must not be placed as well.
+    let p = one_site_program();
+    let bm = p.ops[2].dest.unwrap();
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[1, 2], 7).unwrap();
+    surgery.remove(2);
+    surgery.insert_after(7, p.ops[2].clone(), &Stamp::of(&p.ops[2]));
+    let (after, _) = surgery.finish().unwrap();
+    assert_eq!(after.ops.iter().filter(|o| o.dest == Some(bm)).count(), 1);
+}
+
+#[test]
 fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
     use super::surgery::{Stamp, Surgery};
     use crate::types::{Engine, Opcode, Operand};
