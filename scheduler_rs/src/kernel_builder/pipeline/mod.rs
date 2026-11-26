@@ -32,7 +32,7 @@ use super::tick_tock_ssa::SsaScheduleResult;
 
 use passes::{
     AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
-    FilterDeadStoresPass, GreedySchedulePass, LowerToOpsPass,
+    FilterDeadStoresPass, GreedyJustifyPass, GreedySchedulePass, LowerToOpsPass,
 };
 use passes::{
     ConstChoiceHintPass, ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
@@ -309,6 +309,10 @@ impl PipelineContext {
         if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
             self.run_pass(&ScheduleWithFixedChoicesPass)?;
         }
+        // Forward/backward justification of the greedy schedule (opt-in).
+        if self.config.compiler.greedy_justify_iterations > 0 {
+            self.run_pass(&GreedyJustifyPass)?;
+        }
 
         // The check the CP-SAT path runs before its per-section repair, on the phase timeline:
         // reported so it can be compared with the allocator's peak of the same schedule.
@@ -365,6 +369,10 @@ impl PipelineContext {
             || self.config.compiler.enable_valu_shift_hint_pass;
         if any_hint_pass || self.config.compiler.enable_schedule_with_fixed_choices {
             self.run_pass(&ScheduleWithFixedChoicesPass)?;
+        }
+        // Forward/backward justification of the greedy schedule (opt-in).
+        if self.config.compiler.greedy_justify_iterations > 0 {
+            self.run_pass(&GreedyJustifyPass)?;
         }
 
         // Per-section feasibility stays in tick_tock_ssa orchestration (not a pass)

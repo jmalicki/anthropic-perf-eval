@@ -191,6 +191,8 @@ def main():
                           ("greedy_const_policy", "default"), ("greedy_early_stagger", None)):
         if getattr(args, name, default) != default:
             print(f"  {name}={getattr(args, name)}")
+    if getattr(args, "greedy_justify", 0):
+        print(f"  greedy_justify={args.greedy_justify}")
     overrides = {name: getattr(args, name, None) for name in
                  ("pressure_soft_threshold", "pressure_critical_threshold", "pressure_inflation_threshold")}
     if any(v is not None for v in overrides.values()):
