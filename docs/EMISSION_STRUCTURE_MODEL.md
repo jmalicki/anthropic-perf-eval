@@ -27,8 +27,10 @@ Among plans within 30 cycles of the best, no lower bound stage 1 computes ranks 
 bits: floor Spearman rho -0.54, exact static bound -0.29, on plans the surrogates themselves
 chose; section 10.0.3). The spread tracks how many vector ops the greedy moves to the ALU
 (rho +0.93, measured after the build). That is a post-build diagnostic, not a cause: by the
-identity V - s = 6T - I (#76) a longer schedule leaves more vector work on the VALU whatever
-made it longer. How close stage 1 gets
+identity V - s = 6T - I (#76) the unshifted vector work is set by the cycle count T and the
+idle vector slots I together. On these schedules I is small and nearly constant (115 to 250
+slots, all in the start-up and tail; #76), so a longer schedule leaves more vector work on the
+VALU whatever made it longer; T alone would not imply it. How close stage 1 gets
 depends on what picks among plans of equal floor, not on the floor: five index-bit plans share
 the optimal floor 989 and run 1,067 to 1,414, so the floor alone is good to about 375 cycles;
 the lateness tie-break picks the one at 1,073 (34 above the best) and the cap `flow=0.92` one at
@@ -458,7 +460,10 @@ best, the floor has Spearman rho -0.54, the floor with window rows -0.29, and th
 bound -0.29. A quantity measured after the build tracks them: the vector work the greedy
 leaves on the VALU after its own shifts (rho +0.93, Pearson +0.96). It is a post-build
 diagnostic, not a cause: by the identity V - s = 6T - I (#76; vector ops, shifts, cycles, idle
-vector slots) a schedule that is longer for any reason leaves more vector work on the VALU.
+vector slots) the unshifted vector work is 6T - I, so it depends on the idle slots as well as
+on the length (T = 100, I = 0 and T = 101, I = 6 both give 600). With I small and nearly
+constant across these schedules (115 to 250 slots, start-up and tail only), a schedule that is
+longer for any reason leaves more vector work on the VALU.
 Stage 1 assumes the best VALU/ALU split. Resolution, index bits: the floor alone does not resolve plans.
 Five built plans share the optimal floor 989 and run 1,067, 1,072, 1,073, 1,073 and 1,414, so
 the floor is good to about 375 cycles. What stage 1 returns among them is set by its tie-break:
@@ -625,7 +630,8 @@ The path "near" subset has 3 plans, too few to report. Reading:
   tie-break picks 1,073 and the learned cap 1,039. With path bits the cap decides: `flow=0.9`
   ranks `path_flow90.json` (the best) first, `flow=0.92` misses it by 66. Below that, the
   ranking tracks the vector work left on the VALU after the greedy's shifts, a post-build
-  diagnostic that follows from the cycle count (#76), not a cause stage 1 could model.
+  diagnostic that follows from the cycle count and the idle vector slots (6T - I, #76; I is
+  nearly constant here), not a cause stage 1 could model.
 
 Caveats for every coefficient in the table: the plans were chosen by these surrogates (a
 restricted range, 22 index-bit loop plans at floors 989 to 1,049, with heavy ties: 4 at floor 989,
@@ -705,8 +711,8 @@ $L run $P --state $R/path_nogoodcap.json --modes nogood --nogood-caps flow=0.92 
   --seed-plan docs/emission_plans/path_flow90.json
 # probes: path_flow90.json with access[4] = {gather 12, bits-flow 20}, {gather 11, bits 21}, {gather 13, bits 19}
 cp $R/path_seeds.json $R/path_probe.json
-$L run $P --state $R/path_probe.json --modes "" --seed-plan $R/probe_A.json --seed-plan $R/probe_B.json \
-  --seed-plan $R/probe_C.json
+$L run $P --state $R/path_probe.json --modes "" --seed-plan docs/emission_plans/path_flow90_probe_A.json \
+  --seed-plan docs/emission_plans/path_flow90_probe_B.json --seed-plan docs/emission_plans/path_flow90_probe_C.json
 $L report --state $R/idx_rows.json --extra-state $R/idx_nogood.json --extra-state $R/idx_caps.json \
   --extra-state $R/idx_capsu.json --extra-state $R/idx_nogoodcap.json --caps flow=0.92 --near 30 \
   --json $R/report_idx.json
