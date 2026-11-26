@@ -5588,3 +5588,30 @@ fn test_justify_stops_after_stalled_iterations() {
     assert_eq!(limited.cycles_after, unlimited.cycles_after);
     assert_eq!(limited_cycles, unlimited_cycles);
 }
+
+/// The pace accounting counts every placement of a vector op and every shift, on every path:
+/// a shift placed on the force-schedule path (over budget) counts as shifted (the
+/// `force_shifted = true` in the force path's `Shifted` arm, kept when #78's restructuring of
+/// that path was merged). The runs below force-schedule and make force-path shifts.
+#[test]
+fn test_pace_counts_force_path_shifts() {
+    let mut force_shifts_seen = 0;
+    for budget in [56, 64] {
+        for shift_policy in [ShiftPolicy::WhenFull, ShiftPolicy::Pace { target: None }] {
+            for split_shift in [false, true] {
+                let shape = GreedyShape { split_shift, shift_policy, ..Default::default() };
+                let mut emit = emit_mixed_chains(10, 6);
+                let (exceeded, shifted, _, diagnostics) = schedule_tight(&mut emit.ops, &shape, budget, &GreedyPolicy);
+                assert!(exceeded, "budget {} forces", budget);
+                let label = format!("budget {} {:?} split={}", budget, shift_policy, split_shift);
+                let vector: Vec<&SsaOp> =
+                    emit.ops.iter().filter(|op| op.engine == Engine::Valu && op.cycle >= 0).collect();
+                let shifted_vector = vector.iter().filter(|op| shifted.contains(&op.id)).count();
+                assert_eq!(diagnostics.pace_vector_placed, vector.len(), "{}", label);
+                assert_eq!(diagnostics.pace_shifted, shifted_vector, "{}", label);
+                force_shifts_seen += diagnostics.force_shifts;
+            }
+        }
+    }
+    assert!(force_shifts_seen > 0, "control: some run must shift on the force path");
+}
