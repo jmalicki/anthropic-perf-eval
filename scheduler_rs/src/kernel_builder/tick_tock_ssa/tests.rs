@@ -4583,6 +4583,172 @@ fn test_dependency_pass_keeps_index_war_at_wrap() {
     }));
 }
 
+/// After dead code elimination every ALU-derived ConstChoice alternative reads constants that
+/// a kept op produces (BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it
+/// removed"). Before the fix DCE kept them in every emission measured: e.g. 8 = 1 + 7 and
+/// 9 = 2 + 7 at batch 256 (7 dies), and with `--values-only` and the mirrored index (or
+/// `--prune-dead-index --values-only`) also 6 = 1 + 5 and 9 = 4 + 5, because the pointer load
+/// of header word 5 dies and with it its address constant 5.
+#[test]
+fn test_dce_keeps_no_const_alternative_without_producer() {
+    use crate::kernel_builder::config::IndexForm;
+    use crate::types::ConstEncoding;
+    use std::collections::HashSet;
+
+    type Variant = (&'static str, fn(&mut KernelConfig));
+    let variants: [Variant; 5] = [
+        ("default", |_| {}),
+        ("mirrored", |c| c.spec.index_form = IndexForm::Mirrored),
+        ("values-only", |c| c.spec.values_only = true),
+        ("values-only mirrored", |c| {
+            c.spec.values_only = true;
+            c.spec.index_form = IndexForm::Mirrored;
+        }),
+        ("values-only prune-dead-index", |c| {
+            c.spec.values_only = true;
+            c.spec.prune_dead_index = true;
+        }),
+    ];
+    for rounds in [2usize, 16] {
+        for batch in [8usize, 256] {
+            for (name, apply) in variants.iter() {
+                let mut config = KernelConfig::new(10, 2047, batch, rounds);
+                apply(&mut config);
+                let mut program = SsaTickTockKernelBuilder::new(config).build();
+                let emitted: HashMap<usize, Vec<ConstEncoding>> = program
+                    .ops
+                    .iter()
+                    .filter_map(|op| op.const_alternatives.clone().map(|a| (op.id, a)))
+                    .collect();
+                let (ops, _, _) = eliminate_ssa_dead_code(
+                    std::mem::take(&mut program.ops),
+                    &mut program.vreg_def,
+                    &mut program.const_alternatives,
+                    program.zero_vreg,
+                    Some(&program.vector_group_lanes),
+                );
+                let produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+                for op in &ops {
+                    for enc in op.const_alternatives.iter().flatten() {
+                        assert!(
+                            enc.dependencies().iter().all(|v| produced.contains(v)),
+                            "{} {}r batch {}: constant {:?} keeps {:?}",
+                            name, rounds, batch, op.produces_constant, enc
+                        );
+                    }
+                    // Nothing else is dropped or reordered: Load, AddImm and every derivation
+                    // whose operands survive stay, in emission order.
+                    if let Some(kept) = op.const_alternatives.as_ref() {
+                        let expected: Vec<ConstEncoding> = emitted[&op.id]
+                            .iter()
+                            .filter(|e| e.dependencies().iter().all(|v| produced.contains(v)))
+                            .cloned()
+                            .collect();
+                        assert_eq!(kept, &expected, "{} {}r batch {}: constant {:?}", name, rounds, batch, op.produces_constant);
+                    }
+                }
+                // The reported case: constant 5 dies, 6 loses 1 + 5 and keeps its other encodings.
+                if name.starts_with("values-only m") && batch == 256 {
+                    assert!(!produced.contains(&5));
+                    let six = ops.iter().find(|op| op.produces_constant == Some(6)).unwrap();
+                    let alts = six.const_alternatives.as_ref().unwrap();
+                    assert!(!alts.contains(&ConstEncoding::Add { a_value: 1, b_value: 5 }));
+                    assert!(alts.len() >= 2 && alts[0] == ConstEncoding::Load);
+                }
+            }
+        }
+    }
+}
+
+/// Build `config`, run DCE, and with `undo_drop` put back on every surviving ConstChoice the
+/// alternatives it had before DCE (DCE without `drop_alternatives_without_producer`). Returns
+/// the ops with dependencies computed, the zero VReg, and how many alternatives were put back.
+#[cfg(feature = "cpsat")]
+fn dce_program_for_model(
+    config: KernelConfig,
+    undo_drop: bool,
+) -> (Vec<SsaOp>, Option<crate::types::VReg>, usize) {
+    let mut program = SsaTickTockKernelBuilder::new(config).build();
+    let emitted: HashMap<usize, Vec<crate::types::ConstEncoding>> = program
+        .ops
+        .iter()
+        .filter_map(|op| op.const_alternatives.clone().map(|a| (op.id, a)))
+        .collect();
+    let (mut ops, vreg_def, _) = eliminate_ssa_dead_code(
+        std::mem::take(&mut program.ops),
+        &mut program.vreg_def,
+        &mut program.const_alternatives,
+        program.zero_vreg,
+        Some(&program.vector_group_lanes),
+    );
+    let mut restored = 0;
+    if undo_drop {
+        for op in ops.iter_mut() {
+            if let (Some(alts), Some(before)) = (op.const_alternatives.as_mut(), emitted.get(&op.id)) {
+                restored += before.len() - alts.len();
+                *alts = before.clone();
+            }
+        }
+    }
+    crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
+        &mut ops,
+        &vreg_def,
+        program.zero_vreg,
+        Some(&program.vector_group_lanes),
+    );
+    (ops, program.zero_vreg, restored)
+}
+
+/// Build the whole-kernel CP-SAT model for `ops` (greedy cycles as hints, first solution).
+/// Returns the model's error, if any.
+#[cfg(feature = "cpsat")]
+fn whole_kernel_model_error(mut ops: Vec<SsaOp>) -> Option<String> {
+    use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+    let mut shifted = HashSet::new();
+    ssa_greedy::schedule_ssa_greedy_with_shift(&mut ops, false, &mut shifted).expect("greedy");
+    let hints: Vec<i32> = ops.iter().map(|op| op.cycle).collect();
+    for op in &mut ops {
+        op.cycle = -1;
+    }
+    schedule_ssa_cpsat(
+        &ops,
+        SsaCpsatConfig {
+            time_limit_secs: 30.0,
+            verbose: false,
+            stop_after_first_solution: true,
+            scratch_budget: 1536,
+            enable_valu_shift: false,
+            ..Default::default()
+        },
+        SsaCpsatHints { greedy_hints: Some(&hints), ..Default::default() },
+        None,
+    )
+    .err()
+}
+
+/// The whole-kernel model accepts a real emission after DCE (2 rounds, batch 16, values-only
+/// with the mirrored index, where DCE removes constant 5 and with it alternatives such as
+/// 6 = 1 + 5), and refuses the same ops when the alternatives DCE dropped are put back: an
+/// ALU derivation whose operand has no producer is an error, not a silently dead choice.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_whole_kernel_model_and_stale_const_alternatives() {
+    use crate::kernel_builder::config::IndexForm;
+    let config = || {
+        let mut c = KernelConfig::new(10, 2047, 16, 2);
+        c.spec.values_only = true;
+        c.spec.index_form = IndexForm::Mirrored;
+        c
+    };
+    let (ops, _, _) = dce_program_for_model(config(), false);
+    assert_eq!(whole_kernel_model_error(ops), None);
+
+    let (ops, _, restored) = dce_program_for_model(config(), true);
+    assert!(restored > 0, "DCE must have dropped an alternative for this check to mean anything");
+    let err = whole_kernel_model_error(ops).expect("stale alternatives are refused");
+    assert!(err.contains("reads a value no op produces"), "{}", err);
+}
+
 // ============================================================================
 // Region tags
 // ============================================================================

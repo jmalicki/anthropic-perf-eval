@@ -1380,6 +1380,7 @@ impl SsaTickTockKernelBuilder {
                         live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
                         cse_groups: None, // Per-section: no CSE (feasibility only)
                         vector_group_lanes: Some(&ctx.vector_group_lanes),
+                        zero_reserved: ctx.zero_vreg.is_some(),
                         ..Default::default()
                     },
                     Some(false),
@@ -1699,6 +1700,7 @@ impl SsaTickTockKernelBuilder {
                 forced_shifts: forced_shifts.as_ref(),
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                zero_reserved: ctx.zero_vreg.is_some(),
             };
             match crate::cpsat_scheduler::window::run_window_probe(&ctx.ops, &cpsat_config, &probe_ctx, base, spec) {
                 Ok((report, result)) => {
@@ -1739,6 +1741,7 @@ impl SsaTickTockKernelBuilder {
                 live_through_vregs: None,
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                zero_reserved: ctx.zero_vreg.is_some(),
                 ..Default::default()
             },
             Some(!greedy_budget_exceeded),
