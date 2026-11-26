@@ -717,8 +717,8 @@ predictor stage 1 can use.
 | Window rows | 1,107 to 1,131. Moving gathers into round 3 still hurts |
 | Any stage-1 mode with path bits under the learned cap `flow=0.92` | 1,099 at best, 66 above `path_flow90.json` (which `flow=0.9` returns) |
 
-Not verified: why the greedy shifts fewer ops when depth-1 rounds use `bits-flow`; what sets the
-1,505-word ceiling on path-bit plans; whether the plans at 1,039 differ under CP-SAT or another
+Not verified: why the greedy shifts fewer ops when depth-1 rounds use `bits-flow`; whether the
+plans at 1,039 differ under CP-SAT or another
 scheduler (no stage-2 CP-SAT was run); seeds other than the ones listed; the probes cover
 round 4 only.
 

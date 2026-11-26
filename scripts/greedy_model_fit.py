@@ -199,7 +199,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="collect: dataset to write")
     args = ap.parse_args(argv)
     if args.command == "collect":
-        collect(args.state, args.measured, args.out or args.data)
+        if not args.out:
+            ap.error("collect needs --out (it does not merge into --data, so it never writes there)")
+        collect(args.state, args.measured, args.out)
         return 0
     res = analyse(load(args.data))
     report(res)
