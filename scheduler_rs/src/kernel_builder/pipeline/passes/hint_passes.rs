@@ -275,7 +275,8 @@ impl Pass for ScheduleWithFixedChoicesPass {
 
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         // Encodings are fixed here, so the scheduler makes no split shifts; the lane cycles
-        // of the first greedy run no longer apply.
+        // of the first greedy run no longer apply. Forced shifts need no extra handling: the
+        // first greedy run recorded them in `shifted_ops`, which is the fixed encoding here.
         let shape = ctx.config.compiler.greedy_shape();
         let mut shifted_lane_cycles = std::collections::HashMap::new();
         let greedy_budget = ctx.greedy_budget();
