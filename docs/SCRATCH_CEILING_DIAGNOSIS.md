@@ -200,7 +200,7 @@ Both follow-ups proposed here were done in #83 (docs/STARTUP_AND_STALL_LOOP.md):
 - The stage-1 path-bit loop rerun with `--greedy-budget-force stall
   --pressure-inflation-threshold 0.98` as the judge: negative. No plan beats the baselines
   (path best 1,034, `path_flow90.json` itself under that judge), and stall + 0.98 is not safe
-  on every plan: 3 of 28 new path-bit builds exceed the budget (docs/STALL_DEADLOCK.md on #88).
+  on every plan: 3 of 28 new path-bit builds exceed the budget (docs/STARTUP_AND_STALL_LOOP.md; diagnosed in docs/STALL_DEADLOCK.md, #88).
 - The start-up of `path_flow90.json`: `bits` selects for the first groups in rounds 1 to 3,
   negative (9 hand plans, all slower, 1,036 to 1,063). Ordering the start-up instead,
   `--greedy-flow-priority chain-first --greedy-alu-priority native-first`, gives 1,030

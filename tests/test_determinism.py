@@ -36,6 +36,7 @@ def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize(
     "extra",
     [
@@ -64,6 +65,7 @@ def test_greedy_build_is_reproducible(tmp_path):
     assert _sha(kernel_a) == _sha(kernel_b)
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize(
     "extra",
     [
@@ -88,6 +90,7 @@ def test_scheduler_json_is_reproducible(tmp_path, extra):
     assert _sha(a) == _sha(b), "scheduler JSON differs between two runs of the same build"
 
 
+@pytest.mark.deep
 def test_diff_reports_reordered_constraints(tmp_path):
     """The diff tool must tell reordering apart from a real difference."""
     _, model_path = _build(tmp_path, "a", ["--rounds", "2", "--batch-size", "16", "--cpsat-deterministic-time", "0.2"])
@@ -105,6 +108,7 @@ def test_diff_reports_reordered_constraints(tmp_path):
     assert "different entries" in "\n".join(diff_cpsat_models.compare(a, b))
 
 
+@pytest.mark.deep
 def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkeypatch, capfd):
     """The documented API is scheduler_rs.build_tick_tock_kernel_ssa(**args_to_build_kwargs(...)).
 
@@ -138,6 +142,7 @@ def test_deterministic_budget_reaches_the_solver_through_kwargs(tmp_path, monkey
     assert "stopped on the wall-clock limit" not in log
 
 
+@pytest.mark.deep
 def test_environment_budget_is_recorded_when_no_option_is_given(monkeypatch):
     import json
 
@@ -150,6 +155,7 @@ def test_environment_budget_is_recorded_when_no_option_is_given(monkeypatch):
     assert os.environ["CPSAT_MAX_DETERMINISTIC_TIME"] == "3.5", "the inherited value must be left in place"
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "abc"])
 def test_cli_rejects_invalid_deterministic_budget(bad):
     import argparse
@@ -162,6 +168,7 @@ def test_cli_rejects_invalid_deterministic_budget(bad):
         parser.parse_args(["--cpsat-deterministic-time", bad])
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
 def test_binding_rejects_invalid_deterministic_budget(bad):
     import scheduler_rs

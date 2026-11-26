@@ -24,6 +24,9 @@ default = []
 cpsat = ["cp_sat", "prost"]
 # Optional: slow/optional tests (proptest, minimal failing config, etc.). CI should use --features "cpsat ci-tests".
 ci-tests = []
+# Deep-tier tests (CP-SAT solves to optimality, over a minute each in CI). Without it they are
+# #[ignore]d; ./scripts/test.sh rust enables it, rust-shallow (PR CI) does not.
+deep-tests = []
 
 [profile.release]
 lto = true
