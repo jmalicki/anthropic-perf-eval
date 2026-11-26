@@ -4,14 +4,15 @@ name: CI (deep)
 # deep-tests feature). ci.yml runs everything else on every PR.
 #
 # Runner minutes are rationed, so this runs:
-#   - weekly on main, and only if main has moved since the last successful deep run on main;
+#   - daily on main, and only if main has moved since the last finished deep run on main
+#     (otherwise it repeats that run's result: green if it passed, red if it failed);
 #   - by hand (Actions > CI (deep) > Run workflow), always;
 #   - on a PR that carries the `deep-ci` label (add it to PRs that change the CP-SAT model,
 #     its tuning, or anything else the deep tests guard). A PR without the label starts no job.
 
 on:
   schedule:
-    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+    - cron: "0 6 * * *"  # daily 06:00 UTC
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
@@ -51,14 +52,25 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Scheduled: skip when a deep run on main already succeeded at this commit.
-          green=$(gh api "repos/${{ github.repository }}/actions/workflows/ci-deep.yml/runs?branch=main&status=success&head_sha=${{ github.sha }}&per_page=1" --jq '.total_count')
-          if [ "$green" -gt 0 ]; then
-            echo "main (${{ github.sha }}) already passed the deep tier; skipping"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
+          # Scheduled: if main has not moved since the last finished deep run, repeat that run's
+          # result without spending minutes: green (deep jobs skipped) if it passed, red (this
+          # gate fails) if it failed. Cancelled runs do not count. The run in progress is not
+          # "completed", so it is not its own predecessor.
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/ci-deep.yml/runs?branch=main&status=completed&head_sha=${{ github.sha }}&per_page=50" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success" or .conclusion == "failure")][0] // empty | "\(.conclusion) \(.html_url)"')
+          sha="${{ github.sha }}"
+          case "$last" in
+            success\ *)
+              msg="main is still at ${sha:0:7}, which already passed the deep tier: ${last#success }. Deep jobs skipped."
+              echo "$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              echo "run=false" >> "$GITHUB_OUTPUT" ;;
+            failure\ *)
+              msg="main is still at ${sha:0:7}, which FAILED the deep tier: ${last#failure }. Not rerunning; fix main or rerun by hand."
+              echo "::error::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              exit 1 ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT" ;;
+          esac
 
   # The whole Rust suite with the deep-tests feature (the shallow tier ignores those tests).
   rust:
