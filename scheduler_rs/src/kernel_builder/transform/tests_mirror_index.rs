@@ -198,6 +198,8 @@ fn assert_refused(p: SsaProgram, rule: &MirrorIndexRule, text: &str) {
     let why = report.refused.clone().unwrap_or_else(|| panic!("expected a refusal containing {:?}: {}", text, report.summary()));
     assert!(why.contains(text), "{:?} does not contain {:?}", why, text);
     assert_eq!(report.n_sites(), 0);
+    // A refused rewrite relied on nothing: no assumption is reported.
+    assert!(report.assumptions().is_empty(), "refused, yet reports {:?}", report.assumptions());
     let (d, _) = first_difference(&canonical_ops(&after), &before);
     assert!(d.is_none(), "a refused program must be left unchanged: {:?}", d);
 }
@@ -324,7 +326,22 @@ fn test_mirror_index_refuses_non_ssa_input() {
     let before = canonical_ops(&p);
     let (after, report) = apply_mirror_index(p, &rule()).unwrap();
     assert!(report.refused.as_deref().map_or(false, |r| r.contains("more than once")), "{:?}", report.refused);
+    assert!(report.assumptions().is_empty(), "{:?}", report.assumptions());
     assert_eq!(canonical_ops(&after), before);
+}
+
+#[test]
+fn test_mirror_index_assumes_initial_indices_zero_only_when_it_rewrites() {
+    // spec5 is zero-based: the rewrite relies on InitialIndicesZero. A trace id on a step
+    // refuses it, and then nothing is assumed.
+    let p = raw_program(&spec5());
+    let (_, done) = apply_mirror_index(clone_program(&p), &rule()).unwrap();
+    assert!(done.refused.is_none() && done.n_sites() > 0, "{:?}", done.refused);
+    assert_eq!(done.assumptions(), vec!["initial-indices-zero"]);
+    let mut q = clone_program(&p);
+    let st = step_of(&q, 1);
+    q.ops[st].trace_id = Some("t".into());
+    assert_refused(q, &rule(), "carries a trace id");
 }
 
 

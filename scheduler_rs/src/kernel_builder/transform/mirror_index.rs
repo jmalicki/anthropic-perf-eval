@@ -478,7 +478,8 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
     if plan.steps.is_empty() {
         return Ok((program, report));
     }
-    report.add_facts(&plan.facts);
+    // The plan's facts (assumptions) are recorded only once the rewrite is done: a refused
+    // rewrite relied on nothing.
     if let Err(e) = Surgery::check(&program) {
         report.refused = Some(e);
         return Ok((program, report));
@@ -682,6 +683,7 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
         }
     };
     report.surgery = surgery_report;
+    report.add_facts(&plan.facts);
     if let (Some(before), None) = (before, &report.cost_error) {
         match dce_counts(&program) {
             Ok(after) => report.close(&before, &after),
