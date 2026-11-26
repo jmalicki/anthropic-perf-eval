@@ -98,6 +98,20 @@ docs/4-round-phase-results.md, and the window-probe results of docs/STARTUP_WIND
 and docs/WINDOW_OPTIMALITY_PROBE.md. Re-measured: see "Re-measured after the model change"
 below; everything else is not re-measured.
 
+### Re-measured after the model change
+
+4 rounds, default emission, `--no-valu-shift` (the configuration of CLAUDE.md's 485, which came
+from a 1,800 s wall-clock run and cannot be reproduced exactly), deterministic time 120 (both
+runs ended on it, about 320 s wall), same greedy start (508):
+
+| Model | Cycles | Bound | Gap | Kernel |
+|---|---|---|---|---|
+| before (critical-path build) | 499 | 445 | 10.8% | PROVED, PASSED |
+| after (this branch) | 500 | 445 | 11.0% | PROVED, PASSED |
+
+At this budget the two models end one cycle apart with the same bound: a different search,
+not a gain or a loss attributable to the change. Nothing else is re-measured.
+
 ## 3. Rolling full-model window pass over the whole schedule
 
 Window optimality probe (docs/WINDOW_OPTIMALITY_PROBE.md), rolling pass only: non-overlapping
