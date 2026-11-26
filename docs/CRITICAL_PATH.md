@@ -2,7 +2,8 @@
 
 The load-bound static bound is `t + q + ceil(W / 2)`: t is the dependency depth to the first
 gather load, q the depth from the last gather load to the end. The start-up window probe
-(docs/STARTUP_WINDOW_PROBE.md) found no scheduling slack in the start-up, so this shortens the
+(docs/STARTUP_WINDOW_PROBE.md) found that the ops after a start-up window cannot move earlier
+as one block; whether a re-interleave could shorten the start-up is open. This shortens the
 chains themselves, with emitter options (each a Z3 identity in `verification/rewrites.py`).
 
 All cycle counts are 16-round greedy development measurements with the best flags
