@@ -140,7 +140,8 @@ impl Pass for GreedySchedulePass {
         let is_cpsat_pipeline = ctx.config.cpsat.is_some();
         #[cfg(not(feature = "cpsat"))]
         let is_cpsat_pipeline = false;
-        let use_full_bounds = is_cpsat_pipeline || ctx.config.bounds.greedy_use_full_bounds;
+        let use_full_bounds = (is_cpsat_pipeline && !ctx.config.compiler.cpsat_greedy_policy_bounds)
+            || ctx.config.bounds.greedy_use_full_bounds;
 
         let bounds_usage = match ctx.bounds.as_ref() {
             Some(b) if use_full_bounds => GreedyBoundsUsage::Full {
@@ -392,7 +393,11 @@ impl Pass for GreedyJustifyPass {
             scratch_pools: compiler.scratch_model.is_pools(),
             allocator: Some(allocator),
         };
-        let use_full_bounds = is_cpsat_pipeline || ctx.config.bounds.greedy_use_full_bounds;
+        // As in the greedy pass: `--cpsat-greedy-bounds policy-only` makes the CP-SAT pipeline's
+        // justification unclamped like the greedy-only one, so CP-SAT starts from the
+        // greedy-only schedule.
+        let use_full_bounds = (is_cpsat_pipeline && !ctx.config.compiler.cpsat_greedy_policy_bounds)
+            || ctx.config.bounds.greedy_use_full_bounds;
         let domains = ctx.bounds.as_ref().filter(|_| use_full_bounds).map(|b| (&b.asap, &b.alap));
         let vgl = if ctx.vector_group_lanes.is_empty() { None } else { Some(&ctx.vector_group_lanes) };
         let enable_valu_shift = ctx.config.compiler.enable_valu_shift;

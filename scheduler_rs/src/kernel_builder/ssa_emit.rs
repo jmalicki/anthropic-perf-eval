@@ -1200,7 +1200,9 @@ impl SsaTickTockKernelBuilder {
         } else if mode != CachedSelect::Mobius {
             let pairs = table.pairs.as_ref().expect(&missing);
             if leave_top && tree_depth == 1 {
-                // BitsFlow at depth 1: the top select is the leaf pair itself.
+                // BitsFlow at depth 1: the top select is the leaf pair itself. (`Bits` leaves
+                // are multiply_adds and have no `high`; `select_xor_pushdown_applies` excludes it.)
+                debug_assert!(mode == CachedSelect::BitsFlow, "R18 at depth 1 needs bits-flow, got {:?}", mode);
                 let pair = &pairs[0];
                 return SelectTree::Top { bit: bit_at(0), high: pair.high.expect(&missing), low: pair.base };
             }
