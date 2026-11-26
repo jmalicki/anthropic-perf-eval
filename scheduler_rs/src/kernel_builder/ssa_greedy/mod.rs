@@ -1592,6 +1592,26 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 /// # Returns
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
 /// [`schedule_ssa_greedy_with_liveness_agreement`].
+/// After a greedy rerun with fixed ConstChoice encodings: every fixed `AluDerive` the rerun
+/// did not place as a derivation (`derived`, the rerun's `GreedyDiagnostics::const_alu_derive`)
+/// was scheduled as a load, so record it as `Load`; lowering then emits what was scheduled.
+///
+/// # Returns
+/// How many derivations became loads.
+pub(crate) fn reconcile_const_choice_encodings(
+    encodings: &mut HashMap<usize, ConstChoiceEncoding>,
+    derived: &HashMap<usize, crate::types::AluDeriveInfo>,
+) -> usize {
+    let mut demoted = 0;
+    for (id, enc) in encodings.iter_mut() {
+        if matches!(enc, ConstChoiceEncoding::AluDerive(_)) && !derived.contains_key(id) {
+            *enc = ConstChoiceEncoding::Load;
+            demoted += 1;
+        }
+    }
+    demoted
+}
+
 pub(crate) fn schedule_ssa_greedy_shaped(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -2881,10 +2901,30 @@ fn schedule_ssa_greedy_core(
                         }
                     };
                     if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
-                        if matches!(enc, ConstChoiceEncoding::AddImm) {
-                            Engine::Flow
-                        } else {
-                            Engine::Load
+                        match enc {
+                            ConstChoiceEncoding::AddImm => Engine::Flow,
+                            ConstChoiceEncoding::AluDerive(info) => {
+                                // A derivation of the first run: honour it only where it is
+                                // sound as the policy path makes it (both producers scheduled
+                                // in an earlier cycle and still live, ALU room); otherwise
+                                // the rerun loads the constant and the caller records Load
+                                // (`reconcile_const_choice_encodings`). Never an ALU op the
+                                // slot count and the precedences do not see.
+                                let producer_ok = |id: usize| {
+                                    id_to_idx.get(&id).is_some_and(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                };
+                                if slots.alu_used < 12 && producer_ok(info.left_op_id) && producer_ok(info.right_op_id) {
+                                    const_derive = Some(info.clone());
+                                    Engine::Alu
+                                } else {
+                                    Engine::Load
+                                }
+                            }
+                            _ => Engine::Load,
                         }
                     } else if const_choice_fixed_to_load {
                         Engine::Load
