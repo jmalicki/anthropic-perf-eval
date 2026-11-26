@@ -5252,18 +5252,23 @@ fn test_select_overflow_keeps_slot_limits() {
     ];
     for &select_overflow in &overflows {
         for split_shift in [false, true] {
-            for flow_priority in [FlowPriority::Key, FlowPriority::FeedsLoadFirst] {
+            for (flow_priority, alu_priority) in [
+                (FlowPriority::Key, AluPriority::Key),
+                (FlowPriority::FeedsLoadFirst, AluPriority::Key),
+                (FlowPriority::ChainFirst, AluPriority::NativeFirst),
+            ] {
                 let shape = GreedyShape {
                     priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
                     split_shift,
                     select_overflow,
                     flow_priority,
+                    alu_priority,
                     ..Default::default()
                 };
                 let (mut emit, selects) = emit_delta_select_chains(24);
                 let (_, shifted, fma, lanes) =
                     schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
-                let label = format!("{:?} split={} {:?}", select_overflow, split_shift, flow_priority);
+                let label = format!("{:?} split={} {:?} {:?}", select_overflow, split_shift, flow_priority, alu_priority);
                 assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, &label);
                 assert!(fma.is_subset(&selects), "{}", label);
                 match select_overflow {
@@ -5714,6 +5719,117 @@ fn test_wavefront_feeds_nonfinal_load() {
         let add0 = pred(load1);
         assert!(w.feeds_nonfinal_load(add0), "add before the middle load");
     }
+}
+
+
+// =========================================================================
+// Start-up priorities: chain-first flow, native-first scalar ALU
+// =========================================================================
+
+/// Per chain: a select, an AND of its result, a second select on that, an add and a store.
+/// Returns the program and each chain's second select (op index).
+fn emit_two_select_chains(chains: usize) -> (SsaEmitContext, Vec<usize>) {
+    let mut emit = SsaEmitContext::new();
+    let c1 = emit.emit_const(1);
+    let one = emit.emit_vbroadcast(c1);
+    let c5 = emit.emit_const(5);
+    let base = emit.emit_vbroadcast(c5);
+    let c9 = emit.emit_const(9);
+    let delta = emit.emit_vbroadcast(c9);
+    let true_val = emit.emit_valu(Opcode::Add, base, delta);
+    let addr = emit.emit_const(100);
+    let mut second = Vec::new();
+    for chain in 0..chains {
+        let cv = emit.emit_const(chain as i64);
+        let v = emit.emit_vbroadcast(cv);
+        let cond = emit.emit_valu(Opcode::And, v, one);
+        let s1 = emit.emit_select_choice_shared_delta(cond, true_val, delta, base);
+        let cond2 = emit.emit_valu(Opcode::And, s1, one);
+        let s2 = emit.emit_select_choice_shared_delta(cond2, true_val, delta, base);
+        second.push(emit.ops.len() - 1);
+        let out = emit.emit_valu(Opcode::Add, s2, one);
+        emit.emit_vstore(addr, out);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, second)
+}
+
+/// `chain-first`: the first chain's second select is not overtaken on the one flow slot by
+/// later chains' first selects, so it runs earlier than under the wavefront key (control:
+/// with stagger 0 every first select has a lower key than any second select).
+#[test]
+fn test_flow_chain_first_lets_the_first_chain_through() {
+    let run = |flow_priority| {
+        let shape = GreedyShape {
+            priority: GreedyPriority::Wavefront { stagger_cycles: 0, groups_in_flight: None },
+            flow_priority,
+            ..Default::default()
+        };
+        let (mut emit, second) = emit_two_select_chains(8);
+        let (_, shifted, fma, lanes) =
+            schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
+        assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, &format!("{:?}", flow_priority));
+        emit.ops[second[0]].cycle
+    };
+    let key = run(FlowPriority::Key);
+    let chain_first = run(FlowPriority::ChainFirst);
+    assert!(chain_first < key, "chain 0's second select: chain-first {} vs key {}", chain_first, key);
+}
+
+/// 24 one-op vector chains off one shared broadcast (so they are all ready together and the
+/// vector ALU overflows into shifts) and, last in emission order (highest key), 8 native
+/// scalar adds. Returns the program and the native adds (op indices).
+fn emit_vector_chains_and_late_natives() -> (SsaEmitContext, Vec<usize>) {
+    let mut emit = SsaEmitContext::new();
+    let addr = emit.emit_const(100);
+    let c = emit.emit_const(3);
+    let shared = emit.emit_vbroadcast(c);
+    for _ in 0..24 {
+        let w = emit.emit_valu(Opcode::Add, shared, shared);
+        emit.emit_vstore(addr, w);
+    }
+    let x = emit.emit_const(7);
+    let base = emit.emit_alu_imm(Opcode::Add, x, 1);
+    let mut natives = Vec::new();
+    let mut sums = Vec::new();
+    for j in 0..8 {
+        sums.push(emit.emit_alu_imm(Opcode::Add, base, j + 2));
+        natives.push(emit.ops.len() - 1);
+    }
+    let mut acc = emit.emit_alu(Opcode::Add, sums[0], sums[1]);
+    for s in &sums[2..] {
+        acc = emit.emit_alu(Opcode::Add, acc, *s);
+    }
+    let a2 = emit.emit_const(200);
+    emit.emit_store(a2, acc);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    (emit, natives)
+}
+
+/// `native-first`: native scalar ops take the scalar slots before vector ops are shifted
+/// onto them, so all 8 run in the cycle they become ready; under the wavefront key a shifted
+/// vector op takes 8 of the 12 slots first (control). Slot limits hold both ways.
+#[test]
+fn test_alu_native_first_keeps_scalar_slots_for_natives() {
+    let run = |alu_priority| {
+        let shape = GreedyShape {
+            priority: GreedyPriority::Wavefront { stagger_cycles: 4, groups_in_flight: None },
+            alu_priority,
+            ..Default::default()
+        };
+        let (mut emit, natives) = emit_vector_chains_and_late_natives();
+        let (_, shifted, fma, lanes) =
+            schedule_collecting_fma(&mut emit.ops, &shape, 1536, &GreedyPolicy, true).unwrap();
+        assert_slot_limits_with_selects(&emit.ops, &shifted, &fma, &lanes, &format!("{:?}", alu_priority));
+        let cycles: Vec<i32> = natives.iter().map(|&i| emit.ops[i].cycle).collect();
+        (*cycles.iter().min().unwrap(), *cycles.iter().max().unwrap(), shifted.len())
+    };
+    let (key_first, key_last, key_shifted) = run(AluPriority::Key);
+    let (nf_first, nf_last, _) = run(AluPriority::NativeFirst);
+    assert!(key_shifted > 0, "control: the program must shift vector ops");
+    assert_eq!(nf_first, nf_last, "native-first: all natives in one cycle");
+    assert!(key_last > key_first, "control: under the key, shifts split the natives ({}..{})", key_first, key_last);
+    assert!(nf_last < key_last, "native-first {} vs key {}", nf_last, key_last);
 }
 
 /// `final-last` under scratch-budget deferral (the documented limitation of

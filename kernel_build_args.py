@@ -476,11 +476,17 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
-    group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first"], default="key",
+    group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
+                       help="Wavefront only (an error otherwise): 'key' (default) native scalar ops and "
+                            "shiftable vector ops in one wavefront order; 'native-first' native scalar-ALU ops "
+                            "(e.g. address adds) are tried before the cycle's vector ops (lanes of a split shift "
+                            "carried from the previous cycle are still placed first and can take scalar slots) "
+                            "(docs/STARTUP_AND_STALL_LOOP.md)")
+    group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first", "chain-first"], default="key",
                        help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "
                             "wavefront key; 'feeds-load-first' flow ops that a non-final load depends on (the "
                             "selects before the mid-kernel gathers) before the others "
-                            "(docs/GREEDY_SHAPE_ABLATION.md section 12)")
+                            "(docs/GREEDY_SHAPE_ABLATION.md section 12); 'chain-first' flow ops by group (chain) rank, then key")
     group.add_argument("--greedy-select-overflow", choices=["never", "valu"], default="never",
                        help="Where a SelectChoice with a one-op multiply_add form runs: 'never' (default) always "
                             "a flow vselect; 'valu' the multiply_add on the vector ALU when the flow slot is taken "
@@ -600,6 +606,10 @@ def check_greedy_shape_combinations(get) -> None:
     flow_priority = get("greedy_flow_priority", "key")
     if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
         raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    alu_priority = get("greedy_alu_priority", "key")
+    if alu_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-alu-priority {alu_priority} orders the wavefront priority only; "
                          "it needs --greedy-priority wavefront")
     if overflow == "valu":
         select_choice = get("select_choice", "optimize")
@@ -738,6 +748,7 @@ def args_to_build_kwargs(
         "greedy_select_overflow": get("greedy_select_overflow", "never"),
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
+        "greedy_alu_priority": get("greedy_alu_priority", "key"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -804,6 +815,7 @@ def args_to_build_kwargs(
         "greedy_select_overflow": get("greedy_select_overflow", "never"),
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
+        "greedy_alu_priority": get("greedy_alu_priority", "key"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

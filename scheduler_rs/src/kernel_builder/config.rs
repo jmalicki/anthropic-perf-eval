@@ -753,6 +753,8 @@ pub struct CompilerConfig {
     pub greedy_select_overflow: super::ssa_greedy::SelectOverflow,
     /// Scratch model `words`: when a budget-deferred op is forced (default: `SameCycle`).
     pub greedy_budget_force: super::ssa_greedy::BudgetForce,
+    /// Wavefront: native scalar ops before vector ops on the scalar ALU (default: `Key`).
+    pub greedy_alu_priority: super::ssa_greedy::AluPriority,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -784,6 +786,7 @@ impl Default for CompilerConfig {
             greedy_flow_priority: super::ssa_greedy::FlowPriority::Key,
             greedy_select_overflow: super::ssa_greedy::SelectOverflow::Never,
             greedy_budget_force: super::ssa_greedy::BudgetForce::SameCycle,
+            greedy_alu_priority: super::ssa_greedy::AluPriority::Key,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -888,6 +891,7 @@ impl CompilerConfig {
             flow_priority: self.greedy_flow_priority,
             select_overflow: self.greedy_select_overflow,
             budget_force: self.greedy_budget_force,
+            alu_priority: self.greedy_alu_priority,
             shift_policy: {
                 use super::ssa_greedy::ShiftPolicy;
                 let target = self.greedy_shift_target;
@@ -1068,6 +1072,7 @@ pub fn check_greedy_shape_combinations(
     greedy_priority: GreedyPriorityKind,
     greedy_load_priority: &str,
     greedy_flow_priority: &str,
+    greedy_alu_priority: &str,
     greedy_select_overflow: &str,
     greedy_select_overflow_limit: Option<usize>,
     select_choice: &str,
@@ -1091,6 +1096,13 @@ pub fn check_greedy_shape_combinations(
             "greedy_flow_priority = '{}' (--greedy-flow-priority) orders the wavefront priority only; \
              it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
             greedy_flow_priority
+        ));
+    }
+    if greedy_alu_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_alu_priority = '{}' (--greedy-alu-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_alu_priority
         ));
     }
     if greedy_select_overflow == "valu" {
@@ -1120,19 +1132,21 @@ mod tests {
     fn test_check_greedy_shape_combinations() {
         use super::{check_greedy_shape_combinations as check, GreedyPriorityKind::*};
         // Defaults and the documented combinations are accepted.
-        assert!(check(Fifo, "key", "key", "never", None, "optimize", false, false).is_ok());
-        assert!(check(Wavefront, "final-last", "feeds-load-first", "valu", Some(3), "optimize", false, false).is_ok());
+        assert!(check(Fifo, "key", "key", "key", "never", None, "optimize", false, false).is_ok());
+        assert!(check(Wavefront, "final-last", "feeds-load-first", "key", "valu", Some(3), "optimize", false, false).is_ok());
         // Each ignored combination is an error.
-        assert!(check(Wavefront, "key", "key", "never", Some(3), "optimize", false, false).is_err());
-        assert!(check(Fifo, "key", "feeds-load-first", "never", None, "optimize", false, false).is_err());
-        assert!(check(Fifo, "final-last", "key", "never", None, "optimize", false, false).is_err());
-        assert!(check(Fifo, "tail", "key", "never", None, "optimize", false, false).is_err());
-        assert!(check(Wavefront, "key", "key", "valu", None, "fma", false, false).is_err());
-        assert!(check(Wavefront, "key", "key", "valu", None, "vselect", false, false).is_err());
-        assert!(check(Wavefront, "key", "key", "valu", None, "optimize", true, false).is_err());
-        assert!(check(Wavefront, "key", "key", "valu", None, "optimize", false, true).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "never", Some(3), "optimize", false, false).is_err());
+        assert!(check(Fifo, "key", "feeds-load-first", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "final-last", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "tail", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "fma", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "vselect", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", true, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", false, true).is_err());
+        assert!(check(Fifo, "key", "key", "native-first", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "chain-first", "native-first", "never", None, "optimize", false, false).is_ok());
         // Without overflow, the hint pass and fixed encodings are fine.
-        assert!(check(Wavefront, "key", "key", "never", None, "fma", true, true).is_ok());
+        assert!(check(Wavefront, "key", "key", "key", "never", None, "fma", true, true).is_ok());
     }
 
     use super::*;

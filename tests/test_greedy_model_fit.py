@@ -47,6 +47,32 @@ def test_es_formula_is_the_fitted_formula():
         assert es.greedy_model_cycles(b["counts"]) == gf.predict(b["features"], th)
 
 
+def test_stall_judge_reproduces_greedy_model_stall():
+    """The stall-judge records (judge "stall-0.98", same file) give es.GREEDY_MODEL_STALL and the
+    numbers docs/STARTUP_AND_STALL_LOOP.md quotes; held out, the model is optimistic."""
+    res = gf.analyse(gf.load(judge="stall-0.98"))
+    assert gf.check(res) == []
+    assert res["train_plans"] == 41 and res["loo_mae"] == 5.6
+    oos = res["out_of_sample_summary"]
+    assert (oos["index"]["n"], oos["index"]["mae"]) == (23, 14.5) and oos["index"]["mean_error"] < 0
+    assert (oos["path"]["n"], oos["path"]["mae"]) == (21, 62.3) and oos["path"]["mean_error"] < 0
+
+
+def test_judges_are_kept_apart(tmp_path):
+    default, stall = gf.load(), gf.load(judge="stall-0.98")
+    assert all(b.get("judge", "default") == "default" for b in default["builds"])
+    assert all(b["judge"] == "stall-0.98" for b in stall["builds"])
+    # collect replaces one judge's records and keeps the other's.
+    out = tmp_path / "data.json"
+    out.write_text(open(gf.DATA).read())
+    measured = tmp_path / "m.json"
+    measured.write_text('[{"name": "x", "bit_source": "index", "counts": %s, "cycles": 1000}]'
+                        % __import__("json").dumps(stall["builds"][0]["counts"]))
+    gf.collect([], [str(measured)], str(out), judge="stall-0.98")
+    assert len(gf.load(str(out))["builds"]) == len(default["builds"])
+    assert [b["name"] for b in gf.load(str(out), "stall-0.98")["builds"]] == ["x"]
+
+
 def test_collect_requires_out(tmp_path):
     """Review of #82: `collect` without --out must not overwrite the checked-in dataset."""
     import pytest

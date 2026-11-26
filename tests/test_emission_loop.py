@@ -305,6 +305,123 @@ def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
     assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
 
 
+def test_parse_greedy_options():
+    assert el.parse_greedy_options(["greedy_budget_force=stall", "pressure_inflation_threshold=0.98",
+                                    "greedy_groups_in_flight=32", "greedy_split_shift=true"]) == {
+        "greedy_budget_force": "stall", "pressure_inflation_threshold": 0.98,
+        "greedy_groups_in_flight": 32, "greedy_split_shift": True}
+    with pytest.raises(ValueError):
+        el.parse_greedy_options(["stall"])
+
+
+@pytest.mark.parametrize("objective", ["floor", "greedy-model"])
+def test_topk_enumerates_score_levels(table, tmp_path, objective):
+    """topk builds distinct plans with non-decreasing scores, moving up a level after
+    `per_level` plans, each PROVED and PASSED under the stall judge and within the 1,535
+    assignable words (plus the reserved zero word); the recorded score is the plan's own score. Deterministic-time solves."""
+    judge = dict(es.LOAD_TAIL_GREEDY, greedy_budget_force="stall", pressure_inflation_threshold=0.98)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None, greedy_extra=judge)
+    stage2.deterministic_time = 2.0
+    el.loop_topk(stage2, 3, 60.0, objective, per_level=1)
+    entries = [e for e in stage2.trace if e["mode"] == f"topk-{objective}"]
+    assert len(entries) == 3
+    assert len({e["plan"] for e in entries}) == 3
+    scores = [e["score"] for e in entries]
+    assert scores == sorted(scores) and len(set(scores)) == 3, scores  # one plan per level
+    assert [e["level"] for e in entries] == [1, 2, 3]
+    for b in stage2.builds.values():
+        # peak_live counts the reserved zero word: 1,535 assignable words + it = 1,536.
+        assert b["valid"] and b["peak_live"] - 1 <= 1535 and b["budget_exceeded"] is False
+        assert es.plan_score(table, b["rows"], objective) in scores
+
+
+def test_budget_exceeded_is_recorded_from_the_build(table, tmp_path, monkeypatch):
+    """Stage2 records the build's own budget flag (it used to write False)."""
+    real = es.measure
+
+    def flagged(*a, **k):
+        row = real(*a, **k)
+        row["budget_exceeded"] = True
+        return row
+
+    monkeypatch.setattr(es, "measure", flagged)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+    rec, _ = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert rec["budget_exceeded"] is True
+
+
+def test_greedy_options_are_validated():
+    el.validate_greedy_options({"greedy_budget_force": "stall", "pressure_inflation_threshold": 0.98}, CTX)
+    with pytest.raises(ValueError, match="unknown"):
+        el.validate_greedy_options({"greedy_budgt_force": "stall"}, CTX)  # typo
+    for fixed in ({"rounds": 4}, {"use_greedy": False}, {"select_bit_source": "path"}):
+        with pytest.raises(ValueError, match="fixed"):
+            el.validate_greedy_options(fixed, CTX)
+    # Read by the build but no effect on a greedy build (review of #83).
+    for no_effect in ({"cpsat_workers": 4}, {"force_zero_gap": True}, {"per_section_optimize_secs": 10},
+                      {"asap_alap_tightening": "none"}, {"liveness_detail": "none"}, {"no_cse_groups": True}):
+        with pytest.raises(ValueError, match="do not affect a greedy build"):
+            el.validate_greedy_options(no_effect, CTX)
+    for ok in ({"greedy_justify": 10}, {"scheduling_pressure_policy": "cascade"}, {"enable_schedule_with_fixed_choices": True}):
+        el.validate_greedy_options(ok, CTX)
+    for name in el.GREEDY_BUILD_OPTIONS:
+        assert name in el.build_option_names(), name
+
+
+def test_topk_stops_when_the_plan_space_is_exhausted(tmp_path, monkeypatch):
+    """Review of #83: 2 rounds, one group: the only choice round (depth 1) has 4 encodings, so 4
+    plans, all with the same score under a flat table. One plan per level is built, the other
+    three are rejected at the next level, and then nothing is left: the loop must stop after
+    a few solves (before, each further level cost a solve, up to 10^6 levels)."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    calls = []
+    real_solve = el.solve
+
+    def counting_solve(*a, **k):
+        calls.append(k)
+        return real_solve(*a, **k)
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    monkeypatch.setattr(el, "solve", counting_solve)
+    el.loop_topk(stage2, 10, 20.0, "floor", per_level=1)
+    assert len(stage2.builds) == 1, "one plan per score level, and there is one level"
+    assert stage2.trace[-1]["feedback"].startswith("exhausted")
+    assert stage2.trace[-1]["exhausted"] is True and stage2.trace[-1]["skipped_levels"] == []
+    assert len(calls) <= 8, f"{len(calls)} solves"
+
+
+def test_topk_after_a_skipped_level_is_not_reported_exhausted(tmp_path, monkeypatch):
+    """Review of #83: with no retries, a level whose solve returns a plan below it is skipped.
+    Plans at a skipped level may remain unbuilt, so the run must not end with "exhausted"; its
+    last record says which levels were skipped and that the rejected plans were not built."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    el.loop_topk(stage2, 10, 20.0, "floor", per_level=1, retries=0)
+    assert any("no plan of exactly this score" in e["feedback"] for e in stage2.trace), "control: a level was skipped"
+    last = stage2.trace[-1]
+    assert not last["feedback"].startswith("exhausted"), last["feedback"]
+    assert last["exhausted"] is False and last["skipped_levels"]
+    assert "remain unbuilt" in last["feedback"]
+
+
 def test_error_fingerprints_never_match(table, tmp_path):
     """Review of #76: a fingerprint that failed is a mismatch, even against an equal failure."""
     assert el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "a"})
