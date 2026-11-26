@@ -126,6 +126,19 @@ def run(tables=None, log=print) -> dict:
     return out
 
 
+def compare(res: dict, recorded: dict) -> list:
+    """Differences between rebuilt tables `res` and `recorded` ones, as "CHANGED ..." lines:
+    a rebuilt table that is not recorded, a row count that differs (zip would silently drop
+    the extra rows), and every row whose outcome (cycles or fail) differs."""
+    out = [f"CHANGED {t}: no recorded table" for t in res if t not in recorded]
+    out += [f"CHANGED {t}: {len(rows)} rows rebuilt, {len(recorded[t])} recorded"
+            for t, rows in res.items() if t in recorded and len(rows) != len(recorded[t])]
+    if out:
+        return out
+    return [f"CHANGED {t}: {a['row']}: recorded {outcome(b)}, now {outcome(a)}" for t, rows in res.items()
+            for a, b in zip(rows, recorded[t], strict=True) if outcome(a) != outcome(b)]
+
+
 def outcome(row: dict):
     return row.get("cycles", "fail" if "fail" in row else None)
 
@@ -149,11 +162,10 @@ def main(argv=None) -> int:
         return 0
     with open(args.data) as f:
         recorded = json.load(f)["tables"]
-    diffs = [(t, a["row"], outcome(b), outcome(a)) for t, rows in res.items()
-             for a, b in zip(rows, recorded[t]) if outcome(a) != outcome(b)]
-    for t, row, was, now in diffs:
-        print(f"CHANGED {t}: {row}: recorded {was}, now {now}")
-    return 1 if diffs else 0
+    changes = compare(res, recorded)
+    for line in changes:
+        print(line)
+    return 1 if changes else 0
 
 
 if __name__ == "__main__":

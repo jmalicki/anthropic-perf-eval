@@ -34,3 +34,17 @@ def test_recorded_sweep_holds_the_doc_headline():
     assert (best["best, path"], best["best, index"]) == (1012, 1033)
     assert (best["justify 0, path"], best["justify 0, index"]) == (1044, 1047)
     assert sum(sweep.outcome(r) == "fail" for r in tables["sweep"]) == 2
+
+
+def test_compare_reports_a_recorded_table_missing_its_last_row():
+    """Cheap (no build): a recorded table with fewer rows than the rebuilt one is a change, not
+    silently truncated by zip (review of #93)."""
+    with open(sweep.DATA) as f:
+        recorded = json.load(f)["tables"]
+    assert sweep.compare(recorded, recorded) == []
+    table = next(iter(recorded))
+    short = dict(recorded, **{table: recorded[table][:-1]})
+    changes = sweep.compare(recorded, short)
+    assert changes == [f"CHANGED {table}: {len(recorded[table])} rows rebuilt, {len(recorded[table]) - 1} recorded"]
+    flipped = dict(recorded, **{table: [dict(recorded[table][0], cycles=-1)] + recorded[table][1:]})
+    assert any("recorded -1" in c for c in sweep.compare(recorded, flipped))

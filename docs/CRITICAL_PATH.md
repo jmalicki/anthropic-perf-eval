@@ -135,7 +135,7 @@ once and is not in the data.
 
 **What this branch's code change does and does not explain.** The change is that
 justification now models ALU-derived constants, so it runs with `--greedy-const-policy
-alu-first` (before, it skipped such schedules): that is the `alu-first` rows (1,026 -> 1,016).
+alu-first` (before, it skipped such schedules): that is the `alu-first` rows (1,026 -> 1,016, with R16 `--reassociate-gather-xor`; without R16 it is 1,019).
 The headline 1,012 / 1,033 uses the default const policy (no derived constants) and does not
 depend on it: the neighbours table rebuilt on `critical-path` (#91, without this change)
 gives the same cycles in every row. It is a measurement recorded here.
