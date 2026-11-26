@@ -1,0 +1,258 @@
+"""Closed loop between the structure model and the shaped greedy (scripts/emission_loop.py,
+docs/EMISSION_STRUCTURE_MODEL.md section 10). 16 rounds, 4 groups.
+
+- window_floor equals a brute force over every choice resolution and is monotone.
+- capped_floor is choice_floor without caps and the solver's capped objective with them.
+- No-good cuts and the incumbent bound exclude what they should.
+- With window rows the solver's M is max(floor, the row table's bound) of the plan it returns.
+- The row table learned from built plans never puts a plan's bound above its cycles, and a
+  plan that shows a lower head than the table is reported.
+- The loop end to end: every plan it builds is PROVED and PASSED, and the state is reusable.
+"""
+
+import itertools
+import json
+import os
+import random
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from scripts import emission_loop as el  # noqa: E402
+from scripts import emission_structure as es  # noqa: E402
+
+CTX = es.Context(rounds=16, batch_size=32)
+
+
+def brute_window_floor(c, cap=es.CAP, vlen=es.VLEN):
+    for span in itertools.count(0):
+        if c["load"] > cap["load"] * span or c["store"] > cap["store"] * span:
+            continue
+        for sf in range(c["select"] + 1):
+            if c["flow"] + sf > cap["flow"] * span:
+                continue
+            vector = c["vec_fixed"] + c["vec_shiftable"] + c["select"] - sf
+            if any(vector - sh <= cap["valu"] * span and c["alu"] + vlen * sh <= cap["alu"] * span
+                   for sh in range(c["vec_shiftable"] + 1)):
+                return span
+
+
+def random_window_counts(rng):
+    return {"vec_fixed": rng.randint(0, 20), "vec_shiftable": rng.randint(0, 20), "alu": rng.randint(0, 30),
+            "load": rng.randint(0, 10), "store": rng.randint(0, 4), "flow": rng.randint(0, 4),
+            "select": rng.randint(0, 8)}
+
+
+def test_window_floor_matches_brute_force_and_is_monotone():
+    rng = random.Random(3)
+    for _ in range(300):
+        c = random_window_counts(rng)
+        assert es.window_floor(c) == brute_window_floor(c), c
+        bigger = dict(c)
+        bigger[rng.choice(es.WINDOW_CATEGORIES)] += 1
+        assert es.window_floor(bigger) >= es.window_floor(c)
+    assert es.window_floor(dict.fromkeys(es.WINDOW_CATEGORIES, 0)) == 0
+
+
+def test_capped_floor_is_choice_floor_without_caps():
+    rng = random.Random(4)
+    for _ in range(200):
+        c = {"vec_fixed": rng.randint(0, 30), "vec_shiftable": rng.randint(0, 30), "alu": rng.randint(0, 40),
+             "load": rng.randint(0, 12), "store": rng.randint(0, 6), "flow": rng.randint(0, 4),
+             "select1": rng.randint(0, 5), "select2": rng.randint(0, 5), "const": rng.randint(0, 3),
+             "const_alu": rng.randint(0, 3)}
+        assert el.capped_floor(c) == es.choice_floor(c)["cycles"], c
+        assert el.capped_floor(c, {"flow": 0.5}) >= el.capped_floor(c)
+
+
+def flat_table(ctx, **base):
+    coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+    coef["base"].update(base)
+    return es.CostTable(ctx, coef)
+
+
+@pytest.fixture(scope="module")
+def table(tmp_path_factory):
+    return es.calibrate(CTX, str(tmp_path_factory.mktemp("cal")), n_random=10, seed=3, log=None)
+
+
+def test_nogood_and_incumbent(table):
+    first = es.solve_plan_isolated(table, time_limit=20)
+    key = es.plan_group_counts(first["rows"], CTX)
+    second = es.solve_plan_isolated(table, time_limit=20, nogoods=[{f"{r}:{e}": v for (r, e), v in key.items()}])
+    assert second["status"] != "infeasible"
+    assert es.plan_group_counts(second["rows"], CTX) != key
+    assert second["floor"]["cycles"] >= first["floor"]["cycles"]
+    # Nothing has a floor below the optimum.
+    assert es.solve_plan_isolated(table, time_limit=20, incumbent=first["floor"]["cycles"])["status"] == "infeasible"
+
+
+def test_capped_floor_matches_the_solver(table):
+    caps = {"flow": 0.8}
+    res = es.solve_plan_isolated(table, max_util=caps, time_limit=20)
+    assert el.capped_floor(res["counts"], caps) == res["capped_cycles"]
+
+
+@pytest.fixture(scope="module")
+def built(table, tmp_path_factory):
+    """Stage 2 with three plans built (state in a temporary file)."""
+    d = tmp_path_factory.mktemp("loop")
+    stage2 = el.Stage2(table, str(d), str(d / "state.json"), log=None)
+    for spec in ("gather", "bits+depth4", "bits"):
+        stage2.evaluate(el.resolve_plan(spec, CTX)[1], f"seed {spec}")
+    return stage2
+
+
+def test_builds_are_proved_and_rows_stay_below_cycles(built):
+    assert len(built.builds) == 3
+    for b in built.builds.values():
+        assert b["valid"] and b["proved"] and b["passed"] and b["counts_match"]
+        assert max(b["predicted_floor"], built.rowtable.bound(b["rows"])["bound"]) <= b["cycles"]
+        assert b["rows_bound_after_merge"] <= b["cycles"]
+
+
+def test_row_table_reports_a_plan_below_it(built):
+    rows = el.resolve_plan("bits", CTX)[1]
+    key = next(k for k in built.rowtable.classes if k.startswith("r|") and built.rowtable.classes[k]["head"] > 0)
+    obs = {k: dict(v) for k, v in built.rowtable.classes.items()}
+    obs[key]["head"] -= 1
+    bad = built.rowtable.check(obs, rows)
+    assert {"class": key, "field": "head"}.items() <= bad[0].items()
+    # A round class missing from a plan counts as zero of it.
+    del obs[key]
+    assert any(b["class"] == key and b["field"] == "count" for b in built.rowtable.check(obs, rows))
+
+
+def test_windows_objective_is_the_plans_row_bound(table, built):
+    specs = built.rowtable.window_specs(es.baseline_rows(CTX))
+    assert specs
+    res = es.solve_plan_isolated(table, windows=specs, time_limit=30)
+    bound = built.rowtable.bound(res["rows"], specs)["bound"]
+    assert res["objective"] == max(res["floor"]["cycles"], bound)
+    assert res["objective"] >= es.solve_plan_isolated(table, time_limit=20)["floor"]["cycles"]
+
+
+def test_loop_end_to_end(table, tmp_path):
+    state = tmp_path / "state.json"
+    argv = ["run", "--batch-size", "32", "--state", str(state), "--budget", "1", "--patience", "1",
+            "--time-limit", "20", "--modes", "nogood,caps-underfilled,rows", "--seed-plan", "bits",
+            "--json", str(tmp_path / "out.json")]
+    # Use the calibrated fixture rather than the context's cache.
+    table_path = tmp_path / "table.json"
+    table_path.write_text(json.dumps(table.to_json()))
+    assert el.main(argv + ["--table", str(table_path)]) == 0
+    out = json.loads((tmp_path / "out.json").read_text())
+    modes = {e["mode"] for e in out["trace"]}
+    assert {"nogood", "caps-underfilled", "rows"} <= modes
+    for e in out["trace"]:
+        if "cycles" in e:
+            assert e["proved"] and e["passed"]
+    saved = json.loads(state.read_text())
+    n = len(saved["builds"])
+    # A second run reuses the state: the seed is not rebuilt.
+    assert el.main(["report", "--batch-size", "32", "--state", str(state), "--table", str(table_path)]) == 0
+    assert len(json.loads(state.read_text())["builds"]) == n
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups: canonical no-goods, sound rows cut, reproducibility records
+# ----------------------------------------------------------------------------
+def _fake_build(rows, cycles=1000):
+    return {"name": "fake", "plan": "fake", "rows": [list(r) for r in rows], "valid": True, "cycles": cycles,
+            "simulator_cycles": cycles, "predicted_floor": 900, "rows_bound_before_merge": 0,
+            "rows_bound_after_merge": 0}
+
+
+def _non_canonical(rows):
+    """Same model point, another arrangement: the root (not a choice round) selected with mobius."""
+    other = [list(r) for r in rows]
+    other[0] = ["mobius"] * len(other[0])
+    return other
+
+
+def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
+    res = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    assert el.is_canonical(res["rows"], CTX)
+    other = _non_canonical(res["rows"])
+    assert es.plan_model_key(other, CTX) == es.plan_model_key(res["rows"], CTX)
+    assert not el.is_canonical(other, CTX)
+    # A mixed round arranged in another order is the same point but not canonical either.
+    mixed = es.baseline_rows(CTX)
+    r = CTX.choice_rounds()[0]
+    mixed[r] = ["gather", "bits"] * (CTX.n_groups // 2)
+    assert es.canonical_rows(mixed, CTX)[r] == sorted(mixed[r], key=es.ENCODINGS.index)
+    assert not el.is_canonical(mixed, CTX)
+
+
+def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    seed = _non_canonical(first["rows"])
+    stage2.builds[el.plan_key(seed)] = _fake_build(seed)
+    assert el._built_nogoods(stage2) == []
+    # So stage 1 can still return the model's own arrangement of those counts, unbuilt.
+    res = el.solve(stage2, nogoods=el._built_nogoods(stage2), time_limit=20)
+    assert res["rows"] == first["rows"] and el.plan_key(res["rows"]) not in stage2.builds
+    # Once the canonical arrangement is built, the point is cut.
+    stage2.builds[el.plan_key(first["rows"])] = _fake_build(first["rows"])
+    assert el._built_nogoods(stage2) == [es.plan_model_key(first["rows"], CTX)]
+    res = el.solve(stage2, nogoods=el._built_nogoods(stage2), time_limit=20)
+    assert es.plan_model_key(res["rows"], CTX) != es.plan_model_key(first["rows"], CTX)
+
+
+def test_floor_incumbent_is_the_sound_cut(table):
+    first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
+    res = es.solve_plan_isolated(table, time_limit=20, floor_incumbent=first["floor"]["cycles"])
+    assert res["status"] == "infeasible" and res["solves"][0]["status"] == "INFEASIBLE"
+
+
+@pytest.mark.parametrize("cut", ["sound", "heuristic"])
+def test_rows_cut_is_sound_by_default_and_never_claims_exhaustion_when_heuristic(table, tmp_path, monkeypatch, cut):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    rec = _fake_build(rows, cycles=1000)
+    rec["rows_bound_before_merge"], rec["rows_bound_after_merge"] = 990, 981  # overestimated by 9
+    stage2.builds[el.plan_key(rows)] = rec
+    seen = {}
+
+    def fake_solve(_stage2, **kwargs):
+        seen.update(kwargs)
+        return {"status": "infeasible", "solves": [{"phase": "main", "status": "INFEASIBLE"}]}
+
+    monkeypatch.setattr(el, "solve", fake_solve)
+    el.loop_rows(stage2, 1, 1, 1.0, cut=cut)
+    feedback = stage2.trace[-1]["feedback"]
+    assert seen["floor_incumbent"] == 1000
+    if cut == "sound":
+        assert seen["incumbent"] is None and feedback.startswith("exhausted")
+    else:
+        assert seen["incumbent"] == 1000 + 9 and "exhausted" not in feedback and "heuristic" in feedback
+    assert stage2.trace[-1]["solves"] == [{"phase": "main", "status": "INFEASIBLE"}]
+
+
+def test_solves_are_recorded_and_deterministic(table):
+    a = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
+    b = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
+    assert a["rows"] == b["rows"]
+    phases = [s["phase"] for s in a["solves"]]
+    assert phases[0] == "main" and phases[-1] == "tie_break"
+    for s in a["solves"]:
+        assert s["status"] in ("OPTIMAL", "FEASIBLE", "UNKNOWN") and not s["stopped_on_wall_clock"]
+        assert s["deterministic_time"] <= 5 + 1e-6
+
+
+def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
+    state = tmp_path / "state.json"
+    stage2 = el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "a"})
+    rows = es.baseline_rows(CTX)
+    stage2.builds[el.plan_key(rows)] = _fake_build(rows)
+    stage2.save()
+    assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "a"}).builds
+    with pytest.raises(ValueError, match="not comparable"):
+        el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"})
+    # Reports only read it.
+    assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
+                     check_scheduler=False).scheduler == {"extension_sha256": "a"}
+    assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
