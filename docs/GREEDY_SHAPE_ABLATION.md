@@ -1049,7 +1049,8 @@ with CP-SAT.
   measured.
 - Shift decisions change only when the greedy owned them (no forced shift encoding, no hint
   pass); ALU-derived constants, eliminated vbroadcasts and individually forced shifts
-  (what-if runs, whose forced set the greedy does not see) make the pass skip.
+  (what-if runs, with or without CP-SAT: the greedy places the forced ops shifted, but the
+  justification passes choose every shift themselves) make the pass skip.
 
 ```bash
 # 16 x 256: 1,279 cycles (1,281 on the simulator), PROVED and PASSED

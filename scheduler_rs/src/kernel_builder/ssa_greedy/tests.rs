@@ -6614,6 +6614,278 @@ fn test_justify_stops_after_stalled_iterations() {
     assert_eq!(limited_cycles, unlimited_cycles);
 }
 
+// =========================================================================
+// Individually forced shifts (GreedyShape::forced_shift_ops)
+//
+// The CP-SAT model fixes the shift literal of a forced op to 1. The greedy schedule is the
+// model's hint and bounds its domains, so it must place those ops shifted on every path.
+// =========================================================================
+
+/// A policy that never lets the scheduler choose a shift (as the pressure policies do above
+/// their critical threshold) and otherwise behaves like the plain one.
+#[derive(Debug)]
+struct NoShiftPolicy;
+
+impl PressurePolicy for NoShiftPolicy {
+    fn sort_ready(&self, candidates: &mut [SchedulingCandidate], ctx: &SchedulingContext) {
+        GreedyPolicy.sort_ready(candidates, ctx)
+    }
+
+    fn should_defer_for_pressure(
+        &self,
+        _live_words: usize,
+        _words_added: usize,
+        _words_freed: usize,
+        _scratch_budget: usize,
+    ) -> bool {
+        false
+    }
+
+    fn allow_shift(&self, _live_words: usize, _alu_used: usize, _scratch_budget: usize) -> bool {
+        false
+    }
+}
+
+/// What a forced-shift scheduling run is given besides the ops.
+struct ForcedShiftRun<'a> {
+    forced: &'a [usize],
+    policy: &'a dyn PressurePolicy,
+    budget: usize,
+    enable_valu_shift: bool,
+    fixed_shifted_ops: Option<&'a HashSet<usize>>,
+    valu_shift_fixed_to_none: bool,
+    split_shift: bool,
+}
+
+impl Default for ForcedShiftRun<'_> {
+    fn default() -> Self {
+        ForcedShiftRun {
+            forced: &[],
+            policy: &GreedyPolicy,
+            budget: 1536,
+            enable_valu_shift: true,
+            fixed_shifted_ops: None,
+            valu_shift_fixed_to_none: false,
+            split_shift: false,
+        }
+    }
+}
+
+/// Schedule `ops` with the given forced shifts.
+///
+/// # Returns
+/// `(shifted op ids, per-lane cycles of split shifts, budget_exceeded)`.
+fn schedule_with_forced_shifts(
+    ops: &mut [SsaOp],
+    run: &ForcedShiftRun,
+) -> (HashSet<usize>, HashMap<usize, Vec<i32>>, bool) {
+    let shape = GreedyShape {
+        split_shift: run.split_shift,
+        forced_shift_ops: run.forced.iter().copied().collect(),
+        ..Default::default()
+    };
+    let mut shifted = HashSet::new();
+    let mut lane_cycles = HashMap::new();
+    let ((_, budget_exceeded, _), _) = schedule_ssa_greedy_shaped(
+        ops,
+        run.enable_valu_shift,
+        &mut shifted,
+        run.budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        run.policy,
+        None,
+        false,
+        false,
+        false,
+        run.valu_shift_fixed_to_none,
+        None,
+        run.fixed_shifted_ops,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut lane_cycles,
+    )
+    .expect("greedy schedules the ops");
+    (shifted, lane_cycles, budget_exceeded)
+}
+
+/// Every op has a cycle, no cycle holds more than 6 vector ops that are not shifted or more
+/// than 12 scalar ops (native ones plus the lanes of shifted ops), and every reader runs
+/// after its producers.
+fn assert_slot_limits_with_shifts(
+    ops: &[SsaOp],
+    shifted: &HashSet<usize>,
+    lane_cycles: &HashMap<usize, Vec<i32>>,
+) {
+    let mut alu = shifted_alu_use(ops, shifted, lane_cycles);
+    let mut valu: HashMap<i32, usize> = HashMap::new();
+    let cycle_of: HashMap<usize, i32> = ops.iter().map(|op| (op.id, op.cycle)).collect();
+    for op in ops {
+        assert!(op.cycle >= 0, "op {} was not scheduled", op.id);
+        match op.engine {
+            Engine::Alu => *alu.entry(op.cycle).or_default() += 1,
+            Engine::Valu if !shifted.contains(&op.id) => *valu.entry(op.cycle).or_default() += 1,
+            _ => {}
+        }
+        for dep in &op.dep_ids {
+            assert!(cycle_of[dep] < op.cycle, "op {} runs before its producer {}", op.id, dep);
+        }
+    }
+    for (cycle, used) in &alu {
+        assert!(*used <= 12, "cycle {}: {} scalar slots", cycle, used);
+    }
+    for (cycle, used) in &valu {
+        assert!(*used <= 6, "cycle {}: {} vector slots", cycle, used);
+    }
+}
+
+/// Ids of the adds of `emit_independent_chains` at `level`.
+fn chain_level_ids(emit: &SsaEmitContext, level_ops: &[Vec<usize>], level: usize) -> Vec<usize> {
+    level_ops.iter().map(|chain| emit.ops[chain[level]].id).collect()
+}
+
+/// Ops in the forced set are placed shifted even where the scheduler would leave everything
+/// on the vector slots, including several that become ready in the same cycle (one whole
+/// shift fits per cycle); nothing else is shifted and the slot limits hold.
+#[test]
+fn test_forced_shift_ops_are_placed_shifted() {
+    // 4 chains: at most 4 vector ops per cycle, so the greedy never shifts on its own.
+    let (mut free, free_levels) = emit_independent_chains(4, 3);
+    let (free_shifted, _, _) = schedule_with_forced_shifts(&mut free.ops, &ForcedShiftRun::default());
+    assert!(free_shifted.is_empty(), "nothing to shift without a forced set");
+    let free_cycle = free.ops[free_levels[0][1]].cycle;
+
+    let (mut emit, level_ops) = emit_independent_chains(4, 3);
+    let forced = chain_level_ids(&emit, &level_ops, 1);
+    let run = ForcedShiftRun { forced: &forced, ..Default::default() };
+    let (shifted, lanes, budget_exceeded) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert!(!budget_exceeded);
+    assert_eq!(shifted, forced.iter().copied().collect::<HashSet<_>>());
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+    // All four were ready in `free_cycle`; shifted, they take one cycle each.
+    let mut cycles: Vec<i32> = level_ops.iter().map(|chain| emit.ops[chain[1]].cycle).collect();
+    cycles.sort();
+    assert_eq!(cycles, (free_cycle..free_cycle + 4).collect::<Vec<_>>());
+}
+
+/// A policy that blocks shifting does not apply to a forced shift.
+#[test]
+fn test_forced_shift_overrides_policy_that_blocks_shifting() {
+    // 30 chains saturate the vector slots; with shifting blocked nothing is shifted.
+    let (mut blocked, _) = emit_independent_chains(30, 4);
+    let run = ForcedShiftRun { policy: &NoShiftPolicy, ..Default::default() };
+    let (blocked_shifted, _, _) = schedule_with_forced_shifts(&mut blocked.ops, &run);
+    assert!(blocked_shifted.is_empty(), "the policy blocks every shift");
+
+    let (mut emit, level_ops) = emit_independent_chains(30, 4);
+    let forced: Vec<usize> = chain_level_ids(&emit, &level_ops, 2).into_iter().step_by(7).collect();
+    let run = ForcedShiftRun { forced: &forced, policy: &NoShiftPolicy, ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert_eq!(shifted, forced.iter().copied().collect::<HashSet<_>>());
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+}
+
+/// The force-schedule path (scratch budget too tight, pressure policy blocking shifts) keeps
+/// forced ops shifted and the slot limits intact. Same program as
+/// `test_force_schedule_never_exceeds_valu_capacity`.
+#[test]
+fn test_forced_shift_holds_on_force_schedule_path() {
+    let policies: [(&str, &dyn PressurePolicy); 3] = [
+        ("adaptive", &AdaptivePolicy::default()),
+        ("no-shift", &NoShiftPolicy),
+        ("greedy", &GreedyPolicy),
+    ];
+    for (name, policy) in policies {
+        let mut emit = SsaEmitContext::new();
+        let scalars: Vec<VReg> = (0..8).map(|i| emit.emit_const(i)).collect();
+        let vecs: Vec<VReg> = scalars.iter().map(|&s| emit.emit_vbroadcast(s)).collect();
+        let mut adds = Vec::new();
+        let mut results = Vec::new();
+        for i in 0..12 {
+            results.push(emit.emit_valu(Opcode::Add, vecs[i % 8], vecs[(i + 1) % 8]));
+            adds.push(emit.ops.last().unwrap().id);
+        }
+        let addr = emit.emit_const(200);
+        for &r in &results {
+            emit.emit_vstore(addr, r);
+        }
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+
+        // 8 broadcasts are 64 words: with 80 the adds are force-scheduled past the budget.
+        let run = ForcedShiftRun { forced: &adds, policy, budget: 80, ..Default::default() };
+        let (shifted, lanes, budget_exceeded) = schedule_with_forced_shifts(&mut emit.ops, &run);
+        assert!(budget_exceeded, "{}: the force-schedule path must run", name);
+        assert_eq!(shifted, adds.iter().copied().collect::<HashSet<_>>(), "{}", name);
+        assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+    }
+}
+
+/// With split shifts enabled a forced op is still shifted (whole) and the scalar slots stay
+/// within 12 per cycle next to the split shifts the scheduler chooses itself.
+#[test]
+fn test_forced_shift_with_split_shifts() {
+    let (mut emit, level_ops) = emit_independent_chains(30, 6);
+    let forced: Vec<usize> = chain_level_ids(&emit, &level_ops, 3).into_iter().step_by(5).collect();
+    let run = ForcedShiftRun { forced: &forced, split_shift: true, ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert!(!lanes.is_empty(), "the scheduler still makes split shifts");
+    for id in &forced {
+        assert!(shifted.contains(id), "forced op {} is not shifted", id);
+        assert!(!lanes.contains_key(id), "forced op {} was split over two cycles", id);
+    }
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+}
+
+/// A forced shift is recorded when a hint pass owns the other shift decisions
+/// (`valu_shift_fixed_to_none`): the pass only adds shifts, so it must see this one.
+#[test]
+fn test_forced_shift_recorded_when_hint_pass_owns_shifts() {
+    let (mut emit, level_ops) = emit_independent_chains(4, 3);
+    let forced = vec![emit.ops[level_ops[2][1]].id];
+    let run = ForcedShiftRun { forced: &forced, valu_shift_fixed_to_none: true, ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert_eq!(shifted, forced.iter().copied().collect::<HashSet<_>>());
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+}
+
+/// The forced set is consulted exactly where the CP-SAT model consults it: not with shifting
+/// disabled, not under a complete fixed encoding (`--valu-shift valu`), and never for an op
+/// that cannot shift (a broadcast) or is not a vector op.
+#[test]
+fn test_forced_shift_ignored_where_the_model_ignores_it() {
+    let build = || {
+        let (emit, level_ops) = emit_independent_chains(4, 3);
+        let mut forced = chain_level_ids(&emit, &level_ops, 1);
+        // The two constants and the broadcast: not shiftable.
+        forced.extend(emit.ops.iter().take(3).map(|op| op.id));
+        (emit, forced)
+    };
+
+    let (mut emit, forced) = build();
+    let run = ForcedShiftRun { forced: &forced, enable_valu_shift: false, ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert!(shifted.is_empty(), "shifting disabled");
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+
+    let (mut emit, forced) = build();
+    let none = HashSet::new();
+    let run = ForcedShiftRun { forced: &forced, fixed_shifted_ops: Some(&none), ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    assert!(shifted.is_empty(), "a fixed encoding owns every shift decision");
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+
+    let (mut emit, forced) = build();
+    let run = ForcedShiftRun { forced: &forced, ..Default::default() };
+    let (shifted, lanes, _) = schedule_with_forced_shifts(&mut emit.ops, &run);
+    let shiftable: HashSet<usize> = forced[..4].iter().copied().collect();
+    assert_eq!(shifted, shiftable, "only the shiftable vector ops of the set are shifted");
+    assert_slot_limits_with_shifts(&emit.ops, &shifted, &lanes);
+}
+
 /// Justification after `--greedy-select-overflow valu`: the selects the greedy put on the
 /// vector ALU are multiply-add selects for the pass too (their delta and operands are held to
 /// cycle + 1, as address assignment holds them). The pass's peak equals address
