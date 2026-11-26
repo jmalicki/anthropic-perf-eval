@@ -181,6 +181,18 @@ entry with 4 and with 32 groups (`tests/test_emission_structure.py`, and `derive
 Contexts it does not cover yet: the zero-based index (bits are matched only on the mirrored
 index chain) and `--values-only` (dead index updates are per group, the `tail:*` features).
 
+The apply pass (`transform::apply_tree_access_plan`) takes a plan and rewrites the same
+instantiated program into the plan's program: readers of each site's value are rewired to the
+chosen candidate, then dead code elimination. Three emitter-order effects are reproduced
+explicitly so the result is the `--emission-plan` program op for op (up to VReg and op
+numbering; Rust tests over 74 plans at 4 and 32 groups, and the greedy schedule is the same): a mixed round's
+encodings in order of their first group; the level-end constant `L_d`, which the emitter
+creates at its first live user: the first round that gathers at depth `d`, or, when no round
+gathers there, the final mirrored index conversion if the last round leaves the indices at
+depth `d` (e.g. 15 rounds at height 10 and `L_4`; tested at that shape), with its ALU-derived
+alternatives recomputed there; and the broadcast of a level's first table entry, shared by leaf pairs and
+Mobius coefficients, which the emitter creates with the coefficients when no pair is used.
+
 ## 4. The objective: the capacity floor with choices resolved
 
 `choice_floor(counts)` is the smallest integer `T` such that some resolution of every choice fits
@@ -508,7 +520,7 @@ vector slots, and the vector ALU is busy in every steady-state cycle. So a sched
 longer for any reason shifts fewer ops.
 
 For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
-emission (static bound 1,029); 10 are scheduling loss. Its 158 shifts "missing" against the
+emission (static bound 1,029); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). Its 158 shifts "missing" against the
 floor's split are a consequence: at 1,029 cycles with the same idle vector slots only 1,367
 shifts fit, but a schedule with more idle slots could shift more, so that count is conditional,
 not a bound. What is known about slower plans, labelled removal (an A/B build) or accounting

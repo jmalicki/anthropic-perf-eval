@@ -293,3 +293,71 @@ def test_derive_refuses_to_overwrite_its_reference(tmp_path, monkeypatch, defaul
     with pytest.raises(SystemExit) as e:
         es.main(argv)
     assert e.value.code == 2
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #76): the greedy-model objective
+# ----------------------------------------------------------------------------
+def _flat_table(ctx, **base):
+    coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+    coef["base"].update(base)
+    return es.CostTable(ctx, coef)
+
+
+def test_greedy_model_objective_equals_the_model_with_a_negative_slope():
+    """excess is max(0, flow + selects - flow0) exactly, so the solver's objective equals
+    greedy_model_cycles even under a negative slope override (before: 203 instead of 300)."""
+    ctx = es.Context(rounds=16, batch_size=32)
+    table = _flat_table(ctx, load=400)
+    model = {"a_floor": 3, "a_load": 100, "flow0": 10, "b_flow_x100": -100}
+    res = es.solve_plan_isolated(table, time_limit=20, greedy_model=model)
+    assert res["objective"] == math.ceil(es.greedy_model_cycles(res["counts"], model)) == 300
+
+
+_UNKNOWN_SCRIPT = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from ortools.sat.python import cp_model
+from scripts import emission_structure as es
+
+Real = cp_model.CpSolver
+
+class FloorUnknown(Real):
+    # The second solve (the model-floor phase) returns UNKNOWN without a solution, and any
+    # read of a value after it raises, as reading a solution that does not exist must not happen.
+    calls = 0
+    def Solve(self, model, *a, **k):
+        FloorUnknown.calls += 1
+        if FloorUnknown.calls == 2:
+            self._unknown = True
+            return cp_model.UNKNOWN
+        self._unknown = False
+        return super().Solve(model, *a, **k)
+    def Value(self, x):
+        if getattr(self, "_unknown", False):
+            raise AssertionError("solver.Value() after an UNKNOWN solve")
+        return super().Value(x)
+    def StatusName(self, status=None):
+        return "UNKNOWN" if getattr(self, "_unknown", False) else super().StatusName(status)
+
+cp_model.CpSolver = FloorUnknown
+ctx = es.Context(rounds=16, batch_size=32)
+coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+coef["base"].update(load=400)
+res = es.solve_plan(es.CostTable(ctx, coef), time_limit=20, greedy_model={})
+phases = [(s["phase"], s["status"]) for s in res["solves"]]
+assert ("model_floor", "UNKNOWN") in phases, phases
+print("OK", phases)
+"""
+
+
+def test_tie_break_hints_survive_an_unknown_floor_solve(tmp_path):
+    """If the model-floor solve ends UNKNOWN, the tie-break is hinted from the saved plan, not
+    from solver values that do not exist."""
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = tmp_path / "unknown.py"
+    script.write_text(_UNKNOWN_SCRIPT)
+    out = subprocess.run([sys.executable, str(script), root], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0 and "OK" in out.stdout, out.stdout + out.stderr

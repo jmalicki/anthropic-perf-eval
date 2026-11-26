@@ -952,8 +952,12 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         gm = dict(GREEDY_MODEL, **greedy_model)
         objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
         m.Add(objective >= t + int(gm["a_floor"]))
+        # excess = max(0, flow ops + selects - flow0) exactly, as in greedy_model_cycles: a lower
+        # bound alone would let the solver inflate it under a negative slope override.
+        over = m.NewIntVar(-big - int(gm["flow0"]), big, "flow_over")
+        m.Add(over == cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
         excess = m.NewIntVar(0, big, "flow_excess")
-        m.Add(excess >= cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
+        m.AddMaxEquality(excess, [over, 0])
         loads_all = cnt["load"] + cnt["const"] + cnt["const_alu"]
         m.Add(100 * objective >= 50 * loads_all + 100 * int(gm["a_load"]) + int(gm["b_flow_x100"]) * excess)
     if windows:
@@ -1038,8 +1042,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         # Lexicographic: mixes, then lateness, then work in scalar-op units (a vector op is 8).
         m.Minimize(mixes * (late_max * work_max) + late * work_max + work)
         m.ClearHints()  # the windows' T solve may have hinted these already
-        for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
-            m.AddHint(var, val)
+        # From the saved plan: after a floor solve that ended UNKNOWN there is no solution to
+        # read; otherwise `chosen` holds that solve's values.
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
         status2 = run("tie_break")
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
