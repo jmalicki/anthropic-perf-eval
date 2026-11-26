@@ -89,6 +89,13 @@ impl ForcedEncodings {
     /// force (`CompilerConfig::greedy_forced`). Before this they were ignored without CP-SAT.
     fn from_greedy_forced(ctx: &PipelineContext) -> Self {
         let forced = &ctx.config.compiler.greedy_forced;
+        // One derivation (fixed operands and opcode) broadcast to every ConstChoice would compute
+        // the wrong constant for almost all of them: only `Load` and `AddImm` can be forced. The
+        // bindings never set `AluDerive` (python.rs maps `--const-choice` to these two).
+        assert!(
+            !matches!(forced.const_choice, Some(ConstChoiceEncoding::AluDerive(_))),
+            "greedy_forced.const_choice must be Load or AddImm, not AluDerive"
+        );
         let all = |opcode: Opcode| ctx.ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
         let const_choice = forced
             .const_choice
