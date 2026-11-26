@@ -1497,7 +1497,22 @@ fn test_transform_pass_keeps_the_program_on_an_error() {
     let mut ctx = PipelineContext::new(raw_program(&spec), config);
     let err = ctx.run_greedy_pipeline(false).err().expect("prune-index needs the batch size");
     assert!(err.contains("batch size"), "{}", err);
-    assert_eq!(canonical_ops(&crate::kernel_builder::SsaProgram { ops: ctx.ops.clone(), ..clone_program(&merged) }), canonical_ops(&merged));
+    // Every IR field is the hash-merged program's, and only hash-merge is recorded.
+    let kept = crate::kernel_builder::SsaProgram {
+        ops: ctx.ops.clone(),
+        vreg_def: ctx.vreg_def.clone(),
+        vreg_count: ctx.vreg_count,
+        const_alternatives: ctx.const_alternatives.clone(),
+        zero_vreg: ctx.zero_vreg,
+        vector_group_lanes: ctx.vector_group_lanes.clone(),
+    };
+    assert_eq!(canonical_ops(&kept), canonical_ops(&merged));
+    assert_eq!(kept.vreg_def, merged.vreg_def);
+    assert_eq!(kept.vreg_count, merged.vreg_count);
+    assert_eq!(kept.zero_vreg, merged.zero_vreg);
+    assert_eq!(kept.vector_group_lanes, merged.vector_group_lanes);
+    assert_eq!(format!("{:?}", kept.const_alternatives), format!("{:?}", merged.const_alternatives));
+    assert_eq!(ctx.transform_sites, vec![("hash-merge".to_string(), 64)]);
 }
 
 #[test]
