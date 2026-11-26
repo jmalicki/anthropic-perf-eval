@@ -197,6 +197,10 @@ NOTE = ("Builds behind es.GREEDY_MODEL (judge 'default') and es.GREEDY_MODEL_STA
         "greedy development measurements, every build PROVED and PASSED.")
 
 
+# Fields `analyse` reads from an out-of-sample record (`--measured`).
+MEASURED_FIELDS = ("name", "bit_source", "counts", "cycles")
+
+
 def collect(states, measured, out, judge="default"):
     """Records for one judge from loop state files (use "loop") and measured plans (use
     "out_of_sample"), written into `out`: records of other judges already there are kept,
@@ -218,7 +222,11 @@ def collect(states, measured, out, judge="default"):
                            "greedy_extra": st.get("greedy_extra"), "judge": judge})
     for path in measured:
         with open(path) as f:
-            for m in json.load(f):
+            for i, m in enumerate(json.load(f)):
+                missing = [k for k in MEASURED_FIELDS if k not in m]
+                if missing:
+                    raise ValueError(f"{path}: record {i} ({m.get('name', 'unnamed')}) lacks "
+                                     f"{', '.join(missing)}; the fit reads {', '.join(MEASURED_FIELDS)}")
                 builds.append(dict(m, use="out_of_sample", judge=judge))
     if os.path.exists(out):
         with open(out) as f:
@@ -238,7 +246,7 @@ def main(argv=None) -> int:
                     help="which judge's records to fit (collect: which judge to tag them with)")
     ap.add_argument("--json", help="fit: also write the results here")
     ap.add_argument("--state", action="append", default=[], help="collect: loop state files")
-    ap.add_argument("--measured", action="append", default=[], help="collect: JSON lists of out-of-sample builds")
+    ap.add_argument("--measured", action="append", default=[], help="collect: JSON lists of out-of-sample builds, each with name, bit_source, counts, cycles")
     ap.add_argument("--out", help="collect: dataset to write")
     args = ap.parse_args(argv)
     if args.command == "collect":

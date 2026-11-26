@@ -422,6 +422,39 @@ def test_topk_after_a_skipped_level_is_not_reported_exhausted(tmp_path, monkeypa
     assert "remain unbuilt" in last["feedback"]
 
 
+def test_topk_plateau_that_cannot_be_exhausted_stops_at_the_solve_budget(tmp_path, monkeypatch):
+    """Review of #88 (stacked from #83): on a plateau the enumeration cannot exhaust (every level
+    above the first returns only plans below it, as a flat table does on a large plan space),
+    each level is skipped without a build. The run must stop at the solve budget with the
+    builds made so far and say it is incomplete (before, it stepped levels up to 10^6)."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(ctx)
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    calls = []
+
+    def plateau_solve(*a, **k):
+        calls.append(k)
+        return {"status": "optimal", "rows": rows, "solves": []}
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    monkeypatch.setattr(el, "solve", plateau_solve)
+    monkeypatch.setattr(es, "plan_score", lambda *a, **k: 50)
+    el.loop_topk(stage2, 2, 20.0, "floor", per_level=1, retries=3, max_solves=30)
+    assert len(calls) == 30, f"{len(calls)} solves"
+    assert len(stage2.builds) == 1, "only the first level's plan is built"
+    last = stage2.trace[-1]
+    assert last["feedback"].startswith("incomplete: solve budget of 30"), last["feedback"]
+    assert last["exhausted"] is False and last["skipped_levels"]
+
+
 def test_error_fingerprints_never_match(table, tmp_path):
     """Review of #76: a fingerprint that failed is a mismatch, even against an equal failure."""
     assert el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "a"})

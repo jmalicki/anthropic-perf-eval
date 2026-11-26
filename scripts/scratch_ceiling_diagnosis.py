@@ -93,12 +93,23 @@ def executed_ops(sched: dict) -> dict:
     a multiply_add keeps SSA engine flow but runs on the vector ALU (a vselect stays flow)."""
     on_valu = {low["from_select_choice"] for low in sched["ops"]
                if low.get("from_select_choice") is not None and low["engine"] == "valu"}
-    return {o["id"]: (dict(o, engine="valu") if o["id"] in on_valu else o)
+    # The cycle of each op's last lowered op: the multiply_add of a two-op select (its own
+    # lowered id, `from_select_choice` set) and the second-cycle lanes of a split shift finish
+    # after the SSA op's issue cycle.
+    finish: dict = {}
+    for low, s, _lane in lowered_with_ssa(sched):
+        sid = s["id"] if s is not None else low.get("from_select_choice")
+        if sid is not None:
+            finish[sid] = max(finish.get(sid, -1), low["cycle"])
+    return {o["id"]: dict(o, engine="valu" if o["id"] in on_valu else o["engine"],
+                          finish=max(finish.get(o["id"], o["cycle"]), o["cycle"]))
             for o in sched["ssa_ops"] if o["cycle"] >= 0}
 
 
 def _operand_ready(op: dict, ops: dict) -> int:
-    return max((ops[d]["cycle"] + 1 for d in op["dep_ids"] if d in ops), default=0)
+    """First cycle all of `op`'s operands are visible: one after each producer's last lowered
+    op (a two-op select issued at c writes at c + 1, so its reader is ready at c + 2)."""
+    return max((ops[d]["finish"] + 1 for d in op["dep_ids"] if d in ops), default=0)
 
 
 def _no_room(op: dict, cycle: int, use: dict) -> bool:
