@@ -320,6 +320,7 @@ def test_greedy_justify(capfd):
     assert cycles[5] <= cycles[0], "justification never lengthens the greedy schedule"
 
 
+@pytest.mark.deep
 def test_greedy_justify_with_cpsat(tmp_path, capfd):
     """PyO3: with CP-SAT following, the justified greedy schedule is the hint CP-SAT starts from.
 
@@ -378,6 +379,7 @@ def test_greedy_justify_with_cpsat(tmp_path, capfd):
     assert cycles[10] <= cycles[0], "not longer than the same build without justification"
 
 
+@pytest.mark.deep
 def test_greedy_justify_is_skipped_with_forced_shifts(capfd):
     """PyO3: with individually forced shifts (what-if runs) the justification pass does not run.
 
@@ -459,6 +461,7 @@ def test_greedy_justify_is_skipped_with_forced_shifts_greedy_only(capfd, tmp_pat
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
 
 
+@pytest.mark.deep
 def test_cpsat_split_shift_hint():
     """PyO3: with cpsat_split_shift_hint the split-shift greedy schedule is accepted by CP-SAT and the kernel is correct."""
     import scheduler_rs
@@ -569,6 +572,7 @@ def test_depth4_validates():
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
 
 
+@pytest.mark.deep
 def test_scratch_size_and_scratch_constraint(tmp_path):
     """PyO3: scratch_size / scratch_constraint reach the allocator, are reported in stats and
     give correct kernels (relaxed ones on a simulator with that much scratch)."""

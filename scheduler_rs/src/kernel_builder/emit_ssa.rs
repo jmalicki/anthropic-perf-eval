@@ -6,12 +6,27 @@
 //!
 //! After scheduling, VRegs are mapped to physical addresses via linear scan allocation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::types::{
     compute_const_encodings_alu_ready, ConstEncoding, EmissionPhase, Engine, LiveInterval,
-    MemEdgeKind, MemLocation, Opcode, Operand, SsaOp, SymmetryHint, VReg, VarSource, VarType,
+    MemEdgeKind, MemLocation, Opcode, Operand, RegionKind, RegionTag, SsaOp, SymmetryHint, VReg,
+    VarSource, VarType,
 };
+
+/// Region the emitter is currently in (`SsaEmitContext::set_region`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveRegion {
+    /// What the region computes.
+    pub kind: RegionKind,
+    /// Group, or `None` for a part shared by several groups.
+    pub group: Option<usize>,
+    /// Depth to record instead of the round's tree depth (the level of a setup region).
+    pub depth: Option<usize>,
+}
+
+/// Key of a region: ops with the same key share one `RegionTag::id`.
+type RegionKey = (RegionKind, Option<u32>, Option<u32>, Option<u32>);
 
 /// Tracks alternative implementations for a constant.
 ///
@@ -86,6 +101,10 @@ pub struct SsaEmitContext {
     /// Ops that do not touch memory leave it pending, so it can be set before a helper that
     /// first materialises an address (e.g. `emit_load_imm`).
     pub next_mem_loc: Option<MemLocation>,
+    /// Region the next emitted ops belong to (`set_region`); `None` = untagged.
+    pub current_region: Option<ActiveRegion>,
+    /// Region ids by key, dense in order of first emission (ordered map: deterministic).
+    pub region_ids: BTreeMap<RegionKey, u32>,
 
     // =========================================================================
     // Constant Alternative Tracking (for CP-SAT optimization)
@@ -145,6 +164,8 @@ impl SsaEmitContext {
             next_trace_id: None,
             next_keep_live: None,
             next_mem_loc: None,
+            current_region: None,
+            region_ids: BTreeMap::new(),
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
@@ -229,6 +250,8 @@ impl SsaEmitContext {
         self.next_var_type = None;
         self.next_trace_id = None;
         self.next_mem_loc = None;
+        self.current_region = None;
+        self.region_ids.clear();
         // Reset const alternative tracking
         self.const_alternatives.clear();
         self.zero_vreg = None;
@@ -265,16 +288,61 @@ impl SsaEmitContext {
         self.current_group = None;
     }
 
-    /// Set iteration and group context
+    /// Set iteration and group context. Inside a region (`set_region`) the region's group
+    /// follows it, so per-group emitters tag their ops without knowing about regions.
     pub fn set_iter_group(&mut self, iter: usize, group: usize) {
         self.current_iter = Some(iter);
         self.current_group = Some(group);
+        if let Some(region) = self.current_region.as_mut() {
+            region.group = Some(group);
+        }
     }
 
-    /// Clear iteration and group context
+    /// Clear iteration and group context (and the current region's group).
     pub fn clear_iter_group(&mut self) {
         self.current_iter = None;
         self.current_group = None;
+        if let Some(region) = self.current_region.as_mut() {
+            region.group = None;
+        }
+    }
+
+    /// Tag the ops emitted from now on as region `kind` of `group` (in the current round,
+    /// at the current tree depth) until `clear_region` or the next `set_region`.
+    ///
+    /// Tags change nothing about the program (`SsaOp::region`).
+    ///
+    /// # Arguments
+    /// * `kind` - What the region computes.
+    /// * `group` - Its group, or `None` for a part shared by several groups.
+    pub fn set_region(&mut self, kind: RegionKind, group: Option<usize>) {
+        self.current_region = Some(ActiveRegion { kind, group, depth: None });
+    }
+
+    /// Tag the ops emitted from now on as the setup of cached tree level `depth`
+    /// (`RegionKind::CachedLevelSetup`), until `clear_region`.
+    ///
+    /// # Arguments
+    /// * `depth` - The tree level.
+    pub fn set_setup_region(&mut self, depth: usize) {
+        self.current_region =
+            Some(ActiveRegion { kind: RegionKind::CachedLevelSetup, group: None, depth: Some(depth) });
+    }
+
+    /// Stop tagging: ops emitted from now on have no region.
+    pub fn clear_region(&mut self) {
+        self.current_region = None;
+    }
+
+    /// Tag for an op emitted now, allocating the region's id on first use.
+    fn current_region_tag(&mut self) -> Option<RegionTag> {
+        let region = self.current_region?;
+        let round = self.current_round.map(|r| r as u32);
+        let group = region.group.map(|g| g as u32);
+        let depth = region.depth.or(self.current_tree_depth).map(|d| d as u32);
+        let next = self.region_ids.len() as u32;
+        let id = *self.region_ids.entry((region.kind, round, group, depth)).or_insert(next);
+        Some(RegionTag { id, kind: region.kind, round, group, depth })
     }
 
     /// Set the VarType for the next emitted op
@@ -373,6 +441,7 @@ impl SsaEmitContext {
         // Capture current context for usage accounting
         op.source_info = Some(self.current_var_source());
         op.symmetry_hint = self.current_symmetry_hint.clone();
+        op.region = self.current_region_tag();
         if let Some(var_type) = self.next_var_type.take() {
             op.var_type = Some(var_type);
         }
@@ -1257,6 +1326,59 @@ pub fn compute_ssa_dependencies_with_barriers(
     super::memory_deps::add_barrier_dependencies(ops);
 }
 
+/// True if dead code elimination always keeps `op`: control flow, barriers and stores
+/// (stores have side effects: the harness reads output memory, a use SSA does not see).
+/// The one definition of the roots, shared with `kernel_builder::transform`.
+pub fn is_dce_root(op: &SsaOp) -> bool {
+    matches!(
+        op.opcode,
+        Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier | Opcode::Store | Opcode::Vstore
+    )
+}
+
+/// Drop every ALU-derived `ConstChoice` alternative that names a value no op in `ops`
+/// produces (`produces_constant`), except 0 when `zero_reserved`.
+///
+/// The emitter lists derivations from the constants written so far (`emit_const_choice`);
+/// when dead code elimination removes one of those constants, the derivations that read it
+/// have no producer left. The CP-SAT model looks each operand up among the ops and refuses
+/// an alternative without a producer (whole-kernel solves), so every removal of ops must
+/// leave none: `eliminate_ssa_dead_code` calls this; a pass that removes constant producers
+/// itself must call it or rebuild the alternatives from the constants that remain.
+/// Load and AddImm have no operands and are always kept; the order of the rest is kept.
+///
+/// With a reserved zero VReg the emitter also counts 0 as available (hardware zero at
+/// scratch address 0, no producing op), so e.g. `Sub { a_value: 0, b_value: n }` for `-n`
+/// is listed; it is kept here, and the CP-SAT model switches it off (an ALU derivation names
+/// its operands by producer op id, and the hardware zero has none), in step with
+/// [`zero_operand_has_no_producer`].
+///
+/// # Returns
+/// The number of alternatives dropped.
+pub fn drop_alternatives_without_producer(ops: &mut [SsaOp], zero_reserved: bool) -> usize {
+    let mut produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+    if zero_reserved {
+        produced.insert(0);
+    }
+    let mut dropped = 0;
+    for op in ops.iter_mut() {
+        if let Some(alts) = op.const_alternatives.as_mut() {
+            let before = alts.len();
+            alts.retain(|enc| enc.dependencies().iter().all(|v| produced.contains(v)));
+            dropped += before - alts.len();
+        }
+    }
+    dropped
+}
+
+/// True when `value` is the hardware zero with no producing op: the one operand of an
+/// ALU-derived `ConstChoice` alternative that [`drop_alternatives_without_producer`] keeps
+/// without a producer. False unless `zero_reserved`: without a reserved zero VReg address 0
+/// is ordinary scratch, so a missing 0 is a missing operand like any other.
+pub fn zero_operand_has_no_producer(value: i64, producer: Option<usize>, zero_reserved: bool) -> bool {
+    zero_reserved && value == 0 && producer.is_none()
+}
+
 /// Eliminate SSA dead code: remove ops whose result has no users.
 ///
 /// This reduces cycles, optimizer time, and scratch pressure. Roots (always live)
@@ -1332,16 +1454,8 @@ pub fn eliminate_ssa_dead_code(
 
     // Roots: control flow, barriers, and all stores (side effects; harness reads memory later)
     for (idx, op) in ops.iter().enumerate() {
-        match op.opcode {
-            Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::Barrier => {
-                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
-            }
-            Opcode::Store | Opcode::Vstore => {
-                // Always keep stores: they have side effects (memory). The harness reads
-                // output memory; that use is not visible in SSA, so treat all stores as roots.
-                mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
-            }
-            _ => {}
+        if is_dce_root(op) {
+            mark_live_atomic(idx, &mut live, &mut worklist, &const_choice_partner);
         }
     }
 
@@ -1423,6 +1537,8 @@ pub fn eliminate_ssa_dead_code(
             new_ops.push(op);
         }
     }
+
+    drop_alternatives_without_producer(&mut new_ops, zero_vreg.is_some());
 
     // Rebuild vreg_def from remaining ops only (so ConstChoice's single remaining encoding is the definer)
     let mut new_vreg_def: HashMap<VReg, usize> = HashMap::new();
@@ -1555,6 +1671,37 @@ mod tests {
         );
         let has_dead_const = new_ops.iter().any(|o| o.produces_constant == Some(99));
         assert!(!has_dead_const, "const(99) should be removed by DCE");
+    }
+
+    /// A constant DCE removes takes the ALU derivations that read it with it: 6 = 1 + 5 goes
+    /// when 5 is dead, the derivations of 6 from live constants stay.
+    #[test]
+    fn test_dce_drops_const_alternatives_reading_a_removed_constant() {
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        let one = emit.emit_const_choice(1);
+        let _five = emit.emit_const_choice(5); // never used -> removed by DCE
+        let three = emit.emit_const_choice(3);
+        let six = emit.emit_const_choice(6);
+        let sum = emit.emit_alu(Opcode::Add, one, three);
+        let total = emit.emit_alu(Opcode::Add, sum, six);
+        emit.emit_store(one, total); // root
+        let alts_of_six = |ops: &[SsaOp]| {
+            ops.iter().find(|op| op.produces_constant == Some(6)).unwrap().const_alternatives.clone().unwrap()
+        };
+        let emitted = alts_of_six(&emit.ops);
+        assert!(emitted.contains(&ConstEncoding::Add { a_value: 1, b_value: 5 }), "{:?}", emitted);
+
+        let mut vreg_def = std::mem::take(&mut emit.vreg_def);
+        let mut const_alternatives = emit.take_const_alternatives();
+        let ops = emit.take_ops();
+        let (new_ops, _, _) =
+            eliminate_ssa_dead_code(ops, &mut vreg_def, &mut const_alternatives, emit.zero_vreg, None);
+        assert!(!new_ops.iter().any(|op| op.produces_constant == Some(5)));
+        let kept = alts_of_six(&new_ops);
+        let expected: Vec<ConstEncoding> =
+            emitted.into_iter().filter(|e| !e.dependencies().contains(&5)).collect();
+        assert_eq!(kept, expected);
     }
 
     #[test]

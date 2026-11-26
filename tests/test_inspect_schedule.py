@@ -175,6 +175,7 @@ def test_bundle_flag_is_schedule_cycle_plus_one(greedy, capsys):
     assert [low["slot"][0]] + [int(x) for x in low["slot"][1:]] in bundle["valu"]
 
 
+@pytest.mark.deep
 def test_select_lowered_to_subtract_and_multiply_add(fma):
     s, sched, _ = fma
     fmas = [o for o in sched["ops"] if o["opcode"] == "multiply_add" and o.get("from_select_choice") is not None]

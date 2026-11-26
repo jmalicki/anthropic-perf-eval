@@ -233,18 +233,22 @@ The greedy scheduler (`ssa_greedy/mod.rs`) does not compute intervals. It keeps 
 **Counter rule**:
 1. A value is added when its producer is placed.
 2. Each value has a count of the ops that will read it. A reader counts once however many of its operands name the value. `keep_live` entries count as reads. Readers that are skipped dead stores do not count.
-3. Placing a reader decrements the count of each value it reads; at zero the value is removed in the same cycle.
+3. Placing a reader decrements the count of each value it reads; at zero the value is removed in the same cycle. Exception: a SelectChoice in the one-op delta multiply_add form (`--greedy-select-overflow valu`, or fixed choices that carry a delta) reads its operands, its delta and their group aliases at `cycle+1`, so at zero those are removed at the next cycle; its `keep_live` values are removed in the same cycle as for any reader (address assignment's `use_cycles` reads the same way).
 4. A value with no reader is removed at the next cycle.
 5. Vector groups: a read group (`decompose_vector`) is the decomposed vector, read by every reader of its lanes. A write group (`fresh_vector_group`) is one VLEN-word block added at its first lane write, read by every reader of the group VReg or of a lane, and held at least until the cycle after its last lane write if that lane is never read.
 
-**Theorem**: For every schedule the greedy produces, the counter after the last op of cycle `t` equals `L(t)`, for every `t`. Hence the counter's cycle-end peak equals the allocator's peak. The peak the scheduler reports is sampled after every op, so it is ≥ that peak (an op placed early in a cycle can add its result before a later op in the same cycle releases an operand).
+**Theorem**: For every schedule the greedy produces, within the scope below (the delta-form multiply-add select counted per the exception in rule 3, its reads held to `cycle+1`), the counter after the last op of cycle `t` equals `L(t)`, for every `t`. Hence the counter's cycle-end peak equals the allocator's peak. The peak the scheduler reports is sampled after every op, so it is ≥ that peak (an op placed early in a cycle can add its result before a later op in the same cycle releases an operand).
 
 **How it is checked**:
 - *Every run.* `schedule_ssa_greedy_with_liveness_agreement` recomputes `L(t)` from the finished schedule with `address_assign::compute_live_intervals` and compares it with the counter cycle by cycle. A difference is an error that names the kinds of value that differ, with an example. `SCHEDULER_LIVENESS_AGREEMENT=1` prints the comparison; `SCHEDULER_LIVENESS_AGREEMENT=warn` turns the error into a warning.
 - *Property test.* `test_liveness_agreement_property` (400 random programs; 10,000 more with `ci-tests`) covers repeated operands, `keep_live`, both group kinds, direct lane readers, unread values and chains of dead stores, under tight budgets (force-schedule path), with and without VALU shift, under three pressure policies.
 - *Z3.* `T16` proves the rule for one value with up to three readers (present or not, dead or not, one or two operands each). `T16-per-operand-decrement` and `T16-write-group-per-lane` are the two old rules; Z3 returns SAT, a counterexample to each.
 
-**Scope**: The comparison uses the greedy's own view of the schedule: one cycle per op. Effects that exist only after later passes are outside it: the FMA path of a SelectChoice (dest written at `cycle+1`, `sub_temp`), per-lane cycles of shifted VALU ops chosen by CP-SAT, and the reserved zero word. Those are still covered only by address assignment.
+**Scope**: The comparison uses the greedy's own view of the schedule: one cycle per op. Inside it: the one-op delta multiply_add select that `--greedy-select-overflow valu` (or a fixed choice with a delta) places, "its delta and operands held to `cycle+1`" (rule 3). Outside it:
+- The two-op multiply_add select (no precomputed delta: SUB into `sub_temp` at its cycle, dest written at `cycle+1`). The greedy can place this form itself (`--select-choice fma` when CP-SAT follows, or the select-choice hint pass with fixed choices), and neither the counter nor the agreement check models its `sub_temp` or its `cycle+1` dest: an open gap, see [BUGS.md](../BUGS.md) ("The greedy's live-word counter does not see the two-op multiply-add select").
+- Per-lane cycles of shifted VALU ops chosen by CP-SAT, and the reserved zero word.
+
+What is outside is covered only by address assignment, which still enforces the budget.
 
 **What the check found** (November 2026, all fixed in the same change):
 

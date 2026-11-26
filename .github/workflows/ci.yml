@@ -1,5 +1,8 @@
 name: CI
 
+# Shallow tier: every PR and every push to main. Tests that run a CP-SAT solve (pytest
+# @pytest.mark.deep, Rust #[ignore]d without the deep-tests feature) run in ci-deep.yml.
+
 on:
   pull_request:
   push:
@@ -15,24 +18,21 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BUILD_FROM_PROJECT_ROOT: "1"
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_NO_INSTALL_CLEANUP: "1"
-  HOMEBREW_NO_ENV_HINTS: "1"
+  # Report the slowest tests so a slow test that should be deep is visible in the log.
+  PYTEST_ADDOPTS: "--durations=30"
 
 jobs:
-  # scheduler_rs unit tests (debug profile, --features cpsat).
+  # scheduler_rs unit tests (debug profile, --features cpsat; deep-tests tests are ignored).
   rust:
     name: Rust tests (scheduler_rs)
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
-        run: |
-          brew install or-tools
-          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
-          brew list --versions or-tools protobuf abseil
+      # Prebuilt C++ archive (bundles protobuf and abseil); cached between runs.
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -52,22 +52,23 @@ jobs:
       - name: Create project venv
         run: uv sync
 
-      - name: Rust tests
-        run: ./scripts/test.sh rust
+      - name: Rust tests (shallow)
+        run: ./scripts/test.sh rust-shallow
 
   # Release build of the extension, then everything that imports it.
   python:
     name: Python tests, proofs, kernel builds
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          # scripts/measure_baseline.py reads the original baseline builder from an old commit
+          fetch-depth: 0
 
-      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
-        run: |
-          brew install or-tools
-          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
-          brew list --versions or-tools protobuf abseil
+      # Prebuilt C++ archive (bundles protobuf and abseil); cached between runs.
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -89,8 +90,8 @@ jobs:
       - name: Build scheduler_rs (release)
         run: ./scripts/build_scheduler_rs.sh --release
 
-      - name: Python tests
-        run: ./scripts/test.sh python
+      - name: Python tests (shallow)
+        run: ./scripts/test.sh python-shallow
 
       - name: Z3 proofs
         run: ./scripts/test.sh proofs
@@ -100,3 +101,6 @@ jobs:
 
       - name: Upstream check (16-round greedy kernel on the unmodified upstream simulator and tests)
         run: ./scripts/test.sh upstream
+
+      - name: CI-only pin tests (16-round greedy builds, pytest -m ci_only)
+        run: ./scripts/test.sh ci-only

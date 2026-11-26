@@ -7,6 +7,7 @@ round to minimise the capacity floor, then emit and schedule the chosen plan.
     uv run python -m scripts.emission_structure solve --out plan.json # best plan for the floor
     uv run python -m scripts.emission_structure predict --plan plan.json
     uv run python -m scripts.emission_structure measure --plan plan.json --shaped --upstream
+    uv run python -m scripts.emission_structure derive                # table by instantiation == calibrated?
 
 Design: docs/EMISSION_STRUCTURE_MODEL.md. In short:
 
@@ -30,6 +31,7 @@ Design: docs/EMISSION_STRUCTURE_MODEL.md. In short:
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import itertools
 import json
@@ -180,10 +182,102 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Greedy pipeline model (a calibrated HEURISTIC, not a bound)
+# ----------------------------------------------------------------------------
+# Predicted cycles of the load-tail greedy (shaped flags + LOAD_TAIL_GREEDY) for a plan:
+#
+#     max(floor + a_floor,  loads / 2 + a_load + b_flow * max(0, flow - flow0))
+#
+# with `loads` = load ops + ConstChoices (the greedy keeps consts on the load engine) and
+# `flow` = flow ops + every SelectChoice (the greedy runs every select as a flow vselect; it
+# never takes the multiply_add form). The load engine paces the kernel (one group's gathers
+# per ~31 cycles); the flow work of the first and last select rounds of all groups has to keep
+# up with it, and above about 0.9 flow op per load cycle the flow queue delays late groups'
+# entry into the load stream (docs/GREEDY_SHAPE_ABLATION.md section 12; a hypothesis, not a
+# measured mechanism). Grid-fitted on the 24 index-bit loop builds under 1,200 cycles of
+# docs/emission_plans/greedy_model_data.json; `uv run python -m scripts.greedy_model_fit
+# --check` reproduces these constants and the numbers quoted for them (tests/
+# test_greedy_model_fit.py). Leave-one-out (constants refitted, form fixed, and the form was
+# chosen on the same plans): MAE 6.2, max 18 cycles. Every ranking quoted for it is in-sample.
+# Out of sample it fails: on the four plans stage 1 chose with it, it was optimistic by 20 to
+# 42 cycles. 16 rounds, batch 256, `--merge-hash-stages --index-form mirrored`. Scratch is not
+# modelled: path-bit plans that the greedy runs at the scratch ceiling are underpredicted.
+# b_flow is in hundredths.
+GREEDY_MODEL = {"a_floor": 32, "a_load": 19, "flow0": 900, "b_flow_x100": 75}
+# The same model refitted for the stall judge (LOAD_TAIL_GREEDY + greedy_budget_force=stall,
+# pressure_inflation_threshold=0.98; docs/STARTUP_AND_STALL_LOOP.md section A): 41 index-bit
+# builds under 1,200 cycles, leave-one-out MAE 5.6; held out on 44 later plans it is optimistic
+# (index MAE 14.5, path 62.3). Reproduced by `scripts/greedy_model_fit.py --judge stall-0.98
+# --check`. Pass as `greedy_model=GREEDY_MODEL_STALL` to solve_plan to use it.
+GREEDY_MODEL_STALL = {"a_floor": 52, "a_load": 13, "flow0": 900, "b_flow_x100": 80}
+
+
+def greedy_model_cycles(counts: Mapping[str, int], model: Mapping[str, int] | None = None) -> float:
+    """The greedy pipeline model's predicted cycles for `counts` (see GREEDY_MODEL). A
+    heuristic calibrated on recorded greedy builds, never a bound."""
+    g = dict(GREEDY_MODEL, **(model or {}))
+    loads = counts["load"] + counts["const"] + counts["const_alu"]
+    flow = counts["flow"] + counts["select1"] + counts["select2"]
+    pipeline = loads / 2 + g["a_load"] + g["b_flow_x100"] / 100 * max(0, flow - g["flow0"])
+    return max(choice_floor(counts)["cycles"] + g["a_floor"], pipeline)
+
+
+# Op kinds of a window row (scripts/emission_loop.py). A SelectChoice is charged as 1 flow slot
+# or 1 fixed vector op whatever its FMA form (the 2-op form's subtract may be shared, as the
+# proved reference model of verification/static_bounds_proof.py assumes); ConstChoices and
+# eliminable vbroadcasts are not charged.
+WINDOW_CATEGORIES = ("vec_fixed", "vec_shiftable", "alu", "load", "store", "flow", "select")
+
+
+def _window_fits(c: Mapping[str, int], span: int, cap: Mapping[str, int], vlen: int) -> bool:
+    if span < 0:
+        return False
+    if c["load"] > cap["load"] * span or c["store"] > cap["store"] * span or c["flow"] > cap["flow"] * span:
+        return False
+    on_flow = min(c["select"], cap["flow"] * span - c["flow"])  # a select on flow frees a VALU slot
+    vector = c["vec_fixed"] + c["vec_shiftable"] + c["select"] - on_flow
+    alu_room = cap["alu"] * span - c["alu"]
+    if alu_room < 0:
+        return False
+    return max(0, vector - cap["valu"] * span) <= min(c["vec_shiftable"], alu_room // vlen)
+
+
+def window_floor(counts: Mapping[str, int], cap: Mapping[str, int] = CAP, vlen: int = VLEN) -> int:
+    """Fewest cycles that can hold ops with these WINDOW_CATEGORIES counts, every choice
+    resolved in the best way (selects on flow or the VALU, shiftable vector ops on the VALU or
+    as `vlen` scalar slots). 0 for no ops. Monotone in every count.
+
+    A window row (docs/EMISSION_STRUCTURE_MODEL.md section 10) is makespan >= t + q +
+    window_floor(ops with head >= t and tail >= q): their slots all lie in cycles
+    [t, makespan - 1 - q]. verification/window_rows_proof.py: the coupling of engines in
+    `_window_fits` is proved by Z3 for all counts (WR3); the whole row is a randomized check (WR1).
+    """
+    c = {k: int(counts.get(k, 0)) for k in WINDOW_CATEGORIES}
+    if not any(c.values()):
+        return 0
+    lo, hi = 1, max(1, sum(c.values()))
+    while not _window_fits(c, hi, cap, vlen):
+        hi *= 2
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _window_fits(c, mid, cap, vlen):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+# ----------------------------------------------------------------------------
 # Building probes with the real emitter
 # ----------------------------------------------------------------------------
 SHAPED_GREEDY = {"greedy_barriers": "none", "greedy_priority": "wavefront", "greedy_split_shift": True,
                  "pressure_inflation_threshold": 0.95}
+
+# Added on top of SHAPED_GREEDY for load-bound plans (docs/GREEDY_SHAPE_ABLATION.md section 11):
+# round-15 gathers yield load slots to earlier rounds' gathers, 32 groups in flight, stagger 9.
+# Raises peak live scratch to about 1,430 of 1,536 words; some emissions overflow the budget.
+LOAD_TAIL_GREEDY = {"greedy_load_priority": "final-last", "greedy_groups_in_flight": 32,
+                    "greedy_stagger_cycles": 9}
 
 
 # Calibration and check builds only read the SSA program, which the scheduler does not change;
@@ -554,6 +648,51 @@ def default_table_path(ctx: Context) -> str:
     return os.path.join(ROOT, "artifacts", "emission_structure", f"costs_{ctx.key()}.json")
 
 
+def derive_table(ctx: Context) -> tuple[CostTable, dict]:
+    """Cost table derived by instantiation in scheduler_rs (`derive_tree_access_cost_table`):
+    the canonical program with every alternative of every site built next to it, and each
+    op's liveness reduced to the features of `feature_names`. No probe builds, no fit.
+
+    Returns:
+        (the table, the full JSON document: sites, resources, facts, problems).
+
+    Raises:
+        RuntimeError: if the derivation reports problems (something that does not fit the
+            features) or produces a feature the model does not have.
+    """
+    import scheduler_rs
+    from kernel_build_args import n_nodes_for_height
+
+    doc = json.loads(scheduler_rs.derive_tree_access_cost_table(
+        ctx.forest_height, n_nodes_for_height(ctx.forest_height), ctx.batch_size, ctx.rounds,
+        merge_hash_stages=ctx.merge_hash_stages, index_form=ctx.index_form,
+        select_bit_source=ctx.select_bit_source, values_only=ctx.values_only))
+    if doc["problems"]:
+        raise RuntimeError(f"derived cost table does not fit the features ({len(doc['problems'])} problems): "
+                           + "; ".join(doc["problems"][:5]))
+    names = feature_names(ctx)
+    unknown = sorted(set(doc["coefficients"]) - set(names))
+    if unknown:
+        raise RuntimeError(f"derived cost table has features the model lacks: {unknown}")
+    not_derived = [n for n in names if n not in doc["coefficients"]]
+    if not_derived:  # e.g. tail:* (values_only): never zero-filled
+        raise RuntimeError(f"derived cost table does not derive {len(not_derived)} features of the model: "
+                           f"{not_derived[:5]}")
+    coefficients = {n: {c: int(doc["coefficients"].get(n, {}).get(c, 0)) for c in CATEGORIES} for n in names}
+    return CostTable(ctx, coefficients, notes=["derived by instantiation (scheduler_rs)"]), doc
+
+
+def table_differences(a: CostTable, b: CostTable) -> list[str]:
+    """Entries (feature, category) where two cost tables differ, as readable lines."""
+    diffs = []
+    for name in sorted(set(a.coefficients) | set(b.coefficients)):
+        for c in CATEGORIES:
+            va, vb = a.coefficients.get(name, {}).get(c, 0), b.coefficients.get(name, {}).get(c, 0)
+            if va != vb:
+                diffs.append(f"{name} {c}: {va} vs {vb}")
+    return diffs
+
+
 def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -> CostTable:
     path = path or default_table_path(ctx)
     if os.path.exists(path):
@@ -572,9 +711,66 @@ def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -
 # ----------------------------------------------------------------------------
 # The optimisation model
 # ----------------------------------------------------------------------------
+def plan_group_counts(rows: Sequence[Sequence[str]], ctx: Context) -> dict[tuple[int, str], int]:
+    """Groups per (choice round, encoding) of a plan: what `solve_plan` decides (its rows are
+    rebuilt from these counts in a fixed order, so two plans with equal counts are one plan
+    to the model; with `values_only` the tail patterns are part of the decision too, see
+    `plan_model_key`)."""
+    return {(r, e): rows[r].count(e) for r in ctx.choice_rounds() for e in set(rows[r])}
+
+
+def plan_tail_pattern_counts(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]:
+    """Groups per tail pattern ('g'/'s' per tail round), {} when patterns do not matter."""
+    if not ctx.tail_patterns():
+        return {}
+    tail = ctx.tail_rounds()
+    out: dict[str, int] = collections.Counter(
+        "".join("g" if rows[r][g] == "gather" else "s" for r in tail) for g in range(ctx.n_groups))
+    return dict(out)
+
+
+def plan_model_key(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]:
+    """Everything `solve_plan` decides about a plan, as JSON-friendly keys: "round:encoding"
+    group counts and, with `values_only`, "tail:pattern" counts. Two plans with the same key
+    are the same plan to the model; `canonical_rows` is the arrangement it emits for it."""
+    key = {f"{r}:{e}": v for (r, e), v in plan_group_counts(rows, ctx).items()}
+    key.update({f"tail:{p}": v for p, v in plan_tail_pattern_counts(rows, ctx).items()})
+    return key
+
+
+def rows_from_counts(ctx: Context, chosen: Mapping[tuple[int, str], int], pattern_values: Mapping[str, int],
+                     fixed: Mapping[int, str] | None = None) -> list[list[str]]:
+    """The rows `solve_plan` emits for solved counts: per choice round, contiguous runs in
+    ENCODINGS order; with tail patterns, each group its pattern (in pattern order) and the
+    select groups of each tail round their bit-driven encodings in a fixed order."""
+    g = ctx.n_groups
+    rows = baseline_rows(ctx)
+    for r, e in (fixed or {}).items():  # rounds outside the choice rounds (e.g. the root) keep their fixed encoding
+        rows[r] = [e] * g
+    for r in ctx.choice_rounds():
+        rows[r] = [e for e in ENCODINGS for _ in range(chosen.get((r, e), 0))]
+    patterns = ctx.tail_patterns()
+    if patterns:
+        group_pattern = [p for p in patterns for _ in range(pattern_values.get(p, 0))]
+        for i, r in enumerate(ctx.tail_rounds()):
+            selects = [e for e in BIT_DRIVEN for _ in range(chosen.get((r, e), 0))]
+            rows[r] = ["gather" if p[i] == "g" else selects.pop(0) for p in group_pattern]
+    return rows
+
+
+def canonical_rows(rows: Sequence[Sequence[str]], ctx: Context) -> list[list[str]]:
+    """The arrangement `solve_plan` would emit for this plan's `plan_model_key`. A plan equal
+    to it is the one the model can return; any other arrangement with the same key (a
+    hand-made seed, say) is a different build but the same model point."""
+    return rows_from_counts(ctx, plan_group_counts(rows, ctx), plan_tail_pattern_counts(rows, ctx))
+
+
 def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Mapping[int, str] | None = None,
                time_limit: float = 60.0, tie_break: bool = True, max_util: Mapping[str, float] | None = None,
-               lateness: bool = True) -> dict:
+               lateness: bool = True, nogoods: Sequence[Mapping] | None = None, incumbent: int | None = None,
+               windows: Sequence[Mapping] | None = None, floor_incumbent: int | None = None,
+               deterministic_time: float | None = None, greedy_model: Mapping[str, int] | None = None,
+               min_objective: int | None = None) -> dict:
     """Plan minimising choice_floor of the predicted counts (CP-SAT, exact, single worker so
     that the same inputs give the same plan).
 
@@ -594,10 +790,38 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             may use. Minimises T under that headroom instead of the bare floor: a greedy
             schedule lands far above the floor when two engines saturate at once
             (docs/EMISSION_STRUCTURE_MODEL.md). The plan's own floor is reported too.
+        nogoods: plans to exclude, each as `plan_model_key` (keys "round:encoding" strings or
+            (round, encoding) tuples, plus "tail:pattern" with values_only); one no-good cut
+            per plan. It excludes every arrangement with that key, so only give it plans whose
+            rows are `canonical_rows` (the ones this model emits for the key).
+        incumbent: the objective (T, or M with `windows`) must be below this. Prunes soundly
+            only when the objective is a lower bound on the cycles being compared (with
+            `windows` built from an observed row table it is not: a heuristic cut).
+        floor_incumbent: the capacity floor T must be below this. Sound when compared with
+            scheduled cycles of the same emission (the floor is a lower bound on any schedule).
+        deterministic_time: CP-SAT deterministic-time budget per solve (the solver's own work
+            counter), so that the same inputs give the same plan whatever the machine load;
+            `time_limit` stays as a wall-clock backstop. Each solve's status and whether it
+            stopped on the wall clock are returned under "solves".
+        windows: time-aware rows (scripts/emission_loop.py, `RowTable.window_specs`), each
+            {"t", "q", "const": {cat: n}, "per_group": {(round, encoding) or "r:e": {cat: n}}}.
+            With them the objective is M >= T and, per window, M >= t + q + the window's
+            choice floor (`window_floor`) of the counts it holds; otherwise T.
+        greedy_model: minimise the greedy pipeline model instead (GREEDY_MODEL, overrides
+            from this mapping; {} = the fitted values). A calibrated heuristic of the load-tail
+            greedy's cycles, not a bound: M >= T + a_floor and
+            100 M >= 50 loads + 100 a_load + b_flow_x100 * max(0, flow + selects - flow0).
+            Among plans with the best M the lowest T, then the usual tie-breaks. Not combined
+            with `windows`.
+        min_objective: the objective must be at least this. The objective variable is an upper
+            relaxation of the plan's score (T >= its floor), so this does not make the plan's
+            own score at least `min_objective`: check the returned plan with `plan_score`.
 
     Returns:
         {"rows", "floor" (choice_floor of the plan), "capped_cycles" (T under max_util),
-        "counts", "status"}.
+        "objective" (T, or M with windows), "counts", "status", "tie_break", "solves" (per
+        CP-SAT solve: phase, status, wall and deterministic time, stopped_on_wall_clock)};
+        with nogoods or an incumbent, {"status": "infeasible", "solves"} when no plan is left.
     """
     ctx = table.context
     g = ctx.n_groups
@@ -608,6 +832,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         if not 0 <= r < ctx.rounds or e not in allowed_encodings(ctx.depth(r)):
             raise ValueError(f"fixed: {e!r} is not available in round {r} (depth {ctx.depth(r)})"
                              if 0 <= r < ctx.rounds else f"fixed: no round {r}")
+    if greedy_model is not None and windows:
+        raise ValueError("greedy_model and windows are not combined")
 
     # Imported only after the arguments are checked: in a process that has loaded scheduler_rs
     # this import crashes (see solve_plan_isolated), and a bad argument should fail cleanly.
@@ -706,14 +932,100 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             "flow": cnt["flow"] + s1 + s2 + cf + cfa, "valu": vector - sh}
     for engine, ratio in caps.items():
         m.Add(ratio.denominator * used[engine] <= ratio.numerator * CAP[engine] * t)
-    m.Minimize(t)
+
+    def n_key(key):
+        if isinstance(key, str):
+            r, _, e = key.partition(":")
+            return int(r), e
+        return int(key[0]), key[1]
+
+    for i, plan in enumerate(nogoods or []):
+        want = {n_key(k): int(v) for k, v in plan.items() if not (isinstance(k, str) and k.startswith("tail:"))}
+        want_tail = {k[len("tail:"):]: int(v) for k, v in plan.items() if isinstance(k, str) and k.startswith("tail:")}
+        differs = []
+        for key, var in n.items():
+            b = m.NewBoolVar(f"nogood_{i}_{key[0]}_{key[1]}")
+            m.Add(var != want.get(key, 0)).OnlyEnforceIf(b)
+            differs.append(b)
+        if want_tail:  # with values_only the tail patterns are part of the plan
+            for p, var in pattern_count.items():
+                b = m.NewBoolVar(f"nogood_{i}_tail_{p}")
+                m.Add(var != want_tail.get(p, 0)).OnlyEnforceIf(b)
+                differs.append(b)
+        # A key the model cannot express (an encoding not allowed here) already differs.
+        if all(k in n or v == 0 for k, v in want.items()) and all(p in pattern_count or v == 0
+                                                                  for p, v in want_tail.items()):
+            m.AddBoolOr(differs)
+
+    objective = t
+    if greedy_model is not None:
+        gm = dict(GREEDY_MODEL, **greedy_model)
+        objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
+        m.Add(objective >= t + int(gm["a_floor"]))
+        # excess = max(0, flow ops + selects - flow0) exactly, as in greedy_model_cycles: a lower
+        # bound alone would let the solver inflate it under a negative slope override.
+        over = m.NewIntVar(-big - int(gm["flow0"]), big, "flow_over")
+        m.Add(over == cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
+        excess = m.NewIntVar(0, big, "flow_excess")
+        m.AddMaxEquality(excess, [over, 0])
+        loads_all = cnt["load"] + cnt["const"] + cnt["const_alu"]
+        m.Add(100 * objective >= 50 * loads_all + 100 * int(gm["a_load"]) + int(gm["b_flow_x100"]) * excess)
+    if windows:
+        objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
+        m.Add(objective >= t)
+        for w_i, w in enumerate(windows):
+            per = {n_key(k): v for k, v in w["per_group"].items()}
+            cnt_w = {}
+            for c in WINDOW_CATEGORIES:
+                expr = int(w["const"].get(c, 0))
+                for key, coef in per.items():
+                    if coef.get(c) and key in n:
+                        expr = expr + int(coef[c]) * n[key]
+                cnt_w[c] = expr
+            span = objective - int(w["t"]) - int(w["q"])
+            sf = m.NewIntVar(0, big, f"w{w_i}_select_flow")
+            sh = m.NewIntVar(0, big, f"w{w_i}_shifted")
+            m.Add(sf <= cnt_w["select"])
+            m.Add(sh <= cnt_w["vec_shiftable"])
+            m.Add(cnt_w["load"] <= CAP["load"] * span)
+            m.Add(cnt_w["store"] <= CAP["store"] * span)
+            m.Add(cnt_w["flow"] + sf <= CAP["flow"] * span)
+            m.Add(cnt_w["vec_fixed"] + cnt_w["vec_shiftable"] + cnt_w["select"] - sf - sh <= CAP["valu"] * span)
+            m.Add(cnt_w["alu"] + VLEN * sh <= CAP["alu"] * span)
+    if incumbent is not None:
+        m.Add(objective <= int(incumbent) - 1)
+    if min_objective is not None:
+        m.Add(objective >= int(min_objective))
+    if floor_incumbent is not None:
+        m.Add(t <= int(floor_incumbent) - 1)
+    m.Minimize(objective)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    if deterministic_time is not None:
+        solver.parameters.max_deterministic_time = deterministic_time
     solver.parameters.num_workers = 1
-    status = solver.Solve(m)
+    solves = []
+
+    def run(phase):
+        st = solver.Solve(m)
+        wall = solver.WallTime()
+        solves.append({
+            "phase": phase, "status": solver.StatusName(st), "wall_time": round(wall, 3),
+            "deterministic_time": round(solver.deterministic_time, 4),
+            # Ended on the wall clock rather than on optimality/infeasibility or the
+            # deterministic budget: the result then depends on machine load.
+            "stopped_on_wall_clock": st not in (cp_model.OPTIMAL, cp_model.INFEASIBLE) and wall >= 0.98 * time_limit,
+        })
+        return st
+
+    status = run("main")
+    if status == cp_model.INFEASIBLE and (nogoods or incumbent is not None or floor_incumbent is not None
+                                          or min_objective is not None):
+        return {"status": "infeasible", "solves": solves}
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"structure model: {solver.StatusName(status)}")
+    best_obj = solver.Value(objective)
     best_t = solver.Value(t)
     proven = status == cp_model.OPTIMAL
     # Snapshots of the solved values: rows are rebuilt only from these, so a tie-break that ends
@@ -721,6 +1033,18 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     chosen = {key: solver.Value(var) for key, var in n.items()}
     pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
     tie_break_status = "not run"
+    if (windows or greedy_model is not None) and tie_break:
+        # Among plans with the best M, the lowest floor T, then the usual tie-breaks.
+        m.Add(objective == best_obj)
+        m.Minimize(t)
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
+        status_t = run("windows_floor" if windows else "model_floor")
+        if status_t in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            best_t = solver.Value(t)
+            chosen = {key: solver.Value(var) for key, var in n.items()}
+            pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
+        proven = proven and status_t == cp_model.OPTIMAL
     if tie_break:
         m.Add(t == best_t)
         mixes = sum(u.values()) - len(ctx.choice_rounds())
@@ -730,9 +1054,12 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         late_max = ctx.rounds * ctx.rounds * g + 1
         # Lexicographic: mixes, then lateness, then work in scalar-op units (a vector op is 8).
         m.Minimize(mixes * (late_max * work_max) + late * work_max + work)
-        for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
-            m.AddHint(var, val)
-        status2 = solver.Solve(m)
+        m.ClearHints()  # the windows' T solve may have hinted these already
+        # From the saved plan: after a floor solve that ended UNKNOWN there is no solution to
+        # read; otherwise `chosen` holds that solve's values.
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
+        status2 = run("tie_break")
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             chosen = {key: solver.Value(var) for key, var in n.items()}
@@ -741,36 +1068,64 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             raise RuntimeError(f"structure model tie-break: {tie_break_status}")
         # UNKNOWN (time limit without an incumbent): keep the first solve's plan.
 
-    rows = baseline_rows(ctx)
-    for r, e in fixed.items():  # rounds outside the choice rounds (e.g. the root) keep their fixed encoding
-        rows[r] = [e] * g
-    for r in ctx.choice_rounds():
-        row = []
-        for e in ENCODINGS:  # contiguous runs, in a fixed encoding order
-            if (r, e) in n:
-                row += [e] * chosen[r, e]
-        rows[r] = row
-    if patterns:
-        # Give each group its pattern (in pattern order), then the select groups of each tail
-        # round their bit-driven encodings in a fixed order with the solved counts.
-        group_pattern = [p for p in patterns for _ in range(pattern_values[p])]
-        for i, r in enumerate(tail):
-            selects = [e for e in BIT_DRIVEN if (r, e) in n for _ in range(chosen[r, e])]
-            row = []
-            for p in group_pattern:
-                row.append("gather" if p[i] == "g" else selects.pop(0))
-            rows[r] = row
+    rows = rows_from_counts(ctx, chosen, pattern_values, fixed)
     counts = table.predict(rows)
     floor = choice_floor(counts)
     assert floor["cycles"] <= best_t, (floor["cycles"], best_t)
-    if proven and not caps:
+    # With min_objective, T can sit above the plan's own floor (T is only an upper relaxation
+    # of the floor, and the bound pushes it up): the plan's score must be computed from the
+    # plan (`plan_score`), not taken from the objective.
+    if proven and not caps and greedy_model is None and min_objective is None and (tie_break or not windows):
         assert floor["cycles"] == best_t, (floor["cycles"], best_t)
     return {"rows": rows, "floor": floor, "capped_cycles": best_t, "counts": counts,
-            "status": "optimal" if proven else "feasible", "tie_break": tie_break_status}
+            "objective": best_obj, "status": "optimal" if proven else "feasible", "tie_break": tie_break_status,
+            "solves": solves}
 
 
 def _solve_plan_child(table_json, kwargs):
     return solve_plan(CostTable.from_json(table_json), **kwargs)
+
+
+def plan_score(table: CostTable, rows, objective: str) -> int:
+    """A plan's stage-1 score as `solve_plan` minimises it: "floor" (choice_floor) or
+    "greedy-model" (GREEDY_MODEL with the floor as T, rounded up as the solver's integer M)."""
+    counts = table.predict(rows)
+    if objective == "floor":
+        return choice_floor(counts)["cycles"]
+    if objective == "greedy-model":
+        return math.ceil(greedy_model_cycles(counts))
+    raise ValueError(f"objective {objective!r}")
+
+
+def count_plans_at_most(table: CostTable, score: int, objective: str, limit: int = 200,
+                        deterministic_time: float = 5.0) -> dict:
+    """Plans (distinct model points, `plan_model_key`) whose stage-1 score is at most `score`, counted by
+    repeated solves with a no-good on each plan found, up to `limit`. Returns {"count",
+    "complete"}: complete=False means at least `count` such plans exist."""
+    found: list = []
+    while len(found) < limit:
+        try:
+            res = solve_plan(table, nogoods=found, incumbent=score + 1, tie_break=False,
+                             greedy_model={} if objective == "greedy-model" else None,
+                             deterministic_time=deterministic_time, time_limit=60.0)
+        except RuntimeError:  # UNKNOWN: the budget ran out before deciding
+            return {"count": len(found), "complete": False}
+        if res["status"] == "infeasible":
+            return {"count": len(found), "complete": True}
+        found.append(plan_model_key(res["rows"], table.context))
+    return {"count": len(found), "complete": False}
+
+
+def _count_child(table_json, kwargs):
+    return count_plans_at_most(CostTable.from_json(table_json), **kwargs)
+
+
+def count_plans_at_most_isolated(table: CostTable, **kwargs) -> dict:
+    """`count_plans_at_most` in a spawned child (see `solve_plan_isolated`)."""
+    import multiprocessing
+
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        return pool.apply(_count_child, (table.to_json(), kwargs))
 
 
 def solve_plan_isolated(table: CostTable, **kwargs) -> dict:
@@ -871,6 +1226,7 @@ NAMED_PLANS = {
     "mobius+depth4-after-wrap": ("mobius", "after-wrap"),
     "bits+depth4": ("bits", "all"),
     "bits-flow+depth4": ("bits-flow", "all"),
+    "mobius+depth4": ("mobius", "all"),
 }
 
 
@@ -878,14 +1234,17 @@ NAMED_PLANS = {
 # Evaluation: emit, schedule, prove, validate
 # ----------------------------------------------------------------------------
 def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstream: bool,
-             cpsat_deterministic_time: float | None = None, keep_kernel: str | None = None) -> dict:
-    """Build a plan, prove and validate it, and compare predicted with emitted numbers."""
+             cpsat_deterministic_time: float | None = None, keep_kernel: str | None = None,
+             greedy_extra: Mapping | None = None) -> dict:
+    """Build a plan, prove and validate it, and compare predicted with emitted numbers.
+    `greedy_extra` is applied after the shaped flags (e.g. LOAD_TAIL_GREEDY)."""
     from generate_ssa_kernel import save_kernel_to_json, simulator_cycles, validate_kernel
     from scripts import schedule_report as sr
     from verification.kernel_dataflow import check
 
     ctx = table.context
     extra = dict(SHAPED_GREEDY) if shaped else {}
+    extra.update(greedy_extra or {})
     if cpsat_deterministic_time is not None:
         extra.update(use_greedy=False, cpsat_deterministic_time=cpsat_deterministic_time)
     instrs, stats, sched, path = build_emission(rows, ctx, workdir, name=name, extra=extra)
@@ -907,6 +1266,9 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
         "cycles": stats["cycles"],
         "simulator_cycles": simulator_cycles(instrs)[0],
         "peak_live": stats.get("peak_live"),
+        "budget_exceeded": bool(stats["budget_exceeded"]),
+        "max_addr": stats.get("max_addr"),
+        "scratch_size": stats.get("scratch_size"),
         "proved": proved,
         "passed": passed,
         "upstream": None,
@@ -918,6 +1280,7 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
     save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123,
                         values_only=ctx.values_only)
     row["kernel"] = kernel_path
+    row["sched_json"] = os.path.abspath(path)
     row["upstream_strict"] = None
     if upstream:
         import subprocess
@@ -1026,9 +1389,14 @@ def _print_counts(label, counts):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["loop"]:  # the stage 1 / stage 2 feedback loop lives in its own module
+        from scripts import emission_loop
+        return emission_loop.main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["calibrate", "check", "predict", "solve", "sweep", "measure", "table",
-                                        "scatter"])
+                                        "scatter", "derive", "loop"],
+                    help="loop: closed loop with the shaped greedy (scripts/emission_loop.py; loop --help)")
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--forest-height", type=int, default=10)
@@ -1059,6 +1427,9 @@ def main(argv=None):
     ap.add_argument("--fix", action="append", default=[], metavar="ROUND=ENCODING",
                     help="solve/sweep: keep round ROUND uniform with ENCODING (e.g. 15=gather keeps select work "
                          "out of the last round, the schedule's tail); repeatable")
+    ap.add_argument("--greedy-model", action="store_true",
+                    help="solve: minimise the greedy pipeline model (GREEDY_MODEL; a calibrated heuristic of the "
+                         "load-tail greedy's cycles, not a bound) instead of the floor")
     ap.add_argument("--no-lateness", action="store_true",
                     help="solve/sweep: drop the tie-break that puts select work at a level's earliest visit")
     ap.add_argument("--input", action="append", default=[], metavar="LABEL=ROWS.json",
@@ -1102,6 +1473,39 @@ def main(argv=None):
             for note in table.notes:
                 print("  note: " + note)
             return 0
+        if args.command == "derive":
+            # The derivation needs no probe builds: run and report it first, so a cold cache or
+            # a calibration failure cannot hide it. Its report must not overwrite the
+            # reference it is compared with (a later run would then compare it with itself).
+            reference = args.table or default_table_path(ctx)
+            if args.json and os.path.realpath(args.json) == os.path.realpath(reference):
+                ap.error(f"--json {args.json} is the reference cost table ({reference}); "
+                         "write the derivation elsewhere")
+            derived, doc = derive_table(ctx)
+            if args.json:
+                write_json_atomic(args.json, doc)
+            print(f"Derived by instantiation (scheduler_rs): {len(doc['sites'])} sites, "
+                  f"{len(doc['resources'])} shared-resource groups")
+            print("| Feature | " + " | ".join(CATEGORIES) + " |")
+            print("|---|" + "---|" * len(CATEGORIES))
+            for name, coef in derived.coefficients.items():
+                if any(coef.values()):
+                    print(f"| {name} | " + " | ".join(f"{coef[c]:,}" if coef[c] else "" for c in CATEGORIES) + " |")
+            try:
+                table = load_or_calibrate(ctx, args.table, workdir)
+            except Exception as e:  # noqa: BLE001 - reported; the derivation above stands
+                print(f"no calibrated table to compare with: {type(e).__name__}: {e}")
+                return 1
+            diffs = table_differences(derived, table)
+            entries = len(derived.coefficients) * len(CATEGORIES)
+            if diffs:
+                print(f"DIFFERS from the calibrated table in {len(diffs)} of {entries} entries (derived vs calibrated):")
+                for d in diffs:
+                    print("  " + d)
+                return 1
+            print(f"Equal to the calibrated table in all {entries} entries "
+                  f"({len(derived.coefficients)} features x {len(CATEGORIES)} categories).")
+            return 0
         table = load_or_calibrate(ctx, args.table, workdir)
         if args.what_if:
             if args.command not in ("predict", "solve"):
@@ -1140,8 +1544,11 @@ def main(argv=None):
             max_util = parse_max_util(args.max_util[0] if args.max_util else "none")
             # Isolated: on a cold cache the calibration above has loaded scheduler_rs here.
             result = solve_plan_isolated(table, encodings=args.encodings.split(","), time_limit=args.time_limit,
-                                         max_util=max_util, lateness=not args.no_lateness, fixed=fixed)
+                                         max_util=max_util, lateness=not args.no_lateness, fixed=fixed,
+                                         greedy_model={} if args.greedy_model else None)
             capped = f", T under caps {result['capped_cycles']:,}" if max_util else ""
+            if args.greedy_model:
+                capped += f", greedy model {result['objective']:,} (heuristic)"
             _print_counts(f"best plan ({result['status']}{capped}) [{describe_plan(result['rows'])}]", result["counts"])
             if args.out:
                 doc = plan_document(result["rows"], ctx.forest_height, context=asdict(ctx),

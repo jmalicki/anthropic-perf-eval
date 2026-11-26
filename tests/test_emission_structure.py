@@ -83,6 +83,39 @@ def test_calibration_is_exact_on_unseen_plans(table, tmp_path):
     assert result["compared"] >= 1 and result["bad"] == []
 
 
+def test_table_by_instantiation_equals_calibrated(table):
+    """The binding's cost table, derived from one program holding every alternative, equals
+    the table fitted from probe builds entry for entry, products of shared constants included."""
+    derived, doc = es.derive_table(CTX)
+    assert es.table_differences(derived, table) == []
+    assert any(derived.coefficients[name]["alu"] for name in es.feature_names(CTX) if name.startswith("and:"))
+    assert doc["problems"] == [] and doc["rule"] == "tree-access"
+    choice_rounds = len(CTX.choice_rounds())
+    assert len(doc["sites"]) == choice_rounds * CTX.n_groups
+    site = doc["sites"][0]
+    assert set(site["alternatives"]) == {"gather", "bits", "bits-flow", "mobius"}
+    assert {f["name"]: f["source"] for f in site["facts"]}["depth"] == "structure"
+
+
+@pytest.mark.parametrize("context", [
+    es.Context(rounds=16, batch_size=32, index_form="zero-based"),  # bits not matched on the zero-based chain
+    es.Context(rounds=16, batch_size=32, values_only=True),         # tail:* liveness is per group
+])
+def test_table_by_instantiation_refuses_unsupported_contexts(context):
+    with pytest.raises(RuntimeError, match="problems"):
+        es.derive_table(context)
+
+
+@pytest.mark.ci_only
+@pytest.mark.timeout(1800)
+def test_table_by_instantiation_equals_calibrated_32_groups(tmp_path):
+    """The parity gate at the shape of the recorded results (144 probe builds, a few minutes)."""
+    ctx = es.Context(rounds=16, batch_size=256)
+    calibrated = es.calibrate(ctx, str(tmp_path), log=None)
+    derived, _ = es.derive_table(ctx)
+    assert es.table_differences(derived, calibrated) == []
+
+
 def test_counts_cover_every_ssa_op(tmp_path):
     rows = es.flag_plan(CTX, "bits-flow", "after-wrap")
     _, _, sched, _ = es.build_emission(rows, CTX, str(tmp_path))
@@ -124,6 +157,25 @@ def test_caps_are_exact_and_bound_t_by_the_cap():
     # A cap with more precision than CP-SAT's coefficients allow is rejected, naming the cap.
     with pytest.raises(ValueError, match="0.3333333333333333 has more than 6 decimal places"):
         es.solve_plan_isolated(flat_table(ctx, flow=901), max_util={"flow": 0.3333333333333333}, time_limit=10)
+
+
+def test_greedy_model_objective_matches_its_formula():
+    ctx = es.Context(rounds=16, batch_size=8)
+    model = {"a_floor": 3, "a_load": 5, "flow0": 10, "b_flow_x100": 50}
+    # Load term: 400 loads / 2 + 5 = 205 beats the floor (200) + 3.
+    counts = dict.fromkeys(es.CATEGORIES, 0) | {"load": 400}
+    assert es.greedy_model_cycles(counts, model) == 205
+    res = es.solve_plan_isolated(flat_table(ctx, load=400), greedy_model=model, time_limit=10)
+    assert res["objective"] == 205 and res["floor"]["cycles"] == 200
+    # Flow term: 300 flow ops -> floor 300 + 3 = 303; pipeline 100 + 5 + 0.5 * 290 = 250.
+    counts = dict.fromkeys(es.CATEGORIES, 0) | {"load": 200, "flow": 300}
+    assert es.greedy_model_cycles(counts, model) == 303
+    res = es.solve_plan_isolated(flat_table(ctx, load=200, flow=300), greedy_model=model, time_limit=10)
+    assert res["objective"] == 303
+    # The model is a heuristic, combined with nothing else that changes the objective.
+    with pytest.raises(ValueError, match="not combined"):
+        es.solve_plan(flat_table(ctx, flow=1), greedy_model={}, windows=[{"t": 0, "q": 0, "const": {},
+                                                                          "per_group": {}}])
 
 
 def test_fixed_root_and_encoding_iterators():
@@ -203,3 +255,109 @@ def test_solved_plan_floor_is_emitted(table, tmp_path, max_util):
     _, _, sched, _ = es.build_emission(result["rows"], CTX, str(tmp_path))
     assert es.emission_counts(sched) == result["counts"]
     assert math.isclose(es.choice_floor(es.emission_counts(sched))["cycles"], result["floor"]["cycles"])
+
+
+def test_derive_reports_before_calibrating(monkeypatch, capsys):
+    """`derive` runs and prints the derivation before it loads (or calibrates) the reference:
+    a calibration failure is reported after the derivation, not instead of it."""
+    called = []
+
+    def fake_derive(ctx):
+        called.append("derive")
+        return es.CostTable(ctx, {}, notes=[]), {"sites": [1, 2, 3], "resources": [1]}
+
+    def failing_calibration(*args, **kwargs):
+        called.append("calibrate")
+        raise RuntimeError("probe build failed")
+
+    monkeypatch.setattr(es, "derive_table", fake_derive)
+    monkeypatch.setattr(es, "load_or_calibrate", failing_calibration)
+    assert es.main(["derive", "--rounds", "2", "--batch-size", "16"]) == 1
+    out = capsys.readouterr().out
+    assert called == ["derive", "calibrate"]
+    assert "3 sites" in out and "probe build failed" in out
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_derive_refuses_to_overwrite_its_reference(tmp_path, monkeypatch, default):
+    """--json naming the reference table (given, or the default when --table is omitted) is
+    refused before anything runs."""
+    monkeypatch.setattr(es, "derive_table", lambda ctx: pytest.fail("derived despite the refusal"))
+    if default:
+        ref = es.default_table_path(es.Context(rounds=2, batch_size=16))
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--json", ref]
+    else:
+        ref = str(tmp_path / "costs.json")
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--table", ref,
+                "--json", str(tmp_path / "." / "costs.json")]
+    with pytest.raises(SystemExit) as e:
+        es.main(argv)
+    assert e.value.code == 2
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #76): the greedy-model objective
+# ----------------------------------------------------------------------------
+def _flat_table(ctx, **base):
+    coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+    coef["base"].update(base)
+    return es.CostTable(ctx, coef)
+
+
+def test_greedy_model_objective_equals_the_model_with_a_negative_slope():
+    """excess is max(0, flow + selects - flow0) exactly, so the solver's objective equals
+    greedy_model_cycles even under a negative slope override (before: 203 instead of 300)."""
+    ctx = es.Context(rounds=16, batch_size=32)
+    table = _flat_table(ctx, load=400)
+    model = {"a_floor": 3, "a_load": 100, "flow0": 10, "b_flow_x100": -100}
+    res = es.solve_plan_isolated(table, time_limit=20, greedy_model=model)
+    assert res["objective"] == math.ceil(es.greedy_model_cycles(res["counts"], model)) == 300
+
+
+_UNKNOWN_SCRIPT = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from ortools.sat.python import cp_model
+from scripts import emission_structure as es
+
+Real = cp_model.CpSolver
+
+class FloorUnknown(Real):
+    # The second solve (the model-floor phase) returns UNKNOWN without a solution, and any
+    # read of a value after it raises, as reading a solution that does not exist must not happen.
+    calls = 0
+    def Solve(self, model, *a, **k):
+        FloorUnknown.calls += 1
+        if FloorUnknown.calls == 2:
+            self._unknown = True
+            return cp_model.UNKNOWN
+        self._unknown = False
+        return super().Solve(model, *a, **k)
+    def Value(self, x):
+        if getattr(self, "_unknown", False):
+            raise AssertionError("solver.Value() after an UNKNOWN solve")
+        return super().Value(x)
+    def StatusName(self, status=None):
+        return "UNKNOWN" if getattr(self, "_unknown", False) else super().StatusName(status)
+
+cp_model.CpSolver = FloorUnknown
+ctx = es.Context(rounds=16, batch_size=32)
+coef = {name: dict.fromkeys(es.CATEGORIES, 0) for name in es.feature_names(ctx)}
+coef["base"].update(load=400)
+res = es.solve_plan(es.CostTable(ctx, coef), time_limit=20, greedy_model={})
+phases = [(s["phase"], s["status"]) for s in res["solves"]]
+assert ("model_floor", "UNKNOWN") in phases, phases
+print("OK", phases)
+"""
+
+
+def test_tie_break_hints_survive_an_unknown_floor_solve(tmp_path):
+    """If the model-floor solve ends UNKNOWN, the tie-break is hinted from the saved plan, not
+    from solver values that do not exist."""
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = tmp_path / "unknown.py"
+    script.write_text(_UNKNOWN_SCRIPT)
+    out = subprocess.run([sys.executable, str(script), root], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0 and "OK" in out.stdout, out.stdout + out.stderr

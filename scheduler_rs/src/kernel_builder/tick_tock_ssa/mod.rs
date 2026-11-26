@@ -132,6 +132,9 @@ pub struct SsaTickTockKernelBuilder {
     /// Groups the tree-access emitter being run emits (`emits_group`); `None` = all. Set per
     /// encoding by `emit_round` when an emission plan mixes encodings within a round.
     pub(crate) access_groups: Option<Vec<bool>>,
+    /// When set (`new_instantiating`), every choice site's alternatives are built next to the
+    /// canonical gather and recorded here (`transform::tree_access`).
+    pub(crate) instantiation: Option<crate::kernel_builder::transform::TreeAccessInstantiation>,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
     /// Per-solve CP-SAT budget in deterministic time (None = wall-clock limit only). Set
@@ -702,6 +705,7 @@ impl SsaTickTockKernelBuilder {
             depth4_broadcasts_initialized: false,
             uses_depth4,
             access_groups: None,
+            instantiation: None,
             zero_vreg: None,
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
@@ -709,6 +713,24 @@ impl SsaTickTockKernelBuilder {
             greedy_forced_shifts: None,
             greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode::Optimize,
         }
+    }
+
+    /// A builder that emits the canonical program of `config` (its plan must gather every
+    /// choice site) with every bit-driven alternative of every choice site built next to the
+    /// gather, and the select tables of every cached level visited. The alternatives are dead
+    /// code; `instantiation` records them (`transform::instantiate_tree_access`).
+    ///
+    /// # Arguments
+    /// * `config` - Configuration with the canonical plan.
+    ///
+    /// # Returns
+    /// The builder; `build` then fills `instantiation`.
+    pub fn new_instantiating(config: KernelConfig) -> Self {
+        let visits_depth4 = (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 4);
+        let mut builder = Self::new(config);
+        builder.uses_depth4 = visits_depth4;
+        builder.instantiation = Some(Default::default());
+        builder
     }
 
     /// Build the kernel, returning an `SsaProgram` with all emission artifacts.
@@ -1352,6 +1374,7 @@ impl SsaTickTockKernelBuilder {
                         live_through_vregs: if live_through.is_empty() { None } else { Some(&live_through) },
                         cse_groups: None, // Per-section: no CSE (feasibility only)
                         vector_group_lanes: Some(&ctx.vector_group_lanes),
+                        zero_reserved: ctx.zero_vreg.is_some(),
                         ..Default::default()
                     },
                     Some(false),
@@ -1671,6 +1694,7 @@ impl SsaTickTockKernelBuilder {
                 forced_shifts: forced_shifts.as_ref(),
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                zero_reserved: ctx.zero_vreg.is_some(),
             };
             match crate::cpsat_scheduler::window::run_window_probe(&ctx.ops, &cpsat_config, &probe_ctx, base, spec) {
                 Ok((report, result)) => {
@@ -1711,6 +1735,7 @@ impl SsaTickTockKernelBuilder {
                 live_through_vregs: None,
                 cse_groups: cse_groups_ref,
                 vector_group_lanes: Some(&ctx.vector_group_lanes),
+                zero_reserved: ctx.zero_vreg.is_some(),
                 ..Default::default()
             },
             Some(!greedy_budget_exceeded),

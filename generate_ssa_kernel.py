@@ -153,7 +153,10 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
-    build_kwargs = args_to_build_kwargs(args)
+    try:
+        build_kwargs = args_to_build_kwargs(args)
+    except ValueError as e:  # an option combination that would be ignored or overridden
+        parser.error(str(e))
     emission = non_default_emission_options(build_kwargs)
     if emission:
         print("  emission options: " + ", ".join(f"{k}={v}" for k, v in emission.items()))
@@ -177,6 +180,16 @@ def main():
         note = "" if args.use_greedy else (" (hinted to CP-SAT lane by lane)" if hinted
                                            else " (ignored: CP-SAT follows the greedy)")
         print("  greedy_split_shift=True" + note)
+    if getattr(args, "greedy_shift_policy", "when-full") != "when-full":
+        target = getattr(args, "greedy_shift_target", None)
+        print(f"  greedy_shift_policy={args.greedy_shift_policy}"
+              + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
+    for name, default in (("greedy_load_priority", "key"), ("greedy_flow_priority", "key"),
+                          ("greedy_select_overflow", "never"), ("greedy_budget_force", "same-cycle"),
+                          ("greedy_alu_priority", "key"), ("greedy_const_policy", "default"),
+                          ("greedy_early_stagger", None)):
+        if getattr(args, name, default) != default:
+            print(f"  {name}={getattr(args, name)}")
     if getattr(args, "greedy_justify", 0):
         print(f"  greedy_justify={args.greedy_justify}")
     overrides = {name: getattr(args, name, None) for name in

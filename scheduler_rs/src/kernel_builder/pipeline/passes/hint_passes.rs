@@ -305,6 +305,12 @@ impl Pass for ScheduleWithFixedChoicesPass {
                 &mut shifted_lane_cycles,
             )?;
         ctx.greedy_decisions.shifted_alu_cycles = shifted_lane_cycles;
+        // A derivation the rerun could not honour was scheduled as a load: record what was
+        // scheduled, so lowering never emits an ALU op the schedule did not place.
+        let demoted = ssa_greedy::reconcile_const_choice_encodings(
+            &mut ctx.greedy_decisions.const_choice_encoding,
+            &diagnostics.const_alu_derive,
+        );
 
         ctx.greedy_metrics = crate::kernel_builder::pipeline::SchedulingMetrics {
             cycles,
@@ -315,6 +321,6 @@ impl Pass for ScheduleWithFixedChoicesPass {
             over_budget_cycles: diagnostics.over_budget_cycles,
         };
 
-        Ok(format!("{} cycles (fixed choices)", cycles))
+        Ok(format!("{} cycles (fixed choices; {} ALU-derived constants rescheduled as loads)", cycles, demoted))
     }
 }

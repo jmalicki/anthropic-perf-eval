@@ -253,7 +253,7 @@ pub(crate) fn apply_window_constraints(
     ops: &[SsaOp],
     window: &CpsatWindow,
     vars: &super::op_times::OpVariables,
-    const_choice_alu_encoding_info: &HashMap<usize, Vec<(usize, usize, Opcode)>>,
+    const_choice_alu_encoding_info: &HashMap<usize, Vec<Option<(usize, usize, Opcode)>>>,
 ) -> WindowRegionCounts {
     use cp_sat::builder::{BoolVar, IntVar, LinearExpr};
     use super::op_times::ConstChoiceVars;
@@ -330,10 +330,12 @@ pub(crate) fn apply_window_constraints(
                     Some(ConstChoiceEncoding::AluDerive(info)) => const_choice_alu_encoding_info
                         .get(&idx)
                         .and_then(|alts| {
-                            alts.iter().position(|&(l, r, opcode)| {
-                                Some(&l) == id_to_idx.get(&info.left_op_id)
-                                    && Some(&r) == id_to_idx.get(&info.right_op_id)
-                                    && opcode == info.opcode
+                            alts.iter().position(|alt| {
+                                alt.is_some_and(|(l, r, opcode)| {
+                                    Some(&l) == id_to_idx.get(&info.left_op_id)
+                                        && Some(&r) == id_to_idx.get(&info.right_op_id)
+                                        && opcode == info.opcode
+                                })
                             })
                         })
                         .map(|k| k + 2),
@@ -594,6 +596,8 @@ pub struct WindowProbeContext<'a> {
     pub forced_shifts: Option<&'a HashSet<usize>>,
     pub cse_groups: Option<&'a [super::cse_groups::CseGroup]>,
     pub vector_group_lanes: Option<&'a HashMap<crate::types::VReg, Vec<crate::types::VReg>>>,
+    /// The zero VReg is reserved (`SsaCpsatHints::zero_reserved`).
+    pub zero_reserved: bool,
 }
 
 impl WindowReference {
@@ -716,6 +720,49 @@ pub fn restrict_to_window(
             if let Some((_, r)) = last_pruned {
                 keep[r] = true;
             }
+        }
+    }
+    // A kept ConstChoice reads the constants its ALU-derived alternatives name, but those
+    // reads are not in `srcs` or `dep_ids`, so the loop above does not see them. Keep the
+    // producer of each operand (the first op producing the value, as the model looks it up)
+    // and, as for any value, its latest pruned reader. Without this a pruned subproblem has
+    // an alternative whose operand has no producer, which the model refuses (and before
+    // that silently switched off, so the reduced model was not the full one). Iterated:
+    // a newly kept op can itself be a ConstChoice. The hardware zero has no producer.
+    let mut first_producer: HashMap<i64, usize> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(v) = op.produces_constant {
+            first_producer.entry(v).or_insert(idx);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for idx in 0..n {
+            if !keep[idx] || ops[idx].opcode != crate::types::Opcode::ConstChoice {
+                continue;
+            }
+            let operands: Vec<i64> =
+                ops[idx].const_alternatives.iter().flatten().flat_map(|enc| enc.dependencies()).collect();
+            for value in operands {
+                let Some(&p) = first_producer.get(&value) else { continue };
+                if keep[p] {
+                    continue;
+                }
+                keep[p] = true;
+                changed = true;
+                if let Some(rs) = ops[p].dest.and_then(|d| readers.get(&d)) {
+                    let latest = rs
+                        .iter()
+                        .copied()
+                        .max_by_key(|&r| (window.reference.slot_span(r, &ops[r]).map_or(i32::MIN, |s| s.1), r));
+                    if let Some(r) = latest {
+                        keep[r] = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
     // Dependency edges between a near op and a dropped one need no op: the margins in
@@ -914,6 +961,7 @@ fn solve_window_model(
         vector_group_lanes: ctx.vector_group_lanes,
         alu_lane_hints: Some(&reference.shifted_alu_cycles),
         window: Some(window),
+        zero_reserved: ctx.zero_reserved,
         ..Default::default()
     };
     super::schedule_ssa_cpsat(ops, config.clone(), hints, Some(true))
@@ -1305,6 +1353,47 @@ mod tests {
         config.tuning.objective = crate::cpsat_scheduler::CpsatObjective::Makespan;
         config.tuning.workers = 1;
         config
+    }
+
+    /// A pruned window whose ConstChoice has an ALU-derived alternative (6 = 3 + 3) reading a
+    /// constant that is far before the window and whose only reader is far before too: the
+    /// reduced model keeps the producer of 3 (the alternative's read is not a `dep_ids` edge),
+    /// so the model is built (it used to refuse the alternative: "reads a value no op
+    /// produces") and can still derive 6.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn pruned_window_keeps_const_choice_operand_producers() {
+        use crate::kernel_builder::emit_ssa::{compute_ssa_dependencies, SsaEmitContext};
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        let c3 = emit.emit_const_choice(3);
+        let mut acc = emit.emit_alu(Opcode::Add, c3, c3); // the only reader of 3, at cycle 2
+        for _ in 0..13 {
+            acc = emit.emit_alu_imm(Opcode::Add, acc, 1);
+        }
+        let c6 = emit.emit_const_choice(6); // op 15, cycle 30
+        let six = emit.ops.len() - 1;
+        let out = emit.emit_alu(Opcode::Add, acc, c6);
+        let addr = emit.emit_const(100);
+        emit.emit_store(addr, out);
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let ops = emit.ops;
+        assert!(
+            ops[six].const_alternatives.as_ref().unwrap().contains(&ConstEncoding::Add { a_value: 3, b_value: 3 }),
+            "{:?}",
+            ops[six].const_alternatives
+        );
+        let reference = loose_reference(&ops);
+        assert_eq!(reference.cycles[six], 30);
+        let window = CpsatWindow { start: 28, len: 4, fix_window_encodings: false, reference, prune: true };
+        assert!(window.pruned_ops(&ops, 0).contains(&0), "control: the producer of 3 is pruned by distance");
+        let sub = restrict_to_window(&ops, &window, &[], None).expect("something is pruned");
+        assert!(sub.global.contains(&0), "the producer of the alternative's operand is kept");
+        let result = solve_window(&ops, &probe_config(), &WindowProbeContext::default(), &window)
+            .expect("the pruned model is built")
+            .expect("solution");
+        assert!(result.makespan as i32 <= window.reference.makespan(&ops));
     }
 
     /// A window that covers the whole schedule leaves every op free, so its optimum is the

@@ -15,6 +15,43 @@ simulator with the output unchanged (branch bits kept live), and **1,083** with 
 the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles of floor
 on this structure: once loads stop binding, the vector work binds near 975 (section 6).
 
+A closed loop between this model and the shaped greedy (section 10, Benders-style feedback with
+no-goods, learned caps, and time-aware rows whose row form is argued (coupling proved) but
+whose per-class table is only observed) **finds no plan better than the hand-made ones, also with the load-tail greedy**
+(`--greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9`,
+section 10.0). With index bits, five loop plans tie `flow90.json` at 1,039 / 1,041 and nothing
+goes below. With path bits, the best loop plan (under the cap `flow=0.92` learned on index bits)
+runs 1,099 against 1,033 / 1,035 for `path_flow90.json`, which is itself a stage-1 plan (path
+bits, cap `flow=0.9`). The 1,104 plateau is gone: 28 plans give 19 different cycle counts.
+Among plans within 30 cycles of the best, no lower bound stage 1 computes ranks them (index
+bits: floor Spearman rho -0.54, exact static bound -0.29, on plans the surrogates themselves
+chose; section 10.0.3). The spread tracks how many vector ops the greedy moves to the ALU
+(rho +0.93, measured after the build). That is a post-build diagnostic, not a cause: by the
+identity V - s = 6T - I (#76) the unshifted vector work is set by the cycle count T and the
+idle vector slots I together. On these schedules I is small and nearly constant (115 to 250
+slots, all in the start-up and tail; #76), so a longer schedule leaves more vector work on the
+VALU whatever made it longer; T alone would not imply it. How close stage 1 gets
+depends on what picks among plans of equal floor, not on the floor: five index-bit plans share
+the optimal floor 989 and run 1,067 to 1,414, so the floor alone is good to about 375 cycles;
+the lateness tie-break picks the one at 1,073 (34 above the best) and the cap `flow=0.92` one at
+1,039. With path bits the result depends on the cap: under `flow=0.92` stage 1 lands 66 above
+the best, under `flow=0.9` the capped floor ranks `path_flow90.json` first among all 16 built
+path plans.
+
+Update (section 10, "Update"): the shift count follows from the cycle count, by an exact
+identity. For slow plans: select resolution is a cause by bound only (with every select on
+flow, probe A needs at least 1,050 cycles, the flow row); no removal evidence survives (the
+1,054 with selects overflowing to the VALU was measured with the undercounting live-word
+counter; with the counter fixed that build is over the budget, peak 1,761). Scratch is a cause
+by removal on some path plans (path `flow90.json` 1,105 -> 1,046 scratch-relaxed; not
+`path_flow90.json`, 1,033 -> 1,034). The mid-schedule flow queue is a hypothesis from
+accounting (both interventions aimed at it made plans slower). A calibrated
+greedy term (`--greedy-model`, heuristic) ranks index-bit plans in-sample (Spearman +0.71 near
+the best against -0.54 for the floor; reproducible with `scripts/greedy_model_fit.py`), and
+fails out of sample: the four plans stage 1 chose with it ran 20 to 42 cycles slower than
+predicted. It finds no plan better than 1,039 / 1,033. These are greedy development
+measurements; the PR #69 measurement (1,104 plateau) is kept in section 10 as history.
+
 November 2026. Code: `scripts/emission_structure.py` (model, calibration, solve, measurement),
 `solver/emission_plan.py` (plan format), `--emission-plan` (emitter). Skill:
 `.cursor/skills/use-emission-structure/SKILL.md`. All numbers: 16 rounds, batch 256, height 10,
@@ -122,6 +159,40 @@ Stores (64) and fixed flow ops (0) are constant. Reading it: a group that select
 `bits-flow` instead of gathering saves 8 loads and costs 8 + 7 selects and 2 vector ops (bit
 extraction 4, minus the gather's 2); the level-4 table costs 16 loads and 53 + 8 scalar ops once.
 
+### 3.1 The same table by instantiation (no probe builds)
+
+`python -m scripts.emission_structure derive` gets the table from one emission instead of 144
+fits (`scheduler_rs/src/kernel_builder/transform/`, binding `derive_tree_access_cost_table`).
+The canonical program (root from the shared vector, every other round gathering) is emitted
+with every bit-driven alternative of every choice site built next to its gather by the
+emitter's own per-group code, on operands a structural matcher binds (rule `tree-access`;
+region tags only propose where to look). Then every op gets the condition under which dead
+code elimination keeps it, an OR of (round, group, encoding) choices, which reduces to the
+features above: shared tables to `table:d` / `pairs:d` / `pairs_high:d` / `mobius:d`, gathers'
+base vectors and level-end constants to `gather_round:r` / `gather_depth:d`, and ORs across
+levels, by inclusion-exclusion, to the `and:table:*` products (the scalar constants 3 to 15
+that address the cached nodes). Per-site differences to gathering give `groups:d:e` and are
+checked to be the same at every site. Whether a constant is `const` or `const_alu` depends
+on the constants created before it, so on emission order: every constant is checked to keep
+its category whatever the lazily created level-end constants `L_d` (and its own position, for
+those). Anything that does not reduce to the features is reported, never fitted. At 16 rounds the derived table equals the calibrated one entry for
+entry with 4 and with 32 groups (`tests/test_emission_structure.py`, and `derive` against
+`calibrate`); the Rust tests also compare its predictions with emitted programs directly.
+Contexts it does not cover yet: the zero-based index (bits are matched only on the mirrored
+index chain) and `--values-only` (dead index updates are per group, the `tail:*` features).
+
+The apply pass (`transform::apply_tree_access_plan`) takes a plan and rewrites the same
+instantiated program into the plan's program: readers of each site's value are rewired to the
+chosen candidate, then dead code elimination. Three emitter-order effects are reproduced
+explicitly so the result is the `--emission-plan` program op for op (up to VReg and op
+numbering; Rust tests over 74 plans at 4 and 32 groups, and the greedy schedule is the same): a mixed round's
+encodings in order of their first group; the level-end constant `L_d`, which the emitter
+creates at its first live user: the first round that gathers at depth `d`, or, when no round
+gathers there, the final mirrored index conversion if the last round leaves the indices at
+depth `d` (e.g. 15 rounds at height 10 and `L_4`; tested at that shape), with its ALU-derived
+alternatives recomputed there; and the broadcast of a level's first table entry, shared by leaf pairs and
+Mobius coefficients, which the emitter creates with the coefficients when no pair is used.
+
 ## 4. The objective: the capacity floor with choices resolved
 
 `choice_floor(counts)` is the smallest integer `T` such that some resolution of every choice fits
@@ -228,7 +299,10 @@ What the numbers say:
   resolution alone accounts for 13 to 17 (consts on load: "scheduled floor" against "emitted
   floor").
 
-**Where the gap goes** (`scripts.schedule_report` on the 1,104-cycle schedule of `flow90.json`):
+**Where the gap goes** (`scripts.schedule_report` on the 1,104-cycle schedule of `flow90.json`;
+see docs/GREEDY_SHAPE_ABLATION.md section 11: shifting toward the floor's split does not shorten
+the schedule (PR #76: the shift count follows the schedule's length), and retuning the window and
+stagger plus `--greedy-load-priority final-last` takes this plan to 1,039 cycles with the greedy):
 the vector ALU is 100% busy from cycle 111 to about 994 and the loads nearly so, but the greedy
 ran only 1,039 vector ops as 8 scalar ops, while the floor's balance needs about 1,465. The scalar
 ALU is 64% used. The vector ALU's own term is then 6,387 / 6 = 1,065, only 39 below the schedule.
@@ -350,6 +424,7 @@ What this says:
   the simulator) and `docs/emission_plans/values_only_path_fix15_flow90.json` (values only, 1,083).
 
 
+## 7. Limits
 
 | Limit | Consequence | Mitigation here |
 |---|---|---|
@@ -405,4 +480,507 @@ $M solve --what-if gather-without-address-op                                 # s
 uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate --merge-hash-stages --index-form mirrored \
   --emission-plan docs/emission_plans/flow90.json \
   --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95
+```
+
+## 10. Closing the loop: stage 1 driven by measured schedules
+
+**Conclusion (negative, re-measured with the load-tail greedy; section 10.0).** With the greedy
+that closes the load tail (PR #73), the loop still finds no plan better than the hand-made ones
+under identical flags. Index bits: best 1,039 / 1,041, a tie between `flow90.json` and five loop
+plans. Path bits: best loop plan 1,099 / 1,101 against 1,033 / 1,035 for `path_flow90.json`.
+The 1,104 plateau of PR #69 is gone: 28 index-bit plans give 19 different cycle counts.
+Stage 1 still cannot rank plans near the optimum. Among the 13 plans within 30 cycles of the
+best, the floor has Spearman rho -0.54, the floor with window rows -0.29, and the exact static
+bound -0.29. A quantity measured after the build tracks them: the vector work the greedy
+leaves on the VALU after its own shifts (rho +0.93, Pearson +0.96). It is a post-build
+diagnostic, not a cause: by the identity V - s = 6T - I (#76; vector ops, shifts, cycles, idle
+vector slots) the unshifted vector work is 6T - I, so it depends on the idle slots as well as
+on the length (T = 100, I = 0 and T = 101, I = 6 both give 600). With I small and nearly
+constant across these schedules (115 to 250 slots, start-up and tail only), a schedule that is
+longer for any reason leaves more vector work on the VALU.
+Stage 1 assumes the best VALU/ALU split. Resolution, index bits: the floor alone does not resolve plans.
+Five built plans share the optimal floor 989 and run 1,067, 1,072, 1,073, 1,073 and 1,414, so
+the floor is good to about 375 cycles. What stage 1 returns among them is set by its tie-break:
+the lateness tie-break returns the plan at 1,073, 34 above the best, and the cap `flow=0.92`
+(learned on these builds) one at 1,039. Path bits: the result depends on the cap. Under
+`flow=0.92`, learned on index bits, every stage-1 plan prefers `bits-flow` for the round-4
+selects (a floor 3 cycles lower), which costs 68 cycles, and the best runs 1,099, 66 above
+`path_flow90.json`. Under `flow=0.9` the capped floor is 980 for `path_flow90.json` and at
+least 981 for each of the other 15 built path plans, and `solve --select-bit-source path
+--max-util flow=0.9` returns `path_flow90.json` itself (checked: same rows). So with path bits
+stage 1 finds the best plan under one hand-set cap and misses it by 66 under the learned one;
+which cap generalises is not known from 16 builds. Scratch did not fail any of 44 builds.
+Path-bit plans run within 31 words of the budget, and no plan-level proxy predicts the peak
+(section 10.0.4).
+
+**Update: the shift count is a symptom, and a greedy term for stage 1 (heuristic)**
+(docs/GREEDY_SHAPE_ABLATION.md section 12). "VALU cycles left after the greedy's shifts"
+ranks plans because of an identity, not a mechanism. Vector ops left = 6 x cycles - idle
+vector slots, and the vector ALU is busy in every steady-state cycle. So a schedule that is
+longer for any reason shifts fewer ops.
+
+For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
+emission (static bound 1,029); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). Its 158 shifts "missing" against the
+floor's split are a consequence: at 1,029 cycles with the same idle vector slots only 1,367
+shifts fit, but a schedule with more idle slots could shift more, so that count is conditional,
+not a bound. What is known about slower plans, labelled removal (an A/B build) or accounting
+(a decomposition of one schedule):
+
+- The greedy runs every SelectChoice on the one flow slot. With path bits, round-4 `bits-flow`
+  is flow-bound at 1,050 or more for any schedule that keeps every select on flow (bound on
+  the run's encodings). Removal: letting selects overflow to the vector ALU gave 1,101 -> 1,054,
+  but with a live-word counter that undercounted multiply-add selects; with it fixed, that
+  build exceeds the scratch budget.
+- Index bits, `bits-flow` instead of `bits` in round 1: removal, 14 cycles (1,039 -> 1,053),
+  not scratch (scratch-relaxed leaves 1,053). That a longer mid-schedule flow queue delays late
+  groups into the load stream is a hypothesis from accounting; both interventions aimed at the
+  queue made the plan slower (1,074, 1,067).
+- The scratch budget: removal (analysis only), path `flow90.json` runs 1,046 scratch-relaxed
+  against 1,105.
+
+No valid bound ranks the plans near the optimum. Stage 1 therefore gets a calibrated
+heuristic of the greedy's cycles: `solve_plan(greedy_model={})` / `solve --greedy-model`,
+`max(floor + 32, loads/2 + 19 + 0.75 * max(0, selects + flow ops - 900))`, grid-fitted on the
+24 index-bit loop builds under 1,200 cycles. Data and every number below:
+`docs/emission_plans/greedy_model_data.json`, `uv run python -m scripts.greedy_model_fit
+--check` (`tests/test_greedy_model_fit.py`).
+
+- In-sample it ranks index-bit plans: Spearman +0.95 over 28, +0.71 within 30 cycles of the
+  best (a subset selected on the outcome), where the floor gives -0.54. Refitting the constants
+  leave-one-out gives MAE 6.2 cycles and Spearman +0.96, but the form was chosen on the same
+  plans, so this is not out-of-sample evidence.
+- It does not rank path-bit plans (+0.05); many of them run at the scratch ceiling, which it does
+  not model (not all: `path_flow90.json` is not scratch-bound, 1,033 against 1,034 relaxed).
+- Out of sample it fails: the four plans stage 1 chose with it ran 20 to 42 cycles slower
+  than predicted (index 1,051 and 1,058, predicted 1,030; path 1,053 and 1,054, predicted 1,011
+  and 1,034). Its path plan (1,053) still beats the best earlier loop plan under the learned
+  cap (1,099).
+- It finds nothing below 1,039 / 1,041 (index) or 1,033 / 1,035 (path).
+
+The `bits` / `bits-flow` choice is only partly a select-resolution choice for this greedy.
+Resolution recovered 47 of the 68 round-4 cycles with the undercounting counter and does not
+fit the budget with the fixed one; no resolution rule tried wins everywhere. So it stays a
+stage-1 choice for now.
+
+The rest of this section, from "History" on, is the PR #69 measurement with the shaped greedy
+before the load-tail flags. Its plateau and its conclusion are superseded by section 10.0.
+
+### 10.0 Re-measurement with the load-tail greedy (current)
+
+All numbers: 16 rounds, 32 groups, `--merge-hash-stages --index-form mirrored`, the shaped
+greedy flags of section 10 plus `--greedy-load-priority final-last --greedy-groups-in-flight 32
+--greedy-stagger-cycles 9` (`loop run --load-tail`; the flags are stored in the state file and a
+state refuses others). These are development measurements with the greedy, not recorded
+benchmark results. Every build: counts predicted exactly, PROVED (dataflow replay) and PASSED
+(`--validate`). Both best kernels (1,041 and 1,035 on the simulator) pass
+`./scripts/check_upstream.sh --strict`. Budget: 44 sixteen-round builds, one at a time, greedy
+only (28 with index bits, 16 with `--select-bit-source path`). Every point and trace:
+`docs/emission_plans/loop_report_load_tail.json`.
+
+#### 10.0.1 Best plans under identical flags
+
+| Bit source | Best from the loop (sched / sim) | Hand-made reference (sched / sim) | Static head/tail bound of the reference |
+|---|---|---|---|
+| index | **1,039 / 1,041**, five loop plans (tie) | `flow90.json` 1,039 / 1,041 | 1,029 |
+| path | 1,099 / 1,101 | `path_flow90.json` **1,033 / 1,035** | 1,009 |
+
+No plan is checked in: none beats the references.
+
+Index bits, per mode (seeds: `gather`, three flag plans, `floor_optimal.json`, `flow90.json`):
+
+| Mode | Builds | Cycles (sched) | Before the load-tail flags (PR #69) |
+|---|---|---|---|
+| seeds | 6 | flow90 1,039; floor_optimal 1,073; flag plans 1,158 / 1,249 / 1,696; gather 1,836 | 1,104; 1,125; 1,171 / 1,263 / 1,698; 1,850 |
+| (a) no-goods on the floor | 4 | 1,067, 1,072, 1,073, 1,414 | 1,125 to 1,210 |
+| (b) caps, rule `saturated` | 4 | 1,063 best (caps valu 0.96) | 1,118 |
+| (b) caps, rule `underfilled` | 3 | **1,039** at iteration 2 (learned `flow=0.92`), ties | 1,104, ties |
+| (a) under `flow=0.92` | 8 | 1,039 (x3), 1,053, 1,056 (x2), 1,063, 1,071 | 1,104 (x2) to 1,125 |
+| (c) window rows | 3 | 1,107 to 1,131 | 1,127 to 1,150 |
+
+The six plans at 1,039: `flow90.json`; `r0 bits; r1 mobius; r2-3 bits-flow; r4 gather x16 +
+bits-flow x16; r11 bits; r12 mobius; r13-14 bits-flow` and its x17 / x15 variant; `r0-1 bits; r2-3
+bits-flow; r4 x16 / x16; r11-12 bits; r13-14 bits-flow`; and the two that mix `bits` and `mobius`
+in rounds 1 and 12 (gather in rounds 5 to 10 and 15 everywhere). In each of them rounds 1 and 12
+(depth 1) use `bits` or `mobius`. Every index-bit plan that uses `bits-flow` in round 1 or
+round 12 is slower (1,053 or more).
+
+Path bits (seeds `path_flow90.json`, `flow90.json`, `floor_optimal.json`; then caps `underfilled`
+and no-goods under `flow=0.92`; three hand probes around `path_flow90.json` that change only
+round 4):
+
+| Plan | Floor (path table) | Cycles (sched / sim) | Peak live |
+|---|---|---|---|
+| `path_flow90.json` (r4 gather x12 + bits x20) | 980 | **1,033 / 1,035** | 1,465 |
+| probe: r4 gather x13 + bits x19 | 981 | 1,036 / 1,038 | 1,473 |
+| probe: r4 gather x11 + bits x21 | 980 | 1,039 / 1,041 | 1,449 |
+| probe: r4 gather x12 + **bits-flow** x20 | **977** | 1,101 / 1,103 | 1,481 |
+| best loop plan (no-goods under `flow=0.92`) | 977 | 1,099 / 1,101 | 1,505 |
+| floor-optimal under the path table (caps iteration 0) | 973 | 1,142 / 1,144 | 1,505 |
+| other loop plans (8) | 974 to 993 | 1,104 to 1,305 | 1,497 to 1,505 |
+| `flow90.json`, `floor_optimal.json` built with path bits | 997, 989 | 1,105, 1,098 | 1,489 |
+
+Under path bits the round-4 encoding alone is worth 68 cycles. Stage 1 prefers `bits-flow` there
+because its floor is 3 cycles lower, so no loop mode reaches the region of `path_flow90.json`.
+
+#### 10.0.2 Is the plateau gone?
+
+The 1,104 plateau is gone. With index bits the 28 plans give 19 different cycle counts: 1,039
+(x6), 1,053, 1,056 (x2), 1,063 (x3), 1,067, 1,071, 1,072, 1,073 (x2), 1,082, 1,085, 1,103,
+1,107, 1,128, 1,131, then the seeds and one bad no-good plan (1,158 to 1,836). With path bits, 16
+plans give 14 counts from 1,033 to 1,305.
+
+There is a smaller tie at 1,039, and it has a cause. The cycles follow the vector work the greedy
+leaves on the VALU after shifting, not the plan's floor. For the six plans at 1,039 the greedy
+shifts 1,307 to 1,309 ops, which leaves 6,119 or 6,120 vector ops, i.e. 1,020 VALU cycles; 1,020
+plus 19 cycles of start-up and tail gives 1,039 (as PR #73 found for `flow90.json`). Plans that
+use `bits-flow` in a depth-1 round have the same or a lower floor, but the greedy shifts only
+1,120 to 1,271 ops there, with ALU steady-state use 74% to 85% instead of 91%. Over the 13
+index-bit plans within 30 cycles of the best, cycles = ceil(VALU ops left / 6) + 19 to 32
+(Pearson +0.96). Why the greedy shifts less when depth-1 rounds use flow selects is not
+verified.
+
+#### 10.0.3 Surrogate quality
+
+"Loop plans" excludes seeds and probes. "Near" is every valid build within 30 cycles of the best.
+The last row is a post-build diagnostic, not something stage 1 can compute.
+
+| Surrogate | Index, all (28) P / S | Index, loop (22) P / S | Index, near (13) P / S | Path, all (16) P / S | Path, loop (10) P / S |
+|---|---|---|---|---|---|
+| floor (`choice_floor`) | +0.76 / +0.24 | -0.05 / -0.09 | +0.10 / **-0.54** | -0.05 / -0.47 | +0.11 / -0.34 |
+| floor + window rows | +0.74 / -0.06 | -0.12 / -0.65 | +0.15 / -0.29 | -0.60 / -0.52 | -0.81 / -0.83 |
+| capped floor, learned `flow=0.92` | +0.77 / +0.79 | +0.08 / **+0.71** | +0.32 / +0.19 | +0.19 / -0.12 | +0.35 / +0.35 |
+| capped floor, `flow=0.9` | +0.77 / +0.77 | +0.08 / +0.62 | +0.36 / +0.51 | +0.34 / +0.37 | +0.47 / +0.35 |
+| exact static bound of the built kernel | +0.69 / -0.24 | -0.12 / -0.66 | +0.15 / -0.29 | -0.57 / -0.52 | -0.78 / -0.83 |
+| VALU cycles left after the greedy's shifts (diagnostic) | +0.85 / +0.99 | +0.74 / +0.98 | +0.96 / +0.93 | +0.98 / +0.87 | +0.99 / +0.83 |
+
+The path "near" subset has 3 plans, too few to report. Reading:
+
+- The bounds (floor, rows, static bound) still do not rank near-optimal plans; with path bits
+  they rank them backwards. The rows and the static bound are still never above a plan's cycles
+  (0 of 44).
+- The capped floor ranks the index-bit loop plans (+0.71) as in PR #69, but not the plans
+  within 30 cycles of the best (+0.19), and not path-bit plans.
+- The floor alone resolves nothing among the index-bit plans at floor 989 (1,067 to 1,414); the
+  tie-break picks 1,073 and the learned cap 1,039. With path bits the cap decides: `flow=0.9`
+  ranks `path_flow90.json` (the best) first, `flow=0.92` misses it by 66. Below that, the
+  ranking tracks the vector work left on the VALU after the greedy's shifts, a post-build
+  diagnostic that follows from the cycle count and the idle vector slots (6T - I, #76; I is
+  nearly constant here), not a cause stage 1 could model.
+
+Caveats for every coefficient in the table: the plans were chosen by these surrogates (a
+restricted range, 22 index-bit loop plans at floors 989 to 1,049, with heavy ties: 4 at floor 989,
+10 at capped floor 996), so rank correlations are unstable; the cap `flow=0.92` was learned by the caps
+loop on these index-bit builds and is scored on them (in-sample), and is applied to path bits
+untuned; `flow=0.9` was set by hand on earlier builds; "floor + window rows" uses the final row
+table, learned from all builds including the one scored; the "near" subset is selected on the
+outcome (cycles within 30 of the best), which restricts the range of cycles and biases its
+correlations towards zero; the diagnostic row is measured after the build and is not a
+predictor stage 1 can use.
+
+#### 10.0.4 Scratch
+
+| Bit source | Valid builds | Peak live scratch (words, budget 1,536) | Budget failures |
+|---|---|---|---|
+| index | 28 | 1,057 to 1,473 (1,431 to 1,447 for the 1,039 plans) | 0 |
+| path | 16 | 1,449 to 1,505 | 0 |
+
+- No build failed the scratch budget. `Stage2.evaluate` now records a budget failure as a
+  failed plan with its peak (it raised before), and the report lists such plans. Only the
+  builder's typed failure counts (`scheduler_rs.ScratchBudgetExceeded`, args message, peak_live,
+  budget, raised from `KernelBuilderError::BudgetExceeded`: the greedy pipeline's scheduler
+  and address-assignment checks and the CP-SAT pipeline's final address assignment); any other
+  error is re-raised. Per-section CP-SAT and merged-hint budget failures are still
+  `KernelBuilderError::Other` and so a plain `RuntimeError`, not a recorded plan outcome.
+  `tests/test_emission_loop.py` checks it with a real over-budget build (batch 32 under a
+  300-word budget).
+- With path bits, 7 of 16 builds sit at exactly 1,505 words, 31 below the budget, and all of
+  them run 1,099 cycles or more; the three fastest path plans peak at 1,449 to 1,473. This is
+  consistent with the greedy being held back by scratch on those plans. What sets the 1,505
+  ceiling: docs/SCRATCH_CEILING_DIAGNOSIS.md (the pressure policy, not a limit; with
+  `--greedy-budget-force stall` and a higher inflation threshold these plans run 1,049 to 1,098).
+- No plan-level proxy predicts the peak. Over the index-bit builds the best plan features
+  reach |Spearman| 0.62 (vector-op count, negative), table words +0.41, selected group-rounds
+  -0.43. Over the path-bit builds, `bits-flow` group-rounds -0.59 and `mobius` group-rounds
+  +0.54. The peak follows the schedule more than the plan: Spearman of peak against cycles is
+  -0.87 with index bits (faster schedules keep more groups live) and +0.84 with path bits (the
+  plans at the ceiling are the slow ones).
+- Does stage 1 need a scratch term? Not as a feasibility cut for these plans: none failed.
+  With path bits scratch is close to binding and coincides with slow schedules, so a scratch
+  term may matter there. No sound or predictive proxy was found, so none is added to the model.
+
+#### 10.0.5 What did not work, and what was not verified
+
+| Attempt | Result |
+|---|---|
+| No-goods on the floor | 1,067 to 1,414. Its first plan (level 4 selected in round 15) got worse with the new flags (1,210 -> 1,414) |
+| Caps on saturated engines | 1,063 at best |
+| Window rows | 1,107 to 1,131. Moving gathers into round 3 still hurts |
+| Any stage-1 mode with path bits under the learned cap `flow=0.92` | 1,099 at best, 66 above `path_flow90.json` (which `flow=0.9` returns) |
+
+Not verified: why the greedy shifts fewer ops when depth-1 rounds use `bits-flow`; whether the
+plans at 1,039 differ under CP-SAT or another
+scheduler (no stage-2 CP-SAT was run); seeds other than the ones listed; the probes cover
+round 4 only.
+
+Reproduction (one build at a time; about 3 s per build including proof and validation):
+
+```bash
+L="uv run python -m scripts.emission_structure loop"; R=artifacts/rerun
+$L run --load-tail --state $R/idx_seeds.json --modes ""
+for m in nogood caps capsu rows; do cp $R/idx_seeds.json $R/idx_$m.json; done
+$L run --load-tail --state $R/idx_nogood.json --modes nogood --budget 6 --patience 4 --seed-plan gather
+$L run --load-tail --state $R/idx_capsu.json --modes caps-underfilled --budget 7 --patience 4 --seed-plan gather
+cp $R/idx_capsu.json $R/idx_nogoodcap.json
+$L run --load-tail --state $R/idx_nogoodcap.json --modes nogood --nogood-caps flow=0.92 --budget 8 --patience 8 \
+  --seed-plan gather
+$L run --load-tail --state $R/idx_caps.json --modes caps --budget 5 --patience 3 --seed-plan gather
+$L run --load-tail --state $R/idx_rows.json --modes rows --budget 4 --patience 3 --seed-plan gather
+P="--load-tail --select-bit-source path"
+$L run $P --state $R/path_seeds.json --modes "" --seed-plan docs/emission_plans/path_flow90.json \
+  --seed-plan docs/emission_plans/flow90.json --seed-plan docs/emission_plans/floor_optimal.json
+cp $R/path_seeds.json $R/path_capsu.json
+$L run $P --state $R/path_capsu.json --modes caps-underfilled --budget 6 --patience 3 \
+  --seed-plan docs/emission_plans/path_flow90.json
+cp $R/path_capsu.json $R/path_nogoodcap.json
+$L run $P --state $R/path_nogoodcap.json --modes nogood --nogood-caps flow=0.92 --budget 6 --patience 6 \
+  --seed-plan docs/emission_plans/path_flow90.json
+# probes: path_flow90.json with access[4] = {gather 12, bits-flow 20}, {gather 11, bits 21}, {gather 13, bits 19}
+cp $R/path_seeds.json $R/path_probe.json
+$L run $P --state $R/path_probe.json --modes "" --seed-plan docs/emission_plans/path_flow90_probe_A.json \
+  --seed-plan docs/emission_plans/path_flow90_probe_B.json --seed-plan docs/emission_plans/path_flow90_probe_C.json
+$L report --state $R/idx_rows.json --extra-state $R/idx_nogood.json --extra-state $R/idx_caps.json \
+  --extra-state $R/idx_capsu.json --extra-state $R/idx_nogoodcap.json --caps flow=0.92 --near 30 \
+  --json $R/report_idx.json
+$L report --select-bit-source path --state $R/path_nogoodcap.json --extra-state $R/path_probe.json \
+  --caps flow=0.92 --near 30 --json $R/report_path.json
+```
+
+### History: the PR #69 measurement (shaped greedy without the load-tail flags; superseded)
+
+**Conclusion then (negative; superseded by section 10.0).** Feeding greedy measurements back into the structure model did not
+beat `docs/emission_plans/flow90.json` (1,104 / 1,106, development greedy measurement). The best
+loop found **ties** it: the learned-cap loop reaches 1,104 / 1,106 in 3 builds with no manual
+sweep, and five different plans with floors 994 to 997 all land at exactly 1,104 / 1,106.
+Nothing in 32 loop-state builds went below. The time-aware rows are argued in form (section
+10.3: a Z3 lemma for the engine coupling, a hand argument for the windows, a randomized check of
+the whole), but over
+the plans near the optimum no lower bound stage 1 can compute ranks them, and the rows rank them
+worse than the bare floor. So stage 1 should not be trusted to choose among plans within about
+20 cycles of each other. Its floor and the learned caps get within that distance of the best
+plan, and the last cycles depend on how the greedy schedules each plan.
+
+All numbers in this section: 16 rounds, 32 groups, `--merge-hash-stages --index-form mirrored`,
+the shaped greedy (`--greedy-barriers none --greedy-priority wavefront --greedy-split-shift
+--pressure-inflation-threshold 0.95`) for every build. They are development measurements with
+the greedy, not recorded benchmark results. Every build: counts predicted exactly, PROVED
+(dataflow replay) and PASSED (`--validate`). The flow90 kernel rebuilt here also passes
+`./scripts/check_upstream.sh --strict` (1,106 cycles). Budget: 34 sixteen-round builds at 32
+groups (2 reference builds + 32 in the loop states), one at a time, greedy only.
+
+### 10.1 The loop
+
+`scripts/emission_loop.py` (`python -m scripts.emission_structure loop run|report`). Each
+iteration: (1) stage 1 solves for a plan (`solve_plan`, about 2 s); (2) one shaped-greedy build,
+proved and validated; (3) the scheduler JSON is read: cycles, per-engine utilisation in 10
+buckets (start-up, steady state, tail), the scheduler's own floor and binding engine, the exact
+static head-body-tail bound, and per op class the work, head and tail; (4) feedback; (5) stop on
+the iteration budget, `--patience` iterations without improvement, or an infeasible stage 1.
+Builds are cached in a state file, so a plan is never built twice and modes can share seeds.
+The state records the SHA-256 of the scheduler extension that made its builds and `run` refuses a
+state from another build. Stage-1 solves take a deterministic-time budget (`--deterministic-time`,
+default 20; at 16 rounds and 32 groups each solve proves optimality in under 0.2 units, so the
+budget never binds and the plan does not depend on machine load); the trace records, per
+stage-1 call, every CP-SAT solve (main, windows floor, tie-break) with its status, wall and
+deterministic time and whether it stopped on the wall clock.
+
+The traces in `docs/emission_plans/loop_report.json` predate three of these changes; none
+changes them. They were run with the wall-clock limit only (every solve in them reports
+`optimal`, so they ended on optimality, not on the clock). Rows mode cut with `M < 1,104`, which
+never closed a run and is far above the M of every plan it picked (995, 996). And the no-goods
+of the seeds `bits-flow+depth4` and `mobius+depth4`, which select the root with bits-flow /
+mobius and so are not the arrangement stage 1 emits (it keeps the root on bits), cut their model
+points unbuilt. Those points have floors 1,077 and 1,219, above every objective any recorded
+iteration picked (at most 1,049), so the cuts never changed a pick.
+
+| Feedback | What it adds to stage 1 | Bound or heuristic |
+|---|---|---|
+| (a) `nogood` | A no-good cut per built model point (`plan_model_key`: the group counts per round and encoding, plus tail patterns with `--values-only`) and `floor < best cycles`. A point is cut only once the arrangement stage 1 emits for it (`canonical_rows`) is built; a seed built in another arrangement leaves the point open | Sound: the floor is a lower bound on every schedule. Weak: the incumbent never prunes (floors 989 to 1,000 against 1,104) |
+| (b) `caps` | Learned `max_util` per engine. From the best plan, cap an engine the plan uses at >= 90% at its use minus a step (0.04, halved when nothing is left); keep it if cycles improve. Rule `saturated`: an engine the schedule runs at >= 97% in its steady state. Rule `underfilled`: an engine the schedule fills less than the plan needs, largest shortfall first | Heuristic. It generalises `--max-util flow=0.9` |
+| (c) `rows` | Objective M >= T and, per window (t, q), M >= t + q + `window_floor`(work with head >= t and tail >= q), as linear rows over the plan variables; no-goods; `floor < best cycles` (default `--rows-cut sound`) | Row form argued (coupling proved); the per-class table it is fed is observed (section 10.3), so M is not a bound on an unbuilt plan and `M < best cycles` would be a heuristic cut. It is used only with `--rows-cut heuristic`, as `M < best + e` (e the largest overestimate seen so far), and its closing is reported as the heuristic cut closing, never as exhaustion |
+| (a) under (b)'s cap | No-good enumeration of plans in capped-floor order (`--nogood-caps flow=0.92`) | Heuristic (a capped floor is not a bound, so no incumbent cut) |
+
+The window rows need work per op class as a function of the plan. SSA ops carry
+`source_info` (round, group, phase). The hash, index update and node XOR have a round and no
+group, and are plan-independent per round ("round classes"). Tree-access ops have a group and
+are charged per group using encoding e in round r ("group classes"). The coefficients in stage 1
+are the class counts on the plan's n[r, e], with every class whose minimum head is >= t and
+minimum tail is >= q. Windows are all pairs of observed head and tail values (5,028 windows at
+32 groups; the solve still takes about 2 s). A window is kept only if plan-independent work
+lies in it, so M >= t + q holds for every plan.
+
+### 10.2 Iteration trace (PR #69, without the load-tail flags)
+
+Seeds (built once, shared by every mode):
+
+| Seed | Floor | Window rows (final table) | Cycles (sched / sim) |
+|---|---|---|---|
+| `gather` everywhere | 1,810 | 1,823 | 1,850 / 1,852 |
+| flags `bits`, level 4 on both visits | 1,124 | 1,109 | 1,171 / 1,173 |
+| flags `bits-flow`, level 4 on both visits | 1,077 | 1,063 | 1,698 / 1,700 |
+| flags `mobius`, level 4 on both visits | 1,219 | 1,203 | 1,263 / 1,265 |
+| `floor_optimal.json` | 989 | 1,021 | 1,125 / 1,127 |
+| `flow90.json` | 997 | 1,029 | **1,104 / 1,106** |
+
+(a) No-goods, floor objective. It walks through floor-989 neighbours of the floor-optimal plan
+and stops on patience:
+
+| Iter | Plan (choice rounds that differ from floor-optimal) | Floor | Cycles |
+|---|---|---|---|
+| 0 | level 4 selected in round 15 (x17), gathered in round 4 | 989 | 1,210 / 1,212 |
+| 1 | round 4: one group bits instead of bits-flow | 989 | 1,125 / 1,127 |
+| 2 | round 12: one group bits | 989 | 1,125 / 1,127 |
+| 3 | round 4: two groups bits | 989 | 1,127 / 1,129 |
+| 4 | round 1: one group bits | 989 | 1,125 / 1,127 |
+
+(b) Learned caps, rule `saturated`. It caps VALU and load, the engines the schedule runs full,
+and never flow (steady flow 79% to 90%):
+
+| Iter | Caps solved under | Plan floor / capped T | Cycles | Feedback applied |
+|---|---|---|---|---|
+| 0 | none | 989 / 989 | 1,125 / 1,127 | cap valu 0.96 |
+| 1 | valu 0.96 | 1,017 / 1,017 | 1,121 / 1,123 (best) | cap load 0.96 |
+| 2 | valu 0.96, load 0.96 | 991 / 1,022 | 1,128 / 1,130 | revert; cap valu 0.92 |
+| 3 | valu 0.92 | 1,049 / 1,049 | 1,160 / 1,162 | revert; cap load 0.98 |
+| 4 | valu 0.96, load 0.98 | 997 / 1,018 | 1,121 / 1,123 | cap valu 0.94 |
+| 5 | valu 0.94 | 1,033 / 1,033 | 1,135 / 1,137 | cap load 0.99 |
+| 6 | valu 0.96, load 0.99 | 1,005 / 1,018 | 1,120 / 1,122 (best) | cap load 0.98 |
+| 7 | valu 0.96, load 0.98 | (plan of iter 4, not rebuilt) | 1,121 / 1,123 | cap valu 0.95 |
+| 8 | valu 0.95, load 0.99 | 1,013 / 1,026 | **1,118 / 1,120** (best) | cap load 0.98 |
+| 9 | valu 0.95, load 0.98 | (plan of iter 6) | 1,120 / 1,122 | budget |
+
+(b) Learned caps, rule `underfilled`. The plan needs flow at 100% of its floor, but the
+schedule fills it at 84% to 90%, so the rule caps flow:
+
+| Iter | Caps solved under | Plan | Floor / capped T | Cycles |
+|---|---|---|---|---|
+| 0 | none | floor-optimal | 989 / 989 | 1,125 / 1,127 |
+| 1 | flow 0.96 | r1, r11 bits; r4 gather x16 + bits-flow x16 | 993 / 993 | 1,116 / 1,118 |
+| 2 | flow 0.92 | r1, r12 **mobius**; r4 gather x16 + bits-flow x16 | 994 / 996 | **1,104 / 1,106** |
+| 3 | flow 0.88 | as 2, r4 gather x17 + bits-flow x15 | 997 / 999 | 1,104 / 1,106 |
+| 4, 5 | flow 0.90, 0.91 | `flow90.json` itself (not rebuilt) | 997 / 997 | 1,104 / 1,106 |
+
+(a) under the learned cap `flow=0.92`, next plan by capped floor, no-goods:
+
+| Iter | Plan | Floor | Cycles |
+|---|---|---|---|
+| 0 | r0-1 bits; r2-3 bits-flow; r4 gather x16 + bits-flow x16; r11-12 bits; r13-14 bits-flow | 994 | 1,104 / 1,106 |
+| 1 | r1-3 bits-flow; r4 x16 / x16; r12 bits-flow, r13 bits, r14 bits-flow | 994 | 1,111 / 1,113 |
+| 2 | r1-3 bits-flow; r4 x16 / x16; r12-14 bits-flow | 993 | 1,125 / 1,127 |
+| 3 | r1 bits-flow, r2 bits, r3 bits-flow; r4 x16 / x16; r12-14 bits-flow | 994 | 1,111 / 1,113 |
+| 4 | r1-3 bits-flow; r4 x16 / x16; r12 bits, r13-14 bits-flow | 993 | 1,112 / 1,114 |
+| 5 | r0-1 bits; r2-3 bits-flow; r4 x16 / x16; r12 mobius; r13-14 bits-flow | 995 | 1,104 / 1,106 |
+
+(c) Window rows, no-goods, `M < 1,104`. Stage 1 now prefers gathering 2 or 3 groups in round 3
+and 8 in round 4: loads can then start about 10 cycles earlier, which lowers the load window
+from about 1,021 to 995. The schedules are worse:
+
+| Iter | Plan | Floor | M (rows) | Exact static bound | Cycles |
+|---|---|---|---|---|---|
+| 0 | r1-2 bits-flow; r3 gather x2 + bits-flow x30; r4 gather x8 + bits-flow x24; r12-14 bits-flow | 996 | 996 | 993 | 1,150 / 1,152 |
+| 1 | as 0 with r3 gather x3, r12 bits | 995 | 995 | 995 | 1,127 / 1,129 |
+| 2 | as 1 with r12 bits-flow | 995 | 995 | 994 | 1,150 / 1,152 |
+| 3 | as 2 with r1 bits | 995 | 995 | 995 | 1,130 / 1,132 |
+| 4 | as 2 with r1 mobius | 995 | 995 | 995 | 1,130 / 1,132 |
+
+Plans that tie `flow90.json` at 1,104 / 1,106 (all PROVED and PASSED): the `underfilled` loop's
+iterations 2 and 3, and the capped no-good iterations 0 and 5. None is checked in: none beats
+flow90.
+
+### 10.3 Which rows are bounds
+
+| Claim | Status |
+|---|---|
+| Row form: for any op set, makespan >= t + q + `window_floor`(ops with head >= t and tail >= q), with heads and tails as in `scripts/static_bounds.py` (minimum latency over encodings). Selects are charged one flow slot or one fixed VALU slot, shiftable vector ops one VALU slot or 8 ALU slots, consts and eliminable broadcasts nothing | Three parts (`verification/window_rows_proof.py`, registered in `verification/verify.py`). (1) Every slot of a window op lies in [t, M - 1 - q]: **argued by hand** (induction along edges of latency >= 1 out of every slot, for every encoding: vselect, two-op FMA select, one-op delta select, shifted lanes). (2) WR3, the engine coupling: any per-engine split of the window's ops that fits in S cycles passes `_window_fits(S)`, which is monotone in S: **proved by Z3 for all counts and spans** on the real machine and the six scaled machines, with the transcription checked against the Python function. (3) WR1, the composition: a **randomized check**, not a proof, against the reference model of `verification/static_bounds_proof.py`, which now includes the one-op delta select that bits-flow plans emit (multiply_add at x, visible at x + 1; before, it could not represent it): 2,000 random 3-7 op DAGs at VLEN 2, 815 with a delta select, no violation (150 in the proofs suite). WR1c: 400 instances drawn so that the window row is above every per-engine row (the coupling binds), no violation (40 in the suite); before, the coupling bound on 39 of 2,000 instances. WR2 (non-vacuity): adding 1 to every non-trivial window is violated on 1,763 of 2,000 |
+| `window_floor` is exact for its counts and monotone | Brute force over every resolution (`tests/test_emission_loop.py`) |
+| The class table: every plan's per-group class counts, heads and tails are >= the table's (minimum over built plans) | **Observed, and false in general.** A class's head and tail depend on the encodings of the group's other rounds. The first plan that gathers in a round after selecting in earlier rounds lowers them by 5 to 22 cycles. Over 26 loop plans, 2 contradicted the table they were checked against (9 class fields). For one of them (`rows` iteration 0) the plan's own row bound was overestimated: 995 at solve time, 993 from its own classes. Among the seeds, the floor-optimal plan was overestimated by 9 (1,020 against 1,011). The final table never puts a plan's row bound above its cycles (0 of 32) |
+| Floor (whole emission, `choice_floor`) | Bound (section 4) |
+| Capped floor | Not a bound: a heuristic objective |
+
+So (c) as built is "row form argued (coupling proved by Z3, containment by hand) and checked
+(part 3, randomized), over an observed
+table". Making the table a proved bound
+would need class heads and tails computed as a minimum over the encodings of the neighbouring
+rounds, not as a minimum over plans seen so far.
+
+### 10.4 Surrogate quality (PR #69, superseded by 10.0.3)
+
+Over every valid build (32 distinct plans across the loop states, seeds included) and over the
+26 plans the loops proposed. "Loop plans" are the regime that matters: everything there is
+within 110 cycles of the best. Every point and the full trace:
+`docs/emission_plans/loop_report.json`.
+
+Caveats, which apply to every coefficient below:
+
+- The plans are not a random sample. Each loop plan was chosen by one of these surrogates
+  (the floor, the capped floor or the rows), so the range of each surrogate is restricted
+  (floors 989 to 1,049 among loop plans, 20 of 26 within 989 to 997) and ties are heavy (the
+  26 loop plans take 12 distinct floors, 5 each at 989 and 995; 15 distinct cycle values, 4 at
+  1,104 and 4 at 1,125). Rank correlations on such data are unstable: a few plans move rho a
+  lot.
+- The learned cap `flow=0.92` was learned by the caps loop on these same builds, and it is
+  scored on them: its rho is in-sample. `flow=0.9` was set by hand before the loop, but on
+  earlier builds of the same structure, so it is not out-of-sample either.
+- "floor + window rows" uses the final row table, learned from all builds including the one
+  scored; at solve time each plan saw an earlier, partly different table.
+- None of these is evidence that a surrogate will rank plans it has not seen.
+
+| Surrogate | All builds (n = 32): Pearson / Spearman | Loop plans (n = 26): Pearson / Spearman |
+|---|---|---|
+| floor (`choice_floor`) | +0.82 / +0.30 | +0.18 / +0.03 |
+| floor + window rows (final table) | +0.80 / +0.03 | +0.00 / **-0.41** |
+| capped floor, learned `flow=0.92` | +0.82 / +0.75 | +0.32 / **+0.64** |
+| capped floor, `flow=0.9` | +0.83 / +0.73 | +0.33 / +0.56 |
+| exact static bound of the built kernel (`schedule_report`, any encoding) | +0.74 / -0.13 | -0.00 / -0.42 |
+
+Reading:
+
+- Over all builds the Pearson r of about 0.8 is carried by the extreme seeds (1,700 and 1,850
+  cycles). Among near-optimal plans the floor carries no ranking information.
+- The time-aware rows make the ranking worse. They are true lower bounds on this emission, but
+  what they see (when the first gather can issue, when the last can end) is not what limits the
+  greedy. Moving gathers earlier lowers the rows and raises the measured cycles. The exact
+  static bound of each built kernel behaves the same (-0.42), so this is a limit of
+  head-body-tail reasoning here, not of the observed table.
+- Only the capped floor ranks plans, because the cap encodes a fact about this greedy (it
+  does not fill flow beyond about 90% while loads and the VALU are full). That is a property of
+  the scheduler, not of the plan. A different scheduler would need different caps, so a
+  learned cap must be re-learned whenever stage 2 changes.
+
+### 10.5 What did not work (PR #69)
+
+| Attempt | Result |
+|---|---|
+| (a) no-goods on the floor | Enumerates floor-989 neighbours (1,125 to 1,212). The incumbent cut never fires: floors are about 110 below the cycles |
+| (b) caps on the engines the schedule saturates | 1,118 at best: capping VALU and load lowers neither |
+| (c) window rows in the objective | 1,127 to 1,150: stage 1 moves gathers into round 3, which the rows reward and the greedy does not |
+| Caps at 4 groups | At 4 groups every schedule is latency-bound (steady utilisation about 50%), so no rule finds an engine to cap. The small shape is good for testing the mechanics only |
+| The plateau at 1,104 | Five plans with floors 994 to 997 and different structures in rounds 1, 4 and 12 all schedule to exactly 1,104. The remaining gap (about 107 above the floor, section 5) is not reachable by choosing the structure with this greedy. Superseded: the cause was the greedy's load tail (PR #73); with the load-tail flags these plans run 1,039 to 1,063 (section 10.0) |
+
+Reproduction (one build at a time, about 0.3 s per greedy build plus proof and validation):
+
+```bash
+L="uv run python -m scripts.emission_structure loop"
+$L run --state artifacts/benders/seeds.json --modes ""            # the six seeds
+for m in nogood caps capsu rows; do cp artifacts/benders/seeds.json artifacts/benders/$m.json; done
+$L run --state artifacts/benders/nogood.json --modes nogood --budget 8 --patience 5 --seed-plan gather
+$L run --state artifacts/benders/caps.json --modes caps --budget 10 --patience 5 --seed-plan gather
+$L run --state artifacts/benders/capsu.json --modes caps-underfilled --budget 10 --patience 5 --seed-plan gather
+$L run --state artifacts/benders/rows.json --modes rows --budget 10 --patience 5 --seed-plan gather
+cp artifacts/benders/capsu.json artifacts/benders/nogoodcap.json
+$L run --state artifacts/benders/nogoodcap.json --modes nogood --nogood-caps flow=0.92 --budget 8 --patience 6 \
+  --seed-plan gather
+$L report --state artifacts/benders/rows.json --extra-state artifacts/benders/nogood.json \
+  --extra-state artifacts/benders/caps.json --extra-state artifacts/benders/capsu.json \
+  --extra-state artifacts/benders/nogoodcap.json --caps flow=0.92               # 10.4
+uv run --extra verify python -m verification.window_rows_proof --count 2000 --coupled 400   # WR1, WR1c, WR2, WR3
 ```

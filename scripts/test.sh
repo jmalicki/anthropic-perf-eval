@@ -2,11 +2,21 @@
 # Run the project's test suites with the environment they need.
 #
 #   ./scripts/test.sh            # everything below
-#   ./scripts/test.sh rust       # scheduler_rs unit tests (cargo, --features cpsat)
-#   ./scripts/test.sh python     # pytest: interface, dataflow replay, forced modes, proofs, inspect_schedule, CP-SAT tuning
+#   ./scripts/test.sh rust       # scheduler_rs unit tests (cargo, --features "cpsat deep-tests")
+#   ./scripts/test.sh python     # pytest: every tests/test_*.py, plus solver/test_slot_utilization.py
 #   ./scripts/test.sh proofs     # Z3: liveness theorems, rewrite identities, allocation conjectures, static makespan bounds, memory-alias rules
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
 #   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
+#   ./scripts/test.sh ci-only    # pytest -m ci_only: 16-round pin builds (CI; not part of 'all')
+#
+# Test tiers. The plain suites above run everything (local default). CI splits them:
+#   ./scripts/test.sh rust-shallow    # PR CI: rust without the deep-tests feature (slow solves #[ignore]d)
+#   ./scripts/test.sh python-shallow  # PR CI: python without tests marked @pytest.mark.deep
+#   ./scripts/test.sh python-deep     # deep CI: only tests marked @pytest.mark.deep
+# A test is deep when it runs a CP-SAT solve, except two 2-round CP-SAT smoke tests kept shallow
+# (CLAUDE.md, test tiers). Z3 proofs are milliseconds and stay shallow.
+#
+# Tests marked @pytest.mark.ci_only are deselected by every other pytest run (pyproject addopts).
 #
 # Extra arguments after the suite name are passed through, e.g.
 #   ./scripts/test.sh rust -- test_vector_group
@@ -35,18 +45,45 @@ suite="${1:-all}"
 [ $# -gt 0 ] && shift
 
 run_rust() {
+  cargo test --manifest-path scheduler_rs/Cargo.toml --features "cpsat deep-tests" "$@"
+}
+run_rust_shallow() {
   cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat "$@"
 }
+# run_python [-m MARKEXPR] [pytest args]: a leading -m replaces the default 'not ci_only'.
 run_python() {
-  if [ $# -eq 0 ]; then
-    set -- tests/test_kernel_dataflow.py tests/test_rewrite_proofs.py tests/test_allocation_conjectures.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
-      tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
-      tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
-      tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
-      tests/test_cpsat_lane_model.py tests/test_emission_options.py tests/test_emission_ablation.py tests/test_emission_plan.py tests/test_emission_structure.py tests/test_kernel_lift.py tests/test_scratch_time_overcount.py tests/test_static_bounds.py tests/test_window_optimality_probe.py tests/test_test_slot.py \
-      solver/test_slot_utilization.py
+  marks="not ci_only"
+  if [ "$1" = "-m" ]; then
+    marks="$2"
+    shift 2
   fi
-  uv run pytest -q "$@"
+  if [ $# -eq 0 ]; then
+    # Discovery, not a list: pytest collects every tests/test_*.py, so a new test file runs in
+    # CI without editing this script. tests/submission_tests.py does not match the pattern (it
+    # is not run in CI, see CLAUDE.md). The one test file outside tests/ is named here;
+    # tests/test_suite_coverage.py fails if another appears outside tests/.
+    set -- tests solver/test_slot_utilization.py
+  fi
+  rc=0
+  uv run pytest -q -m "$marks" "$@" || rc=$?
+  if [ "$rc" -eq 5 ]; then
+    echo "test.sh python: no test selected ($marks). Tests marked ci_only are deselected by this suite;" \
+      "if that is what you named, run: ./scripts/test.sh ci-only $*" >&2
+  fi
+  return "$rc"
+}
+run_ci_only() {
+  if [ $# -eq 0 ]; then
+    set -- tests
+  fi
+  rc=0
+  uv run pytest -q -m ci_only "$@" || rc=$?
+  # Exit 5 = nothing collected: no ci_only test in the selection, which is not a failure.
+  if [ "$rc" -eq 5 ]; then
+    echo "test.sh ci-only: no ci_only test in $*" >&2
+    rc=0
+  fi
+  return "$rc"
 }
 run_proofs() {
   uv run python -m verification.verify -q "$@"
@@ -74,10 +111,14 @@ fi
 
 case "$suite" in
   rust) run_rust "$@" ;;
+  rust-shallow) run_rust_shallow "$@" ;;
   python) run_python "$@" ;;
+  python-shallow) run_python -m "not ci_only and not deep" "$@" ;;
+  python-deep) run_python -m "deep and not ci_only" "$@" ;;
   proofs) run_proofs "$@" ;;
   kernel) run_kernel "$@" ;;
   upstream) run_upstream "$@" ;;
+  ci-only) run_ci_only "$@" ;;
   all) for s in rust python proofs kernel upstream; do "$(pwd)/scripts/test.sh" "$s"; done ;;
-  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | all)" >&2; exit 2 ;;
+  *) echo "unknown suite '$suite' (rust | rust-shallow | python | python-shallow | python-deep | proofs | kernel | upstream | ci-only | all)" >&2; exit 2 ;;
 esac

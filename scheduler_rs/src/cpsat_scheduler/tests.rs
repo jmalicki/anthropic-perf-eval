@@ -65,6 +65,137 @@ mod ssa_tests {
         // There is no precedence constraint requiring zero to be scheduled before AddImm.
     }
 
+    /// Seven constants: 1, 2, 100..=103 with only Load / AddImm, and 6 with Load, AddImm and
+    /// one ALU derivation `1 + operand`. Load (2) and Flow (1) materialise three constants per
+    /// cycle, so without the derivation the ops need three cycles; deriving 6 on the scalar
+    /// ALU in cycle 1 (after 1 and the operand) fits them in two. `section` solves it as a
+    /// section (segment mode, no live-in values).
+    #[cfg(feature = "cpsat")]
+    fn solve_seven_constants_with_derived_six(
+        operand: i64,
+        section: bool,
+    ) -> Result<Option<SsaCpsatResult>, String> {
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        for v in [1, 2, 100, 101, 102, 103, 6] {
+            emit.emit_const_choice(v);
+        }
+        for op in emit.ops.iter_mut() {
+            let v = op.produces_constant.unwrap();
+            let mut alts = vec![ConstEncoding::Load, ConstEncoding::AddImm { value: v }];
+            if v == 6 {
+                alts.push(ConstEncoding::Add { a_value: 1, b_value: operand });
+            }
+            op.const_alternatives = Some(alts);
+        }
+        let vreg_def = std::mem::take(&mut emit.vreg_def);
+        compute_ssa_dependencies(&mut emit.ops, &vreg_def, emit.zero_vreg, None);
+        let no_live_in: Vec<(crate::types::VReg, usize)> = Vec::new();
+        schedule_ssa_cpsat(
+            &emit.ops,
+            SsaCpsatConfig {
+                time_limit_secs: 10.0,
+                verbose: false,
+                enable_valu_shift: false,
+                scratch_budget: 1536,
+                ..Default::default()
+            },
+            SsaCpsatHints {
+                initial_live: section.then_some(&no_live_in[..]),
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    /// Cycles the ops occupy and the number of ALU-derived constants.
+    #[cfg(feature = "cpsat")]
+    fn cycles_and_alu_derived(r: &SsaCpsatResult) -> (i32, usize) {
+        let derived = r
+            .const_choice_encoding
+            .values()
+            .filter(|e| matches!(e, crate::types::ConstChoiceEncoding::AluDerive(_)))
+            .count();
+        (r.cycle_assignments.iter().max().unwrap() + 1, derived)
+    }
+
+    /// A derivation whose operands are produced is chosen: it saves a cycle.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_alu_derivation_with_live_operands_is_chosen() {
+        for section in [false, true] {
+            let r = solve_seven_constants_with_derived_six(2, section).unwrap().unwrap();
+            assert_eq!(cycles_and_alu_derived(&r), (2, 1), "section={}", section);
+        }
+    }
+
+    /// BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it removed": an
+    /// alternative reading a value no op produces used to take the constant itself as the
+    /// operand's producer (`unwrap_or(&idx)`), i.e. `cycle >= cycle + 1` under its literal, so
+    /// the solver could never choose it (the ops then took three cycles, not two). It is now
+    /// an error in a whole-kernel model; in a section solve (operand produced in an earlier
+    /// section) the alternative is switched off explicitly.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_alternative_without_producer() {
+        let err = solve_seven_constants_with_derived_six(5, false).unwrap_err();
+        assert!(err.contains("reads a value no op produces"), "{}", err);
+        let r = solve_seven_constants_with_derived_six(5, true).unwrap().unwrap();
+        assert_eq!(cycles_and_alu_derived(&r), (3, 0));
+    }
+
+    /// The hardware zero as an ALU operand: with a reserved zero VReg the emitter lists
+    /// `-5 = 0 - 5` (`Sub { a_value: 0, b_value: 5 }`), and no op produces 0. Dead code
+    /// elimination keeps that alternative (it is not stale), and the whole-kernel model
+    /// switches it off instead of refusing it as an alternative without a producer (the
+    /// derivation names its operands by producer op id; the zero has none). Without a reserved
+    /// zero VReg the drop treats 0 like any other missing value.
+    #[cfg(feature = "cpsat")]
+    #[test]
+    fn test_const_choice_zero_operand_is_kept_and_switched_off() {
+        use crate::kernel_builder::emit_ssa::{drop_alternatives_without_producer, eliminate_ssa_dead_code};
+        use crate::types::ConstEncoding;
+        let mut emit = SsaEmitContext::new();
+        emit.reserve_zero_vreg();
+        let addr = emit.emit_const_choice(5);
+        let neg = emit.emit_const_choice(-5);
+        emit.emit_store(addr, neg); // root: both constants live
+        let sub = ConstEncoding::Sub { a_value: 0, b_value: 5 };
+        let alts_of_neg = |ops: &[SsaOp]| {
+            ops.iter().find(|op| op.produces_constant == Some(-5)).unwrap().const_alternatives.clone().unwrap()
+        };
+        assert!(alts_of_neg(&emit.ops).contains(&sub), "{:?}", alts_of_neg(&emit.ops));
+
+        let mut without_zero = emit.ops.clone();
+        assert_eq!(drop_alternatives_without_producer(&mut without_zero, false), 1);
+        assert!(!alts_of_neg(&without_zero).contains(&sub));
+
+        let mut vreg_def = std::mem::take(&mut emit.vreg_def);
+        let mut const_alternatives = emit.take_const_alternatives();
+        let zero = emit.zero_vreg;
+        let (mut ops, new_vreg_def, _) =
+            eliminate_ssa_dead_code(emit.take_ops(), &mut vreg_def, &mut const_alternatives, zero, None);
+        assert!(alts_of_neg(&ops).contains(&sub), "DCE keeps the zero-operand alternative");
+        compute_ssa_dependencies(&mut ops, &new_vreg_def, zero, None);
+        let config = SsaCpsatConfig {
+            time_limit_secs: 10.0,
+            verbose: false,
+            enable_valu_shift: false,
+            scratch_budget: 1536,
+            ..Default::default()
+        };
+        // Without a reserved zero the same alternative reads a value nothing produces.
+        let err = schedule_ssa_cpsat(&ops, config.clone(), SsaCpsatHints::default(), None).unwrap_err();
+        assert!(err.contains("reads a value no op produces"), "{}", err);
+        let r = schedule_ssa_cpsat(&ops, config, SsaCpsatHints { zero_reserved: true, ..Default::default() }, None)
+            .expect("a reserved zero operand is not a missing producer")
+            .expect("feasible");
+        assert!(!r
+            .const_choice_encoding
+            .values()
+            .any(|e| matches!(e, crate::types::ConstChoiceEncoding::AluDerive(_))));
+    }
+
     /// Sanity check: ForceAddImm must be feasible. If this fails, AddImm constraints are wrong.
     #[cfg(feature = "cpsat")]
     #[test]
@@ -3297,6 +3428,7 @@ mod resource_tightening_tests {
     /// same with and without tightening (two vector slots, as in the other toy-kernel tests,
     /// so that every solve is proved well inside the time limit).
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_energetic_tightening_keeps_the_optimum_of_the_toy_kernel() {
         let ops = super::tuning_objective_tests::toy_ops();
         for symmetry_rows in [SymmetryRows::Declared, SymmetryRows::None] {
@@ -7189,6 +7321,7 @@ mod redundant_row_group_tests {
     /// must not change the proved optimum (selects here use the Flow slot or two vector slots).
     #[cfg(feature = "cpsat")]
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_dropping_redundant_rows_keeps_the_optimal_makespan() {
         use super::tuning_objective_tests::toy_ops;
 
@@ -7385,6 +7518,7 @@ mod tuning_lane_model_tests {
     /// Sorting and pinning are dominance restrictions: the proved optimum must not change,
     /// under either objective.
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_every_lane_model_reaches_the_same_optimal_makespan() {
         let ops = toy_ops();
         for objective in [CpsatObjective::MakespanTiebreak, CpsatObjective::Makespan] {
@@ -7401,6 +7535,7 @@ mod tuning_lane_model_tests {
     /// With every op shifted (13 ops x 8 lanes on 12 scalar slots) lanes must straddle
     /// cycles; the sorted models return them in order.
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_sorted_lane_models_return_ordered_lanes() {
         let ops = toy_ops();
         for lane_model in ALL {

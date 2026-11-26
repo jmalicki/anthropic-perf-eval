@@ -285,6 +285,12 @@ impl LivenessUse for OpLiveness<'_> {
                     out.push((sub_temp, read_at));
                 }
             }
+            // Liveness-only dependencies hold through the op's own cycle, as on every path.
+            if let Some(ref keep) = op.keep_live {
+                for &v in keep {
+                    out.push((v, op.cycle));
+                }
+            }
             return out;
         }
         // Default: each src VReg read at op.cycle
@@ -514,19 +520,17 @@ pub fn compute_live_intervals(
     // pack chains of ALU ops that consume lanes at different times. See emit_ssa.rs
     // decompose_vector doc comment and docs/UNIFY_SCRATCH_LIVENESS_PLAN.md.
     // Latest cycle at which each VReg is read (operand or `keep_live`), computed once so
-    // the group loop below is a lookup per group and lane, not a scan of every op.
+    // the group loop below is a lookup per group and lane, not a scan of every op. The read
+    // cycles are `use_cycles`' (a multiply_add select reads at cycle + 1), the same ones the
+    // second pass and the A4 check use.
     let mut max_read_cycle: HashMap<VReg, i32> = HashMap::new();
     for op in ops {
-        let reads = op
-            .srcs
-            .iter()
-            .filter_map(|s| s.as_vreg())
-            .chain(op.keep_live.iter().flatten().copied());
-        for vreg in reads {
+        let op_liv = OpLiveness { op, ctx: &ctx };
+        for (vreg, read_cycle) in op_liv.use_cycles(op, &ctx) {
             max_read_cycle
                 .entry(vreg)
-                .and_modify(|c| *c = (*c).max(op.cycle))
-                .or_insert(op.cycle);
+                .and_modify(|c| *c = (*c).max(read_cycle))
+                .or_insert(read_cycle);
         }
     }
     for (group_vreg, lane_vregs) in &config.vector_group_lanes {
@@ -1681,7 +1685,9 @@ pub fn compute_liveness_curve(
         events.push((interval.start, vreg, true)); // becoming live
         events.push((interval.end, vreg, false)); // dying (at end cycle)
     }
-    events.sort_by_key(|(cycle, _, is_start)| (*cycle, !*is_start)); // ends before starts at same cycle
+    // Ends before starts at the same cycle; then by VReg, so `becoming_live` / `dying` do not
+    // follow the hash order of `intervals`.
+    events.sort_by_key(|(cycle, vreg, is_start)| (*cycle, !*is_start, vreg.id, vreg.size()));
 
     // Track currently live VRegs
     let mut live_set: HashSet<VReg> = HashSet::new();
@@ -3165,6 +3171,49 @@ mod tests {
         let result = assign_addresses(&ops, &config).unwrap();
         assert_eq!(result.vreg_to_addr[&lanes[3]], 503);
         assert_eq!(result.words_used, 0, "only the fixed group and its lanes are placed");
+    }
+
+    /// Review of #76 (CodeRabbit, second pass): a write group whose last use is a select in the
+    /// multiply_add form, which reads its sources at cycle + 1 (`use_cycles`). The group's
+    /// interval must reach that read; before, the group pass took the select's raw cycle, the
+    /// interval ended at `c` and the A4 check panicked on the `c + 1` read.
+    #[test]
+    fn test_write_group_read_by_multiply_add_select_reaches_cycle_plus_one() {
+        let group = VReg::vector(100);
+        let lanes: Vec<VReg> = (0..VLEN as u32).map(|i| VReg::scalar(i + 1)).collect();
+        let (cond, other, out) = (VReg::vector(200), VReg::vector(300), VReg::vector(400));
+        let mut ops: Vec<SsaOp> = lanes
+            .iter()
+            .enumerate()
+            .map(|(i, &lane)| {
+                let mut op =
+                    SsaOp::new(i, Engine::Load, Opcode::Const, Some(lane), vec![Operand::Imm(i as i64)]);
+                op.cycle = 0;
+                op
+            })
+            .collect();
+        for (k, v) in [cond, other].into_iter().enumerate() {
+            let mut op = SsaOp::new(10 + k, Engine::Valu, Opcode::Vbroadcast, Some(v), vec![Operand::VReg(lanes[0])]);
+            op.cycle = 1;
+            ops.push(op);
+        }
+        let mut select = SsaOp::new(
+            20,
+            Engine::Valu,
+            Opcode::SelectChoice,
+            Some(out),
+            vec![Operand::VReg(cond), Operand::VReg(group), Operand::VReg(other)],
+        );
+        select.cycle = 4;
+        ops.push(select);
+        let mut store = SsaOp::new(21, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(64), Operand::VReg(out)]);
+        store.cycle = 6;
+        ops.push(store);
+        let mut config = AddressAssignConfig::default();
+        config.vector_group_lanes.insert(group, lanes.clone());
+        config.select_fma_ops.insert(20);
+        let intervals = compute_live_intervals(&config, &ops).unwrap();
+        assert_eq!(intervals[&group].end, 5, "the group is read by the multiply_add at cycle 4 + 1");
     }
 
     /// Overlapping fixed ranges (a fixed group and its fixed lanes) are subtracted once.
