@@ -80,8 +80,9 @@ struct Parity {
     /// Ops that differ only by the emitter's leaked `HashState` label (after DCE).
     leaked: usize,
     /// Constants whose ALU-derived alternatives differ after DCE before recomputing them:
-    /// `(value, rewritten, emitted)`. The emitted program keeps alternatives that name a
-    /// constant DCE removed (stale, BUGS.md); the rewrite recomputes them (C13).
+    /// `(value, rewritten, emitted)`. The rewrite recomputes them for the live constants
+    /// (C13); DCE only drops the ones that name a constant it removed (#79), so the emitted
+    /// program can list fewer.
     stale_alternatives: Vec<(i64, String, String)>,
     /// Summaries of each transform.
     summaries: Vec<String>,
