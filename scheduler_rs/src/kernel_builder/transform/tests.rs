@@ -315,17 +315,24 @@ fn shape(rounds: usize, forest_height: usize, batch_size: usize) -> ProblemSpec 
 fn test_derived_table_predicts_emitted_counts_at_other_shapes() {
     // Rounds 15 (the final index is at depth 4 and reads L_4), height 8 (wrap after level 8,
     // so levels 1 to 4 are visited twice in 15 rounds), 26 rounds (three visits of some levels).
+    // Every shape is expected to derive without problems; a shape that reports one is a
+    // regression here, not a reason to skip it silently.
+    let mut compared = 0;
     for spec in [shape(15, 10, 32), shape(15, 8, 32), shape(26, 10, 32), shape(9, 6, 16)] {
         let table = derive_tree_access_costs(&spec).unwrap();
-        if !table.problems.is_empty() {
-            // Reported, not fitted: the prediction must then not be trusted, so nothing to compare.
-            eprintln!("rounds {} height {}: {:?}", spec.rounds, spec.forest_height, table.problems);
-            continue;
-        }
+        assert!(
+            table.problems.is_empty(),
+            "rounds {} height {}: expected an exact table, got problems {:?}",
+            spec.rounds,
+            spec.forest_height,
+            table.problems
+        );
         for (i, plan) in test_plans(&spec, 6).iter().enumerate() {
             assert_eq!(table.predict(plan), emitted_counts(&spec, plan), "rounds {} height {} plan {}", spec.rounds, spec.forest_height, i);
         }
+        compared += 1;
     }
+    assert_eq!(compared, 4);
 }
 
 #[test]
@@ -364,4 +371,36 @@ fn test_plan_dependent_const_category_is_reported() {
     let problems = plan_dependent_const_categories(&ops, &live, &users, true, &Shape::new(&spec));
     assert_eq!(problems.len(), 1, "{:?}", problems);
     assert!(problems[0].starts_with("constant 14"), "{:?}", problems);
+}
+
+#[test]
+fn test_mirrored_gather_base_must_be_a_level_end() {
+    // The mirrored gather base is forest_p + L_d. A constant that is no level end is rejected
+    // (the depth search used to run to d = 62 and overflow); 6 = L_2 still reads as depth 2,
+    // which the tag (depth 3) then contradicts.
+    let spec = context(32, SelectBitSource::Index);
+    let base_const = |p: &crate::kernel_builder::SsaProgram| -> usize {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        let prop = rule().propose(&g).into_iter().find(|p| p.round == Some(3) && p.group == Some(0)).unwrap();
+        let sub = *prop.ops.iter().find(|&&i| p.ops[i].opcode == crate::types::Opcode::Sub).unwrap();
+        let bcast = g.def_op(p.ops[sub].srcs[0].as_vreg().unwrap()).unwrap();
+        let add = g.def_op(bcast.srcs[0].as_vreg().unwrap()).unwrap();
+        g.def_index(add.srcs[1].as_vreg().unwrap()).unwrap()
+    };
+    let check = |value: i64| -> Result<(), String> {
+        let mut p = canonical_program(&spec);
+        let k = base_const(&p);
+        assert_eq!(p.ops[k].produces_constant, Some(14), "depth 3's level end");
+        p.ops[k].srcs[0] = crate::types::Operand::Imm(value);
+        p.ops[k].produces_constant = Some(value);
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        let prop = rule().propose(&g).into_iter().find(|p| p.round == Some(3) && p.group == Some(0)).unwrap();
+        rule().match_site(&g, &prop).map(|_| ()).map_err(|e| e.0)
+    };
+    let err = check(5).unwrap_err();
+    assert!(err.contains("not a level-end index"), "{}", err);
+    let err = check((1i64 << 40) + 7).unwrap_err();
+    assert!(err.contains("not a level-end index"), "{}", err);
+    let err = check(6).unwrap_err();
+    assert!(err.contains("the address base is level 2"), "{}", err);
 }
