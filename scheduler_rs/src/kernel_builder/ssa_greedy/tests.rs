@@ -5687,6 +5687,70 @@ fn schedule_with_const_policy(
     diagnostics.const_alu_derive
 }
 
+/// Review of #86: a rerun with fixed encodings (hint passes, --schedule-with-fixed-choices)
+/// schedules a fixed `AluDerive` as the ALU op it lowers to, after its producers, or, where
+/// that is not sound, as a load that `reconcile_const_choice_encodings` records as `Load`.
+/// Before, it always scheduled it as a load while lowering still emitted the ALU op.
+#[test]
+fn test_fixed_alu_derive_is_scheduled_as_derived_or_recorded_as_load() {
+    let mut first = emit_derivable_consts();
+    let derived = schedule_with_const_policy(&mut first, ConstPolicy::AluFirst);
+    assert!(!derived.is_empty());
+    let mut emit = emit_derivable_consts();
+    let id_of = |value: i64| emit.ops.iter().find(|o| o.produces_constant == Some(value)).unwrap().id;
+    let mut fixed: HashMap<usize, ConstChoiceEncoding> = emit
+        .ops
+        .iter()
+        .filter(|o| o.opcode == Opcode::ConstChoice)
+        .map(|o| (o.id, derived.get(&o.id).map_or(ConstChoiceEncoding::Load, |i| ConstChoiceEncoding::AluDerive(i.clone()))))
+        .collect();
+    // 8 = 24 - 16: its producers cannot be scheduled before it (all constants are ready at
+    // cycle 0 and 8 comes first), so this derivation cannot be honoured.
+    let unsound = (id_of(8), crate::types::AluDeriveInfo { left_op_id: id_of(24), right_op_id: id_of(16), opcode: Opcode::Sub });
+    assert!(!derived.contains_key(&unsound.0));
+    fixed.insert(unsound.0, ConstChoiceEncoding::AluDerive(unsound.1));
+
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let (_, agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        1536,
+        None,
+        None,
+        None,
+        Some(&mut HashSet::new()),
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some(&fixed),
+        None,
+        None,
+        &mut diagnostics,
+        &GreedyShape::default(),
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the constants");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    // Every honoured derivation runs on the ALU after both producers.
+    let cycle_of = |id: usize| emit.ops.iter().find(|o| o.id == id).unwrap().cycle;
+    for (id, info) in &diagnostics.const_alu_derive {
+        assert!(cycle_of(*id) > cycle_of(info.left_op_id) && cycle_of(*id) > cycle_of(info.right_op_id));
+    }
+    assert!(!diagnostics.const_alu_derive.contains_key(&unsound.0), "8 cannot be derived before 24 and 16");
+    assert!(!diagnostics.const_alu_derive.is_empty(), "the first run's derivations are kept");
+    let demoted = reconcile_const_choice_encodings(&mut fixed, &diagnostics.const_alu_derive);
+    assert!(demoted >= 1);
+    assert_eq!(fixed[&unsound.0], ConstChoiceEncoding::Load);
+    for id in diagnostics.const_alu_derive.keys() {
+        assert!(matches!(fixed[id], ConstChoiceEncoding::AluDerive(_)));
+    }
+}
+
 /// `alu-first` derives constants on the scalar ALU from two constants that are visible (an
 /// earlier cycle) and still live at the derive's cycle, and the operands add up to the value.
 /// The default policy never derives (control).

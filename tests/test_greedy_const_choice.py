@@ -71,3 +71,30 @@ def test_justify_does_not_run_with_alu_derived_constants():
         "control: alu-first derives a constant on the scalar ALU"
     cycles = lambda s: [(op["cycle"], op["engine"], op["slot"]) for op in s["ops"]]  # noqa: E731
     assert cycles(justified) == cycles(plain)
+
+
+@pytest.mark.parametrize("policy", ["alu-first", "alu-when-load-full"])
+@pytest.mark.parametrize("owner", ["enable_schedule_with_fixed_choices", "enable_select_choice_hint_pass",
+                                   "enable_valu_shift_hint_pass"])
+def test_const_policy_with_a_fixed_choices_rerun(policy, owner):
+    """Review of #86: a hint pass or --schedule-with-fixed-choices reruns the greedy with the
+    first run's encodings fixed. A derived constant must then be scheduled as an ALU op after
+    its producers (or recorded as the load the rerun made it): before, the rerun placed it as a
+    load while lowering still emitted the ALU derivation, at a cycle nothing ordered after its
+    producers and outside the slot count (13 scalar ops in a cycle at 4 rounds, batch 32)."""
+    rounds, batch = 4, 32
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sched.json")
+        instrs, stats = build_kernel_with_args(rounds=rounds, batch_size=batch, use_greedy=True, verbose=False,
+                                               output_json=path, greedy_const_policy=policy, **{owner: True})
+        with open(path) as f:
+            sched = json.load(f)
+    instrs = json.loads(json.dumps(list(instrs)))
+    assert any(op.get("from_const_choice") is not None and op["engine"] == "alu" for op in sched["ops"]), \
+        "control: derivations are kept (honoured by the rerun), not all turned into loads"
+    limits = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
+    for c, bundle in enumerate(instrs):
+        for engine, slots in bundle.items():
+            assert len(slots) <= limits.get(engine, 99), f"cycle {c}: {len(slots)} {engine} slots"
+    assert check({"instrs": instrs}, sched).ok, "dataflow replay: kernel differs from its SSA program"
+    assert validate_kernel(instrs, HEIGHT, batch, rounds, 123)
