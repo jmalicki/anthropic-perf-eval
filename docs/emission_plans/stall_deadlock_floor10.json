@@ -1,0 +1,46 @@
+{
+ "format": "emission-plan/1",
+ "rounds": 16,
+ "groups": 32,
+ "forest_height": 10,
+ "access": [
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  {
+   "gather": 25,
+   "mobius": 7
+  },
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "bits",
+  "bits",
+  {
+   "bits": 19,
+   "bits-flow": 13
+  },
+  {
+   "gather": 6,
+   "bits-flow": 26
+  },
+  {
+   "gather": 6,
+   "bits-flow": 26
+  }
+ ],
+ "context": {
+  "rounds": 16,
+  "batch_size": 256,
+  "forest_height": 10,
+  "merge_hash_stages": true,
+  "index_form": "mirrored",
+  "select_bit_source": "path",
+  "values_only": false
+ },
+ "comment": "topk-floor10 (stall deadlock)"
+}

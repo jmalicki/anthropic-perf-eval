@@ -33,6 +33,40 @@ pub const MAX_TREE_REDUCE_DEPTH: u32 = 4;
 /// (`R7-index-range-by-depth`). `Mirrored` tracks `n = L_d - idx` with
 /// `L_d = 2^(d+1) - 2` (`level_last_index`): the node's position in its level counted from
 /// the right. Proofs: `R9` to `R11` in `verification/rewrites.py`.
+/// Rounds whose round XOR is pushed below the top select of a cached-level select tree:
+/// `val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo)` (`R18-select-xor-pushdown`).
+/// The two XORs run in parallel with the branch bit's AND, so the chain from one round's
+/// hash to the next is one cycle shorter; one more vector op per group and round. Only where
+/// the top of the tree is a SelectChoice (`bits-flow`; `bits` from depth 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectXorPushdown {
+    /// Never (default).
+    #[default]
+    None,
+    /// Rounds before the first wrap (the start-up: on the chain to the first gather).
+    FirstPass,
+    /// Every cached-level select round.
+    All,
+}
+
+/// Which consumers of the mirrored index `n' = 2n + bit` use the early form
+/// `V - n' = madd(n, -2, V) - bit` (`R17-index-early-terms`): the multiply_add depends only on
+/// the previous index, so after the newest branch bit only the subtraction remains on the
+/// dependency chain (one cycle shorter). Mirrored index form only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexEarlyTerms {
+    /// Never (default).
+    #[default]
+    None,
+    /// The final index store `L_d - n'`: same op count (`n'` is then dead), one cycle off
+    /// the tail.
+    Final,
+    /// The final index store, and the gather address `(forest_p + L_d) - n'` of a group's
+    /// first gather after rounds without one: one more vector op per such gather (`n'` is
+    /// still needed), one cycle off the chain to it.
+    FirstGather,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexForm {
     /// The reference index. Update per round: AND, SUB, multiply_add (3 vector ops).
@@ -315,6 +349,14 @@ pub struct ProblemSpec {
     /// `depth4_select_after_wrap_only` for the choice of tree access (`access_encoding`);
     /// check it with `check_access_plan`. Default `None`: the emission is unchanged.
     pub access_plan: Option<Vec<Vec<AccessEncoding>>>,
+    /// Gather rounds: XOR the deferred hash constant into the value instead of into the
+    /// loaded node, `val ^ (node ^ K) = (val ^ K) ^ node` (`R16-gather-xor-reassociation`),
+    /// so one XOR instead of two follows the load. Same op count. Default false.
+    pub reassociate_gather_xor: bool,
+    /// See [`IndexEarlyTerms`]. Default `None`.
+    pub index_early_terms: IndexEarlyTerms,
+    /// See [`SelectXorPushdown`]. Default `None`.
+    pub select_xor_pushdown: SelectXorPushdown,
 }
 
 impl Default for ProblemSpec {
@@ -343,6 +385,9 @@ impl Default for ProblemSpec {
             select_bit_source: SelectBitSource::Index,
             depth4_select_after_wrap_only: false,
             access_plan: None,
+            reassociate_gather_xor: false,
+            index_early_terms: IndexEarlyTerms::None,
+            select_xor_pushdown: SelectXorPushdown::None,
         }
     }
 }
@@ -432,6 +477,106 @@ impl ProblemSpec {
             self.round_depth(r) == tree_depth
                 && (0..self.n_groups()).any(|g| self.access_encoding(r, tree_depth, g) == encoding)
         })
+    }
+
+    /// True if round `rnd` is in the first pass down the tree: rounds 0 to `forest_height`,
+    /// i.e. up to and including the first wrap round. Relies on round 0 being at depth 0
+    /// (`round_depth`), which `check_critical_path_options` asserts.
+    pub fn is_first_pass_round(&self, rnd: usize) -> bool {
+        rnd <= self.forest_height
+    }
+
+    /// True if `R18-select-xor-pushdown` applies to a group fetching its node with `mode` in
+    /// round `rnd` at `tree_depth`: the option covers the round (`FirstPass`: first pass only)
+    /// and the top of the group's select tree is a SelectChoice (`BitsFlow` from depth 1,
+    /// `Bits` from depth 2). The emitter and `check_critical_path_options` both use this.
+    pub fn select_xor_pushdown_applies(&self, rnd: Option<usize>, tree_depth: usize, mode: CachedSelect) -> bool {
+        let round_ok = match self.select_xor_pushdown {
+            SelectXorPushdown::None => false,
+            SelectXorPushdown::FirstPass => rnd.map_or(false, |r| self.is_first_pass_round(r)),
+            SelectXorPushdown::All => true,
+        };
+        round_ok
+            && tree_depth >= 1
+            && (mode == CachedSelect::BitsFlow || (mode == CachedSelect::Bits && tree_depth >= 2))
+    }
+
+    /// Reject critical-path rewrite options (docs/CRITICAL_PATH.md) that would be silent
+    /// no-ops for this problem, so a direct Rust caller gets the same errors as the CLI.
+    ///
+    /// # Returns
+    /// `Err` naming the option when `index_early_terms` is set without the mirrored index;
+    /// when `select_xor_pushdown` is set but no group in any round it covers has a
+    /// SelectChoice at the top of its select tree (e.g. `standard` or `mobius` cached select,
+    /// or `bits` only at depth 1); when `reassociate_gather_xor` is set but no group ever
+    /// gathers.
+    pub fn check_critical_path_options(&self) -> Result<(), String> {
+        // `is_first_pass_round` counts the first pass from round 0 at depth 0.
+        assert_eq!(self.round_depth(0), 0, "round 0 must visit depth 0 (the root)");
+        if self.index_early_terms != IndexEarlyTerms::None && self.index_form != IndexForm::Mirrored {
+            return Err("index_early_terms (--index-early-terms) needs index_form = Mirrored \
+                        (--index-form mirrored); otherwise it is ignored"
+                .to_string());
+        }
+        // The early form needs an index update `n' = madd(n, 2, bit)` of a known index: the
+        // round before is at depth >= 1 and is not the wrap round (which resets the index).
+        let madd_update = |rnd: usize| {
+            let d = self.round_depth(rnd);
+            d >= 1 && d != self.forest_height
+        };
+        // `final`: the final index store after such an update (none with values_only, which
+        // drops the index store). `first-gather`: also a group's first gather after a round in
+        // which it did not gather, when that round's update is such an update.
+        let final_applies = !self.values_only && self.rounds > 0 && madd_update(self.rounds - 1);
+        let first_gather_applies = (1..self.rounds).any(|r| {
+            let (d, dp) = (self.round_depth(r), self.round_depth(r - 1));
+            madd_update(r - 1)
+                && (0..self.n_groups()).any(|g| {
+                    self.access_encoding(r, d, g) == AccessEncoding::Gather
+                        && self.access_encoding(r - 1, dp, g) != AccessEncoding::Gather
+                })
+        });
+        let early_applies = match self.index_early_terms {
+            IndexEarlyTerms::None => true,
+            IndexEarlyTerms::Final => final_applies,
+            IndexEarlyTerms::FirstGather => final_applies || first_gather_applies,
+        };
+        if !early_applies {
+            return Err(format!(
+                "index_early_terms = {:?} (--index-early-terms) applies to no op of this kernel: the final index \
+                 store needs a last round at depth >= 1 that is not the wrap round, and no --values-only{}; \
+                 otherwise it is ignored",
+                self.index_early_terms,
+                if self.index_early_terms == IndexEarlyTerms::FirstGather {
+                    ", and no group gathers right after such a round without gathering in it"
+                } else {
+                    ""
+                }
+            ));
+        }
+        let any = |pred: &dyn Fn(usize, usize, AccessEncoding) -> bool| {
+            (0..self.rounds).any(|r| {
+                let d = self.round_depth(r);
+                (0..self.n_groups()).any(|g| pred(r, d, self.access_encoding(r, d, g)))
+            })
+        };
+        if self.select_xor_pushdown != SelectXorPushdown::None
+            && !any(&|r, d, e| e.cached_select().map_or(false, |m| self.select_xor_pushdown_applies(Some(r), d, m)))
+        {
+            return Err(format!(
+                "select_xor_pushdown = {:?} (--select-xor-pushdown) applies to no round of this kernel: it needs a \
+                 select tree whose top is a SelectChoice (bits-flow from depth 1, bits from depth 2){}; otherwise \
+                 it is ignored",
+                self.select_xor_pushdown,
+                if self.select_xor_pushdown == SelectXorPushdown::FirstPass { " in the first pass" } else { "" }
+            ));
+        }
+        if self.reassociate_gather_xor && !any(&|_, _, e| e == AccessEncoding::Gather) {
+            return Err("reassociate_gather_xor (--reassociate-gather-xor) applies to gather rounds and this kernel \
+                        has none; otherwise it is ignored"
+                .to_string());
+        }
+        Ok(())
     }
 
     /// Check `access_plan` against the problem shape: one row per round, one entry per group,
@@ -747,6 +892,21 @@ pub struct CompilerConfig {
     pub greedy_shift_target: Option<usize>,
     /// Wavefront: which ready loads get the load slots (default: `Key`, the wavefront key).
     pub greedy_load_priority: super::ssa_greedy::LoadPriority,
+    /// Wavefront: which ready flow ops get the flow slot (default: `Key`).
+    pub greedy_flow_priority: super::ssa_greedy::FlowPriority,
+    /// Where a SelectChoice with a one-op multiply_add form may run (default: `Never`, flow).
+    pub greedy_select_overflow: super::ssa_greedy::SelectOverflow,
+    /// Scratch model `words`: when a budget-deferred op is forced (default: `SameCycle`).
+    pub greedy_budget_force: super::ssa_greedy::BudgetForce,
+    /// Wavefront: native scalar ops before vector ops on the scalar ALU (default: `Key`).
+    pub greedy_alu_priority: super::ssa_greedy::AluPriority,
+    /// Where the greedy materialises ConstChoices (default: `Default`); greedy-only.
+    pub greedy_const_policy: super::ssa_greedy::ConstPolicy,
+    /// Wavefront: a different stagger for the first groups (default: none).
+    pub greedy_early_stagger: Option<super::ssa_greedy::EarlyStagger>,
+    /// Encodings forced by `--const-choice`, `--select-choice`, `--valu-shift` in a greedy-only
+    /// build (with CP-SAT they come from the CP-SAT config). Default: none forced.
+    pub greedy_forced: GreedyForcedChoices,
     /// Rewrite rules applied to the finished SSA program before dependency computation
     /// (`TransformPass`), in this order (default: none, the program is scheduled as emitted).
     /// Unlike the other fields these change the ops; they are compiler passes, not emission
@@ -820,6 +980,18 @@ impl TransformKind {
     }
 }
 
+
+/// Forced encodings for a greedy-only build. `None` = the greedy decides.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GreedyForcedChoices {
+    /// Every ConstChoice as this encoding (`Load` or `AddImm`).
+    pub const_choice: Option<crate::types::ConstChoiceEncoding>,
+    /// Every SelectChoice as this encoding.
+    pub select_choice: Option<crate::types::SelectChoiceEncoding>,
+    /// `Some(true)`: every shiftable vector op on the scalar ALU; `Some(false)`: none.
+    pub valu_shift: Option<bool>,
+}
+
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
 /// no schedule of the benchmark kernel comes near it, small enough for the simulator to allocate.
 pub const UNBOUNDED_SCRATCH_WORDS: usize = 1 << 20;
@@ -846,6 +1018,13 @@ impl Default for CompilerConfig {
             greedy_shift_policy: GreedyShiftPolicyKind::default(),
             greedy_shift_target: None,
             greedy_load_priority: super::ssa_greedy::LoadPriority::Key,
+            greedy_flow_priority: super::ssa_greedy::FlowPriority::Key,
+            greedy_select_overflow: super::ssa_greedy::SelectOverflow::Never,
+            greedy_budget_force: super::ssa_greedy::BudgetForce::SameCycle,
+            greedy_alu_priority: super::ssa_greedy::AluPriority::Key,
+            greedy_const_policy: super::ssa_greedy::ConstPolicy::Default,
+            greedy_early_stagger: None,
+            greedy_forced: GreedyForcedChoices::default(),
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -949,7 +1128,15 @@ impl CompilerConfig {
             split_shift: self.greedy_split_shift,
             scratch_pools: self.scratch_model.is_pools(),
             pool_caps: None,
+            // Set by the scheduling passes from the pipeline configuration.
+            forced_shift_ops: Default::default(),
             load_priority: self.greedy_load_priority,
+            flow_priority: self.greedy_flow_priority,
+            select_overflow: self.greedy_select_overflow,
+            budget_force: self.greedy_budget_force,
+            alu_priority: self.greedy_alu_priority,
+            const_policy: self.greedy_const_policy,
+            early_stagger: self.greedy_early_stagger,
             shift_policy: {
                 use super::ssa_greedy::ShiftPolicy;
                 let target = self.greedy_shift_target;
@@ -1114,8 +1301,178 @@ pub fn merged_hash_stage_constants(first: usize) -> Option<(i64, i64, i64, i64)>
     Some((mult & MASK, (c + d) & MASK, (mult << k) & MASK, (c << k) & MASK))
 }
 
+/// Reject greedy shape options that would be silently ignored (review of #76).
+///
+/// * `greedy_select_overflow_limit` only means something with `greedy_select_overflow = "valu"`.
+/// * `greedy_flow_priority = "feeds-load-first"` is a wavefront ordering; the FIFO priority
+///   never reads it.
+/// * `greedy_select_overflow = "valu"` decides each select's form in the greedy; a fixed
+///   select encoding (`select_choice` other than `optimize`), the select-choice hint pass or
+///   `schedule_with_fixed_choices` owns that decision, and the greedy then never overflows.
+///
+/// # Returns
+/// `Err` with the offending combination, else `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_greedy_shape_combinations(
+    greedy_priority: GreedyPriorityKind,
+    greedy_load_priority: &str,
+    greedy_flow_priority: &str,
+    greedy_alu_priority: &str,
+    greedy_select_overflow: &str,
+    greedy_select_overflow_limit: Option<usize>,
+    select_choice: &str,
+    enable_select_choice_hint_pass: bool,
+    enable_schedule_with_fixed_choices: bool,
+) -> Result<(), String> {
+    if greedy_select_overflow_limit.is_some() && greedy_select_overflow != "valu" {
+        return Err("greedy_select_overflow_limit (--greedy-select-overflow-limit) needs \
+                    greedy_select_overflow = 'valu' (--greedy-select-overflow valu); otherwise it is ignored"
+            .to_string());
+    }
+    if greedy_load_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_load_priority = '{}' (--greedy-load-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_load_priority
+        ));
+    }
+    if greedy_flow_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_flow_priority = '{}' (--greedy-flow-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_flow_priority
+        ));
+    }
+    if greedy_alu_priority != "key" && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err(format!(
+            "greedy_alu_priority = '{}' (--greedy-alu-priority) orders the wavefront priority only; \
+             it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)",
+            greedy_alu_priority
+        ));
+    }
+    if greedy_select_overflow == "valu" {
+        let owner = if select_choice != "optimize" {
+            Some(format!("select_choice = '{}' (--select-choice {})", select_choice, select_choice))
+        } else if enable_select_choice_hint_pass {
+            Some("the select-choice hint pass (--select-choice-hint-pass / --hint-passes)".to_string())
+        } else if enable_schedule_with_fixed_choices {
+            Some("schedule_with_fixed_choices (--schedule-with-fixed-choices)".to_string())
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
+            return Err(format!(
+                "greedy_select_overflow = 'valu' (--greedy-select-overflow valu) is ignored when {} owns \
+                 the select encoding",
+                owner
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject encoding options another option would silently override or ignore (the same
+/// rules as `kernel_build_args.check_encoding_option_combinations`; review of #86).
+///
+/// # Returns
+/// `Err` naming the options for: an early stagger without the wavefront priority; a forced
+/// `const_choice` / `select_choice` / `valu_shift` (not "optimize") with the hint pass that
+/// would overwrite it; a `greedy_const_policy` other than "default" under CP-SAT, with a
+/// forced `const_choice`, or with the const-choice hint pass.
+#[allow(clippy::too_many_arguments)]
+pub fn check_encoding_option_combinations(
+    greedy_priority: GreedyPriorityKind,
+    greedy_early_stagger: Option<(usize, u32)>,
+    use_cpsat: bool,
+    const_choice: &str,
+    select_choice: &str,
+    valu_shift: &str,
+    enable_const_choice_hint_pass: bool,
+    enable_select_choice_hint_pass: bool,
+    enable_valu_shift_hint_pass: bool,
+    greedy_const_policy: &str,
+) -> Result<(), String> {
+    if greedy_early_stagger.is_some() && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err("greedy_early_stagger (--greedy-early-stagger) staggers the wavefront priority only; \
+                    it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)"
+            .to_string());
+    }
+    for (name, forced, hint) in [
+        ("const_choice", const_choice, enable_const_choice_hint_pass),
+        ("select_choice", select_choice, enable_select_choice_hint_pass),
+        ("valu_shift", valu_shift, enable_valu_shift_hint_pass),
+    ] {
+        if forced != "optimize" && hint {
+            return Err(format!(
+                "{} = '{}' forces the encoding, and the {} hint pass would overwrite it; use one or the other",
+                name, forced, name
+            ));
+        }
+    }
+    if greedy_const_policy != "default" {
+        let owner = if use_cpsat {
+            Some("CP-SAT (the policy is greedy-only: the CP-SAT hint cannot name an ALU derivation)".to_string())
+        } else if const_choice != "optimize" {
+            Some(format!("const_choice = '{}'", const_choice))
+        } else if enable_const_choice_hint_pass {
+            Some("the const-choice hint pass".to_string())
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
+            return Err(format!(
+                "greedy_const_policy = '{}' (--greedy-const-policy) is ignored when {} owns the ConstChoice encoding",
+                greedy_const_policy, owner
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_check_encoding_option_combinations() {
+        use super::{check_encoding_option_combinations as check, GreedyPriorityKind::*};
+        let ok = |p, s, cpsat, cc: &str, sc: &str, vs: &str, h: (bool, bool, bool), pol: &str| {
+            check(p, s, cpsat, cc, sc, vs, h.0, h.1, h.2, pol)
+        };
+        let none = (false, false, false);
+        assert!(ok(Fifo, None, true, "optimize", "optimize", "optimize", none, "default").is_ok());
+        assert!(ok(Wavefront, Some((8, 3)), false, "load", "fma", "alu", none, "default").is_ok());
+        assert!(ok(Wavefront, None, false, "optimize", "optimize", "optimize", (true, true, true), "default").is_ok());
+        assert!(ok(Wavefront, None, false, "optimize", "optimize", "optimize", (false, true, true), "alu-first").is_ok());
+        // Each ignored or overridden combination is an error.
+        assert!(ok(Fifo, Some((8, 3)), false, "optimize", "optimize", "optimize", none, "default").is_err());
+        assert!(ok(Fifo, None, false, "load", "optimize", "optimize", (true, false, false), "default").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "vselect", "optimize", (false, true, false), "default").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "optimize", "valu", (false, false, true), "default").is_err());
+        assert!(ok(Fifo, None, true, "optimize", "optimize", "optimize", none, "alu-first").is_err());
+        assert!(ok(Fifo, None, false, "add_imm", "optimize", "optimize", none, "alu-first").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "optimize", "optimize", (true, false, false), "alu-when-load-full").is_err());
+    }
+
+    #[test]
+    fn test_check_greedy_shape_combinations() {
+        use super::{check_greedy_shape_combinations as check, GreedyPriorityKind::*};
+        // Defaults and the documented combinations are accepted.
+        assert!(check(Fifo, "key", "key", "key", "never", None, "optimize", false, false).is_ok());
+        assert!(check(Wavefront, "final-last", "feeds-load-first", "key", "valu", Some(3), "optimize", false, false).is_ok());
+        // Each ignored combination is an error.
+        assert!(check(Wavefront, "key", "key", "key", "never", Some(3), "optimize", false, false).is_err());
+        assert!(check(Fifo, "key", "feeds-load-first", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "final-last", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Fifo, "tail", "key", "key", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "fma", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "vselect", false, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", true, false).is_err());
+        assert!(check(Wavefront, "key", "key", "key", "valu", None, "optimize", false, true).is_err());
+        assert!(check(Fifo, "key", "key", "native-first", "never", None, "optimize", false, false).is_err());
+        assert!(check(Wavefront, "key", "chain-first", "native-first", "never", None, "optimize", false, false).is_ok());
+        // Without overflow, the hint pass and fixed encodings are fine.
+        assert!(check(Wavefront, "key", "key", "key", "never", None, "fma", true, true).is_ok());
+    }
+
     use super::*;
 
     /// Same values as verification/rewrites.py level_last_index (tests/test_rewrite_proofs.py).
@@ -1218,6 +1575,75 @@ mod tests {
         assert!(bad(&mut spec, 2, 3, AccessEncoding::Standard).unwrap_err().contains("standard"));
         spec.access_plan.as_mut().unwrap().pop();
         assert!(spec.check_access_plan().unwrap_err().contains("15 rounds"));
+    }
+
+    /// Critical-path options that would be silent no-ops are rejected for any caller of
+    /// `ProblemSpec` (review of #91), and `first-pass` is the rounds up to the first wrap.
+    #[test]
+    fn test_check_critical_path_options() {
+        let spec = |f: &dyn Fn(&mut ProblemSpec)| {
+            let mut s = ProblemSpec { forest_height: 3, n_nodes: 15, batch_size: 16, rounds: 9, ..Default::default() };
+            s.index_form = IndexForm::Mirrored;
+            s.tree_reduce_max_depth = 2;
+            s.cached_select = CachedSelect::BitsFlow;
+            f(&mut s);
+            s
+        };
+        assert_eq!(spec(&|_| {}).check_critical_path_options(), Ok(()));
+        // index_early_terms needs the mirrored index.
+        let e = spec(&|s| {
+            s.index_early_terms = IndexEarlyTerms::Final;
+            s.index_form = IndexForm::ZeroBased;
+        });
+        assert!(e.check_critical_path_options().unwrap_err().contains("index_early_terms"));
+        // Pushdown: fine for bits-flow; a no-op for standard, mobius, and bits at depth 1 only.
+        for mode in [SelectXorPushdown::FirstPass, SelectXorPushdown::All] {
+            assert_eq!(spec(&|s| s.select_xor_pushdown = mode).check_critical_path_options(), Ok(()));
+            for (cs, depth) in [(CachedSelect::Standard, 2), (CachedSelect::Mobius, 2), (CachedSelect::Bits, 1)] {
+                let s = spec(&|s| {
+                    s.select_xor_pushdown = mode;
+                    s.cached_select = cs;
+                    s.tree_reduce_max_depth = depth;
+                });
+                assert!(s.check_critical_path_options().unwrap_err().contains("select_xor_pushdown"), "{:?}", cs);
+            }
+            let bits2 = spec(&|s| {
+                s.select_xor_pushdown = mode;
+                s.cached_select = CachedSelect::Bits;
+            });
+            assert_eq!(bits2.check_critical_path_options(), Ok(()));
+        }
+        // index_early_terms that applies to no op: `final` with the last round at depth 0 (9
+        // rounds), at the wrap round (8) or with values_only; fine at depth 2 (7 rounds).
+        // `first-gather` at 9 rounds still has the gather of round 3 after round 2 (depth 2).
+        let early = |rounds: usize, t: IndexEarlyTerms, values_only: bool| {
+            spec(&|s| {
+                s.rounds = rounds;
+                s.index_early_terms = t;
+                s.values_only = values_only;
+            })
+            .check_critical_path_options()
+        };
+        assert_eq!(early(7, IndexEarlyTerms::Final, false), Ok(()));
+        for (rounds, values_only) in [(8, false), (9, false), (7, true)] {
+            assert!(early(rounds, IndexEarlyTerms::Final, values_only).unwrap_err().contains("applies to no op"));
+        }
+        assert_eq!(early(9, IndexEarlyTerms::FirstGather, false), Ok(()));
+        // Reassociation needs a gather round: none when every level is cached.
+        assert_eq!(spec(&|s| s.reassociate_gather_xor = true).check_critical_path_options(), Ok(()));
+        let all_cached = spec(&|s| {
+            s.reassociate_gather_xor = true;
+            s.tree_reduce_max_depth = 3;
+        });
+        assert!(all_cached.check_critical_path_options().unwrap_err().contains("reassociate_gather_xor"));
+        // First pass: rounds 0 to forest_height (the first wrap round), each at depth = round.
+        let s = spec(&|_| {});
+        for r in 0..s.rounds {
+            assert_eq!(s.is_first_pass_round(r), r <= 3);
+            if s.is_first_pass_round(r) {
+                assert_eq!(s.round_depth(r), r);
+            }
+        }
     }
 
     #[test]

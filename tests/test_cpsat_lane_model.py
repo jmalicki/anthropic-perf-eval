@@ -278,6 +278,7 @@ CASES += [
 ]
 
 
+@pytest.mark.deep
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("cfg,lane_model", CASES, ids=[f"{c}-{m}" for c, m in CASES])
 def test_every_lane_row_has_a_proved_shape(tmp_path, cfg, lane_model):
@@ -308,6 +309,7 @@ def test_every_lane_row_has_a_proved_shape(tmp_path, cfg, lane_model):
         assert not rows.domain_gaps(), rows.domain_gaps()[:10]
 
 
+@pytest.mark.deep
 @pytest.mark.timeout(600)
 def test_free_is_the_default_model(tmp_path):
     default = _export(tmp_path, "default", ["--rounds", "3"])

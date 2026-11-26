@@ -37,6 +37,7 @@ testpaths = [".", "solver", "tests"]
 addopts = "-m 'not ci_only'"
 markers = [
     "ci_only: optional/CI-only tests (deselected by default via addopts; run them with -m ci_only or ./scripts/test.sh ci-only)",
+    "deep: runs a CP-SAT solve (deep tier). Runs locally by default; PR CI deselects it (./scripts/test.sh python-shallow) and the deep workflow runs it (python-deep)",
 ]
 
 [tool.hatch.build.targets.wheel]

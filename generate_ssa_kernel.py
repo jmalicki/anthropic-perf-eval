@@ -103,7 +103,9 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=requested_values_only,
+            # Only an explicit --values-only overrides the saved kernel; --transform values-only
+            # builds nothing here, and a kernel built with it already records values_only.
+            values_only=args.values_only,
         )
 
     use_cpsat = not args.use_greedy
@@ -158,7 +160,10 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
-    build_kwargs = args_to_build_kwargs(args)
+    try:
+        build_kwargs = args_to_build_kwargs(args)
+    except ValueError as e:  # an option combination that would be ignored or overridden
+        parser.error(str(e))
     emission = non_default_emission_options(build_kwargs)
     if emission:
         print("  emission options: " + ", ".join(f"{k}={v}" for k, v in emission.items()))
@@ -186,11 +191,12 @@ def main():
         target = getattr(args, "greedy_shift_target", None)
         print(f"  greedy_shift_policy={args.greedy_shift_policy}"
               + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
-    if getattr(args, "greedy_load_priority", "key") != "key":
-        print(f"  greedy_load_priority={args.greedy_load_priority}")
-        if getattr(args, "greedy_priority", "fifo") != "wavefront":
-            print("  WARNING: --greedy-load-priority applies only with --greedy-priority wavefront; "
-                  "it is ignored here", file=sys.stderr)
+    for name, default in (("greedy_load_priority", "key"), ("greedy_flow_priority", "key"),
+                          ("greedy_select_overflow", "never"), ("greedy_budget_force", "same-cycle"),
+                          ("greedy_alu_priority", "key"), ("greedy_const_policy", "default"),
+                          ("greedy_early_stagger", None)):
+        if getattr(args, name, default) != default:
+            print(f"  {name}={getattr(args, name)}")
     if getattr(args, "greedy_justify", 0):
         print(f"  greedy_justify={args.greedy_justify}")
     overrides = {name: getattr(args, name, None) for name in

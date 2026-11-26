@@ -200,6 +200,7 @@ def test_greedy_and_cpsat_reach_the_critical_path(tmp_path):
     assert len(emit(g, gs)) == 4
 
 
+@pytest.mark.deep
 def test_cpsat_reaches_the_critical_path(tmp_path):
     # Run in a subprocess: the OR-Tools Python wheel and the OR-Tools library that
     # scheduler_rs links cannot share one process (importing both segfaults).

@@ -40,6 +40,16 @@ fn dce(p: &SsaProgram) -> SsaProgram {
 /// differed between `a` and `b` before recomputing and agree after.
 fn stale_alternatives(a: &mut SsaProgram, b: &mut SsaProgram) -> Vec<(i64, String, String)> {
     let before: Vec<_> = a.ops.iter().zip(&b.ops).map(|(x, y)| (x.const_alternatives.clone(), y.const_alternatives.clone())).collect();
+    // Only ALU derivations may differ (they depend on the constants before each op); Load and
+    // AddImm must already agree, or the rewrite lost (or gained) an encoding.
+    let non_alu = |alts: &Option<Vec<crate::types::ConstEncoding>>| -> Option<Vec<crate::types::ConstEncoding>> {
+        alts.as_ref().map(|v| v.iter().filter(|e| e.alu_opcode().is_none()).cloned().collect())
+    };
+    for (i, (x, y)) in a.ops.iter().zip(&b.ops).enumerate() {
+        if x.opcode == Opcode::ConstChoice || y.opcode == Opcode::ConstChoice {
+            assert_eq!(non_alu(&x.const_alternatives), non_alu(&y.const_alternatives), "op {} ({:?}): Load/AddImm encodings differ", i, x.produces_constant);
+        }
+    }
     for p in [&mut *a, &mut *b] {
         let alts = recompute_alternatives(&p.ops, p.zero_vreg.is_some(), |_| false);
         for (op, alt) in p.ops.iter_mut().zip(alts) {
@@ -121,6 +131,18 @@ pub(super) fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], lab
     let (diff, leaked) = first_difference(&canonical_ops(&a), &canonical_ops(&b));
     if let Some(d) = diff {
         panic!("{} {:?}: after DCE: {}\n{}", label, transforms, d, summaries.join("\n"));
+    }
+    // The leaked label is accepted only where the emitter leaks it: the first op of the
+    // selection setup (an ALU add, no region), as in `check_hash_merge_parity`.
+    {
+        use crate::types::{EmissionPhase, Engine};
+        let first_selection_setup =
+            a.ops.iter().position(|o| o.source_info.as_ref().map_or(false, |s| s.phase == EmissionPhase::ValuSelectionInit));
+        for &i in &leaked {
+            let op = &a.ops[i];
+            assert_eq!(Some(i), first_selection_setup, "{} {:?}: label leak on {:?}", label, transforms, op);
+            assert!(op.region.is_none() && op.engine == Engine::Alu && op.opcode == Opcode::Add, "{} {:?}: label leak on {:?}", label, transforms, op);
+        }
     }
     let parity = Parity {
         raw_exact: raw_diff.is_none(),
@@ -209,9 +231,17 @@ fn combined(rounds: usize) {
                 let parity = check_parity(&spec, &order, &label);
                 programs.push((order, parity.program));
             }
+            // Both are rewrites of the same input: no emitter exception, every op equal.
             for (order, ops) in &programs[1..] {
-                let (d, _) = first_difference(ops, &programs[0].1);
-                assert!(d.is_none(), "{}: order {:?} differs from {:?}: {:?}", label, order, programs[0].0, d);
+                let first = ops.iter().zip(&programs[0].1).position(|(x, y)| x != y);
+                assert!(
+                    ops.len() == programs[0].1.len() && first.is_none(),
+                    "{}: order {:?} differs from {:?} at op {:?}",
+                    label,
+                    order,
+                    programs[0].0,
+                    first.map(|i| (&ops[i], &programs[0].1[i]))
+                );
             }
         }
     }
@@ -388,11 +418,13 @@ fn test_values_only_refuses_observed_or_unknown_stores() {
     // A load from an address that is not a header pointer plus a constant may alias: every
     // index store before it is refused.
     let mut q = clone_program(&p);
-    let input_value = q.ops.iter().filter(|o| o.opcode == Opcode::Vload).nth(1).unwrap().dest.unwrap();
-    let s = VReg::scalar(q.vreg_count);
-    q.vreg_count += 1;
-    // Address = a word of the input values: unknown, so it may alias the indices.
-    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(s), vec![Operand::VReg(input_value)]));
+    // One input value, loaded into a scalar register through the values' (known) address.
+    let values_addr = q.ops.iter().filter(|o| o.opcode == Opcode::Vload).nth(1).unwrap().srcs[0].clone();
+    let (x, s) = (VReg::scalar(q.vreg_count), VReg::scalar(q.vreg_count + 1));
+    q.vreg_count += 2;
+    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(x), vec![values_addr]));
+    // Address = that input value: unknown, so it may alias the indices.
+    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(s), vec![Operand::VReg(x)]));
     let (found, rejected) = sites(&q, &rule);
     assert!(found.is_empty());
     assert_eq!(reason_count(&rejected, "may read the stored indices back"), 32, "{:?}", rejected);
@@ -552,9 +584,10 @@ fn test_values_only_delta_table() {
 /// Run the greedy pipeline on `program`, applying `transforms` in the pass.
 ///
 /// # Returns
-/// `(cycles, lowered ops, peak live words, budget exceeded, lane-map entries, lane-map entries
-/// whose key or a lane is still read or written by a scheduled op)`.
-fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize, usize, bool, usize, usize) {
+/// `(cycles, lowered ops, peak live words, (greedy over budget, address assignment over budget),
+/// lane-map entries, lane-map entries whose key or a lane is still read or written by a
+/// scheduled op)`. The kernel builder rejects a schedule if either flag is set.
+fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize, usize, (bool, bool), usize, usize) {
     use crate::kernel_builder::config::CompilerConfig;
     use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
     let config = PipelineConfig {
@@ -564,6 +597,7 @@ fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize,
     };
     let mut ctx = PipelineContext::new(program, config);
     ctx.run_greedy_pipeline(true).unwrap();
+    let greedy_exceeded = ctx.greedy_metrics.budget_exceeded;
     let used: std::collections::HashSet<crate::types::VReg> =
         ctx.ops.iter().flat_map(|o| o.reads().chain(o.dest)).collect();
     let lanes = ctx.vector_group_lanes.len();
@@ -573,7 +607,7 @@ fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize,
         .filter(|(k, ls)| used.contains(k) || ls.iter().any(|l| used.contains(l)))
         .count();
     let r = ctx.into_result().unwrap();
-    (r.cycles, r.ops.len(), r.address_result.peak_live, r.address_result.budget_exceeded, lanes, live_lanes)
+    (r.cycles, r.ops.len(), r.address_result.peak_live, (greedy_exceeded, r.address_result.budget_exceeded), lanes, live_lanes)
 }
 
 #[test]

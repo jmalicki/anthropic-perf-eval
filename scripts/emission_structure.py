@@ -181,6 +181,47 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
             "vector_op_equivalents": vector_op_equivalents(c, res)}
 
 
+# ----------------------------------------------------------------------------
+# Greedy pipeline model (a calibrated HEURISTIC, not a bound)
+# ----------------------------------------------------------------------------
+# Predicted cycles of the load-tail greedy (shaped flags + LOAD_TAIL_GREEDY) for a plan:
+#
+#     max(floor + a_floor,  loads / 2 + a_load + b_flow * max(0, flow - flow0))
+#
+# with `loads` = load ops + ConstChoices (the greedy keeps consts on the load engine) and
+# `flow` = flow ops + every SelectChoice (the greedy runs every select as a flow vselect; it
+# never takes the multiply_add form). The load engine paces the kernel (one group's gathers
+# per ~31 cycles); the flow work of the first and last select rounds of all groups has to keep
+# up with it, and above about 0.9 flow op per load cycle the flow queue delays late groups'
+# entry into the load stream (docs/GREEDY_SHAPE_ABLATION.md section 12; a hypothesis, not a
+# measured mechanism). Grid-fitted on the 24 index-bit loop builds under 1,200 cycles of
+# docs/emission_plans/greedy_model_data.json; `uv run python -m scripts.greedy_model_fit
+# --check` reproduces these constants and the numbers quoted for them (tests/
+# test_greedy_model_fit.py). Leave-one-out (constants refitted, form fixed, and the form was
+# chosen on the same plans): MAE 6.2, max 18 cycles. Every ranking quoted for it is in-sample.
+# Out of sample it fails: on the four plans stage 1 chose with it, it was optimistic by 20 to
+# 42 cycles. 16 rounds, batch 256, `--merge-hash-stages --index-form mirrored`. Scratch is not
+# modelled: path-bit plans that the greedy runs at the scratch ceiling are underpredicted.
+# b_flow is in hundredths.
+GREEDY_MODEL = {"a_floor": 32, "a_load": 19, "flow0": 900, "b_flow_x100": 75}
+# The same model refitted for the stall judge (LOAD_TAIL_GREEDY + greedy_budget_force=stall,
+# pressure_inflation_threshold=0.98; docs/STARTUP_AND_STALL_LOOP.md section A): 41 index-bit
+# builds under 1,200 cycles, leave-one-out MAE 5.6; held out on 44 later plans it is optimistic
+# (index MAE 14.5, path 62.3). Reproduced by `scripts/greedy_model_fit.py --judge stall-0.98
+# --check`. Pass as `greedy_model=GREEDY_MODEL_STALL` to solve_plan to use it.
+GREEDY_MODEL_STALL = {"a_floor": 52, "a_load": 13, "flow0": 900, "b_flow_x100": 80}
+
+
+def greedy_model_cycles(counts: Mapping[str, int], model: Mapping[str, int] | None = None) -> float:
+    """The greedy pipeline model's predicted cycles for `counts` (see GREEDY_MODEL). A
+    heuristic calibrated on recorded greedy builds, never a bound."""
+    g = dict(GREEDY_MODEL, **(model or {}))
+    loads = counts["load"] + counts["const"] + counts["const_alu"]
+    flow = counts["flow"] + counts["select1"] + counts["select2"]
+    pipeline = loads / 2 + g["a_load"] + g["b_flow_x100"] / 100 * max(0, flow - g["flow0"])
+    return max(choice_floor(counts)["cycles"] + g["a_floor"], pipeline)
+
+
 # Op kinds of a window row (scripts/emission_loop.py). A SelectChoice is charged as 1 flow slot
 # or 1 fixed vector op whatever its FMA form (the 2-op form's subtract may be shared, as the
 # proved reference model of verification/static_bounds_proof.py assumes); ConstChoices and
@@ -728,7 +769,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
                time_limit: float = 60.0, tie_break: bool = True, max_util: Mapping[str, float] | None = None,
                lateness: bool = True, nogoods: Sequence[Mapping] | None = None, incumbent: int | None = None,
                windows: Sequence[Mapping] | None = None, floor_incumbent: int | None = None,
-               deterministic_time: float | None = None) -> dict:
+               deterministic_time: float | None = None, greedy_model: Mapping[str, int] | None = None,
+               min_objective: int | None = None) -> dict:
     """Plan minimising choice_floor of the predicted counts (CP-SAT, exact, single worker so
     that the same inputs give the same plan).
 
@@ -765,6 +807,15 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             {"t", "q", "const": {cat: n}, "per_group": {(round, encoding) or "r:e": {cat: n}}}.
             With them the objective is M >= T and, per window, M >= t + q + the window's
             choice floor (`window_floor`) of the counts it holds; otherwise T.
+        greedy_model: minimise the greedy pipeline model instead (GREEDY_MODEL, overrides
+            from this mapping; {} = the fitted values). A calibrated heuristic of the load-tail
+            greedy's cycles, not a bound: M >= T + a_floor and
+            100 M >= 50 loads + 100 a_load + b_flow_x100 * max(0, flow + selects - flow0).
+            Among plans with the best M the lowest T, then the usual tie-breaks. Not combined
+            with `windows`.
+        min_objective: the objective must be at least this. The objective variable is an upper
+            relaxation of the plan's score (T >= its floor), so this does not make the plan's
+            own score at least `min_objective`: check the returned plan with `plan_score`.
 
     Returns:
         {"rows", "floor" (choice_floor of the plan), "capped_cycles" (T under max_util),
@@ -781,6 +832,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         if not 0 <= r < ctx.rounds or e not in allowed_encodings(ctx.depth(r)):
             raise ValueError(f"fixed: {e!r} is not available in round {r} (depth {ctx.depth(r)})"
                              if 0 <= r < ctx.rounds else f"fixed: no round {r}")
+    if greedy_model is not None and windows:
+        raise ValueError("greedy_model and windows are not combined")
 
     # Imported only after the arguments are checked: in a process that has loaded scheduler_rs
     # this import crashes (see solve_plan_isolated), and a bad argument should fail cleanly.
@@ -905,6 +958,18 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             m.AddBoolOr(differs)
 
     objective = t
+    if greedy_model is not None:
+        gm = dict(GREEDY_MODEL, **greedy_model)
+        objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
+        m.Add(objective >= t + int(gm["a_floor"]))
+        # excess = max(0, flow ops + selects - flow0) exactly, as in greedy_model_cycles: a lower
+        # bound alone would let the solver inflate it under a negative slope override.
+        over = m.NewIntVar(-big - int(gm["flow0"]), big, "flow_over")
+        m.Add(over == cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
+        excess = m.NewIntVar(0, big, "flow_excess")
+        m.AddMaxEquality(excess, [over, 0])
+        loads_all = cnt["load"] + cnt["const"] + cnt["const_alu"]
+        m.Add(100 * objective >= 50 * loads_all + 100 * int(gm["a_load"]) + int(gm["b_flow_x100"]) * excess)
     if windows:
         objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
         m.Add(objective >= t)
@@ -929,6 +994,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             m.Add(cnt_w["alu"] + VLEN * sh <= CAP["alu"] * span)
     if incumbent is not None:
         m.Add(objective <= int(incumbent) - 1)
+    if min_objective is not None:
+        m.Add(objective >= int(min_objective))
     if floor_incumbent is not None:
         m.Add(t <= int(floor_incumbent) - 1)
     m.Minimize(objective)
@@ -953,7 +1020,8 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         return st
 
     status = run("main")
-    if status == cp_model.INFEASIBLE and (nogoods or incumbent is not None or floor_incumbent is not None):
+    if status == cp_model.INFEASIBLE and (nogoods or incumbent is not None or floor_incumbent is not None
+                                          or min_objective is not None):
         return {"status": "infeasible", "solves": solves}
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"structure model: {solver.StatusName(status)}")
@@ -965,13 +1033,13 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     chosen = {key: solver.Value(var) for key, var in n.items()}
     pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
     tie_break_status = "not run"
-    if windows and tie_break:
+    if (windows or greedy_model is not None) and tie_break:
         # Among plans with the best M, the lowest floor T, then the usual tie-breaks.
         m.Add(objective == best_obj)
         m.Minimize(t)
         for key, val in chosen.items():
             m.AddHint(n[key], val)
-        status_t = run("windows_floor")
+        status_t = run("windows_floor" if windows else "model_floor")
         if status_t in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             best_t = solver.Value(t)
             chosen = {key: solver.Value(var) for key, var in n.items()}
@@ -987,8 +1055,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         # Lexicographic: mixes, then lateness, then work in scalar-op units (a vector op is 8).
         m.Minimize(mixes * (late_max * work_max) + late * work_max + work)
         m.ClearHints()  # the windows' T solve may have hinted these already
-        for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
-            m.AddHint(var, val)
+        # From the saved plan: after a floor solve that ended UNKNOWN there is no solution to
+        # read; otherwise `chosen` holds that solve's values.
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
         status2 = run("tie_break")
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -1002,7 +1072,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     counts = table.predict(rows)
     floor = choice_floor(counts)
     assert floor["cycles"] <= best_t, (floor["cycles"], best_t)
-    if proven and not caps and (tie_break or not windows):
+    # With min_objective, T can sit above the plan's own floor (T is only an upper relaxation
+    # of the floor, and the bound pushes it up): the plan's score must be computed from the
+    # plan (`plan_score`), not taken from the objective.
+    if proven and not caps and greedy_model is None and min_objective is None and (tie_break or not windows):
         assert floor["cycles"] == best_t, (floor["cycles"], best_t)
     return {"rows": rows, "floor": floor, "capped_cycles": best_t, "counts": counts,
             "objective": best_obj, "status": "optimal" if proven else "feasible", "tie_break": tie_break_status,
@@ -1011,6 +1084,48 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
 
 def _solve_plan_child(table_json, kwargs):
     return solve_plan(CostTable.from_json(table_json), **kwargs)
+
+
+def plan_score(table: CostTable, rows, objective: str) -> int:
+    """A plan's stage-1 score as `solve_plan` minimises it: "floor" (choice_floor) or
+    "greedy-model" (GREEDY_MODEL with the floor as T, rounded up as the solver's integer M)."""
+    counts = table.predict(rows)
+    if objective == "floor":
+        return choice_floor(counts)["cycles"]
+    if objective == "greedy-model":
+        return math.ceil(greedy_model_cycles(counts))
+    raise ValueError(f"objective {objective!r}")
+
+
+def count_plans_at_most(table: CostTable, score: int, objective: str, limit: int = 200,
+                        deterministic_time: float = 5.0) -> dict:
+    """Plans (distinct model points, `plan_model_key`) whose stage-1 score is at most `score`, counted by
+    repeated solves with a no-good on each plan found, up to `limit`. Returns {"count",
+    "complete"}: complete=False means at least `count` such plans exist."""
+    found: list = []
+    while len(found) < limit:
+        try:
+            res = solve_plan(table, nogoods=found, incumbent=score + 1, tie_break=False,
+                             greedy_model={} if objective == "greedy-model" else None,
+                             deterministic_time=deterministic_time, time_limit=60.0)
+        except RuntimeError:  # UNKNOWN: the budget ran out before deciding
+            return {"count": len(found), "complete": False}
+        if res["status"] == "infeasible":
+            return {"count": len(found), "complete": True}
+        found.append(plan_model_key(res["rows"], table.context))
+    return {"count": len(found), "complete": False}
+
+
+def _count_child(table_json, kwargs):
+    return count_plans_at_most(CostTable.from_json(table_json), **kwargs)
+
+
+def count_plans_at_most_isolated(table: CostTable, **kwargs) -> dict:
+    """`count_plans_at_most` in a spawned child (see `solve_plan_isolated`)."""
+    import multiprocessing
+
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        return pool.apply(_count_child, (table.to_json(), kwargs))
 
 
 def solve_plan_isolated(table: CostTable, **kwargs) -> dict:
@@ -1151,6 +1266,7 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
         "cycles": stats["cycles"],
         "simulator_cycles": simulator_cycles(instrs)[0],
         "peak_live": stats.get("peak_live"),
+        "budget_exceeded": bool(stats["budget_exceeded"]),
         "max_addr": stats.get("max_addr"),
         "scratch_size": stats.get("scratch_size"),
         "proved": proved,
@@ -1311,6 +1427,9 @@ def main(argv=None):
     ap.add_argument("--fix", action="append", default=[], metavar="ROUND=ENCODING",
                     help="solve/sweep: keep round ROUND uniform with ENCODING (e.g. 15=gather keeps select work "
                          "out of the last round, the schedule's tail); repeatable")
+    ap.add_argument("--greedy-model", action="store_true",
+                    help="solve: minimise the greedy pipeline model (GREEDY_MODEL; a calibrated heuristic of the "
+                         "load-tail greedy's cycles, not a bound) instead of the floor")
     ap.add_argument("--no-lateness", action="store_true",
                     help="solve/sweep: drop the tie-break that puts select work at a level's earliest visit")
     ap.add_argument("--input", action="append", default=[], metavar="LABEL=ROWS.json",
@@ -1425,8 +1544,11 @@ def main(argv=None):
             max_util = parse_max_util(args.max_util[0] if args.max_util else "none")
             # Isolated: on a cold cache the calibration above has loaded scheduler_rs here.
             result = solve_plan_isolated(table, encodings=args.encodings.split(","), time_limit=args.time_limit,
-                                         max_util=max_util, lateness=not args.no_lateness, fixed=fixed)
+                                         max_util=max_util, lateness=not args.no_lateness, fixed=fixed,
+                                         greedy_model={} if args.greedy_model else None)
             capped = f", T under caps {result['capped_cycles']:,}" if max_util else ""
+            if args.greedy_model:
+                capped += f", greedy model {result['objective']:,} (heuristic)"
             _print_counts(f"best plan ({result['status']}{capped}) [{describe_plan(result['rows'])}]", result["counts"])
             if args.out:
                 doc = plan_document(result["rows"], ctx.forest_height, context=asdict(ctx),

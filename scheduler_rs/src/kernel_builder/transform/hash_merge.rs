@@ -507,12 +507,16 @@ pub fn apply_hash_merge(
         for s in &sites {
             for &v in &s.operands {
                 let d = graph.def_index(v).unwrap();
-                if d >= anchor || graph.readers(d).iter().all(|r| removed.contains(r)) {
+                // A kept-live operand stays where it is: `keep_live` is not a read, so the
+                // reader check of `move_after` would not see the op that keeps it.
+                if d >= anchor || graph.is_kept_live(v) || graph.readers(d).iter().all(|r| removed.contains(r)) {
                     continue;
                 }
-                if let Some(sd) = graph.def_op(v).and_then(|b| b.srcs[0].as_vreg()).and_then(|sv| graph.def_index(sv)) {
-                    if graph.readers(sd).iter().all(|&r| r == d || r > anchor) {
-                        regroup.insert(sd);
+                if let Some(sv) = graph.def_op(v).and_then(|b| b.srcs[0].as_vreg()) {
+                    if let Some(sd) = graph.def_index(sv) {
+                        if !graph.is_kept_live(sv) && graph.readers(sd).iter().all(|&r| r == d || r > anchor) {
+                            regroup.insert(sd);
+                        }
                     }
                 }
                 regroup.insert(d);
@@ -544,7 +548,10 @@ pub fn apply_hash_merge(
         };
         let (l_op, l) = vec_op(&mut surgery, Opcode::MultiplyAdd, [s.input, v_m1, v_c1]);
         let (h_op, h) = vec_op(&mut surgery, Opcode::MultiplyAdd, [s.input, v_m2, v_c2]);
-        let (mut r_op, r) = vec_op(&mut surgery, Opcode::Xor, [l, h, h]);
+        // l stands for t = x + D and h for s = x << K: keep the original operand order (a traced
+        // op records its inputs in that order).
+        let s_first = surgery.ops()[s.xor].srcs[0].as_vreg() == surgery.ops()[s.shl].dest;
+        let (mut r_op, r) = vec_op(&mut surgery, Opcode::Xor, if s_first { [h, l, l] } else { [l, h, h] });
         r_op.trace_id = surgery.ops()[s.xor].trace_id.clone();
         let inserted = [l_op, h_op, r_op];
 

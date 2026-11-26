@@ -1,0 +1,132 @@
+{
+  "spec": {
+    "window_sizes": [
+      60,
+      110
+    ],
+    "stride_fraction": 0.5,
+    "encodings": [
+      "free"
+    ],
+    "sweep": true,
+    "rolling": false,
+    "cycle_range": [
+      0,
+      61
+    ],
+    "deterministic_time": 60.0,
+    "time_limit_secs": 900.0,
+    "workers": 4,
+    "asap_alap_tightening": null,
+    "ignore_subsolvers": [
+      "max_lp",
+      "max_lp_sym",
+      "reduced_costs",
+      "pseudo_costs"
+    ],
+    "prune": false,
+    "output": "/private/tmp/claude-501/sc/p89/INDEXB_checked_startup.json"
+  },
+  "num_ops": 10692,
+  "base_makespan": 1033,
+  "base_check_status": "optimal (makespan 1033, 1.8s)",
+  "entries": [
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 0,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1033,
+      "makespan": 1033,
+      "saved": 0,
+      "lb": 1033,
+      "saved_bound": 0,
+      "wall_secs": 2.714971875,
+      "before": 0,
+      "inside": 529,
+      "after": 10163,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 30,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1033,
+      "makespan": 1033,
+      "saved": 0,
+      "lb": 1033,
+      "saved_bound": 0,
+      "wall_secs": 2.620419916,
+      "before": 220,
+      "inside": 626,
+      "after": 9846,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 60,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1033,
+      "makespan": 1033,
+      "saved": 0,
+      "lb": 1033,
+      "saved_bound": 0,
+      "wall_secs": 2.9643705000000002,
+      "before": 529,
+      "inside": 665,
+      "after": 9498,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 110,
+      "start": 0,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1033,
+      "makespan": 1033,
+      "saved": 0,
+      "lb": 1033,
+      "saved_bound": 0,
+      "wall_secs": 3.111013459,
+      "before": 0,
+      "inside": 1081,
+      "after": 9611,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 110,
+      "start": 55,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1033,
+      "makespan": 1033,
+      "saved": 0,
+      "lb": 1033,
+      "saved_bound": 0,
+      "wall_secs": 119.876193333,
+      "before": 480,
+      "inside": 1173,
+      "after": 9039,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    }
+  ],
+  "rolling_final": [],
+  "rolling_checks": []
+}

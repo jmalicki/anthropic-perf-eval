@@ -46,7 +46,7 @@ The objective is the makespan alone, so the solver maximises `delta`: the saving
 
 ## Keeping it fast
 
-- **Reduced model** (default; `--no-prune` solves the full model instead, for checks): ops far from the window are left out of the cumulatives and, apart from the def and latest reader of each value that reaches the window, out of the model (`restrict_to_window`). It is exact: same presolved model and result as the unreduced one on a 16-round window, 1,585 of 12,356 ops at W=50.
+- **Reduced model** (default; `--no-prune` solves the full model instead, for checks): ops far from the window are left out of the cumulatives and, apart from the def and latest reader of each value that reaches the window, out of the model (`restrict_to_window`). It is meant to be exact (same presolved model and result as the unreduced one on a 16-round window), but on a path-bit kernel the two disagreed (BUGS.md, unresolved): re-check any reduced-model gain with `--no-prune`.
 - **Max-LP workers left out** (default `--ignore-subsolvers max_lp max_lp_sym reduced_costs pseudo_costs`; pass `--ignore-subsolvers` with no names to keep them): on big window models they spend many minutes building LP relaxations at almost no deterministic time, and interleaved search waits for them.
 - `--workers 2` and a deterministic budget of 10 to 20 per window are enough: most W=25 windows close in seconds.
 - The all-fixed check runs on the full model with one worker; the rolling pass's final schedule is re-checked the same way (`rolling_checks` in the report).

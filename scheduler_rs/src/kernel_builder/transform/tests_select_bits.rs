@@ -681,20 +681,20 @@ fn mirroring_constant(p: &SsaProgram) -> (VReg, bool) {
 }
 
 #[test]
-fn test_select_bits_refuses_an_edit_that_drops_a_kept_live_constant() {
+fn test_select_bits_keeps_a_kept_live_constant() {
     // The rewrite makes the L_2 vector dead (only the extraction SUBs read it). Named in
-    // another op's keep_live it may not be dropped: the program is refused, unchanged, instead
-    // of failing the surgery.
+    // another op's keep_live, it is kept (the surgery's liveness counts keep_live), and the
+    // rewrite goes ahead.
     let spec = ProblemSpec { rounds: 5, cached_select: CachedSelect::Bits, tree_reduce_max_depth: 3, ..Default::default() };
     let mut p = raw_program(&spec);
     let (c, only_subs) = mirroring_constant(&p);
     assert!(only_subs, "the L_2 vector has other readers; the test needs one only the extraction reads");
     p.ops.last_mut().unwrap().keep_live = Some(vec![c]);
-    let before = canonical_ops(&p);
-    let (after, report) = apply_select_bits(p, &rule(), |_| true).expect("refused, not an error");
-    assert!(report.refused.as_deref().map_or(false, |r| r.contains("keep_live")), "{:?}", report.refused);
-    assert_eq!(report.n_sites(), 0);
-    assert_eq!(canonical_ops(&after), before);
+    let (after, report) = apply_select_bits(p, &rule(), |_| true).expect("rewritten, not an error");
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    assert!(report.n_sites() > 0);
+    assert!(after.ops.iter().any(|o| o.dest == Some(c)), "the kept-live constant was dropped");
+    super::surgery::Surgery::check(&after).unwrap();
 }
 
 #[test]

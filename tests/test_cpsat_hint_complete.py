@@ -52,29 +52,30 @@ def _export_model(tmp_path, extra):
 @pytest.mark.parametrize(
     "extra",
     [
+        # Shallow on purpose: CP-SAT smoke test every PR runs (CLAUDE.md, test tiers).
         ["--rounds", "2"],
         # From 3 rounds up the selects share subtractions (CSE groups).
-        ["--rounds", "3"],
-        ["--rounds", "4"],
+        pytest.param(["--rounds", "3"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "4"], marks=pytest.mark.deep),
         # A gather round.
-        ["--rounds", "5"],
-        ["--rounds", "3", "--no-valu-shift"],
-        ["--rounds", "3", "--select-choice", "vselect"],
-        ["--rounds", "3", "--const-choice", "load"],
-        ["--rounds", "3", "--valu-shift", "alu"],
-        ["--rounds", "3", "--valu-shift", "valu"],
-        ["--rounds", "3", "--select-choice", "fma"],
-        ["--rounds", "3", "--const-choice", "add_imm"],
-        ["--rounds", "3", "--cpsat-makespan-interval"],
-        ["--rounds", "3", "--cpsat-objective", "makespan"],
+        pytest.param(["--rounds", "5"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--no-valu-shift"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--select-choice", "vselect"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--const-choice", "load"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--valu-shift", "alu"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--valu-shift", "valu"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--select-choice", "fma"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--const-choice", "add_imm"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--cpsat-makespan-interval"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--cpsat-objective", "makespan"], marks=pytest.mark.deep),
         # Checked symmetry rows widen corresponding ops' domains and add group_sym rows.
-        ["--rounds", "4", "--cpsat-symmetry-rows", "checked"],
+        pytest.param(["--rounds", "4", "--cpsat-symmetry-rows", "checked"], marks=pytest.mark.deep),
         # Scratch model pools: vector and scalar cumulatives, write groups as one vector.
-        ["--rounds", "3", "--scratch-model", "pools"],
-        ["--rounds", "5", "--scratch-model", "pools"],
-        ["--rounds", "3", "--cpsat-makespan-rows", "static"],
+        pytest.param(["--rounds", "3", "--scratch-model", "pools"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "5", "--scratch-model", "pools"], marks=pytest.mark.deep),
+        pytest.param(["--rounds", "3", "--cpsat-makespan-rows", "static"], marks=pytest.mark.deep),
         # Five rounds: static heads span more than one bucket.
-        ["--rounds", "5", "--cpsat-makespan-rows", "bucketed"],
+        pytest.param(["--rounds", "5", "--cpsat-makespan-rows", "bucketed"], marks=pytest.mark.deep),
     ],
     ids=lambda extra: " ".join(extra).replace("--", ""),
 )
@@ -98,6 +99,7 @@ def test_greedy_hint_is_complete(tmp_path, extra):
         )
 
 
+@pytest.mark.deep
 def test_cse_groups_are_present_in_the_three_round_model(tmp_path):
     """The 3-round case above does exercise the shared-SUB variables."""
     model, _ = _export_model(tmp_path, ["--rounds", "3"])
@@ -126,6 +128,7 @@ LANE_MODEL_CASES = [
 ]
 
 
+@pytest.mark.deep
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("extra", LANE_MODEL_CASES, ids=lambda extra: " ".join(extra).replace("--", ""))
 def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):

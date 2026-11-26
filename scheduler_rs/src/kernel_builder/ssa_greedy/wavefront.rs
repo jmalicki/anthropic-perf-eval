@@ -50,6 +50,28 @@ pub enum GreedyPriority {
     },
 }
 
+/// A different stagger for the first chains: chain `rank` starts
+/// `cycles * min(rank, groups) + stagger * max(rank - groups, 0)` cycles after chain 0, so the
+/// first `groups` chains can enter together (or closer) while the rest keep the normal stagger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyStagger {
+    /// How many leading chains use `cycles`.
+    pub groups: usize,
+    /// Stagger between consecutive leading chains.
+    pub cycles: u32,
+}
+
+/// Virtual start delay of chain `rank` (see [`EarlyStagger`]).
+pub(super) fn chain_offset(rank: usize, stagger_cycles: u32, early: Option<EarlyStagger>) -> i64 {
+    match early {
+        None => stagger_cycles as i64 * rank as i64,
+        Some(e) => {
+            let lead = rank.min(e.groups);
+            e.cycles as i64 * lead as i64 + stagger_cycles as i64 * (rank - lead) as i64
+        }
+    }
+}
+
 /// Per-op wavefront keys and the in-flight window over chains.
 #[derive(Debug)]
 pub(super) struct Wavefront {
@@ -59,6 +81,8 @@ pub(super) struct Wavefront {
     height: Vec<i64>,
     /// Whether some load depends on the op, per op index.
     feeds_load: Vec<bool>,
+    /// Whether a non-final load (one that some later load depends on) depends on the op.
+    feeds_nonfinal_load: Vec<bool>,
     /// Chain rank per op index; `None` for shared ops.
     chain: Vec<Option<usize>>,
     /// Ops still to be scheduled per chain.
@@ -80,6 +104,7 @@ impl Wavefront {
     /// * `skipped` - Indices the scheduler will not schedule (dead stores)
     /// * `stagger_cycles` - Virtual start delay between consecutive chains
     /// * `groups_in_flight` - Chains allowed to run at once; `None` = no limit
+    /// * `early` - A different stagger for the first chains (see [`EarlyStagger`]); `None` = none
     ///
     /// # Returns
     /// The wavefront state, or `Err` if the dependency graph has a cycle.
@@ -91,6 +116,7 @@ impl Wavefront {
         skipped: &HashSet<usize>,
         stagger_cycles: u32,
         groups_in_flight: Option<usize>,
+        early: Option<EarlyStagger>,
     ) -> Result<Self, String> {
         let n = ops.len();
         let order = topological_order(ops, consumers, id_to_idx)?;
@@ -119,6 +145,13 @@ impl Wavefront {
             feeds_load[idx] = consumers[idx]
                 .iter()
                 .any(|&c| feeds_load[c] || ops[c].engine == crate::types::Engine::Load);
+        }
+        // Whether a non-final load (a load with `feeds_load`) is reachable from the op.
+        let mut feeds_nonfinal_load = vec![false; n];
+        for &idx in order.iter().rev() {
+            feeds_nonfinal_load[idx] = consumers[idx].iter().any(|&c| {
+                feeds_nonfinal_load[c] || (ops[c].engine == crate::types::Engine::Load && feeds_load[c])
+            });
         }
 
         // Which sinks each op reaches, as a bitset over sinks.
@@ -197,7 +230,7 @@ impl Wavefront {
         let mut key = vec![i64::MAX; n];
         for idx in 0..n {
             if let Some(rank) = chain[idx] {
-                key[idx] = depth[idx] + stagger_cycles as i64 * rank as i64;
+                key[idx] = depth[idx] + chain_offset(rank, stagger_cycles, early);
             }
         }
         // A shared op is needed just before its most urgent consumer.
@@ -218,6 +251,7 @@ impl Wavefront {
             key,
             height,
             feeds_load,
+            feeds_nonfinal_load,
             chain,
             remaining,
             admit_below: 0,
@@ -243,8 +277,12 @@ impl Wavefront {
         self.feeds_load[idx]
     }
 
+    /// Whether a non-final load (one some later load depends on) depends on the op.
+    pub(super) fn feeds_nonfinal_load(&self, idx: usize) -> bool {
+        self.feeds_nonfinal_load[idx]
+    }
+
     /// Chain rank of an op, `None` for shared ops.
-    #[cfg(test)]
     pub(super) fn chain(&self, idx: usize) -> Option<usize> {
         self.chain[idx]
     }

@@ -149,6 +149,13 @@ pub struct SsaTickTockKernelBuilder {
     /// Timeline of the CP-SAT scratch cumulative (default `Phase`). Set before
     /// `build_and_schedule_cpsat`; applies to the per-section and full-kernel solves.
     pub cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime,
+    /// Individually forced shifts for `build_and_schedule_greedy` (ops that must run as 8
+    /// scalar ALU ops); `build_and_schedule_cpsat` takes them as an argument. Set after `new()`.
+    pub greedy_forced_shifts: Option<HashSet<usize>>,
+    /// The VALU shift mode requested for `build_and_schedule_greedy`. It only decides whether
+    /// `greedy_forced_shifts` applies (`PipelineConfig::forced_shift_ids`): the greedy-only
+    /// build does not apply the mode itself. Set after `new()`.
+    pub greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
@@ -674,6 +681,9 @@ impl SsaTickTockKernelBuilder {
         if let Err(e) = config.spec.check_access_plan() {
             panic!("invalid emission plan: {}", e);
         }
+        if let Err(e) = config.spec.check_critical_path_options() {
+            panic!("invalid critical-path options: {}", e);
+        }
         let uses_depth4 = if config.spec.access_plan.is_some() {
             // Some group selects among the cached level-4 nodes.
             [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius]
@@ -707,6 +717,8 @@ impl SsaTickTockKernelBuilder {
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
             cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime::default(),
+            greedy_forced_shifts: None,
+            greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode::Optimize,
         }
     }
 
@@ -820,6 +832,8 @@ impl SsaTickTockKernelBuilder {
                 }),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             greedy_verbose: verbose,
+            forced_shifts: self.greedy_forced_shifts.clone(),
+            valu_shift_mode: self.greedy_valu_shift_mode,
             ..Default::default()
         };
         config.bounds.greedy_use_full_bounds = self.config.compiler.greedy_use_full_bounds;
@@ -1119,12 +1133,21 @@ impl SsaTickTockKernelBuilder {
         // repair itself and the checks of its result use the model's timeline.
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
+        // CPSAT_SECTION_CHECK_TIMELINE=model (analysis, e.g. the window probe): decide on the
+        // model's own timeline instead. Its count has no per-lane shifted cycles, so it can
+        // miss an over-budget section; the window probe's all-fixed check then rejects the
+        // reference, so this cannot produce an invalid kernel unnoticed.
+        let check_timeline = if std::env::var("CPSAT_SECTION_CHECK_TIMELINE").as_deref() == Ok("model") {
+            self.cpsat_scratch_time
+        } else {
+            crate::cpsat_scheduler::ScratchTime::Cycle
+        };
         let budget_result = section_budget(
             &ctx.ops,
             effective_budget,
             Some(&greedy_select_fma_ops),
             None,
-            crate::cpsat_scheduler::ScratchTime::Cycle, &scratch_aliases,
+            check_timeline, &scratch_aliases,
         );
         let n_exceeding: usize = budget_result
             .section_exceeds_budget

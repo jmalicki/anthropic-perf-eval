@@ -116,13 +116,15 @@ impl Pass for TransformPass {
         let n_nodes = ctx.config.compiler.transform_n_nodes;
         let mut summaries = Vec::new();
         for t in transforms {
+            // A copy: on an error the context keeps the program as it was before this
+            // transform (the earlier transforms' result), for the error export.
             let program = SsaProgram {
-                ops: std::mem::take(&mut ctx.ops),
-                vreg_def: std::mem::take(&mut ctx.vreg_def),
+                ops: ctx.ops.clone(),
+                vreg_def: ctx.vreg_def.clone(),
                 vreg_count: ctx.vreg_count,
-                const_alternatives: std::mem::take(&mut ctx.const_alternatives),
+                const_alternatives: ctx.const_alternatives.clone(),
                 zero_vreg: ctx.zero_vreg,
-                vector_group_lanes: std::mem::take(&mut ctx.vector_group_lanes),
+                vector_group_lanes: ctx.vector_group_lanes.clone(),
             };
             let (program, outcome) = apply_transform_with(program, t, batch_size, n_nodes)?;
             if outcome.sites == 0 {

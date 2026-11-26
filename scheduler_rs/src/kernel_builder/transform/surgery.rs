@@ -144,8 +144,8 @@ pub struct Surgery {
     removed: BTreeSet<usize>,
     before: BTreeMap<usize, Vec<Slot>>,
     after: BTreeMap<usize, Vec<Slot>>,
-    /// Original ops placed elsewhere (`move_after`).
-    moved: BTreeSet<usize>,
+    /// Original ops placed elsewhere (`move_after`): op index -> the original op it now follows.
+    moved: BTreeMap<usize, usize>,
     rename: BTreeMap<VReg, VReg>,
     /// Value -> indices of `ConstChoice` / `Const` ops producing it, increasing (lookup only).
     const_ops: HashMap<i64, Vec<usize>>,
@@ -200,11 +200,21 @@ pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool, foreign: impl Fn
 }
 
 /// Which ops dead code elimination keeps, by index.
+///
+/// A value named in a kept op's `keep_live` or `delta_vreg` is kept too (with what it reads):
+/// the emitter's dead code elimination follows `srcs` only, so on this private copy those
+/// entries are appended to `srcs`.
 fn dce_live(ops: &[SsaOp], program: &SsaProgram) -> Vec<bool> {
     let mut ops: Vec<SsaOp> = ops.to_vec();
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     for (i, op) in ops.iter_mut().enumerate() {
         op.id = i;
+        if let Some(keep) = op.keep_live.clone() {
+            op.srcs.extend(keep.into_iter().map(Operand::VReg));
+        }
+        if let Some(delta) = op.delta_vreg {
+            op.srcs.push(Operand::VReg(delta));
+        }
         if let Some(d) = op.dest {
             vreg_def.entry(d).or_insert(i);
         }
@@ -372,7 +382,7 @@ impl Surgery {
             removed: BTreeSet::new(),
             before: BTreeMap::new(),
             after: BTreeMap::new(),
-            moved: BTreeSet::new(),
+            moved: BTreeMap::new(),
             rename: BTreeMap::new(),
             const_ops,
             broadcast_ops,
@@ -439,25 +449,57 @@ impl Surgery {
     /// * `at` - Original op index they go after.
     ///
     /// # Returns
-    /// An error if an op that stays in place reads one of them at or before `at` (or one is
-    /// not before `at`); then nothing is recorded.
+    /// An error if an op outside the group that is not removed reads one of them, or names its
+    /// value in `keep_live`, and is placed at or before `at` (its own position, or the op an
+    /// earlier `move_after` put it after), if one is not before `at`, or if one was already
+    /// moved or removed (an op has one placement); then nothing is recorded.
     pub fn move_after(&mut self, idxs: &[usize], at: usize) -> Result<(), String> {
         let group: BTreeSet<usize> = idxs.iter().copied().collect();
         let graph = SsaGraph::new(&self.program.ops, &self.program.vector_group_lanes);
+        // The op defining `v`, or the vector `v` is a lane of.
+        let definer = |v: VReg| graph.def_index(v).or_else(|| graph.element_of(v).and_then(|(vec, _)| graph.def_index(vec)));
         for &idx in &group {
             if idx >= at {
                 return Err(format!("op {} is not before op {}", idx, at));
             }
-            let stays = |r: &usize| !group.contains(r) && !self.removed.contains(r) && !self.moved.contains(r);
-            if let Some(&r) = graph.readers(idx).iter().find(|&&r| r <= at && stays(&r)) {
+            if self.moved.contains_key(&idx) {
+                return Err(format!("op {} is already moved", idx));
+            }
+            if self.removed.contains(&idx) {
+                return Err(format!("op {} is removed", idx));
+            }
+            // A reader outside the group that is placed at or before `at`.
+            let before_at = |r: &usize| {
+                !group.contains(r) && !self.removed.contains(r) && self.moved.get(r).copied().unwrap_or(*r) <= at
+            };
+            if let Some(&r) = graph.readers(idx).iter().find(|&r| before_at(r)) {
                 return Err(format!("op {} is read by op {} before op {}", idx, r, at));
+            }
+            let keeper = (0..self.program.ops.len()).find(|&r| {
+                before_at(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
+            });
+            if let Some(r) = keeper {
+                return Err(format!("op {} is kept live by op {} before op {}", idx, r, at));
+            }
+            // A new op queued next to an original op at or before `at` that reads it (or keeps
+            // it live).
+            let queued = self.before.range(..=at).chain(self.after.range(..=at));
+            let reads_idx = |op: &SsaOp| op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| definer(v) == Some(idx));
+            if let Some((&k, _)) = queued.into_iter().find(|(_, slots)| slots.iter().any(|s| matches!(s, Slot::New(op) if reads_idx(op)))) {
+                return Err(format!("op {} is read by an op inserted next to op {} before op {}", idx, k, at));
             }
         }
         for idx in group {
-            self.moved.insert(idx);
+            self.moved.insert(idx, at);
             self.after.entry(at).or_default().push(Slot::Moved(idx));
         }
         Ok(())
+    }
+
+    /// Whether original op `i` is still in the program and placed at or before original op
+    /// `after` (its own position, or the op it was moved after).
+    fn visible_at(&self, i: usize, after: usize) -> bool {
+        !self.removed.contains(&i) && self.moved.get(&i).copied().unwrap_or(i) <= after
     }
 
     /// A new vector op `dest = opcode(srcs)` (VALU), inserted before `at`.
@@ -484,12 +526,14 @@ impl Surgery {
 
     /// Every reader of `old` reads `new` instead.
     pub fn replace_uses(&mut self, old: VReg, new: VReg) {
-        self.rename.insert(old, new);
+        if old != new {
+            self.rename.insert(old, new);
+        }
     }
 
     /// The scalar constant `value` visible right after original op `after`: an existing
-    /// `ConstChoice` / `Const` created at or before it (the first such, as the emitter's CSE
-    /// returns), one this surgery created at an anchor at or before it, the zero register for
+    /// `ConstChoice` / `Const` placed at or before it (the first such, as the emitter's CSE
+    /// returns; a moved op counts at the op it was moved after), one this surgery created at an anchor at or before it, the zero register for
     /// 0, or else a new `ConstChoice` inserted after `after` (alternatives set by `finish`).
     ///
     /// # Arguments
@@ -505,7 +549,7 @@ impl Surgery {
                 return z;
             }
         }
-        if let Some(&i) = self.const_ops.get(&value).and_then(|v| v.iter().find(|&&i| i <= after && !self.removed.contains(&i))) {
+        if let Some(&i) = self.const_ops.get(&value).and_then(|v| v.iter().find(|&&i| self.visible_at(i, after))) {
             return self.program.ops[i].dest.expect("constant op has a dest");
         }
         if let Some(&(a, v)) = self.new_consts.get(&value) {
@@ -523,7 +567,7 @@ impl Surgery {
     }
 
     /// `vbroadcast(scalar)` visible right after original op `after`: an existing broadcast of
-    /// `scalar` at or before it, one this surgery created, or a new one inserted after
+    /// `scalar` placed at or before it (a moved one counts at the op it was moved after), one this surgery created, or a new one inserted after
     /// `after`.
     ///
     /// # Arguments
@@ -534,7 +578,7 @@ impl Surgery {
     /// # Returns
     /// The vector VReg.
     pub fn broadcast(&mut self, scalar: VReg, after: usize, stamp: &Stamp) -> VReg {
-        if let Some(&i) = self.broadcast_ops.get(&scalar).and_then(|v| v.iter().find(|&&i| i <= after && !self.removed.contains(&i))) {
+        if let Some(&i) = self.broadcast_ops.get(&scalar).and_then(|v| v.iter().find(|&&i| self.visible_at(i, after))) {
             return self.program.ops[i].dest.expect("broadcast has a dest");
         }
         if let Some(&(a, v)) = self.new_broadcasts.get(&scalar) {
@@ -605,12 +649,20 @@ impl Surgery {
     /// reason, or an error for an inconsistency.
     pub fn finish_or_refuse(self) -> Result<Finished, String> {
         let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
+        // Every rename chain must end (resolve below then terminates).
+        for &start in rename.keys() {
+            let mut seen: HashSet<VReg> = HashSet::from([start]);
+            let mut v = start;
+            while let Some(&to) = rename.get(&v) {
+                if !seen.insert(to) {
+                    return Err(format!("rename cycle through {:?}", start));
+                }
+                v = to;
+            }
+        }
         let resolve = |mut v: VReg| {
-            let mut guard = 0;
             while let Some(&to) = rename.get(&v) {
                 v = to;
-                guard += 1;
-                assert!(guard < 1000, "rename cycle");
             }
             v
         };
@@ -618,20 +670,18 @@ impl Surgery {
 
         // 1. Splice, with the origin of each op.
         let mut seq: Vec<(SsaOp, Option<usize>)> = Vec::with_capacity(program.ops.len());
+        // A moved op that was removed afterwards is not placed anywhere.
         let slot = |s: Slot| match s {
-            Slot::New(op) => (op, None),
-            Slot::Moved(j) => (program.ops[j].clone(), Some(j)),
+            Slot::New(op) => Some((op, None)),
+            Slot::Moved(j) if removed.contains(&j) => None,
+            Slot::Moved(j) => Some((program.ops[j].clone(), Some(j))),
         };
         for (i, op) in program.ops.iter().enumerate() {
-            for s in before.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
-            if !removed.contains(&i) && !moved.contains(&i) {
+            seq.extend(before.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
+            if !removed.contains(&i) && !moved.contains_key(&i) {
                 seq.push((op.clone(), Some(i)));
             }
-            for s in after.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
+            seq.extend(after.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
         }
         // 2. Rewire.
         if !rename.is_empty() {
@@ -689,11 +739,13 @@ impl Surgery {
             let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
             let dangling = |op: &SsaOp| {
-                op_reads(op).any(|v| {
+                op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| {
+                    // Defined, a group alias all of whose lanes are defined, or a lane of a
+                    // defined vector: anything else is gone.
                     Some(v) != program.zero_vreg
                         && graph.def_index(v).is_none()
-                        && graph.group_lanes(v).is_none()
-                        && graph.element_of(v).is_none()
+                        && !graph.group_lanes(v).map_or(false, |ls| ls.iter().all(|l| graph.def_index(*l).is_some()))
+                        && !graph.element_of(v).map_or(false, |(vec, _)| graph.def_index(vec).is_some())
                 })
             };
             let before_len = kept.len();
@@ -749,8 +801,15 @@ impl Surgery {
             }
             if why.is_none() {
                 let survived: BTreeSet<usize> = kept.iter().filter_map(|(_, o)| *o).collect();
-                if let Some(i) = (0..program.ops.len())
-                    .find(|&i| live_before[i] && !survived.contains(&i) && program.ops[i].trace_id.is_some())
+                // A dropped traced op is refused unless a surviving op carries its trace id
+                // (hash-merge moves the id of the XOR it replaces to the new XOR); a trace id
+                // that no surviving op carries would be lost.
+                let carried: BTreeSet<&str> = kept.iter().filter_map(|(o, _)| o.trace_id.as_deref()).collect();
+                if let Some(i) = (0..program.ops.len()).find(|&i| {
+                    live_before[i]
+                        && !survived.contains(&i)
+                        && program.ops[i].trace_id.as_deref().map_or(false, |t| !carried.contains(t))
+                })
                 {
                     why = Some(format!("the edit would drop op {}, which carries a trace id", i));
                 }

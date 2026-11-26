@@ -717,6 +717,41 @@ def check_bit_path_steps_needs_boolean(ctx=None) -> tuple[str, str, float, dict]
     return ("R15-bit-path-steps-needs-boolean", str(solver.check()), 0.0, _stats(solver))
 
 
+def check_gather_xor_reassociation(ctx=None) -> tuple[str, str, float, dict]:
+    """R16: val ^ (node ^ K) = (val ^ K) ^ node for every 32-bit val, node and the deferred
+    stage-5 constant K: the constant can go into the value (ready before the gather returns)
+    instead of the loaded node, so one XOR follows the load. Same op count."""
+    val, node = _bv("val"), _bv("node")
+    k = _const(STAGE5_XOR_CONST)
+    return _refute("R16-gather-xor-reassociation", val ^ (node ^ k) != (val ^ k) ^ node, ctx=ctx)
+
+
+def check_index_early_terms(ctx=None) -> tuple[str, str, float, dict]:
+    """R17: a consumer V - n' of the mirrored update n' = 2n + bit equals
+    multiply_add(n, -2, V) - bit (mod 2^32), whose multiply_add needs only n: the final index
+    store (V = L) and a gather address (V = forest_p + L) keep one op after the newest bit."""
+    v, n, bit = _bv("V"), _bv("n"), _bv("bit")
+    minus2 = _const(0xFFFFFFFE)
+    return _refute("R17-index-early-terms", v - (_const(2) * n + bit) != (n * minus2 + v) - bit, ctx=ctx)
+
+
+def check_index_early_terms_needs_wrap(ctx=None) -> tuple[str, str, float, dict]:
+    """R17-needs-wrap: with -2 replaced by 2 the early form is wrong (SAT): the constant is
+    the two's complement of 2, not 2."""
+    v, n, bit = _bv("V"), _bv("n"), _bv("bit")
+    solver = Solver(ctx=ctx)
+    solver.add(v - (_const(2) * n + bit) != (n * _const(2) + v) - bit)
+    return ("R17-index-early-terms-needs-wrap", str(solver.check()), 0.0, _stats(solver))
+
+
+def check_select_xor_pushdown(ctx=None) -> tuple[str, str, float, dict]:
+    """R18: val ^ select(c, hi, lo) = select(c, val ^ hi, val ^ lo) for every condition, so
+    the round XOR can run on both select operands in parallel with the branch bit."""
+    val, hi, lo, c = _bv("val"), _bv("hi"), _bv("lo"), _bv("c")
+    cond = c != _const(0)
+    return _refute("R18-select-xor-pushdown", val ^ If(cond, hi, lo) != If(cond, val ^ hi, val ^ lo), ctx=ctx)
+
+
 # =============================================================================
 # Normal forms used by the SSA equivalence checker (verification/ssa_equivalence.py)
 # =============================================================================
@@ -869,8 +904,10 @@ REWRITE_CHECKS = [
     ("R10-mirror-uses-general", "Mirror-index use rewrites hold for any constants", check_mirror_uses_general),
     ("R15-bit-path-steps", "Bit-path forms: each step of the select-bits-path analysis is an identity", check_bit_path_steps),
     ("R15-bit-path-steps-needs-boolean", "AND reads the addend back only if it is 0/1 (SAT)", check_bit_path_steps_needs_boolean),
-
-
+    ("R16-gather-xor-reassociation", "Deferred constant XORed into the value instead of the gathered node", check_gather_xor_reassociation),
+    ("R17-index-early-terms", "V - (2n + bit) = madd(n, -2, V) - bit: one op after the newest bit", check_index_early_terms),
+    ("R17-index-early-terms-needs-wrap", "With +2 instead of -2 the early form is wrong (SAT)", check_index_early_terms_needs_wrap),
+    ("R18-select-xor-pushdown", "Round XOR pushed below the top select", check_select_xor_pushdown),
     ("R21-linear-normal-form", "+, -, constant multiples and constant left shifts form linear forms", check_linear_normal_form),
     ("R22-xor-normal-form", "XOR expressions are a constant XOR a set of atoms", check_xor_normal_form),
     ("R23-equality-as-difference", "a == b is a - b == 0 (either sign)", check_equality_as_difference),
@@ -889,6 +926,7 @@ EXPECT_SAT = {
     "R14-mobius-select-needs-boolean",
     "R15-bits-from-index-needs-range",
     "R15-bit-path-steps-needs-boolean",
+    "R17-index-early-terms-needs-wrap",
 }
 
 

@@ -68,6 +68,18 @@ _n_nodes = n_nodes_for_height
 # CP-SAT tuning switches (kept together, apart from the other option helpers)
 # ----------------------------------------------------------------------------
 
+def _early_stagger(text):
+    """K:S for --greedy-early-stagger: K >= 1 groups, S >= 0 cycles."""
+    try:
+        k, sep, c = text.partition(":")
+        k, c = int(k), int(c)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected K:S (two integers), got {text!r}")
+    if not sep or k < 1 or c < 0:
+        raise argparse.ArgumentTypeError(f"expected K:S with K >= 1 and S >= 0, got {text!r}")
+    return (k, c)
+
+
 def _positive_int(text: str) -> int:
     """argparse type: an integer greater than zero."""
     try:
@@ -208,6 +220,9 @@ EMISSION_DEFAULTS = {
     # Per round and group tree-access encodings (solver/emission_plan.py): a path, a plan dict,
     # or an expanded list. Passed to the binding expanded; None = choose from the flags above.
     "emission_plan": None,
+    "reassociate_gather_xor": False,
+    "index_early_terms": "none",
+    "select_xor_pushdown": "none",
     # Rewrite rules applied to the finished SSA program before scheduling (list of names, in
     # order); None = none. They read only the ops (scheduler_rs/src/kernel_builder/transform/).
     "transform": None,
@@ -262,6 +277,24 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "cached nodes instead of gathering. all (default): every visit (rounds 4 and 15 of "
                             "16). after-wrap: only visits after the first wrap (round 15); round 4 gathers. "
                             "Selecting costs 15 selects per group and saves 8 loads per group")
+    group.add_argument("--reassociate-gather-xor", action="store_true",
+                       default=EMISSION_DEFAULTS["reassociate_gather_xor"],
+                       help="Gather rounds: XOR the deferred hash constant into the value, not the loaded node: "
+                            "val ^ (node ^ K) = (val ^ K) ^ node, so one XOR instead of two follows the load "
+                            "(same op count; proof: R16-gather-xor-reassociation; docs/CRITICAL_PATH.md)")
+    group.add_argument("--index-early-terms", choices=["none", "final", "first-gather"],
+                       default=EMISSION_DEFAULTS["index_early_terms"],
+                       help="Mirrored index only: write consumers of n' = 2n + bit as madd(n, -2, V) - bit, so "
+                            "only one op follows the newest branch bit. 'final': the final index store (same op "
+                            "count); 'first-gather': also each group's first gather address after rounds "
+                            "without a gather (+1 op per such gather). Proof: R17-index-early-terms")
+    group.add_argument("--select-xor-pushdown", choices=["none", "first-pass", "all"],
+                       default=EMISSION_DEFAULTS["select_xor_pushdown"],
+                       help="Push the round XOR below the top select of a cached-level select tree: "
+                            "val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo), one cycle off the "
+                            "chain per select round, one more vector op per group and round; only where the top "
+                            "is a SelectChoice (bits-flow; bits from depth 2). 'first-pass': rounds before the "
+                            "wrap (the chain to the first gather). Proof: R18-select-xor-pushdown")
     group.add_argument("--emission-plan", default=EMISSION_DEFAULTS["emission_plan"], metavar="PATH",
                        help="JSON plan of the tree-access encoding (gather, bits, bits-flow, mobius) of every "
                             "group in every round, as written by scripts/emission_structure.py (format: "
@@ -443,7 +476,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--select-choice", choices=["optimize", "fma", "vselect"], default="optimize",
                        help="CP-SAT SelectChoice (default: optimize)")
     group.add_argument("--valu-shift", choices=["optimize", "alu", "valu"], default="optimize",
-                       help="CP-SAT VALU shift (default: optimize)")
+                       help="VALU shift (default: optimize): 'alu' every shiftable vector op as 8 scalar ops, "
+                            "'valu' none. Also under --use-greedy, where 'alu' is very slow (about one shifted "
+                            "op per cycle: 7,148 cycles at 16 rounds against 2,007; a warning is printed)")
     group.add_argument("--force-zero-gap", action="store_true",
                        help="Force 0 integral gap: prove the schedule optimal for the emitted ops (not for the problem)")
     group.add_argument("--asap-alap-tightening", choices=["none", "simple", "symmetry-aware", "energetic"],
@@ -498,6 +533,43 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
+    group.add_argument("--greedy-early-stagger", type=_early_stagger, default=None, metavar="K:S",
+                       help="Wavefront: the first K groups are staggered S cycles apart instead of "
+                            "--greedy-stagger-cycles (later groups keep that stagger after them); default off "
+                            "(docs/GREEDY_CONST_CHOICE.md)")
+    group.add_argument("--greedy-const-policy", choices=["default", "alu-first", "alu-when-load-full"],
+                       default="default",
+                       help="Greedy-only: where a ConstChoice is materialised. 'default' add_imm when the flow "
+                            "slot is free and idle, else a load; 'alu-first' derive it on the scalar ALU from "
+                            "two constants scheduled earlier and still live: an alternative the emitter offers, "
+                            "or else any a + b that equals it (non-negative, below 2^31); else the default; "
+                            "'alu-when-load-full' a load while a load slot is free, else ALU derivation, else "
+                            "the default (docs/GREEDY_CONST_CHOICE.md)")
+    group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
+                       help="Wavefront only (an error otherwise): 'key' (default) native scalar ops and "
+                            "shiftable vector ops in one wavefront order; 'native-first' native scalar-ALU ops "
+                            "(e.g. address adds) are tried before the cycle's vector ops (lanes of a split shift "
+                            "carried from the previous cycle are still placed first and can take scalar slots) "
+                            "(docs/STARTUP_AND_STALL_LOOP.md)")
+    group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first", "chain-first"], default="key",
+                       help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "
+                            "wavefront key; 'feeds-load-first' flow ops that a non-final load depends on (the "
+                            "selects before the mid-kernel gathers) before the others "
+                            "(docs/GREEDY_SHAPE_ABLATION.md section 12); 'chain-first' flow ops by group (chain) rank, then key")
+    group.add_argument("--greedy-select-overflow", choices=["never", "valu"], default="never",
+                       help="Where a SelectChoice with a one-op multiply_add form runs: 'never' (default) always "
+                            "a flow vselect; 'valu' the multiply_add on the vector ALU when the flow slot is taken "
+                            "in that cycle and a vector slot is free (docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-budget-force", choices=["same-cycle", "stall"], default="same-cycle",
+                       help="Scratch model words: when an op the greedy's budget check deferred is forced past "
+                            "the budget. 'same-cycle' (default) forces one deferred op per cycle whenever it has "
+                            "a slot, so a run that reaches the budget overshoots it and fails address "
+                            "assignment; 'stall' forces only in a cycle where nothing else was placed, as the "
+                            "pools model does (docs/SCRATCH_CEILING_DIAGNOSIS.md). Not safe on every plan: a run can "
+                            "paint itself in and then stay over budget (docs/STALL_DEADLOCK.md)")
+    group.add_argument("--greedy-select-overflow-limit", type=_positive_int, default=None, metavar="N",
+                       help="With --greedy-select-overflow valu: at most N selects take the multiply_add form "
+                            "(default: no limit). The structure model's floor resolution gives one value")
     group.add_argument("--greedy-justify", type=_non_negative_int, default=0, metavar="N",
                        help="Shorten the greedy schedule by forward/backward justification, at most N "
                             "iterations (default 0 = off). Keeps the greedy's const/select encodings; a "
@@ -582,6 +654,81 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     return group
 
 
+def check_greedy_shape_combinations(get) -> None:
+    """Reject greedy shape options that would be silently ignored (same rules as Rust's
+    `config::check_greedy_shape_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-select-overflow-limit without --greedy-select-overflow valu;
+            --greedy-load-priority or --greedy-flow-priority other than key without
+            --greedy-priority wavefront;
+            --greedy-select-overflow valu when a fixed select encoding (--select-choice fma or
+            vselect), the select-choice hint pass (--select-choice-hint-pass, --hint-passes) or
+            --schedule-with-fixed-choices owns the select encoding.
+    """
+    overflow = get("greedy_select_overflow", "never")
+    if get("greedy_select_overflow_limit") is not None and overflow != "valu":
+        raise ValueError("--greedy-select-overflow-limit needs --greedy-select-overflow valu; otherwise it is ignored")
+    load_priority = get("greedy_load_priority", "key")
+    if load_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-load-priority {load_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    flow_priority = get("greedy_flow_priority", "key")
+    if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    alu_priority = get("greedy_alu_priority", "key")
+    if alu_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-alu-priority {alu_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    if overflow == "valu":
+        select_choice = get("select_choice", "optimize")
+        if select_choice != "optimize":
+            owner = f"--select-choice {select_choice}"
+        elif get("hint_passes", False) or get("enable_select_choice_hint_pass", False):
+            owner = "the select-choice hint pass (--select-choice-hint-pass / --hint-passes)"
+        elif get("enable_schedule_with_fixed_choices", False):
+            owner = "--schedule-with-fixed-choices"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-select-overflow valu is ignored when {owner} owns the select encoding")
+
+
+def check_encoding_option_combinations(get) -> None:
+    """Reject encoding options another option would silently override or ignore (same rules
+    as Rust's `config::check_encoding_option_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-early-stagger without --greedy-priority wavefront; a forced
+            --const-choice / --select-choice / --valu-shift together with the hint pass that
+            would overwrite it (--*-hint-pass, --hint-passes); --greedy-const-policy other than
+            default under CP-SAT (no --use-greedy), with a forced --const-choice, or with the
+            const-choice hint pass, all of which own the ConstChoice encoding instead.
+    """
+    if get("greedy_early_stagger") is not None and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError("--greedy-early-stagger staggers the wavefront priority only; it needs --greedy-priority wavefront")
+    all_hints = get("hint_passes", False)
+    for name, hint in (("const_choice", "const_choice"), ("select_choice", "select_choice"), ("valu_shift", "valu_shift")):
+        forced = get(name, "optimize")
+        if forced != "optimize" and (all_hints or get(f"enable_{hint}_hint_pass", False)):
+            flag = name.replace("_", "-")
+            raise ValueError(f"--{flag} {forced} forces the encoding, and the {flag} hint pass "
+                             f"(--{flag}-hint-pass / --hint-passes) would overwrite it; use one or the other")
+    policy = get("greedy_const_policy", "default")
+    if policy != "default":
+        if not get("use_greedy", False):
+            owner = "CP-SAT (it is greedy-only: the CP-SAT hint cannot name an ALU derivation; add --use-greedy)"
+        elif get("const_choice", "optimize") != "optimize":
+            owner = f"--const-choice {get('const_choice')}"
+        elif all_hints or get("enable_const_choice_hint_pass", False):
+            owner = "the const-choice hint pass (--const-choice-hint-pass / --hint-passes)"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-const-policy {policy} is ignored when {owner} owns the ConstChoice encoding")
+
+
 def args_to_build_kwargs(
     args=None,
     *,
@@ -609,6 +756,14 @@ def args_to_build_kwargs(
             return getattr(args, name, default)
         return default
 
+    check_greedy_shape_combinations(get)
+    check_encoding_option_combinations(get)
+    # Not with --no-valu-shift: shifting is off, so --valu-shift alu shifts nothing.
+    if get("use_greedy", False) and get("valu_shift", "optimize") == "alu" and get("enable_valu_shift", True):
+        import sys as _sys
+        print("WARNING: --valu-shift alu under --use-greedy runs every shiftable vector op as 8 scalar ops, "
+              "about one per cycle on the 12 scalar slots: expect a schedule several times longer "
+              "(16 rounds: 7,148 cycles against 2,007)", file=_sys.stderr)
     forest_height = get("forest_height", 10)
     n_nodes_val = get("n_nodes")
     n_nodes = n_nodes_val if n_nodes_val is not None else _n_nodes(forest_height)
@@ -700,6 +855,13 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
+        "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
+        "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -762,6 +924,13 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
+        "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
+        "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

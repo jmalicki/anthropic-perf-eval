@@ -275,7 +275,8 @@ impl Pass for ScheduleWithFixedChoicesPass {
 
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         // Encodings are fixed here, so the scheduler makes no split shifts; the lane cycles
-        // of the first greedy run no longer apply.
+        // of the first greedy run no longer apply. Forced shifts need no extra handling: the
+        // first greedy run recorded them in `shifted_ops`, which is the fixed encoding here.
         let shape = ctx.config.compiler.greedy_shape();
         let mut shifted_lane_cycles = std::collections::HashMap::new();
         let greedy_budget = ctx.greedy_budget();
@@ -304,6 +305,12 @@ impl Pass for ScheduleWithFixedChoicesPass {
                 &mut shifted_lane_cycles,
             )?;
         ctx.greedy_decisions.shifted_alu_cycles = shifted_lane_cycles;
+        // A derivation the rerun could not honour was scheduled as a load: record what was
+        // scheduled, so lowering never emits an ALU op the schedule did not place.
+        let demoted = ssa_greedy::reconcile_const_choice_encodings(
+            &mut ctx.greedy_decisions.const_choice_encoding,
+            &diagnostics.const_alu_derive,
+        );
 
         ctx.greedy_metrics = crate::kernel_builder::pipeline::SchedulingMetrics {
             cycles,
@@ -314,6 +321,6 @@ impl Pass for ScheduleWithFixedChoicesPass {
             over_budget_cycles: diagnostics.over_budget_cycles,
         };
 
-        Ok(format!("{} cycles (fixed choices)", cycles))
+        Ok(format!("{} cycles (fixed choices; {} ALU-derived constants rescheduled as loads)", cycles, demoted))
     }
 }
