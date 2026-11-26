@@ -41,7 +41,7 @@ A `note:` line lists select conditions that were lowered to `multiply_add` but a
 
 ## Limits
 
-- It proves kernel = SSA program. It does not prove SSA program = reference kernel; `--validate` still checks that numerically.
+- It proves kernel = SSA program. It does not prove SSA program = reference kernel; `--validate` still checks that numerically. To prove a rewritten SSA program equals the canonical one, use `verification.ssa_equivalence` (skill use-ssa-equivalence).
 - Algebraic identities it knows: constant folding, commutativity, `c*(t-f)+f = select(c,t,f)`, `(x-y)+y = x`. A new lowering that relies on another identity will show up as a `foreign-value` on a correct kernel; add the identity to `Terms` with a unit test in `tests/test_kernel_dataflow.py`.
 - Straight-line kernels only (no jumps).
 

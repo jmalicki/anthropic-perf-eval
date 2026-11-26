@@ -280,3 +280,28 @@ def test_relaxed_scratch_build_is_marked_and_kept_off_normal_paths(tmp_path, mon
     monkeypatch.setattr(sys, "argv", ["generate_ssa_kernel.py", "--validate-only", "kernel_relaxed_scratch.json"])
     assert generate_ssa_kernel.main() == 0
     assert "RELAXED-SCRATCH kernel" in capsys.readouterr().out
+
+
+def test_greedy_shift_policy_and_load_priority_flags():
+    """--greedy-shift-policy, --greedy-shift-target and --greedy-load-priority default to the
+    historical behaviour and are passed to the binding and recorded."""
+    import argparse
+
+    from kernel_build_args import add_kernel_build_args
+
+    default = args_to_build_kwargs(None, use_greedy=True, use_git_sha=False)
+    recorded = json.loads(default["run_options_json"])
+    assert (default["greedy_shift_policy"], default["greedy_shift_target"], default["greedy_load_priority"]) == (
+        "when-full", None, "key")
+    assert (recorded["greedy_shift_policy"], recorded["greedy_load_priority"]) == ("when-full", "key")
+
+    parser = argparse.ArgumentParser()
+    add_kernel_build_args(parser)
+    kwargs = args_to_build_kwargs(parser.parse_args(
+        ["--use-greedy", "--greedy-shift-policy", "reserve-pace", "--greedy-shift-target", "1300",
+         "--greedy-load-priority", "final-last"]), use_git_sha=False)
+    assert (kwargs["greedy_shift_policy"], kwargs["greedy_shift_target"], kwargs["greedy_load_priority"]) == (
+        "reserve-pace", 1300, "final-last")
+    assert json.loads(kwargs["run_options_json"])["greedy_load_priority"] == "final-last"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--greedy-load-priority", "nope"])
