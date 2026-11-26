@@ -177,20 +177,19 @@ mod ssa_tests {
             eliminate_ssa_dead_code(emit.take_ops(), &mut vreg_def, &mut const_alternatives, zero, None);
         assert!(alts_of_neg(&ops).contains(&sub), "DCE keeps the zero-operand alternative");
         compute_ssa_dependencies(&mut ops, &new_vreg_def, zero, None);
-        let r = schedule_ssa_cpsat(
-            &ops,
-            SsaCpsatConfig {
-                time_limit_secs: 10.0,
-                verbose: false,
-                enable_valu_shift: false,
-                scratch_budget: 1536,
-                ..Default::default()
-            },
-            SsaCpsatHints::default(),
-            None,
-        )
-        .expect("a zero operand is not a missing producer")
-        .expect("feasible");
+        let config = SsaCpsatConfig {
+            time_limit_secs: 10.0,
+            verbose: false,
+            enable_valu_shift: false,
+            scratch_budget: 1536,
+            ..Default::default()
+        };
+        // Without a reserved zero the same alternative reads a value nothing produces.
+        let err = schedule_ssa_cpsat(&ops, config.clone(), SsaCpsatHints::default(), None).unwrap_err();
+        assert!(err.contains("reads a value no op produces"), "{}", err);
+        let r = schedule_ssa_cpsat(&ops, config, SsaCpsatHints { zero_reserved: true, ..Default::default() }, None)
+            .expect("a reserved zero operand is not a missing producer")
+            .expect("feasible");
         assert!(!r
             .const_choice_encoding
             .values()

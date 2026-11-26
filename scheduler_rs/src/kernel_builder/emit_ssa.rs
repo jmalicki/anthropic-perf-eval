@@ -1294,10 +1294,10 @@ pub fn drop_alternatives_without_producer(ops: &mut [SsaOp], zero_reserved: bool
 
 /// True when `value` is the hardware zero with no producing op: the one operand of an
 /// ALU-derived `ConstChoice` alternative that [`drop_alternatives_without_producer`] keeps
-/// without a producer (only when the zero VReg is reserved; the emitter lists 0 as an
-/// operand only then).
-pub fn zero_operand_has_no_producer(value: i64, producer: Option<usize>) -> bool {
-    value == 0 && producer.is_none()
+/// without a producer. False unless `zero_reserved`: without a reserved zero VReg address 0
+/// is ordinary scratch, so a missing 0 is a missing operand like any other.
+pub fn zero_operand_has_no_producer(value: i64, producer: Option<usize>, zero_reserved: bool) -> bool {
+    zero_reserved && value == 0 && producer.is_none()
 }
 
 /// Eliminate SSA dead code: remove ops whose result has no users.

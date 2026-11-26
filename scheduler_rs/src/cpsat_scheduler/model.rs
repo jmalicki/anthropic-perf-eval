@@ -1481,8 +1481,10 @@ pub fn schedule_ssa_cpsat(
                             // producing op) is kept by DCE but cannot be expressed here: the
                             // chosen derivation names its operands by producer op id. Off.
                             use crate::kernel_builder::emit_ssa::zero_operand_has_no_producer;
-                            let only_zero_missing = (producers.0.is_some() || zero_operand_has_no_producer(deps[0], producers.0))
-                                && (producers.1.is_some() || zero_operand_has_no_producer(deps[1], producers.1));
+                            let zero_ok = |value: i64, producer: Option<usize>| {
+                                producer.is_some() || zero_operand_has_no_producer(value, producer, hints.zero_reserved)
+                            };
+                            let only_zero_missing = zero_ok(deps[0], producers.0) && zero_ok(deps[1], producers.1);
                             let (left_idx, right_idx) = match producers {
                                 (Some(l), Some(r)) => (l, r),
                                 _ if only_zero_missing || initial_live.is_some() => {
