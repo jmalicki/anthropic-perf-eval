@@ -242,7 +242,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="collect: dataset to write")
     args = ap.parse_args(argv)
     if args.command == "collect":
-        collect(args.state, args.measured, args.out or args.data, judge=args.judge)
+        if not args.out:
+            ap.error("collect needs --out (it rewrites this judge's records in that file, so the "
+                     "checked-in dataset is only written when named)")
+        collect(args.state, args.measured, args.out, judge=args.judge)
         return 0
     res = analyse(load(args.data, args.judge))
     report(res)

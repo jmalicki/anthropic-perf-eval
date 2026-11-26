@@ -220,6 +220,9 @@ EMISSION_DEFAULTS = {
     # Per round and group tree-access encodings (solver/emission_plan.py): a path, a plan dict,
     # or an expanded list. Passed to the binding expanded; None = choose from the flags above.
     "emission_plan": None,
+    # Rewrite rules applied to the finished SSA program before scheduling (list of names, in
+    # order); None = none. They read only the ops (scheduler_rs/src/kernel_builder/transform/).
+    "transform": None,
 }
 
 
@@ -276,6 +279,13 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "group in every round, as written by scripts/emission_structure.py (format: "
                             "solver/emission_plan.py). Replaces --cached-select, --tree-reduce-max-depth and "
                             "--depth4-select-rounds for the tree access. See docs/EMISSION_STRUCTURE_MODEL.md")
+    group.add_argument("--transform", action="append", choices=["hash-merge"], default=EMISSION_DEFAULTS["transform"],
+                       metavar="RULE",
+                       help="Rewrite the finished SSA program with RULE before scheduling (repeatable; applied in "
+                            "order). hash-merge: find hash stages x = a*m + c; (x + d) ^ (x << k) from the ops "
+                            "alone and rewrite them to (a*m + c+d) ^ (a*(m<<k) + (c<<k)), the program "
+                            "--merge-hash-stages emits (proof: R8-hash-stage-merge-general; with --merge-hash-stages "
+                            "there is nothing left to merge and it warns). Off by default")
     return group
 
 

@@ -8,12 +8,16 @@ kernel. Tables come from `uv run python -m scripts.schedule_report --table`.
 
 ## 0. Latest: what limits useful shifting (section 12)
 
-The greedy's shift count is a symptom of its cycle count, not a cause. Every vector op it does
-not shift takes one vector slot, so `V - s = 6T - I` exactly (V vector ops, s shifted, T cycles,
-I idle vector slots). The vector ALU is busy in every steady-state cycle, so a schedule that is
-longer for any reason shifts fewer ops. For `flow90.json` (1,039): 32 of its 42 cycles above
+Every vector op the greedy does not shift takes one vector slot, so `V - s = 6T - I` exactly
+(V vector ops, s shifted, T cycles, I idle vector slots). The identity ties the shift count to
+the cycle count only for a fixed number of idle slots: at the same I, a schedule that is longer
+for any reason shifts fewer ops, but an idle cycle adds 1 to T and 6 to I and leaves s
+unchanged. The greedy's vector ALU is busy in every steady-state cycle, so here I is small and
+nearly constant. Forcing more shifts (`pace`, `reserve`, PR #73) made these schedules slower,
+which rules out too few shifts as the cause for those policies only; a shift decision can still
+delay a schedule under policies not tested. For `flow90.json` (1,039): 32 of its 42 cycles above
 the floor are needed by any schedule of that emission (static head/tail bound 1,029, a
-bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are scheduling loss. In shifts: the floor's split shifts 1,465 ops and the greedy
+bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). In shifts: the floor's split shifts 1,465 ops and the greedy
 1,307, 158 fewer. A schedule at 1,029 cycles **with the same 115 idle vector slots** could shift
 at most 1,367; one with more idle slots could shift more, so "98 of the 158 are out of reach" is
 conditional on I, not a bound. Each number below is labelled **removal** (a build with the
@@ -742,8 +746,9 @@ uv run python -m scripts.greedy_gap_diagnosis best.json --from 51 --slice 100
 
 ## 12. What limits useful shifting
 
-**Conclusion.** The number of vector ops the greedy shifts to the scalar ALU does not limit the
-schedule. It follows from the schedule's length. Every vector op left unshifted takes one
+**Conclusion.** For the shift policies tested here (`when-full`, `pace`, `reserve`), the number of
+vector ops the greedy shifts to the scalar ALU does not limit the schedule. At a fixed number of
+idle vector slots it follows from the schedule's length. Every vector op left unshifted takes one
 vector slot, so for vector ops V, shifted s, cycles T and idle vector slots I:
 
 ```
@@ -753,8 +758,9 @@ V - s = 6 T - I        (exact; checked on every schedule below)
 The vector ALU is busy in every steady-state cycle (I is 115 to 250 slots, all in the start-up
 and the tail). So a schedule that is longer for any reason shifts fewer ops. PR #74 found
 cycles = VALU ops left / 6 + 19 to 32 (Spearman +0.83 to +0.99). That is this identity, not a
-cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes schedules slower.
-The causes are elsewhere. "Needed by any schedule" is the static head/tail bound, a bound (row arithmetic argued by hand, checked by Z3 on random small DAGs):
+cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes the tuned schedules
+slower (`reserve` gained 3 cycles only on the untuned 1,104-cycle schedule, section 11). For those
+policies the causes are elsewhere; an untested shift policy can still delay a schedule. "Needed by any schedule" is the static head/tail bound, a bound (row arithmetic argued by hand, checked by Z3 on random small DAGs):
 SB1 in verification/static_bounds_proof.py (150 random DAGs of 3 to 7 ops at VLEN 2) and
 makespan_rows.py, not a proof for all graphs. In the last column each
 number is labelled: **removal** = a build with the cause removed or changed (an A/B), the only
@@ -762,15 +768,16 @@ kind that says what removing it buys; **accounting** = a decomposition of one sc
 
 | Plan (cycles) | Cycles above the floor | Needed by any schedule | The rest: what is known |
 |---|---|---|---|
-| `flow90.json`, index (1,039) | 42 (floor 997) | 32 (static head/tail bound 1,029, load row) | 10 cycles of scheduling loss (bound minus cycles); cause not identified |
+| `flow90.json`, index (1,039) | 42 (floor 997) | 32 (static head/tail bound 1,029, load row) | 10 cycles above the static bound (cycles minus bound: an upper bound on scheduling loss, the optimum is not known); cause not identified |
 | `r1 bits-flow` variant of a 1,039 plan, index (1,053) | 60 (floor 993) | 32 (bound 1,025) | Removal: `bits` instead of `bits-flow` in round 1 gives 1,039 (14 cycles); scratch-relaxed leaves 1,053 (not scratch). Hypothesis, from accounting: the longer flow queue in mid-schedule delays late groups into the load stream. Both interventions aimed at it are slower (feeds-load-first 1,074, overflow 1,067), so it is not established |
-| `path_flow90.json`, path (1,033) | 53 (floor 980) | 29 (bound 1,009) | 24 cycles of scheduling loss; removal: scratch-relaxed 1,034 (not scratch). #82 accounts for them (start-up load idle slots) |
+| `path_flow90.json`, path (1,033) | 53 (floor 980) | 29 (bound 1,009) | 24 cycles above the static bound (an upper bound on scheduling loss); removal: scratch-relaxed 1,034 (not scratch). #82 accounts for them (start-up load idle slots) |
 | probe A: `path_flow90.json` with `bits-flow` in round 4, path (1,101) | 124 (floor 977) | 32 (load bound 1,009); 73 for any schedule that runs every select on flow (flow row 1,050) | Removal: `--greedy-select-overflow valu` gave 1,054 with the undercounting live-word counter; with the counter fixed it exceeds the budget (peak 1,761). Removal: scratch-relaxed 1,093 |
 | `flow90.json`, path (1,105) | 108 (floor 997) | 32 (bound 1,029) | Removal (analysis only): scratch-relaxed gives 1,046, so the 1,536-word budget, or how the greedy meets it, costs up to 59 |
 
 In shift counts, for `flow90.json`: the floor's split is 1,465 and the greedy's is 1,307,
 158 "missing" shifts (`scripts.shift_limit_diagnosis` prints a different count, 6 x 42 - I =
-137, the shifts needed to close the 42 cycles to the floor at this schedule's idle slots). The
+137: the shifts a schedule at the floor with **no** idle vector slot would take beyond this one's.
+Closing the 42 cycles while keeping this schedule's 115 idle slots would need 6 x 42 = 252). The
 identity gives s = V - 6T + I, so the shifts a schedule can take depend on its idle vector
 slots I as well as on T. A schedule at the static bound of 1,029 cycles **with the same 115
 idle slots** could shift at most 1,367, 98 short of the floor's split; a schedule at 1,029 with
@@ -911,14 +918,14 @@ plans, so 32 is the first of a tie, not a measured offset.
 
 ### 12.4 Not verified
 
-- Why the 1,039 schedules lose their last 10 cycles.
+- Where the 1,039 schedules' 10 cycles above the static bound go (an upper bound on what scheduling could recover).
 - A select-resolution rule that wins on both the index and the path plans. Overflow keyed
   to a target count or to the scalar ALU's slack was not tried beyond the limits above.
 - A scratch term for path-bit plans. The 1,505-word ceiling is explained in
   docs/SCRATCH_CEILING_DIAGNOSIS.md: the pressure policy, needed because the `words` model
   forces budget-deferred ops in the same cycle (`--greedy-budget-force stall` removes the
   same-cycle force; not safe on every plan: 3 of 28 path-bit plans exceed the budget, see
-  docs/STALL_DEADLOCK.md on #88).
+  docs/STARTUP_AND_STALL_LOOP.md; diagnosed in docs/STALL_DEADLOCK.md, #88).
 - The model in other contexts (rounds, batch, values-only).
 - CP-SAT on any of these emissions (no whole-program CP-SAT, by the machine rules).
 
@@ -936,8 +943,12 @@ uv run python -m scripts.shift_limit_diagnosis s.json --floor 997
 # The flags of section 12.2 on top: --greedy-select-overflow valu [--greedy-select-overflow-limit N],
 # --greedy-flow-priority feeds-load-first. Scratch-relaxed analysis: --scratch-budget-override 4096.
 # Stage 1 with the greedy model
-uv run python -m scripts.emission_structure solve --greedy-model [--select-bit-source path] --out plan.json
-uv run python -m scripts.emission_structure loop report --state <state.json> ... --near 30   # greedy_model row
+uv run python -m scripts.emission_structure solve --greedy-model --out plan.json        # index bits
+uv run python -m scripts.emission_structure solve --greedy-model --select-bit-source path --out plan_path.json
+# (the loop builds plans with the load-tail greedy and stores builds and flags in the state file)
+uv run python -m scripts.emission_structure loop run --load-tail --state loop_state.json \
+  --modes nogood --budget 4 --max-builds 8
+uv run python -m scripts.emission_structure loop report --state loop_state.json --near 30   # greedy_model row
 ```
 
 ## 13. Forward/backward justification (`--greedy-justify N`)
@@ -1038,7 +1049,8 @@ with CP-SAT.
   measured.
 - Shift decisions change only when the greedy owned them (no forced shift encoding, no hint
   pass); ALU-derived constants, eliminated vbroadcasts and individually forced shifts
-  (what-if runs, whose forced set the greedy does not see) make the pass skip.
+  (what-if runs, with or without CP-SAT: the greedy places the forced ops shifted, but the
+  justification passes choose every shift themselves) make the pass skip.
 
 ```bash
 # 16 x 256: 1,279 cycles (1,281 on the simulator), PROVED and PASSED

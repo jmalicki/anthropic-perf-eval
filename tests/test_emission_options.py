@@ -75,6 +75,24 @@ def test_merge_hash_stages_saves_one_op_per_hash(tmp_path, rounds):
     assert len(phase_ops(base_sched, "hash", "multiply_add")) == 3 * groups * rounds
 
 
+@pytest.mark.parametrize("rounds", [2, 3])
+def test_hash_merge_transform_equals_merge_hash_stages(tmp_path, rounds):
+    """--transform hash-merge rewrites the default program into the merged one: PROVED, PASSED,
+    the same hash ops and op counts as --merge-hash-stages."""
+    merged, merged_sched = build(tmp_path, rounds, merge_hash_stages=True)
+    rewritten, rewritten_sched = build(tmp_path, rounds, transform=["hash-merge"])
+    assert len(phase_ops(rewritten_sched, "hash")) == len(phase_ops(merged_sched, "hash"))
+    assert len(phase_ops(rewritten_sched, "hash", "multiply_add")) == 4 * (BATCH // 8) * rounds
+    for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
+        assert rewritten["emission"][key] == merged["emission"][key], key
+    assert len(rewritten_sched["ssa_ops"]) == len(merged_sched["ssa_ops"])
+
+
+def test_transform_rejects_unknown_rule():
+    with pytest.raises(ValueError, match="hash-merge"):
+        scheduler_rs.build_tick_tock_kernel_ssa(10, 2047, BATCH, 2, verbose=False, transform=["nope"])
+
+
 # ---------------------------------------------------------------------------
 # --index-form mirrored
 # ---------------------------------------------------------------------------
@@ -195,6 +213,7 @@ def test_values_only_stores_no_indices_and_drops_what_fed_them(tmp_path, index_f
     assert values["engines"]["store"]["ops"] == groups
 
 
+@pytest.mark.deep
 def test_validate_only_remembers_values_only(tmp_path):
     """A kernel saved by a --values-only build is re-validated on values only."""
     from generate_ssa_kernel import load_kernel_from_json, save_kernel_to_json
@@ -283,6 +302,7 @@ def test_cached_select_after_the_wrap(tmp_path, rounds):
     build(tmp_path, rounds, cached_select="mobius")
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("select_choice", ["fma", "vselect", "optimize"])
 def test_cached_select_bits_flow_with_cpsat_select_modes(tmp_path, select_choice):
     """Every select of bits-flow is a SelectChoice; CP-SAT must be able to encode it either way."""

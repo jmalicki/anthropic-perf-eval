@@ -29,7 +29,8 @@ schedule's slots without a counterfactual build.
   enough.
   **Budget: stall + 0.98 is not safe on every plan.** 3 of the 28 new path-bit builds fail the
   scratch budget (peaks 1,761, 1,809, 1,817): the greedy reaches a cycle where nothing can be
-  placed at 1,528 live words (a real deadlock), forces an op and stays over budget for 265 to
+  placed at 1,528 live words (the greedy cannot proceed: no single ready op fits; not shown to
+  have no in-budget schedule, docs/STALL_DEADLOCK.md), forces an op and stays over budget for 265 to
   874 cycles. 0 of the index builds and 0 of the 85 earlier builds fail. They are recorded as
   failed plans, not tuned around.
 - **B, start-up: 1,033 -> 1,030** (1,032 simulated; PROVED, PASSED, `check_upstream.sh
@@ -83,7 +84,7 @@ machine load; the top-k rerun uses deterministic-time solves; the builds are det
 | top-k, floor, 14 levels | scores 989 to 1,002: 1,051 to 1,334 | scores 973 to 986: 1,066 to 1,246 (1 failed) |
 | top-k, greedy model, 14 levels | scores 1,030 to 1,043: 1,052 to 1,423 | scores 1,011 to 1,025: 1,055 to 1,481 (2 failed, 1 level skipped) |
 | plans scoring at or below the best known plan | floor 997: 100+; model 1,043: 100+ | floor 980: 100+; model 1,023: 100+ |
-| failed / over budget | 0 / 0 | 3 / 3 (peaks 1,761 to 1,817: deadlock at the budget) |
+| failed / over budget | 0 / 0 | 3 / 3 (peaks 1,761 to 1,817: greedy stuck at the budget) |
 | peak live scratch (incl. the zero word) | 1,057 to 1,473 | 1,057 to 1,536 |
 
 **Top-k, corrected.** The first version built the 8 unbuilt plans the solver returned in turn;
@@ -218,8 +219,12 @@ uv run generate_ssa_kernel.py $F --emission-plan docs/emission_plans/path_flow90
 uv run python -m scripts.scratch_ceiling_diagnosis gap both.json
 # Loop A (per bit source; one heavy job at a time):
 J="--load-tail --greedy-option greedy_budget_force=stall --greedy-option pressure_inflation_threshold=0.98"
-uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
-  --modes nogood,caps,caps-underfilled,rows --budget 8   # + seeds, see section A
+# The eight seeds of section A (--seed-plan replaces the default list, so all are named):
+SEEDS="--seed-plan gather --seed-plan bits+depth4 --seed-plan bits-flow+depth4 --seed-plan mobius+depth4 \
+  --seed-plan docs/emission_plans/floor_optimal.json --seed-plan docs/emission_plans/flow90.json \
+  --seed-plan docs/emission_plans/path_flow90.json --seed-plan docs/emission_plans/path_nogood_capped0.json"
+uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J $SEEDS \
+  --modes nogood,caps,caps-underfilled,rows --budget 8
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
   --nogood-caps flow=0.92 --modes nogood --budget 8
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
