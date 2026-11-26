@@ -48,7 +48,9 @@ def test_stall_fails_after_an_inflation_emptied_cycle(name, monkeypatch, tmp_pat
     assert state["live_words"] > state["budget"] - 8  # less than one vector free
     assert any(h["ready_at"] > state["cycle"] for h in state["heap"])  # work waiting: not a deadlock
     r = sd.analyse(state, json.loads(sched_path.read_text()))
-    assert r["deferred"] and all(d["adds"] > d["frees"] for d in r["deferred"])
+    # Every deferred op writes a vector (its 8 words are what the budget check refused). The
+    # script's "frees" count is approximate (no lane aliases, keep_live or deltas): not asserted.
+    assert r["deferred"] and all(d["adds"] == 8 for d in r["deferred"])
 
 
 @pytest.mark.parametrize("name,cycles", sorted(PLANS.items()))
