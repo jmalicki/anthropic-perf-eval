@@ -1,12 +1,15 @@
-"""Why a `--greedy-budget-force stall` run deadlocked at the scratch budget.
+"""Why a `--greedy-budget-force stall` run got stuck at the scratch budget.
 
 Inputs: the state the greedy writes at the first cycle `stall` forces an op
 (`SCHEDULER_DEADLOCK_DUMP=state.json`) and the failed build's exported schedule
 (`scheduler_output_error.json`: every op's eventual cycle, operands and destination).
 
 Prints, for the deadlock cycle:
-- the ops the budget check deferred (all ready), with the words each would add and free:
-  if every one adds more than it frees, no ready op can run within the budget;
+- the ops the budget check deferred (all ready), with the words each would add and free.
+  "Frees" is approximate: it counts a source operand whose only remaining reader is this op,
+  by the operand's own id; it does not resolve vector-group lane aliases and ignores
+  `keep_live`, a select's delta and a value listed twice as a source. Treat "adds more than
+  it frees" as an indication, not a proof that no ready op fits;
 - every live value with readers left, and why each remaining reader cannot run now:
   "deferred" (ready, budget check), "waits until c" (in the ready heap with a later ready
   cycle: latency or ASAP inflation), "not admitted" (outside the groups-in-flight window), or

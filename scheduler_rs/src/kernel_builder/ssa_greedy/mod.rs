@@ -102,7 +102,7 @@ pub struct GreedyShape {
 /// any run that reaches the budget overshoots it (address assignment then rejects the
 /// kernel). The pressure policy's inflation and shift suppression are what keep a default
 /// run below the budget, which is why passing runs stop short of it.
-/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `Stall` forces only in a cycle where nothing else was placed (the greedy is stuck), as the
 /// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
 /// in this one may have freed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3319,7 +3319,18 @@ fn schedule_ssa_greedy_core(
                     "slots": {"valu": slots.valu_used, "alu": slots.alu_used, "load": slots.load_used,
                               "flow": slots.flow_used, "store": slots.store_used},
                 });
-                if let Err(e) = std::fs::write(path, state.to_string()) {
+                // One dump per greedy run; a build that runs the greedy again writes the n-th
+                // dump to `<path>.<n>` instead of overwriting the first.
+                static DUMPS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+                    std::sync::Mutex::new(std::collections::BTreeMap::new());
+                let n = {
+                    let mut dumps = DUMPS.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = dumps.entry(path.clone()).or_insert(0);
+                    *n += 1;
+                    *n - 1
+                };
+                let path = if n == 0 { path.clone() } else { format!("{}.{}", path, n) };
+                if let Err(e) = std::fs::write(&path, state.to_string()) {
                     eprintln!("SCHEDULER_DEADLOCK_DUMP: cannot write {}: {}", path, e);
                 }
             }

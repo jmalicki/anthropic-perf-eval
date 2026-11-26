@@ -22,11 +22,16 @@ the greedy itself (`SCHEDULER_DEADLOCK_DUMP`), not reconstructed.
    placed, so it forces here, before inflation's own breaker (3 empty cycles) acts.
 2. **Waiting does not save these plans either: the greedy has painted itself in.** A rule that
    forces only when nothing waits in the heap (implemented and measured, then removed) gets
-   one step further on each plan and reaches a real deadlock: e.g. `floor10` at cycle 509,
+   one step further on each plan and reaches a state where the greedy cannot proceed: e.g.
+   `floor10` at cycle 509,
    1,528 live words, nothing waiting, 213 ready ops (selects and hash ops of the late groups
    26 to 31 and shared round-0/1 ops), **every one adding 8 words and freeing none** (their
-   inputs all have other readers left). With 7 words free no op fits, and no op frees words
-   until one runs: no in-budget schedule exists from that state. The live words are the late
+   inputs all have other readers left, by the approximate count of
+   `scripts/stall_deadlock_diagnosis.py`). With 7 words free **no single ready op fits, so
+   the greedy, which places ops one at a time, cannot proceed**. This does not show that no
+   in-budget schedule exists from that state: a set of ops issued in one cycle that together
+   free as many words as they write is not excluded. The state came from a force rule that
+   was removed again, so nothing in the tree reproduces it. The live words are the late
    groups' path bits and tree-access values of rounds 2 to 4 plus the early groups' values of
    rounds 9 to 15: all 32 groups are in flight.
 3. **Which choice made it unavoidable:** admitting all 32 groups. With 24 or 20 groups in
@@ -38,7 +43,7 @@ the greedy itself (`SCHEDULER_DEADLOCK_DUMP`), not reconstructed.
    layout (the `words` model's known limit; `--scratch-model pools`).
 4. **Decision: leave `stall` as is and document it.** No small rule fixes these plans:
    - a smarter force rule cannot: once any op is forced over the budget the kernel is invalid;
-   - forcing only in a real deadlock (no op waiting) is sound, changes nothing on any passing
+   - forcing only when no op waits in the heap is sound, changes nothing on any passing
      plan (1,030, 1,039, the ceiling plans 1,049 / 1,053 / 1,064 / 1,098: identical), and saves
      none of the three, so it was not kept;
    - a reserve (`--greedy-budget-headroom` 16 / 48 / 96) only moves the same deadlock lower:
@@ -54,6 +59,8 @@ the greedy itself (`SCHEDULER_DEADLOCK_DUMP`), not reconstructed.
 - `SCHEDULER_DEADLOCK_DUMP=state.json`: the greedy writes its state at the first cycle the
   force path runs without `same-cycle` (cycle, live words, live values with remaining readers,
   budget-deferred ops, the ready heap with each op's ready cycle and admission, slots used).
+  If the greedy runs more than once in a build, the first dump goes to the given path and
+  the n-th to `<path>.<n>`.
 - `uv run python -m scripts.stall_deadlock_diagnosis state.json scheduler_output_error.json
   [--live]`: joins it with the failed build's exported schedule; prints the deferred ops with
   words added and freed, the live words by the state of each value's first remaining reader,

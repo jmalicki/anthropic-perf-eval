@@ -4702,7 +4702,7 @@ fn test_budget_force_stall_keeps_words_budget_where_same_cycle_does_not() {
     assert!(stall_peak <= budget, "stall peak {} > budget {}", stall_peak, budget);
 }
 
-/// A real deadlock still forces with `stall`: the scheduler completes and reports it.
+/// When nothing fits, `stall` still forces: the scheduler completes and reports it.
 #[test]
 fn test_budget_force_stall_still_breaks_deadlock() {
     let (exceeded, _) = schedule_with_budget_force(&mut emit_three_broadcasts(), VLEN, BudgetForce::Stall);
