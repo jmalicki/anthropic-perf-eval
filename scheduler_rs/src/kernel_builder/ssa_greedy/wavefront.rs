@@ -55,6 +55,10 @@ pub enum GreedyPriority {
 pub(super) struct Wavefront {
     /// Priority key per op index (lower runs first).
     key: Vec<i64>,
+    /// Longest dependency path from the op to the end of the program, per op index.
+    height: Vec<i64>,
+    /// Whether some load depends on the op, per op index.
+    feeds_load: Vec<bool>,
     /// Chain rank per op index; `None` for shared ops.
     chain: Vec<Option<usize>>,
     /// Ops still to be scheduled per chain.
@@ -98,6 +102,23 @@ impl Wavefront {
             for &consumer in &consumers[idx] {
                 depth[consumer] = depth[consumer].max(depth[idx] + offset);
             }
+        }
+
+        // Longest dependency path from each op to the end of the program (its own latency
+        // included): the cycles that must follow its issue on an unlimited machine.
+        let mut height = vec![0i64; n];
+        for &idx in order.iter().rev() {
+            let offset = ops[idx].precedence_offset_for_asap(shiftable_set.contains(&idx)) as i64;
+            let below = consumers[idx].iter().map(|&c| height[c]).max().unwrap_or(0);
+            height[idx] = offset + below;
+        }
+
+        // Whether a load is reachable from the op (through at least one consumer).
+        let mut feeds_load = vec![false; n];
+        for &idx in order.iter().rev() {
+            feeds_load[idx] = consumers[idx]
+                .iter()
+                .any(|&c| feeds_load[c] || ops[c].engine == crate::types::Engine::Load);
         }
 
         // Which sinks each op reaches, as a bitset over sinks.
@@ -195,6 +216,8 @@ impl Wavefront {
         }
         let mut wavefront = Wavefront {
             key,
+            height,
+            feeds_load,
             chain,
             remaining,
             admit_below: 0,
@@ -207,6 +230,17 @@ impl Wavefront {
     /// Priority key of an op (lower runs first).
     pub(super) fn key(&self, idx: usize) -> i64 {
         self.key[idx]
+    }
+
+    /// Longest dependency path from an op to the end of the program (its latency included).
+    pub(super) fn height(&self, idx: usize) -> i64 {
+        self.height[idx]
+    }
+
+    /// Whether some load depends (directly or not) on the op. A load for which this is false
+    /// is a *final* load: no later load waits for it.
+    pub(super) fn feeds_load(&self, idx: usize) -> bool {
+        self.feeds_load[idx]
     }
 
     /// Chain rank of an op, `None` for shared ops.
