@@ -231,7 +231,7 @@ Forward/backward justification (list-schedule the reversed graph latest-first, m
 schedule forward again) takes milliseconds and gains more than CP-SAT does in two minutes. These
 figures come from an experiment outside the generator; the pass itself is `--greedy-justify N`,
 with the 16-round figures in
-[GREEDY_SHAPE_ABLATION.md, section 11](GREEDY_SHAPE_ABLATION.md#11-forwardbackward-justification---greedy-justify-n).
+[GREEDY_SHAPE_ABLATION.md, section 13](GREEDY_SHAPE_ABLATION.md#13-forwardbackward-justification---greedy-justify-n).
 
 ## 7. Why per-op counting cannot see our bottleneck
 

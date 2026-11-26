@@ -266,7 +266,9 @@ impl Rule for TreeAccessRule {
                 return reject("address base does not start at the tree pointer");
             }
             let l = graph.const_value(*k).ok_or_else(|| Rejection("level-end offset is not a constant".into()))?;
-            let d = (0..63usize)
+            // A level end is a 32-bit word, 2^(d+1) - 2 < 2^32, so only d <= 30 can match; the
+            // search stops there (level_last_index(62) would overflow).
+            let d = (0..=30usize)
                 .find(|&d| level_last_index(d) == l)
                 .ok_or_else(|| Rejection(format!("{} is not a level-end index 2^(d+1) - 2", l)))?;
             if let Some(claimed) = proposal.depth {

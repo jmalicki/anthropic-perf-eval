@@ -1,8 +1,11 @@
 """Region tags (`SsaOp::region`) change nothing about the emitted program.
 
-The SSA program (without the `region` field) and the greedy kernel of a small matrix of builds
-are compared with fingerprints recorded on main before tags existed (commit 1fcf628). A change
-that alters the emission on purpose must update the fingerprints and say why.
+The SSA program of a small matrix of builds, without the `region` field and without anything
+the scheduler decides (`cycle`), is compared with fingerprints of the emitted program, recorded
+on main just before tags existed (e6f2579) and unchanged with them (61d7798). They
+pin emission only: a scheduler change does not touch them, a change that alters the emission
+on purpose must update them and say why. The kernel itself is not fingerprinted (it depends
+on the schedule and the allocation; the scheduler reads no region tag).
 """
 
 import hashlib
@@ -21,15 +24,18 @@ SHAPED = dict(greedy_barriers="none", greedy_priority="wavefront", greedy_split_
               pressure_inflation_threshold=0.95)
 MIRRORED = dict(merge_hash_stages=True, index_form="mirrored")
 
-# name -> (build options, sha256 prefix of the ssa_ops without `region`, of the kernel instrs)
+# Fields of an SSA op left out of the fingerprint: the tag itself, and what the scheduler decides.
+NOT_EMISSION = {"region", "cycle"}
+
+# name -> (build options, sha256 prefix of the ssa_ops without NOT_EMISSION)
 MATRIX = {
-    "r2_default": (dict(rounds=2), "86bda95c612ef005", "90d4c2ba7ef09f6c"),
-    "r4_default": (dict(rounds=4), "6264f623350489fa", "c26f32421fe591a0"),
+    "r2_default": (dict(rounds=2), "85822d1d80955e7e"),
+    "r4_default": (dict(rounds=4), "988343cd32747388"),
     "r16_plan_flow90": (dict(rounds=16, **MIRRORED, **SHAPED,
                              emission_plan=os.path.join(ROOT, "docs", "emission_plans", "flow90.json")),
-                        "989a6d6c6e353f1f", "85f4dfd740813798"),
+                        "3e1b14d2726bcc96"),
     "r16_zero_mobius": (dict(rounds=16, cached_select="mobius", prune_dead_index=True, **SHAPED),
-                        "af87789a07be12ef", "cf858893dc0356a1"),
+                        "235da91a3694ed01"),
 }
 
 
@@ -47,15 +53,14 @@ def sha(obj) -> str:
 
 
 @pytest.mark.parametrize("name", sorted(MATRIX))
-def test_program_and_kernel_match_main_without_region(tmp_path, name):
-    options, ssa_sha, kernel_sha = MATRIX[name]
+def test_program_matches_without_region(tmp_path, name):
+    options, ssa_sha = MATRIX[name]
     if "emission_plan" in options:
         from solver.emission_plan import load_plan
         options = dict(options, emission_plan=load_plan(options["emission_plan"]))
-    instrs, sched = build(tmp_path, name, options)
-    ops = [{k: v for k, v in op.items() if k != "region"} for op in sched["ssa_ops"]]
+    _, sched = build(tmp_path, name, options)
+    ops = [{k: v for k, v in op.items() if k not in NOT_EMISSION} for op in sched["ssa_ops"]]
     assert sha(ops) == ssa_sha
-    assert hashlib.sha256(json.dumps(instrs).encode()).hexdigest()[:16] == kernel_sha
 
 
 def test_region_field_in_the_scheduler_json(tmp_path):
