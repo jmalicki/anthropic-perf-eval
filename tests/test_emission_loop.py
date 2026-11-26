@@ -215,6 +215,7 @@ def _non_canonical(rows):
     return other
 
 
+@pytest.mark.deep
 def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
     res = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
     assert el.is_canonical(res["rows"], CTX)
@@ -229,6 +230,7 @@ def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
     assert not el.is_canonical(mixed, CTX)
 
 
+@pytest.mark.deep
 def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
     stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
     first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
@@ -245,6 +247,7 @@ def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
     assert es.plan_model_key(res["rows"], CTX) != es.plan_model_key(first["rows"], CTX)
 
 
+@pytest.mark.deep
 def test_floor_incumbent_is_the_sound_cut(table):
     first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
     res = es.solve_plan_isolated(table, time_limit=20, floor_incumbent=first["floor"]["cycles"])
@@ -275,6 +278,7 @@ def test_rows_cut_is_sound_by_default_and_never_claims_exhaustion_when_heuristic
     assert stage2.trace[-1]["solves"] == [{"phase": "main", "status": "INFEASIBLE"}]
 
 
+@pytest.mark.deep
 def test_solves_are_recorded_and_deterministic(table):
     a = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
     b = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
