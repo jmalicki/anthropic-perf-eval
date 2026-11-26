@@ -694,3 +694,14 @@ fn test_select_bits_refuses_an_edit_that_drops_a_traced_op() {
     assert!(report.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", report.refused);
     assert_eq!(canonical_ops(&after), before);
 }
+
+#[test]
+fn test_select_bits_report_carries_the_assumption_only_when_used() {
+    // Zero-based first pass: InitialIndicesZero; mirrored: nothing assumed.
+    let zb = raw_program(&spec5(IndexForm::ZeroBased));
+    let (_, r) = apply_select_bits(zb, &rule(), |_| true).unwrap();
+    assert_eq!(r.assumptions(), vec!["initial-indices-zero"]);
+    let m = raw_program(&spec5(IndexForm::Mirrored));
+    let (_, r) = apply_select_bits(m, &rule(), |_| true).unwrap();
+    assert!(r.n_sites() > 0 && r.assumptions().is_empty(), "{:?}", r.facts);
+}

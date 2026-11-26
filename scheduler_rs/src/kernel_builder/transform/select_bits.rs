@@ -568,6 +568,7 @@ pub fn apply_select_bits(
     let mut surgery = Surgery::new(program)?;
     for s in &sites {
         *report.sites.entry("bit-read").or_default() += 1;
+        report.add_facts(&s.facts);
         // The site's op is not removed by the rule but by the cascade, with the extraction
         // ops that only fed it: the per-site delta is 0 and the saving is in the cascade.
         *report.site_classes.entry(("bit-read", [0; 10])).or_default() += 1;
