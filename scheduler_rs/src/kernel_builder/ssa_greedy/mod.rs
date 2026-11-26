@@ -608,6 +608,13 @@ pub(crate) struct GreedyDiagnostics {
     pub dumps_emitted: usize,
     /// Shifts (whole or split) made by a proactive shift policy while a vector slot was free.
     pub proactive_shifts: usize,
+    /// Shifts placed on the force-schedule path (over the scratch budget).
+    pub force_shifts: usize,
+    /// Pace accounting at the end of the run: vector ops placed and, of those, shifted, over
+    /// every path (normal, split start, force-schedule). See the pace comment in
+    /// `schedule_ssa_greedy_core`.
+    pub pace_vector_placed: usize,
+    pub pace_shifted: usize,
     /// Breakdown for the worst cycle so far, printed by `finish` (only kept when `verbose`).
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
@@ -2413,7 +2420,9 @@ fn schedule_ssa_greedy_core(
             );
         }
     }
-    // Vector ops that cannot shift (multiply_add, vbroadcast, SelectChoice on the vector path).
+    // Ops whose own engine is the vector ALU and that cannot shift (multiply_add, vbroadcast).
+    // A SelectChoice is not among them even when it takes the vector path: its own engine is
+    // flow, and its vector slot is decided only when it is placed.
     let fixed_vector: Vec<bool> = (0..ops.len())
         .map(|i| ops[i].engine == Engine::Valu && !shiftable_set.contains(&i))
         .collect();
@@ -3333,7 +3342,8 @@ fn schedule_ssa_greedy_core(
         // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
         let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
         // With `Stall`, a cycle whose only placement was a split-shift start is not a
-        // deadlock either (`pools` keeps its historical rule). Defensive: a split starts only
+        // deadlock either, with or without pool capacities (`pools` changes only
+        // `force_same_cycle` above). Defensive: a split starts only
         // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
         // the same cycle (`split_only_cycles` stays 0; checked in the tests).
         let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
@@ -3465,6 +3475,7 @@ fn schedule_ssa_greedy_core(
                     }
                     SlotResult::Shifted => {
                         force_shifted = true;
+                        diagnostics.force_shifts += 1;
                         // With fixed shifts the caller records them (the op is in the set).
                         if fixed_shifted_ops.is_none() {
                             shifted_ops.insert(op_id);
@@ -3737,6 +3748,8 @@ fn schedule_ssa_greedy_core(
         );
     }
 
+    diagnostics.pace_vector_placed = pace_vector_placed;
+    diagnostics.pace_shifted = pace_shifted;
     diagnostics.emit(peak_live_words, scratch_budget);
 
     Ok((cycle, budget_exceeded, peak_live_words))

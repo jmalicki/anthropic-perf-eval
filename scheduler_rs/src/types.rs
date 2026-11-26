@@ -1486,6 +1486,87 @@ pub struct SsaOp {
     /// graph does not already imply are kept (`compute_memory_dependencies`), so this is empty
     /// for every kernel emitted today.
     pub mem_deps: Vec<(usize, MemEdgeKind)>,
+
+    /// The emitter's claim about which program region this op belongs to (`RegionTag`):
+    /// tree access, node XOR, hash or index step of one group in one round, or the cached
+    /// level setup. `None` for init, data load/store and anything emitted outside a region.
+    /// A hint for transforms to propose where to look; it is never the semantics of the op
+    /// and never its ownership (a transform must verify a site from the ops' definitions).
+    /// See `RegionTag` for exactly what a tag records.
+    pub region: Option<RegionTag>,
+}
+
+// ============================================================================
+// Program regions (emitter tags)
+// ============================================================================
+
+/// Kind of a tagged program region (`RegionTag`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RegionKind {
+    /// Fetch of the tree node of one group (`group: Some`), or the per-round part shared by
+    /// the groups that use this encoding in the round (`group: None`, e.g. the gather's
+    /// address base vector). The encoding is the one the emitter used.
+    TreeAccess(crate::kernel_builder::config::AccessEncoding),
+    /// Shared constants of one cached tree level (node table XORed with the hash constant,
+    /// leaf pairs, Mobius coefficients), emitted once at init; `depth` is the level.
+    CachedLevelSetup,
+    /// `value ^= node` of one group.
+    NodeXor,
+    /// The hash of one group's value.
+    Hash,
+    /// Branch bit and index update of one group.
+    IndexStep,
+}
+
+impl RegionKind {
+    /// Spelling used in the scheduler output JSON.
+    pub fn as_str(&self) -> &'static str {
+        use crate::kernel_builder::config::AccessEncoding as E;
+        match self {
+            RegionKind::TreeAccess(E::Gather) => "tree_access:gather",
+            RegionKind::TreeAccess(E::Standard) => "tree_access:standard",
+            RegionKind::TreeAccess(E::Bits) => "tree_access:bits",
+            RegionKind::TreeAccess(E::BitsFlow) => "tree_access:bits-flow",
+            RegionKind::TreeAccess(E::Mobius) => "tree_access:mobius",
+            RegionKind::CachedLevelSetup => "cached_level_setup",
+            RegionKind::NodeXor => "node_xor",
+            RegionKind::Hash => "hash",
+            RegionKind::IndexStep => "index_step",
+        }
+    }
+}
+
+/// Emitter tag on an op: the region that was active when the emitter first created it.
+///
+/// That is all a tag means. In particular:
+/// * Ops the emitter deduplicates (constants, broadcasts and other vectors created on first
+///   use and then shared through its caches) carry the tag of whichever region first needed
+///   them, and may be read by other regions: e.g. with the zero-based index and
+///   `prune_dead_index`, the one vector of zeros every group uses in the wrap round is tagged
+///   `index_step` of the first group.
+/// * The shared part of a region (`group: None`) holds what was first created there, so its
+///   contents differ between the first and later visits of a depth (a level's end constant
+///   is created on the first visit that gathers; lazily initialised broadcasts on the first
+///   visit that selects).
+/// * Nothing may derive ownership or semantics from a tag. Transforms use tags only to
+///   propose candidate sites and must justify a rewrite by the structure of the ops.
+///
+/// Every op created for the same (kind, round, group, depth) carries the same `id`; ids are
+/// dense in order of first emission. The scheduler JSON is written after dead code
+/// elimination, so ids of regions whose ops were all removed are missing there (ids can have
+/// gaps). Tags are emitted alongside the program and change nothing about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RegionTag {
+    /// Dense region id (order of first emission).
+    pub id: u32,
+    /// What the region computes, as the emitter claims it.
+    pub kind: RegionKind,
+    /// Round, or `None` outside the round loop (setup).
+    pub round: Option<u32>,
+    /// Group of 8 lanes, or `None` for a part shared by several groups.
+    pub group: Option<u32>,
+    /// Tree depth the round visits (the level for `CachedLevelSetup`).
+    pub depth: Option<u32>,
 }
 
 // ============================================================================
@@ -1659,6 +1740,7 @@ impl SsaOp {
             keep_live: None,
             mem_loc: None,
             mem_deps: Vec::new(),
+            region: None,
         }
     }
 

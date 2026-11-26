@@ -353,3 +353,42 @@ def test_greedy_options_are_validated():
     for fixed in ({"rounds": 4}, {"use_greedy": False}, {"select_bit_source": "path"}):
         with pytest.raises(ValueError, match="fixed"):
             el.validate_greedy_options(fixed, CTX)
+    # Read by the build but no effect on a greedy build (review of #83).
+    for no_effect in ({"cpsat_workers": 4}, {"force_zero_gap": True}, {"per_section_optimize_secs": 10},
+                      {"asap_alap_tightening": "none"}, {"liveness_detail": "none"}, {"no_cse_groups": True}):
+        with pytest.raises(ValueError, match="do not affect a greedy build"):
+            el.validate_greedy_options(no_effect, CTX)
+    for ok in ({"greedy_justify": 10}, {"scheduling_pressure_policy": "cascade"}, {"enable_schedule_with_fixed_choices": True}):
+        el.validate_greedy_options(ok, CTX)
+    for name in el.GREEDY_BUILD_OPTIONS:
+        assert name in el.build_option_names(), name
+
+
+def test_topk_stops_when_the_plan_space_is_exhausted(tmp_path, monkeypatch):
+    """Review of #83: 2 rounds, one group: the only choice round (depth 1) has 4 encodings, so 4
+    plans, all with the same score under a flat table. One plan per level is built, the other
+    three are rejected at the next level, and then nothing is left: the loop must stop after
+    a few solves (before, each further level cost a solve, up to 10^6 levels)."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    calls = []
+    real_solve = el.solve
+
+    def counting_solve(*a, **k):
+        calls.append(k)
+        return real_solve(*a, **k)
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    monkeypatch.setattr(el, "solve", counting_solve)
+    el.loop_topk(stage2, 10, 20.0, "floor", per_level=1)
+    assert len(stage2.builds) == 1, "one plan per score level, and there is one level"
+    assert stage2.trace[-1]["feedback"].startswith("exhausted")
+    assert len(calls) <= 8, f"{len(calls)} solves"
