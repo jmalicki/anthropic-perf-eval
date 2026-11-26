@@ -641,7 +641,21 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
                 _record(stage2, mode, it, res, None, False,
                         f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
                                               else f"no plan of exactly this score in {retries} tries"))
-                level, at_level, it = level + 1, 0, it + 1
+                at_level, it = 0, it + 1
+                if res["status"] == "infeasible":
+                    # No remaining (unbuilt, not rejected) plan scores <= level: the objective
+                    # can always be raised to meet min_objective. The lowest score left is the
+                    # next non-empty level; none left means the enumeration is done (before,
+                    # this stepped level + 1 with one solve each, up to 10^6).
+                    nxt = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                                greedy_model=gm, tie_break=False)
+                    if nxt["status"] == "infeasible":
+                        _record(stage2, mode, it, nxt, None, False,
+                                "exhausted: no unbuilt plan left (built or rejected at a lower level)")
+                        break
+                    level = max(level + 1, es.plan_score(stage2.table, nxt["rows"], objective))
+                else:
+                    level += 1
                 if level > 10 ** 6:
                     break
                 continue
@@ -951,18 +965,41 @@ def build_option_names() -> frozenset:
     return frozenset(names)
 
 
+# Build options that change a greedy-only build's schedule, besides every greedy_* and
+# pressure_* option. Not allowed: CP-SAT-only options (cpsat_*, force_zero_gap,
+# per_section_optimize_secs, asap_alap_tightening, ...: no effect under --use-greedy), emission
+# options (they change the op counts the loop's cost table predicts), output and diagnostic
+# options, and the relaxed-scratch analysis switches. --const-choice / --select-choice /
+# --valu-shift take effect under the greedy since #86.
+GREEDY_BUILD_OPTIONS = frozenset({
+    "scheduling_pressure_policy", "scratch_model", "enable_valu_shift", "hint_passes",
+    "const_choice", "select_choice", "valu_shift",
+    "enable_const_choice_hint_pass", "enable_select_choice_hint_pass", "enable_valu_shift_hint_pass",
+    "enable_schedule_with_fixed_choices",
+})
+
+
+def affects_greedy_build(name: str) -> bool:
+    return name.startswith(("greedy_", "pressure_")) or name in GREEDY_BUILD_OPTIONS
+
+
 def validate_greedy_options(options: Mapping, ctx: es.Context) -> None:
-    """Reject --greedy-option keys the build would ignore (a typo would otherwise build with
-    the default judge while the state records the option) and keys the loop fixes."""
+    """Reject --greedy-option keys the build would ignore (a typo, or an option that does
+    nothing in a greedy build, would otherwise build with the default judge while the state
+    records the option) and keys the loop fixes."""
     known = build_option_names()
     fixed = LOOP_FIXED_OPTIONS | set(ctx.build_options())
     unknown = sorted(k for k in options if k not in known)
     clashing = sorted(k for k in options if k in fixed)
+    no_effect = sorted(k for k in options if k in known and k not in fixed and not affects_greedy_build(k))
     if unknown:
         raise ValueError(f"--greedy-option: unknown build option(s) {unknown}; the build reads "
                          f"{len(known)} names, e.g. greedy_budget_force, pressure_inflation_threshold")
     if clashing:
         raise ValueError(f"--greedy-option: {clashing} are fixed by the loop's context or pipeline")
+    if no_effect:
+        raise ValueError(f"--greedy-option: {no_effect} do not affect a greedy build (CP-SAT-only, emission or "
+                         f"output options); allowed: greedy_*, pressure_*, {', '.join(sorted(GREEDY_BUILD_OPTIONS))}")
 
 
 def main(argv=None) -> int:

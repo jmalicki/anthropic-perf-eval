@@ -119,12 +119,11 @@ def test_select_xor_pushdown_after_the_wrap(variant):
 @pytest.mark.parametrize("rounds", [8, 9])
 def test_index_early_terms_after_the_wrap(rounds):
     none = build(**dict(WRAP, rounds=rounds))
-    final = build(**dict(WRAP, rounds=rounds, index_early_terms="final"))
     first = build(**dict(WRAP, rounds=rounds, index_early_terms="first-gather"))
-    # 'final' (both a last round at depth 0 and a last round that is the wrap round): proved
-    # and validated above; the store then has no early form to use (n' = bit, or index 0),
-    # so the program is the same.
-    assert final["vector_ops"] == none["vector_ops"]
+    # 'final' with the last round at depth 0 (9 rounds: n' = bit) or at the wrap round (8:
+    # index 0) has no early form to use: rejected as a no-op (review of #91).
+    with pytest.raises(ValueError, match="applies to no op"):
+        build(**dict(WRAP, rounds=rounds, index_early_terms="final"))
     # 'first-gather': the gathers of round 3 and, after the wrap, round 7 (depth 3, the wrap
     # round) take madd(n, -2, F + L) - bit: one more multiply_add per group in those rounds.
     # n' is then read by nothing (the wrap round resets the index), so the update's
@@ -153,7 +152,7 @@ def test_index_early_terms_final_after_the_wrap_is_used():
 def test_all_three_after_the_wrap(rounds, merge):
     build(**dict(WRAP, rounds=rounds, merge_hash_stages=merge, reassociate_gather_xor=True,
                  index_early_terms="first-gather", select_xor_pushdown="all"))
-    build(**dict(WRAP, rounds=rounds, merge_hash_stages=merge, reassociate_gather_xor=True,
+    build(**dict(WRAP, rounds=7, merge_hash_stages=merge, reassociate_gather_xor=True,
                  index_early_terms="final", select_xor_pushdown="all", select_bit_source="index"))
 
 
@@ -178,3 +177,10 @@ def test_pushdown_with_bits_only_at_depth_1_is_rejected():
     build_kernel_with_args(verbose=False, **opts, emission_plan=plan)  # the plan itself is fine
     with pytest.raises(ValueError, match="select_xor_pushdown"):
         build_kernel_with_args(verbose=False, **opts, emission_plan=plan, select_xor_pushdown="all")
+
+
+def test_index_early_terms_final_with_values_only_is_rejected():
+    """--values-only drops the final index store, so 'final' has nothing to rewrite."""
+    with pytest.raises(ValueError, match="applies to no op"):
+        build_kernel_with_args(verbose=False, **{**BASE, **WRAP, "rounds": 7, "values_only": True,
+                                                 "index_early_terms": "final"})

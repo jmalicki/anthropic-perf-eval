@@ -55,7 +55,9 @@ Path kernel (1,030), same shape on the index kernel (1,039):
 
 An option that would change nothing in a kernel is an error (`ProblemSpec::check_critical_path_options`,
 for the CLI, the binding and Rust callers alike): `--index-early-terms` without `--index-form
-mirrored`; `--select-xor-pushdown` when no round it covers has a SelectChoice at the top of its
+mirrored`, or where it rewrites no op (`final` with the last round at depth 0 or at the wrap
+round, or with `--values-only`; `first-gather` when also no group gathers right after a round
+at depth >= 1 in which it did not gather); `--select-xor-pushdown` when no round it covers has a SelectChoice at the top of its
 select tree (`standard` or `mobius` cached select, `bits` only at depth 1); `--reassociate-gather-xor`
 when no group gathers. `first-pass` means rounds 0 to `forest_height` (up to the first wrap).
 `tests/test_critical_path_rewrites.py` also builds every option after the wrap (height 3, 7 to 9
