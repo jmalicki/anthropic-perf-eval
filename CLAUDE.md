@@ -122,12 +122,12 @@ uv run tests/submission_tests.py
 
 ### CI
 
-GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on a macOS arm64 runner (`macos-latest`) with OR-Tools from Homebrew, the same setup as local development. Two jobs:
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on Linux (`ubuntu-24.04`, x86_64; Linux runners queue far less than macOS ones). OR-Tools comes from Google's prebuilt C++ archive (it bundles protobuf and abseil), installed and cached by [.github/actions/setup-ortools](.github/actions/setup-ortools/action.yml), which pins the version and checksum. Two jobs:
 
 - **Rust tests (scheduler_rs)** — `./scripts/test.sh rust` (debug profile, `--features cpsat`).
 - **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, `./scripts/test.sh upstream`, `./scripts/test.sh ci-only`, one step each. The python suite collects `tests/` by discovery, so every `tests/test_*.py` runs in CI without being listed; `tests/test_suite_coverage.py` fails on a test file outside `tests/` that the suite does not run.
 
-To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI installs whatever OR-Tools version Homebrew currently ships (printed by the "Install OR-Tools" step); if a failure does not reproduce, compare that against `brew list --versions or-tools`.
+To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI differs from local development in platform (Linux x86_64, not macOS arm64) and in the OR-Tools build (the pinned archive in setup-ortools, not Homebrew's); if a failure does not reproduce locally, suspect those first, especially for tests that pin CP-SAT results.
 
 Not run in CI: the `ci-tests` Cargo feature, `tests/submission_tests.py`, and any full CP-SAT kernel build (the kernel suite is greedy-only).
 
