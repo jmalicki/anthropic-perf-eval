@@ -28,8 +28,21 @@ The check's peak is reported as `section_check_peak` (stats and scheduler JSON).
 Tests: `test_section_check_counts_what_the_allocator_counts` (Rust, 4 rounds, round
 barriers / wavefront / wavefront + split shifts) and `tests/test_section_check.py`.
 
-**What moves.** Greedy-only builds never run the check: no greedy number moves (1,026 and
-1,038 rebuilt unchanged). CP-SAT-pipeline builds can only repair a different set of sections.
+The check bounds peak live words. A section within the budget can still lack an address
+layout (the `words` model's known limit: docs/STALL_DEADLOCK.md records `floor10` at 28 groups
+in flight with 0 words forced and no layout), so "within the budget" here means "no repair
+needed by word count", not "address assignment will succeed". All three checks (which sections
+to repair, the post-merge check, the hint check) compare against the same budget, the 1,535
+assignable words (the zero word is not counted).
+
+After a per-section solve the check uses that section's new encodings: multiply-add selects
+(per-section overrides) and constants (`merge_section_const_encodings`: the solve's AddImm /
+AluDerive, the greedy's for ops not sent to the solve). Test `test_merge_section_const_encodings`.
+
+**What moves.** The greedy-only pipeline runs the check only to report `section_check_peak`;
+an error there is printed and the peak left out, so it cannot fail or change a greedy-only
+build (address assignment stays the judge). No greedy number moves (1,026 and 1,038 rebuilt
+unchanged). CP-SAT-pipeline builds can only repair a different set of sections.
 Flagged sections old vs new on 40 cells (2x16, 3x64, 4x64, 2x256, 3x256, 4x256, 6x64, 16x256 ×
 default, `--no-valu-shift`, `--scheduling-pressure-policy greedy`, shaped, shaped + 0.95): the
 same everywhere except 4x256 with the `greedy` policy (sections 2, 3 → 3). 3x256 with the
@@ -64,9 +77,26 @@ otherwise; `Always` adds it, `Never` drops it). The hint and the post-solve all-
 with the select forced to vselect (32 before the fix), 40 forced to multiply-add, 24 with
 `Optimize`. With the fix the 1,030 path reference passes the all-fixed check (optimal).
 
-This changes the full-kernel model of every emission with precomputed-delta selects. It only
-removes an overcount (every schedule feasible before is still feasible), but documented
-CP-SAT results were obtained with the overcount and have not been re-measured.
+A second test, `test_ssa_cpsat_delta_kept_live_when_the_solver_chooses_multiply_add`, has two
+delta selects compete for the one flow slot under `Optimize`, so the solver takes the
+multiply-add path at some budgets, and checks that address assignment fits every solution in
+its budget; with the multiply-add row of the fix removed it fails (48 live words at a 40-word
+budget). If every read of a value is conditional (not reachable today: `true_val = base +
+delta` always reads the delta), the value is kept as a dead value through the write slot of
+its last write (`exec_end + 2`), in the model and in the post-solve check.
+
+**What this changes.** The default emission uses delta selects (`ssa_emit.rs`, the cached
+tree levels), so every default CP-SAT model changes: one extra variable and two enforced rows
+per (value, select) pair where the select reads the value only as its delta, and a max over
+readers instead of a single reader for those values. Per-section repair models change the same
+way, and `scripts/cpsat_model_identity.py` records made before this change no longer match
+(re-record the base). It only removes an overcount (every schedule feasible before is still
+feasible), but the search changes, so any documented CP-SAT result can move. At risk: the
+4-round 485 (CLAUDE.md), the CP-SAT tables of docs/CPSAT_CONFIG_ABLATION.md,
+docs/CPSAT_LANE_MODEL.md, docs/GREEDY_SHAPE_ABLATION.md (CP-SAT from each greedy start) and
+docs/4-round-phase-results.md, and the window-probe results of docs/STARTUP_WINDOW_PROBE.md
+and docs/WINDOW_OPTIMALITY_PROBE.md. Re-measured: see "Re-measured after the model change"
+below; everything else is not re-measured.
 
 ## 3. Rolling full-model window pass over the whole schedule
 

@@ -4653,3 +4653,37 @@ fn test_section_check_counts_what_the_allocator_counts() {
         }
     }
 }
+
+/// After a per-section solve the section's constants take the solve's encodings (AddImm,
+/// AluDerive, else Load) and ops not sent to the solve keep the greedy's; constants of other
+/// sections are untouched. Before, the AluDerive set the post-merge check used was the
+/// greedy's snapshot, so a constant the solve moved from AluDerive to Load still extended
+/// its producers' intervals.
+#[test]
+fn test_merge_section_const_encodings() {
+    use crate::types::{AluDeriveInfo, ConstChoiceEncoding};
+    let konst = |id| {
+        let mut op = SsaOp::new(id, Engine::Load, Opcode::ConstChoice, Some(VReg::scalar(id as u32)), vec![]);
+        op.cycle = 0;
+        op
+    };
+    let info = |l, r| AluDeriveInfo { left_op_id: l, right_op_id: r, opcode: Opcode::Add };
+    let section = vec![konst(1), konst(2), konst(3), konst(4)];
+    let greedy_add_imm: HashSet<usize> = [2, 4].into_iter().collect();
+    let greedy_alu: HashMap<usize, AluDeriveInfo> = [(1, info(10, 11)), (3, info(12, 13)), (9, info(14, 15))].into_iter().collect();
+    let mut add_imm = greedy_add_imm.clone();
+    add_imm.insert(8); // another section's constant
+    let mut alu = greedy_alu.clone();
+    // The solve re-encoded ops 1, 2, 3 (4 was not sent): 1 -> Load, 2 -> AluDerive, 3 -> AddImm.
+    let solved: HashMap<usize, ConstChoiceEncoding> = [
+        (1, ConstChoiceEncoding::Load),
+        (2, ConstChoiceEncoding::AluDerive(info(16, 17))),
+        (3, ConstChoiceEncoding::AddImm),
+    ]
+    .into_iter()
+    .collect();
+    merge_section_const_encodings(&section, &solved, &[4], &greedy_add_imm, &greedy_alu, &mut add_imm, &mut alu);
+    assert_eq!(add_imm, [3, 4, 8].into_iter().collect::<HashSet<_>>());
+    assert_eq!(alu.keys().copied().collect::<std::collections::BTreeSet<_>>(), [2, 9].into_iter().collect());
+    assert_eq!(alu[&2].left_op_id, 16);
+}

@@ -175,6 +175,52 @@ pub(crate) fn section_cycle_range(
     range
 }
 
+/// After a per-section solve, the constant encodings of the merged schedule: the section's
+/// ConstChoice ops take the solve's encoding (AddImm or AluDerive; anything else is Load), and
+/// ops not sent to the solve (`not_sent`, kept at their greedy cycles) keep the greedy's.
+///
+/// # Arguments
+/// * `section_ops` - The section's ops
+/// * `solved` - The per-section solve's ConstChoice encodings
+/// * `not_sent` - Op ids of the section not given to the solve
+/// * `greedy_add_imm` / `greedy_alu_derive` - The greedy's encodings
+/// * `add_imm` / `alu_derive` - Current encodings, updated in place
+pub(crate) fn merge_section_const_encodings(
+    section_ops: &[SsaOp],
+    solved: &HashMap<usize, crate::types::ConstChoiceEncoding>,
+    not_sent: &[usize],
+    greedy_add_imm: &HashSet<usize>,
+    greedy_alu_derive: &HashMap<usize, crate::types::AluDeriveInfo>,
+    add_imm: &mut HashSet<usize>,
+    alu_derive: &mut HashMap<usize, crate::types::AluDeriveInfo>,
+) {
+    for op in section_ops {
+        if op.opcode == Opcode::ConstChoice {
+            add_imm.remove(&op.id);
+            alu_derive.remove(&op.id);
+        }
+    }
+    for (id, enc) in solved {
+        match enc {
+            crate::types::ConstChoiceEncoding::AddImm => {
+                add_imm.insert(*id);
+            }
+            crate::types::ConstChoiceEncoding::AluDerive(info) => {
+                alu_derive.insert(*id, info.clone());
+            }
+            _ => {}
+        }
+    }
+    for id in not_sent {
+        if greedy_add_imm.contains(id) {
+            add_imm.insert(*id);
+        }
+        if let Some(info) = greedy_alu_derive.get(id) {
+            alu_derive.insert(*id, info.clone());
+        }
+    }
+}
+
 /// Move every scheduled op of a section (barriers excluded) by `delta` cycles, together with
 /// the per-lane cycles of its split shift, if it has one, so the lanes stay where the op is.
 ///
@@ -1072,19 +1118,23 @@ impl SsaTickTockKernelBuilder {
             ctx.config.compiler.effective_scratch_budget(ctx.zero_vreg.is_some());
         // Which sections to repair: counted on the model's timeline with the allocator's own
         // intervals (shifted lanes at their cycles, multiply-add selects, ALU-derived
-        // constants, vector groups), so a section is repaired exactly when address assignment
-        // could not place the greedy schedule. Before, the check had no lane cycles and fell
+        // constants, vector groups): a section is repaired when its peak live words, counted
+        // as the allocator counts them, exceed the budget (a section within it can still lack
+        // an address layout; the check bounds words). Before, the check had no lane cycles and fell
         // back to the cycle timeline to stay on the safe side, which overcounted (1,597
         // words against an exact 1,483 on the best greedy kernels) and sent within-budget
         // schedules to the repair (BUGS.md).
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
-        let greedy_alu_derive = ctx.greedy_decisions.alu_derive_ops();
+        // ALU-derived constants of the current schedule: the greedy's, updated when a
+        // per-section solve re-encodes a section's constants (`merge_section_const_encodings`).
+        let mut current_alu_derive = ctx.greedy_decisions.alu_derive_ops();
+        let greedy_alu_derive_ops = current_alu_derive.clone();
         macro_rules! section_liveness {
             () => {
                 SectionLiveness {
                     shifted_alu_cycles: Some(&ctx.greedy_decisions.shifted_alu_cycles),
-                    const_alu_derive_ops: Some(&greedy_alu_derive),
+                    const_alu_derive_ops: Some(&current_alu_derive),
                     vector_group_lanes: Some(&ctx.vector_group_lanes),
                 }
             };
@@ -1404,27 +1454,21 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 let (start, end) = boundaries[k];
-                for op in &ctx.ops[start..end] {
-                    if op.opcode == Opcode::ConstChoice {
-                        current_const_add_imm.remove(&op.id);
-                    }
-                }
-                for (id, enc) in &seg_result.const_choice_encoding {
-                    if matches!(enc, crate::types::ConstChoiceEncoding::AddImm) {
-                        current_const_add_imm.insert(*id);
-                    }
-                }
-                // Re-insert ConstChoice ops that were filtered out (AddImm alternatives
-                // not sent to per-section CP-SAT) but were in greedy's original set.
                 let filtered_global_set: HashSet<usize> = filtered_global_indices.iter().copied().collect();
-                for &gi in &global_indices {
-                    if !filtered_global_set.contains(&gi) {
-                        let op_id = ctx.ops[gi].id;
-                        if greedy_const_add_imm_ops.contains(&op_id) {
-                            current_const_add_imm.insert(op_id);
-                        }
-                    }
-                }
+                let not_sent: Vec<usize> = global_indices
+                    .iter()
+                    .filter(|gi| !filtered_global_set.contains(gi))
+                    .map(|&gi| ctx.ops[gi].id)
+                    .collect();
+                merge_section_const_encodings(
+                    &ctx.ops[start..end],
+                    &seg_result.const_choice_encoding,
+                    &not_sent,
+                    &greedy_const_add_imm_ops,
+                    &greedy_alu_derive_ops,
+                    &mut current_const_add_imm,
+                    &mut current_alu_derive,
+                );
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
                         let op = &mut ctx.ops[filtered_global_indices[seg_idx]];
@@ -1483,19 +1527,19 @@ impl SsaTickTockKernelBuilder {
         // Presolve guarantee: merged schedule must be within scratch budget
         let scratch_size = ctx.config.compiler.scratch_size;
         let post_merge_budget = budget_or_export!(section_budget(
-            &ctx.ops, scratch_size,
+            &ctx.ops, effective_budget,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
             self.cpsat_scratch_time, &section_liveness!(),
         ));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
-            .find(|(_, &p)| p > scratch_size)
+            .find(|(_, &p)| p > effective_budget)
         {
             let msg = format!(
                 "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget {}). \
                  This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
-                sec, *peak, scratch_size
+                sec, *peak, effective_budget
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);
@@ -1517,11 +1561,11 @@ impl SsaTickTockKernelBuilder {
             &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &section_liveness!(),
         )).section_peaks.iter().copied().max().unwrap_or(0);
 
-        if hint_peak > scratch_size {
+        if hint_peak > effective_budget {
             let msg = format!(
                 "Merged hint schedule exceeds scratch budget: peak {} words (budget {}). \
                  Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
-                hint_peak, scratch_size
+                hint_peak, effective_budget
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);

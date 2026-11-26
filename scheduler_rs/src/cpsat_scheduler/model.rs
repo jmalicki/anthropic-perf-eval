@@ -2471,8 +2471,13 @@ pub fn schedule_ssa_cpsat(
                         }
                     }
                     if !unconditional {
-                        // Every read may vanish: keep the value one cycle past its last write.
-                        read_ends.push(times[def_idx].exec_end() + 1);
+                        // Every read may vanish. The allocator then holds the value as a dead
+                        // value over [last write, last write + 1] (8 words in the write slot of
+                        // its last write); `+ 2` keeps that slot on the phase timeline, where an
+                        // end of `+ 1` would give an empty interval. Unreachable today: every
+                        // delta select's `true_val = base + delta` reads the delta
+                        // unconditionally.
+                        read_ends.push(times[def_idx].exec_end() + 2);
                     }
                     let c = model.add_max_eq(end_var, read_ends);
                     model.set_constraint_name(c, &format!("scratch_live_end_{}", vreg.id));

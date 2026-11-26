@@ -813,7 +813,10 @@ pub(crate) fn verify_scratch_budget_all_readers(
             .iter()
             .filter(|&&r| !delta_only.contains(&r) || times.on_fma_path(r))
             .map(|&r| times.last_read_end(r))
-            .max();
+            .max()
+            // Every reader dropped (vselect deltas only): a dead value held in the write slot
+            // of its last write, as in the model.
+            .or_else(|| (!readers.is_empty()).then(|| times.exec_end(*def_idx) + 2));
         let Some(end) = end else {
             continue;
         };

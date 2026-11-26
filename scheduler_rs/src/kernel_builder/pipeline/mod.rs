@@ -190,8 +190,10 @@ impl PipelineContext {
     /// The per-section scratch check on the greedy schedule, before any repair: which
     /// sections the per-section CP-SAT must repair. Counted with the allocator's intervals
     /// (shifted lanes, multiply-add selects, ALU-derived constants, vector groups) on
-    /// `scratch_time` (`round_budget::section_budget`), so on the phase timeline a section is
-    /// repaired exactly when address assignment could not place it.
+    /// `scratch_time` (`round_budget::section_budget`): on the phase timeline its peak is
+    /// the allocator's peak live words. A section within the budget can still lack an address
+    /// layout (the `words` model's known limit, docs/ALLOCATION_CONJECTURES.md); the check
+    /// bounds words, not layouts.
     ///
     /// # Arguments
     /// * `budget` - Words available to allocatable values
@@ -315,13 +317,18 @@ impl PipelineContext {
         }
 
         // The check the CP-SAT path runs before its per-section repair, on the phase timeline:
-        // reported so it can be compared with the allocator's peak of the same schedule.
+        // reported only, for comparison with the allocator's peak of the same schedule. It
+        // never fails or changes a greedy-only build: address assignment below is the judge.
         let budget = self.effective_scratch_budget();
-        self.section_check_peak = self
-            .greedy_section_check(budget, crate::cpsat_scheduler::ScratchTime::Phase)?
-            .section_peaks
-            .into_iter()
-            .max();
+        self.section_check_peak = match self
+            .greedy_section_check(budget, crate::cpsat_scheduler::ScratchTime::Phase)
+        {
+            Ok(r) => r.section_peaks.into_iter().max(),
+            Err(e) => {
+                eprintln!("section check (report only) could not count this schedule: {}", e);
+                None
+            }
+        };
 
         // In greedy-only mode, final decisions = greedy decisions
         self.final_decisions = self.greedy_decisions.clone();
