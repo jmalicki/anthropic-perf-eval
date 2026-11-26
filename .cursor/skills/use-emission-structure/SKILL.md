@@ -23,7 +23,18 @@ $M measure --shaped --upstream --plan plan.json --plan bits          # build, pr
 $M sweep --shaped --max-util none --max-util flow=0.9 ...            # solve + measure per cap
 $M solve --values-only --select-bit-source path --fix 15=gather --max-util flow=0.9 --out p.json
 $M solve --what-if gather-without-address-op                        # uncalibrated estimate for a future encoding
+$M solve --greedy-model --out plan.json   # minimise a calibrated HEURISTIC of the load-tail greedy's cycles
 ```
+
+`--greedy-model` (`solve_plan(greedy_model={})`, `es.GREEDY_MODEL`) is grid-fitted on 24
+recorded load-tail builds (index bits; data `docs/emission_plans/greedy_model_data.json`;
+`uv run python -m scripts.greedy_model_fit --check` reproduces it). In-sample it ranks
+index-bit plans near the optimum (Spearman +0.71, floor -0.54), not path-bit plans (scratch);
+out of sample it was optimistic by 20 to 42 cycles on all four plans it chose. It is not a
+bound; refit it (and its data) whenever the greedy changes. To see why a built plan is slow, run
+`uv run python -m scripts.shift_limit_diagnosis sched.json --floor N`: the shift count follows
+from the cycle count (`V - s = 6T - I`), so look at the static bound, select resolution and flow
+waits, and scratch (docs/GREEDY_SHAPE_ABLATION.md section 12).
 
 ## Closed loop with the shaped greedy (`loop`)
 

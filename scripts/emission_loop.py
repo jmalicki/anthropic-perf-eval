@@ -92,6 +92,12 @@ def is_canonical(rows, ctx: es.Context) -> bool:
     return [list(r) for r in rows] == es.canonical_rows(rows, ctx)
 
 
+def same_scheduler(a: Mapping | None, b: Mapping | None) -> bool:
+    """True if two fingerprints name the same extension binary. A fingerprint that failed
+    ({"error": ...}) or is missing matches nothing, not even an equal failure."""
+    return bool(a and b and "extension_sha256" in a and a == b)
+
+
 def scheduler_fingerprint() -> dict:
     """SHA-256 of the installed scheduler_rs extension binary (or {"error": ...}). Builds made
     with different binaries are not comparable."""
@@ -442,7 +448,7 @@ class Stage2:
                                  f"not {self.greedy_extra}")
             self.greedy_extra = state.get("greedy_extra", {})
             recorded = state.get("scheduler")
-            if check_scheduler and state["builds"] and recorded != self.scheduler:
+            if check_scheduler and state["builds"] and not same_scheduler(recorded, self.scheduler):
                 raise ValueError(f"{state_path} holds builds from scheduler {recorded or 'unrecorded'}, not the "
                                  f"installed {self.scheduler}: they are not comparable; use a new --state")
             if not check_scheduler and recorded is not None:
@@ -590,6 +596,7 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
         stale = 0 if improved else stale + 1
         _record(stage2, mode, it, res, rec, built,
                 "no-good on this plan" + (f"; caps {dict(max_util)}" if max_util else
+                                          "; no valid incumbent yet, no cut" if best is None else
                                           f"; incumbent floor < {best['cycles']}")
                 + (" (new best)" if improved else ""))
         if stale >= patience:
@@ -770,6 +777,8 @@ def surrogates(stage2: Stage2, caps: Mapping[str, float] | None) -> list[dict]:
             "capped_floor": capped_floor(b["counts"], caps) if caps else None,
             "capped_floor_flow90": capped_floor(b["counts"], {"flow": 0.9}),
             "static_bound_any": b["summary"]["static_bound_any"],
+            # Calibrated heuristic of the load-tail greedy's cycles (es.GREEDY_MODEL), not a bound.
+            "greedy_model": es.greedy_model_cycles(b["counts"]),
             "rows_le_cycles": max(b["predicted_floor"], rb["bound"]) <= b["cycles"],
             "peak_live": b.get("peak_live"), "max_addr": b.get("max_addr"),
             # Post-build diagnostic, not a stage-1 surrogate: vector work the greedy left on the
@@ -793,7 +802,7 @@ def failed_builds(stage2: Stage2) -> list[dict]:
 def correlation_table(points: Sequence[Mapping], subset: str = "all") -> list[dict]:
     rows = []
     for name in ("floor", "floor_plus_rows", "capped_floor", "capped_floor_flow90", "static_bound_any",
-                 "valu_after_greedy_shift"):
+                 "greedy_model", "valu_after_greedy_shift"):
         pts = [(p[name], p["cycles"]) for p in points if p.get(name) is not None]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         rows.append({"surrogate": name, "subset": subset, "n": len(pts), "pearson": pearson(xs, ys),
@@ -915,6 +924,12 @@ def main(argv=None) -> int:
                            if e["mode"].startswith("caps") and "(new best)" in e["feedback"]), None)
     for path in args.extra_state:
         other = Stage2(table, workdir, path, log=None, check_scheduler=False)
+        if other.greedy_extra != stage2.greedy_extra:
+            ap.error(f"--extra-state {path} was built with greedy options {other.greedy_extra}, the primary "
+                     f"state with {stage2.greedy_extra}: their measurements are not comparable and are not merged")
+        if not same_scheduler(other.scheduler, stage2.scheduler):
+            print(f"note: --extra-state {path} holds builds from scheduler {other.scheduler or 'unrecorded'}, not "
+                  f"{stage2.scheduler or 'unrecorded'}; its builds are merged but were made by another binary")
         stage2.builds = {**other.builds, **stage2.builds}
         stage2.rowtable = stage2.rowtable.union(other.rowtable)
         stage2.trace = stage2.trace + other.trace

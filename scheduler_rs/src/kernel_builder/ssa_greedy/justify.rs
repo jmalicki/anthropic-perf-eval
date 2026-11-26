@@ -699,21 +699,25 @@ enum Rejection {
 ///
 /// Uses `interval_liveness_curve` (the liveness the greedy's counter is checked against
 /// and address assignment computes), the pool condition when the scratch model is `pools`,
-/// and address assignment itself when `config.allocator` is set.
+/// and address assignment itself when `config.allocator` is set. `select_fma_ops` are the
+/// SelectChoice ops on the multiply-add path (their reads, and a precomputed delta, are held
+/// to cycle + 1, as address assignment holds them).
 ///
 /// # Returns
 /// The peak, or the reason the schedule does not fit.
 fn scratch_check(
     work: &Workspace,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
+    select_fma_ops: &HashSet<usize>,
     config: &JustifyConfig,
 ) -> Result<usize, String> {
-    let (_, peak, _) = interval_liveness_curve(&work.ops, vector_group_lanes, &work.shifted_lane_cycles)?;
+    let (_, peak, _) =
+        interval_liveness_curve(&work.ops, vector_group_lanes, &work.shifted_lane_cycles, select_fma_ops)?;
     if peak > config.scratch_budget {
         return Err(format!("peak live {} words > budget {}", peak, config.scratch_budget));
     }
     if config.scratch_pools {
-        let pools = scratch_pool_peaks(&work.ops, vector_group_lanes, &work.shifted_lane_cycles)?;
+        let pools = scratch_pool_peaks(&work.ops, vector_group_lanes, &work.shifted_lane_cycles, select_fma_ops)?;
         if pools.split_words() > config.scratch_budget {
             return Err(format!("pools need {} words > budget {}", pools.split_words(), config.scratch_budget));
         }
@@ -772,7 +776,15 @@ pub(crate) fn justify_schedule(
     config: &JustifyConfig,
 ) -> Result<JustifyOutcome, String> {
     let mut outcome = JustifyOutcome::default();
-    let (_, input_peak, _) = interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles)?;
+    // Selects on the multiply-add path, including those the greedy put there itself
+    // (`--greedy-select-overflow valu`): the liveness checks must hold their reads as
+    // address assignment does.
+    let select_fma_ops: HashSet<usize> = select_choice
+        .iter()
+        .filter(|(_, e)| matches!(e, SelectChoiceEncoding::Fma))
+        .map(|(id, _)| *id)
+        .collect();
+    let (_, input_peak, _) = interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &select_fma_ops)?;
     outcome.peak_live_before = input_peak;
     outcome.peak_live_after = input_peak;
     let count_shifts = |outcome: &mut JustifyOutcome, shifted: &HashSet<usize>, lanes: &HashMap<usize, Vec<i32>>| {
@@ -849,7 +861,7 @@ pub(crate) fn justify_schedule(
                 }
             }
         }
-        scratch_check(work, vector_group_lanes, config).map_err(|e| {
+        scratch_check(work, vector_group_lanes, &select_fma_ops, config).map_err(|e| {
             outcome.scratch_rejections += 1;
             Rejection::Scratch(e)
         })
