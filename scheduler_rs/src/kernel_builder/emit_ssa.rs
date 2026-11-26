@@ -6,12 +6,27 @@
 //!
 //! After scheduling, VRegs are mapped to physical addresses via linear scan allocation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::types::{
     compute_const_encodings_alu_ready, ConstEncoding, EmissionPhase, Engine, LiveInterval,
-    MemEdgeKind, MemLocation, Opcode, Operand, SsaOp, SymmetryHint, VReg, VarSource, VarType,
+    MemEdgeKind, MemLocation, Opcode, Operand, RegionKind, RegionTag, SsaOp, SymmetryHint, VReg,
+    VarSource, VarType,
 };
+
+/// Region the emitter is currently in (`SsaEmitContext::set_region`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveRegion {
+    /// What the region computes.
+    pub kind: RegionKind,
+    /// Group, or `None` for a part shared by several groups.
+    pub group: Option<usize>,
+    /// Depth to record instead of the round's tree depth (the level of a setup region).
+    pub depth: Option<usize>,
+}
+
+/// Key of a region: ops with the same key share one `RegionTag::id`.
+type RegionKey = (RegionKind, Option<u32>, Option<u32>, Option<u32>);
 
 /// Tracks alternative implementations for a constant.
 ///
@@ -86,6 +101,10 @@ pub struct SsaEmitContext {
     /// Ops that do not touch memory leave it pending, so it can be set before a helper that
     /// first materialises an address (e.g. `emit_load_imm`).
     pub next_mem_loc: Option<MemLocation>,
+    /// Region the next emitted ops belong to (`set_region`); `None` = untagged.
+    pub current_region: Option<ActiveRegion>,
+    /// Region ids by key, dense in order of first emission (ordered map: deterministic).
+    pub region_ids: BTreeMap<RegionKey, u32>,
 
     // =========================================================================
     // Constant Alternative Tracking (for CP-SAT optimization)
@@ -145,6 +164,8 @@ impl SsaEmitContext {
             next_trace_id: None,
             next_keep_live: None,
             next_mem_loc: None,
+            current_region: None,
+            region_ids: BTreeMap::new(),
             // Constant alternative tracking
             const_alternatives: Vec::new(),
             zero_vreg: None,
@@ -229,6 +250,8 @@ impl SsaEmitContext {
         self.next_var_type = None;
         self.next_trace_id = None;
         self.next_mem_loc = None;
+        self.current_region = None;
+        self.region_ids.clear();
         // Reset const alternative tracking
         self.const_alternatives.clear();
         self.zero_vreg = None;
@@ -265,16 +288,61 @@ impl SsaEmitContext {
         self.current_group = None;
     }
 
-    /// Set iteration and group context
+    /// Set iteration and group context. Inside a region (`set_region`) the region's group
+    /// follows it, so per-group emitters tag their ops without knowing about regions.
     pub fn set_iter_group(&mut self, iter: usize, group: usize) {
         self.current_iter = Some(iter);
         self.current_group = Some(group);
+        if let Some(region) = self.current_region.as_mut() {
+            region.group = Some(group);
+        }
     }
 
-    /// Clear iteration and group context
+    /// Clear iteration and group context (and the current region's group).
     pub fn clear_iter_group(&mut self) {
         self.current_iter = None;
         self.current_group = None;
+        if let Some(region) = self.current_region.as_mut() {
+            region.group = None;
+        }
+    }
+
+    /// Tag the ops emitted from now on as region `kind` of `group` (in the current round,
+    /// at the current tree depth) until `clear_region` or the next `set_region`.
+    ///
+    /// Tags change nothing about the program (`SsaOp::region`).
+    ///
+    /// # Arguments
+    /// * `kind` - What the region computes.
+    /// * `group` - Its group, or `None` for a part shared by several groups.
+    pub fn set_region(&mut self, kind: RegionKind, group: Option<usize>) {
+        self.current_region = Some(ActiveRegion { kind, group, depth: None });
+    }
+
+    /// Tag the ops emitted from now on as the setup of cached tree level `depth`
+    /// (`RegionKind::CachedLevelSetup`), until `clear_region`.
+    ///
+    /// # Arguments
+    /// * `depth` - The tree level.
+    pub fn set_setup_region(&mut self, depth: usize) {
+        self.current_region =
+            Some(ActiveRegion { kind: RegionKind::CachedLevelSetup, group: None, depth: Some(depth) });
+    }
+
+    /// Stop tagging: ops emitted from now on have no region.
+    pub fn clear_region(&mut self) {
+        self.current_region = None;
+    }
+
+    /// Tag for an op emitted now, allocating the region's id on first use.
+    fn current_region_tag(&mut self) -> Option<RegionTag> {
+        let region = self.current_region?;
+        let round = self.current_round.map(|r| r as u32);
+        let group = region.group.map(|g| g as u32);
+        let depth = region.depth.or(self.current_tree_depth).map(|d| d as u32);
+        let next = self.region_ids.len() as u32;
+        let id = *self.region_ids.entry((region.kind, round, group, depth)).or_insert(next);
+        Some(RegionTag { id, kind: region.kind, round, group, depth })
     }
 
     /// Set the VarType for the next emitted op
@@ -373,6 +441,7 @@ impl SsaEmitContext {
         // Capture current context for usage accounting
         op.source_info = Some(self.current_var_source());
         op.symmetry_hint = self.current_symmetry_hint.clone();
+        op.region = self.current_region_tag();
         if let Some(var_type) = self.next_var_type.take() {
             op.var_type = Some(var_type);
         }

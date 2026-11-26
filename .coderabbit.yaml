@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit configuration. Only path filters are set here; everything else
+# keeps CodeRabbit's defaults.
+#
+# The excluded files are machine-written run reports and data sets (loop
+# reports, model-fit data, schedule dumps). They are checked in so results can
+# be recomputed, and are covered by tests that read them; a line-by-line review
+# of thousands of generated JSON lines adds nothing and can exhaust the review
+# budget for the code in the same pull request.
+#
+# Hand-written inputs stay reviewable: emission plans such as
+# docs/emission_plans/flow90.json are NOT excluded.
+reviews:
+  path_filters:
+    # Stage-1 loop reports (scripts/emission_loop.py report)
+    - "!docs/emission_plans/loop_report*.json"
+    # Greedy-model fit data (scripts/greedy_model_fit.py collect)
+    - "!docs/emission_plans/greedy_model_data*.json"
+    # Greedy deadlock state dumps (SCHEDULER_DEADLOCK_DUMP)
+    - "!docs/emission_plans/stall_deadlock_*.json"
+    # Solver counterexample dumps written by the verification scripts
+    - "!verification/*_counterexamples.json"
+    # Generated schedule, kernel and analysis outputs at the repository root
+    - "!*.json"
+    # Exported CP-SAT models
+    - "!**/*.pb"

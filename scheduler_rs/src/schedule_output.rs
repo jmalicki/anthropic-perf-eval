@@ -428,6 +428,23 @@ struct SsaOpDebugOut {
     /// reading the hardware zero, which has no producing op, is kept but switched off).
     #[serde(skip_serializing_if = "Option::is_none")]
     const_alu_derivable: Option<bool>,
+    /// Emitter region tag (`SsaOp::region`): a hint about which region the op was emitted
+    /// for, never its semantics. Written only for tagged ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<RegionTagOut>,
+}
+
+/// `SsaOp::region` in the scheduler output JSON.
+#[derive(Serialize)]
+struct RegionTagOut {
+    id: u32,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u32>,
 }
 
 /// One memory ordering edge: the source op, its kind ("raw", "war", "waw") and the minimum
@@ -675,6 +692,13 @@ pub fn write_ssa_schedule_json(
                     }),
                     const_alu_derivable: (op.opcode == crate::types::Opcode::ConstChoice)
                         .then(|| const_alu_derivable(op, &produced)),
+                    region: op.region.map(|r| RegionTagOut {
+                        id: r.id,
+                        kind: r.kind.as_str(),
+                        round: r.round,
+                        group: r.group,
+                        depth: r.depth,
+                    }),
                 }
             })
             .collect()
