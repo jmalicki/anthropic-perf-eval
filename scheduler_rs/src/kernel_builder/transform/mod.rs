@@ -16,7 +16,9 @@
 //! - `rule` - the `Rule` trait, proposals, facts
 //! - `tree_access` - tree access at depth d: matcher, builders, instantiation
 //! - `cost` - liveness of every op as a function of the choices, and the cost table
+//! - `apply` - rewrite the instantiated canonical program into the program of a selection
 
+pub mod apply;
 pub mod cost;
 pub mod graph;
 pub mod rule;
@@ -25,6 +27,7 @@ pub mod tree_access;
 #[cfg(test)]
 mod tests;
 
+pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};
 pub use graph::SsaGraph;
 pub use rule::{Fact, FactSource, Proposal, Rejection, Rule};

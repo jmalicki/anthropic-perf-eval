@@ -22,20 +22,26 @@ fn context(batch_size: usize, bit_source: SelectBitSource) -> ProblemSpec {
     }
 }
 
-/// Counts of the program a plan emits, after dead code elimination.
-fn emitted_counts(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) -> Counts {
+/// The program the emitter writes for a plan, after dead code elimination.
+fn emitted_program(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) -> crate::kernel_builder::SsaProgram {
     let config = KernelConfig {
         spec: ProblemSpec { access_plan: Some(plan.to_vec()), ..spec.clone() },
         ..KernelConfig::new(spec.forest_height, spec.n_nodes, spec.batch_size, spec.rounds)
     };
     let mut program = SsaTickTockKernelBuilder::new(config).build();
-    let (ops, _, _) = eliminate_ssa_dead_code(
+    let (ops, vreg_def, const_alternatives) = eliminate_ssa_dead_code(
         std::mem::take(&mut program.ops),
         &mut program.vreg_def,
         &mut program.const_alternatives,
         program.zero_vreg,
         Some(&program.vector_group_lanes),
     );
+    crate::kernel_builder::SsaProgram { ops, vreg_def, const_alternatives, ..program }
+}
+
+/// Counts of the program a plan emits, after dead code elimination.
+fn emitted_counts(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>]) -> Counts {
+    let ops = emitted_program(spec, plan).ops;
     let mut c = [0; 10];
     for op in &ops {
         if let Some(k) = category(op).unwrap() {
@@ -261,6 +267,181 @@ fn test_gather_tag_on_partial_region_is_rejected() {
     let graph = SsaGraph::new(&program.ops, &program.vector_group_lanes);
     let p = rule().propose(&graph).into_iter().find(|p| p.round == Some(3) && p.group == Some(0)).unwrap();
     assert!(rule().match_site(&graph, &p).is_err());
+}
+
+// ----------------------------------------------------------------------------
+// Apply: the rewritten canonical program is the planned program, op for op
+// ----------------------------------------------------------------------------
+
+/// Every op printed with VRegs renamed in order of first appearance (lanes of a vector group
+/// named right after the group), and region ids dropped (they are dense per emission).
+fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<String> {
+    use crate::types::{Operand, VReg};
+    use std::collections::HashMap;
+    let mut names: HashMap<VReg, usize> = HashMap::new();
+    let mut name = |v: VReg, names: &mut HashMap<VReg, usize>| -> String {
+        if !names.contains_key(&v) {
+            let n = names.len();
+            names.insert(v, n);
+            if let Some(lanes) = program.vector_group_lanes.get(&v) {
+                for &l in lanes {
+                    let n = names.len();
+                    names.entry(l).or_insert(n);
+                }
+            }
+        }
+        format!("{}{}", if v.is_scalar() { "s" } else { "v" }, names[&v])
+    };
+    program
+        .ops
+        .iter()
+        .map(|op| {
+            let srcs: Vec<String> = op
+                .srcs
+                .iter()
+                .map(|s| match s {
+                    Operand::VReg(v) => name(*v, &mut names),
+                    Operand::Imm(i) => format!("#{}", i),
+                })
+                .collect();
+            let keep: Option<Vec<String>> =
+                op.keep_live.as_ref().map(|k| k.iter().map(|v| name(*v, &mut names)).collect());
+            let delta = op.delta_vreg.map(|v| name(v, &mut names));
+            let sub_temp = op.sub_temp_vreg.map(|v| name(v, &mut names));
+            let dest = op.dest.map(|v| name(v, &mut names));
+            format!(
+                "{:?} {:?} {:?} <- {:?} keep={:?} delta={:?} sub={} sub_temp={:?} vt={:?} src={:?} sym={:?} mem={:?} \
+                 alts={:?} k={:?} trace={:?} region={:?}",
+                op.engine, op.opcode, dest, srcs, keep, delta, op.needs_subtraction, sub_temp, op.var_type,
+                op.source_info, op.symmetry_hint, op.mem_loc, op.const_alternatives, op.produces_constant,
+                op.trace_id, op.region.map(|t| (t.kind, t.round, t.group, t.depth)),
+            )
+        })
+        .collect::<Vec<String>>()
+        .into_iter()
+        .chain({
+            // The lane map: every group with its key and lanes named as in the ops; a group
+            // no op references is listed as such (it would still reserve scratch).
+            let mut groups: Vec<String> = program
+                .vector_group_lanes
+                .iter()
+                .map(|(key, lanes)| match names.get(key) {
+                    Some(k) => format!("group v{} = {:?}", k, lanes.iter().map(|l| names.get(l).copied()).collect::<Vec<_>>()),
+                    None => "group not referenced by any op".to_string(),
+                })
+                .collect();
+            groups.sort();
+            groups
+        })
+        .collect()
+}
+
+fn check_apply(spec: &ProblemSpec, plan: &[Vec<AccessEncoding>], label: &str) {
+    let applied = canonical_ops(&super::apply::apply_tree_access_plan(spec, plan).unwrap());
+    let emitted = canonical_ops(&emitted_program(spec, plan));
+    if let Some(i) = (0..applied.len().min(emitted.len())).find(|&i| applied[i] != emitted[i]) {
+        panic!("{}: first difference at op {}:\n applied {}\n emitted {}\nplan {:?}", label, i, applied[i], emitted[i], plan);
+    }
+    assert_eq!(applied.len(), emitted.len(), "{}: op count", label);
+}
+
+#[test]
+fn test_apply_reproduces_the_planned_program_4_groups() {
+    let spec = context(32, SelectBitSource::Index);
+    for (i, plan) in test_plans(&spec, 16).iter().enumerate() {
+        check_apply(&spec, plan, &format!("plan {}", i));
+    }
+}
+
+#[test]
+fn test_apply_reproduces_the_planned_program_path_bits() {
+    let spec = context(32, SelectBitSource::Path);
+    for (i, plan) in test_plans(&spec, 6).iter().enumerate() {
+        check_apply(&spec, plan, &format!("plan {}", i));
+    }
+}
+
+#[test]
+fn test_apply_reproduces_the_planned_program_32_groups() {
+    let spec = context(256, SelectBitSource::Index);
+    // flow90.json's structure: rounds 1-4 and 12-15 mixed or selected, round 15 gathering.
+    use AccessEncoding::*;
+    let mut plan = super::cost::canonical_plan(&spec);
+    for r in [1, 2, 12, 13] {
+        plan[r] = vec![Bits; 32];
+    }
+    for r in [3, 14] {
+        plan[r] = vec![BitsFlow; 32];
+    }
+    plan[4] = (0..32).map(|g| if g < 17 { Gather } else { BitsFlow }).collect();
+    check_apply(&spec, &plan, "flow90-like");
+    for (i, plan) in test_plans(&spec, 3).iter().enumerate() {
+        check_apply(&spec, plan, &format!("plan {}", i));
+    }
+}
+
+#[test]
+fn test_applied_program_schedules_like_the_emitted_one() {
+    // Downstream of the apply pass the pipeline runs unchanged: the greedy schedule of the
+    // rewritten program has the emitted program's cycles, ops, peak live and budget flags
+    // (shaped greedy, as the recorded results use).
+    use crate::kernel_builder::config::{GreedyBarrierMode, GreedyPriorityKind};
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+    use AccessEncoding::*;
+    let schedule = |program| {
+        let mut config = PipelineConfig::default();
+        config.compiler.greedy_barriers = GreedyBarrierMode::None;
+        config.compiler.greedy_priority = GreedyPriorityKind::Wavefront;
+        config.compiler.greedy_split_shift = true;
+        let mut ctx = PipelineContext::new(program, config);
+        ctx.run_greedy_pipeline(true).unwrap();
+        let greedy_exceeded = ctx.greedy_metrics.budget_exceeded;
+        let r = ctx.into_result().unwrap();
+        (r.cycles, r.ops.len(), r.address_result.peak_live, r.address_result.budget_exceeded, greedy_exceeded)
+    };
+    let small = context(32, SelectBitSource::Index);
+    let mut plan = super::cost::canonical_plan(&small);
+    plan[2] = vec![Mobius, Bits, Gather, BitsFlow];
+    plan[4] = vec![Gather, Gather, BitsFlow, BitsFlow];
+    plan[13] = vec![Bits; 4];
+    let large = context(256, SelectBitSource::Index);
+    let mut flow90 = super::cost::canonical_plan(&large);
+    for r in [1, 2, 12, 13] {
+        flow90[r] = vec![Bits; 32];
+    }
+    for r in [3, 14] {
+        flow90[r] = vec![BitsFlow; 32];
+    }
+    flow90[4] = (0..32).map(|g| if g < 17 { Gather } else { BitsFlow }).collect();
+    for (label, spec, plan) in [("4 groups", &small, &plan), ("32 groups, flow90-like", &large, &flow90)] {
+        let applied = schedule(super::apply::apply_tree_access_plan(spec, plan).unwrap());
+        let emitted = schedule(emitted_program(spec, plan));
+        assert_eq!(
+            applied, emitted,
+            "{}: (cycles, ops, peak live, address budget exceeded, greedy budget exceeded)",
+            label
+        );
+    }
+}
+
+#[test]
+fn test_apply_reproduces_the_planned_program_at_other_shapes() {
+    // Rounds 15: the last round is at depth 4, so the final index conversion reads L_4; a
+    // plan with no gather at depth 4 creates L_4 there (not in round 4). Also height 8 and
+    // 26 rounds (more visits per level).
+    for spec in [shape(15, 10, 32), shape(15, 8, 32), shape(26, 10, 32)] {
+        for (i, plan) in test_plans(&spec, 4).iter().enumerate() {
+            check_apply(&spec, plan, &format!("rounds {} height {} plan {}", spec.rounds, spec.forest_height, i));
+        }
+    }
+}
+
+#[test]
+fn test_apply_rejects_a_choice_outside_the_cached_levels() {
+    let spec = context(32, SelectBitSource::Index);
+    let mut plan = super::cost::canonical_plan(&spec);
+    plan[6] = vec![AccessEncoding::Bits; 4];
+    assert!(super::apply::apply_tree_access_plan(&spec, &plan).is_err());
 }
 
 // ----------------------------------------------------------------------------
