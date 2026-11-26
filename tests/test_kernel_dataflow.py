@@ -55,6 +55,7 @@ def test_clean_greedy_kernel_is_proved(greedy):
     assert report.ssa_values > 1000
 
 
+# Shallow on purpose: one of the two CP-SAT smoke tests every PR runs (CLAUDE.md, test tiers).
 def test_clean_cpsat_kernel_is_proved(tmp_path_factory):
     """CP-SAT exercises the alternative encodings (shifted ops, FMA selects, add_imm)."""
     kernel, sched = _build(tmp_path_factory, "cpsat", rounds=2, use_cpsat=True, cpsat_time_limit=20.0)

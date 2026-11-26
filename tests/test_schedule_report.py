@@ -87,7 +87,7 @@ def test_emission_floor_names_the_binding_engine():
 # ---------------------------------------------------------------------------
 # Report on real kernels
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("fixture", ["greedy", "cpsat"])
+@pytest.mark.parametrize("fixture", ["greedy", pytest.param("cpsat", marks=pytest.mark.deep)])
 def test_engine_counts_sum_to_lowered_ops(fixture, request):
     sched, _ = request.getfixturevalue(fixture)
     rep = sr.analyze(sched)
@@ -98,7 +98,7 @@ def test_engine_counts_sum_to_lowered_ops(fixture, request):
     assert em["vector_ops"] == _ssa_vector_ops(sched)
 
 
-@pytest.mark.parametrize("fixture", ["greedy", "cpsat"])
+@pytest.mark.parametrize("fixture", ["greedy", pytest.param("cpsat", marks=pytest.mark.deep)])
 def test_gap_is_non_negative_and_floor_is_consistent(fixture, request):
     sched, _ = request.getfixturevalue(fixture)
     rep = sr.analyze(sched)
@@ -110,7 +110,7 @@ def test_gap_is_non_negative_and_floor_is_consistent(fixture, request):
         assert rep["engines"][e]["floor"] <= rep["floor"]["cycles"]
 
 
-@pytest.mark.parametrize("fixture", ["greedy", "cpsat"])
+@pytest.mark.parametrize("fixture", ["greedy", pytest.param("cpsat", marks=pytest.mark.deep)])
 def test_round_spans_cover_all_scheduled_ops(fixture, request):
     sched, _ = request.getfixturevalue(fixture)
     rows = {r["round"]: r for r in sr.per_round(sched)}
@@ -150,6 +150,7 @@ def test_wording_states_the_floor_is_conditional(greedy):
     assert f"{rep['floor']['cycles']} cycles" in lines[0]
 
 
+@pytest.mark.deep
 def test_cpsat_bound_is_labelled_as_emission_scoped(cpsat):
     sched, _ = cpsat
     assert sched["run_options"]["use_cpsat"] is True
@@ -160,7 +161,7 @@ def test_cpsat_bound_is_labelled_as_emission_scoped(cpsat):
     assert "CP-SAT bound for this emission (lb_cycles)" in sr.format_report(rep)
 
 
-@pytest.mark.parametrize("fixture", ["greedy", "cpsat"])
+@pytest.mark.parametrize("fixture", ["greedy", pytest.param("cpsat", marks=pytest.mark.deep)])
 def test_scratch_usage_is_between_liveness_and_pool_bound(fixture, request):
     """The allocator uses at least the per-cycle peak of 8*vectors + scalars (no layout can do
     better) and at most 8*max vectors + max scalars (what the two-pass allocator guarantees)."""
@@ -193,6 +194,7 @@ def test_greedy_json_has_no_bound_fields(greedy):
     assert sr.analyze(sched)["run"]["scheduler"] == "greedy"
 
 
+@pytest.mark.deep
 def test_scheduler_and_rounds_are_inferred_without_run_options(greedy, cpsat):
     for (sched, _), scheduler, rounds in ((greedy, "greedy", 5), (cpsat, "cpsat", 2)):
         bare = {k: v for k, v in sched.items() if k != "run_options"}
@@ -200,6 +202,7 @@ def test_scheduler_and_rounds_are_inferred_without_run_options(greedy, cpsat):
         assert (run["scheduler"], run["rounds"], run["batch_size"]) == (scheduler, rounds, None)
 
 
+@pytest.mark.deep
 def test_cli_json_and_compare(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert sr.main([a, "--json"]) == 0
@@ -266,6 +269,7 @@ def test_round_overlap_is_zero_by_default_and_positive_without_barriers():
     assert sr.round_overlap([r for r in rounds if r["round"] == 0]) is None
 
 
+@pytest.mark.deep
 def test_table_mode(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert sr.main(["--table", f"five rounds={a}", b]) == 0
@@ -295,6 +299,7 @@ def test_table_escapes_pipes_in_labels(greedy):
     assert row.count("|") - row.count("\\|") == sr.TABLE_HEADER.count("|")
 
 
+@pytest.mark.deep
 def test_table_rejects_duplicate_labels(greedy, cpsat, capsys):
     (_, a), (_, b) = greedy, cpsat
     assert a.endswith("sched.json") and b.endswith("sched.json")
