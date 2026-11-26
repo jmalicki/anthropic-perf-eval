@@ -70,3 +70,24 @@ def test_fewer_groups_in_flight_builds_within_budget(name, cycles, monkeypatch):
     assert not stats["budget_exceeded"] and stats["cycles"] == cycles
     assert check({"instrs": instrs}, sched).ok
     assert validate_kernel(instrs, 10, 256, 16, 123)
+
+
+def test_nested_inflation_blockers_are_not_counted_as_budget_blockers():
+    """A reader blocked behind an inflation-deferred op ("inflation (deferred this cycle)"
+    nested in "blocked on op ...") is bucketed as inflation, not as a budget-deferred op.
+    Before the fix the generic "deferred" substring matched first."""
+    def op(i, dest=None, srcs=(), deps=(), cycle=-1):
+        return {"id": i, "opcode": "+", "engine": "valu", "dest": dest, "cycle": cycle, "dep_ids": list(deps),
+                "srcs": [{"VReg": {"id": s, "width": "vector"}} for s in srcs], "source_info": {}}
+    sched = {"ssa_ops": [
+        op(1, "v1_v", cycle=0), op(2, "v2_v", cycle=0),
+        op(3, "v3_v"),                       # inflation-deferred
+        op(4, "v4_v", srcs=[1], deps=[3]),   # reads v1, waits on op 3
+        op(5, "v5_v"),                       # budget-deferred
+        op(6, "v6_v", srcs=[2], deps=[5]),   # reads v2, waits on op 5
+    ]}
+    state = {"cycle": 5, "live_words": 16, "budget": 16, "slots": {},
+             "live": [{"vreg": 1, "words": 8, "remaining_users": 1}, {"vreg": 2, "words": 8, "remaining_users": 1}],
+             "budget_deferred": [{"id": 5, "reason": "budget"}], "inflation_deferred": [3], "heap": []}
+    kinds = sd.analyse(state, sched)["words_by_first_reader_state"]
+    assert kinds == {"blocked behind an inflation-deferred op": 8, "blocked behind a deferred op": 8}, kinds

@@ -50,7 +50,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -606,7 +606,7 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
 
 
 def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_level: int = 1,
-              retries: int = 20) -> dict:
+              retries: int = 20, max_solves: Optional[int] = None) -> dict:
     """Plain selection by a stage-1 score: build plans in order of increasing score and judge
     each with the greedy. `objective` "floor" (the capacity floor, a bound) or
     "greedy-model" (GREEDY_MODEL, a fitted heuristic).
@@ -624,7 +624,10 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     only when no level was skipped; otherwise its last record is "incomplete" and lists the
     skipped levels (`exhausted`, `skipped_levels`, `rejected_unbuilt` in the record). Solves use the
     loop's deterministic-time budget. No incumbent bound, no patience stop: all k builds are
-    made."""
+    made, unless the run reaches `max_solves` solves (default `(retries + 1) * (k + 10)`): on a
+    score plateau that cannot be exhausted (e.g. a flat table, where every level above the first
+    returns plans below it and is skipped without a build) the run then ends "incomplete" with
+    the builds made so far."""
     if objective not in ("floor", "greedy-model"):
         raise ValueError(f"topk objective {objective!r}")
     if per_level < 1:
@@ -638,10 +641,25 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     # Levels given up after `retries` tries: plans of exactly that score may remain unbuilt.
     skipped: list = []
     level, levels_seen, at_level, builds, it = None, 0, 0, 0, 0
+    budget = max_solves if max_solves is not None else (retries + 1) * (k + 10)
+    solves = 0
+
+    def counted_solve(*a, **kw):
+        nonlocal solves
+        solves += 1
+        return solve(*a, **kw)
+
     while builds < k:
+        if solves >= budget:
+            msg = (f"incomplete: solve budget of {budget} reached after {builds} of {k} builds; levels "
+                   f"{skipped} were skipped and {len(rejected)} rejected plans were never built")
+            _record(stage2, mode, it, {"status": "budget", "solves": []}, None, False, msg,
+                    extra={"exhausted": False, "skipped_levels": list(skipped),
+                           "rejected_unbuilt": len(rejected), "solve_budget": budget})
+            break
         if level is None:
-            res = solve(stage2, nogoods=_built_nogoods(stage2), time_limit=time_limit, greedy_model=gm,
-                        tie_break=False)
+            res = counted_solve(stage2, nogoods=_built_nogoods(stage2), time_limit=time_limit, greedy_model=gm,
+                                tie_break=False)
             if res["status"] == "infeasible":
                 _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
                 break
@@ -649,7 +667,11 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
         else:
             res = None
             for _ in range(retries + 1):
-                res = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                if solves >= budget:
+                    # Never build a plan the last solve found below the level.
+                    res = {"status": "budget"}
+                    break
+                res = counted_solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
                             greedy_model=gm, tie_break=False, incumbent=level + 1, min_objective=level)
                 if res["status"] == "infeasible" or es.plan_score(stage2.table, res["rows"], objective) == level:
                     break
@@ -657,6 +679,8 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
             else:
                 res = {"status": "skipped"}
                 skipped.append(level)
+            if res["status"] == "budget":
+                continue  # the loop head records the incomplete run
             if res["status"] != "optimal" and res["status"] != "feasible":
                 _record(stage2, mode, it, res, None, False,
                         f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
@@ -667,8 +691,10 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
                     # can always be raised to meet min_objective. The lowest score left is the
                     # next non-empty level; none left means the enumeration is done (before,
                     # this stepped level + 1 with one solve each, up to 10^6).
-                    nxt = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
-                                greedy_model=gm, tie_break=False)
+                    if solves >= budget:
+                        continue
+                    nxt = counted_solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                                        greedy_model=gm, tie_break=False)
                     if nxt["status"] == "infeasible":
                         end = {"exhausted": not skipped, "skipped_levels": list(skipped),
                                "rejected_unbuilt": len(rejected)}
