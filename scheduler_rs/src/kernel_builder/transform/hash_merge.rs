@@ -125,8 +125,10 @@ pub fn merged_constants(m: i64, c: i64, d: i64, k: i64) -> (i64, i64, i64, i64) 
     // The inputs are whatever the constants' annotations say (any i64 that agrees with the
     // immediate): reduce them first and wrap, so nothing overflows.
     let (m, c, d) = (m & MASK, c & MASK, d & MASK);
-    let k = (k & 31) as u32;
-    (m, c.wrapping_add(d) & MASK, m.wrapping_shl(k) & MASK, c.wrapping_shl(k) & MASK)
+    // The machine's word shift: `x << k` mod 2^32, which is 0 for k >= 32 (not k mod 32). The
+    // matcher admits only 0 <= k < 32; a negative k is no machine shift and also gives 0.
+    let shl = |x: i64| if (0..32).contains(&k) { (x << k) & MASK } else { 0 };
+    (m, c.wrapping_add(d) & MASK, shl(m), shl(c))
 }
 
 #[cfg(test)]
@@ -139,6 +141,9 @@ mod merged_constants_tests {
         assert_eq!(merged_constants(i64::MAX, i64::MAX, i64::MAX, 31), (0xFFFF_FFFF, 0xFFFF_FFFE, 0x8000_0000, 0x8000_0000));
         assert_eq!(merged_constants(-1, -1, 1, 0), (0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0xFFFF_FFFF));
         assert_eq!(merged_constants(3, 0xFFFF_FFFF, 2, 4), (3, 1, 48, 0xFFFF_FFF0));
+        // A word shift by 32 or more is 0 (not a shift by k mod 32).
+        assert_eq!(merged_constants(3, 5, 2, 32), (3, 7, 0, 0));
+        assert_eq!(merged_constants(3, 5, 2, 40), (3, 7, 0, 0));
     }
 }
 

@@ -133,13 +133,22 @@ fn test_index_transforms_keep_outputs_with_the_tree_extent_known() {
                 let p = raw_program(&spec);
                 let mut q = clone_program(&p);
                 for &t in &ts {
-                    q = apply_transform_with(q, t, Some(spec.batch_size), Some(spec.n_nodes)).unwrap().0;
+                    let (next, outcome) = apply_transform_with(q, t, Some(spec.batch_size), Some(spec.n_nodes)).unwrap();
+                    assert!(outcome.refused.is_none(), "{} {:?}: refused: {:?}", label, t, outcome.refused);
+                    // values-only always has index stores to drop; prune-index has nothing to
+                    // prune on a mirrored index.
+                    let expect_sites = t == TransformKind::ValuesOnly || spec.index_form != crate::kernel_builder::config::IndexForm::Mirrored;
+                    assert_eq!(outcome.sites > 0, expect_sites, "{} {:?}: {}", label, t, outcome.summary);
+                    q = next;
                 }
                 let seeds = [4u64, 40];
                 let (b, a) = (outputs(&p, &spec, &seeds), outputs(&q, &spec, &seeds));
                 for ((bo, _), (ao, _)) in b.iter().zip(&a) {
                     assert_eq!(ao.1, bo.1, "{} {:?}: values", label, ts);
-                    if !ts.contains(&TransformKind::ValuesOnly) {
+                    if ts.contains(&TransformKind::ValuesOnly) {
+                        // The index stores are gone: the index memory keeps its initial zeros.
+                        assert!(ao.0.iter().all(|&i| i == 0), "{} {:?}: values-only must leave the index memory untouched", label, ts);
+                    } else {
                         assert_eq!(ao.0, bo.0, "{} {:?}: indices", label, ts);
                     }
                 }

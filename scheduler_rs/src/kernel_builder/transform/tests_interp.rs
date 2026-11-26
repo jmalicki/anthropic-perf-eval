@@ -170,3 +170,77 @@ fn test_index_transforms_preserve_outputs() {
         }
     }
 }
+
+/// A program from `ops` (dest ids as given), with the lane map `lanes`.
+fn tiny(ops: Vec<crate::types::SsaOp>, lanes: Vec<(crate::types::VReg, Vec<crate::types::VReg>)>, vreg_count: u32) -> SsaProgram {
+    let mut ops = ops;
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = i;
+    }
+    SsaProgram {
+        vreg_def: ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect(),
+        ops,
+        vreg_count,
+        const_alternatives: Vec::new(),
+        zero_vreg: None,
+        vector_group_lanes: lanes.into_iter().collect(),
+    }
+}
+
+#[test]
+fn test_interp_rejects_a_malformed_vector_group() {
+    use crate::types::{Engine, Opcode, Operand, SsaOp, VReg};
+    // A vector alias with 7 scalar lanes, stored: an error, not a panic. With 8 lanes it runs.
+    let konst = |d: VReg, k: i64| {
+        let mut op = SsaOp::new(0, Engine::Load, Opcode::Const, Some(d), vec![Operand::Imm(k)]);
+        op.produces_constant = Some(k);
+        op
+    };
+    for n in [7u32, 8] {
+        let addr = VReg::scalar(0);
+        let lanes: Vec<VReg> = (1..=n).map(VReg::scalar).collect();
+        let key = VReg::vector(n + 1);
+        let mut ops = vec![konst(addr, 16)];
+        ops.extend(lanes.iter().map(|&l| konst(l, 3)));
+        ops.push(SsaOp::new(0, Engine::Store, Opcode::Vstore, None, vec![Operand::VReg(addr), Operand::VReg(key)]));
+        let p = tiny(ops, vec![(key, lanes)], n + 2);
+        let mut mem = vec![0u32; 64];
+        let r = super::interp::run_with(&p, &mut mem, super::interp::SelectLowering::Both);
+        if n == 7 {
+            assert!(r.as_ref().err().map_or(false, |e| e.contains("malformed")), "{:?}", r.err());
+        } else {
+            r.unwrap();
+            assert_eq!(&mem[16..24], &[3; 8]);
+        }
+    }
+}
+
+#[test]
+fn test_interp_reads_the_select_delta_only_for_the_multiply_add_lowering() {
+    use super::interp::{run_with, SelectLowering};
+    use crate::types::{Engine, Opcode, Operand, SsaOp, VReg};
+    // A SelectChoice whose delta is a scalar (wrong width): vselect does not read it and gives
+    // its result; the multiply_add lowering (and Both) report the width.
+    let konst = |d: VReg, k: i64| {
+        let mut op = SsaOp::new(0, Engine::Load, Opcode::Const, Some(d), vec![Operand::Imm(k)]);
+        op.produces_constant = Some(k);
+        op
+    };
+    let (one, five, nine, delta) = (VReg::scalar(0), VReg::scalar(1), VReg::scalar(2), VReg::scalar(3));
+    let (c, t, f, r) = (VReg::vector(4), VReg::vector(5), VReg::vector(6), VReg::vector(7));
+    let bc = |d: VReg, s: VReg| SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(d), vec![Operand::VReg(s)]);
+    let mut sel = SsaOp::new(0, Engine::Flow, Opcode::SelectChoice, Some(r), vec![Operand::VReg(c), Operand::VReg(t), Operand::VReg(f)]);
+    sel.delta_vreg = Some(delta);
+    let p = tiny(
+        vec![konst(one, 1), konst(five, 5), konst(nine, 9), konst(delta, 4), bc(c, one), bc(t, five), bc(f, nine), sel],
+        vec![],
+        8,
+    );
+    let mut mem = vec![0u32; 8];
+    let regs = run_with(&p, &mut mem, SelectLowering::Vselect).unwrap();
+    assert_eq!(regs[&r], vec![5; 8]);
+    for lowering in [SelectLowering::MultiplyAdd, SelectLowering::Both] {
+        let e = run_with(&p, &mut mem, lowering).err().expect("wrong-width delta");
+        assert!(e.contains("delta has the wrong width"), "{}", e);
+    }
+}

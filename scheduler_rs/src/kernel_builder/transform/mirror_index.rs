@@ -210,9 +210,28 @@ impl MirrorIndexRule {
             // A reader other than a step that reads `d` as its offset.
             let not_offset = readers.iter().any(|&r| !plan.steps.iter().any(|s| s.op == r && s.offset == d));
             if l.len() == 1 && not_offset {
+                // E.g. `(loaded index + 2) - b` is `2 - b` only because the loaded index is 0.
+                if values.relies_on_assumption(graph, d) || paths.assumed(i) {
+                    plan.assumed = true;
+                }
                 plan.index_values.insert(d, (1, l));
             } else if l.is_empty() && stored {
                 plan.index_values.insert(d, (0, l));
+            }
+        }
+        // Every index store must store an index value of the plan (a step result, a depth-1
+        // value, a stored zero): a stored index the plan does not cover (e.g. a second family
+        // `6 - (2*b0 + b1)` that is no step's result) would stay zero-based while the rest is
+        // rewritten, so the program is refused as a whole.
+        for &st in &index_stores {
+            match graph.ops[st].srcs.get(1).and_then(|s| s.as_vreg()) {
+                Some(v) if plan.index_values.contains_key(&v) => {}
+                v => {
+                    return Err(format!(
+                        "index store {} stores {:?}, which is no index value the rewrite builds (a step result, a depth-1 index or a stored zero)",
+                        st, v
+                    ))
+                }
             }
         }
         // 2. Classify every use.

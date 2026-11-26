@@ -777,6 +777,11 @@ fn renumbered(p: &SsaProgram) -> SsaProgram {
         if let Some(d) = op.dest.as_mut() {
             *d = name(*d, &mut map, &lanes);
         }
+        // A SelectChoice's temporary (its multiply_add form's SUB) is a VReg too: address
+        // assignment and liveness read it.
+        if let Some(t) = op.sub_temp_vreg.as_mut() {
+            *t = name(*t, &mut map, &lanes);
+        }
     }
     q.vector_group_lanes = lanes
         .iter()
@@ -830,6 +835,11 @@ fn test_mirror_index_kernel_equals_the_flag_kernel() {
         }
     }
     assert_eq!(renum.0, renum.1, "{}: kernels differ beyond VReg numbering", label);
+    // The default greedy builds the same kernel as is; the best-shape configuration may differ
+    // in scratch addresses only (VReg numbering), which the renumbered comparison covers.
+    if label == "default greedy" {
+        assert_eq!(as_is.0, as_is.1, "{}: kernels differ as built", label);
+    }
     }
 }
 
@@ -897,13 +907,112 @@ fn test_mirror_index_index_store_before_the_last_value_definer() {
     drop(g);
     let store = p.ops.remove(r);
     let ready = store.srcs.iter().filter_map(|s| s.as_vreg()).map(|v| p.ops.iter().position(|o| o.dest == Some(v)).unwrap()).max().unwrap();
-    let last_value_def = value_stores(&{ let mut q = clone_program(&p); q.ops.insert(ready + 1, store.clone()); renumber(&mut q); q })
-        .iter()
-        .map(|&s| s)
-        .max()
-        .unwrap();
+    let moved_srcs = store.srcs.clone();
     p.ops.insert(ready + 1, store);
     renumber(&mut p);
-    assert!(ready + 1 < last_value_def, "the index store must precede the last value definer");
+    // The emitter computes the stored values before the index chain ends; move the latest
+    // value definer (and its value store, its only reader) to the end, so that a value is
+    // computed after the index store.
+    let latest = value_stores(&p)
+        .into_iter()
+        .map(|s| (p.ops.iter().position(|o| o.dest == p.ops[s].srcs[1].as_vreg()).unwrap(), s))
+        .max()
+        .unwrap();
+    let (def_op, store_op) = (p.ops[latest.0].clone(), p.ops[latest.1].clone());
+    let (hi, lo) = (latest.0.max(latest.1), latest.0.min(latest.1));
+    p.ops.remove(hi);
+    p.ops.remove(lo);
+    p.ops.push(def_op);
+    p.ops.push(store_op);
+    renumber(&mut p);
+    // The latest definer of a value the value stores write (the stores' data operands), in
+    // the reordered program.
+    let last_value_def = value_stores(&p)
+        .iter()
+        .map(|&s| {
+            let v = p.ops[s].srcs[1].as_vreg().unwrap();
+            p.ops.iter().position(|o| o.dest == Some(v)).unwrap()
+        })
+        .max()
+        .unwrap();
+    let at = p.ops.iter().position(|o| o.opcode == Opcode::Vstore && o.srcs == moved_srcs).unwrap();
+    assert!(at < last_value_def, "the index store ({}) must precede the last value definer ({})", at, last_value_def);
     rewrite_and_compare(&p, &spec, "index store early");
+}
+
+/// Index stores of `p` (vector stores into the indices array).
+fn index_stores(p: &SsaProgram) -> Vec<usize> {
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let values = super::values::ValueFacts::compute(&g, p.zero_vreg, &rule().layout, &[]);
+    (0..p.ops.len())
+        .filter(|&i| p.ops[i].opcode == Opcode::Vstore)
+        .filter(|&i| p.ops[i].srcs[0].as_vreg().and_then(|a| values.address(&g, a)).map_or(false, |a| a.word == 5))
+        .collect()
+}
+
+/// Append a vector store of `value` to the address of index store `like`.
+fn push_index_store(p: &mut SsaProgram, like: usize, value: VReg) {
+    let mut st = p.ops[like].clone();
+    st.srcs[1] = Operand::VReg(value);
+    st.id = p.ops.len();
+    p.ops.push(st);
+}
+
+#[test]
+fn test_mirror_index_records_the_assumption_of_a_standalone_depth_1_index() {
+    // A pruned program (no step relies on InitialIndicesZero) plus an index store of a
+    // standalone depth-1 index. Built as `(loaded index + 2) - b` it is `2 - b` only because
+    // the loaded index is 0: the assumption is reported. Built from a literal 2, nothing is.
+    let spec = standard3();
+    let pruned = apply_transform(raw_program(&spec), TransformKind::PruneIndex, Some(BATCH)).unwrap().0;
+    let (_, base) = apply_mirror_index(clone_program(&pruned), &rule()).unwrap();
+    assert!(base.refused.is_none() && base.n_sites() > 0, "{:?}", base.refused);
+    assert!(base.assumptions().is_empty(), "the pruned program relies on nothing: {:?}", base.assumptions());
+    let g = SsaGraph::new(&pruned.ops, &pruned.vector_group_lanes);
+    let bit = rule().plan(&g, pruned.zero_vreg).unwrap().steps[0].bit;
+    drop(g);
+    let st = index_stores(&pruned)[0];
+    let addr = pruned.ops[st].srcs[0].as_vreg().unwrap();
+    for assumed in [true, false] {
+        let mut p = clone_program(&pruned);
+        let two = vconst(&p, 2);
+        let base_value = if assumed {
+            // The initial index, loaded right after its address is defined (before any store).
+            let ld = fresh(&mut p, true);
+            let at = p.ops.iter().position(|o| o.dest == Some(addr)).unwrap() + 1;
+            p.ops.insert(at, SsaOp::new(0, Engine::Load, Opcode::Vload, Some(ld), vec![Operand::VReg(addr)]));
+            renumber(&mut p);
+            push_valu(&mut p, Opcode::Add, &[ld, two])
+        } else {
+            two
+        };
+        let z = push_valu(&mut p, Opcode::Sub, &[base_value, bit]);
+        let st = index_stores(&p)[0];
+        push_index_store(&mut p, st, z);
+        renumber(&mut p);
+        let (_, report) = apply_mirror_index(p, &rule()).unwrap();
+        assert!(report.refused.is_none() && report.n_sites() > 0, "assumed {}: {:?}", assumed, report.refused);
+        let expected: Vec<&str> = if assumed { vec!["initial-indices-zero"] } else { vec![] };
+        assert_eq!(report.assumptions(), expected, "assumed {}", assumed);
+    }
+}
+
+#[test]
+fn test_mirror_index_refuses_a_stored_index_it_does_not_build() {
+    // A second index family stored for group 0: `6 - (2*b0 + b1)`, a depth-2 zero-based index
+    // that is no step's result. Rewriting the other chains would leave it zero-based: the
+    // program is refused as a whole.
+    let spec = standard3();
+    let mut p = raw_program(&spec);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let plan = rule().plan(&g, p.zero_vreg).unwrap();
+    let bits: Vec<VReg> = plan.steps.iter().filter(|s| p.ops[s.op].region.and_then(|t| t.group) == Some(1)).map(|s| s.bit).collect();
+    drop(g);
+    let (two, six) = (vconst(&p, 2), vconst(&p, 6));
+    let pos = push_valu(&mut p, Opcode::MultiplyAdd, &[bits[0], two, bits[1]]);
+    let z = push_valu(&mut p, Opcode::Sub, &[six, pos]);
+    let st = index_stores(&p)[0];
+    push_index_store(&mut p, st, z);
+    renumber(&mut p);
+    assert_refused(p, &rule(), "no index value the rewrite builds");
 }

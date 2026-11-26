@@ -103,6 +103,10 @@ pub fn run_with(p: &SsaProgram, mem: &mut [u32], select: SelectLowering) -> Resu
             return Ok(x.clone());
         }
         if let Some(lanes) = p.vector_group_lanes.get(&v) {
+            // A group is a vector key and VLEN scalar lanes; anything else is malformed.
+            if !v.is_vector() || lanes.len() != VLEN || lanes.iter().any(|l| l.is_vector()) {
+                return Err(format!("interp: vector group {:?} is malformed ({} lanes)", v, lanes.len()));
+            }
             return lanes
                 .iter()
                 .map(|l| regs.get(l).map(|x| x[0]).ok_or_else(|| format!("interp: lane {:?} of {:?} unset", l, v)))
@@ -188,6 +192,11 @@ pub fn run_with(p: &SsaProgram, mem: &mut [u32], select: SelectLowering) -> Resu
             }
             Opcode::SelectChoice => {
                 let (c, t, f) = (lanes(0, &regs, n)?, lanes(1, &regs, n)?, lanes(2, &regs, n)?);
+                let vselect: Vec<u32> = (0..n).map(|k| if c[k] != 0 { t[k] } else { f[k] }).collect();
+                if select == SelectLowering::Vselect {
+                    // The vselect lowering does not read the delta.
+                    Some(vselect)
+                } else {
                 let delta = match op.delta_vreg {
                     Some(d) => {
                         if width(d) != n {
@@ -197,7 +206,6 @@ pub fn run_with(p: &SsaProgram, mem: &mut [u32], select: SelectLowering) -> Resu
                     }
                     None => (0..n).map(|k| t[k].wrapping_sub(f[k])).collect(),
                 };
-                let vselect: Vec<u32> = (0..n).map(|k| if c[k] != 0 { t[k] } else { f[k] }).collect();
                 let fma: Vec<u32> = (0..n).map(|k| c[k].wrapping_mul(delta[k]).wrapping_add(f[k])).collect();
                 match select {
                     SelectLowering::Vselect => Some(vselect),
@@ -209,6 +217,7 @@ pub fn run_with(p: &SsaProgram, mem: &mut [u32], select: SelectLowering) -> Resu
                             i, vselect, fma
                         ))
                     }
+                }
                 }
             }
             opc if op.srcs.len() == 2 => {
@@ -222,6 +231,9 @@ pub fn run_with(p: &SsaProgram, mem: &mut [u32], select: SelectLowering) -> Resu
                 return Err(format!("interp: op {} writes {} lanes to {:?}", i, v.len(), d));
             }
             if let Some(ls) = p.vector_group_lanes.get(&d) {
+                if !d.is_vector() || ls.len() != VLEN || ls.iter().any(|l| l.is_vector()) {
+                    return Err(format!("interp: vector group {:?} is malformed ({} lanes)", d, ls.len()));
+                }
                 for (k, l) in ls.iter().enumerate() {
                     regs.insert(*l, vec![v[k]]);
                 }
