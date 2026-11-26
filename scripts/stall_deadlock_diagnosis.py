@@ -4,18 +4,21 @@ Inputs: the state the greedy writes at the first cycle `stall` forces an op
 (`SCHEDULER_DEADLOCK_DUMP=state.json`) and the failed build's exported schedule
 (`scheduler_output_error.json`: every op's eventual cycle, operands and destination).
 
-Prints, for the deadlock cycle:
-- the ops the budget check deferred (all ready), with the words each would add and free.
+Prints, for that cycle (the first stall force; not necessarily a deadlock):
+- the ready ops deferred this cycle, each with its reason ("budget": the hard budget check;
+  "pressure": the pressure policy's soft deferral) and the words it would add and free.
   "Frees" is approximate: it counts a source operand whose only remaining reader is this op,
   by the operand's own id; it does not resolve vector-group lane aliases and ignores
   `keep_live`, a select's delta and a value listed twice as a source. Treat "adds more than
   it frees" as an indication, not a proof that no ready op fits;
-- every live value with readers left, and why each remaining reader cannot run now:
-  "deferred" (ready, budget check), "waits until c" (in the ready heap with a later ready
-  cycle: latency or ASAP inflation), "not admitted" (outside the groups-in-flight window), or
-  "blocked on op X" (an unscheduled operand producer; its own state is given);
-- a summary: words held by values whose every remaining reader is blocked behind an op that
-  needs words itself (a cycle of waits), and the earliest-started groups among them.
+- live words grouped by the state of each value's first remaining reader (by op id):
+  "deferred" (ready, with its reason), "inflation" (deferred by ASAP inflation this cycle),
+  "in heap" (in the ready heap, operands not yet visible), "not admitted" (outside the
+  groups-in-flight window), or "blocked on op X" (an unscheduled operand producer; its own
+  state is given). Readers are found through source operands only: a value whose remaining
+  readers read it through a lane alias, `keep_live` or a select's delta has the dump's
+  `remaining_users` above 0 but no reader here, and is reported as "readers not resolved".
+  With `--live`, every live value and its first readers.
 
 Usage (from the project root):
     SCHEDULER_DEADLOCK_DUMP=state.json uv run generate_ssa_kernel.py ... --greedy-budget-force stall
@@ -49,19 +52,24 @@ def analyse(state: dict, sched: dict) -> dict:
             v = vreg_id(src)
             if v is not None:
                 readers[v].append(o["id"])
-    deferred = set(state["budget_deferred"])
+    # Older dumps list ids only (no reason).
+    deferred = {(d["id"] if isinstance(d, dict) else d): (d.get("reason", "unknown") if isinstance(d, dict) else "unknown")
+                for d in state["budget_deferred"]}
+    inflated = set(state.get("inflation_deferred", []))
     heap = {h["id"]: h for h in state["heap"]}
     live = {v["vreg"]: v for v in state["live"]}
-    done = lambda i: 0 <= ops[i]["cycle"] < cyc  # noqa: E731  (scheduled before the deadlock cycle)
+    done = lambda i: 0 <= ops[i]["cycle"] < cyc  # noqa: E731  (scheduled before the dumped cycle)
 
     def status(i, depth=0):
         if i in deferred:
-            return "deferred (ready, budget check)"
+            return f"deferred (ready, {deferred[i]})"
+        if i in inflated:
+            return "inflation (deferred this cycle)"
         if i in heap:
-            h = heap[i]
-            if not h["in_window"]:
+            if not heap[i]["in_window"]:
                 return "not admitted (groups in flight)"
-            return f"waits until {h['ready_at']}"
+            # The heap key is an order, not a wait: the op is offered again every cycle.
+            return "in heap (operands not yet visible)"
         pending = [d for d in ops[i]["dep_ids"] if d in ops and not done(d)]
         if not pending:
             return "ready but not tried"
@@ -84,7 +92,8 @@ def analyse(state: dict, sched: dict) -> dict:
     deferred_rows = [{"id": i, "opcode": ops[i]["opcode"], "engine": ops[i]["engine"],
                       "group": (ops[i].get("source_info") or {}).get("group"),
                       "round": (ops[i].get("source_info") or {}).get("round"),
-                      "adds": words_added(i), "frees": words_freed(i)} for i in sorted(deferred)]
+                      "reason": deferred[i], "adds": words_added(i), "frees": words_freed(i)}
+                     for i in sorted(deferred)]
     live_rows = []
     for v, info in live.items():
         rem = [r for r in readers.get(v, []) if not done(r)]
@@ -96,17 +105,22 @@ def analyse(state: dict, sched: dict) -> dict:
     kinds = collections.Counter()
     for row in live_rows:
         if not row["readers"]:
-            kinds["no reader left (released next cycle)"] += row["words"]
+            if live[row["vreg"]]["remaining_users"] > 0:
+                kinds["readers not resolved (lane alias, keep_live or delta)"] += row["words"]
+            else:
+                kinds["no reader left (released next cycle)"] += row["words"]
             continue
         st = row["readers"][0][1]
-        key = ("deferred" if st.startswith("deferred") else "waits (latency/inflation)" if st.startswith("waits")
+        key = ("deferred" if st.startswith("deferred") else "inflation" if st.startswith("inflation")
+               else "in heap" if st.startswith("in heap")
                else "not admitted" if st.startswith("not admitted")
                else "blocked behind a deferred op" if "deferred" in st
-               else "blocked behind a waiting op" if "waits" in st
+               else "blocked behind an inflation-deferred op" if "inflation" in st
+               else "blocked behind an op in the heap" if "in heap" in st
                else "blocked (other)")
         kinds[key] += row["words"]
     return {"cycle": cyc, "live_words": state["live_words"], "budget": state["budget"], "slots": state["slots"],
-            "deferred": deferred_rows, "live": live_rows, "words_by_first_reader_state": dict(kinds)}
+            "inflation_deferred": len(inflated), "deferred": deferred_rows, "live": live_rows, "words_by_first_reader_state": dict(kinds)}
 
 
 def main(argv=None) -> int:
@@ -120,10 +134,11 @@ def main(argv=None) -> int:
     with open(args.schedule) as f:
         sched = json.load(f)
     r = analyse(state, sched)
-    print(f"deadlock at cycle {r['cycle']}: {r['live_words']} live words, budget {r['budget']}, slots used {r['slots']}")
-    print(f"budget-deferred ready ops ({len(r['deferred'])}):")
+    print(f"first stall force at cycle {r['cycle']}: {r['live_words']} live words, budget {r['budget']}, "
+          f"slots used {r['slots']}; {r['inflation_deferred']} ops deferred by ASAP inflation this cycle")
+    print(f"deferred ready ops ({len(r['deferred'])}):")
     for d in r["deferred"]:
-        print(f"  op {d['id']} {d['opcode']} ({d['engine']}, group {d['group']}, round {d['round']}): "
+        print(f"  op {d['id']} {d['opcode']} ({d['engine']}, group {d['group']}, round {d['round']}, {d['reason']}): "
               f"adds {d['adds']}, frees {d['frees']}")
     print("live words by the state of each value's first remaining reader:")
     for k, w in sorted(r["words_by_first_reader_state"].items(), key=lambda x: -x[1]):

@@ -31,9 +31,13 @@ dev = [
 [tool.pytest.ini_options]
 timeout = 120
 testpaths = [".", "solver", "tests"]
-# Optional/CI-only tests: mark with @pytest.mark.ci_only. Default run excludes them: pytest -m "not ci_only". CI runs full suite.
+# Optional/CI-only tests (e.g. 16-round pin builds): mark with @pytest.mark.ci_only. Every
+# pytest run deselects them by default (addopts below); a later -m on the command line replaces
+# it: `uv run pytest -m ci_only` runs only them, `./scripts/test.sh ci-only` too (CI runs that).
+addopts = "-m 'not ci_only'"
 markers = [
-    "ci_only: marks tests as optional/CI-only (excluded by default; use -m ci_only to run only these, or run without -m filter for full suite)",
+    "ci_only: optional/CI-only tests (deselected by default via addopts; run them with -m ci_only or ./scripts/test.sh ci-only)",
+    "deep: runs a CP-SAT solve (deep tier). Runs locally by default; PR CI deselects it (./scripts/test.sh python-shallow) and the deep workflow runs it (python-deep)",
 ]
 
 [tool.hatch.build.targets.wheel]

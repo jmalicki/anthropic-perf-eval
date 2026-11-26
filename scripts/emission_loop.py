@@ -597,6 +597,7 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
         stale = 0 if improved else stale + 1
         _record(stage2, mode, it, res, rec, built,
                 "no-good on this plan" + (f"; caps {dict(max_util)}" if max_util else
+                                          "; no valid incumbent yet, no cut" if best is None else
                                           f"; incumbent floor < {best['cycles']}")
                 + (" (new best)" if improved else ""))
         if stale >= patience:
@@ -619,7 +620,9 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     After `per_level` plans, or when no unbuilt plan scores at most L, it moves to L + 1.
     Each record carries its score and level index (1 = the first level of this run).
     No-goods are per model point (`plan_model_key`: the per-(round, encoding) group counts):
-    plans that differ only in which groups use an encoding are one plan here. Solves use the
+    plans that differ only in which groups use an encoding are one plan here. The run ends "exhausted"
+    only when no level was skipped; otherwise its last record is "incomplete" and lists the
+    skipped levels (`exhausted`, `skipped_levels`, `rejected_unbuilt` in the record). Solves use the
     loop's deterministic-time budget. No incumbent bound, no patience stop: all k builds are
     made."""
     if objective not in ("floor", "greedy-model"):
@@ -629,7 +632,11 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     mode = f"topk-{objective}"
     gm = {} if objective == "greedy-model" else None
     best = stage2.best()
+    # Plans that came up below the level being enumerated: excluded for the rest of the run and
+    # never built (their level was already full, or was skipped).
     rejected: list = []
+    # Levels given up after `retries` tries: plans of exactly that score may remain unbuilt.
+    skipped: list = []
     level, levels_seen, at_level, builds, it = None, 0, 0, 0, 0
     while builds < k:
         if level is None:
@@ -649,6 +656,7 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
                 rejected.append(es.plan_model_key(res["rows"], stage2.ctx))
             else:
                 res = {"status": "skipped"}
+                skipped.append(level)
             if res["status"] != "optimal" and res["status"] != "feasible":
                 _record(stage2, mode, it, res, None, False,
                         f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
@@ -662,8 +670,16 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
                     nxt = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
                                 greedy_model=gm, tie_break=False)
                     if nxt["status"] == "infeasible":
-                        _record(stage2, mode, it, nxt, None, False,
-                                "exhausted: no unbuilt plan left (built or rejected at a lower level)")
+                        end = {"exhausted": not skipped, "skipped_levels": list(skipped),
+                               "rejected_unbuilt": len(rejected)}
+                        if skipped:
+                            msg = (f"incomplete: no plan left outside the built and rejected ones, but levels "
+                                   f"{skipped} were skipped after {retries} tries, so plans of those scores "
+                                   f"may remain unbuilt; {len(rejected)} rejected plans were never built")
+                        else:
+                            msg = (f"exhausted: no unbuilt plan left; {len(rejected)} plans rejected at a "
+                                   "level above their own (their level already had per_level builds) were not built")
+                        _record(stage2, mode, it, nxt, None, False, msg, extra=end)
                         break
                     level = max(level + 1, es.plan_score(stage2.table, nxt["rows"], objective))
                 else:
@@ -1127,6 +1143,9 @@ def main(argv=None) -> int:
                            if e["mode"].startswith("caps") and "(new best)" in e["feedback"]), None)
     for path in args.extra_state:
         other = Stage2(table, workdir, path, log=None, check_scheduler=False)
+        if other.greedy_extra != stage2.greedy_extra:
+            ap.error(f"--extra-state {path} was built with greedy options {other.greedy_extra}, the primary "
+                     f"state with {stage2.greedy_extra}: their measurements are not comparable and are not merged")
         if not same_scheduler(other.scheduler, stage2.scheduler):
             print(f"note: --extra-state {path} holds builds from scheduler {other.scheduler or 'unrecorded'}, not "
                   f"{stage2.scheduler or 'unrecorded'}; its builds are merged but were made by another binary")

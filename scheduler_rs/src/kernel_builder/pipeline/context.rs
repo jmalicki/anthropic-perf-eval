@@ -277,6 +277,39 @@ pub struct PipelineConfig {
     /// CP-SAT specific configuration (None for greedy-only pipeline).
     #[cfg(feature = "cpsat")]
     pub cpsat: Option<CpSatPipelineConfig>,
+    /// Individually forced shifts for the greedy-only pipeline (ops that must run as 8 scalar
+    /// ALU ops). The CP-SAT pipeline carries them in `cpsat.forced_shifts`; read both through
+    /// [`PipelineConfig::forced_shift_ids`].
+    pub forced_shifts: Option<HashSet<usize>>,
+    /// The VALU shift mode the caller asked for, for the greedy-only pipeline (the CP-SAT
+    /// pipeline carries it in `cpsat.valu_shift_mode`). Here it only decides whether
+    /// `forced_shifts` applies: the greedy-only build does not apply the mode itself (BUGS.md).
+    pub valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
+}
+
+impl PipelineConfig {
+    /// Ids of the individually forced shifts that apply to this run, in id order.
+    ///
+    /// The one place that decides it, for both pipelines: the set and the shift mode come
+    /// from the CP-SAT configuration when there is one, else from the greedy-only fields, and
+    /// the set applies only under `ValuShiftMode::Optimize`, as in the CP-SAT model (under
+    /// `alu` / `valu` every shift decision is fixed by the mode and the set is not read).
+    ///
+    /// # Returns
+    /// The forced ids; empty when no shift is forced or the mode is not `Optimize`.
+    pub fn forced_shift_ids(&self) -> std::collections::BTreeSet<usize> {
+        use crate::cpsat_scheduler::ValuShiftMode;
+
+        #[cfg(feature = "cpsat")]
+        let from_cpsat = self.cpsat.as_ref().map(|c| (c.forced_shifts.as_ref(), c.valu_shift_mode));
+        #[cfg(not(feature = "cpsat"))]
+        let from_cpsat: Option<(Option<&HashSet<usize>>, ValuShiftMode)> = None;
+        let (ids, mode) = from_cpsat.unwrap_or((self.forced_shifts.as_ref(), self.valu_shift_mode));
+        if mode != ValuShiftMode::Optimize {
+            return Default::default();
+        }
+        ids.map(|ids| ids.iter().copied().collect()).unwrap_or_default()
+    }
 }
 
 impl Default for PipelineConfig {
@@ -290,6 +323,8 @@ impl Default for PipelineConfig {
             bounds: BoundsConfig::default(),
             #[cfg(feature = "cpsat")]
             cpsat: None,
+            forced_shifts: None,
+            valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode::Optimize,
         }
     }
 }
@@ -307,4 +342,49 @@ pub struct PassReport {
     pub duration: Duration,
     /// Optional detail string (e.g. "213 cycles, peak 1530 words").
     pub detail: String,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpsat_scheduler::ValuShiftMode;
+
+    /// The forced set applies only under `ValuShiftMode::Optimize`, in the greedy-only
+    /// pipeline exactly as in the CP-SAT pipeline (whose model reads it only there).
+    #[test]
+    fn test_forced_shift_ids_apply_only_under_optimize() {
+        let forced: HashSet<usize> = [7, 3].into_iter().collect();
+        let expected: std::collections::BTreeSet<usize> = [3, 7].into_iter().collect();
+        for mode in [ValuShiftMode::Optimize, ValuShiftMode::ForceAlu, ValuShiftMode::ForceValu] {
+            let want = if mode == ValuShiftMode::Optimize { expected.clone() } else { Default::default() };
+
+            let greedy_only = PipelineConfig {
+                forced_shifts: Some(forced.clone()),
+                valu_shift_mode: mode,
+                ..Default::default()
+            };
+            assert_eq!(greedy_only.forced_shift_ids(), want, "greedy-only, {:?}", mode);
+
+            #[cfg(feature = "cpsat")]
+            {
+                let with_cpsat = PipelineConfig {
+                    cpsat: Some(CpSatPipelineConfig {
+                        forced_shifts: Some(forced.clone()),
+                        valu_shift_mode: mode,
+                        ..Default::default()
+                    }),
+                    // The greedy-only fields are not read when CP-SAT follows.
+                    forced_shifts: Some([99].into_iter().collect()),
+                    valu_shift_mode: ValuShiftMode::Optimize,
+                    ..Default::default()
+                };
+                assert_eq!(with_cpsat.forced_shift_ids(), want, "CP-SAT pipeline, {:?}", mode);
+            }
+        }
+        assert!(PipelineConfig::default().forced_shift_ids().is_empty());
+    }
 }

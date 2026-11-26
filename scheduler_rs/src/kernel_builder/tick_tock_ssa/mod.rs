@@ -138,6 +138,9 @@ pub struct SsaTickTockKernelBuilder {
     /// Groups the tree-access emitter being run emits (`emits_group`); `None` = all. Set per
     /// encoding by `emit_round` when an emission plan mixes encodings within a round.
     pub(crate) access_groups: Option<Vec<bool>>,
+    /// When set (`new_instantiating`), every choice site's alternatives are built next to the
+    /// canonical gather and recorded here (`transform::tree_access`).
+    pub(crate) instantiation: Option<crate::kernel_builder::transform::TreeAccessInstantiation>,
     /// VReg representing constant 0 (loaded at address 0)
     pub(crate) zero_vreg: Option<VReg>,
     /// Per-solve CP-SAT budget in deterministic time (None = wall-clock limit only). Set
@@ -149,6 +152,13 @@ pub struct SsaTickTockKernelBuilder {
     /// Timeline of the CP-SAT scratch cumulative (default `Phase`). Set before
     /// `build_and_schedule_cpsat`; applies to the per-section and full-kernel solves.
     pub cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime,
+    /// Individually forced shifts for `build_and_schedule_greedy` (ops that must run as 8
+    /// scalar ALU ops); `build_and_schedule_cpsat` takes them as an argument. Set after `new()`.
+    pub greedy_forced_shifts: Option<HashSet<usize>>,
+    /// The VALU shift mode requested for `build_and_schedule_greedy`. It only decides whether
+    /// `greedy_forced_shifts` applies (`PipelineConfig::forced_shift_ids`): the greedy-only
+    /// build does not apply the mode itself. Set after `new()`.
+    pub greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
@@ -751,11 +761,32 @@ impl SsaTickTockKernelBuilder {
             depth4_broadcasts_initialized: false,
             uses_depth4,
             access_groups: None,
+            instantiation: None,
             zero_vreg: None,
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
             cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime::default(),
+            greedy_forced_shifts: None,
+            greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode::Optimize,
         }
+    }
+
+    /// A builder that emits the canonical program of `config` (its plan must gather every
+    /// choice site) with every bit-driven alternative of every choice site built next to the
+    /// gather, and the select tables of every cached level visited. The alternatives are dead
+    /// code; `instantiation` records them (`transform::instantiate_tree_access`).
+    ///
+    /// # Arguments
+    /// * `config` - Configuration with the canonical plan.
+    ///
+    /// # Returns
+    /// The builder; `build` then fills `instantiation`.
+    pub fn new_instantiating(config: KernelConfig) -> Self {
+        let visits_depth4 = (0..config.spec.rounds).any(|r| config.spec.round_depth(r) == 4);
+        let mut builder = Self::new(config);
+        builder.uses_depth4 = visits_depth4;
+        builder.instantiation = Some(Default::default());
+        builder
     }
 
     /// Build the kernel, returning an `SsaProgram` with all emission artifacts.
@@ -848,6 +879,8 @@ impl SsaTickTockKernelBuilder {
                 }),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             greedy_verbose: verbose,
+            forced_shifts: self.greedy_forced_shifts.clone(),
+            valu_shift_mode: self.greedy_valu_shift_mode,
             ..Default::default()
         };
         config.bounds.greedy_use_full_bounds = self.config.compiler.greedy_use_full_bounds;
@@ -960,7 +993,7 @@ impl SsaTickTockKernelBuilder {
             passes::{
                 ComputeBoundsPass, ConstChoiceHintPass, ComputeDependenciesPass, DcePass,
                 ElideBarriersPass, FilterDeadStoresPass, AssignAddressesPass, LowerToOpsPass,
-                ScheduleWithFixedChoicesPass, SelectChoiceHintPass, ValuShiftHintPass,
+                ScheduleWithFixedChoicesPass, SelectChoiceHintPass, TransformPass, ValuShiftHintPass,
             },
         };
         use crate::cpsat_scheduler::{
@@ -1014,7 +1047,24 @@ impl SsaTickTockKernelBuilder {
         };
         let mut ctx = PipelineContext::new(program, config);
 
-        // Phase 1: Dependencies + DCE + Bounds + Greedy (via pipeline passes)
+        // Phase 1: [Transforms] + Dependencies + DCE + Bounds + Greedy (via pipeline passes)
+        if !ctx.config.compiler.transforms.is_empty() {
+            run_pass_with_error_export!(&mut ctx, &TransformPass);
+            // Transforms renumber op ids: forced shifts must name vector ops of the
+            // transformed program (as its scheduler JSON lists them).
+            if let Some(forced) = forced_shifts.as_ref() {
+                let mut ids: Vec<usize> = forced.iter().copied().collect();
+                ids.sort_unstable();
+                if let Some(bad) = ids.iter().find(|&&id| !ctx.ops.iter().any(|o| o.id == id && o.engine == Engine::Valu)) {
+                    return Err(KernelBuilderError::Other(format!(
+                        "forced_shifts: op {} is not a vector op of the transformed program; with --transform, \
+                         op ids are those of the rewritten program (take them from a scheduler JSON of a run \
+                         with the same transforms)",
+                        bad
+                    )));
+                }
+            }
+        }
         run_pass_with_error_export!(&mut ctx, &ComputeDependenciesPass);
         if self.config.compiler.enable_ssa_dce {
             run_pass_with_error_export!(&mut ctx, &DcePass);

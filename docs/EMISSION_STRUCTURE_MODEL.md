@@ -159,6 +159,40 @@ Stores (64) and fixed flow ops (0) are constant. Reading it: a group that select
 `bits-flow` instead of gathering saves 8 loads and costs 8 + 7 selects and 2 vector ops (bit
 extraction 4, minus the gather's 2); the level-4 table costs 16 loads and 53 + 8 scalar ops once.
 
+### 3.1 The same table by instantiation (no probe builds)
+
+`python -m scripts.emission_structure derive` gets the table from one emission instead of 144
+fits (`scheduler_rs/src/kernel_builder/transform/`, binding `derive_tree_access_cost_table`).
+The canonical program (root from the shared vector, every other round gathering) is emitted
+with every bit-driven alternative of every choice site built next to its gather by the
+emitter's own per-group code, on operands a structural matcher binds (rule `tree-access`;
+region tags only propose where to look). Then every op gets the condition under which dead
+code elimination keeps it, an OR of (round, group, encoding) choices, which reduces to the
+features above: shared tables to `table:d` / `pairs:d` / `pairs_high:d` / `mobius:d`, gathers'
+base vectors and level-end constants to `gather_round:r` / `gather_depth:d`, and ORs across
+levels, by inclusion-exclusion, to the `and:table:*` products (the scalar constants 3 to 15
+that address the cached nodes). Per-site differences to gathering give `groups:d:e` and are
+checked to be the same at every site. Whether a constant is `const` or `const_alu` depends
+on the constants created before it, so on emission order: every constant is checked to keep
+its category whatever the lazily created level-end constants `L_d` (and its own position, for
+those). Anything that does not reduce to the features is reported, never fitted. At 16 rounds the derived table equals the calibrated one entry for
+entry with 4 and with 32 groups (`tests/test_emission_structure.py`, and `derive` against
+`calibrate`); the Rust tests also compare its predictions with emitted programs directly.
+Contexts it does not cover yet: the zero-based index (bits are matched only on the mirrored
+index chain) and `--values-only` (dead index updates are per group, the `tail:*` features).
+
+The apply pass (`transform::apply_tree_access_plan`) takes a plan and rewrites the same
+instantiated program into the plan's program: readers of each site's value are rewired to the
+chosen candidate, then dead code elimination. Three emitter-order effects are reproduced
+explicitly so the result is the `--emission-plan` program op for op (up to VReg and op
+numbering; Rust tests over 74 plans at 4 and 32 groups, and the greedy schedule is the same): a mixed round's
+encodings in order of their first group; the level-end constant `L_d`, which the emitter
+creates at its first live user: the first round that gathers at depth `d`, or, when no round
+gathers there, the final mirrored index conversion if the last round leaves the indices at
+depth `d` (e.g. 15 rounds at height 10 and `L_4`; tested at that shape), with its ALU-derived
+alternatives recomputed there; and the broadcast of a level's first table entry, shared by leaf pairs and
+Mobius coefficients, which the emitter creates with the coefficients when no pair is used.
+
 ## 4. The objective: the capacity floor with choices resolved
 
 `choice_floor(counts)` is the smallest integer `T` such that some resolution of every choice fits
@@ -486,7 +520,7 @@ vector slots, and the vector ALU is busy in every steady-state cycle. So a sched
 longer for any reason shifts fewer ops.
 
 For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
-emission (static bound 1,029); 10 are scheduling loss. Its 158 shifts "missing" against the
+emission (static bound 1,029); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). Its 158 shifts "missing" against the
 floor's split are a consequence: at 1,029 cycles with the same idle vector slots only 1,367
 shifts fit, but a schedule with more idle slots could shift more, so that count is conditional,
 not a bound. What is known about slower plans, labelled removal (an A/B build) or accounting
@@ -683,8 +717,8 @@ predictor stage 1 can use.
 | Window rows | 1,107 to 1,131. Moving gathers into round 3 still hurts |
 | Any stage-1 mode with path bits under the learned cap `flow=0.92` | 1,099 at best, 66 above `path_flow90.json` (which `flow=0.9` returns) |
 
-Not verified: why the greedy shifts fewer ops when depth-1 rounds use `bits-flow`; what sets the
-1,505-word ceiling on path-bit plans; whether the plans at 1,039 differ under CP-SAT or another
+Not verified: why the greedy shifts fewer ops when depth-1 rounds use `bits-flow`; whether the
+plans at 1,039 differ under CP-SAT or another
 scheduler (no stage-2 CP-SAT was run); seeds other than the ones listed; the probes cover
 round 4 only.
 

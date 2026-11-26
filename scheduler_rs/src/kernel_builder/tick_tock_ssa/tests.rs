@@ -2288,6 +2288,7 @@ fn test_split_shift_ignored_when_cpsat_follows() {
 /// 16 scalar slots in a cycle if it counted a split op whole) and the kernel is valid.
 #[cfg(feature = "cpsat")]
 #[test]
+#[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
 fn test_split_shift_hint_reaches_cpsat() {
     use crate::cpsat_scheduler::{ConstChoiceMode, SelectChoiceMode, ValuShiftMode};
 
@@ -2590,6 +2591,7 @@ fn cpsat_with_scratch(scratch_size: usize, scratch_constraint: bool) -> SsaSched
 /// address assignment (its budget is the configured size), and the schedule stays valid.
 #[cfg(feature = "cpsat")]
 #[test]
+#[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
 fn test_scratch_settings_reach_cpsat_model_and_address_assignment() {
     use crate::kernel_builder::config::UNBOUNDED_SCRATCH_WORDS;
     for (scratch_size, constraint, cpsat_budget) in [

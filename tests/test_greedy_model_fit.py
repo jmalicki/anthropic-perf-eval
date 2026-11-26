@@ -71,3 +71,15 @@ def test_judges_are_kept_apart(tmp_path):
     gf.collect([], [str(measured)], str(out), judge="stall-0.98")
     assert len(gf.load(str(out))["builds"]) == len(default["builds"])
     assert [b["name"] for b in gf.load(str(out), "stall-0.98")["builds"]] == ["x"]
+
+
+def test_collect_requires_out(tmp_path):
+    """Review of #82: `collect` without --out must not overwrite the checked-in dataset."""
+    import pytest
+    from scripts import greedy_model_fit as gmf
+
+    data = tmp_path / "data.json"
+    data.write_text('{"builds": [1]}')
+    with pytest.raises(SystemExit):
+        gmf.main(["collect", "--data", str(data)])
+    assert data.read_text() == '{"builds": [1]}'

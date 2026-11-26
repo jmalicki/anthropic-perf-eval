@@ -16,6 +16,7 @@
 //! - `ssa_program` - SsaProgram IR type (emission output / compilation input)
 //! - `tick_tock_ssa/` - SSA-based kernel builder (orchestration, scheduling)
 //! - `round_budget` - Per-section scratch budget analysis
+//! - `transform/` - Rewrite rules: site matching, alternatives, cost by instantiation
 
 pub mod barrier_elision;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod ssa_greedy;
 pub mod ssa_lower;
 pub mod ssa_program;
 pub mod tick_tock_ssa;
+pub mod transform;
 
 pub use config::KernelConfig;
 pub use context_ssa::SsaScratchContext;

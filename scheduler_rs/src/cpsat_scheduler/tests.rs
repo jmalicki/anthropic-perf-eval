@@ -3567,6 +3567,7 @@ mod resource_tightening_tests {
     /// same with and without tightening (two vector slots, as in the other toy-kernel tests,
     /// so that every solve is proved well inside the time limit).
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_energetic_tightening_keeps_the_optimum_of_the_toy_kernel() {
         let ops = super::tuning_objective_tests::toy_ops();
         for symmetry_rows in [SymmetryRows::Declared, SymmetryRows::None] {
@@ -7459,6 +7460,7 @@ mod redundant_row_group_tests {
     /// must not change the proved optimum (selects here use the Flow slot or two vector slots).
     #[cfg(feature = "cpsat")]
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_dropping_redundant_rows_keeps_the_optimal_makespan() {
         use super::tuning_objective_tests::toy_ops;
 
@@ -7655,6 +7657,7 @@ mod tuning_lane_model_tests {
     /// Sorting and pinning are dominance restrictions: the proved optimum must not change,
     /// under either objective.
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_every_lane_model_reaches_the_same_optimal_makespan() {
         let ops = toy_ops();
         for objective in [CpsatObjective::MakespanTiebreak, CpsatObjective::Makespan] {
@@ -7671,6 +7674,7 @@ mod tuning_lane_model_tests {
     /// With every op shifted (13 ops x 8 lanes on 12 scalar slots) lanes must straddle
     /// cycles; the sorted models return them in order.
     #[test]
+    #[cfg_attr(not(feature = "deep-tests"), ignore = "deep tier (over 60 s in CI): --features deep-tests")]
     fn test_sorted_lane_models_return_ordered_lanes() {
         let ops = toy_ops();
         for lane_model in ALL {
