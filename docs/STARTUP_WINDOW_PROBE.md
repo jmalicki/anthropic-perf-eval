@@ -96,7 +96,7 @@ none and checked reports differ only in wall times. The probe now writes `genera
 the report's spec and, per window, the model size and the stop reason (`solve`:
 `num_variables`, `num_constraints`, `deterministic_time`, `stop` = proved / deterministic
 budget / wall-clock backstop); `docs/window_probe/rescoped/PATHB_none_rolling_recorded.json`
-is one of the runs regenerated with it.
+is the `none` path rolling run regenerated with it (same tree as above): 17/17 windows proved, 0 saved, 1,012; its spec lists `--cpsat-symmetry-rows none --cpsat-greedy-alap-slack none` and the first window's model has 433,801 constraints.
 
 **What this shows:** neither the symmetry rows, nor the ALAP cap, nor the scratch overcount
 hid a gain of this kind. In no window of either best kernel, start-up or later, can the rest
@@ -177,7 +177,10 @@ demand, so a schedule the old reduced model accepted should still be feasible in
 reduced model while the new full model proves it impossible; the disagreement most likely
 persists and the reduced run did not find that schedule within its budget. These runs used
 #92's branch before it had main's #79 change to `restrict_to_window` (producers of ALU-derived
-operands kept). Reports: `docs/window_probe/rescoped/i10_{reduced,full}.json`.
+operands kept). Re-run on a tree with both #79 and #92's model (#92 with #89 merged in): the
+same, [30, 90) and [60, 120) both 0 saved, bound 1, stopped on the deterministic budget
+(60.1 and 60.0 deterministic time, 297 s and 236 s wall), as recorded per window in
+`docs/window_probe/rescoped/i10_reduced_79.json`. Reports: `docs/window_probe/rescoped/i10_{reduced,full}.json`.
 
 The rolling pass is protected by its full-model re-check. Sweep rows are not re-checked, so
 reduced-model sweep gains should not be trusted without `--no-prune`. On the
