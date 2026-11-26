@@ -107,3 +107,23 @@ def test_blame_attributes_a_vector_select_to_the_vector_alu():
     lowered[6] = {"id": 6, "engine": "flow", "opcode": "vselect", "cycle": 1, "from_select_choice": 6}
     use, _, _ = _uses(sched)
     assert blame(7, executed_ops(sched), use) == ("flow", False, 6)
+
+
+def test_operand_ready_after_the_multiply_add_of_a_two_op_select():
+    """Review of #88: a two-op select issued at 4 writes its result with the multiply_add at 5
+    (lowered id ssa_id + 1000000), so a consumer is ready at 6, not 5. Single-cycle producers
+    stay ready at cycle + 1."""
+    from scripts.scratch_ceiling_diagnosis import _operand_ready, executed_ops
+
+    ssa = [{"id": 0, "engine": "valu", "opcode": "^", "cycle": 3, "dep_ids": []},
+           {"id": 6, "engine": "flow", "opcode": "select_choice", "cycle": 4, "dep_ids": [0]},
+           {"id": 7, "engine": "load", "opcode": "load", "cycle": 6, "dep_ids": [6]},
+           {"id": 8, "engine": "load", "opcode": "load", "cycle": 6, "dep_ids": [0]}]
+    lowered = [{"id": 0, "engine": "valu", "opcode": "^", "cycle": 3},
+               {"id": 6, "engine": "valu", "opcode": "-", "cycle": 4, "from_select_choice": 6},
+               {"id": 1000006, "engine": "valu", "opcode": "multiply_add", "cycle": 5, "from_select_choice": 6},
+               {"id": 7, "engine": "load", "opcode": "load", "cycle": 6},
+               {"id": 8, "engine": "load", "opcode": "load", "cycle": 6}]
+    ops = executed_ops({"total_cycles": 7, "ssa_ops": ssa, "ops": lowered})
+    assert _operand_ready(ops[7], ops) == 6
+    assert _operand_ready(ops[8], ops) == 4

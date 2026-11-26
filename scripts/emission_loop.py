@@ -605,8 +605,12 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
     return best
 
 
+class _SolveBudgetSpent(Exception):
+    """loop_topk: its total solve budget is spent."""
+
+
 def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_level: int = 1,
-              retries: int = 20) -> dict:
+              retries: int = 20, max_solves: int = 200) -> dict:
     """Plain selection by a stage-1 score: build plans in order of increasing score and judge
     each with the greedy. `objective` "floor" (the capacity floor, a bound) or
     "greedy-model" (GREEDY_MODEL, a fitted heuristic).
@@ -624,7 +628,8 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     only when no level was skipped; otherwise its last record is "incomplete" and lists the
     skipped levels (`exhausted`, `skipped_levels`, `rejected_unbuilt` in the record). Solves use the
     loop's deterministic-time budget. No incumbent bound, no patience stop: all k builds are
-    made."""
+    made, unless the total of `max_solves` solves is spent first (a plateau that cannot be
+    exhausted); the run then ends "incomplete: solve budget" with the builds made so far."""
     if objective not in ("floor", "greedy-model"):
         raise ValueError(f"topk objective {objective!r}")
     if per_level < 1:
@@ -638,69 +643,88 @@ def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_lev
     # Levels given up after `retries` tries: plans of exactly that score may remain unbuilt.
     skipped: list = []
     level, levels_seen, at_level, builds, it = None, 0, 0, 0, 0
-    while builds < k:
-        if level is None:
-            res = solve(stage2, nogoods=_built_nogoods(stage2), time_limit=time_limit, greedy_model=gm,
-                        tie_break=False)
-            if res["status"] == "infeasible":
-                _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
-                break
-            level = es.plan_score(stage2.table, res["rows"], objective)
-        else:
-            res = None
-            for _ in range(retries + 1):
-                res = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
-                            greedy_model=gm, tie_break=False, incumbent=level + 1, min_objective=level)
-                if res["status"] == "infeasible" or es.plan_score(stage2.table, res["rows"], objective) == level:
-                    break
-                rejected.append(es.plan_model_key(res["rows"], stage2.ctx))
-            else:
-                res = {"status": "skipped"}
-                skipped.append(level)
-            if res["status"] != "optimal" and res["status"] != "feasible":
-                _record(stage2, mode, it, res, None, False,
-                        f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
-                                              else f"no plan of exactly this score in {retries} tries"))
-                at_level, it = 0, it + 1
+    # Total solver work. On a plateau that cannot be exhausted (plans above a level keep coming
+    # back below it) the levels advance without builds, each costing up to retries + 1 solves:
+    # stop after max_solves and report the run incomplete.
+    solves = 0
+
+    def counted_solve(*a, **kw):
+        nonlocal solves
+        if solves >= max_solves:
+            raise _SolveBudgetSpent
+        solves += 1
+        return solve(*a, **kw)
+
+    try:
+        while builds < k:
+            if level is None:
+                res = counted_solve(stage2, nogoods=_built_nogoods(stage2), time_limit=time_limit,
+                                    greedy_model=gm, tie_break=False)
                 if res["status"] == "infeasible":
-                    # No remaining (unbuilt, not rejected) plan scores <= level: the objective
-                    # can always be raised to meet min_objective. The lowest score left is the
-                    # next non-empty level; none left means the enumeration is done (before,
-                    # this stepped level + 1 with one solve each, up to 10^6).
-                    nxt = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
-                                greedy_model=gm, tie_break=False)
-                    if nxt["status"] == "infeasible":
-                        end = {"exhausted": not skipped, "skipped_levels": list(skipped),
-                               "rejected_unbuilt": len(rejected)}
-                        if skipped:
-                            msg = (f"incomplete: no plan left outside the built and rejected ones, but levels "
-                                   f"{skipped} were skipped after {retries} tries, so plans of those scores "
-                                   f"may remain unbuilt; {len(rejected)} rejected plans were never built")
-                        else:
-                            msg = (f"exhausted: no unbuilt plan left; {len(rejected)} plans rejected at a "
-                                   "level above their own (their level already had per_level builds) were not built")
-                        _record(stage2, mode, it, nxt, None, False, msg, extra=end)
-                        break
-                    level = max(level + 1, es.plan_score(stage2.table, nxt["rows"], objective))
-                else:
-                    level += 1
-                if level > 10 ** 6:
+                    _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
                     break
-                continue
-        if at_level == 0:
-            levels_seen += 1
-        at_level += 1
-        rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
-        builds += 1
-        improved = rec["valid"] and (best is None or rec["cycles"] < best["cycles"])
-        best = rec if improved else best
-        _record(stage2, mode, it, res, rec, built,
-                f"score {level} ({objective}), level {levels_seen} of this run, plan {at_level} at that level"
-                + (" (new best)" if improved else ""),
-                extra={"score": level, "level": levels_seen, "at_level": at_level})
-        it += 1
-        if at_level >= per_level:
-            level, at_level = level + 1, 0
+                level = es.plan_score(stage2.table, res["rows"], objective)
+            else:
+                res = None
+                for _ in range(retries + 1):
+                    res = counted_solve(stage2, nogoods=_built_nogoods(stage2) + rejected,
+                                        time_limit=time_limit, greedy_model=gm, tie_break=False,
+                                        incumbent=level + 1, min_objective=level)
+                    if res["status"] == "infeasible" or es.plan_score(stage2.table, res["rows"], objective) == level:
+                        break
+                    rejected.append(es.plan_model_key(res["rows"], stage2.ctx))
+                else:
+                    res = {"status": "skipped"}
+                    skipped.append(level)
+                if res["status"] != "optimal" and res["status"] != "feasible":
+                    _record(stage2, mode, it, res, None, False,
+                            f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
+                                                  else f"no plan of exactly this score in {retries} tries"))
+                    at_level, it = 0, it + 1
+                    if res["status"] == "infeasible":
+                        # No remaining (unbuilt, not rejected) plan scores <= level: the objective
+                        # can always be raised to meet min_objective. The lowest score left is the
+                        # next non-empty level; none left means the enumeration is done (before,
+                        # this stepped level + 1 with one solve each, up to 10^6).
+                        nxt = counted_solve(stage2, nogoods=_built_nogoods(stage2) + rejected,
+                                            time_limit=time_limit, greedy_model=gm, tie_break=False)
+                        if nxt["status"] == "infeasible":
+                            end = {"exhausted": not skipped, "skipped_levels": list(skipped),
+                                   "rejected_unbuilt": len(rejected)}
+                            if skipped:
+                                msg = (f"incomplete: no plan left outside the built and rejected ones, but levels "
+                                       f"{skipped} were skipped after {retries} tries, so plans of those scores "
+                                       f"may remain unbuilt; {len(rejected)} rejected plans were never built")
+                            else:
+                                msg = (f"exhausted: no unbuilt plan left; {len(rejected)} plans rejected at a "
+                                       "level above their own (their level already had per_level builds) were not built")
+                            _record(stage2, mode, it, nxt, None, False, msg, extra=end)
+                            break
+                        level = max(level + 1, es.plan_score(stage2.table, nxt["rows"], objective))
+                    else:
+                        level += 1
+                    if level > 10 ** 6:
+                        break
+                    continue
+            if at_level == 0:
+                levels_seen += 1
+            at_level += 1
+            rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
+            builds += 1
+            improved = rec["valid"] and (best is None or rec["cycles"] < best["cycles"])
+            best = rec if improved else best
+            _record(stage2, mode, it, res, rec, built,
+                    f"score {level} ({objective}), level {levels_seen} of this run, plan {at_level} at that level"
+                    + (" (new best)" if improved else ""),
+                    extra={"score": level, "level": levels_seen, "at_level": at_level})
+            it += 1
+            if at_level >= per_level:
+                level, at_level = level + 1, 0
+    except _SolveBudgetSpent:
+        _record(stage2, mode, it, {"status": "budget"}, None, False,
+                f"incomplete: solve budget of {max_solves} spent after {builds} builds; plans at or above "
+                f"score {level} may remain unbuilt",
+                extra={"exhausted": False, "skipped_levels": list(skipped), "rejected_unbuilt": len(rejected)})
     return best
 
 
@@ -1048,6 +1072,8 @@ def main(argv=None) -> int:
                     " (stored in the state; a state refuses a different setting)")
     ap.add_argument("--per-level", type=int, default=1,
                     help="topk modes: plans built per score level before moving to the next level")
+    ap.add_argument("--topk-max-solves", type=int, default=200,
+                    help="topk modes: total CP-SAT solves per mode; the run stops as incomplete when spent")
     ap.add_argument("--count-limit", type=int, default=200,
                     help="topk modes: count plans at or below the best plan's score up to this many")
     ap.add_argument("--greedy-option", action="append", default=[], metavar="KEY=VALUE",
@@ -1124,7 +1150,8 @@ def main(argv=None) -> int:
                 caps_found = loop_caps(stage2, n_iter, args.patience, args.time_limit, rule=rule, mode=m)["caps"]
             elif m.startswith("topk-"):
                 obj = m[len("topk-"):]
-                loop_topk(stage2, n_iter, args.time_limit, obj, per_level=args.per_level)
+                loop_topk(stage2, n_iter, args.time_limit, obj, per_level=args.per_level,
+                          max_solves=args.topk_max_solves)
                 summary = topk_summary(stage2, obj, limit=args.count_limit)
                 stage2.trace.append({"mode": m, "iter": "summary", "built": False, "summary": summary,
                                      "feedback": "best known plan: score {best_score}, {plans_at_or_below_score}{plus} "

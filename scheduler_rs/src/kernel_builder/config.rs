@@ -803,12 +803,26 @@ impl TransformKind {
 /// Forced encodings for a greedy-only build. `None` = the greedy decides.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GreedyForcedChoices {
-    /// Every ConstChoice as this encoding (`Load` or `AddImm`).
+    /// Every ConstChoice as this encoding (`Load` or `AddImm`; `check` rejects `AluDerive`).
     pub const_choice: Option<crate::types::ConstChoiceEncoding>,
     /// Every SelectChoice as this encoding.
     pub select_choice: Option<crate::types::SelectChoiceEncoding>,
     /// `Some(true)`: every shiftable vector op on the scalar ALU; `Some(false)`: none.
     pub valu_shift: Option<bool>,
+}
+
+impl GreedyForcedChoices {
+    /// An error for a forced `AluDerive`: it names one producer pair and opcode, so broadcast
+    /// to every ConstChoice it would compute the wrong constant almost everywhere.
+    pub fn check(&self) -> Result<(), String> {
+        match &self.const_choice {
+            Some(crate::types::ConstChoiceEncoding::AluDerive(info)) => Err(format!(
+                "greedy-forced const_choice must be Load or AddImm, not AluDerive ({:?})",
+                info
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that

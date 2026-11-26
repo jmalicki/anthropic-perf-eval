@@ -5017,3 +5017,21 @@ fn test_region_tag_of_a_shared_op_is_the_first_creator() {
         .collect();
     assert_eq!(stored_at.len(), 4, "stored as the index of every group: {:?}", stored_at);
 }
+
+/// Review of #88 (CodeRabbit): `GreedyForcedChoices::const_choice` is one encoding broadcast to
+/// every ConstChoice, so only `Load` and `AddImm` make sense; an `AluDerive` names one producer
+/// pair and opcode and would compute the wrong constant almost everywhere. The greedy build
+/// must reject it with an error, not lower it.
+#[test]
+fn test_greedy_forced_alu_derive_is_rejected() {
+    use crate::types::{AluDeriveInfo, ConstChoiceEncoding};
+    let config = KernelConfig::new(10, 2047, 16, 2);
+    let mut builder = SsaTickTockKernelBuilder::new(config);
+    builder.config.compiler.greedy_forced.const_choice =
+        Some(ConstChoiceEncoding::AluDerive(AluDeriveInfo { left_op_id: 0, right_op_id: 1, opcode: Opcode::Add }));
+    let err = builder
+        .build_and_schedule_greedy(true, None, false)
+        .err()
+        .expect("a forced AluDerive is an error");
+    assert!(format!("{:?}", err).contains("AluDerive"), "{:?}", err);
+}

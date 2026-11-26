@@ -66,7 +66,7 @@ def test_judges_are_kept_apart(tmp_path):
     out = tmp_path / "data.json"
     out.write_text(open(gf.DATA).read())
     measured = tmp_path / "m.json"
-    measured.write_text('[{"name": "x", "bit_source": "index", "counts": %s, "cycles": 1000}]'
+    measured.write_text('[{"name": "x", "bit_source": "index", "rows": [], "counts": %s, "cycles": 1000}]'
                         % __import__("json").dumps(stall["builds"][0]["counts"]))
     gf.collect([], [str(measured)], str(out), judge="stall-0.98")
     assert len(gf.load(str(out))["builds"]) == len(default["builds"])
@@ -83,3 +83,21 @@ def test_collect_requires_out(tmp_path):
     with pytest.raises(SystemExit):
         gmf.main(["collect", "--data", str(data)])
     assert data.read_text() == '{"builds": [1]}'
+
+
+def test_collect_rejects_measured_records_without_dataset_fields(tmp_path):
+    """Review of #88: `collect` copied --measured records unchecked; one without `bit_source`
+    (e.g. `emission_structure measure` output) wrote a dataset the fit cannot read. It must
+    refuse before writing, naming the record and the missing field."""
+    import json
+
+    import pytest
+    from scripts import greedy_model_fit as gmf
+
+    good = gmf.load()["builds"][0]
+    measured = tmp_path / "m.json"
+    measured.write_text(json.dumps([{k: v for k, v in good.items() if k != "bit_source"} | {"name": "probe"}]))
+    out = tmp_path / "out.json"
+    with pytest.raises(ValueError, match="probe.*bit_source"):
+        gmf.collect([], [str(measured)], str(out))
+    assert not out.exists()

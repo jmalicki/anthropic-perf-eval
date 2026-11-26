@@ -422,6 +422,37 @@ def test_topk_after_a_skipped_level_is_not_reported_exhausted(tmp_path, monkeypa
     assert "remain unbuilt" in last["feedback"]
 
 
+def test_topk_total_solves_are_bounded(tmp_path, monkeypatch):
+    """Review of #88: on a score plateau that cannot be exhausted (a flat table: every plan
+    scores the same, so each level above it returns plans below it), the levels advance without
+    builds and each costs solves. A total solve budget ends the run with partial progress,
+    reported as incomplete."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    calls = []
+    real_solve = el.solve
+
+    def counting_solve(*a, **k):
+        calls.append(k)
+        return real_solve(*a, **k)
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    monkeypatch.setattr(el, "solve", counting_solve)
+    el.loop_topk(stage2, 10, 20.0, "floor", per_level=1, retries=0, max_solves=3)
+    assert len(calls) == 3
+    last = stage2.trace[-1]
+    assert last["feedback"].startswith("incomplete: solve budget"), last["feedback"]
+    assert last["exhausted"] is False and len(stage2.builds) == 1
+
+
 def test_error_fingerprints_never_match(table, tmp_path):
     """Review of #76: a fingerprint that failed is a mismatch, even against an equal failure."""
     assert el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "a"})

@@ -89,16 +89,28 @@ def _uses(sched: dict):
 
 
 def executed_ops(sched: dict) -> dict:
-    """Scheduled SSA ops by id, each with the engine that executes it: a SelectChoice lowered to
-    a multiply_add keeps SSA engine flow but runs on the vector ALU (a vselect stays flow)."""
-    on_valu = {low["from_select_choice"] for low in sched["ops"]
-               if low.get("from_select_choice") is not None and low["engine"] == "valu"}
-    return {o["id"]: (dict(o, engine="valu") if o["id"] in on_valu else o)
+    """Scheduled SSA ops by id, each with the engine that executes it and `finish`, the cycle of
+    its last lowered op. A SelectChoice lowered to a multiply_add keeps SSA engine flow but runs
+    on the vector ALU (a vselect stays flow); a two-op select finishes at its multiply_add
+    (cycle + 1, lowered id ssa_id + 1000000), a split-shifted op at its last lane."""
+    ssa = {o["id"]: o for o in sched["ssa_ops"]}
+    on_valu, finish = set(), {}
+    for low, s, _ in lowered_with_ssa(sched):
+        sid = low.get("from_select_choice")
+        if sid is not None:
+            s = ssa.get(sid, s)
+            if low["engine"] == "valu":
+                on_valu.add(sid)
+        if s is not None:
+            finish[s["id"]] = max(finish.get(s["id"], low["cycle"]), low["cycle"])
+    return {o["id"]: dict(o, engine="valu" if o["id"] in on_valu else o["engine"],
+                          finish=finish.get(o["id"], o["cycle"]))
             for o in sched["ssa_ops"] if o["cycle"] >= 0}
 
 
 def _operand_ready(op: dict, ops: dict) -> int:
-    return max((ops[d]["cycle"] + 1 for d in op["dep_ids"] if d in ops), default=0)
+    # The producer's last lowered op (`executed_ops`), else its issue cycle.
+    return max((ops[d].get("finish", ops[d]["cycle"]) + 1 for d in op["dep_ids"] if d in ops), default=0)
 
 
 def _no_room(op: dict, cycle: int, use: dict) -> bool:

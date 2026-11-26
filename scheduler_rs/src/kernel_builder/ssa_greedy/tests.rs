@@ -5464,6 +5464,86 @@ fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
     assert!(checked > 0, "control: some budget runs with a multiply-add select and is kept");
 }
 
+/// Review of #88 (CodeRabbit): a select in the vselect form whose delta is a write group and
+/// which keeps one lane of that group live. The lane read belongs to the group's allocation, so
+/// the group is read at the select's cycle; the delta-only exception (the vselect does not read
+/// its delta) must not backdate the group's release to its earlier real read. Before: the
+/// counter released the group at the Add, address assignment kept it to the select, and the
+/// agreement check failed.
+#[test]
+fn test_vselect_keep_live_lane_of_its_delta_group_holds_the_group() {
+    let shape = GreedyShape { select_overflow: SelectOverflow::Valu { limit: None }, ..Default::default() };
+    let mut emit = SsaEmitContext::new();
+    let c = emit.emit_const(5);
+    let b = emit.emit_vbroadcast(c);
+    let one_c = emit.emit_const(1);
+    let one = emit.emit_vbroadcast(one_c);
+    let idx = emit.emit_vload_imm(200);
+    let v_addr = emit.emit_valu(Opcode::Add, idx, b);
+    let addr_lanes = emit.decompose_vector(v_addr);
+    let (g, g_lanes) = emit.fresh_vector_group();
+    for (addr, dest) in addr_lanes.iter().zip(g_lanes.iter()) {
+        emit.emit_load_into(*addr, *dest);
+    }
+    let t = emit.emit_valu(Opcode::Add, b, g); // the last real read of the group
+    // Delay the select well past `t`.
+    let mut cond = emit.emit_valu(Opcode::Add, one, b);
+    for _ in 0..4 {
+        cond = emit.emit_valu(Opcode::Add, cond, t);
+    }
+    let s = emit.emit_select_choice_shared_delta(cond, t, g, b);
+    emit.ops.last_mut().unwrap().keep_live = Some(vec![g_lanes[0]]);
+    emit.emit_vstore_imm(300, s);
+    let groups = emit.take_vector_group_lanes();
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, Some(&groups));
+    let mut fma = HashSet::new();
+    let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops, true, &mut HashSet::new(), 1536, Some(&mut fma), None, None, None,
+        &GreedyBoundsUsage::None, &GreedyPolicy, Some(&groups), false, false, false, false, None, None, None,
+        &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("scheduler error: {}", e));
+    assert!(fma.is_empty(), "control: the select took the vselect form");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
+/// Review of #88 (CodeRabbit): a fixed select-choice map that omits a select. The omitted
+/// select falls back to the scheduler's own rule (overflow to the vector ALU when the flow slot
+/// is taken); its multiply-add placement must then be reported like any overflow placement, or
+/// a caller defaulting the missing decision to vselect puts two ops on the one flow slot.
+#[test]
+fn test_partial_fixed_select_map_reports_an_overflowed_select() {
+    let shape = GreedyShape { select_overflow: SelectOverflow::Valu { limit: None }, ..Default::default() };
+    let mut emit = SsaEmitContext::new();
+    let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+        let c = emit.emit_const(v);
+        emit.emit_vbroadcast(c)
+    };
+    let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+    let (c1v, c2v) = (vec_of(&mut emit, 1), vec_of(&mut emit, 0));
+    let t = emit.emit_valu(Opcode::Add, b, d);
+    let s1 = emit.emit_select_choice_shared_delta(c1v, t, d, b);
+    let s1_id = emit.ops.last().unwrap().id;
+    let s2 = emit.emit_select_choice_shared_delta(c2v, t, d, b);
+    let s2_id = emit.ops.last().unwrap().id;
+    let x = emit.emit_valu(Opcode::Add, s1, s2);
+    emit.emit_vstore_imm(300, x);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    // The map fixes s1 to the vselect form and says nothing about s2.
+    let fixed: HashMap<usize, SelectChoiceEncoding> = [(s1_id, SelectChoiceEncoding::Vselect)].into_iter().collect();
+    let mut fma = HashSet::new();
+    let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops, true, &mut HashSet::new(), 1536, Some(&mut fma), None, None, None,
+        &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None, Some(&fixed),
+        &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("scheduler error: {}", e));
+    let cycle = |id: usize| emit.ops.iter().find(|o| o.id == id).unwrap().cycle;
+    assert_eq!(cycle(s1_id), cycle(s2_id), "control: both selects in one cycle, so one is not on flow");
+    assert!(fma.contains(&s2_id), "the overflowed select is reported in the multiply-add set: {:?}", fma);
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
 /// Review of #76 (CodeRabbit, third pass; fix in #82): the fit estimate of a select in the
 /// multiply_add form must hold only what the multiply_add reads (sources, delta, their group
 /// aliases) to cycle + 1. A `keep_live`-only vector is released at the select's cycle, so the

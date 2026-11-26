@@ -65,3 +65,20 @@ def test_fewer_groups_in_flight_builds_within_budget(name, cycles):
     assert not stats["budget_exceeded"] and stats["cycles"] == cycles
     assert check({"instrs": instrs}, sched).ok
     assert validate_kernel(instrs, 10, 256, 16, 123)
+
+
+def test_live_group_read_through_a_lane_is_not_reported_released():
+    """Review of #88: a live vector group whose remaining reader reads one of its lanes has no
+    direct reader under the group's id. With `remaining_users` > 0 in the dump the script must
+    not claim it is released next cycle."""
+    state = {"cycle": 5, "live_words": 8, "budget": 8, "slots": {}, "budget_deferred": [], "heap": [],
+             "live": [{"vreg": 10, "words": 8, "remaining_users": 1},
+                      {"vreg": 20, "words": 1, "remaining_users": 0}]}
+    sched = {"ssa_ops": [
+        {"id": 1, "opcode": "load", "engine": "load", "cycle": 2, "dep_ids": [], "dest": "v10_v", "srcs": []},
+        {"id": 2, "opcode": "+", "engine": "alu", "cycle": 9, "dep_ids": [1], "dest": "v30_s",
+         "srcs": [{"VReg": {"id": 11}}]},  # reads lane 11 of group 10
+        {"id": 3, "opcode": "load", "engine": "load", "cycle": 1, "dep_ids": [], "dest": "v20_s", "srcs": []}]}
+    kinds = sd.analyse(state, sched)["words_by_first_reader_state"]
+    assert kinds.get("no reader left (released next cycle)") == 1  # vreg 20: no users left
+    assert kinds.get("reader not resolved (lane alias or keep_live)") == 8

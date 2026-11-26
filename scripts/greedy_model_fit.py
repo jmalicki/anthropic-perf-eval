@@ -7,6 +7,11 @@
     uv run python -m scripts.greedy_model_fit --judge stall-0.98 --check   # GREEDY_MODEL_STALL
     uv run python -m scripts.greedy_model_fit collect --state S.json [...] [--measured M.json] --out D.json
 
+`--measured` is a JSON list of build records in the dataset's own format, each with `name`,
+`bit_source` ("index" or "path"), `rows`, `counts` (predicted op counts, `es.Table.predict`) and
+`cycles`; `collect` refuses a record that lacks one. No script writes it: the records are
+assembled from the builds (`emission_structure measure` output has no bit source or counts).
+
 The model (scripts/emission_structure.py, docs/GREEDY_SHAPE_ABLATION.md section 12.3) is
 
     predicted = max(floor + a_floor,  loads / 2 + a_load + b_flow * max(0, flow - flow0))
@@ -197,6 +202,10 @@ NOTE = ("Builds behind es.GREEDY_MODEL (judge 'default') and es.GREEDY_MODEL_STA
         "greedy development measurements, every build PROVED and PASSED.")
 
 
+# What the fit reads from a measured (out-of-sample) record (`load`, `analyse`), plus its plan rows.
+MEASURED_FIELDS = ("name", "bit_source", "rows", "counts", "cycles")
+
+
 def collect(states, measured, out, judge="default"):
     """Records for one judge from loop state files (use "loop") and measured plans (use
     "out_of_sample"), written into `out`: records of other judges already there are kept,
@@ -218,7 +227,14 @@ def collect(states, measured, out, judge="default"):
                            "greedy_extra": st.get("greedy_extra"), "judge": judge})
     for path in measured:
         with open(path) as f:
-            for m in json.load(f):
+            for i, m in enumerate(json.load(f)):
+                missing = [k for k in MEASURED_FIELDS if k not in m]
+                if missing:
+                    raise ValueError(f"{path}: measured record {m.get('name', f'#{i}')!r} lacks {', '.join(missing)} "
+                                     f"(each needs {', '.join(MEASURED_FIELDS)})")
+                if m["bit_source"] not in ("index", "path"):
+                    raise ValueError(f"{path}: measured record {m['name']!r}: bit_source {m['bit_source']!r} "
+                                     "is not index or path")
                 builds.append(dict(m, use="out_of_sample", judge=judge))
     if os.path.exists(out):
         with open(out) as f:

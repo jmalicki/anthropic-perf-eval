@@ -112,7 +112,9 @@ def test_forced_valu_shift_takes_effect_under_greedy():
     """--valu-shift alu shifts every shiftable vector op, --valu-shift valu none (review of #86).
     4 rounds, batch 32: the smallest size here where the default greedy shifts some (8)."""
     def shifted(mode):
-        instrs, stats = build_kernel_with_args(rounds=4, batch_size=32, use_greedy=True, verbose=False, valu_shift=mode)
+        with tempfile.TemporaryDirectory() as tmp:  # not the default scheduler_output.json
+            instrs, stats = build_kernel_with_args(rounds=4, batch_size=32, use_greedy=True, verbose=False,
+                                                   valu_shift=mode, output_json=os.path.join(tmp, "sched.json"))
         instrs = json.loads(json.dumps(list(instrs)))
         assert validate_kernel(instrs, HEIGHT, 32, 4, 123)
         return stats["valu_shifted"], instrs

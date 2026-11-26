@@ -89,6 +89,8 @@ impl ForcedEncodings {
     /// force (`CompilerConfig::greedy_forced`). Before this they were ignored without CP-SAT.
     fn from_greedy_forced(ctx: &PipelineContext) -> Self {
         let forced = &ctx.config.compiler.greedy_forced;
+        // Checked in `GreedySchedulePass::run` (`GreedyForcedChoices::check`): one encoding for
+        // every ConstChoice is `Load` or `AddImm`, never an `AluDerive` (one producer pair).
         let all = |opcode: Opcode| ctx.ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
         let const_choice = forced
             .const_choice
@@ -120,6 +122,7 @@ impl Pass for GreedySchedulePass {
     }
 
     fn run(&self, ctx: &mut PipelineContext) -> Result<String, String> {
+        ctx.config.compiler.greedy_forced.check()?;
         let enable_valu_shift = ctx.config.compiler.enable_valu_shift;
 
         // Construct pressure policy from config

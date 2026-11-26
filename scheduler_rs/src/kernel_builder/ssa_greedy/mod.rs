@@ -1045,19 +1045,25 @@ fn release_read_values(
     // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
     // address assignment counts it (`use_cycles`).
     let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
+    // What the op really reads at its cycle in any form: its sources and keep_live values with
+    // their group aliases (a keep_live lane of the delta group reads the group's allocation).
+    let real_reads: HashSet<VReg> = op
+        .srcs
+        .iter()
+        .filter_map(|s| s.as_vreg())
+        .chain(op.keep_live.iter().flatten().copied())
+        .flat_map(|v| std::iter::once(v).chain(liveness_aliases.get(&v).into_iter().flatten().copied()))
+        .collect();
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
         // A vselect does not read the delta: no read, only one holder fewer. Unless the
-        // same VReg is also a direct source or keep-live read of the select (e.g. the
-        // condition is the delta), which the vselect does read at this cycle.
-        let delta_only = delta_read
-            && !fma
-            && op.delta_vreg == Some(*vreg)
-            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
-            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        // same allocation is also a source or keep-live read of the select, directly or
+        // through a group alias (e.g. the condition is the delta, or a kept lane of the delta
+        // group), which the vselect does read at this cycle.
+        let delta_only = delta_read && !fma && op.delta_vreg == Some(*vreg) && !real_reads.contains(vreg);
         if !delta_only {
             let end = cycle as i32 + i32::from(fma && fma_reads.contains(vreg));
             let e = trace.read_end.entry(*vreg).or_insert(end);
@@ -2151,8 +2157,9 @@ fn schedule_ssa_greedy_core(
     trace.delta_readers = ops
         .iter()
         .filter(|op| op.opcode == Opcode::SelectChoice && op.delta_vreg.is_some())
-        .filter(|op| match fixed_select_choice_encoding {
-            Some(fixed) => matches!(fixed.get(&op.id), Some(SelectChoiceEncoding::Fma)),
+        // Per op: a select a partial fixed map leaves out follows the scheduler's own rule.
+        .filter(|op| match fixed_select_choice_encoding.and_then(|m| m.get(&op.id)) {
+            Some(enc) => matches!(enc, SelectChoiceEncoding::Fma),
             None => !select_choice_fixed_to_vselect && shape.select_overflow != SelectOverflow::Never,
         })
         .map(|op| op.id)
@@ -3229,8 +3236,10 @@ fn schedule_ssa_greedy_core(
                         if engine == Engine::Valu && fma_extra_latency.contains(&idx) {
                             fma_carry += 1;
                         }
+                        // Per op: a select the fixed map does not cover was placed by the
+                        // overflow rule and is reported like any overflow placement.
                         if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
-                            && fixed_select_choice_encoding.is_none()
+                            && fixed_select_choice_encoding.map_or(true, |m| !m.contains_key(&op_id))
                         {
                             overflow_select_fma.insert(op_id);
                         }

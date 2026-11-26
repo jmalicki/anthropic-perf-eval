@@ -91,12 +91,18 @@ def analyse(state: dict, sched: dict) -> dict:
         p = producer.get(v)
         si = (ops[p].get("source_info") or {}) if p in ops else {}
         live_rows.append({"vreg": v, "words": info["words"], "producer": p,
+                          "remaining_users": info.get("remaining_users"),
                           "group": si.get("group"), "round": si.get("round"), "phase": si.get("phase"),
                           "readers": [(r, status(r)) for r in sorted(rem)]})
     kinds = collections.Counter()
     for row in live_rows:
         if not row["readers"]:
-            kinds["no reader left (released next cycle)"] += row["words"]
+            # The reader list is rebuilt from direct operands only; a reader through a lane
+            # alias or keep_live is not in it. Only the dump's count says nothing is left.
+            if row["remaining_users"]:
+                kinds["reader not resolved (lane alias or keep_live)"] += row["words"]
+            else:
+                kinds["no reader left (released next cycle)"] += row["words"]
             continue
         st = row["readers"][0][1]
         key = ("deferred" if st.startswith("deferred") else "waits (latency/inflation)" if st.startswith("waits")
