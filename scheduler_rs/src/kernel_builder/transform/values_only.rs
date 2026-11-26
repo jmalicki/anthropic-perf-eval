@@ -216,6 +216,7 @@ pub fn apply_values_only(
     let before = dce_counts(&program).map_err(|e| report.cost_error = Some(e)).ok();
     for s in &sites {
         *report.sites.entry("index-store").or_default() += 1;
+        report.add_facts(&s.facts);
         if let Some(before) = &before {
             match dce_counts_without(&program, &[s.store]) {
                 Ok(alone) => *report.site_classes.entry(("index-store", sub(&alone, before))).or_default() += 1,

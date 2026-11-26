@@ -9,6 +9,7 @@ use crate::types::SsaOp;
 use super::super::emit_ssa::eliminate_ssa_dead_code;
 use super::super::SsaProgram;
 use super::cost::{category, Counts, CATEGORIES};
+use super::rule::{Fact, FactSource};
 use super::surgery::SurgeryReport;
 
 /// Counts per category of some ops.
@@ -92,9 +93,27 @@ pub struct RuleReport {
     /// Why the cost could not be computed (an op the categories do not know); the rewrite is
     /// applied regardless and the deltas are left empty.
     pub cost_error: Option<String>,
+    /// The whole-program facts and declared assumptions (`FactSource::Program` and
+    /// `FactSource::Assumption`) the rewritten sites relied on, each once, in the order first
+    /// seen: what a run must state for the rewrite to hold.
+    pub facts: Vec<Fact>,
 }
 
 impl RuleReport {
+    /// Record the facts a rewritten site relied on (`facts` keeps the whole-program ones).
+    pub fn add_facts(&mut self, facts: &[Fact]) {
+        for f in facts {
+            if matches!(f.source, FactSource::Program | FactSource::Assumption) && !self.facts.contains(f) {
+                self.facts.push(f.clone());
+            }
+        }
+    }
+
+    /// Names of the declared assumptions the rewrite relied on.
+    pub fn assumptions(&self) -> Vec<&'static str> {
+        self.facts.iter().filter(|f| f.source == FactSource::Assumption).map(|f| f.name).collect()
+    }
+
     /// Total number of sites rewritten.
     pub fn n_sites(&self) -> usize {
         self.sites.values().sum()
@@ -120,8 +139,9 @@ impl RuleReport {
         let sites: Vec<String> = self.sites.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
         let classes: Vec<String> =
             self.site_classes.iter().map(|((k, d), n)| format!("{} x {} [{}]", n, k, format_counts(d))).collect();
+        let assumed = self.assumptions();
         format!(
-            "{}: sites {}; per-site {}; cascade [{}]; total [{}]; {} removed, {} cascaded, {} ConstChoice alternatives changed",
+            "{}: sites {}; per-site {}; cascade [{}]; total [{}]; {} removed, {} cascaded, {} ConstChoice alternatives changed{}",
             self.rule,
             if sites.is_empty() { "none".into() } else { sites.join(", ") },
             if classes.is_empty() { "none".into() } else { classes.join(", ") },
@@ -129,7 +149,8 @@ impl RuleReport {
             format_counts(&self.total_delta),
             self.surgery.removed,
             self.surgery.cascaded.len(),
-            self.surgery.alternatives.len()
+            self.surgery.alternatives.len(),
+            if assumed.is_empty() { String::new() } else { format!("; assumes {}", assumed.join(", ")) }
         )
     }
 }
