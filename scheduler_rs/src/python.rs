@@ -1127,7 +1127,7 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,
-    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, greedy_justify=0, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase", greedy_shift_policy="when-full", greedy_shift_target=None, greedy_load_priority="key", greedy_flow_priority="key", greedy_select_overflow="never", greedy_select_overflow_limit=None))]
+    cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, greedy_justify=0, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase", greedy_shift_policy="when-full", greedy_shift_target=None, greedy_load_priority="key", greedy_flow_priority="key", greedy_select_overflow="never", greedy_select_overflow_limit=None, greedy_budget_force="same-cycle"))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
     forest_height: usize,
@@ -1200,6 +1200,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     greedy_flow_priority: &str,
     greedy_select_overflow: &str,
     greedy_select_overflow_limit: Option<usize>,
+    greedy_budget_force: &str,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
     let cpsat_tuning = crate::cpsat_scheduler::CpsatTuning::from_json(cpsat_tuning_json)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1394,6 +1395,16 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 other => {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "Invalid greedy_flow_priority '{}': must be 'key' or 'feeds-load-first'",
+                        other
+                    )))
+                }
+            },
+            greedy_budget_force: match greedy_budget_force {
+                "same-cycle" => crate::kernel_builder::ssa_greedy::BudgetForce::SameCycle,
+                "stall" => crate::kernel_builder::ssa_greedy::BudgetForce::Stall,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid greedy_budget_force '{}': must be 'same-cycle' or 'stall'",
                         other
                     )))
                 }

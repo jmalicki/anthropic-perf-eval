@@ -495,6 +495,12 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                        help="Where a SelectChoice with a one-op multiply_add form runs: 'never' (default) always "
                             "a flow vselect; 'valu' the multiply_add on the vector ALU when the flow slot is taken "
                             "in that cycle and a vector slot is free (docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-budget-force", choices=["same-cycle", "stall"], default="same-cycle",
+                       help="Scratch model words: when an op the greedy's budget check deferred is forced past "
+                            "the budget. 'same-cycle' (default) forces one deferred op per cycle whenever it has "
+                            "a slot, so a run that reaches the budget overshoots it and fails address "
+                            "assignment; 'stall' forces only in a cycle where nothing else was placed, as the "
+                            "pools model does (docs/SCRATCH_CEILING_DIAGNOSIS.md)")
     group.add_argument("--greedy-select-overflow-limit", type=_positive_int, default=None, metavar="N",
                        help="With --greedy-select-overflow valu: at most N selects take the multiply_add form "
                             "(default: no limit). The structure model's floor resolution gives one value")
@@ -741,6 +747,7 @@ def args_to_build_kwargs(
         "greedy_flow_priority": get("greedy_flow_priority", "key"),
         "greedy_select_overflow": get("greedy_select_overflow", "never"),
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
+        "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -806,6 +813,7 @@ def args_to_build_kwargs(
         "greedy_flow_priority": get("greedy_flow_priority", "key"),
         "greedy_select_overflow": get("greedy_select_overflow", "never"),
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
+        "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
