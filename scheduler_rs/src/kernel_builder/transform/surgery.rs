@@ -191,11 +191,18 @@ pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool, foreign: impl Fn
 }
 
 /// Which ops dead code elimination keeps, by index.
+///
+/// A value named in a kept op's `keep_live` is kept too (with what it reads): the emitter's
+/// dead code elimination follows `srcs` only, so on this private copy the `keep_live` entries
+/// are appended to `srcs`.
 fn dce_live(ops: &[SsaOp], program: &SsaProgram) -> Vec<bool> {
     let mut ops: Vec<SsaOp> = ops.to_vec();
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     for (i, op) in ops.iter_mut().enumerate() {
         op.id = i;
+        if let Some(keep) = op.keep_live.clone() {
+            op.srcs.extend(keep.into_iter().map(Operand::VReg));
+        }
         if let Some(d) = op.dest {
             vreg_def.entry(d).or_insert(i);
         }

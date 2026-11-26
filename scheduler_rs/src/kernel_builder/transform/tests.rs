@@ -1309,6 +1309,12 @@ fn test_surgery_checks_where_moved_readers_and_keepers_are() {
     let err = surgery.move_after(&[1], 7).unwrap_err();
     assert!(err.contains("read by op 2"), "{}", err);
     surgery.finish().unwrap();
+    // At the same anchor the reader moved first comes first: its operand cannot follow.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 7).unwrap();
+    let err = surgery.move_after(&[1], 7).unwrap_err();
+    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.finish().unwrap();
     // The other order is valid: the reader after op 7, its operand after op 5.
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
     surgery.move_after(&[2], 7).unwrap();
@@ -1337,6 +1343,41 @@ fn test_surgery_drops_a_moved_op_that_is_then_removed() {
     surgery.insert_after(7, p.ops[2].clone(), &Stamp::of(&p.ops[2]));
     let (after, _) = surgery.finish().unwrap();
     assert_eq!(after.ops.iter().filter(|o| o.dest == Some(bm)).count(), 1);
+}
+
+#[test]
+fn test_hash_merge_keeps_a_kept_live_constant() {
+    use crate::types::{Opcode, Operand};
+    // m = 3, c = 5, d = 7, k = 1, and the surviving last store names the scalar constant 7 in
+    // keep_live. The rewrite removes the last reader of 7 (the broadcast of D); dead code
+    // elimination must keep 7 for the store. Without the keeper, 7 goes with the site.
+    let build = |keep: bool| {
+        let (mut p, _) = synthetic_hash_program(11, 1);
+        let consts: Vec<usize> = (0..p.ops.len()).filter(|&i| p.ops[i].opcode == Opcode::ConstChoice).collect();
+        for (&i, value) in consts.iter().zip([3i64, 5, 7, 1]) {
+            p.ops[i].srcs[0] = Operand::Imm(value);
+            p.ops[i].produces_constant = Some(value);
+            p.ops[i + 1].produces_constant = Some(value);
+        }
+        let seven = p.ops[consts[2]].dest.unwrap();
+        if keep {
+            p.ops.last_mut().unwrap().keep_live = Some(vec![seven]);
+        }
+        (p, seven)
+    };
+    let defines = |p: &crate::kernel_builder::SsaProgram, v| p.ops.iter().any(|o| o.dest == Some(v));
+    let (p, seven) = build(true);
+    let before = clone_program(&p);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1, "{:?}", report.rejections);
+    assert!(defines(&after, seven));
+    super::surgery::Surgery::check(&after).unwrap();
+    assert_same_values(&before, &after, 3);
+    let (p, seven) = build(false);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1);
+    assert!(!defines(&after, seven));
+    assert!(report.surgery.cascaded.iter().any(|&(_, _, c)| c == Some(7)), "{:?}", report.surgery.cascaded);
 }
 
 #[test]
