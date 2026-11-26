@@ -104,3 +104,53 @@ def test_static_bound_import_error_is_reported(monkeypatch, capsys):
     assert sld.static_bound(_schedule()) is None
     assert "static head/tail bound not computed" in capsys.readouterr().err
     assert "static head/tail bound not computed" in report("s", analyze(_schedule()), floor=2, bound=None)
+
+
+def test_select_waits_count_by_the_engine_that_runs_them():
+    """Review of #76: a SelectChoice lowered to a vector multiply_add (SSA engine still flow)
+    waits for a vector slot, not the flow slot: no flow wait, and its wait is fixed vector work."""
+    d = _schedule()
+    assert 13 in analyze(d)["flow_wait"], "control: the vselect form counts as a flow wait"
+    for low in d["ops"]:
+        if low.get("from_select_choice") == 14:
+            low["engine"], low["opcode"] = "valu", "multiply_add"
+    a = analyze(d)
+    assert 13 not in a["flow_wait"]
+
+
+def test_two_op_select_finishes_at_its_multiply_add():
+    """Review of #76 (second pass): the multiply_add of a two-op select is lowered with id
+    `ssa_id + 1000000`; it resolves to the select through `from_select_choice`, so the select
+    finishes at the multiply_add and a consumer issued the cycle after it did not wait."""
+    si = _si(6)
+    ssa = [{"id": 0, "engine": "flow", "opcode": "select_choice", "dep_ids": [], "cycle": 0,
+            "source_info": si, "srcs": [], "dest": None, "var_type": "x", "select_fma_vector_ops": 2},
+           {"id": 1, "engine": "valu", "opcode": "^", "dep_ids": [0], "cycle": 2, "source_info": si,
+            "srcs": [], "dest": None, "var_type": "x"}]
+    ops = [{"id": 0, "engine": "valu", "opcode": "-", "cycle": 0, "from_select_choice": 0},
+           {"id": 1000000, "engine": "valu", "opcode": "multiply_add", "cycle": 1, "from_select_choice": 0},
+           {"id": 1, "engine": "valu", "opcode": "^", "cycle": 2}]
+    a = analyze({"total_cycles": 3, "ops": ops, "ssa_ops": ssa, "peak_live_words": 0})
+    assert a["bands"]["r5-10"]["ready_wait"] == 0
+
+
+def test_cycle_with_only_a_vector_select_belongs_to_its_round():
+    """Review of #76 (second pass): a cycle whose only vector work is a round-6 select lowered
+    to a multiply_add is attributed to r5-10, not setup."""
+    ssa = [{"id": 0, "engine": "flow", "opcode": "select_choice", "dep_ids": [], "cycle": 0,
+            "source_info": _si(6), "srcs": [], "dest": None, "var_type": "x", "select_fma_vector_ops": 1}]
+    ops = [{"id": 0, "engine": "valu", "opcode": "multiply_add", "cycle": 0, "from_select_choice": 0}]
+    a = analyze({"total_cycles": 1, "ops": ops, "ssa_ops": ssa, "peak_live_words": 0})
+    assert a["bands"]["r5-10"]["cycles"] == 1 and a["bands"]["setup"]["cycles"] == 0
+    assert a["bands"]["r5-10"]["alu_idle"] == 12
+
+
+def test_eliminated_vbroadcasts_are_not_vector_ops():
+    """Review of #76 (second pass): a vbroadcast removed by broadcast elimination has no
+    lowered op; counting it breaks V - s = 6T - I."""
+    d = _schedule()
+    d["ssa_ops"].append({"id": 20, "engine": "valu", "opcode": "vbroadcast", "dep_ids": [], "cycle": 0,
+                         "source_info": _si(None), "srcs": [], "dest": None, "var_type": "x"})
+    d["eliminated_vbroadcast_ops"] = [20]
+    a = analyze(d)
+    assert a["vector_ops"] == 14 and a["identity_holds"]

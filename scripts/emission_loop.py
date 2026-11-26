@@ -597,6 +597,7 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
         stale = 0 if improved else stale + 1
         _record(stage2, mode, it, res, rec, built,
                 "no-good on this plan" + (f"; caps {dict(max_util)}" if max_util else
+                                          "; no valid incumbent yet, no cut" if best is None else
                                           f"; incumbent floor < {best['cycles']}")
                 + (" (new best)" if improved else ""))
         if stale >= patience:
@@ -1126,6 +1127,9 @@ def main(argv=None) -> int:
                            if e["mode"].startswith("caps") and "(new best)" in e["feedback"]), None)
     for path in args.extra_state:
         other = Stage2(table, workdir, path, log=None, check_scheduler=False)
+        if other.greedy_extra != stage2.greedy_extra:
+            ap.error(f"--extra-state {path} was built with greedy options {other.greedy_extra}, the primary "
+                     f"state with {stage2.greedy_extra}: their measurements are not comparable and are not merged")
         if not same_scheduler(other.scheduler, stage2.scheduler):
             print(f"note: --extra-state {path} holds builds from scheduler {other.scheduler or 'unrecorded'}, not "
                   f"{stage2.scheduler or 'unrecorded'}; its builds are merged but were made by another binary")
