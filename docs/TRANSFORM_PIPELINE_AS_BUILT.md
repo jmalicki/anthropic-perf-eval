@@ -45,9 +45,9 @@ The implementation is the PR stack:
   matches (`CompilerConfig::transforms`). No solver chooses per site. The strategy flags
   therefore remain, under a new name: `--transform hash-merge` stands for
   `--merge-hash-stages`, and so on.
-- **Section 4's objective was found not to work as planned.** Later stage-1 experiments
-  showed that stage-1 scores cannot rank plans near the optimum: more than 100 plans tie at
-  or below the best score.
+- **Section 4's objective was found not to work as planned.** Stage-1 scores cannot rank
+  plans near the optimum: the level-enumerated top-k search on `startup-and-stall-loop` (#83)
+  found more than 100 plans that score at or below each best known plan.
 
 ## Evidence instead of a rewrite certificate
 
