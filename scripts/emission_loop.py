@@ -250,6 +250,8 @@ class RowTable:
         return bad
 
     def _axis(self, values) -> list[int]:
+        if self.max_axis < 2:
+            raise ValueError(f"max_axis {self.max_axis}: needs at least 2 (the first and last values)")
         vals = sorted(set(values))
         if len(vals) <= self.max_axis:
             return vals
@@ -404,6 +406,10 @@ def schedule_summary(sched: Mapping) -> dict:
         "scheduled_floor_binds": rep["floor"]["binding"],
         "static_bound_any": (rep.get("static_bound") or {}).get("any", {}).get("bound"),
         "valu_shifted": rep["emission"]["vector_ops_shifted_to_alu"],
+        # Lowered vector ops that come from SelectChoices run as multiply_adds (none with the
+        # loop's greedy flags, which run every select as a flow vselect).
+        "select_ops_on_valu": sum(1 for o in sched.get("ops") or []
+                                  if o.get("from_select_choice") is not None and o.get("engine") == "valu"),
     }
 
 
@@ -812,7 +818,8 @@ def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float, cut
         stale = 0 if improved else stale + 1
         _record(stage2, "rows", it, res, rec, built,
                 f"no-good on this plan; row table refined from it; "
-                + (f"floor < {best['cycles']}" if cut == "sound" else f"M < {best['cycles']} + overestimate")
+                + ("no valid incumbent yet, no cut" if best is None else
+                   f"floor < {best['cycles']}" if cut == "sound" else f"M < {best['cycles']} + overestimate")
                 + (" (new best)" if improved else ""),
                 {"windows": len(specs), "rows_bound": predicted["bound"], "rows_window": [predicted["t"], predicted["q"]],
                  "violations": len(violations),
@@ -875,9 +882,12 @@ def surrogates(stage2: Stage2, caps: Mapping[str, float] | None) -> list[dict]:
             "rows_le_cycles": max(b["predicted_floor"], rb["bound"]) <= b["cycles"],
             "peak_live": b.get("peak_live"), "max_addr": b.get("max_addr"),
             # Post-build diagnostic, not a stage-1 surrogate: vector work the greedy left on the
-            # VALU (after its own shifts), in VALU cycles. Stage 1 assumes the best split instead.
+            # VALU (native vector ops not shifted, plus selects lowered to multiply_adds on the
+            # VALU), in VALU cycles. Builds recorded before the select count was kept have none
+            # (their greedy flags put every select on flow). Stage 1 assumes the best split.
             "valu_after_greedy_shift": math.ceil((b["counts"]["vec_fixed"] + b["counts"]["vec_shiftable"]
-                                                  - b["summary"]["valu_shifted"]) / es.CAP["valu"]),
+                                                  - b["summary"]["valu_shifted"]
+                                                  + b["summary"].get("select_ops_on_valu", 0)) / es.CAP["valu"]),
         })
     return out
 
@@ -1054,6 +1064,8 @@ def main(argv=None) -> int:
     ap.add_argument("--extra-state", action="append", default=[],
                     help="report: also count the builds (and row observations) of these state files")
     args = ap.parse_args(argv)
+    if args.max_axis is not None and args.max_axis < 2:
+        ap.error(f"--max-axis {args.max_axis}: needs at least 2 (the first and last head and tail values)")
     ctx = es.Context(rounds=args.rounds, batch_size=args.batch_size, forest_height=args.forest_height,
                      select_bit_source=args.select_bit_source)
     workdir = args.workdir or os.path.join(os.path.dirname(os.path.abspath(args.state)), "builds")
