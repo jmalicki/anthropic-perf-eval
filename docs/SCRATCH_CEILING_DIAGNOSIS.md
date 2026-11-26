@@ -195,14 +195,16 @@ threshold too, which costs 1 cycle on `path_flow90.json`.
 
 ## What next
 
-- For stage 1: rerun the path-bit loop with `--greedy-budget-force stall
-  --pressure-inflation-threshold 0.98`. The plans the loop scored at 1,099 to 1,142 now score
-  1,049 to 1,064, which changes which path plans look promising, though none here beats
-  1,033.
-- For `path_flow90.json` the remaining 24 cycles are the start-up: 9.5 on the flow slot
-  (round 1 to 3 selects before the first gathers) and 5 of setup loads inside the window.
-  Candidates: `multiply_add` selects (`bits`) in round 1 to 3 for the first few groups only,
-  or ordering the setup loads before t. Neither is a scratch question.
+Both follow-ups proposed here were done in #83 (docs/STARTUP_AND_STALL_LOOP.md):
+
+- The stage-1 path-bit loop rerun with `--greedy-budget-force stall
+  --pressure-inflation-threshold 0.98` as the judge: negative. No plan beats the baselines
+  (path best 1,034, `path_flow90.json` itself under that judge), and stall + 0.98 is not safe
+  on every plan: 3 of 28 new path-bit builds exceed the budget (docs/STALL_DEADLOCK.md on #88).
+- The start-up of `path_flow90.json`: `bits` selects for the first groups in rounds 1 to 3,
+  negative (9 hand plans, all slower, 1,036 to 1,063). Ordering the start-up instead,
+  `--greedy-flow-priority chain-first --greedy-alu-priority native-first`, gives 1,030
+  (setup loads in the window 10 -> 1).
 
 ## Reproduce
 

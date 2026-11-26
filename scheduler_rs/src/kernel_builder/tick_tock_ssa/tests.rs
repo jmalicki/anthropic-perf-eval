@@ -4742,3 +4742,432 @@ fn test_cpsat_greedy_policy_bounds_gives_the_greedy_only_schedule() {
     let full = pipeline_greedy_schedule(0, true, false);
     assert!(full != pipeline_greedy_schedule(0, false, false), "full bounds should shape the CP-SAT greedy differently here");
 }
+
+/// After dead code elimination every ALU-derived ConstChoice alternative reads constants that
+/// a kept op produces (BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it
+/// removed"). Before the fix DCE kept them in every emission measured: e.g. 8 = 1 + 7 and
+/// 9 = 2 + 7 at batch 256 (7 dies), and with `--values-only` and the mirrored index (or
+/// `--prune-dead-index --values-only`) also 6 = 1 + 5 and 9 = 4 + 5, because the pointer load
+/// of header word 5 dies and with it its address constant 5.
+#[test]
+fn test_dce_keeps_no_const_alternative_without_producer() {
+    use crate::kernel_builder::config::IndexForm;
+    use crate::types::ConstEncoding;
+    use std::collections::HashSet;
+
+    type Variant = (&'static str, fn(&mut KernelConfig));
+    let variants: [Variant; 5] = [
+        ("default", |_| {}),
+        ("mirrored", |c| c.spec.index_form = IndexForm::Mirrored),
+        ("values-only", |c| c.spec.values_only = true),
+        ("values-only mirrored", |c| {
+            c.spec.values_only = true;
+            c.spec.index_form = IndexForm::Mirrored;
+        }),
+        ("values-only prune-dead-index", |c| {
+            c.spec.values_only = true;
+            c.spec.prune_dead_index = true;
+        }),
+    ];
+    for rounds in [2usize, 16] {
+        for batch in [8usize, 256] {
+            for (name, apply) in variants.iter() {
+                let mut config = KernelConfig::new(10, 2047, batch, rounds);
+                apply(&mut config);
+                let mut program = SsaTickTockKernelBuilder::new(config).build();
+                let emitted: HashMap<usize, Vec<ConstEncoding>> = program
+                    .ops
+                    .iter()
+                    .filter_map(|op| op.const_alternatives.clone().map(|a| (op.id, a)))
+                    .collect();
+                let (ops, _, _) = eliminate_ssa_dead_code(
+                    std::mem::take(&mut program.ops),
+                    &mut program.vreg_def,
+                    &mut program.const_alternatives,
+                    program.zero_vreg,
+                    Some(&program.vector_group_lanes),
+                );
+                let produced: HashSet<i64> = ops.iter().filter_map(|op| op.produces_constant).collect();
+                for op in &ops {
+                    for enc in op.const_alternatives.iter().flatten() {
+                        assert!(
+                            enc.dependencies().iter().all(|v| produced.contains(v)),
+                            "{} {}r batch {}: constant {:?} keeps {:?}",
+                            name, rounds, batch, op.produces_constant, enc
+                        );
+                    }
+                    // Nothing else is dropped or reordered: Load, AddImm and every derivation
+                    // whose operands survive stay, in emission order.
+                    if let Some(kept) = op.const_alternatives.as_ref() {
+                        let expected: Vec<ConstEncoding> = emitted[&op.id]
+                            .iter()
+                            .filter(|e| e.dependencies().iter().all(|v| produced.contains(v)))
+                            .cloned()
+                            .collect();
+                        assert_eq!(kept, &expected, "{} {}r batch {}: constant {:?}", name, rounds, batch, op.produces_constant);
+                    }
+                }
+                // The reported case: constant 5 dies, 6 loses 1 + 5 and keeps its other encodings.
+                if name.starts_with("values-only m") && batch == 256 {
+                    assert!(!produced.contains(&5));
+                    let six = ops.iter().find(|op| op.produces_constant == Some(6)).unwrap();
+                    let alts = six.const_alternatives.as_ref().unwrap();
+                    assert!(!alts.contains(&ConstEncoding::Add { a_value: 1, b_value: 5 }));
+                    assert!(alts.len() >= 2 && alts[0] == ConstEncoding::Load);
+                }
+            }
+        }
+    }
+}
+
+/// Build `config`, run DCE, and with `undo_drop` put back on every surviving ConstChoice the
+/// alternatives it had before DCE (DCE without `drop_alternatives_without_producer`). Returns
+/// the ops with dependencies computed, the zero VReg, and how many alternatives were put back.
+#[cfg(feature = "cpsat")]
+fn dce_program_for_model(
+    config: KernelConfig,
+    undo_drop: bool,
+) -> (Vec<SsaOp>, Option<crate::types::VReg>, usize) {
+    let mut program = SsaTickTockKernelBuilder::new(config).build();
+    let emitted: HashMap<usize, Vec<crate::types::ConstEncoding>> = program
+        .ops
+        .iter()
+        .filter_map(|op| op.const_alternatives.clone().map(|a| (op.id, a)))
+        .collect();
+    let (mut ops, vreg_def, _) = eliminate_ssa_dead_code(
+        std::mem::take(&mut program.ops),
+        &mut program.vreg_def,
+        &mut program.const_alternatives,
+        program.zero_vreg,
+        Some(&program.vector_group_lanes),
+    );
+    let mut restored = 0;
+    if undo_drop {
+        for op in ops.iter_mut() {
+            if let (Some(alts), Some(before)) = (op.const_alternatives.as_mut(), emitted.get(&op.id)) {
+                restored += before.len() - alts.len();
+                *alts = before.clone();
+            }
+        }
+    }
+    crate::kernel_builder::emit_ssa::compute_ssa_dependencies(
+        &mut ops,
+        &vreg_def,
+        program.zero_vreg,
+        Some(&program.vector_group_lanes),
+    );
+    (ops, program.zero_vreg, restored)
+}
+
+/// Build the whole-kernel CP-SAT model for `ops` (greedy cycles as hints, first solution).
+/// Returns the model's error, if any.
+#[cfg(feature = "cpsat")]
+fn whole_kernel_model_error(mut ops: Vec<SsaOp>) -> Option<String> {
+    use crate::cpsat_scheduler::{schedule_ssa_cpsat, SsaCpsatConfig, SsaCpsatHints};
+    let mut shifted = HashSet::new();
+    ssa_greedy::schedule_ssa_greedy_with_shift(&mut ops, false, &mut shifted).expect("greedy");
+    let hints: Vec<i32> = ops.iter().map(|op| op.cycle).collect();
+    for op in &mut ops {
+        op.cycle = -1;
+    }
+    schedule_ssa_cpsat(
+        &ops,
+        SsaCpsatConfig {
+            time_limit_secs: 30.0,
+            verbose: false,
+            stop_after_first_solution: true,
+            scratch_budget: 1536,
+            enable_valu_shift: false,
+            ..Default::default()
+        },
+        SsaCpsatHints { greedy_hints: Some(&hints), ..Default::default() },
+        None,
+    )
+    .err()
+}
+
+/// The whole-kernel model accepts a real emission after DCE (2 rounds, batch 16, values-only
+/// with the mirrored index, where DCE removes constant 5 and with it alternatives such as
+/// 6 = 1 + 5), and refuses the same ops when the alternatives DCE dropped are put back: an
+/// ALU derivation whose operand has no producer is an error, not a silently dead choice.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_whole_kernel_model_and_stale_const_alternatives() {
+    use crate::kernel_builder::config::IndexForm;
+    let config = || {
+        let mut c = KernelConfig::new(10, 2047, 16, 2);
+        c.spec.values_only = true;
+        c.spec.index_form = IndexForm::Mirrored;
+        c
+    };
+    let (ops, _, _) = dce_program_for_model(config(), false);
+    assert_eq!(whole_kernel_model_error(ops), None);
+
+    let (ops, _, restored) = dce_program_for_model(config(), true);
+    assert!(restored > 0, "DCE must have dropped an alternative for this check to mean anything");
+    let err = whole_kernel_model_error(ops).expect("stale alternatives are refused");
+    assert!(err.contains("reads a value no op produces"), "{}", err);
+}
+
+/// 16 rounds, 4 groups, merged hash, mirrored index; round 4 mixes gather, bits-flow and
+/// mobius, round 12 uses bits, every other round the plannable default (bits at the root,
+/// gather elsewhere).
+fn region_tag_test_config() -> KernelConfig {
+    use crate::kernel_builder::config::IndexForm;
+    let mut config = KernelConfig::new(10, 2047, 32, 16);
+    let mut plan: Vec<Vec<AccessEncoding>> = (0..16)
+        .map(|r| {
+            let depth = config.spec.round_depth(r);
+            vec![if depth == 0 { AccessEncoding::Bits } else { AccessEncoding::Gather }; 4]
+        })
+        .collect();
+    plan[4] = vec![AccessEncoding::Gather, AccessEncoding::BitsFlow, AccessEncoding::Gather, AccessEncoding::Mobius];
+    plan[12] = vec![AccessEncoding::Bits; 4];
+    config.spec.merge_hash_stages = true;
+    config.spec.index_form = IndexForm::Mirrored;
+    config.spec.access_plan = Some(plan);
+    config
+}
+
+/// The configurations the region-tag tests cover: the mixed plan above (mirrored), the
+/// default emission (standard encoding, zero-based index), and zero-based with
+/// `prune_dead_index` and `cached_select = bits` to depth 4 (`SelectBitSource::Index`).
+fn region_tag_test_configs() -> Vec<(&'static str, KernelConfig)> {
+    use crate::kernel_builder::config::{CachedSelect, SelectBitSource};
+    let mut zero_bits = KernelConfig::new(10, 2047, 32, 16);
+    zero_bits.spec.prune_dead_index = true;
+    zero_bits.spec.cached_select = CachedSelect::Bits;
+    zero_bits.spec.select_bit_source = SelectBitSource::Index;
+    zero_bits.spec.tree_reduce_max_depth = 4;
+    vec![
+        ("mixed plan, mirrored", region_tag_test_config()),
+        ("default (standard, zero-based)", KernelConfig::new(10, 2047, 32, 16)),
+        ("zero-based, prune, bits to depth 4", zero_bits),
+    ]
+}
+
+/// Group each op's value derives from, found independently of tags and emitter context:
+/// follow the operands back to the `vload` of the batch values (group = word offset / 8).
+/// `None` for ops that read no batch value (constants, setup).
+fn value_groups(ops: &[SsaOp], lanes: &HashMap<VReg, Vec<VReg>>) -> Vec<std::collections::BTreeSet<usize>> {
+    use crate::types::{MemOffset, MemRegion};
+    let mut def: HashMap<VReg, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(d) = op.dest {
+            def.entry(d).or_insert(i);
+        }
+    }
+    // Decomposed lanes depend on their vector; assembled groups on their lanes.
+    let mut element_of: HashMap<VReg, VReg> = HashMap::new();
+    for op in ops {
+        if let Some(d) = op.dest {
+            if let Some(ls) = lanes.get(&d) {
+                for l in ls {
+                    element_of.insert(*l, d);
+                }
+            }
+        }
+    }
+    let mut groups = vec![std::collections::BTreeSet::new(); ops.len()];
+    for i in 0..ops.len() {
+        let op = &ops[i];
+        if op.opcode == Opcode::Vload {
+            if let Some(loc) = op.mem_loc {
+                if loc.region == MemRegion::Values {
+                    if let MemOffset::Const(k) = loc.offset {
+                        groups[i].insert(k as usize / 8);
+                    }
+                }
+            }
+        }
+        let mut acc = std::mem::take(&mut groups[i]);
+        for v in op.reads() {
+            let producers: Vec<usize> = match lanes.get(&v) {
+                Some(ls) if !def.contains_key(&v) => ls.iter().filter_map(|l| def.get(l).copied()).collect(),
+                _ => def.get(&v).or_else(|| element_of.get(&v).and_then(|vec| def.get(vec))).copied().into_iter().collect(),
+            };
+            for p in producers {
+                assert!(p < i);
+                acc.extend(groups[p].iter().copied());
+            }
+        }
+        groups[i] = acc;
+    }
+    groups
+}
+
+#[test]
+fn test_region_tags_follow_the_phases_and_groups() {
+    use crate::types::{EmissionPhase, RegionKind, RegionTag};
+    use std::collections::BTreeMap;
+    for (label, config) in region_tag_test_configs() {
+        let spec = config.spec.clone();
+        let program = SsaTickTockKernelBuilder::new(config).build();
+        let ops = &program.ops;
+        let groups = value_groups(ops, &program.vector_group_lanes);
+
+        // Round = barriers seen so far (one between rounds), depth = round mod tree height:
+        // both independent of the emitter's round context.
+        let mut round = 0u32;
+        let mut seen_loop = false;
+        for (i, op) in ops.iter().enumerate() {
+            let phase = op.source_info.as_ref().unwrap().phase;
+            if op.opcode == Opcode::Barrier {
+                assert!(op.region.is_none(), "{}: round barriers belong to no region", label);
+                round += 1;
+                continue;
+            }
+            let in_round = matches!(
+                phase,
+                EmissionPhase::TreeAccess | EmissionPhase::Xor | EmissionPhase::Hash | EmissionPhase::Branch
+            );
+            seen_loop |= in_round;
+            if !in_round {
+                match op.region {
+                    Some(tag) => {
+                        assert_eq!(tag.kind, RegionKind::CachedLevelSetup, "{}: {:?}", label, op);
+                        assert!(phase == EmissionPhase::ValuSelectionInit && !seen_loop);
+                        assert!(tag.round.is_none() && tag.group.is_none() && tag.depth.is_some());
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            let tag = op.region.unwrap_or_else(|| panic!("{}: untagged op in a round: {:?}", label, op));
+            assert_eq!(tag.round, Some(round), "{}: {:?}", label, op);
+            assert_eq!(tag.depth, Some(spec.round_depth(round as usize) as u32), "{}: {:?}", label, op);
+            let kind_ok = matches!(
+                (phase, tag.kind),
+                (EmissionPhase::TreeAccess, RegionKind::TreeAccess(_))
+                    | (EmissionPhase::Xor, RegionKind::NodeXor)
+                    | (EmissionPhase::Hash, RegionKind::Hash)
+                    | (EmissionPhase::Branch, RegionKind::IndexStep)
+            );
+            assert!(kind_ok, "{}: phase {:?} tagged {:?}", label, phase, tag.kind);
+            // A per-group op that reads batch values reads only its own group's: the tag's
+            // group is the loop's group, not a copy of some other field.
+            if let Some(g) = tag.group {
+                if !groups[i].is_empty() {
+                    assert_eq!(groups[i], [g as usize].into_iter().collect(), "{}: {:?}", label, op);
+                }
+            } else {
+                assert!(groups[i].is_empty(), "{}: shared part reads a group's values: {:?}", label, op);
+            }
+        }
+        assert_eq!(round as usize, spec.rounds - 1, "{}: one barrier between rounds", label);
+
+        // Every group of every round has its value regions; levels whose tables exist are tagged.
+        for r in 0..spec.rounds as u32 {
+            for g in 0..spec.n_groups() as u32 {
+                for kind in [RegionKind::NodeXor, RegionKind::Hash, RegionKind::IndexStep] {
+                    // At the wrap the mirrored index becomes "no index" without an op, and with
+                    // prune_dead_index all groups share one vector of zeros, created (and
+                    // tagged) by group 0 only.
+                    let wrap = spec.round_depth(r as usize) == spec.forest_height;
+                    let shared_wrap = spec.index_form == crate::kernel_builder::config::IndexForm::Mirrored
+                        || (spec.prune_dead_index && g > 0);
+                    if kind == RegionKind::IndexStep && wrap && shared_wrap {
+                        continue;
+                    }
+                    assert!(
+                        ops.iter().any(|o| o.region.map_or(false, |t| t.kind == kind && t.round == Some(r) && t.group == Some(g))),
+                        "{}: no {:?} region for round {} group {}", label, kind, r, g
+                    );
+                }
+            }
+        }
+        let bit_driven_levels: Vec<usize> = (0..=4)
+            .filter(|&d| [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius].iter().any(|&e| spec.uses_access(d, e)))
+            .collect();
+        for d in bit_driven_levels {
+            assert!(
+                ops.iter().any(|o| o.region.map_or(false, |t| t.kind == RegionKind::CachedLevelSetup && t.depth == Some(d as u32))),
+                "{}: no setup tag for level {}", label, d
+            );
+        }
+
+        // Ids are dense in order of first emission, one per (kind, round, group, depth).
+        let mut by_id: BTreeMap<u32, RegionTag> = BTreeMap::new();
+        for op in ops {
+            let Some(tag) = op.region else { continue };
+            match by_id.get(&tag.id) {
+                Some(first) => assert_eq!(
+                    (first.kind, first.round, first.group, first.depth),
+                    (tag.kind, tag.round, tag.group, tag.depth)
+                ),
+                None => {
+                    assert_eq!(tag.id as usize, by_id.len(), "{}: ids are allocated in order", label);
+                    by_id.insert(tag.id, tag);
+                }
+            }
+        }
+        let keys: HashSet<_> = by_id.values().map(|t| (t.kind, t.round, t.group, t.depth)).collect();
+        assert_eq!(keys.len(), by_id.len(), "{}: one id per key", label);
+    }
+}
+
+#[test]
+fn test_region_tags_of_the_mixed_round() {
+    use crate::types::RegionKind;
+    let ops = SsaTickTockKernelBuilder::new(region_tag_test_config()).build_ops();
+    // Round 4 (depth 4): per group the encoding of the plan; gathering groups have one
+    // address op, 8 loads and the XOR with the hash constant.
+    let in_region = |round: u32, group: Option<u32>| -> Vec<&SsaOp> {
+        ops.iter()
+            .filter(|o| {
+                o.region.map_or(false, |t| {
+                    matches!(t.kind, RegionKind::TreeAccess(_)) && t.round == Some(round) && t.group == group
+                })
+            })
+            .collect()
+    };
+    let round4 = [AccessEncoding::Gather, AccessEncoding::BitsFlow, AccessEncoding::Gather, AccessEncoding::Mobius];
+    for (g, want) in round4.into_iter().enumerate() {
+        let region = in_region(4, Some(g as u32));
+        assert!(region.iter().all(|o| o.region.unwrap().kind == RegionKind::TreeAccess(want)));
+        if want == AccessEncoding::Gather {
+            assert_eq!(region.len(), 10, "group {}: {:?}", g, region);
+            assert_eq!(region.iter().filter(|o| o.opcode == Opcode::Load).count(), 8);
+        } else if want == AccessEncoding::Mobius {
+            assert_eq!(region.iter().filter(|o| o.opcode == Opcode::MultiplyAdd).count(), 15);
+        }
+    }
+    // The gather's shared part on the first visit of level 4 that gathers: the level-end
+    // constant, the pointer add and the broadcast. On the second visit (round 15) the
+    // constant already exists: the shared part's contents depend on the visit.
+    let shared: Vec<Opcode> = in_region(4, None).iter().map(|o| o.opcode).collect();
+    assert_eq!(shared, vec![Opcode::ConstChoice, Opcode::Add, Opcode::Vbroadcast]);
+    let shared15: Vec<Opcode> = in_region(15, None).iter().map(|o| o.opcode).collect();
+    assert_eq!(shared15, vec![Opcode::Add, Opcode::Vbroadcast]);
+}
+
+#[test]
+fn test_region_tag_of_a_shared_op_is_the_first_creator() {
+    // The documented contract (`RegionTag`): a deduplicated op carries the tag of the region
+    // that first needed it and may be read by others. Zero-based + prune, 11 rounds: the one
+    // vector of zeros of the wrap round (the last round) is every group's final index, read
+    // by every group's index store, but tagged as group 0's index step.
+    use crate::types::RegionKind;
+    let mut config = KernelConfig::new(10, 2047, 32, 11);
+    config.spec.prune_dead_index = true;
+    let program = SsaTickTockKernelBuilder::new(config).build();
+    let ops = &program.ops;
+    let wrap = ops
+        .iter()
+        .find(|o| {
+            o.opcode == Opcode::Vbroadcast
+                && o.region.map_or(false, |t| t.kind == RegionKind::IndexStep && t.round == Some(10))
+        })
+        .expect("the zeros vector of the wrap round");
+    assert_eq!(wrap.region.unwrap().group, Some(0));
+    let dest = wrap.dest.unwrap();
+    let stored_at: HashSet<i64> = ops
+        .iter()
+        .filter(|o| o.opcode == Opcode::Vstore && o.reads().any(|v| v == dest))
+        .filter_map(|o| match o.mem_loc.map(|l| (l.region, l.offset)) {
+            Some((crate::types::MemRegion::Indices, crate::types::MemOffset::Const(k))) => Some(k),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored_at.len(), 4, "stored as the index of every group: {:?}", stored_at);
+}

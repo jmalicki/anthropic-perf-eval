@@ -1419,7 +1419,10 @@ pub fn schedule_ssa_cpsat(
     let mut const_flow_intervals: HashMap<usize, IntervalVar> = HashMap::new();
     // N-way ConstChoice (Load | AddImm | ALU_0 | ALU_1 | ...): encoding vars and ALU option info for extraction
     let mut const_choice_encoding_vars: HashMap<usize, Vec<BoolVar>> = HashMap::new();
-    let mut const_choice_alu_encoding_info: HashMap<usize, Vec<(usize, usize, Opcode)>> =
+    // Per ALU alternative k: `Some((left producer, right producer, opcode))`, or `None` when
+    // the alternative is switched off (a section solve whose operand is produced in an
+    // earlier section).
+    let mut const_choice_alu_encoding_info: HashMap<usize, Vec<Option<(usize, usize, Opcode)>>> =
         HashMap::new();
     let mut const_choice_alu_intervals: HashMap<usize, Vec<IntervalVar>> = HashMap::new();
 
@@ -1492,7 +1495,7 @@ pub fn schedule_ssa_cpsat(
                     );
                     const_flow_intervals.insert(idx, add_imm_interval);
 
-                    let mut alu_info: Vec<(usize, usize, Opcode)> = Vec::new();
+                    let mut alu_info: Vec<Option<(usize, usize, Opcode)>> = Vec::new();
                     for (k, enc) in alts[2..].iter().enumerate() {
                         let use_alu_k = use_vars[2 + k];
                         let alu_interval = model.new_optional_fixed_size_interval_var(
@@ -1505,10 +1508,42 @@ pub fn schedule_ssa_cpsat(
 
                         let deps = enc.dependencies();
                         if deps.len() >= 2 {
-                            let left_idx = *value_to_producer_idx.get(&deps[0]).unwrap_or(&idx);
-                            let right_idx = *value_to_producer_idx.get(&deps[1]).unwrap_or(&idx);
+                            // Each operand must be produced by an op of this model. Dead code
+                            // elimination drops alternatives naming a constant it removed
+                            // (`drop_alternatives_without_producer`), so in a whole-kernel
+                            // model a missing producer is a bug upstream. A section solve
+                            // sees only its own ops: an operand produced in an earlier
+                            // section has no producer here, and the alternative is off.
+                            let producers = (
+                                value_to_producer_idx.get(&deps[0]).copied(),
+                                value_to_producer_idx.get(&deps[1]).copied(),
+                            );
+                            // An operand that is the hardware zero (reserved zero VReg, no
+                            // producing op) is kept by DCE but cannot be expressed here: the
+                            // chosen derivation names its operands by producer op id. Off.
+                            use crate::kernel_builder::emit_ssa::zero_operand_has_no_producer;
+                            let zero_ok = |value: i64, producer: Option<usize>| {
+                                producer.is_some() || zero_operand_has_no_producer(value, producer, hints.zero_reserved)
+                            };
+                            let only_zero_missing = zero_ok(deps[0], producers.0) && zero_ok(deps[1], producers.1);
+                            let (left_idx, right_idx) = match producers {
+                                (Some(l), Some(r)) => (l, r),
+                                _ if only_zero_missing || initial_live.is_some() => {
+                                    let c = model.add_eq(LinearExpr::from(use_alu_k), 0);
+                                    model.set_constraint_name(c, &format!("const_choice_off_{}_k_{}", idx, k));
+                                    alu_info.push(None);
+                                    continue;
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "ConstChoice op {} (value {:?}): ALU alternative {:?} reads a value no op produces; \
+                                         alternatives must be dropped when their operands die (DCE)",
+                                        ops[idx].id, ops[idx].produces_constant, enc
+                                    ));
+                                }
+                            };
                             if let Some(opcode) = enc.alu_opcode() {
-                                alu_info.push((left_idx, right_idx, opcode));
+                                alu_info.push(Some((left_idx, right_idx, opcode)));
                                 let c_left = model.add_ge(times[idx].issue(), times[left_idx].visible());
                                 model.only_enforce_if(c_left, [use_alu_k]);
                                 model.set_constraint_name(c_left, &format!("const_choice_prec_{}_k_{}_left", idx, k));
@@ -1532,8 +1567,10 @@ pub fn schedule_ssa_cpsat(
                     let hint_idx = match window.and_then(|w| w.reference.const_choice_encoding.get(&ops[idx].id)) {
                         Some(crate::types::ConstChoiceEncoding::AluDerive(info)) => alu_info
                             .iter()
-                            .position(|&(l, r, opcode)| {
-                                ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                            .position(|alt| {
+                                alt.is_some_and(|(l, r, opcode)| {
+                                    ops[l].id == info.left_op_id && ops[r].id == info.right_op_id && opcode == info.opcode
+                                })
                             })
                             .map_or(hint_idx, |k| k + 2),
                         _ => hint_idx,
@@ -4532,12 +4569,33 @@ pub fn schedule_ssa_cpsat(
             model.proto().constraints.len()
         );
     }
+    let (num_variables, num_constraints) = (model.proto().variables.len(), model.proto().constraints.len());
     let response = model.solve_with_parameters(&params);
     if window.is_some() {
         eprintln!(
             "[window probe]   solve: {:.1}s wall, {:.1} deterministic time",
             response.wall_time, response.deterministic_time
         );
+        let optimal = response.status() == cp_sat::proto::CpSolverStatus::Optimal
+            || response.status() == cp_sat::proto::CpSolverStatus::Infeasible;
+        let stop = if optimal {
+            "proved"
+        } else if response.wall_time >= time_limit_secs * 0.999
+            && deterministic_budget.map_or(true, |d| response.deterministic_time < d)
+        {
+            "wall-clock backstop"
+        } else if deterministic_budget.is_some_and(|d| response.deterministic_time >= d) {
+            "deterministic budget"
+        } else {
+            "other"
+        };
+        *super::window::LAST_WINDOW_SOLVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(super::window::WindowSolveStats {
+            num_variables,
+            num_constraints,
+            wall_secs: response.wall_time,
+            deterministic_time: response.deterministic_time,
+            stop: stop.to_string(),
+        });
     }
     let solve_time = start_time.elapsed().as_secs_f64();
     // A deterministic budget only makes the run reproducible if the solve ended on it (or on
@@ -4682,8 +4740,7 @@ pub fn schedule_ssa_cpsat(
                                     Some(k) if k >= 2 => {
                                         if let Some(info) = const_choice_alu_encoding_info.get(&idx) {
                                             let i = k - 2;
-                                            if i < info.len() {
-                                                let (li, ri, opcode) = info[i];
+                                            if let Some(&Some((li, ri, opcode))) = info.get(i) {
                                                 crate::types::ConstChoiceEncoding::AluDerive(
                                                     crate::types::AluDeriveInfo {
                                                         left_op_id: ops[li].id,

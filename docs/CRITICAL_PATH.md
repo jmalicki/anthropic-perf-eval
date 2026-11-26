@@ -2,7 +2,8 @@
 
 The load-bound static bound is `t + q + ceil(W / 2)`: t is the dependency depth to the first
 gather load, q the depth from the last gather load to the end. The start-up window probe
-(docs/STARTUP_WINDOW_PROBE.md) found no scheduling slack in the start-up, so this shortens the
+(docs/STARTUP_WINDOW_PROBE.md) found that the ops after a start-up window cannot move earlier
+as one block; whether a re-interleave could shorten the start-up is open. This shortens the
 chains themselves, with emitter options (each a Z3 identity in `verification/rewrites.py`).
 
 All cycle counts are 16-round greedy development measurements with the best flags
@@ -52,6 +53,16 @@ Path kernel (1,030), same shape on the index kernel (1,039):
 | `--index-early-terms final` | R17: `V - (2n + b) = madd(n, -2, V) - b` | q -1 (final index store) | +1 (the -2 broadcast; `n'` becomes dead) |
 | `--index-early-terms first-gather` | R17, also each group's first gather address | t -1 | +65 (path) |
 | `--select-xor-pushdown first-pass` | R18: `val ^ sel(c, a, b) = sel(c, val ^ a, val ^ b)` | t -3 (path), -2 (index) | +1 per group per select round (+116 path, +79 index) |
+
+An option that would change nothing in a kernel is an error (`ProblemSpec::check_critical_path_options`,
+for the CLI, the binding and Rust callers alike): `--index-early-terms` without `--index-form
+mirrored`, or where it rewrites no op (`final` with the last round at depth 0 or at the wrap
+round, or with `--values-only`; `first-gather` when also no group gathers right after a round
+at depth >= 1 in which it did not gather); `--select-xor-pushdown` when no round it covers has a SelectChoice at the top of its
+select tree (`standard` or `mobius` cached select, `bits` only at depth 1); `--reassociate-gather-xor`
+when no group gathers. `first-pass` means rounds 0 to `forest_height` (up to the first wrap).
+`tests/test_critical_path_rewrites.py` also builds every option after the wrap (height 3, 7 to 9
+rounds), proved and validated.
 
 ## 3. Measurements (16 rounds)
 

@@ -629,6 +629,10 @@ pub struct SsaCpsatHints<'a> {
     /// Window optimality probe (analysis only): hold every op outside the window at its
     /// reference cycle and let the ops inside move. See `cpsat_scheduler::window`.
     pub window: Option<&'a super::window::CpsatWindow>,
+    /// The zero VReg is reserved (scratch address 0 holds 0, no op produces it). Only then may
+    /// an ALU-derived ConstChoice alternative read 0 without a producer (the model switches
+    /// such an alternative off); otherwise a missing 0 is an error like any missing operand.
+    pub zero_reserved: bool,
 }
 
 /// Result from SSA CP-SAT scheduling with VALU shift decisions
