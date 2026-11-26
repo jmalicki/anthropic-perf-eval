@@ -508,7 +508,7 @@ vector slots, and the vector ALU is busy in every steady-state cycle. So a sched
 longer for any reason shifts fewer ops.
 
 For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
-emission (static bound 1,029); 10 are scheduling loss. Its 158 shifts "missing" against the
+emission (static bound 1,029); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). Its 158 shifts "missing" against the
 floor's split are a consequence: at 1,029 cycles with the same idle vector slots only 1,367
 shifts fit, but a schedule with more idle slots could shift more, so that count is conditional,
 not a bound. What is known about slower plans, labelled removal (an A/B build) or accounting

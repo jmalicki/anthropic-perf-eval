@@ -5218,6 +5218,177 @@ fn test_select_overflow_keeps_slot_limits_when_force_scheduling() {
     }
 }
 
+/// Review of #76 (CodeRabbit): the budget fit check must not count as freed a value a
+/// multiply-add select read this cycle (it is held to cycle + 1). Swept over tight budgets
+/// with selects overflowing to the vector ALU: whenever the greedy reports the budget as kept,
+/// interval liveness of its schedule stays within it.
+#[test]
+fn test_fit_check_respects_multiply_add_read_holds() {
+    let mut binding = 0;
+    for budget in (40..=200).step_by(4) {
+        for chains in [12, 24] {
+            let shape = GreedyShape {
+                priority: GreedyPriority::Wavefront { stagger_cycles: 1, groups_in_flight: None },
+                select_overflow: SelectOverflow::Valu { limit: None },
+                ..Default::default()
+            };
+            let (mut emit, _) = emit_delta_select_chains(chains);
+            let mut fma = HashSet::new();
+            let mut lanes = HashMap::new();
+            let result = schedule_ssa_greedy_shaped(
+                &mut emit.ops,
+                true,
+                &mut HashSet::new(),
+                budget,
+                Some(&mut fma),
+                None,
+                None,
+                None,
+                &GreedyBoundsUsage::None,
+                &GreedyPolicy,
+                None,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                &mut GreedyDiagnostics::new(false),
+                &shape,
+                &mut lanes,
+            );
+            let Ok(((_, exceeded, _), _)) = result else { continue };
+            if exceeded {
+                continue;
+            }
+            let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+            let config = crate::address_assign::AddressAssignConfig {
+                select_fma_ops: fma.clone(),
+                shifted_alu_cycles: lanes.clone(),
+                ..Default::default()
+            };
+            let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+            let peak = crate::address_assign::compute_peak_liveness(&intervals);
+            assert!(peak <= budget, "budget {} chains {}: kept by the greedy, but interval peak {}", budget, chains, peak);
+            binding += usize::from(peak + 16 >= budget);
+        }
+    }
+    assert!(binding > 0, "control: some run must sit near its budget");
+}
+
+/// The same, on a program built for it: in one cycle a select takes the flow slot, a second
+/// select overflows to the vector ALU (a delta multiply_add reading its base `b2`, held to
+/// cycle + 1), and an ordinary op is the last reader of `b2` in that cycle and writes a new
+/// vector. At a budget where only the (wrong) early release of `b2` lets that op fit, the
+/// greedy must defer it or report the budget exceeded.
+#[test]
+fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
+    let build = || {
+        let mut emit = SsaEmitContext::new();
+        let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+            let c = emit.emit_const(v);
+            emit.emit_vbroadcast(c)
+        };
+        let one = vec_of(&mut emit, 1);
+        let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+        let (c1v, c2v) = (vec_of(&mut emit, 1), vec_of(&mut emit, 0));
+        let t = emit.emit_valu(Opcode::Add, b, d);
+        // Both selects and `o` become ready in the same cycle, right after `t`.
+        let s1 = emit.emit_select_choice_shared_delta(c1v, t, d, b);
+        let s2 = emit.emit_select_choice_shared_delta(c2v, t, d, b);
+        let o = emit.emit_valu(Opcode::Add, b, t); // last reader of b, a new vector
+        let _ = one;
+        let addr = emit.emit_const(100);
+        let x = emit.emit_valu(Opcode::Add, s1, s2);
+        let y = emit.emit_valu(Opcode::Add, x, o);
+        emit.emit_vstore(addr, y);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+        emit
+    };
+    let mut checked = 0;
+    for budget in 16..=160 {
+        let mut emit = build();
+        let mut fma = HashSet::new();
+        let shape = GreedyShape { select_overflow: SelectOverflow::Valu { limit: None }, ..Default::default() };
+        let Ok(((_, exceeded, _), _)) = schedule_ssa_greedy_shaped(
+            &mut emit.ops, true, &mut HashSet::new(), budget, Some(&mut fma), None, None, None,
+            &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None, None,
+            &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
+        ) else { continue };
+        if exceeded || fma.is_empty() {
+            continue;
+        }
+        let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+        let config = crate::address_assign::AddressAssignConfig { select_fma_ops: fma.clone(), ..Default::default() };
+        let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+        let peak = crate::address_assign::compute_peak_liveness(&intervals);
+        assert!(peak <= budget, "budget {}: kept by the greedy, but interval peak {}", budget, peak);
+        checked += 1;
+    }
+    assert!(checked > 0, "control: some budget runs with a multiply-add select and is kept");
+}
+
+/// Review of #76 (CodeRabbit): a select whose condition is the same VReg as its delta. In the
+/// vselect form the delta is not read, but the condition is: the counter must keep the shared
+/// VReg to the select's cycle (before, the delta-only skip also dropped the direct read, so the
+/// counter released it at the earlier `Add` and disagreed with the intervals).
+#[test]
+fn test_select_whose_condition_is_its_delta_keeps_the_direct_read() {
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+        select_overflow: SelectOverflow::Valu { limit: None },
+        ..Default::default()
+    };
+    let mut emit = SsaEmitContext::new();
+    let c5 = emit.emit_const(5);
+    let base = emit.emit_vbroadcast(c5);
+    let c1 = emit.emit_const(1);
+    let one = emit.emit_vbroadcast(c1);
+    let addr = emit.emit_const(100);
+    for chain in 0..6 {
+        let cv = emit.emit_const(chain as i64);
+        let v = emit.emit_vbroadcast(cv);
+        let delta = emit.emit_valu(Opcode::And, v, one);
+        let true_val = emit.emit_valu(Opcode::Add, base, delta);
+        // Work between the Add and the select, so the select reads the shared VReg later.
+        let mut pad = emit.emit_valu(Opcode::Add, true_val, one);
+        for _ in 0..3 {
+            pad = emit.emit_valu(Opcode::Add, pad, one);
+        }
+        let sel = emit.emit_select_choice_shared_delta(delta, true_val, delta, base);
+        let out = emit.emit_valu(Opcode::Add, sel, pad);
+        emit.emit_vstore(addr, out);
+    }
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let mut fma = HashSet::new();
+    let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut HashSet::new(),
+        1536,
+        Some(&mut fma),
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("the live-word counter agrees with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
 /// Regression (review of #76): a select the overflow puts on the vector ALU reads its
 /// operands and its precomputed delta one cycle after its own (address assignment's
 /// `select_fma_ops` rule, address_assign.rs). The counter did not count the delta as read

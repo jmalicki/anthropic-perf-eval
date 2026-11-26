@@ -83,6 +83,14 @@ def analyze(d: dict) -> dict:
         # after the last one.
         return max((finish[x] + 1 for x in o["dep_ids"] if x in finish), default=0)
 
+    # A SelectChoice keeps SSA engine flow, but runs on the vector ALU when it is lowered to a
+    # multiply_add (overflow, fixed fma): classify its wait by the engine that executes it.
+    select_engine = {}
+    for low in d["ops"]:
+        sid = low.get("from_select_choice")
+        if sid is not None and (low["engine"] == "valu" or sid not in select_engine):
+            select_engine[sid] = low["engine"]
+
     w_shift, w_fixed = [0] * total, [0] * total
     wait_by_band = collections.Counter()
     flow_wait = collections.defaultdict(list)
@@ -90,13 +98,15 @@ def analyze(d: dict) -> dict:
         if o["id"] not in start:
             continue
         r, s = ready(o), start[o["id"]]
-        if o["engine"] == "valu":
-            arr = w_fixed if o["opcode"] in FIXED_VECTOR else w_shift
+        engine = select_engine.get(o["id"], o["engine"])
+        if engine == "valu":
+            fixed = o["opcode"] in FIXED_VECTOR or o["id"] in select_engine  # selects never shift
+            arr = w_fixed if fixed else w_shift
             for t in range(r, min(s, total)):
                 arr[t] += 1
-            if o["opcode"] not in FIXED_VECTOR:
+            if not fixed:
                 wait_by_band[band_of(o["source_info"]["round"])] += max(0, s - r)
-        elif o["engine"] == "flow":
+        elif engine == "flow":
             flow_wait[o["source_info"]["round"]].append(s - r)
 
     idle = collections.Counter()
@@ -175,7 +185,8 @@ def report(name: str, a: dict, floor: int | None, bound: int | None) -> str:
         if bound is not None:
             forced = max(0, min(bound, a["cycles"]) - floor)
             line += (f"; static head/tail bound {bound}: {forced} of those cycles are needed by any schedule, "
-                     f"{a['cycles'] - max(bound, floor)} are scheduling loss")
+                     f"{a['cycles'] - max(bound, floor)} are the gap above the static bound (an upper bound on "
+                     f"the scheduling loss; the optimum is not known)")
         else:
             line += "; static head/tail bound not computed"
         out.append(line)

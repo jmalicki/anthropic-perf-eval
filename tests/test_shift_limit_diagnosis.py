@@ -104,3 +104,15 @@ def test_static_bound_import_error_is_reported(monkeypatch, capsys):
     assert sld.static_bound(_schedule()) is None
     assert "static head/tail bound not computed" in capsys.readouterr().err
     assert "static head/tail bound not computed" in report("s", analyze(_schedule()), floor=2, bound=None)
+
+
+def test_select_waits_count_by_the_engine_that_runs_them():
+    """Review of #76: a SelectChoice lowered to a vector multiply_add (SSA engine still flow)
+    waits for a vector slot, not the flow slot: no flow wait, and its wait is fixed vector work."""
+    d = _schedule()
+    assert 13 in analyze(d)["flow_wait"], "control: the vselect form counts as a flow wait"
+    for low in d["ops"]:
+        if low.get("from_select_choice") == 14:
+            low["engine"], low["opcode"] = "valu", "multiply_add"
+    a = analyze(d)
+    assert 13 not in a["flow_wait"]

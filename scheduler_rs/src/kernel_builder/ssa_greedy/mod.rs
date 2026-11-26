@@ -966,8 +966,15 @@ fn release_read_values(
             continue;
         };
         *remaining = remaining.saturating_sub(1);
-        // A vselect does not read the delta: no read, only one holder fewer.
-        if !(delta_read && !fma && op.delta_vreg == Some(*vreg)) {
+        // A vselect does not read the delta: no read, only one holder fewer. Unless the
+        // same VReg is also a direct source or keep-live read of the select (e.g. the
+        // condition is the delta), which the vselect does read at this cycle.
+        let delta_only = delta_read
+            && !fma
+            && op.delta_vreg == Some(*vreg)
+            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
+            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        if !delta_only {
             let end = cycle as i32 + i32::from(fma);
             let e = trace.read_end.entry(*vreg).or_insert(end);
             *e = (*e).max(end);
@@ -2924,6 +2931,9 @@ fn schedule_ssa_greedy_core(
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
                             && write_groups.releasable_at(vreg, cycle)
+                            // A multiply_add select read it this cycle: the release loop holds
+                            // it to cycle + 1, so it is not freed for this op's write.
+                            && trace.read_end.get(vreg).map_or(true, |&end| end <= cycle as i32)
                     })
                     .collect();
                 let words_freed: usize = freed.iter().map(|v| v.size()).sum();

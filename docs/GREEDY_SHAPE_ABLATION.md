@@ -13,7 +13,7 @@ not shift takes one vector slot, so `V - s = 6T - I` exactly (V vector ops, s sh
 I idle vector slots). The vector ALU is busy in every steady-state cycle, so a schedule that is
 longer for any reason shifts fewer ops. For `flow90.json` (1,039): 32 of its 42 cycles above
 the floor are needed by any schedule of that emission (static head/tail bound 1,029, a
-bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are scheduling loss. In shifts: the floor's split shifts 1,465 ops and the greedy
+bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). In shifts: the floor's split shifts 1,465 ops and the greedy
 1,307, 158 fewer. A schedule at 1,029 cycles **with the same 115 idle vector slots** could shift
 at most 1,367; one with more idle slots could shift more, so "98 of the 158 are out of reach" is
 conditional on I, not a bound. Each number below is labelled **removal** (a build with the
@@ -762,9 +762,9 @@ kind that says what removing it buys; **accounting** = a decomposition of one sc
 
 | Plan (cycles) | Cycles above the floor | Needed by any schedule | The rest: what is known |
 |---|---|---|---|
-| `flow90.json`, index (1,039) | 42 (floor 997) | 32 (static head/tail bound 1,029, load row) | 10 cycles of scheduling loss (bound minus cycles); cause not identified |
+| `flow90.json`, index (1,039) | 42 (floor 997) | 32 (static head/tail bound 1,029, load row) | 10 cycles above the static bound (cycles minus bound: an upper bound on scheduling loss, the optimum is not known); cause not identified |
 | `r1 bits-flow` variant of a 1,039 plan, index (1,053) | 60 (floor 993) | 32 (bound 1,025) | Removal: `bits` instead of `bits-flow` in round 1 gives 1,039 (14 cycles); scratch-relaxed leaves 1,053 (not scratch). Hypothesis, from accounting: the longer flow queue in mid-schedule delays late groups into the load stream. Both interventions aimed at it are slower (feeds-load-first 1,074, overflow 1,067), so it is not established |
-| `path_flow90.json`, path (1,033) | 53 (floor 980) | 29 (bound 1,009) | 24 cycles of scheduling loss; removal: scratch-relaxed 1,034 (not scratch). #82 accounts for them (start-up load idle slots) |
+| `path_flow90.json`, path (1,033) | 53 (floor 980) | 29 (bound 1,009) | 24 cycles above the static bound (an upper bound on scheduling loss); removal: scratch-relaxed 1,034 (not scratch). #82 accounts for them (start-up load idle slots) |
 | probe A: `path_flow90.json` with `bits-flow` in round 4, path (1,101) | 124 (floor 977) | 32 (load bound 1,009); 73 for any schedule that runs every select on flow (flow row 1,050) | Removal: `--greedy-select-overflow valu` gave 1,054 with the undercounting live-word counter; with the counter fixed it exceeds the budget (peak 1,761). Removal: scratch-relaxed 1,093 |
 | `flow90.json`, path (1,105) | 108 (floor 997) | 32 (bound 1,029) | Removal (analysis only): scratch-relaxed gives 1,046, so the 1,536-word budget, or how the greedy meets it, costs up to 59 |
 
@@ -911,7 +911,7 @@ plans, so 32 is the first of a tie, not a measured offset.
 
 ### 12.4 Not verified
 
-- Why the 1,039 schedules lose their last 10 cycles.
+- Where the 1,039 schedules' 10 cycles above the static bound go (an upper bound on what scheduling could recover).
 - A select-resolution rule that wins on both the index and the path plans. Overflow keyed
   to a target count or to the scalar ALU's slack was not tried beyond the limits above.
 - A scratch term for path-bit plans. The 1,505-word ceiling's cause was not checked beyond
