@@ -49,6 +49,7 @@ def _export_model(tmp_path, extra):
     return diff_cpsat_models.load(str(model_path)), result.stdout + result.stderr
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize(
     "extra",
     [
@@ -98,6 +99,7 @@ def test_greedy_hint_is_complete(tmp_path, extra):
         )
 
 
+@pytest.mark.deep
 def test_cse_groups_are_present_in_the_three_round_model(tmp_path):
     """The 3-round case above does exercise the shared-SUB variables."""
     model, _ = _export_model(tmp_path, ["--rounds", "3"])
@@ -126,6 +128,7 @@ LANE_MODEL_CASES = [
 ]
 
 
+@pytest.mark.deep
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("extra", LANE_MODEL_CASES, ids=lambda extra: " ".join(extra).replace("--", ""))
 def test_greedy_hint_is_complete_and_feasible_under_each_lane_model(tmp_path, extra):

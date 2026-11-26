@@ -1,5 +1,8 @@
 name: CI
 
+# Shallow tier: every PR and every push to main. Tests that run a CP-SAT solve (pytest
+# @pytest.mark.deep, Rust #[ignore]d without the deep-tests feature) run in ci-deep.yml.
+
 on:
   pull_request:
   push:
@@ -15,9 +18,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BUILD_FROM_PROJECT_ROOT: "1"
+  # Report the slowest tests so a slow test that should be deep is visible in the log.
+  PYTEST_ADDOPTS: "--durations=30"
 
 jobs:
-  # scheduler_rs unit tests (debug profile, --features cpsat).
+  # scheduler_rs unit tests (debug profile, --features cpsat; deep-tests tests are ignored).
   rust:
     name: Rust tests (scheduler_rs)
     runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
@@ -47,8 +52,8 @@ jobs:
       - name: Create project venv
         run: uv sync
 
-      - name: Rust tests
-        run: ./scripts/test.sh rust
+      - name: Rust tests (shallow)
+        run: ./scripts/test.sh rust-shallow
 
   # Release build of the extension, then everything that imports it.
   python:
@@ -85,8 +90,8 @@ jobs:
       - name: Build scheduler_rs (release)
         run: ./scripts/build_scheduler_rs.sh --release
 
-      - name: Python tests
-        run: ./scripts/test.sh python
+      - name: Python tests (shallow)
+        run: ./scripts/test.sh python-shallow
 
       - name: Z3 proofs
         run: ./scripts/test.sh proofs

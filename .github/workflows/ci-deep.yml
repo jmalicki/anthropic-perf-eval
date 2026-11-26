@@ -1,0 +1,92 @@
+name: CI (deep)
+
+# Deep tier: tests that run CP-SAT solves (pytest @pytest.mark.deep; Rust tests behind the
+# deep-tests feature). ci.yml runs everything else on every PR.
+#
+# Runs on every push to main, by hand (Actions > CI (deep) > Run workflow), and on a PR that
+# carries the `deep-ci` label (add it to PRs that change the CP-SAT model, its tuning, or
+# anything else the deep tests guard).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-deep-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_FROM_PROJECT_ROOT: "1"
+  PYTEST_ADDOPTS: "--durations=30"
+
+jobs:
+  # The whole Rust suite with the deep-tests feature (the shallow tier ignores those tests).
+  rust:
+    name: Rust tests, deep (scheduler_rs)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep-ci')
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          # Explicit path: the default '**/uv.lock' glob walks the tree and dies with ELOOP on
+          # the self-referential symlink .claude/.cursor.
+          cache-dependency-glob: uv.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: test-deep
+
+      - name: Create project venv
+        run: uv sync
+
+      - name: Rust tests (all, with deep-tests)
+        run: ./scripts/test.sh rust
+
+  python:
+    name: Python tests, deep
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep-ci')
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: release
+
+      - name: Create project venv
+        run: uv sync
+
+      - name: Build scheduler_rs (release)
+        run: ./scripts/build_scheduler_rs.sh --release
+
+      - name: Python tests (deep)
+        run: ./scripts/test.sh python-deep
