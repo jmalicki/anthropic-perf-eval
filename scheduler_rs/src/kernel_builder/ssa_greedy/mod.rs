@@ -1039,14 +1039,33 @@ fn release_read_values(
 ) {
     let delta_read = trace.delta_readers.contains(&op.id);
     let fma = trace.fma_selects.contains(&op.id);
+    // What a multiply_add select reads at cycle + 1: its sources, its delta and their group
+    // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
+    // address assignment counts it (`use_cycles`).
+    let fma_reads: HashSet<VReg> = if fma {
+        let direct: Vec<VReg> = op.srcs.iter().filter_map(|s| s.as_vreg()).chain(op.delta_vreg).collect();
+        direct
+            .iter()
+            .flat_map(|v| std::iter::once(*v).chain(liveness_aliases.get(v).into_iter().flatten().copied()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
-        // A vselect does not read the delta: no read, only one holder fewer.
-        if !(delta_read && !fma && op.delta_vreg == Some(*vreg)) {
-            let end = cycle as i32 + i32::from(fma);
+        // A vselect does not read the delta: no read, only one holder fewer. Unless the
+        // same VReg is also a direct source or keep-live read of the select (e.g. the
+        // condition is the delta), which the vselect does read at this cycle.
+        let delta_only = delta_read
+            && !fma
+            && op.delta_vreg == Some(*vreg)
+            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
+            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        if !delta_only {
+            let end = cycle as i32 + i32::from(fma && fma_reads.contains(vreg));
             let e = trace.read_end.entry(*vreg).or_insert(end);
             *e = (*e).max(end);
         }
@@ -1707,7 +1726,15 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &words_shape,
         shifted_lane_cycles,
     )?;
-    let fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    // Every select the run lowered as a multiply_add: the caller's set (overflow placements)
+    // and the selects forced to that form, which the caller only adds after the call returns.
+    // The local copy leaves the caller's set to the caller.
+    let mut fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    if let Some(fixed) = fixed_select_choice_encoding {
+        fma_now.extend(
+            fixed.iter().filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma)).map(|(id, _)| *id),
+        );
+    }
     let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
@@ -3139,6 +3166,9 @@ fn schedule_ssa_greedy_core(
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
                             && write_groups.releasable_at(vreg, cycle)
+                            // A multiply_add select read it this cycle: the release loop holds
+                            // it to cycle + 1, so it is not freed for this op's write.
+                            && trace.read_end.get(vreg).map_or(true, |&end| end <= cycle as i32)
                     })
                     .collect();
                 let words_freed: usize = freed.iter().map(|v| v.size()).sum();

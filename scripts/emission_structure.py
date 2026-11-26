@@ -7,6 +7,7 @@ round to minimise the capacity floor, then emit and schedule the chosen plan.
     uv run python -m scripts.emission_structure solve --out plan.json # best plan for the floor
     uv run python -m scripts.emission_structure predict --plan plan.json
     uv run python -m scripts.emission_structure measure --plan plan.json --shaped --upstream
+    uv run python -m scripts.emission_structure derive                # table by instantiation == calibrated?
 
 Design: docs/EMISSION_STRUCTURE_MODEL.md. In short:
 
@@ -647,6 +648,51 @@ def default_table_path(ctx: Context) -> str:
     return os.path.join(ROOT, "artifacts", "emission_structure", f"costs_{ctx.key()}.json")
 
 
+def derive_table(ctx: Context) -> tuple[CostTable, dict]:
+    """Cost table derived by instantiation in scheduler_rs (`derive_tree_access_cost_table`):
+    the canonical program with every alternative of every site built next to it, and each
+    op's liveness reduced to the features of `feature_names`. No probe builds, no fit.
+
+    Returns:
+        (the table, the full JSON document: sites, resources, facts, problems).
+
+    Raises:
+        RuntimeError: if the derivation reports problems (something that does not fit the
+            features) or produces a feature the model does not have.
+    """
+    import scheduler_rs
+    from kernel_build_args import n_nodes_for_height
+
+    doc = json.loads(scheduler_rs.derive_tree_access_cost_table(
+        ctx.forest_height, n_nodes_for_height(ctx.forest_height), ctx.batch_size, ctx.rounds,
+        merge_hash_stages=ctx.merge_hash_stages, index_form=ctx.index_form,
+        select_bit_source=ctx.select_bit_source, values_only=ctx.values_only))
+    if doc["problems"]:
+        raise RuntimeError(f"derived cost table does not fit the features ({len(doc['problems'])} problems): "
+                           + "; ".join(doc["problems"][:5]))
+    names = feature_names(ctx)
+    unknown = sorted(set(doc["coefficients"]) - set(names))
+    if unknown:
+        raise RuntimeError(f"derived cost table has features the model lacks: {unknown}")
+    not_derived = [n for n in names if n not in doc["coefficients"]]
+    if not_derived:  # e.g. tail:* (values_only): never zero-filled
+        raise RuntimeError(f"derived cost table does not derive {len(not_derived)} features of the model: "
+                           f"{not_derived[:5]}")
+    coefficients = {n: {c: int(doc["coefficients"].get(n, {}).get(c, 0)) for c in CATEGORIES} for n in names}
+    return CostTable(ctx, coefficients, notes=["derived by instantiation (scheduler_rs)"]), doc
+
+
+def table_differences(a: CostTable, b: CostTable) -> list[str]:
+    """Entries (feature, category) where two cost tables differ, as readable lines."""
+    diffs = []
+    for name in sorted(set(a.coefficients) | set(b.coefficients)):
+        for c in CATEGORIES:
+            va, vb = a.coefficients.get(name, {}).get(c, 0), b.coefficients.get(name, {}).get(c, 0)
+            if va != vb:
+                diffs.append(f"{name} {c}: {va} vs {vb}")
+    return diffs
+
+
 def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -> CostTable:
     path = path or default_table_path(ctx)
     if os.path.exists(path):
@@ -916,8 +962,12 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         gm = dict(GREEDY_MODEL, **greedy_model)
         objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
         m.Add(objective >= t + int(gm["a_floor"]))
+        # excess = max(0, flow ops + selects - flow0) exactly, as in greedy_model_cycles: a lower
+        # bound alone would let the solver inflate it under a negative slope override.
+        over = m.NewIntVar(-big - int(gm["flow0"]), big, "flow_over")
+        m.Add(over == cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
         excess = m.NewIntVar(0, big, "flow_excess")
-        m.Add(excess >= cnt["flow"] + cnt["select1"] + cnt["select2"] - int(gm["flow0"]))
+        m.AddMaxEquality(excess, [over, 0])
         loads_all = cnt["load"] + cnt["const"] + cnt["const_alu"]
         m.Add(100 * objective >= 50 * loads_all + 100 * int(gm["a_load"]) + int(gm["b_flow_x100"]) * excess)
     if windows:
@@ -1005,8 +1055,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         # Lexicographic: mixes, then lateness, then work in scalar-op units (a vector op is 8).
         m.Minimize(mixes * (late_max * work_max) + late * work_max + work)
         m.ClearHints()  # the windows' T solve may have hinted these already
-        for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
-            m.AddHint(var, val)
+        # From the saved plan: after a floor solve that ended UNKNOWN there is no solution to
+        # read; otherwise `chosen` holds that solve's values.
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
         status2 = run("tie_break")
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -1343,7 +1395,7 @@ def main(argv=None):
         return emission_loop.main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["calibrate", "check", "predict", "solve", "sweep", "measure", "table",
-                                        "scatter", "loop"],
+                                        "scatter", "derive", "loop"],
                     help="loop: closed loop with the shaped greedy (scripts/emission_loop.py; loop --help)")
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=256)
@@ -1420,6 +1472,39 @@ def main(argv=None):
             print(f"calibrated from {table.calibration_plans} plans (exact); written to {path}")
             for note in table.notes:
                 print("  note: " + note)
+            return 0
+        if args.command == "derive":
+            # The derivation needs no probe builds: run and report it first, so a cold cache or
+            # a calibration failure cannot hide it. Its report must not overwrite the
+            # reference it is compared with (a later run would then compare it with itself).
+            reference = args.table or default_table_path(ctx)
+            if args.json and os.path.realpath(args.json) == os.path.realpath(reference):
+                ap.error(f"--json {args.json} is the reference cost table ({reference}); "
+                         "write the derivation elsewhere")
+            derived, doc = derive_table(ctx)
+            if args.json:
+                write_json_atomic(args.json, doc)
+            print(f"Derived by instantiation (scheduler_rs): {len(doc['sites'])} sites, "
+                  f"{len(doc['resources'])} shared-resource groups")
+            print("| Feature | " + " | ".join(CATEGORIES) + " |")
+            print("|---|" + "---|" * len(CATEGORIES))
+            for name, coef in derived.coefficients.items():
+                if any(coef.values()):
+                    print(f"| {name} | " + " | ".join(f"{coef[c]:,}" if coef[c] else "" for c in CATEGORIES) + " |")
+            try:
+                table = load_or_calibrate(ctx, args.table, workdir)
+            except Exception as e:  # noqa: BLE001 - reported; the derivation above stands
+                print(f"no calibrated table to compare with: {type(e).__name__}: {e}")
+                return 1
+            diffs = table_differences(derived, table)
+            entries = len(derived.coefficients) * len(CATEGORIES)
+            if diffs:
+                print(f"DIFFERS from the calibrated table in {len(diffs)} of {entries} entries (derived vs calibrated):")
+                for d in diffs:
+                    print("  " + d)
+                return 1
+            print(f"Equal to the calibrated table in all {entries} entries "
+                  f"({len(derived.coefficients)} features x {len(CATEGORIES)} categories).")
             return 0
         table = load_or_calibrate(ctx, args.table, workdir)
         if args.what_if:

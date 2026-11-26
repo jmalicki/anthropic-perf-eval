@@ -56,6 +56,7 @@ fn scheduler_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ScratchBudgetExceeded", m.py().get_type::<python::ScratchBudgetExceeded>())?;
     m.add_function(wrap_pyfunction!(python::optional_constraint_group_names, m)?)?;
     m.add_function(wrap_pyfunction!(python::resolve_cpsat_tuning, m)?)?;
+    m.add_function(wrap_pyfunction!(python::derive_tree_access_cost_table, m)?)?;
     m.add_class::<python::OptionalConstraintGroupPy>()?;
     // Expose each variant as a class attribute for Python (e.g. OptionalConstraintGroup.redundant_linear_bounds).
     let py = m.py();
