@@ -1,0 +1,37 @@
+{
+ "format": "emission-plan/1",
+ "rounds": 16,
+ "groups": 32,
+ "forest_height": 10,
+ "access": [
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  {
+   "gather": 13,
+   "bits": 19
+  },
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  "gather"
+ ],
+ "context": {
+  "rounds": 16,
+  "batch_size": 256,
+  "forest_height": 10,
+  "merge_hash_stages": true,
+  "index_form": "mirrored",
+  "select_bit_source": "path",
+  "values_only": false
+ },
+ "comment": "Probe C (docs/EMISSION_STRUCTURE_MODEL.md section 10.0.1): docs/emission_plans/path_flow90.json with round 4 = gather 13 + bits 19; every other round unchanged. Path bits (--select-bit-source path)."
+}
