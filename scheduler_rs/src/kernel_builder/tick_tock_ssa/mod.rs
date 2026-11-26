@@ -106,6 +106,12 @@ pub struct SsaScheduleResult {
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+    /// Peak words of the per-section scratch check on the greedy schedule (the most over all
+    /// sections), counted with the allocator's intervals; None if the check did not run. The
+    /// greedy-only path counts it on the phase timeline for comparison with
+    /// `address_result.pool_peaks`; the CP-SAT path on the model's timeline, where it decides
+    /// which sections the per-section CP-SAT repairs.
+    pub section_check_peak: Option<usize>,
     /// Per transform applied (`--transform`), in order: its name and the sites it rewrote. The
     /// caller decides from this, not from the request, whether e.g. the indices are still stored.
     pub transform_sites: Vec<(String, usize)>,
@@ -180,6 +186,52 @@ pub(crate) fn section_cycle_range(
         }
     }
     range
+}
+
+/// After a per-section solve, the constant encodings of the merged schedule: the section's
+/// ConstChoice ops take the solve's encoding (AddImm or AluDerive; anything else is Load), and
+/// ops not sent to the solve (`not_sent`, kept at their greedy cycles) keep the greedy's.
+///
+/// # Arguments
+/// * `section_ops` - The section's ops
+/// * `solved` - The per-section solve's ConstChoice encodings
+/// * `not_sent` - Op ids of the section not given to the solve
+/// * `greedy_add_imm` / `greedy_alu_derive` - The greedy's encodings
+/// * `add_imm` / `alu_derive` - Current encodings, updated in place
+pub(crate) fn merge_section_const_encodings(
+    section_ops: &[SsaOp],
+    solved: &HashMap<usize, crate::types::ConstChoiceEncoding>,
+    not_sent: &[usize],
+    greedy_add_imm: &HashSet<usize>,
+    greedy_alu_derive: &HashMap<usize, crate::types::AluDeriveInfo>,
+    add_imm: &mut HashSet<usize>,
+    alu_derive: &mut HashMap<usize, crate::types::AluDeriveInfo>,
+) {
+    for op in section_ops {
+        if op.opcode == Opcode::ConstChoice {
+            add_imm.remove(&op.id);
+            alu_derive.remove(&op.id);
+        }
+    }
+    for (id, enc) in solved {
+        match enc {
+            crate::types::ConstChoiceEncoding::AddImm => {
+                add_imm.insert(*id);
+            }
+            crate::types::ConstChoiceEncoding::AluDerive(info) => {
+                alu_derive.insert(*id, info.clone());
+            }
+            _ => {}
+        }
+    }
+    for id in not_sent {
+        if greedy_add_imm.contains(id) {
+            add_imm.insert(*id);
+        }
+        if let Some(info) = greedy_alu_derive.get(id) {
+            alu_derive.insert(*id, info.clone());
+        }
+    }
 }
 
 /// Move every scheduled op of a section (barriers excluded) by `delta` cycles, together with
@@ -636,6 +688,7 @@ pub fn export_partial_result_on_error(
         cpsat_scratch_budget: ctx.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
         scratch_relaxed: ctx.config.compiler.is_relaxed_scratch(),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
+        section_check_peak: ctx.section_check_peak,
         transform_sites: ctx.transform_sites.clone(),
     };
 
@@ -938,7 +991,7 @@ impl SsaTickTockKernelBuilder {
             .map_err(KernelBuilderError::Other)?;
         use super::barrier_elision::{count_barriers, section_boundaries};
         use super::round_budget::{
-            section_budget, ScratchAliases, vreg_def_section,
+            section_budget, ScratchAliases, SectionLiveness, vreg_def_section,
         };
         use super::pipeline::{
             BoundsConfig, CpSatExtra, CpSatPipelineConfig, PipelineConfig, PipelineContext,
@@ -1124,31 +1177,44 @@ impl SsaTickTockKernelBuilder {
         let boundaries = section_boundaries(&ctx.ops);
         let effective_budget =
             ctx.config.compiler.effective_scratch_budget(ctx.zero_vreg.is_some());
-        // Which sections to repair: counted on the cycle timeline whatever the model's
-        // timeline. This count has no per-lane shifted cycles, so on the
-        // phase timeline it can miss a section whose greedy schedule is
-        // over budget (3x256 with the greedy pressure policy: the greedy force-scheduled, this
-        // check said the section fits, and the full-kernel solve then started from an
-        // infeasible hint). The cycle count's same-cycle overcount makes it the safe side; the
-        // repair itself and the checks of its result use the model's timeline.
+        // Which sections to repair: counted on the model's timeline with the allocator's own
+        // intervals (shifted lanes at their cycles, multiply-add selects, ALU-derived
+        // constants, vector groups): a section is repaired when its peak live words, counted
+        // as the allocator counts them, exceed the budget (a section within it can still lack
+        // an address layout; the check bounds words). Before, the check had no lane cycles and fell
+        // back to the cycle timeline to stay on the safe side, which overcounted (1,597
+        // words against the allocator's 1,496 on the 1,030-cycle path kernel) and sent within-budget
+        // schedules to the repair (BUGS.md).
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
-        // CPSAT_SECTION_CHECK_TIMELINE=model (analysis, e.g. the window probe): decide on the
-        // model's own timeline instead. Its count has no per-lane shifted cycles, so it can
-        // miss an over-budget section; the window probe's all-fixed check then rejects the
-        // reference, so this cannot produce an invalid kernel unnoticed.
-        let check_timeline = if std::env::var("CPSAT_SECTION_CHECK_TIMELINE").as_deref() == Ok("model") {
-            self.cpsat_scratch_time
-        } else {
-            crate::cpsat_scheduler::ScratchTime::Cycle
-        };
-        let budget_result = section_budget(
-            &ctx.ops,
-            effective_budget,
-            Some(&greedy_select_fma_ops),
-            None,
-            check_timeline, &scratch_aliases,
-        );
+        // ALU-derived constants of the current schedule: the greedy's, updated when a
+        // per-section solve re-encodes a section's constants (`merge_section_const_encodings`).
+        let mut current_alu_derive = ctx.greedy_decisions.alu_derive_ops();
+        let greedy_alu_derive_ops = current_alu_derive.clone();
+        macro_rules! section_liveness {
+            () => {
+                SectionLiveness {
+                    shifted_alu_cycles: Some(&ctx.greedy_decisions.shifted_alu_cycles),
+                    const_alu_derive_ops: Some(&current_alu_derive),
+                    vector_group_lanes: Some(&ctx.vector_group_lanes),
+                }
+            };
+        }
+        macro_rules! budget_or_export {
+            ($e:expr) => {
+                match $e {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let error = KernelBuilderError::Other(e);
+                        export_partial_result_on_error_safe(&ctx, &error);
+                        return Err(error);
+                    }
+                }
+            };
+        }
+        let budget_result =
+            budget_or_export!(ctx.greedy_section_check(effective_budget, self.cpsat_scratch_time));
+        ctx.section_check_peak = budget_result.section_peaks.iter().copied().max();
         let n_exceeding: usize = budget_result
             .section_exceeds_budget
             .iter()
@@ -1160,8 +1226,8 @@ impl SsaTickTockKernelBuilder {
                 "================================================================================"
             );
             eprintln!(
-                "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)",
-                ctx.config.compiler.scratch_size
+                "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} assignable words of {})",
+                effective_budget, ctx.config.compiler.scratch_size
             );
             eprintln!(
                 "  Sections that exceed budget will get a per-section CP-SAT run (feasibility)."
@@ -1237,16 +1303,18 @@ impl SsaTickTockKernelBuilder {
                 } else {
                     0
                 };
-                let greedy_section_peak = verbose.then(|| {
-                    section_budget(
+                let greedy_section_peak = if verbose {
+                    Some(budget_or_export!(section_budget(
                         &ctx.ops,
                         effective_budget,
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
                         self.cpsat_scratch_time,
-                        &scratch_aliases,
-                    ).section_peaks[k]
-                });
+                        &section_liveness!(),
+                    )).section_peaks[k])
+                } else {
+                    None
+                };
 
                 let section_optimize = per_section_optimize_secs.map_or(false, |t| t > 0.0);
                 if verbose {
@@ -1329,11 +1397,16 @@ impl SsaTickTockKernelBuilder {
                     actually_rescheduled_op_ids.insert(ctx.ops[gi].id);
                 }
 
-                let initial_live = scratch_aliases.live_in(
+                let mut initial_live = scratch_aliases.live_in(
                     &ctx.ops, &boundaries, k, &vreg_def_sec, &filtered_global_indices,
                 );
-                let (live_out, live_through) =
+                let (mut live_out, mut live_through) =
                     scratch_aliases.live_after(&ctx.ops, &boundaries, k, &vreg_def_sec);
+                // ALU-derived constants read their producers without operands.
+                super::round_budget::extend_section_liveness_for_alu_derive(
+                    &ctx.ops, &boundaries, k, &vreg_def_sec, &current_alu_derive,
+                    &filtered_global_indices, &mut initial_live, &mut live_out, &mut live_through,
+                );
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false),
                     _ => {
@@ -1448,27 +1521,21 @@ impl SsaTickTockKernelBuilder {
                     }
                 }
                 let (start, end) = boundaries[k];
-                for op in &ctx.ops[start..end] {
-                    if op.opcode == Opcode::ConstChoice {
-                        current_const_add_imm.remove(&op.id);
-                    }
-                }
-                for (id, enc) in &seg_result.const_choice_encoding {
-                    if matches!(enc, crate::types::ConstChoiceEncoding::AddImm) {
-                        current_const_add_imm.insert(*id);
-                    }
-                }
-                // Re-insert ConstChoice ops that were filtered out (AddImm alternatives
-                // not sent to per-section CP-SAT) but were in greedy's original set.
                 let filtered_global_set: HashSet<usize> = filtered_global_indices.iter().copied().collect();
-                for &gi in &global_indices {
-                    if !filtered_global_set.contains(&gi) {
-                        let op_id = ctx.ops[gi].id;
-                        if greedy_const_add_imm_ops.contains(&op_id) {
-                            current_const_add_imm.insert(op_id);
-                        }
-                    }
-                }
+                let not_sent: Vec<usize> = global_indices
+                    .iter()
+                    .filter(|gi| !filtered_global_set.contains(gi))
+                    .map(|&gi| ctx.ops[gi].id)
+                    .collect();
+                merge_section_const_encodings(
+                    &ctx.ops[start..end],
+                    &seg_result.const_choice_encoding,
+                    &not_sent,
+                    &greedy_const_add_imm_ops,
+                    &greedy_alu_derive_ops,
+                    &mut current_const_add_imm,
+                    &mut current_alu_derive,
+                );
                 for (seg_idx, &cycle) in seg_result.cycle_assignments.iter().enumerate() {
                     if seg_idx < filtered_global_indices.len() && cycle >= 0 {
                         let op = &mut ctx.ops[filtered_global_indices[seg_idx]];
@@ -1492,13 +1559,13 @@ impl SsaTickTockKernelBuilder {
                     (seg_result.makespan as i32).max(greedy_section_makespan),
                 );
                 if let Some(greedy_section_peak) = greedy_section_peak {
-                    let after_budget = section_budget(
+                    let after_budget = budget_or_export!(section_budget(
                         &ctx.ops,
                         effective_budget,
                         Some(&greedy_select_fma_ops),
                         Some(&section_select_fma_overrides),
-                        self.cpsat_scratch_time, &scratch_aliases,
-                    );
+                        self.cpsat_scratch_time, &section_liveness!(),
+                    ));
                     let after_peak = after_budget.section_peaks[k];
                     let delta_cycles = seg_result.makespan as i32 - greedy_section_makespan;
                     let delta_peak = after_peak as i32 - greedy_section_peak as i32;
@@ -1526,20 +1593,20 @@ impl SsaTickTockKernelBuilder {
 
         // Presolve guarantee: merged schedule must be within scratch budget
         let scratch_size = ctx.config.compiler.scratch_size;
-        let post_merge_budget = section_budget(
-            &ctx.ops, scratch_size,
+        let post_merge_budget = budget_or_export!(section_budget(
+            &ctx.ops, effective_budget,
             Some(&greedy_select_fma_ops),
             Some(&section_select_fma_overrides),
-            self.cpsat_scratch_time, &scratch_aliases,
-        );
+            self.cpsat_scratch_time, &section_liveness!(),
+        ));
         if let Some((sec, peak)) = post_merge_budget
             .section_peaks.iter().enumerate()
-            .find(|(_, &p)| p > scratch_size)
+            .find(|(_, &p)| p > effective_budget)
         {
             let msg = format!(
                 "Per-section CP-SAT produced a merged schedule that exceeds scratch budget: section {} has peak {} words (budget {}). \
                  This indicates a bug in the segment scratch model (e.g. live-through or live-out).",
-                sec, *peak, scratch_size
+                sec, *peak, effective_budget
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);
@@ -1557,15 +1624,15 @@ impl SsaTickTockKernelBuilder {
         let greedy_hints: Vec<i32> = ctx.ops.iter().map(|op| op.cycle).collect();
         let hint_makespan = greedy_hints.iter().copied().max().map(|c| c + 1).unwrap_or(0);
         let effective_budget_hint = effective_budget;
-        let hint_peak = section_budget(
-            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &scratch_aliases,
-        ).section_peaks.iter().copied().max().unwrap_or(0);
+        let hint_peak = budget_or_export!(section_budget(
+            &ctx.ops, effective_budget_hint, Some(&current_select_fma), None, self.cpsat_scratch_time, &section_liveness!(),
+        )).section_peaks.iter().copied().max().unwrap_or(0);
 
-        if hint_peak > scratch_size {
+        if hint_peak > effective_budget {
             let msg = format!(
                 "Merged hint schedule exceeds scratch budget: peak {} words (budget {}). \
                  Presolves must guarantee a feasible hint; this indicates a bug in the segment scratch model.",
-                hint_peak, scratch_size
+                hint_peak, effective_budget
             );
             let error = KernelBuilderError::Other(msg);
             export_partial_result_on_error_safe(&ctx, &error);

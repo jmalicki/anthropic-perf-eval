@@ -150,6 +150,9 @@ pub struct PipelineContext {
     // --- Diagnostics ---
     /// Reports from each pass (timing, summaries).
     pub reports: Vec<PassReport>,
+    /// Peak words of the per-section scratch check on the greedy schedule (see
+    /// `SsaScheduleResult::section_check_peak`).
+    pub section_check_peak: Option<usize>,
 }
 
 impl PipelineContext {
@@ -184,7 +187,43 @@ impl PipelineContext {
             cpsat_extra: None,
             config,
             reports: Vec::new(),
+            section_check_peak: None,
         }
+    }
+
+    /// The per-section scratch check on the greedy schedule, before any repair: which
+    /// sections the per-section CP-SAT must repair. Counted with the allocator's intervals
+    /// (shifted lanes, multiply-add selects, ALU-derived constants, vector groups) on
+    /// `scratch_time` (`round_budget::section_budget`): on the phase timeline its peak is
+    /// the allocator's peak live words. A section within the budget can still lack an address
+    /// layout (the `words` model's known limit, docs/ALLOCATION_CONJECTURES.md); the check
+    /// bounds words, not layouts.
+    ///
+    /// # Arguments
+    /// * `budget` - Words available to allocatable values
+    /// * `scratch_time` - Timeline of the CP-SAT scratch model
+    ///
+    /// # Returns
+    /// Per-section peaks, or `Err` if the schedule reads a value before it is written.
+    pub fn greedy_section_check(
+        &self,
+        budget: usize,
+        scratch_time: crate::cpsat_scheduler::ScratchTime,
+    ) -> Result<super::round_budget::SectionBudgetResult, String> {
+        let fma = self.greedy_decisions.select_fma_ops();
+        let alu_derive = self.greedy_decisions.alu_derive_ops();
+        super::round_budget::section_budget(
+            &self.ops,
+            budget,
+            Some(&fma),
+            None,
+            scratch_time,
+            &super::round_budget::SectionLiveness {
+                shifted_alu_cycles: Some(&self.greedy_decisions.shifted_alu_cycles),
+                const_alu_derive_ops: Some(&alu_derive),
+                vector_group_lanes: Some(&self.vector_group_lanes),
+            },
+        )
     }
 
     /// Run a pass with timing and report recording.
@@ -283,6 +322,20 @@ impl PipelineContext {
         if self.config.compiler.greedy_justify_iterations > 0 {
             self.run_pass(&GreedyJustifyPass)?;
         }
+
+        // The check the CP-SAT path runs before its per-section repair, on the phase timeline:
+        // reported only, for comparison with the allocator's peak of the same schedule. It
+        // never fails or changes a greedy-only build: address assignment below is the judge.
+        let budget = self.effective_scratch_budget();
+        self.section_check_peak = match self
+            .greedy_section_check(budget, crate::cpsat_scheduler::ScratchTime::Phase)
+        {
+            Ok(r) => r.section_peaks.into_iter().max(),
+            Err(e) => {
+                eprintln!("section check (report only) could not count this schedule: {}", e);
+                None
+            }
+        };
 
         // In greedy-only mode, final decisions = greedy decisions
         self.final_decisions = self.greedy_decisions.clone();
@@ -440,6 +493,7 @@ impl PipelineContext {
             cpsat_scratch_budget: self.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
             scratch_relaxed: self.config.compiler.is_relaxed_scratch(),
             vector_group_lanes: self.vector_group_lanes,
+            section_check_peak: self.section_check_peak,
             transform_sites: self.transform_sites,
         })
     }
