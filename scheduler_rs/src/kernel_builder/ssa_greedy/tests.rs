@@ -5627,6 +5627,70 @@ fn test_select_whose_condition_is_its_delta_keeps_the_direct_read() {
     assert!(agreement.agrees(), "{}", agreement);
 }
 
+/// Review of #88 (CodeRabbit, stacked from #82): a vselect that keeps a lane of its delta's
+/// vector group live. The lane's read belongs to the group's block, which address assignment
+/// holds through the select's cycle; the delta-only skip matched exact VRegs only, so it
+/// treated the group as unread at the select and backdated its release.
+#[test]
+fn test_select_keeping_a_lane_of_its_delta_holds_the_delta_group() {
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+        select_overflow: SelectOverflow::Valu { limit: None },
+        ..Default::default()
+    };
+    let mut emit = SsaEmitContext::new();
+    let c5 = emit.emit_const(5);
+    let base = emit.emit_vbroadcast(c5);
+    let c1 = emit.emit_const(1);
+    let one = emit.emit_vbroadcast(c1);
+    let addr = emit.emit_const(100);
+    for chain in 0..6 {
+        let cv = emit.emit_const(chain as i64);
+        let v = emit.emit_vbroadcast(cv);
+        let delta = emit.emit_valu(Opcode::And, v, one);
+        let delta_lanes = emit.decompose_vector(delta);
+        let true_val = emit.emit_valu(Opcode::Add, base, delta);
+        // Work between the Add and the select, so the select's hold is later than the Add.
+        let mut pad = emit.emit_valu(Opcode::Add, true_val, one);
+        for _ in 0..3 {
+            pad = emit.emit_valu(Opcode::Add, pad, one);
+        }
+        let sel = emit.emit_select_choice_shared_delta(v, true_val, delta, base);
+        let sel_idx = emit.ops.iter().position(|op| op.dest == Some(sel)).expect("select op");
+        emit.ops[sel_idx].keep_live = Some(vec![delta_lanes[0]]);
+        let out = emit.emit_valu(Opcode::Add, sel, pad);
+        emit.emit_vstore(addr, out);
+    }
+    let lanes = emit.vector_group_lanes.clone();
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, Some(&lanes));
+    let mut fma = HashSet::new();
+    let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut HashSet::new(),
+        1536,
+        Some(&mut fma),
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        Some(&lanes),
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("the live-word counter agrees with interval liveness");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
 /// Regression (review of #76): a select the overflow puts on the vector ALU reads its
 /// operands and its precomputed delta one cycle after its own (address assignment's
 /// `select_fma_ops` rule, address_assign.rs). The counter did not count the delta as read

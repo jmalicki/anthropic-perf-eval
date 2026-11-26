@@ -114,8 +114,9 @@ def analyse(state: dict, sched: dict) -> dict:
         key = ("deferred" if st.startswith("deferred") else "inflation" if st.startswith("inflation")
                else "in heap" if st.startswith("in heap")
                else "not admitted" if st.startswith("not admitted")
-               else "blocked behind a deferred op" if "deferred" in st
+               # "inflation (deferred this cycle)" contains "deferred": test inflation first.
                else "blocked behind an inflation-deferred op" if "inflation" in st
+               else "blocked behind a deferred op" if "deferred" in st
                else "blocked behind an op in the heap" if "in heap" in st
                else "blocked (other)")
         kinds[key] += row["words"]

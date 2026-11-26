@@ -83,3 +83,17 @@ def test_collect_requires_out(tmp_path):
     with pytest.raises(SystemExit):
         gmf.main(["collect", "--data", str(data)])
     assert data.read_text() == '{"builds": [1]}'
+
+
+def test_collect_rejects_measured_record_missing_fields(tmp_path):
+    """Review of #88 (stacked from #83): a `--measured` record the fit cannot read (here, the
+    `measure` output of emission_structure.py, which has no bit_source or counts) is refused
+    with the record and the missing fields named, and nothing is written."""
+    import pytest
+
+    measured = tmp_path / "m.json"
+    measured.write_text('[{"name": "plan7", "cycles": 1100}]')
+    out = tmp_path / "data.json"
+    with pytest.raises(ValueError, match=r"record 0 \(plan7\) lacks bit_source, counts"):
+        gf.collect([], [str(measured)], str(out))
+    assert not out.exists()
