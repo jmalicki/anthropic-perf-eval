@@ -6527,16 +6527,15 @@ fn test_alu_derive_extends_a_producer_read_only_by_derivations() {
     assert_eq!((with[&c8].start, with[&c8].end), (0, 3), "live until the derive's read");
 }
 
-/// A derive whose producer is not in the scheduled ops would read an unassigned word; the
-/// debug assertion catches it instead of skipping the extension.
+/// A derive whose producer is not in the scheduled ops would read an unassigned word; it is an
+/// error (in every build profile), not a skipped extension.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "has no live interval")]
-fn test_alu_derive_without_its_producer_is_asserted() {
+fn test_alu_derive_without_its_producer_is_an_error() {
     let (emit, derive) = emit_constant_read_only_by_derivation();
     let without_producer: Vec<SsaOp> = emit.ops[1..].to_vec();
     let config = crate::address_assign::AddressAssignConfig { const_alu_derive_ops: derive, ..Default::default() };
-    let _ = crate::address_assign::compute_live_intervals(&config, &without_producer);
+    let err = crate::address_assign::compute_live_intervals(&config, &without_producer).unwrap_err();
+    assert!(err.contains("has no live interval"), "{}", err);
 }
 
 /// The greedy's own `alu-first` schedule of five derivable constants: the pass accepts it as

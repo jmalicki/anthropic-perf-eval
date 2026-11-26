@@ -14,6 +14,7 @@ from scripts import justify_on_best_sweep as sweep  # noqa: E402
 
 
 @pytest.mark.ci_only
+@pytest.mark.timeout(600)  # 62 builds, about 70 s in CI: above the global 120 s on a slow runner
 def test_justify_on_best_sweep_reproduces_the_recorded_rows():
     with open(sweep.DATA) as f:
         recorded = json.load(f)["tables"]

@@ -446,27 +446,26 @@ pub fn compute_live_intervals(
         // scheduled op with a dest has an interval from the first pass (a value no op reads
         // gets [D, D + 1]), so a producer read only by derivations is covered too. A producer
         // missing from `ops` (unscheduled) or without a dest would leave the derive reading an
-        // unassigned word: never produced by the schedulers, asserted here.
+        // unassigned word: never produced by the schedulers, and an error here (in release
+        // builds too: a skipped extension would be a silent liveness undercount).
         for producer_op_id in [left_op_id, right_op_id] {
             let producer_vreg = id_to_info.get(&producer_op_id).and_then(|&(_, dest)| dest);
             let interval = producer_vreg.and_then(|v| intervals.get_mut(&v));
-            debug_assert!(
-                interval.is_some(),
-                "AluDerive op {} (cycle {}) reads op {}, which has no live interval (not scheduled, or no dest)",
-                derive_op_id,
-                derive_cycle,
-                producer_op_id
-            );
-            if let Some(interval) = interval {
-                if derive_cycle > interval.end {
-                    if debug {
-                        eprintln!(
-                            "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
-                            producer_vreg, producer_op_id, interval.end, derive_cycle, derive_op_id
-                        );
-                    }
-                    interval.end = derive_cycle;
+            let Some(interval) = interval else {
+                return Err(format!(
+                    "BUG: AluDerive op {} (cycle {}) reads op {}, which has no live interval (not scheduled, or \
+                     no dest)",
+                    derive_op_id, derive_cycle, producer_op_id
+                ));
+            };
+            if derive_cycle > interval.end {
+                if debug {
+                    eprintln!(
+                        "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
+                        producer_vreg, producer_op_id, interval.end, derive_cycle, derive_op_id
+                    );
                 }
+                interval.end = derive_cycle;
             }
         }
     }
