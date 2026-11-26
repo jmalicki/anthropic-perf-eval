@@ -598,3 +598,133 @@ def test_wrong_mobius_coefficient_is_rejected(tmp_path_factory):
     tree_fma = lambda op: (op.get("source_info") or {}).get("phase") == "tree_access"  # noqa: E731
     result = se.check_equivalence(mobius, _swap_constant_operand(mobius, tree_fma), shape=SHAPE)
     assert result.verdict == "counterexample", se.format_result(result)
+
+
+# =============================================================================
+# Review threads on #70 (second round): each a reproduced wrong verdict or crash
+# =============================================================================
+
+
+class _TreeProg(_Prog):
+    """x = tree[0], an input word no program stores (so the programs below store freely)."""
+
+    def __init__(self, layout=TINY_LAYOUT):
+        self.ops = []
+        self.layout = layout
+        self.vp = self.const(layout.values_p)
+        self.x = self.op("load", self.const(layout.forest_p))
+
+    def store_at(self, value, addr):
+        return self.store(value, addr=self.const(addr))
+
+
+@pytest.mark.parametrize("bad", [2.9, True, "2", -1])
+def test_recorded_shape_must_be_an_integer(bad):
+    a = dict(_a(), run_options={"rounds": 2, "batch_size": 8, "forest_height": bad})
+    b = dict(_a(), run_options={"rounds": 2, "batch_size": 8, "forest_height": 2})
+    with pytest.raises(se.EquivalenceError, match="not a non-negative integer"):
+        se.check_equivalence(a, b)
+
+
+def test_load_bound_includes_reachable_header_words():
+    # rounds = 2^30, so header word 0 is 2^30. A load reads word 0 only when x == 12345 (no
+    # sample has it), word 1 otherwise; masking it with 0x3fffffff is not a no-op.
+    shape = (1 << 30, 8, 2)
+    layout = se.Layout.from_params(*shape)
+
+    def prog(masked):
+        p = _TreeProg(layout)
+        v = p.op("load", p.op("-", p.const(1), p.op("==", p.x, p.const(12345))))
+        if masked:
+            v = p.op("&", v, p.const(0x3FFFFFFF))
+        return p.store_at(v, layout.values_p)
+    result = se.check_equivalence(prog(False), prog(True), shape=shape)
+    assert result.verdict != "proved", se.format_result(result)
+
+
+def test_value_dead_load_of_a_stored_word_is_audited():
+    # values[1] := 0xffffffff; a value-dead quotient x // (values[x & 1] + 1): for odd x the
+    # load reads the stored word and the divisor wraps to 0.
+    def prog(extra):
+        p = _TreeProg()
+        p.store_at(p.op("+", p.x, p.const(7)), TINY_LAYOUT.values_p + 2)
+        p.store_at(p.const(0xFFFFFFFF), TINY_LAYOUT.values_p + 1)
+        if extra:
+            v = p.op("load", p.op("+", p.vp, p.op("&", p.x, p.const(1))))
+            p.op("//", p.x, p.op("+", v, p.const(1)))
+        return {"ssa_ops": p.ops, "vector_group_lanes": {}}
+    result = se.check_equivalence(prog(False), prog(True), shape=TINY)
+    assert result.verdict == "unproved"
+    assert any("may read a word the program stores" in u for u in result.unproved), result.unproved
+
+
+@pytest.mark.parametrize("trap", ["load at mem_size", "divide by 0"])
+def test_a_recorded_trap_is_not_proved_not_an_input_error(tmp_path, trap):
+    p = _Prog()
+    r = p.plus7()
+    if trap == "load at mem_size":
+        p.op("load", p.const(TINY_LAYOUT.mem_size))
+    else:
+        p.op("//", p.x, p.const(0))
+    assert _main(tmp_path, _a(), p.store(r)) == 2
+
+
+@pytest.mark.timeout(60)
+def test_merge_never_makes_a_representative_reach_its_own_class():
+    layout = TINY_LAYOUT
+    terms = se.NormTerms(layout, layout.sample_images(8, 0))
+    x = terms.mem(terms.const(layout.forest_p))
+    m = terms._binop("&", x, terms.const(0x3FFFFFFF))
+    sweeper = se.Sweeper(terms, 1000, 4000)
+    for t in (x, m):
+        sweeper.mask[t] = se.BOTH
+    sweeper.merge(m, x)
+    assert sweeper.find(m) == sweeper.find(x) == x  # m (which reads x) points to x, not the reverse
+    assert sweeper._serialise((m,), deep=True) is not None
+    # A cycle forced by hand is refused, not followed forever.
+    cyclic = se.Sweeper(terms, 1000, 4000)
+    for t in (x, m):
+        cyclic.mask[t] = se.BOTH
+    cyclic.parent[x] = m
+    assert cyclic._serialise((m,), deep=True) is None
+
+
+@pytest.mark.timeout(60)
+def test_swapped_masked_and_unmasked_words_terminate():
+    # A stores (m, x, m + 1, x + 1), B stores (x, m, x + 1, m + 1), m = x & 0x3fffffff, x an
+    # input word: equal under the precondition (x < 2^30).
+    def prog(order):
+        p = _TreeProg()
+        m = p.op("&", p.x, p.const(0x3FFFFFFF))
+        vals = {"m": m, "x": p.x, "m1": p.op("+", m, p.const(1)), "x1": p.op("+", p.x, p.const(1))}
+        for k, name in enumerate(order):
+            p.store_at(vals[name], TINY_LAYOUT.values_p + 1 + k)
+        return {"ssa_ops": p.ops, "vector_group_lanes": {}}
+    result = se.check_equivalence(prog(["m", "x", "m1", "x1"]), prog(["x", "m", "x1", "m1"]), shape=TINY)
+    assert result.verdict == "proved", se.format_result(result)
+
+
+def test_memory_order_failure_is_not_a_counterexample():
+    # Both store 7 to an initially zero word; A then loads it and copies it to an output, B
+    # writes 7 there directly. The model reads initial memory (0), so a "witness" 0 vs 7 would
+    # be false: the result is NOT PROVED with the memory-order reason first.
+    word = TINY_LAYOUT.mem_size - 1
+
+    def prog(copy):
+        p = _TreeProg()
+        p.store_at(p.op("+", p.x, p.const(7)), TINY_LAYOUT.values_p)
+        addr = p.const(word)
+        p.store(p.const(7), addr=addr)
+        out = p.op("load", addr) if copy else p.const(7)
+        return p.store_at(out, TINY_LAYOUT.values_p + 2)
+    result = se.check_equivalence(prog(True), prog(False), shape=TINY)
+    assert result.verdict == "unproved" and result.difference is None
+    assert "not ordered before the store" in result.unproved[0]
+
+
+def test_unreadable_input_json_is_an_input_error(tmp_path):
+    missing = tmp_path / "missing.json"
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    for path in (missing, bad):
+        assert se.main([str(path), str(path), "--shape", *map(str, TINY)]) == 3

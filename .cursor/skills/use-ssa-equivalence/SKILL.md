@@ -22,9 +22,11 @@ uv run generate_ssa_kernel.py --rounds 16 --batch-size 32 --use-greedy -q --outp
 uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/b.json
 
 # A --values-only build stores no indices: compare the values only
+uv run generate_ssa_kernel.py --rounds 16 --batch-size 32 --use-greedy -q --output-json /tmp/vo.json --values-only
 uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/vo.json --values-only
 
 # Save the counterexample input (initial memory image) for problem.Machine
+# (/tmp/bad.json: any scheduler JSON of the same shape that differs from /tmp/a.json)
 uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/bad.json --counterexample-out /tmp/cex.json
 ```
 

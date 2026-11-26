@@ -190,9 +190,15 @@ class Layout:
 def recorded_shape(sched: dict) -> tuple[int, int, int] | None:
     """(rounds, batch_size, forest_height) from the run_options the generator writes, or None."""
     opts = sched.get("run_options") or {}
-    if not all(k in opts for k in ("rounds", "batch_size", "forest_height")):
+    keys = ("rounds", "batch_size", "forest_height")
+    if not all(k in opts for k in keys):
         return None
-    return (int(opts["rounds"]), int(opts["batch_size"]), int(opts["forest_height"]))
+    for k in keys:
+        # A JSON number that is not an integer (2.9, true, "2") is not a shape: truncating
+        # it would let it agree with a different shape.
+        if type(opts[k]) is not int or opts[k] < 0:
+            raise EquivalenceError(f"run_options.{k} is {opts[k]!r}, not a non-negative integer")
+    return (opts["rounds"], opts["batch_size"], opts["forest_height"])
 
 
 def layout_of(sched_a: dict, sched_b: dict, shape: tuple[int, int, int] | None = None) -> Layout:
@@ -272,6 +278,13 @@ class NormTerms(Terms):
         self.layout = layout
         self.images = images
         self.rows = np.arange(images.shape[0])
+        # Fixed words at or above the input bound (header words holding the shape, e.g. a
+        # rounds count of 2^30): a load whose address may reach one can read it.
+        self.big_fixed = [(a, v) for a, v in enumerate(layout.image)
+                          if v >= VALUE_BOUND and layout.fixed_word(a) is not None]
+        # Every live load with a non-constant address, per program, before normalisation can
+        # drop it from the output graph (the memory-order audit checks all of them).
+        self.live_loads: dict[str, list[int]] = {}
         self.vals: list[np.ndarray] = []
         self.iv: list[tuple[int, int]] = []
         self.program = ""  # name of the program being built, for trap messages
@@ -347,8 +360,13 @@ class NormTerms(Terms):
                 return iv[term[3]]
             return (min(iv[term[2]][0], iv[term[3]][0]), max(iv[term[2]][1], iv[term[3]][1]))
         if kind == "mem":
-            # Every initial word is below 2^30: inputs by precondition, the rest by the layout.
-            return (0, VALUE_BOUND - 1) if iv[term[1]][1] < self.layout.mem_size else TOP
+            # Inputs are below 2^30 by precondition; fixed words are known, and those at or
+            # above 2^30 that the address interval reaches widen the bound.
+            lo, hi = iv[term[1]]
+            if hi >= self.layout.mem_size:
+                return TOP
+            top = max([VALUE_BOUND - 1] + [v for a, v in self.big_fixed if lo <= a <= hi])
+            return (0, top)
         a, b = iv[term[1]], iv[term[2]]
         if kind == "&":
             return (0, min(a[1], b[1]))
@@ -518,6 +536,8 @@ class NormTerms(Terms):
             tid = self.const(self.layout.fixed_word(ca))
         else:
             tid = self._intern(("mem", addr))
+            if record and ca is None:
+                self.live_loads.setdefault(self.program, []).append(tid)
         addrs = self.vals[addr]
         bad = addrs >= self.layout.mem_size
         raw = np.where(bad, np.uint64(0), self.images[self.rows, np.where(bad, 0, addrs).astype(np.int64)])
@@ -638,9 +658,12 @@ class ConcreteTerms:
     the store). Only loads of words in `watch` are tracked.
     """
 
-    def __init__(self, image, watch: set[int] | frozenset = frozenset()) -> None:
+    def __init__(self, image, watch: set[int] | frozenset = frozenset(), lenient: bool = False) -> None:
         self.image = image
         self.watch = watch
+        # lenient: a load outside memory reads 0 and a division by zero gives 0 instead of
+        # raising (for the memory-order audit, where possible traps are already recorded)
+        self.lenient = lenient
         self.loads: list[tuple[int, int]] = []  # (load id, address) of watched loads
 
     def const(self, value: int):
@@ -654,6 +677,8 @@ class ConcreteTerms:
 
     def binop(self, op, a, b):
         if op in ("//", "%", "cdiv") and b[0] == 0:
+            if self.lenient:
+                return (0, a[1] | b[1])
             raise EquivalenceError(f"division by zero ({op}) on the counterexample input")
         return (_FOLD[op](a[0], b[0]) % MOD, a[1] | b[1])
 
@@ -665,6 +690,8 @@ class ConcreteTerms:
 
     def mem(self, addr):
         if not 0 <= addr[0] < len(self.image):
+            if self.lenient:
+                return (0, addr[1])
             raise EquivalenceError(f"load from address {addr[0]} outside memory on the counterexample input")
         deps = addr[1]
         if addr[0] in self.watch:
@@ -684,7 +711,9 @@ def memory_order_problems(sched: dict, terms: NormTerms, stores: dict[int, tuple
     """Loads that might observe a store of the same program (the model reads initial memory)."""
     stored = set(stores)
     problems = []
-    for t in sorted(reach):
+    # Every live load with a non-constant address, whether or not its value reaches an output
+    # (a value-dead load can still read a stored word, and its bound rules out traps).
+    for t in sorted(set(terms.live_loads.get(name, [])) | {t for t in reach if terms.defs[t][0] == "mem"}):
         term = terms.defs[t]
         if term[0] != "mem" or terms.const_value(term[1]) is not None:
             continue
@@ -695,7 +724,9 @@ def memory_order_problems(sched: dict, terms: NormTerms, stores: dict[int, tuple
             problems.append(f"{name}: load {terms.show(t)} (address in [{lo}, {hi}]) may read a word the program stores")
     # Constant-address loads (including those folded by the preconditions): exact, via the
     # dependency sets of the concrete interpreter.
-    interp = ConcreteTerms(layout.image, frozenset(stored))
+    # Lenient: an op that may trap is already recorded by the symbolic run; replaying it here
+    # must not turn a NOT PROVED into an input error.
+    interp = ConcreteTerms(layout.image, frozenset(stored), lenient=True)
     concrete, _ = build_program(sched, interp, name, mem_size=layout.mem_size)
     deps_of = {addr: val[1] for addr, (val, _) in concrete.items()}
     for load_id, addr in interp.loads:
@@ -754,6 +785,31 @@ class Sweeper:
         while t in self.parent and self.parent[t] != root:
             self.parent[t], t = root, self.parent[t]
         return root
+
+    def depends_on(self, a: int, b: int) -> bool:
+        """Whether term `a`, with children replaced by their representatives, reaches class `b`."""
+        target, seen, stack = self.find(b), set(), [self.find(a)]
+        while stack:
+            n = stack.pop()
+            if n == target:
+                return True
+            if n in seen:
+                continue
+            seen.add(n)
+            stack.extend(self.find(k) for k in _children(self.terms.defs[n]))
+        return False
+
+    def merge(self, a: int, b: int) -> None:
+        """Record a proved equality of `a` and `b`: the class whose representative depends on
+        the other becomes its child, so no representative ever reaches its own class (which
+        would make `_serialise` loop)."""
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.depends_on(ra, rb):
+            self.parent[ra] = rb
+        else:
+            self.parent[rb] = ra
 
     def rebuild(self, t: int) -> int:
         """`t` with every child replaced by its representative, re-normalised."""
@@ -831,12 +887,15 @@ class Sweeper:
             return not deep or T.iv[n] == TOP or T.defs[n][0] == "mem"
 
         out = []
+        open_: set[int] = set()  # expanded but not yet indexed: re-entering one is a cycle
         for root in roots:
             stack = [(root, False)]
             while stack:
                 n, expanded = stack.pop()
                 if n in index:
                     continue
+                if not expanded and n in open_:
+                    return None  # a representative reaches its own class: not serialisable
                 term = T.defs[n]
                 if is_cut(n):
                     index[n] = len(nodes)
@@ -845,6 +904,7 @@ class Sweeper:
                     continue
                 kids = [self.find(k) for k in _children(term)]
                 if not expanded:
+                    open_.add(n)
                     stack.append((n, True))
                     stack.extend((k, False) for k in reversed(kids) if k not in index)
                     continue
@@ -864,6 +924,7 @@ class Sweeper:
                     nodes.append((kind, *ki))
                 ivs.append(T.iv[n])
                 index[n] = len(nodes) - 1
+                open_.discard(n)
             out.append(index[root])
         return nodes, out, ivs
 
@@ -1076,12 +1137,14 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
             # them (then the word is a counterexample and Z3 would only time out).
             same = np.array_equal(terms.vals[a], terms.vals[b])
             if same and sweeper.prove(ra, rb) == "unsat":
-                sweeper.parent[rb] = ra
+                sweeper.merge(ra, rb)
                 continue
             unproved.append((addr, a, b))
     result.proved_words = len(words) - len(unproved)
 
-    for addr, a, b in unproved:
+    # A failed memory-order or trap audit means the model (loads read initial memory, no
+    # trap) may not be the machine's behaviour, so no sample is a trustworthy witness.
+    for addr, a, b in ([] if problems else unproved):
         diff = np.nonzero(terms.vals[a] != terms.vals[b])[0]
         if len(diff):
             s = int(diff[0])
@@ -1094,9 +1157,10 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
             result.difference = Difference(addr, layout.region(addr), value_a, value_b, image, s)
             break
     else:
-        result.unproved = [f"mem[{addr}] ({layout.region(addr)}): A {terms.show(a)}, B {terms.show(b)}"
-                           for addr, a, b in unproved]
-        result.unproved += problems
+        # Audit failures first: they are why no word may be trusted, proved or not.
+        result.unproved = list(problems)
+        result.unproved += [f"mem[{addr}] ({layout.region(addr)}): A {terms.show(a)}, B {terms.show(b)}"
+                            for addr, a, b in unproved]
         if sweeper.stats.unknown:
             result.unproved.append(f"{sweeper.stats.unknown} Z3 quer(y/ies) returned unknown (timeout {timeout_ms} ms)")
         result.verdict = "proved" if not unproved and not problems else "unproved"
@@ -1147,10 +1211,14 @@ def main(argv=None) -> int:
     ap.add_argument("--counterexample-out", metavar="PATH",
                     help="write the counterexample (initial memory image, word, both values) as JSON")
     args = ap.parse_args(argv)
-    with open(args.a) as f:
-        sched_a = json.load(f)
-    with open(args.b) as f:
-        sched_b = json.load(f)
+    try:
+        with open(args.a) as f:
+            sched_a = json.load(f)
+        with open(args.b) as f:
+            sched_b = json.load(f)
+    except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
+        print(f"ssa equivalence: input error: cannot read the scheduler JSON: {e}", file=sys.stderr)
+        return 3
     try:
         result = check_equivalence(sched_a, sched_b, args.values_only, args.samples, args.seed,
                                    args.timeout_ms, args.node_budget,
