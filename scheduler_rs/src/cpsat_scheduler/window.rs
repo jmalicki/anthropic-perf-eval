@@ -454,11 +454,15 @@ pub struct WindowProbeSpec {
     /// the deterministic budget never ran out and LNS never started. `[]` keeps them.
     pub ignore_subsolvers: Vec<String>,
     /// Leave pinned ops far from the window out of the cumulatives (default true; see
-    /// [`CpsatWindow::pruned_ops`]). Exact: it removes only intervals at cycles nothing can
+    /// [`CpsatWindow::pruned_ops`]). Meant to be exact (it disagreed with the full model on a
+    /// path-bit kernel, BUGS.md): it removes only intervals at cycles nothing can
     /// move to, and the post-solve checks still validate the whole schedule.
     pub prune: bool,
     /// Report path (JSON, rewritten after every window). Required.
     pub output: String,
+    /// Generator arguments of the run, recorded in the report so it states the model
+    /// settings it was solved with (e.g. `--cpsat-symmetry-rows`). Not interpreted.
+    pub generator_args: Vec<String>,
 }
 
 impl Default for WindowProbeSpec {
@@ -480,6 +484,7 @@ impl Default for WindowProbeSpec {
                 .collect(),
             prune: true,
             output: String::new(),
+            generator_args: Vec::new(),
         }
     }
 }
@@ -533,6 +538,25 @@ impl WindowProbeSpec {
     }
 }
 
+/// Size and end of the last window model solved (set by `schedule_ssa_cpsat` when it solves a
+/// window, read by the probe right after).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct WindowSolveStats {
+    /// Model size before presolve.
+    pub num_variables: usize,
+    pub num_constraints: usize,
+    /// CP-SAT's own wall and deterministic time for the solve.
+    pub wall_secs: f64,
+    pub deterministic_time: f64,
+    /// Why the solve ended: "proved" (optimal or infeasible), "deterministic budget",
+    /// "wall-clock backstop" (the wall limit fired before the deterministic budget: the
+    /// result depends on machine load) or "other".
+    pub stop: String,
+}
+
+/// See [`WindowSolveStats`].
+pub(crate) static LAST_WINDOW_SOLVE: std::sync::Mutex<Option<WindowSolveStats>> = std::sync::Mutex::new(None);
+
 /// One window solve in the probe report.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WindowProbeEntry {
@@ -563,6 +587,8 @@ pub struct WindowProbeEntry {
     pub shift_changes: usize,
     pub select_changes: usize,
     pub const_changes: usize,
+    /// Model size and stop reason of the solve (None if no window model was solved).
+    pub solve: Option<WindowSolveStats>,
 }
 
 /// The probe report written to [`WindowProbeSpec::output`].
@@ -1139,6 +1165,7 @@ pub fn run_window_probe(
             shift_changes: changes.0,
             select_changes: changes.1,
             const_changes: changes.2,
+            solve: LAST_WINDOW_SOLVE.lock().unwrap_or_else(|e| e.into_inner()).take(),
         };
         eprintln!(
             "[window probe] {} W={} [{}, {}) {}: {}, makespan {:?}, saved {} (bound {:?}), {} ops inside, {:.1}s; encoding changes: shift {}, select {}, const {}",

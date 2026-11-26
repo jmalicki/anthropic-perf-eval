@@ -22,7 +22,8 @@ The first runs (table A) used the model as it was then, which also contained:
 - the default `declared` symmetry rows (`sym_ord` / `sym_lex`), which BUGS.md records as not
   justified by a proven symmetry: they can raise the optimum, and they fix the cross-group
   order that a start-up re-interleave would change;
-- a scratch overcount (a select's delta counted on the vselect path, 56 words on the path
+- a scratch overcount (a select's delta counted on the vselect path: seven 8-word tables, 56
+  words of intervals, a 48-word higher peak (1,544 against the allocator's 1,496) on the path
   kernel; fixed in #92).
 
 Table B re-runs the windows on the fixed model of #92, from the current best references, with
@@ -63,6 +64,40 @@ pinned window probe skips the checked anchor rows by design (CLAUDE.md), so the 
 repeats the `none` row and is not a separate test of checked symmetry. Reports:
 `docs/window_probe/rescoped/{PATHB,INDEXB}_{declared,none,checked}_{startup,rolling}.json`.
 
+Commands for table B (run from the #92 branch, `section-check-timeline`, at 0d63e67):
+
+```bash
+COMMON="--rounds 16 --greedy-barriers none --greedy-priority wavefront --greedy-split-shift \
+  --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 \
+  --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored"
+REW="--reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-justify 10"
+PATHB="$COMMON --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path \
+  --greedy-alu-priority native-first --greedy-flow-priority chain-first $REW"
+INDEXB="$COMMON --emission-plan docs/emission_plans/flow90.json --select-bit-source index $REW"
+G="--cpsat-split-shift-hint --cpsat-greedy-bounds policy-only"
+P="uv run python -m scripts.window_optimality_probe --rounds 16 --encodings free \
+  --deterministic-time 60 --time-limit 900 --workers 4 --no-validate --no-prune"
+STARTUP="--window-sizes 60 110 --stride-fraction 0.5 --cycle-range 0 61 --no-rolling"
+ROLLING="--window-sizes 60 --no-sweep"
+# for K in PATHB INDEXB, rows:
+#   declared: $P $STARTUP --report ${K}_declared_startup.json -- ${!K} $G --cpsat-symmetry-rows declared
+#             $P $ROLLING --report ${K}_declared_rolling.json -- ${!K} $G --cpsat-symmetry-rows declared
+#   none:     ... -- ${!K} $G --cpsat-symmetry-rows none --cpsat-greedy-alap-slack none
+#   checked:  ... -- ${!K} $G --cpsat-symmetry-rows checked --cpsat-greedy-alap-slack none
+# Reduced vs full (path, pipeline greedy 1,032):
+#   $P(without --no-prune) --window-sizes 60 --stride-fraction 0.5 --cycle-range 30 61 --no-rolling \
+#     -- $COMMON --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path \
+#        --greedy-alu-priority native-first --greedy-flow-priority chain-first --cpsat-split-shift-hint
+#   and the same with --no-prune.
+```
+
+The reports of these runs predate the probe recording its generator arguments: the declared,
+none and checked reports differ only in wall times. The probe now writes `generator_args` into
+the report's spec and, per window, the model size and the stop reason (`solve`:
+`num_variables`, `num_constraints`, `deterministic_time`, `stop` = proved / deterministic
+budget / wall-clock backstop); `docs/window_probe/rescoped/PATHB_none_rolling_recorded.json`
+is one of the runs regenerated with it.
+
 **What this shows:** neither the symmetry rows, nor the ALAP cap, nor the scratch overcount
 hid a gain of this kind. In no window of either best kernel, start-up or later, can the rest
 of the schedule move earlier as a block. Whether a re-interleaving of the later schedule could
@@ -83,7 +118,10 @@ What a shorter start-up would take:
   admission experiments (docs/GREEDY_CONST_CHOICE.md, docs/STALL_DEADLOCK.md) covered part of
   that and found nothing.
 
-## What the probe could and could not take
+## What the probe could and could not take (table A runs)
+
+This section describes the table A runs; table B's references are the best kernels (1,012 /
+1,033), carried with `--cpsat-greedy-bounds policy-only`.
 
 - **Reference.** The probe takes its reference from the CP-SAT pipeline's greedy, which runs
   with full bounds (ASAP deferral, capacity deferral) and gives **1,032** (path) and **1,045**
@@ -101,10 +139,10 @@ What a shorter start-up would take:
   budget check counts liveness on the cycle timeline (1,597 > 1,535 for a schedule whose
   exact peak is 1,483) and starts a no-shift feasibility repair of the whole kernel, which
   found nothing in 600 s (without shifts the vector ALU alone needs 1,220 cycles).
-  `CPSAT_SECTION_CHECK_TIMELINE=model` (analysis only, new) makes the check use the model's own
-  timeline; the section then fits (1,533). The check has no per-lane shifted cycles and can
-  miss an over-budget section; the probe's all-fixed check would then reject the reference,
-  so it cannot produce an invalid kernel unnoticed.
+  The table A runs used `CPSAT_SECTION_CHECK_TIMELINE=model` (an analysis switch, removed in
+  #92), which made the check use the model's own timeline; the section then fit (1,533). That
+  check had no per-lane shifted cycles and could miss an over-budget section; the probe's
+  all-fixed check would then have rejected the reference.
 
 ## The reduced and full models disagreed
 
@@ -121,7 +159,8 @@ kernel the two models disagreed:
 
 Which model was right is not shown. The dropped constraint was never identified, and the
 1,031 schedule was never lowered and validated on its own. The full model of the time was
-itself too tight: it carried the 56-word delta overcount fixed in #92. So the 1-cycle gains
+itself too tight: it carried the delta overcount fixed in #92 (seven 8-word tables, 56 words;
+48 words at the peak). So the 1-cycle gains
 may have been real and the full model wrong. There is no tool here that lowers a rolled
 schedule without one of the two models, so this stays open (BUGS.md).
 
@@ -132,8 +171,13 @@ Re-run on the #92 model, same reference (path, pipeline greedy, 1,032), W=60:
 | [30, 90) | 0 saved, bound 1, ended on the budget (475 s) | 0 saved, optimal (4.6 s) |
 | [60, 120) | 0 saved, bound 1, ended on the budget (403 s) | 0 saved, optimal (4.7 s) |
 
-With the fixed model the reduced model no longer finds the 1-cycle schedules, and the full
-model proves there are none. Reports: `docs/window_probe/rescoped/i10_{reduced,full}.json`.
+No disagreement was observed, but that settles nothing: the reduced runs did not close
+(bound 1 left open on both windows) while the full model proved 0. #92's fix only removes
+demand, so a schedule the old reduced model accepted should still be feasible in the new
+reduced model while the new full model proves it impossible; the disagreement most likely
+persists and the reduced run did not find that schedule within its budget. These runs used
+#92's branch before it had main's #79 change to `restrict_to_window` (producers of ALU-derived
+operands kept). Reports: `docs/window_probe/rescoped/i10_{reduced,full}.json`.
 
 The rolling pass is protected by its full-model re-check. Sweep rows are not re-checked, so
 reduced-model sweep gains should not be trusted without `--no-prune`. On the
@@ -167,5 +211,6 @@ Table B used the #92 branch (`section-check-timeline`) with `--cpsat-greedy-boun
 --cpsat-split-shift-hint`, the three rewrites and `--greedy-justify 10`, plus the model setting.
 
 All results are probe measurements on CP-SAT models of the emitted ops, not recorded kernel
-results; the only kernels built here are the references (1,034 and 1,047 simulated), which
-are worse than the best kernels and not results.
+results. The only kernels built in the table A runs are their references (1,034 and 1,047
+simulated), worse than the best kernels and not results; table B builds no kernel
+(`--no-validate`).
