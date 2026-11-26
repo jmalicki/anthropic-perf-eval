@@ -116,3 +116,133 @@ uv run generate_ssa_kernel.py <best flags> --emission-plan docs/emission_plans/f
 
 Tests: `tests/test_critical_path_rewrites.py` (each rewrite proved, validated, its op-count
 delta, and the chain it shortens, at 6 rounds).
+
+## Justification on the best kernels (`--greedy-justify 10`)
+
+Forward/backward justification (docs/GREEDY_SHAPE_ABLATION.md section 13) applied to the
+best flags above. Justification now models ALU-derived constants (`--greedy-const-policy`):
+a derived constant is scheduled after both producers, and both stay live to its cycle in the
+pass's scratch check and in its address-assignment trial. Before, the pass skipped any
+schedule with one. All rows: 16 rounds, `--use-greedy --validate`, PROVED and PASSED, no
+build over the scratch budget unless marked.
+
+Data: the sweep, rewrites and neighbours tables below are
+`docs/emission_plans/justify_on_best_sweep.json` (every row with its command line), rebuilt
+and compared by `uv run python -m scripts.justify_on_best_sweep` and by the ci_only test
+`tests/test_justify_on_best_sweep.py`. The justify 0 / 10 rows of the removal table are
+pinned by `tests/test_justify_on_best_pin.py` (ci_only); the justify 50 column was measured
+once and is not in the data.
+
+**What this branch's code change does and does not explain.** The change is that
+justification now models ALU-derived constants, so it runs with `--greedy-const-policy
+alu-first` (before, it skipped such schedules): that is the `alu-first` rows (1,026 -> 1,016, with R16 `--reassociate-gather-xor`; without R16 it is 1,019).
+The headline 1,012 / 1,033 uses the default const policy (no derived constants) and does not
+depend on it: the neighbours table rebuilt on `critical-path` (#91, without this change)
+gives the same cycles in every row. It is a measurement recorded here.
+
+**Measured by removal** (justify on/off, every other flag fixed; best flags + path
+`--reassociate-gather-xor` + chain-first + native-first, index `--index-early-terms final`):
+
+| Configuration | justify 0 | justify 10 | justify 50 |
+|---|---|---|---|
+| index | 1,038 / 1,040 | 1,038 / 1,040 | 1,038 / 1,040 |
+| path, `alu-first` | 1,026 / 1,028 | **1,016 / 1,018** | 1,016 / 1,018 |
+| path, default const policy | 1,031 / 1,033 | **1,016 / 1,018** | 1,016 / 1,018 |
+
+(scheduled / simulator cycles). The 1,026 interaction does not stack with justification:
+both const policies end at 1,016. Peak scratch 1,497 words (alu-first) and 1,520 (default).
+
+**Index plan, why nothing changes:** not a guard. With `SCHEDULER_DEBUG=1` every forward
+pass comes out at exactly 1,038 and the backward passes at 1,038 to 1,046, so no candidate is
+strictly shorter and none is checked. A plateau of the list scheduler, not a proven optimum
+(the static bound is 1,028).
+
+### Sweep (all with `--greedy-justify 10`)
+
+Shape, with each plan's rewrites as above (path also `alu-first`); cycles, "fail" = the
+greedy itself exceeded the scratch budget (peak 1,728), so justification did not run and the
+build failed:
+
+| stagger / in flight | path, prio | path, no prio | index, prio | index, no prio |
+|---|---|---|---|---|
+| 8 / 24 | 1,030 | 1,032 | 1,061 | 1,057 |
+| 8 / 32 | **1,016** | fail | 1,038 | 1,038 |
+| 9 / 24 | 1,027 | 1,033 | 1,061 | 1,061 |
+| 9 / 32 | **1,016** | fail | 1,038 | 1,038 |
+| 10 / 24 | 1,028 | 1,035 | 1,063 | 1,059 |
+| 10 / 32 | **1,016** | 1,018 | 1,038 | 1,038 |
+
+Robustness: with 32 groups in flight and the priorities, path is 1,016 at staggers 8, 9 and
+10 (before justification the same pair gave 1,067 and 1,040 at 8 and 10); index is 1,038 at
+all three. 24 in flight is worse on both plans.
+
+Rewrites (stagger 9, 32 in flight; path with chain-first + native-first, index without);
+cycles, with `alu-first` off / on:
+
+| Rewrites | path | index |
+|---|---|---|
+| none | 1,019 / 1,019 | 1,039 / 1,039 |
+| R16 | 1,016 / 1,016 | 1,036 / 1,036 |
+| R17 final | 1,018 / 1,018 | 1,038 / 1,038 |
+| R16 + R17 final | 1,015 / 1,015 | 1,035 / 1,035 |
+| R18 first-pass | 1,016 / 1,016 | 1,037 / 1,037 |
+| R18 first-pass + R16 + R17 final | **1,012 / 1,012** | **1,033 / 1,033** |
+
+The rewrites lowered the static bound but the plain greedy did not follow (section 3);
+with justification it does: all three together give path **1,012** (1,014 simulated) and
+index **1,033** (1,035), the lowest of the sweep, with or without `alu-first`. Peak scratch
+1,401 to 1,453 words.
+
+`--greedy-budget-force stall` at inflation 0.95 and 0.98 (best path / index rows above):
+1,016 / 1,038 in both, unchanged.
+
+**The new bests and their neighbours** (R18 first-pass + R16 + R17 final, justify 10; path
+with chain-first + native-first unless noted):
+
+| Setting | path | index |
+|---|---|---|
+| stagger 9, 32 in flight (best) | **1,012 / 1,014** | **1,033 / 1,035** |
+| stagger 8 | 1,012 | 1,033 |
+| stagger 10 | 1,012 | 1,035 |
+| 28 in flight | 1,014 | 1,040 |
+| 24 in flight | 1,026 | 1,061 |
+| path without the priorities / index with them | 1,012 | 1,033 |
+| same, **justify 0** (measured by removal) | 1,044 | 1,047 |
+
+Both best kernels pass `./scripts/check_upstream.sh --strict` (path 1,014 simulated, 145.7x;
+index 1,035, 142.7x). Path 1,012 holds at staggers 8 to 10 and with or without the
+priorities; the gain needs 32 groups in flight (28: +2, 24: +14). Justification is worth 32
+cycles on path and 14 on index with these rewrites: without it the rewrites run slower than
+the baseline (section 3), with it they give the best kernels. Pinned by
+`tests/test_justify_on_best_pin.py` (ci_only; also the `alu-first` pair 1,026 -> 1,016, the
+only rows that need this branch's change).
+
+**As a CP-SAT hint (measured on a local merge, not reproducible from this branch).** The
+justified schedules are solutions of the CP-SAT model. Checked with the window probe's
+all-fixed check (every op pinned) on `section-check-timeline` (#92, 87f4e80, its
+scratch-model fix) with this branch merged in locally and never pushed; on this branch alone
+the per-section check overcount (BUGS.md) blocks it, so the result cannot be reproduced here
+until #92 lands. Best flags plus
+`--greedy-justify 10 --cpsat-split-shift-hint`, `--no-sweep --no-rolling`:
+
+| Plan | greedy (CP-SAT pipeline, full bounds) | justified, inside every ASAP/ALAP domain | all-fixed check |
+|---|---|---|---|
+| path, R16 + R17 final + R18 first-pass | 1,046 | 1,012 (0 domain rejections) | optimal, makespan 1,012 |
+| index, the same rewrites | 1,044 | 1,033 | optimal, makespan 1,033 |
+
+Both final kernels PROVED and PASSED. So the justified schedule survives as the hint of a
+whole-program or windowed CP-SAT solve with these flags; no CP-SAT improvement was run here.
+
+```bash
+# 1,016 (path, R16, alu-first optional)
+uv run generate_ssa_kernel.py --rounds 16 --use-greedy --validate \
+  --greedy-barriers none --greedy-priority wavefront --greedy-split-shift \
+  --pressure-inflation-threshold 0.95 --greedy-load-priority final-last \
+  --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored \
+  --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path \
+  --greedy-alu-priority native-first --greedy-flow-priority chain-first \
+  --reassociate-gather-xor --greedy-justify 10 --save-kernel k.json
+# 1,012 (path) / 1,033 (index, flow90.json, no priorities, no path bits): add
+#   --index-early-terms final --select-xor-pushdown first-pass
+./scripts/check_upstream.sh --strict --kernel k.json
+```

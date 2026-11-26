@@ -738,3 +738,36 @@ fn test_rule_reports_carry_the_assumptions_used() {
     assert!(post_wrap.n_sites() > 0);
     assert!(post_wrap.assumptions().is_empty(), "{:?}", post_wrap.facts);
 }
+
+#[test]
+fn test_index_rules_report_no_assumption_when_refused() {
+    use super::prune_index::apply_prune_index;
+    // A trace id on an op the rule removes (no op carries it afterwards) refuses the edit; a
+    // refused rewrite relied on nothing, so no assumption is reported.
+    let spec = ProblemSpec { rounds: 2, ..Default::default() };
+    let p = raw_program(&spec);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    // prune-index: the initial-index load that only the zero-factor update reads (the edit
+    // drops it as dead).
+    let rule = PruneIndexRule::for_problem(256);
+    let site = rule.find_sites(&g, p.zero_vreg).0.into_iter().find(|s| s.kind == PruneKind::ZeroUpdate).unwrap();
+    let zero_update = def(&p, site.zero.expect("the index shown to be 0"));
+    assert_eq!(p.ops[zero_update].opcode, Opcode::Vload, "{:?}", p.ops[zero_update]);
+    let (_, ok) = apply_prune_index(clone_program(&p), &rule, |_| true).unwrap();
+    assert!(ok.assumptions().contains(&"initial-indices-zero"), "{:?}", ok.assumptions());
+    let mut q = clone_program(&p);
+    q.ops[zero_update].trace_id = Some("update".into());
+    let (_, refused) = apply_prune_index(q, &rule, |_| true).unwrap();
+    assert!(refused.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", refused.refused);
+    assert!(refused.assumptions().is_empty(), "{:?}", refused.assumptions());
+    // values-only: an index store.
+    let rule = ValuesOnlyRule::for_problem(256);
+    let (_, ok) = apply_values_only(clone_program(&p), &rule, |_| true).unwrap();
+    assert!(ok.assumptions().contains(&"indices-not-observed"), "{:?}", ok.assumptions());
+    let mut q = clone_program(&p);
+    let store = found_store(&p, 0);
+    q.ops[store].trace_id = Some("store".into());
+    let (_, refused) = apply_values_only(q, &rule, |_| true).unwrap();
+    assert!(refused.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", refused.refused);
+    assert!(refused.assumptions().is_empty(), "{:?}", refused.assumptions());
+}

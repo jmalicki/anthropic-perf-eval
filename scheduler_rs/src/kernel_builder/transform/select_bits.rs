@@ -578,6 +578,8 @@ pub fn apply_select_bits(
         Finished::Done(program, report) => (program, report),
         Finished::Refused(program, why) => {
             report.refused = Some(why);
+            // Nothing was rewritten, so nothing relied on the sites' facts (assumptions).
+            report.facts.clear();
             report.sites = Default::default();
             report.site_classes = Default::default();
             return Ok((program, report));

@@ -1255,6 +1255,9 @@ impl CounterTrace {
 ///   op's cycle (split shifts); empty otherwise
 /// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds (address assignment's
 ///   `select_fma_ops`: their reads are held to cycle + 1)
+/// * `const_alu_derive_ops` - ConstChoice ops derived on the scalar ALU, by op id (address
+///   assignment's `const_alu_derive_ops`: the producers of both operands stay live to the
+///   derive's cycle)
 ///
 /// # Returns
 /// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
@@ -1264,9 +1267,10 @@ pub(super) fn interval_liveness_curve(
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     select_fma_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
     let (curve, peak, intervals, _, _) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops, const_alu_derive_ops)?;
     Ok((curve, peak, intervals))
 }
 
@@ -1278,6 +1282,7 @@ fn interval_liveness_inputs(
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     select_fma_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>, AddressAssignConfig, Vec<SsaOp>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
@@ -1293,6 +1298,7 @@ fn interval_liveness_inputs(
         vector_group_lanes: groups,
         shifted_alu_cycles: shifted_lane_cycles.clone(),
         select_fma_ops: select_fma_ops.clone(),
+        const_alu_derive_ops: const_alu_derive_ops.clone(),
         ..Default::default()
     };
     let intervals = compute_live_intervals(&config, &scheduled)?;
@@ -1332,10 +1338,16 @@ fn compare_counter_with_intervals(
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     trace: &CounterTrace,
     counter_peak: usize,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
 ) -> Result<LivenessAgreement, String> {
     let cycle_end_live = &trace.cycle_end_live;
-    let (curve, interval_peak, intervals) =
-        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &trace.fma_selects)?;
+    let (curve, interval_peak, intervals) = interval_liveness_curve(
+        ops,
+        vector_group_lanes,
+        shifted_lane_cycles,
+        &trace.fma_selects,
+        const_alu_derive_ops,
+    )?;
     let mut agreement = LivenessAgreement {
         counter_peak,
         counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
@@ -1778,7 +1790,7 @@ pub(crate) fn schedule_ssa_greedy_shaped(
             fixed.iter().filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma)).map(|(id, _)| *id),
         );
     }
-    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now)?;
+    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now, &diagnostics.const_alu_derive)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
         return Ok(first);
@@ -1849,6 +1861,7 @@ pub(crate) fn schedule_ssa_greedy_shaped(
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of split shifts
 /// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds
+/// * `const_alu_derive_ops` - ConstChoice ops derived on the scalar ALU, by op id
 ///
 /// # Returns
 /// The pool peaks, or the interval computation's error.
@@ -1857,9 +1870,10 @@ pub(super) fn scratch_pool_peaks(
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     select_fma_ops: &HashSet<usize>,
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
 ) -> Result<crate::address_assign::PoolPeaks, String> {
     let (_, _, intervals, config, scheduled) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops, const_alu_derive_ops)?;
     let spans = crate::address_assign::compute_value_spans(
         &intervals,
         &crate::address_assign::last_write_cycles(&scheduled, &config),
@@ -1892,6 +1906,11 @@ fn schedule_ssa_greedy_shaped_once(
     shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
     shifted_lane_cycles.clear();
+    // Defensive: this run's derivations only. Every caller today passes fresh diagnostics
+    // (the pipeline creates them, and the `pools` rerun replaces them with
+    // `GreedyDiagnostics::new` first), so this changes no build; it guards a caller that
+    // reuses one `GreedyDiagnostics` across runs.
+    diagnostics.const_alu_derive.clear();
     let mut trace = CounterTrace::default();
     let result = schedule_ssa_greedy_core(
         ops,
@@ -1919,7 +1938,7 @@ fn schedule_ssa_greedy_shaped_once(
     )?;
     // Memory edges are enforced by readiness; check the result (free when there are none).
     check_memory_edges(ops, |idx| ops[idx].cycle).map_err(|e| format!("greedy schedule: {}", e))?;
-    check_liveness_agreement(ops, vector_group_lanes, shifted_lane_cycles, &trace, result)
+    check_liveness_agreement(ops, vector_group_lanes, shifted_lane_cycles, &trace, result, &diagnostics.const_alu_derive)
 }
 
 /// Same as [`schedule_ssa_greedy_with_diagnostics`], and also returns the
@@ -1991,9 +2010,16 @@ fn check_liveness_agreement(
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
     trace: &CounterTrace,
     result: (usize, bool, usize),
+    const_alu_derive_ops: &HashMap<usize, crate::types::AluDeriveInfo>,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
-    let agreement =
-        compare_counter_with_intervals(ops, vector_group_lanes, shifted_lane_cycles, trace, result.2)?;
+    let agreement = compare_counter_with_intervals(
+        ops,
+        vector_group_lanes,
+        shifted_lane_cycles,
+        trace,
+        result.2,
+        const_alu_derive_ops,
+    )?;
     // SCHEDULER_LIVENESS_AGREEMENT: any value prints the comparison; `warn` also turns a
     // disagreement from an error into a warning.
     let mode = std::env::var("SCHEDULER_LIVENESS_AGREEMENT").ok();

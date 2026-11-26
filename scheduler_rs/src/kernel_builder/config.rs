@@ -27,12 +27,6 @@ pub use crate::architecture::anthropic_perf_eval::{SCRATCH_SIZE, VLEN};
 /// tree_reduce_max_depth is clamped to 0..=MAX_TREE_REDUCE_DEPTH.
 pub const MAX_TREE_REDUCE_DEPTH: u32 = 4;
 
-/// How the kernel represents each lane's tree index between rounds.
-///
-/// The reference index `idx` at tree depth `d` lies in `[2^d - 1, 2^(d+1) - 2]`
-/// (`R7-index-range-by-depth`). `Mirrored` tracks `n = L_d - idx` with
-/// `L_d = 2^(d+1) - 2` (`level_last_index`): the node's position in its level counted from
-/// the right. Proofs: `R9` to `R11` in `verification/rewrites.py`.
 /// Rounds whose round XOR is pushed below the top select of a cached-level select tree:
 /// `val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo)` (`R18-select-xor-pushdown`).
 /// The two XORs run in parallel with the branch bit's AND, so the chain from one round's
@@ -43,7 +37,8 @@ pub enum SelectXorPushdown {
     /// Never (default).
     #[default]
     None,
-    /// Rounds before the first wrap (the start-up: on the chain to the first gather).
+    /// The first pass down the tree: rounds 0 to `forest_height`, up to and including the
+    /// first wrap round (the start-up, on the chain to the first gather).
     FirstPass,
     /// Every cached-level select round.
     All,
@@ -67,6 +62,12 @@ pub enum IndexEarlyTerms {
     FirstGather,
 }
 
+/// How the kernel represents each lane's tree index between rounds.
+///
+/// The reference index `idx` at tree depth `d` lies in `[2^d - 1, 2^(d+1) - 2]`
+/// (`R7-index-range-by-depth`). `Mirrored` tracks `n = L_d - idx` with
+/// `L_d = 2^(d+1) - 2` (`level_last_index`): the node's position in its level counted from
+/// the right. Proofs: `R9` to `R11` in `verification/rewrites.py`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexForm {
     /// The reference index. Update per round: AND, SUB, multiply_add (3 vector ops).
@@ -885,6 +886,11 @@ pub struct CompilerConfig {
     /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
     /// split shifts).
     pub cpsat_split_shift_hint: bool,
+    /// When CP-SAT follows: the greedy that feeds it uses its bounds only for the pressure
+    /// policy, as the greedy-only pipeline does (`GreedyBoundsUsage::PolicyOnly`), so the warm
+    /// start is the greedy-only schedule (default: false, `Full`: ASAP deferral, clamping and
+    /// capacity deferral, a different and usually longer schedule).
+    pub cpsat_greedy_policy_bounds: bool,
     /// When the greedy shifts a vector op to the scalar ALU (default: `WhenFull`).
     pub greedy_shift_policy: GreedyShiftPolicyKind,
     /// Pace target for `greedy_shift_policy` `Pace`/`ReservePace`: vector ops to run as 8
@@ -1015,6 +1021,7 @@ impl Default for CompilerConfig {
             greedy_split_shift: false,
             greedy_justify_iterations: 0,
             cpsat_split_shift_hint: false,
+            cpsat_greedy_policy_bounds: false,
             greedy_shift_policy: GreedyShiftPolicyKind::default(),
             greedy_shift_target: None,
             greedy_load_priority: super::ssa_greedy::LoadPriority::Key,
