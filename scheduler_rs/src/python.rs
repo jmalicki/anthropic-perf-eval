@@ -1124,6 +1124,10 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 /// `merge_hash_stages` emits, op for op up to VReg numbering. Op ids are renumbered, so
 /// `forced_shifts` must name ops of the transformed program. See
 /// scheduler_rs/src/kernel_builder/transform/hash_merge.rs.
+/// "prune-index": the program `prune_dead_index` emits, from the ops (shared wrap zero, depth-0
+/// index update from an index shown to be 0, assuming the input indices start at 0); see
+/// transform/prune_index.rs. "values-only": declares the final indices unobserved (the program
+/// `values_only` emits after dead code elimination); see transform/values_only.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,
@@ -1390,6 +1394,8 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             scratch_model,
             cpsat_split_shift_hint,
             transforms,
+            transform_batch_size: Some(batch_size),
+            transform_n_nodes: Some(n_nodes),
             greedy_shift_policy: crate::kernel_builder::config::GreedyShiftPolicyKind::from_str(
                 greedy_shift_policy,
             )
@@ -1667,6 +1673,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         stats.set_item("cpsat_scratch_budget", b)?;
     }
     stats.set_item("valu_shifted", result.valu_shifted)?;
+    // Sites each `--transform` rewrote, in order: callers decide from the outcome (e.g. whether
+    // values-only removed the index stores), not from the request.
+    let transform_sites = PyList::empty(py);
+    for (name, sites) in &result.transform_sites {
+        transform_sites.append((name.as_str(), *sites))?;
+    }
+    stats.set_item("transform_sites", transform_sites)?;
     if let Some(ec) = result.empty_cycle_count {
         stats.set_item("empty_cycle_count", ec)?;
     }

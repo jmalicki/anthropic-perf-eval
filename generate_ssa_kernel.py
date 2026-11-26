@@ -89,6 +89,11 @@ def main():
                         help="Suppress verbose output from Rust scheduler")
 
     args = parser.parse_args()
+    # --values-only (emitter flag) and --transform values-only (declared output contract) both
+    # leave the final indices unwritten: validation then compares the values only. For a build
+    # this is decided again from the outcome (indices_unobserved_after_build); here it is the
+    # request, used only by --validate-only (which also reads what the saved kernel recorded).
+    requested_values_only = args.values_only or "values-only" in (getattr(args, "transform", None) or [])
 
     # Validate-only: load kernel and run validation, then exit
     if args.validate_only:
@@ -98,7 +103,7 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=args.values_only,
+            values_only=requested_values_only,
         )
 
     use_cpsat = not args.use_greedy
@@ -216,6 +221,10 @@ def main():
 
     cycles = stats["cycles"]
     speedup = BASELINE / cycles
+    indices_unobserved = indices_unobserved_after_build(args.values_only, getattr(args, "transform", None), stats)
+    if requested_values_only and not indices_unobserved:
+        print("\n  NOTE: --transform values-only rewrote no index store; the kernel stores the indices, "
+              "so validation compares them too.")
 
     print(f"\nResults:")
     print(f"  Build time: {build_time:.1f}s")
@@ -255,7 +264,7 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=args.values_only,
+            values_only=indices_unobserved,
             relaxed_scratch_size=simulator_scratch_size(scratch_size, stats.get("max_addr")) if relaxed else None,
         )
         marked = " [RELAXED SCRATCH: not valid on the machine]" if relaxed else ""
@@ -283,11 +292,11 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=args.values_only,
+            values_only=indices_unobserved,
             scratch_size=sim_scratch,
         )
         if correct:
-            print(f"  {passed_message(args.values_only)}")
+            print(f"  {passed_message(indices_unobserved)}")
         else:
             print(f"  FAILED - kernel produces incorrect output")
             return 1
@@ -295,11 +304,23 @@ def main():
     return 0
 
 
+def indices_unobserved_after_build(values_only_flag, transforms, stats):
+    """Whether the built kernel leaves the final indices unwritten: --values-only was set, or
+    --transform values-only rewrote at least one index store (stats["transform_sites"]). A
+    values-only transform that rewrote nothing (or was refused) leaves the stores in place, so the
+    indices must then be validated."""
+    if values_only_flag:
+        return True
+    if "values-only" not in (transforms or []):
+        return False
+    return any(name == "values-only" and sites > 0 for name, sites in stats.get("transform_sites", []))
+
+
 def passed_message(values_only):
     """The validation verdict line; says so when only the values were compared."""
     if values_only:
-        return ("PASSED (values only) - kernel produces correct values; --values-only kernels do not "
-                "store the final indices, so indices were not compared")
+        return ("PASSED (values only) - kernel produces correct values; --values-only and --transform "
+                "values-only kernels do not store the final indices, so indices were not compared")
     return "PASSED - kernel produces correct output"
 
 

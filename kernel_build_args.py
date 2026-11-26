@@ -279,13 +279,18 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "group in every round, as written by scripts/emission_structure.py (format: "
                             "solver/emission_plan.py). Replaces --cached-select, --tree-reduce-max-depth and "
                             "--depth4-select-rounds for the tree access. See docs/EMISSION_STRUCTURE_MODEL.md")
-    group.add_argument("--transform", action="append", choices=["hash-merge"], default=EMISSION_DEFAULTS["transform"],
+    group.add_argument("--transform", action="append", choices=["hash-merge", "prune-index", "values-only"], default=EMISSION_DEFAULTS["transform"],
                        metavar="RULE",
                        help="Rewrite the finished SSA program with RULE before scheduling (repeatable; applied in "
                             "order). hash-merge: find hash stages x = a*m + c; (x + d) ^ (x << k) from the ops "
                             "alone and rewrite them to (a*m + c+d) ^ (a*(m<<k) + (c<<k)), the program "
                             "--merge-hash-stages emits (proof: R8-hash-stage-merge-general; with --merge-hash-stages "
-                            "there is nothing left to merge and it warns). Off by default")
+                            "there is nothing left to merge and it warns). prune-index: share the wrap "
+                            "round's zero vector and replace multiply_adds with a factor shown to be 0 (the index "
+                            "update at depth 0) by their addend, assuming the input indices start at 0; the initial "
+                            "index load then dies (proofs: R12). values-only: declare the final indices unobserved, "
+                            "so the index stores stop being roots and dead code elimination does the rest; "
+                            "validation then compares values only. Off by default")
     return group
 
 
