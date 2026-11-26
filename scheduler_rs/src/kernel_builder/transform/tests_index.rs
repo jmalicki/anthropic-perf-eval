@@ -40,6 +40,16 @@ fn dce(p: &SsaProgram) -> SsaProgram {
 /// differed between `a` and `b` before recomputing and agree after.
 fn stale_alternatives(a: &mut SsaProgram, b: &mut SsaProgram) -> Vec<(i64, String, String)> {
     let before: Vec<_> = a.ops.iter().zip(&b.ops).map(|(x, y)| (x.const_alternatives.clone(), y.const_alternatives.clone())).collect();
+    // Only ALU derivations may differ (they depend on the constants before each op); Load and
+    // AddImm must already agree, or the rewrite lost (or gained) an encoding.
+    let non_alu = |alts: &Option<Vec<crate::types::ConstEncoding>>| -> Option<Vec<crate::types::ConstEncoding>> {
+        alts.as_ref().map(|v| v.iter().filter(|e| e.alu_opcode().is_none()).cloned().collect())
+    };
+    for (i, (x, y)) in a.ops.iter().zip(&b.ops).enumerate() {
+        if x.opcode == Opcode::ConstChoice || y.opcode == Opcode::ConstChoice {
+            assert_eq!(non_alu(&x.const_alternatives), non_alu(&y.const_alternatives), "op {} ({:?}): Load/AddImm encodings differ", i, x.produces_constant);
+        }
+    }
     for p in [&mut *a, &mut *b] {
         let alts = recompute_alternatives(&p.ops, p.zero_vreg.is_some(), |_| false);
         for (op, alt) in p.ops.iter_mut().zip(alts) {
@@ -207,9 +217,17 @@ fn combined(rounds: usize) {
                 let parity = check_parity(&spec, &order, &label);
                 programs.push((order, parity.program));
             }
+            // Both are rewrites of the same input: no emitter exception, every op equal.
             for (order, ops) in &programs[1..] {
-                let (d, _) = first_difference(ops, &programs[0].1);
-                assert!(d.is_none(), "{}: order {:?} differs from {:?}: {:?}", label, order, programs[0].0, d);
+                let first = ops.iter().zip(&programs[0].1).position(|(x, y)| x != y);
+                assert!(
+                    ops.len() == programs[0].1.len() && first.is_none(),
+                    "{}: order {:?} differs from {:?} at op {:?}",
+                    label,
+                    order,
+                    programs[0].0,
+                    first.map(|i| (&ops[i], &programs[0].1[i]))
+                );
             }
         }
     }

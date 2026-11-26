@@ -1,0 +1,139 @@
+name: CI (deep)
+
+# Deep tier: tests that run CP-SAT solves (pytest @pytest.mark.deep; Rust tests behind the
+# deep-tests feature). ci.yml runs everything else on every PR.
+#
+# Runner minutes are rationed, so this runs:
+#   - daily on main, and only if main has moved since the last finished deep run on main
+#     (otherwise it repeats that run's result: green if it passed, red if it failed);
+#   - by hand (Actions > CI (deep) > Run workflow), always;
+#   - on a PR that carries the `deep-ci` label (add it to PRs that change the CP-SAT model,
+#     its tuning, or anything else the deep tests guard). A PR without the label starts no job.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # daily 06:00 UTC
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-deep-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read  # the gate lists earlier runs of this workflow
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_FROM_PROJECT_ROOT: "1"
+  PYTEST_ADDOPTS: "--durations=30"
+
+jobs:
+  # Decides whether the deep jobs run. Skipped outright (no job, no minutes) on a PR without
+  # the label, and on a label event for some other label.
+  gate:
+    name: Deep tier needed?
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'deep-ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'deep-ci'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Scheduled: if main has not moved since the last finished deep run, repeat that run's
+          # result without spending minutes: green (deep jobs skipped) if it passed, red (this
+          # gate fails) if it failed. Cancelled runs do not count. The run in progress is not
+          # "completed", so it is not its own predecessor.
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/ci-deep.yml/runs?branch=main&status=completed&head_sha=${{ github.sha }}&per_page=50" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success" or .conclusion == "failure")][0] // empty | "\(.conclusion) \(.html_url)"')
+          sha="${{ github.sha }}"
+          case "$last" in
+            success\ *)
+              msg="main is still at ${sha:0:7}, which already passed the deep tier: ${last#success }. Deep jobs skipped."
+              echo "$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              echo "run=false" >> "$GITHUB_OUTPUT" ;;
+            failure\ *)
+              msg="main is still at ${sha:0:7}, which FAILED the deep tier: ${last#failure }. Not rerunning; fix main or rerun by hand."
+              echo "::error::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              exit 1 ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # The whole Rust suite with the deep-tests feature (the shallow tier ignores those tests).
+  rust:
+    name: Rust tests, deep (scheduler_rs)
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          # Explicit path: the default '**/uv.lock' glob walks the tree and dies with ELOOP on
+          # the self-referential symlink .claude/.cursor.
+          cache-dependency-glob: uv.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: test-deep
+
+      - name: Create project venv
+        run: uv sync
+
+      - name: Rust tests (all, with deep-tests)
+        run: ./scripts/test.sh rust
+
+  python:
+    name: Python tests, deep
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scheduler_rs -> target
+          key: release
+
+      - name: Create project venv
+        run: uv sync
+
+      - name: Build scheduler_rs (release)
+        run: ./scripts/build_scheduler_rs.sh --release
+
+      - name: Python tests (deep)
+        run: ./scripts/test.sh python-deep

@@ -200,11 +200,21 @@ pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool, foreign: impl Fn
 }
 
 /// Which ops dead code elimination keeps, by index.
+///
+/// A value named in a kept op's `keep_live` or `delta_vreg` is kept too (with what it reads):
+/// the emitter's dead code elimination follows `srcs` only, so on this private copy those
+/// entries are appended to `srcs`.
 fn dce_live(ops: &[SsaOp], program: &SsaProgram) -> Vec<bool> {
     let mut ops: Vec<SsaOp> = ops.to_vec();
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     for (i, op) in ops.iter_mut().enumerate() {
         op.id = i;
+        if let Some(keep) = op.keep_live.clone() {
+            op.srcs.extend(keep.into_iter().map(Operand::VReg));
+        }
+        if let Some(delta) = op.delta_vreg {
+            op.srcs.push(Operand::VReg(delta));
+        }
         if let Some(d) = op.dest {
             vreg_def.entry(d).or_insert(i);
         }
@@ -417,9 +427,10 @@ impl Surgery {
     /// * `at` - Original op index they go after.
     ///
     /// # Returns
-    /// An error if an op that stays in place reads one of them, or names its value in
-    /// `keep_live`, at or before `at`, if one is not before `at`, or if one was already moved
-    /// or removed (an op has one placement); then nothing is recorded.
+    /// An error if an op outside the group that is not removed reads one of them, or names its
+    /// value in `keep_live`, and is placed at or before `at` (its own position, or the op an
+    /// earlier `move_after` put it after), if one is not before `at`, or if one was already
+    /// moved or removed (an op has one placement); then nothing is recorded.
     pub fn move_after(&mut self, idxs: &[usize], at: usize) -> Result<(), String> {
         let group: BTreeSet<usize> = idxs.iter().copied().collect();
         let graph = SsaGraph::new(&self.program.ops, &self.program.vector_group_lanes);
@@ -435,15 +446,25 @@ impl Surgery {
             if self.removed.contains(&idx) {
                 return Err(format!("op {} is removed", idx));
             }
-            let stays = |r: &usize| !group.contains(r) && !self.removed.contains(r) && !self.moved.contains_key(r);
-            if let Some(&r) = graph.readers(idx).iter().find(|&&r| r <= at && stays(&r)) {
+            // A reader outside the group that is placed at or before `at`.
+            let before_at = |r: &usize| {
+                !group.contains(r) && !self.removed.contains(r) && self.moved.get(r).copied().unwrap_or(*r) <= at
+            };
+            if let Some(&r) = graph.readers(idx).iter().find(|&r| before_at(r)) {
                 return Err(format!("op {} is read by op {} before op {}", idx, r, at));
             }
-            let keeper = (0..=at).find(|&r| {
-                stays(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
+            let keeper = (0..self.program.ops.len()).find(|&r| {
+                before_at(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
             });
             if let Some(r) = keeper {
                 return Err(format!("op {} is kept live by op {} before op {}", idx, r, at));
+            }
+            // A new op queued next to an original op at or before `at` that reads it (or keeps
+            // it live).
+            let queued = self.before.range(..=at).chain(self.after.range(..=at));
+            let reads_idx = |op: &SsaOp| op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| definer(v) == Some(idx));
+            if let Some((&k, _)) = queued.into_iter().find(|(_, slots)| slots.iter().any(|s| matches!(s, Slot::New(op) if reads_idx(op)))) {
+                return Err(format!("op {} is read by an op inserted next to op {} before op {}", idx, k, at));
             }
         }
         for idx in group {
@@ -483,7 +504,9 @@ impl Surgery {
 
     /// Every reader of `old` reads `new` instead.
     pub fn replace_uses(&mut self, old: VReg, new: VReg) {
-        self.rename.insert(old, new);
+        if old != new {
+            self.rename.insert(old, new);
+        }
     }
 
     /// The scalar constant `value` visible right after original op `after`: an existing
@@ -604,12 +627,20 @@ impl Surgery {
     /// reason, or an error for an inconsistency.
     pub fn finish_or_refuse(self) -> Result<Finished, String> {
         let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
+        // Every rename chain must end (resolve below then terminates).
+        for &start in rename.keys() {
+            let mut seen: HashSet<VReg> = HashSet::from([start]);
+            let mut v = start;
+            while let Some(&to) = rename.get(&v) {
+                if !seen.insert(to) {
+                    return Err(format!("rename cycle through {:?}", start));
+                }
+                v = to;
+            }
+        }
         let resolve = |mut v: VReg| {
-            let mut guard = 0;
             while let Some(&to) = rename.get(&v) {
                 v = to;
-                guard += 1;
-                assert!(guard < 1000, "rename cycle");
             }
             v
         };
@@ -617,20 +648,18 @@ impl Surgery {
 
         // 1. Splice, with the origin of each op.
         let mut seq: Vec<(SsaOp, Option<usize>)> = Vec::with_capacity(program.ops.len());
+        // A moved op that was removed afterwards is not placed anywhere.
         let slot = |s: Slot| match s {
-            Slot::New(op) => (op, None),
-            Slot::Moved(j) => (program.ops[j].clone(), Some(j)),
+            Slot::New(op) => Some((op, None)),
+            Slot::Moved(j) if removed.contains(&j) => None,
+            Slot::Moved(j) => Some((program.ops[j].clone(), Some(j))),
         };
         for (i, op) in program.ops.iter().enumerate() {
-            for s in before.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
+            seq.extend(before.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
             if !removed.contains(&i) && !moved.contains_key(&i) {
                 seq.push((op.clone(), Some(i)));
             }
-            for s in after.remove(&i).unwrap_or_default() {
-                seq.push(slot(s));
-            }
+            seq.extend(after.remove(&i).unwrap_or_default().into_iter().filter_map(slot));
         }
         // 2. Rewire.
         if !rename.is_empty() {
@@ -688,11 +717,13 @@ impl Surgery {
             let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
             let dangling = |op: &SsaOp| {
-                op_reads(op).any(|v| {
+                op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| {
+                    // Defined, a group alias all of whose lanes are defined, or a lane of a
+                    // defined vector: anything else is gone.
                     Some(v) != program.zero_vreg
                         && graph.def_index(v).is_none()
-                        && graph.group_lanes(v).is_none()
-                        && graph.element_of(v).is_none()
+                        && !graph.group_lanes(v).map_or(false, |ls| ls.iter().all(|l| graph.def_index(*l).is_some()))
+                        && !graph.element_of(v).map_or(false, |(vec, _)| graph.def_index(vec).is_some())
                 })
             };
             let before_len = kept.len();

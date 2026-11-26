@@ -103,6 +103,7 @@ def test_search_flags_travel_in_kwargs_and_run_options():
     assert json.loads(overridden["cpsat_tuning_json"]) == {"workers": 3}
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("bad", ['{"wrokers": 4}', '{"workers": 0}', '{"workers": 10001}', '{"workers": "8"}', "[1]",
                                  '{"extra_subsolvers": ["objective_lb"]}'])
 def test_binding_rejects_bad_tuning(bad):
@@ -126,6 +127,7 @@ def test_cli_rejects_bad_worker_counts(argv):
 # The flags reach the solver
 # ----------------------------------------------------------------------------
 
+@pytest.mark.deep
 def test_default_solver_parameters_are_unchanged(tmp_path):
     output, _, _, _ = _run(tmp_path, "default", [], quiet=False)
     params = _solver_parameters(output)
@@ -134,6 +136,7 @@ def test_default_solver_parameters_are_unchanged(tmp_path):
     assert "subsolvers" not in params
 
 
+@pytest.mark.deep
 def test_search_flags_reach_the_solver(tmp_path):
     output, _, sched, _ = _run(
         tmp_path, "tuned",
@@ -151,6 +154,7 @@ def test_search_flags_reach_the_solver(tmp_path):
     assert recorded["workers"] == 3 and recorded["interleave_search"] is False
 
 
+@pytest.mark.deep
 def test_search_flags_do_not_change_the_model(tmp_path):
     """Workers and search mode are solver parameters; the model handed over stays the same."""
     _, base, _, _ = _run(tmp_path, "base", [])
@@ -158,6 +162,7 @@ def test_search_flags_do_not_change_the_model(tmp_path):
     assert not _model_diff(base, tuned)
 
 
+@pytest.mark.deep
 def test_explicit_defaults_build_the_default_kernel(tmp_path):
     """Passing every default explicitly is the same build as passing nothing."""
     _, base_model, _, base_kernel = _run(tmp_path, "base", [])
@@ -175,6 +180,7 @@ def _variables(model):
 # Objective
 # ----------------------------------------------------------------------------
 
+@pytest.mark.deep
 def test_default_objective_has_the_tie_breaker(tmp_path):
     _, model_path, _, _ = _run(tmp_path, "base", [])
     model = diff_cpsat_models.load(str(model_path))
@@ -184,6 +190,7 @@ def test_default_objective_has_the_tie_breaker(tmp_path):
     assert any(c.name == "tie_sum_completion" for c in model.constraints)
 
 
+@pytest.mark.deep
 def test_makespan_only_objective_reaches_the_solver(tmp_path):
     output, model_path, sched, _ = _run(tmp_path, "makespan", ["--cpsat-objective", "makespan"], quiet=False)
     model = diff_cpsat_models.load(str(model_path))
@@ -200,12 +207,14 @@ def test_makespan_only_objective_reaches_the_solver(tmp_path):
     assert 0 < data["lb_cycles"] <= data["total_cycles"]
 
 
+@pytest.mark.deep
 def test_explicit_default_objective_is_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", [])
     _, same, _, _ = _run(tmp_path, "explicit", ["--cpsat-objective", "makespan+tiebreak"])
     assert not _model_diff(base, same)
 
 
+@pytest.mark.deep
 @pytest.mark.timeout(600)
 def test_lane_model_reaches_the_model_and_run_options(tmp_path):
     """--cpsat-lane-model: free is the default model; the others add their rows and are recorded.
@@ -238,12 +247,14 @@ def _cycle_slack(model):
 # Greedy ALAP cap and horizon
 # ----------------------------------------------------------------------------
 
+@pytest.mark.deep
 def test_default_alap_cap_is_greedy_plus_15(tmp_path):
     _, model_path, _, _ = _run(tmp_path, "base", [])
     slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
     assert slack and max(slack) == 15
 
 
+@pytest.mark.deep
 def test_alap_slack_reaches_the_model(tmp_path):
     _, model_path, sched, _ = _run(tmp_path, "slack5", ["--cpsat-greedy-alap-slack", "5"])
     slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
@@ -252,6 +263,7 @@ def test_alap_slack_reaches_the_model(tmp_path):
         assert json.load(f)["run_options"]["cpsat_tuning"]["greedy_alap_slack"] == 5
 
 
+@pytest.mark.deep
 def test_alap_cap_can_be_switched_off(tmp_path):
     _, model_path, sched, _ = _run(tmp_path, "nocap", ["--cpsat-greedy-alap-slack", "none"])
     slack = _cycle_slack(diff_cpsat_models.load(str(model_path)))
@@ -260,6 +272,7 @@ def test_alap_cap_can_be_switched_off(tmp_path):
         assert json.load(f)["run_options"]["cpsat_tuning"]["greedy_alap_slack"] is None
 
 
+@pytest.mark.deep
 def test_horizon_guards_can_be_dropped(tmp_path):
     """The horizon is max(greedy makespan + 20, max-latency critical path, number of ops)."""
     def horizon(tag, extra):
@@ -284,6 +297,7 @@ def test_horizon_guards_can_be_dropped(tmp_path):
     assert tight == greedy_makespan + 20
 
 
+@pytest.mark.deep
 def test_explicit_default_slack_and_horizon_are_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", [])
     _, same, _, _ = _run(tmp_path, "explicit", ["--cpsat-greedy-alap-slack", "15", "--cpsat-horizon-num-ops",
@@ -316,6 +330,7 @@ def _cumulatives(model):
     return {c.name: c.cumulative for c in model.constraints if c.WhichOneof("constraint") == "cumulative"}
 
 
+@pytest.mark.deep
 def test_makespan_interval_reaches_the_model(tmp_path):
     _, base_path, _, _ = _run(tmp_path, "base", [])
     output, tuned_path, sched, _ = _run(tmp_path, "tail", ["--cpsat-makespan-interval"], quiet=False)
@@ -349,6 +364,7 @@ def test_makespan_interval_reaches_the_model(tmp_path):
         assert json.load(f)["run_options"]["cpsat_tuning"]["makespan_interval"] is True
 
 
+@pytest.mark.deep
 def test_push_tasks_toward_start_reaches_the_solver(tmp_path):
     output, model_path, _, _ = _run(tmp_path, "push", ["--cpsat-push-tasks-toward-start"], quiet=False)
     assert "push_all_tasks_toward_start: true" in _solver_parameters(output)
@@ -356,6 +372,7 @@ def test_push_tasks_toward_start_reaches_the_solver(tmp_path):
     assert not _model_diff(base_path, model_path), "a solver parameter, not a model change"
 
 
+@pytest.mark.deep
 def test_makespan_interval_off_is_the_default_model(tmp_path):
     output, base, _, _ = _run(tmp_path, "base", [], quiet=False)
     assert "push_all_tasks_toward_start" not in _solver_parameters(output)
@@ -375,6 +392,7 @@ PROPAGATOR_PARAMETERS = [
 ]
 
 
+@pytest.mark.deep
 def test_cumulative_propagators_default_to_off(tmp_path):
     output, _, _, _ = _run(tmp_path, "base", [], quiet=False)
     params = _solver_parameters(output)
@@ -382,6 +400,7 @@ def test_cumulative_propagators_default_to_off(tmp_path):
         assert name not in params
 
 
+@pytest.mark.deep
 def test_cumulative_propagators_reach_the_solver(tmp_path):
     output, model_path, sched, _ = _run(
         tmp_path, "props", ["--cpsat-cumulative-propagators", "all", "--cpsat-ttef-max-intervals", "100000"],
@@ -400,6 +419,7 @@ def test_cumulative_propagators_reach_the_solver(tmp_path):
     assert not _model_diff(base_path, model_path), "solver parameters, not a model change"
 
 
+@pytest.mark.deep
 def test_one_propagator_sets_only_its_parameter(tmp_path):
     output, _, _, _ = _run(tmp_path, "overload", ["--cpsat-cumulative-propagators", "overload_checker"], quiet=False)
     params = _solver_parameters(output)
@@ -408,6 +428,7 @@ def test_one_propagator_sets_only_its_parameter(tmp_path):
     assert "use_hard_precedences_in_cumulative" not in params
 
 
+@pytest.mark.deep
 def test_hard_precedences_sets_both_solver_parameters(tmp_path):
     """OR-Tools 9.15 builds the precedence list only under exploit_all_precedences."""
     output, _, _, _ = _run(tmp_path, "prec", ["--cpsat-cumulative-propagators", "hard_precedences"], quiet=False)
@@ -446,6 +467,7 @@ def test_new_constraint_groups_are_listed():
     assert scheduler_rs.OptionalConstraintGroup.flow_cumulative.name == "flow_cumulative"
 
 
+@pytest.mark.deep
 def test_conditional_makespan_rows_can_be_left_out(tmp_path):
     _, base_path, _, _ = _run(tmp_path, "base", [])
     _, lean_path, sched, _ = _run(tmp_path, "lean", ["--disable-cpsat-constraints", "conditional_makespan"])
@@ -464,6 +486,7 @@ def test_conditional_makespan_rows_can_be_left_out(tmp_path):
         assert json.load(f)["run_options"]["disabled_cpsat_constraints"] == ["conditional_makespan"]
 
 
+@pytest.mark.deep
 def test_flow_cumulative_can_be_left_out(tmp_path):
     _, base_path, _, _ = _run(tmp_path, "base", [])
     _, lean_path, _, _ = _run(tmp_path, "lean", ["--disable-cpsat-constraints", "flow_cumulative"])
@@ -483,12 +506,14 @@ def test_no_disabled_groups_is_recorded_as_empty():
 # Linearization, probing and makespan rows
 # ----------------------------------------------------------------------------
 
+@pytest.mark.deep
 def test_linearization_and_probing_default_to_level_2(tmp_path):
     output, _, _, _ = _run(tmp_path, "default", [], quiet=False)
     params = _solver_parameters(output)
     assert "linearization_level: 2" in params and "cp_model_probing_level: 2" in params
 
 
+@pytest.mark.deep
 def test_linearization_and_probing_reach_the_solver(tmp_path):
     output, model_path, sched, _ = _run(
         tmp_path, "levels", ["--cpsat-linearization-level", "1", "--cpsat-probing-level", "0"], quiet=False
@@ -509,6 +534,7 @@ def test_cli_rejects_bad_levels_and_rows(argv):
         _parse(argv)
 
 
+@pytest.mark.deep
 def test_makespan_rows_none_is_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", [])
     _, explicit, sched, _ = _run(tmp_path, "none", ["--cpsat-makespan-rows", "none"])
@@ -517,6 +543,7 @@ def test_makespan_rows_none_is_the_default_model(tmp_path):
         assert json.load(f)["run_options"]["cpsat_tuning"]["makespan_rows"] == "none"
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("mode,rounds", [("static", "3"), ("bucketed", "5")])
 def test_makespan_rows_reach_the_model(tmp_path, mode, rounds):
     """The rows are added, the hint stays complete and feasible, and the static bound printed
@@ -539,6 +566,7 @@ def test_makespan_rows_reach_the_model(tmp_path, mode, rounds):
 SYMMETRY = ["--rounds", "4", "--batch-size", "64"]
 
 
+@pytest.mark.deep
 def test_symmetry_rows_declared_is_the_default_model(tmp_path):
     _, base, _, _ = _run(tmp_path, "base", SYMMETRY)
     _, explicit, sched, _ = _run(tmp_path, "declared", SYMMETRY + ["--cpsat-symmetry-rows", "declared"])
@@ -548,6 +576,7 @@ def test_symmetry_rows_declared_is_the_default_model(tmp_path):
         assert json.load(f)["run_options"]["cpsat_tuning"]["symmetry_rows"] == "declared"
 
 
+@pytest.mark.deep
 def test_symmetry_rows_none_and_checked(tmp_path):
     _, none_path, _, _ = _run(tmp_path, "none", SYMMETRY + ["--cpsat-symmetry-rows", "none"])
     names = _constraint_names(diff_cpsat_models.load(str(none_path)))
@@ -562,6 +591,7 @@ def test_symmetry_rows_none_and_checked(tmp_path):
     check_hint_is_feasible(checked_path)
 
 
+@pytest.mark.deep
 def test_random_seed_reaches_the_solver(tmp_path):
     output, model_path, sched, _ = _run(tmp_path, "seed", ["--cpsat-random-seed", "7"], quiet=False)
     assert "random_seed: 7" in _solver_parameters(output)

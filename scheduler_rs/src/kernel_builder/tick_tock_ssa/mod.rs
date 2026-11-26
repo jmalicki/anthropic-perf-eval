@@ -149,6 +149,13 @@ pub struct SsaTickTockKernelBuilder {
     /// Timeline of the CP-SAT scratch cumulative (default `Phase`). Set before
     /// `build_and_schedule_cpsat`; applies to the per-section and full-kernel solves.
     pub cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime,
+    /// Individually forced shifts for `build_and_schedule_greedy` (ops that must run as 8
+    /// scalar ALU ops); `build_and_schedule_cpsat` takes them as an argument. Set after `new()`.
+    pub greedy_forced_shifts: Option<HashSet<usize>>,
+    /// The VALU shift mode requested for `build_and_schedule_greedy`. It only decides whether
+    /// `greedy_forced_shifts` applies (`PipelineConfig::forced_shift_ids`): the greedy-only
+    /// build does not apply the mode itself. Set after `new()`.
+    pub greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode,
 }
 
 /// Scratch write size in words for an op (1 for scalar, 8 for vector). Store writes to mem, not scratch.
@@ -707,6 +714,8 @@ impl SsaTickTockKernelBuilder {
             cpsat_deterministic_time: None,
             cpsat_tuning: crate::cpsat_scheduler::CpsatTuning::default(),
             cpsat_scratch_time: crate::cpsat_scheduler::ScratchTime::default(),
+            greedy_forced_shifts: None,
+            greedy_valu_shift_mode: crate::cpsat_scheduler::ValuShiftMode::Optimize,
         }
     }
 
@@ -820,6 +829,8 @@ impl SsaTickTockKernelBuilder {
                 }),
             verbose: false, // greedy path doesn't need pipeline-level verbosity
             greedy_verbose: verbose,
+            forced_shifts: self.greedy_forced_shifts.clone(),
+            valu_shift_mode: self.greedy_valu_shift_mode,
             ..Default::default()
         };
         config.bounds.greedy_use_full_bounds = self.config.compiler.greedy_use_full_bounds;
