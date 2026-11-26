@@ -13,7 +13,8 @@
 #   ./scripts/test.sh rust-shallow    # PR CI: rust without the deep-tests feature (slow solves #[ignore]d)
 #   ./scripts/test.sh python-shallow  # PR CI: python without tests marked @pytest.mark.deep
 #   ./scripts/test.sh python-deep     # deep CI: only tests marked @pytest.mark.deep
-# A test is deep when it runs a CP-SAT solve. Z3 proofs are milliseconds and stay shallow.
+# A test is deep when it runs a CP-SAT solve, except two 2-round CP-SAT smoke tests kept shallow
+# (CLAUDE.md, test tiers). Z3 proofs are milliseconds and stay shallow.
 #
 # Tests marked @pytest.mark.ci_only are deselected by every other pytest run (pyproject addopts).
 #
