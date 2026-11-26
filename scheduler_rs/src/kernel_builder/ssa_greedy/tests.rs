@@ -5464,6 +5464,50 @@ fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
     assert!(checked > 0, "control: some budget runs with a multiply-add select and is kept");
 }
 
+/// Review of #76 (CodeRabbit, third pass; fix in #82): the fit estimate of a select in the
+/// multiply_add form must hold only what the multiply_add reads (sources, delta, their group
+/// aliases) to cycle + 1. A `keep_live`-only vector is released at the select's cycle, so the
+/// select's destination may reuse its words. Four vector inputs, a `keep_live` vector and a
+/// scalar take 41 words; at budget 41 the estimate was 49, the select was deferred with nothing
+/// else ready, and the force path reported the budget exceeded.
+#[test]
+fn test_fit_estimate_frees_keep_live_only_value_of_multiply_add_select() {
+    let mut emit = SsaEmitContext::new();
+    let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+        let c = emit.emit_const(v);
+        emit.emit_vbroadcast(c)
+    };
+    let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+    let cond = vec_of(&mut emit, 1);
+    let held = vec_of(&mut emit, 7);
+    let t = emit.emit_valu(Opcode::Add, b, d);
+    let s = emit.emit_select_choice_shared_delta(cond, t, d, b);
+    emit.ops.last_mut().unwrap().keep_live = Some(vec![held]);
+    let select_id = emit.ops.last().unwrap().id;
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, s);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let forced: HashMap<usize, SelectChoiceEncoding> = [(select_id, SelectChoiceEncoding::Fma)].into_iter().collect();
+    let budget = 41;
+    let mut fma = HashSet::new();
+    let ((_, exceeded, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops, true, &mut HashSet::new(), budget, Some(&mut fma), None, None, None,
+        &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None,
+        Some(&forced), &mut GreedyDiagnostics::new(false), &GreedyShape::default(), &mut HashMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("scheduler error: {}", e));
+    assert!(agreement.agrees(), "{}", agreement);
+    let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+    let config = crate::address_assign::AddressAssignConfig {
+        select_fma_ops: [select_id].into_iter().collect(),
+        ..Default::default()
+    };
+    let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+    let peak = crate::address_assign::compute_peak_liveness(&intervals);
+    assert!(peak <= budget, "control: the schedule fits in {} words (interval peak {})", budget, peak);
+    assert!(!exceeded, "the select fits by reusing the keep_live vector's words (interval peak {})", peak);
+}
+
 /// Review of #76 (CodeRabbit, second pass): the pools check must measure selects forced to the
 /// multiply_add form by `fixed_select_choice_encoding` with their cycle + 1 reads. Before, only
 /// the caller's set (which gets forced selects after the call) went into the measurement, so a

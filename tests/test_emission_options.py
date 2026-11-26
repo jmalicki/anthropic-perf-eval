@@ -195,6 +195,7 @@ def test_values_only_stores_no_indices_and_drops_what_fed_them(tmp_path, index_f
     assert values["engines"]["store"]["ops"] == groups
 
 
+@pytest.mark.deep
 def test_validate_only_remembers_values_only(tmp_path):
     """A kernel saved by a --values-only build is re-validated on values only."""
     from generate_ssa_kernel import load_kernel_from_json, save_kernel_to_json
@@ -283,6 +284,7 @@ def test_cached_select_after_the_wrap(tmp_path, rounds):
     build(tmp_path, rounds, cached_select="mobius")
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("select_choice", ["fma", "vselect", "optimize"])
 def test_cached_select_bits_flow_with_cpsat_select_modes(tmp_path, select_choice):
     """Every select of bits-flow is a SelectChoice; CP-SAT must be able to encode it either way."""

@@ -26,6 +26,7 @@ FORCED = [
 ]
 
 
+@pytest.mark.deep
 @pytest.mark.parametrize("mode", FORCED, ids=lambda m: "-".join(f"{k}={v}" for k, v in m.items()))
 def test_forced_mode_builds_and_matches_ssa(mode, tmp_path):
     sched_path = tmp_path / "sched.json"
@@ -52,6 +53,7 @@ def test_forced_mode_builds_and_matches_ssa(mode, tmp_path):
         assert not any(op["opcode"] == "vselect" for op in lowered)
 
 
+@pytest.mark.deep
 def test_forced_fma_hint_is_feasible_at_3_rounds_batch_64(tmp_path):
     """--select-choice fma at 3 rounds / batch 64 used to hand CP-SAT an infeasible hint.
 
