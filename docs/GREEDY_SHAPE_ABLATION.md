@@ -913,7 +913,9 @@ in-sample, and the "near" column is a subset selected on the outcome.
   to a target count or to the scalar ALU's slack was not tried beyond the limits above.
 - A scratch term for path-bit plans. The 1,505-word ceiling is explained in
   docs/SCRATCH_CEILING_DIAGNOSIS.md: the pressure policy, needed because the `words` model
-  forces budget-deferred ops in the same cycle (`--greedy-budget-force stall` fixes that).
+  forces budget-deferred ops in the same cycle (`--greedy-budget-force stall` removes the
+  same-cycle force; not safe on every plan: 3 of 28 path-bit plans exceed the budget, see
+  docs/STALL_DEADLOCK.md on #88).
 - The model in other contexts (rounds, batch, values-only).
 - CP-SAT on any of these emissions (no whole-program CP-SAT, by the machine rules).
 
