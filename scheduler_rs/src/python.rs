@@ -1118,9 +1118,15 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 /// tree_reduce_max_depth and depth4_select_rounds for the choice of tree access (combining it
 /// with cached_select or depth4_select_rounds is an error). Plan format: solver/emission_plan.py;
 /// see docs/EMISSION_STRUCTURE_MODEL.md.
+/// transform: rewrite rules applied to the finished SSA program before scheduling, in order
+/// (list of names; default none). "hash-merge": hash stages 2+3 in three ops, found and
+/// rewritten from the ops alone; on the default emission the result is the program
+/// `merge_hash_stages` emits, op for op up to VReg numbering. Op ids are renumbered, so
+/// `forced_shifts` must name ops of the transformed program. See
+/// scheduler_rs/src/kernel_builder/transform/hash_merge.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
-    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None,
+    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,
     cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, greedy_justify=0, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase", greedy_shift_policy="when-full", greedy_shift_target=None, greedy_load_priority="key", greedy_flow_priority="key", greedy_select_overflow="never", greedy_select_overflow_limit=None, greedy_budget_force="same-cycle", greedy_alu_priority="key", greedy_const_policy="default", greedy_early_stagger=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
@@ -1147,6 +1153,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     select_bit_source: &str,
     depth4_select_rounds: &str,
     emission_plan: Option<Vec<Vec<String>>>,
+    transform: Option<Vec<String>>,
     // Scheduler, solver and output options.
     cpsat_tuning_json: Option<&str>,
     liveness_detail: Option<String>,
@@ -1325,6 +1332,13 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         }
     };
 
+    let transforms: Vec<crate::kernel_builder::config::TransformKind> = transform
+        .unwrap_or_default()
+        .iter()
+        .map(|t| crate::kernel_builder::config::TransformKind::from_str(t))
+        .collect::<Result<_, _>>()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
     let config = KernelConfig {
         spec: ProblemSpec {
             forest_height,
@@ -1375,6 +1389,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             cpsat_scratch_constraint: scratch_constraint,
             scratch_model,
             cpsat_split_shift_hint,
+            transforms,
             greedy_shift_policy: crate::kernel_builder::config::GreedyShiftPolicyKind::from_str(
                 greedy_shift_policy,
             )
