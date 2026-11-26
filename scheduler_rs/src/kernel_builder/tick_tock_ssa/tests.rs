@@ -4585,6 +4585,166 @@ fn test_dependency_pass_keeps_index_war_at_wrap() {
     }));
 }
 
+// =========================================================================
+// Per-section scratch check agrees with address assignment
+// =========================================================================
+
+/// Runs the greedy-only pipeline step by step and returns the section check's peak on the
+/// greedy schedule (phase and cycle timelines) and the allocator's peak on the same schedule.
+fn section_check_and_allocator_peaks(configure: impl FnOnce(&mut KernelConfig)) -> (usize, usize, usize, usize) {
+    use crate::cpsat_scheduler::ScratchTime;
+    use crate::kernel_builder::pipeline::passes::{
+        AssignAddressesPass, ComputeBoundsPass, ComputeDependenciesPass, DcePass, ElideBarriersPass,
+        FilterDeadStoresPass, GreedySchedulePass,
+    };
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+
+    let mut config = KernelConfig::new(10, 2047, 256, 4);
+    configure(&mut config);
+    let program = SsaTickTockKernelBuilder::new(config.clone()).build();
+    let budget = config.compiler.effective_scratch_budget(program.zero_vreg.is_some());
+    let pipeline = PipelineConfig {
+        compiler: crate::kernel_builder::config::CompilerConfig {
+            enable_valu_shift: true,
+            ..config.compiler.clone()
+        },
+        scratch_budget: budget,
+        ..Default::default()
+    };
+    let mut ctx = PipelineContext::new(program, pipeline);
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&DcePass).unwrap();
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&ComputeBoundsPass).unwrap();
+    ctx.run_pass(&GreedySchedulePass).unwrap();
+    let peak = |r: super::super::round_budget::SectionBudgetResult| r.section_peaks.into_iter().max().unwrap();
+    let phase = peak(ctx.greedy_section_check(budget, ScratchTime::Phase).unwrap());
+    let cycle = peak(ctx.greedy_section_check(budget, ScratchTime::Cycle).unwrap());
+    let n_lanes = ctx.greedy_decisions.shifted_alu_cycles.len();
+    ctx.final_decisions = ctx.greedy_decisions.clone();
+    ctx.run_pass(&ElideBarriersPass).unwrap();
+    ctx.run_pass(&FilterDeadStoresPass).unwrap();
+    ctx.run_pass(&AssignAddressesPass).unwrap();
+    let words = ctx.address_result.unwrap().pool_peaks.unwrap().words;
+    (phase, cycle, words, n_lanes)
+}
+
+/// The per-section check that decides which sections the per-section CP-SAT repairs counts
+/// exactly what address assignment counts on the phase timeline (the CP-SAT default), with
+/// and without split shifts (whose lanes run in two cycles) and with and without round
+/// barriers; the cycle timeline counts at least as much. Before, the check had no lane
+/// cycles and counted on the cycle timeline: 1,597 words against the allocator's 1,496 on
+/// the best 16-round greedy kernel (BUGS.md).
+#[test]
+fn test_section_check_counts_what_the_allocator_counts() {
+    type Configure = fn(&mut KernelConfig);
+    let shapes: [(&str, Configure); 3] = [
+        ("round barriers", |_| {}),
+        ("wavefront", configure_wavefront),
+        ("wavefront + split shifts", |c| {
+            configure_wavefront(c);
+            c.compiler.greedy_split_shift = true;
+        }),
+    ];
+    for (name, configure) in shapes {
+        let (phase, cycle, words, n_lanes) = section_check_and_allocator_peaks(configure);
+        assert_eq!(phase, words, "{}: section check {} vs allocator {}", name, phase, words);
+        assert!(cycle >= words, "{}: cycle timeline {} below allocator {}", name, cycle, words);
+        if name.contains("split") {
+            assert!(n_lanes > 0, "{}: no split shifts to test", name);
+        }
+    }
+}
+
+/// After a per-section solve the section's constants take the solve's encodings (AddImm,
+/// AluDerive, else Load) and ops not sent to the solve keep the greedy's; constants of other
+/// sections are untouched. Before, the AluDerive set the post-merge check used was the
+/// greedy's snapshot, so a constant the solve moved from AluDerive to Load still extended
+/// its producers' intervals.
+#[test]
+fn test_merge_section_const_encodings() {
+    use crate::types::{AluDeriveInfo, ConstChoiceEncoding};
+    let konst = |id| {
+        let mut op = SsaOp::new(id, Engine::Load, Opcode::ConstChoice, Some(VReg::scalar(id as u32)), vec![]);
+        op.cycle = 0;
+        op
+    };
+    let info = |l, r| AluDeriveInfo { left_op_id: l, right_op_id: r, opcode: Opcode::Add };
+    let section = vec![konst(1), konst(2), konst(3), konst(4)];
+    let greedy_add_imm: HashSet<usize> = [2, 4].into_iter().collect();
+    let greedy_alu: HashMap<usize, AluDeriveInfo> = [(1, info(10, 11)), (3, info(12, 13)), (9, info(14, 15))].into_iter().collect();
+    let mut add_imm = greedy_add_imm.clone();
+    add_imm.insert(8); // another section's constant
+    let mut alu = greedy_alu.clone();
+    // The solve re-encoded ops 1, 2, 3 (4 was not sent): 1 -> Load, 2 -> AluDerive, 3 -> AddImm.
+    let solved: HashMap<usize, ConstChoiceEncoding> = [
+        (1, ConstChoiceEncoding::Load),
+        (2, ConstChoiceEncoding::AluDerive(info(16, 17))),
+        (3, ConstChoiceEncoding::AddImm),
+    ]
+    .into_iter()
+    .collect();
+    merge_section_const_encodings(&section, &solved, &[4], &greedy_add_imm, &greedy_alu, &mut add_imm, &mut alu);
+    assert_eq!(add_imm, [3, 4, 8].into_iter().collect::<HashSet<_>>());
+    assert_eq!(alu.keys().copied().collect::<std::collections::BTreeSet<_>>(), [2, 9].into_iter().collect());
+    assert_eq!(alu[&2].left_op_id, 16);
+}
+
+/// Greedy (and justified) cycles of a 4-round shaped kernel as the greedy-only pipeline or the
+/// CP-SAT pipeline computes them, before any CP-SAT solve: the op cycles and the lane cycles.
+#[cfg(feature = "cpsat")]
+fn pipeline_greedy_schedule(
+    justify: usize,
+    cpsat: bool,
+    policy_only: bool,
+) -> (Vec<i32>, std::collections::BTreeMap<usize, Vec<i32>>) {
+    use crate::kernel_builder::pipeline::passes::{
+        ComputeBoundsPass, ComputeDependenciesPass, DcePass, GreedyJustifyPass, GreedySchedulePass,
+    };
+    use crate::kernel_builder::pipeline::{CpSatPipelineConfig, PipelineConfig, PipelineContext};
+    let mut config = KernelConfig::new(10, 2047, 256, 4);
+    configure_wavefront(&mut config);
+    config.compiler.greedy_split_shift = true;
+    config.compiler.cpsat_split_shift_hint = true;
+    config.compiler.greedy_justify_iterations = justify;
+    config.compiler.cpsat_greedy_policy_bounds = policy_only;
+    let program = SsaTickTockKernelBuilder::new(config.clone()).build();
+    let budget = config.compiler.effective_scratch_budget(program.zero_vreg.is_some());
+    let pipeline = PipelineConfig {
+        compiler: crate::kernel_builder::config::CompilerConfig { enable_valu_shift: true, ..config.compiler.clone() },
+        scratch_budget: budget,
+        cpsat: cpsat.then(CpSatPipelineConfig::default),
+        ..Default::default()
+    };
+    let mut ctx = PipelineContext::new(program, pipeline);
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&DcePass).unwrap();
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&ComputeBoundsPass).unwrap();
+    ctx.run_pass(&GreedySchedulePass).unwrap();
+    if justify > 0 {
+        ctx.run_pass(&GreedyJustifyPass).unwrap();
+    }
+    let cycles = ctx.ops.iter().map(|op| op.cycle).collect();
+    let lanes = ctx.greedy_decisions.shifted_alu_cycles.into_iter().collect();
+    (cycles, lanes)
+}
+
+/// `--cpsat-greedy-bounds policy-only`: the greedy that feeds CP-SAT, and the justification
+/// after it, compute exactly the greedy-only schedule (op and lane cycles), with and without
+/// `--greedy-justify`. With the default (`full`) the CP-SAT pipeline's greedy differs here.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_cpsat_greedy_policy_bounds_gives_the_greedy_only_schedule() {
+    for justify in [0, 10] {
+        let greedy_only = pipeline_greedy_schedule(justify, false, false);
+        let policy_only = pipeline_greedy_schedule(justify, true, true);
+        assert!(greedy_only == policy_only, "justify {}: policy-only CP-SAT greedy differs from greedy-only", justify);
+    }
+    let full = pipeline_greedy_schedule(0, true, false);
+    assert!(full != pipeline_greedy_schedule(0, false, false), "full bounds should shape the CP-SAT greedy differently here");
+}
+
 /// After dead code elimination every ALU-derived ConstChoice alternative reads constants that
 /// a kept op produces (BUGS.md "DCE left ConstChoice ALU alternatives that name a constant it
 /// removed"). Before the fix DCE kept them in every emission measured: e.g. 8 = 1 + 7 and
@@ -4750,10 +4910,6 @@ fn test_whole_kernel_model_and_stale_const_alternatives() {
     let err = whole_kernel_model_error(ops).expect("stale alternatives are refused");
     assert!(err.contains("reads a value no op produces"), "{}", err);
 }
-
-// ============================================================================
-// Region tags
-// ============================================================================
 
 /// 16 rounds, 4 groups, merged hash, mirrored index; round 4 mixes gather, bits-flow and
 /// mobius, round 12 uses bits, every other round the plannable default (bits at the root,

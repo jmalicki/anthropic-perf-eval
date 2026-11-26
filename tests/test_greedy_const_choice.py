@@ -63,20 +63,27 @@ def test_const_policy_kernels_are_proved_and_valid(policy):
     assert encodings["alu"] > 0, f"control: {policy} derived nothing ({dict(encodings)})"
 
 
-def test_justify_does_not_run_with_alu_derived_constants():
-    """`--greedy-justify` does not model ALU-derived constants (their reads of producer
-    values), so with `--greedy-const-policy alu-first` it leaves the schedule alone: the kernel
-    equals the one built without it (shaped greedy, where justification otherwise shortens)."""
+def test_justify_with_alu_derived_constants():
+    """`--greedy-justify` models ALU-derived constants (their reads of producer values): with
+    `--greedy-const-policy alu-first` it runs, keeps every derivation, and the kernel is still
+    proved against its SSA program and validated (in _build)."""
     shape = dict(greedy_barriers="none", greedy_priority="wavefront", greedy_split_shift=True,
                  pressure_inflation_threshold=0.95, greedy_const_policy="alu-first")
     _, _, plain = _build(**shape)
     _, _, justified = _build(greedy_justify=10, **shape)
-    assert any(op.get("from_const_choice") is not None and op["engine"] == "alu" for op in plain["ops"]), \
-        "control: alu-first derives a constant on the scalar ALU"
-    cycles = lambda s: [(op["cycle"], op["engine"], op["slot"]) for op in s["ops"]]  # noqa: E731
-    assert cycles(justified) == cycles(plain)
-    # Control: without the policy, justification does change this schedule, so the equality
-    # above means it did not run, not that it had nothing to do.
+    derived = lambda s: sorted(op["from_const_choice"] for op in s["ops"]  # noqa: E731
+                               if op.get("from_const_choice") is not None and op["engine"] == "alu")
+    assert derived(plain), "control: alu-first derives a constant on the scalar ALU"
+    assert derived(justified) == derived(plain)
+    # The pass ran on this input (before, it skipped any schedule with a derived constant).
+    summary = justified["_stats"]["greedy_justify_summary"]
+    assert plain["_stats"]["greedy_justify_summary"] in (None, "off")
+    assert summary and summary != "off" and not summary.startswith("skipped"), summary
+    assert "fell back" not in summary and "failed verification" not in summary, summary
+    assert justified["_stats"]["cycles"] < plain["_stats"]["cycles"], (summary, plain["_stats"]["cycles"])
+    cycles = lambda s: [op["cycle"] for op in s["ssa_ops"]]  # noqa: E731
+    assert cycles(justified) != cycles(plain)
+    # Control: without the policy, justification changes this schedule too.
     default = dict(shape, greedy_const_policy="default")
     assert cycles(_build(greedy_justify=10, **default)[2]) != cycles(_build(**default)[2])
 
