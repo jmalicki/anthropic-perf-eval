@@ -64,6 +64,30 @@ def test_greedy_build_is_reproducible(tmp_path):
     assert _sha(kernel_a) == _sha(kernel_b)
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--rounds", "3", "--batch-size", "64", "--use-greedy", "--greedy-barriers", "none",
+         "--greedy-priority", "wavefront", "--greedy-split-shift"],
+        ["--rounds", "3", "--batch-size", "64", "--cpsat-deterministic-time", "0.5", "--greedy-barriers", "none",
+         "--greedy-priority", "wavefront", "--greedy-split-shift", "--cpsat-split-shift-hint"],
+    ],
+    ids=["greedy-split-shift", "cpsat-split-shift-hint"],
+)
+def test_scheduler_json_is_reproducible(tmp_path, extra):
+    """The scheduler JSON is byte-identical across two runs of one build. Per-lane shifts
+    exercise `valu_shift_debug.samples` (the first ten of each kind), and the CP-SAT build also
+    writes `schedule_constraints` with its ordering rows; both once followed a hash order."""
+    import json
+
+    _build(tmp_path, "a", extra)
+    _build(tmp_path, "b", extra)
+    a, b = tmp_path / "sched_a.json", tmp_path / "sched_b.json"
+    sched = json.loads(a.read_text())
+    assert sched.get("valu_shift_debug", {}).get("samples"), "control: the build has per-lane shift samples"
+    assert _sha(a) == _sha(b), "scheduler JSON differs between two runs of the same build"
+
+
 def test_diff_reports_reordered_constraints(tmp_path):
     """The diff tool must tell reordering apart from a real difference."""
     _, model_path = _build(tmp_path, "a", ["--rounds", "2", "--batch-size", "16", "--cpsat-deterministic-time", "0.2"])
