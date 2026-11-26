@@ -26,7 +26,7 @@ use super::super::SsaProgram;
 use super::graph::SsaGraph;
 use super::report::{counts_of, dce_counts, sub, RuleReport};
 use super::rule::{Fact, FactSource, Rejection};
-use super::surgery::Surgery;
+use super::surgery::{Finished, Surgery};
 use super::values::{Address, Assumption, MemoryLayout, ValueFacts};
 
 /// Rule id.
@@ -229,7 +229,17 @@ pub fn apply_values_only(
         debug_assert_eq!(surgery.ops()[s.store].engine, Engine::Store);
         surgery.remove(s.store);
     }
-    let (program, surgery_report) = surgery.finish()?;
+    let (program, surgery_report) = match surgery.finish_or_refuse()? {
+        Finished::Done(program, report) => (program, report),
+        Finished::Refused(program, why) => {
+            report.refused = Some(why);
+            // Nothing was rewritten, so nothing relied on the sites' facts (assumptions).
+            report.facts.clear();
+            report.sites = Default::default();
+            report.site_classes = Default::default();
+            return Ok((program, report));
+        }
+    };
     report.surgery = surgery_report;
     if let (Some(before), None) = (before, &report.cost_error) {
         match dce_counts(&program) {

@@ -45,7 +45,7 @@ use super::super::SsaProgram;
 use super::cost::{category, Counts};
 use super::graph::SsaGraph;
 use super::rule::{AlternativeSpec, Fact, FactSource, Proposal, Rejection, Rule};
-use super::surgery::{Stamp, Surgery, SurgeryReport};
+use super::surgery::{Finished, Stamp, Surgery, SurgeryReport};
 
 /// Rule id.
 pub const HASH_MERGE_RULE: &str = "hash-merge";
@@ -559,7 +559,15 @@ pub fn apply_hash_merge(
         }
         surgery.replace_uses(s.output, r);
     }
-    let (program, surgery_report) = surgery.finish()?;
+    let (program, surgery_report) = match surgery.finish_or_refuse()? {
+        Finished::Done(program, report) => (program, report),
+        Finished::Refused(program, why) => {
+            report.refused = Some(why);
+            report.sites = 0;
+            report.site_classes = Default::default();
+            return Ok((program, report));
+        }
+    };
     report.surgery = surgery_report;
 
     if report.cost_error.is_some() {

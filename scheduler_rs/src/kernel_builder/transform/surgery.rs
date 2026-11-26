@@ -89,6 +89,15 @@ impl Stamp {
     }
 }
 
+/// Outcome of `Surgery::finish_or_refuse`.
+pub enum Finished {
+    /// The rewritten program and the report.
+    Done(SsaProgram, SurgeryReport),
+    /// The edit was refused; the program as it was given (only `vreg_count` may have grown)
+    /// and the reason.
+    Refused(SsaProgram, String),
+}
+
 /// A `ConstChoice` whose alternatives the rewrite changed (coupling C13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlternativesChange {
@@ -285,6 +294,23 @@ impl Surgery {
                 if !defined.insert(d) {
                     return Err(format!("{:?} is defined more than once (again by op {}): not single assignment", d, i));
                 }
+            }
+        }
+        // A vector with its own definer whose lanes are also listed as a group (a decomposed
+        // vector, read lane by lane) must not have a lane written by another op: its value would
+        // then be two things, and no rule's analysis (which reads the vector's definer) sees the
+        // lane write. Keys are checked in sorted order so the message is deterministic.
+        let mut keys: Vec<&VReg> = program.vector_group_lanes.keys().collect();
+        keys.sort_by_key(|v| (v.id, v.is_vector()));
+        for key in keys {
+            if !defined.contains(key) {
+                continue;
+            }
+            if let Some(lane) = program.vector_group_lanes[key].iter().find(|l| defined.contains(l)) {
+                return Err(format!(
+                    "{:?} is defined as a vector and its lane {:?} is written separately: a lane written twice",
+                    key, lane
+                ));
             }
         }
         check_def_before_use(&program.ops, program)
@@ -583,6 +609,23 @@ impl Surgery {
     /// eliminated beyond what the rewrite killed) and the report, or an error if a removed
     /// value is still read.
     pub fn finish(self) -> Result<(SsaProgram, SurgeryReport), String> {
+        match self.finish_or_refuse()? {
+            Finished::Done(program, report) => Ok((program, report)),
+            Finished::Refused(_, why) => Err(why),
+        }
+    }
+
+    /// Apply the edits, or refuse them and hand the program back unchanged.
+    ///
+    /// The edit is refused (not an error) when it would drop an op that something still
+    /// depends on outside dataflow: a value named in a surviving op's `keep_live`, or an op
+    /// carrying a trace id. Removal of what a rewrite made dead (step 3) can reach such ops
+    /// that the rule never looked at (e.g. a constant broadcast only the removed ops read).
+    ///
+    /// # Returns
+    /// `Finished::Done` as `finish`, `Finished::Refused` with the original program and the
+    /// reason, or an error for an inconsistency.
+    pub fn finish_or_refuse(self) -> Result<Finished, String> {
         let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
         // Every rename chain must end (resolve below then terminates).
         for &start in rename.keys() {
@@ -697,6 +740,46 @@ impl Surgery {
                 break;
             }
         }
+        // Refuse, with the input unchanged, an edit that drops a kept-live value or a traced op.
+        {
+            let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
+            let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
+            // Defined, a group alias all of whose lanes are defined, or a lane of a defined
+            // vector.
+            let exists = |v: VReg| {
+                Some(v) == program.zero_vreg
+                    || graph.def_index(v).is_some()
+                    || graph.group_lanes(v).map_or(false, |ls| ls.iter().all(|l| graph.def_index(*l).is_some()))
+                    || graph.element_of(v).map_or(false, |(vec, _)| graph.def_index(vec).is_some())
+            };
+            let mut why: Option<String> = None;
+            for (op, _) in &kept {
+                if let Some(v) = op.keep_live.iter().flatten().copied().find(|&v| !exists(v)) {
+                    why = Some(format!("the edit would drop {:?}, which op {} keeps live (keep_live)", v, op.id));
+                    break;
+                }
+            }
+            if why.is_none() {
+                let survived: BTreeSet<usize> = kept.iter().filter_map(|(_, o)| *o).collect();
+                // A dropped traced op is refused unless a live op of the result carries its
+                // trace id (hash-merge moves the id of the XOR it replaces to the new XOR). An
+                // already-dead carrier does not count: pipeline dead code elimination removes it.
+                let live_after = dce_live(&ops_only, &program);
+                let carried: BTreeSet<&str> =
+                    kept.iter().zip(&live_after).filter(|(_, &l)| l).filter_map(|((o, _), _)| o.trace_id.as_deref()).collect();
+                if let Some(i) = (0..program.ops.len()).find(|&i| {
+                    live_before[i]
+                        && !survived.contains(&i)
+                        && program.ops[i].trace_id.as_deref().map_or(false, |t| !carried.contains(t))
+                })
+                {
+                    why = Some(format!("the edit would drop op {}, which carries a trace id", i));
+                }
+            }
+            if let Some(why) = why {
+                return Ok(Finished::Refused(program, why));
+            }
+        }
         let (mut ops, origins): (Vec<SsaOp>, Vec<Option<usize>>) = kept.into_iter().unzip();
 
         // Nothing may read a value that no longer exists, and every value is defined before
@@ -733,7 +816,7 @@ impl Surgery {
                 vreg_def.entry(d).or_insert(i);
             }
         }
-        Ok((
+        Ok(Finished::Done(
             SsaProgram {
                 ops,
                 vreg_def,

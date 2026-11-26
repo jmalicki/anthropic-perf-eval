@@ -34,7 +34,7 @@ impl Rng {
 ///
 /// # Returns
 /// `(mem, indices_p, values_p)`.
-fn memory(spec: &ProblemSpec, seed: u64) -> (Vec<u32>, usize, usize) {
+pub(super) fn memory(spec: &ProblemSpec, seed: u64) -> (Vec<u32>, usize, usize) {
     let mut rng = Rng(seed);
     let (n_nodes, batch) = (spec.n_nodes, spec.batch_size);
     let header = 8;
@@ -197,13 +197,13 @@ pub(super) fn run(p: &SsaProgram, mem: &mut [u32]) {
     }
 }
 
-type Outputs = (Vec<u32>, Vec<u32>);
+pub(super) type Outputs = (Vec<u32>, Vec<u32>);
 
 /// Run `p` on random inputs.
 ///
 /// # Returns
 /// Per seed, the program's final `(indices, values)` and the reference's.
-fn outputs(p: &SsaProgram, spec: &ProblemSpec, seeds: &[u64]) -> Vec<(Outputs, Outputs)> {
+pub(super) fn outputs(p: &SsaProgram, spec: &ProblemSpec, seeds: &[u64]) -> Vec<(Outputs, Outputs)> {
     seeds
         .iter()
         .map(|&seed| {

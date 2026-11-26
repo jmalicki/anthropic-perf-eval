@@ -75,6 +75,7 @@ fn with_flags(spec: &ProblemSpec, transforms: &[TransformKind]) -> ProblemSpec {
             TransformKind::HashMerge => s.merge_hash_stages = true,
             TransformKind::PruneIndex => s.prune_dead_index = true,
             TransformKind::ValuesOnly => s.values_only = true,
+            TransformKind::SelectBitsPath => s.select_bit_source = SelectBitSource::Path,
         }
     }
     s
@@ -82,22 +83,22 @@ fn with_flags(spec: &ProblemSpec, transforms: &[TransformKind]) -> ProblemSpec {
 
 /// Outcome of a parity check.
 #[derive(Debug)]
-struct Parity {
+pub(super) struct Parity {
     /// The raw programs (before DCE) are equal op for op.
-    raw_exact: bool,
+    pub raw_exact: bool,
     /// Ops differing between the raw programs (first few, printed).
-    raw_diff: Option<String>,
+    pub raw_diff: Option<String>,
     /// Ops that differ only by the emitter's leaked `HashState` label (after DCE).
-    leaked: usize,
+    pub leaked: usize,
     /// Constants whose ALU-derived alternatives differ after DCE before recomputing them:
     /// `(value, rewritten, emitted)`. The rewrite recomputes them for the live constants
     /// (C13); DCE only drops the ones that name a constant it removed (#79), so the emitted
     /// program can list fewer.
-    stale_alternatives: Vec<(i64, String, String)>,
+    pub stale_alternatives: Vec<(i64, String, String)>,
     /// Summaries of each transform.
-    summaries: Vec<String>,
+    pub summaries: Vec<String>,
     /// The rewritten raw program, printed by `canonical_ops`.
-    program: Vec<String>,
+    pub program: Vec<String>,
 }
 
 /// Gate 1: apply `transforms` in order to the emission of `spec` without the flags, and
@@ -106,8 +107,14 @@ struct Parity {
 /// one leaked label of BUGS.md); the raw programs are compared too and the difference
 /// reported (the emitter writes ops it knows are dead, such as the last round's index update
 /// under `--values-only`, which the rewrite removes with what it made dead).
-fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], label: &str) -> Parity {
-    let base = ProblemSpec { merge_hash_stages: false, prune_dead_index: false, values_only: false, ..spec.clone() };
+pub(super) fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], label: &str) -> Parity {
+    let base = ProblemSpec {
+        merge_hash_stages: false,
+        prune_dead_index: false,
+        values_only: false,
+        select_bit_source: SelectBitSource::Index,
+        ..spec.clone()
+    };
     let mut p = raw_program(&base);
     let mut summaries = Vec::new();
     for &t in transforms {
@@ -122,6 +129,18 @@ fn check_parity(spec: &ProblemSpec, transforms: &[TransformKind], label: &str) -
     let (diff, leaked) = first_difference(&canonical_ops(&a), &canonical_ops(&b));
     if let Some(d) = diff {
         panic!("{} {:?}: after DCE: {}\n{}", label, transforms, d, summaries.join("\n"));
+    }
+    // The leaked label is accepted only where the emitter leaks it: the first op of the
+    // selection setup (an ALU add, no region), as in `check_hash_merge_parity`.
+    {
+        use crate::types::{EmissionPhase, Engine};
+        let first_selection_setup =
+            a.ops.iter().position(|o| o.source_info.as_ref().map_or(false, |s| s.phase == EmissionPhase::ValuSelectionInit));
+        for &i in &leaked {
+            let op = &a.ops[i];
+            assert_eq!(Some(i), first_selection_setup, "{} {:?}: label leak on {:?}", label, transforms, op);
+            assert!(op.region.is_none() && op.engine == Engine::Alu && op.opcode == Opcode::Add, "{} {:?}: label leak on {:?}", label, transforms, op);
+        }
     }
     let parity = Parity {
         raw_exact: raw_diff.is_none(),
@@ -397,11 +416,13 @@ fn test_values_only_refuses_observed_or_unknown_stores() {
     // A load from an address that is not a header pointer plus a constant may alias: every
     // index store before it is refused.
     let mut q = clone_program(&p);
-    let input_value = q.ops.iter().filter(|o| o.opcode == Opcode::Vload).nth(1).unwrap().dest.unwrap();
-    let s = VReg::scalar(q.vreg_count);
-    q.vreg_count += 1;
-    // Address = a word of the input values: unknown, so it may alias the indices.
-    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(s), vec![Operand::VReg(input_value)]));
+    // One input value, loaded into a scalar register through the values' (known) address.
+    let values_addr = q.ops.iter().filter(|o| o.opcode == Opcode::Vload).nth(1).unwrap().srcs[0].clone();
+    let (x, s) = (VReg::scalar(q.vreg_count), VReg::scalar(q.vreg_count + 1));
+    q.vreg_count += 2;
+    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(x), vec![values_addr]));
+    // Address = that input value: unknown, so it may alias the indices.
+    q.ops.push(SsaOp::new(0, Engine::Load, Opcode::Load, Some(s), vec![Operand::VReg(x)]));
     let (found, rejected) = sites(&q, &rule);
     assert!(found.is_empty());
     assert_eq!(reason_count(&rejected, "may read the stored indices back"), 32, "{:?}", rejected);
@@ -561,9 +582,10 @@ fn test_values_only_delta_table() {
 /// Run the greedy pipeline on `program`, applying `transforms` in the pass.
 ///
 /// # Returns
-/// `(cycles, lowered ops, peak live words, budget exceeded, lane-map entries, lane-map entries
-/// whose key or a lane is still read or written by a scheduled op)`.
-fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize, usize, bool, usize, usize) {
+/// `(cycles, lowered ops, peak live words, (greedy over budget, address assignment over budget),
+/// lane-map entries, lane-map entries whose key or a lane is still read or written by a
+/// scheduled op)`. The kernel builder rejects a schedule if either flag is set.
+fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize, usize, (bool, bool), usize, usize) {
     use crate::kernel_builder::config::CompilerConfig;
     use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
     let config = PipelineConfig {
@@ -573,6 +595,7 @@ fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize,
     };
     let mut ctx = PipelineContext::new(program, config);
     ctx.run_greedy_pipeline(true).unwrap();
+    let greedy_exceeded = ctx.greedy_metrics.budget_exceeded;
     let used: std::collections::HashSet<crate::types::VReg> =
         ctx.ops.iter().flat_map(|o| o.reads().chain(o.dest)).collect();
     let lanes = ctx.vector_group_lanes.len();
@@ -582,7 +605,7 @@ fn greedy(program: SsaProgram, transforms: Vec<TransformKind>) -> (usize, usize,
         .filter(|(k, ls)| used.contains(k) || ls.iter().any(|l| used.contains(l)))
         .count();
     let r = ctx.into_result().unwrap();
-    (r.cycles, r.ops.len(), r.address_result.peak_live, r.address_result.budget_exceeded, lanes, live_lanes)
+    (r.cycles, r.ops.len(), r.address_result.peak_live, (greedy_exceeded, r.address_result.budget_exceeded), lanes, live_lanes)
 }
 
 #[test]
@@ -712,4 +735,37 @@ fn test_rule_reports_carry_the_assumptions_used() {
     let (_, post_wrap) = super::prune_index::apply_prune_index(clone_program(&p16), &rule, |s| s.round.map_or(false, |r| r >= 10)).unwrap();
     assert!(post_wrap.n_sites() > 0);
     assert!(post_wrap.assumptions().is_empty(), "{:?}", post_wrap.facts);
+}
+
+#[test]
+fn test_index_rules_report_no_assumption_when_refused() {
+    use super::prune_index::apply_prune_index;
+    // A trace id on an op the rule removes (no op carries it afterwards) refuses the edit; a
+    // refused rewrite relied on nothing, so no assumption is reported.
+    let spec = ProblemSpec { rounds: 2, ..Default::default() };
+    let p = raw_program(&spec);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    // prune-index: the initial-index load that only the zero-factor update reads (the edit
+    // drops it as dead).
+    let rule = PruneIndexRule::for_problem(256);
+    let site = rule.find_sites(&g, p.zero_vreg).0.into_iter().find(|s| s.kind == PruneKind::ZeroUpdate).unwrap();
+    let zero_update = def(&p, site.zero.expect("the index shown to be 0"));
+    assert_eq!(p.ops[zero_update].opcode, Opcode::Vload, "{:?}", p.ops[zero_update]);
+    let (_, ok) = apply_prune_index(clone_program(&p), &rule, |_| true).unwrap();
+    assert!(ok.assumptions().contains(&"initial-indices-zero"), "{:?}", ok.assumptions());
+    let mut q = clone_program(&p);
+    q.ops[zero_update].trace_id = Some("update".into());
+    let (_, refused) = apply_prune_index(q, &rule, |_| true).unwrap();
+    assert!(refused.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", refused.refused);
+    assert!(refused.assumptions().is_empty(), "{:?}", refused.assumptions());
+    // values-only: an index store.
+    let rule = ValuesOnlyRule::for_problem(256);
+    let (_, ok) = apply_values_only(clone_program(&p), &rule, |_| true).unwrap();
+    assert!(ok.assumptions().contains(&"indices-not-observed"), "{:?}", ok.assumptions());
+    let mut q = clone_program(&p);
+    let store = found_store(&p, 0);
+    q.ops[store].trace_id = Some("store".into());
+    let (_, refused) = apply_values_only(q, &rule, |_| true).unwrap();
+    assert!(refused.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", refused.refused);
+    assert!(refused.assumptions().is_empty(), "{:?}", refused.assumptions());
 }

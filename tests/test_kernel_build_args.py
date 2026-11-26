@@ -362,3 +362,17 @@ def test_binding_rejects_ignored_greedy_shape_combinations():
         scheduler_rs.build_tick_tock_kernel_ssa(
             forest_height=2, n_nodes=7, batch_size=8, rounds=1, verbose=False, use_cpsat=False,
             greedy_load_priority="final-last")
+
+
+def test_validate_only_ignores_a_values_only_transform(monkeypatch):
+    """--validate-only builds nothing, so --transform values-only must not turn index validation
+    off for a saved kernel; an explicit --values-only still does (the saved metadata decides
+    otherwise)."""
+    import generate_ssa_kernel
+
+    seen = []
+    monkeypatch.setattr(generate_ssa_kernel, "run_validate_only", lambda *a, values_only=False, **k: seen.append(values_only) or 0)
+    for extra, expected in [(["--transform", "values-only"], False), (["--values-only"], True), ([], False)]:
+        monkeypatch.setattr(sys, "argv", ["generate_ssa_kernel.py", "--validate-only", "k.json"] + extra)
+        assert generate_ssa_kernel.main() == 0
+        assert seen[-1] is expected, extra

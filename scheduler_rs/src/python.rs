@@ -1128,6 +1128,13 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 /// index update from an index shown to be 0, assuming the input indices start at 0); see
 /// transform/prune_index.rs. "values-only": declares the final indices unobserved (the program
 /// `values_only` emits after dead code elimination); see transform/values_only.rs.
+/// "select-bits-path": bit-driven tree access reads the earlier branch bits instead of
+/// extracting them from the index (the program `select_bit_source="path"` emits), from forms
+/// proved on the ops; see transform/select_bits.rs. On the first pass of a zero-based index
+/// (before the wrap) its rewrites assume the input indices start at 0 (`InitialIndicesZero`,
+/// as the root broadcast of round 0 already does): a bit derived from a loaded index is
+/// replaced by an earlier branch bit, which differs for a nonzero start. Mirrored and
+/// post-wrap sites need no such precondition.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None, reassociate_gather_xor=false, index_early_terms="none", select_xor_pushdown="none",

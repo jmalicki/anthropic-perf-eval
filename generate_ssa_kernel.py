@@ -103,7 +103,9 @@ def main():
             args.batch_size,
             args.rounds,
             args.seed,
-            values_only=requested_values_only,
+            # Only an explicit --values-only overrides the saved kernel; --transform values-only
+            # builds nothing here, and a kernel built with it already records values_only.
+            values_only=args.values_only,
         )
 
     use_cpsat = not args.use_greedy
