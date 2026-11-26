@@ -156,6 +156,49 @@ def test_loop_end_to_end(table, tmp_path):
     assert len(json.loads(state.read_text())["builds"]) == n
 
 
+def test_greedy_options_are_part_of_the_state(table, tmp_path):
+    """Builds with the load-tail flags are recorded with them, and a state refuses other flags."""
+    state = str(tmp_path / "state.json")
+    stage2 = el.Stage2(table, str(tmp_path), state, log=None, greedy_extra=es.LOAD_TAIL_GREEDY)
+    rec, built = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert built and rec["valid"] and rec["proved"] and rec["passed"]
+    assert rec["peak_live"] and rec["peak_live"] <= 1536 and rec["budget_exceeded"] is False
+    assert json.loads((tmp_path / "state.json").read_text())["greedy_extra"] == es.LOAD_TAIL_GREEDY
+    with pytest.raises(ValueError, match="greedy options"):
+        el.Stage2(table, str(tmp_path), state, log=None, greedy_extra={})
+    # None (report) accepts the stored options.
+    assert el.Stage2(table, str(tmp_path), state, log=None).greedy_extra == es.LOAD_TAIL_GREEDY
+
+
+def test_scratch_budget_failure_is_a_recorded_outcome(table, tmp_path):
+    """A real over-budget build (batch 32 needs about 440 words; give it 300) is recorded as a
+    failed plan with the builder's own peak, from the typed exception."""
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None,
+                       greedy_extra={"scratch_budget_override": 300})
+    rec, built = stage2.evaluate(el.resolve_plan("bits", CTX)[1], "seed bits")
+    assert built and not rec["valid"] and rec["budget_exceeded"]
+    assert rec["peak_live"] > 300 and "scratch budget exceeded" in rec["error"]
+    assert rec["error"].startswith("ScratchBudgetExceeded")
+    assert stage2.best() is None
+    assert el.failed_builds(stage2)[0]["peak_live"] == rec["peak_live"]
+
+
+def test_only_the_typed_budget_error_is_a_plan_outcome(table, tmp_path, monkeypatch):
+    import scheduler_rs
+
+    assert issubclass(scheduler_rs.ScratchBudgetExceeded, RuntimeError)
+    stage2 = el.Stage2(table, str(tmp_path), str(tmp_path / "s.json"), log=None)
+
+    def untyped(*a, **k):  # mentions the budget, but is not the builder's budget failure
+        raise RuntimeError("scratch budget exceeded: peak_live 1600 > budget 1536")
+
+    monkeypatch.setattr(es, "measure", untyped)
+    with pytest.raises(RuntimeError, match="1600"):
+        stage2.evaluate(el.resolve_plan("gather", CTX)[1], "seed gather")
+    assert el.scratch_budget_error(scheduler_rs.ScratchBudgetExceeded("m", 1600, 1536)) == {
+        "peak_live": 1600, "budget": 1536}
+
+
 # ----------------------------------------------------------------------------
 # Review follow-ups: canonical no-goods, sound rows cut, reproducibility records
 # ----------------------------------------------------------------------------
@@ -256,3 +299,46 @@ def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
     assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
                      check_scheduler=False).scheduler == {"extension_sha256": "a"}
     assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #74)
+# ----------------------------------------------------------------------------
+def test_rows_loop_survives_a_failed_build_without_incumbent(table, tmp_path, monkeypatch):
+    """No valid incumbent yet and the candidate fails the scratch budget: the loop records it
+    and goes on (before, the feedback read best['cycles'] from None and aborted the run)."""
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    monkeypatch.setattr(el, "solve", lambda *a, **k: {"status": "optimal", "rows": rows, "solves": []})
+
+    def failing_evaluate(r, name, *a, **k):
+        return stage2._failed(r, name, el.plan_key(r), "ScratchBudgetExceeded: test", peak_live=1600), True
+
+    monkeypatch.setattr(stage2, "evaluate", failing_evaluate)
+    assert el.loop_rows(stage2, 2, 5, 1.0) is None
+    rows_entries = [e for e in stage2.trace if e["mode"] == "rows"]
+    assert len(rows_entries) == 2 and all("no valid incumbent" in e["feedback"] for e in rows_entries)
+
+
+def test_max_axis_below_two_is_rejected(table, tmp_path):
+    with pytest.raises(SystemExit):
+        el.main(["report", "--state", str(tmp_path / "s.json"), "--max-axis", "1"])
+    with pytest.raises(ValueError, match="max_axis"):
+        el.RowTable(CTX, {}, 0, max_axis=1)._axis([1, 2, 3])
+
+
+def test_valu_diagnostic_counts_selects_on_the_valu(table):
+    """valu_after_greedy_shift counts native vector ops left on the VALU plus selects lowered
+    to multiply_adds there; a build without the field counts none."""
+    stage2 = el.Stage2(table, "/nonexistent", None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    counts = table.predict(rows)
+    base = dict(_fake_build(rows), counts=counts, predicted_floor=es.choice_floor(counts)["cycles"],
+                summary={"static_bound_any": 0, "valu_shifted": 0})
+    native = counts["vec_fixed"] + counts["vec_shiftable"]
+    stage2.builds = {"a": base}
+    without = el.surrogates(stage2, None)[0]["valu_after_greedy_shift"]
+    assert without == -(-native // es.CAP["valu"])
+    with_selects = dict(base, summary=dict(base["summary"], select_ops_on_valu=6 * 7))
+    stage2.builds = {"a": with_selects}
+    assert el.surrogates(stage2, None)[0]["valu_after_greedy_shift"] == -(-(native + 42) // es.CAP["valu"])

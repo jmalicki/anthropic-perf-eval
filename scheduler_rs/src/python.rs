@@ -1044,6 +1044,30 @@ pub fn optional_constraint_group_names() -> Vec<String> {
 // =============================================================================
 
 use crate::kernel_builder::{KernelConfig, SsaTickTockKernelBuilder};
+use crate::kernel_builder::tick_tock_ssa::KernelBuilderError;
+
+pyo3::create_exception!(
+    scheduler_rs,
+    ScratchBudgetExceeded,
+    pyo3::exceptions::PyRuntimeError,
+    "The schedule does not fit the scratch budget. args = (message, peak_live, budget): the \
+     numbers of the accounting that raised it (see KernelBuilderError::BudgetExceeded: the \
+     greedy pipeline's checks and the CP-SAT pipeline's final address assignment; per-section \
+     CP-SAT and merged-hint budget failures are plain RuntimeErrors). A RuntimeError subclass, \
+     so callers that catch RuntimeError still do."
+);
+
+/// Python exception for a kernel build error: `ScratchBudgetExceeded` (typed, with peak_live
+/// and budget) for a scratch-budget failure, RuntimeError otherwise. `prefix` names the path.
+fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
+    let msg = format!("{}: {}", prefix, e);
+    match e {
+        KernelBuilderError::BudgetExceeded { peak_live, budget, .. } => {
+            PyErr::new::<ScratchBudgetExceeded, _>((msg, peak_live, budget))
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(msg),
+    }
+}
 
 /// Build a tick-tock kernel using SSA-based emission.
 ///
@@ -1450,14 +1474,12 @@ pub fn build_tick_tock_kernel_ssa<'py>(
                 enable_cse_groups,
                 enable_bulk_move,
             )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("SSA CP-SAT build failed: {}", e))
-            })?
+            .map_err(|e| kernel_build_error_to_py("SSA CP-SAT build failed", e))?
     } else {
         let enable_valu_shift = builder.config.compiler.enable_valu_shift;
-        builder.build_and_schedule_greedy(enable_valu_shift, None, verbose).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("SSA build failed: {}", e))
-        })?
+        builder
+            .build_and_schedule_greedy(enable_valu_shift, None, verbose)
+            .map_err(|e| kernel_build_error_to_py("SSA build failed", e))?
     };
 
     if verbose {
