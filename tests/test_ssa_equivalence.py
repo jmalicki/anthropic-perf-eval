@@ -420,3 +420,181 @@ def test_shape_must_match_recorded_run_options():
     with pytest.raises(se.EquivalenceError, match="disagree"):
         se.check_equivalence(a, b)
     assert se.check_equivalence(a, _a()).verdict == "proved"
+
+
+# =============================================================================
+# Malformed programs are input errors or not proved, never PROVED (pre-merge review)
+# =============================================================================
+
+
+def _redefine(prog, vid, opcode, srcs, cycle=0):
+    """Append an op that defines v`vid` again."""
+    prog.ops.append({"id": len(prog.ops), "opcode": opcode, "dest": f"v{vid}_s", "cycle": cycle,
+                     "source_info": {}, "srcs": [{"VReg": {"id": s, "width": "scalar"}} for s in srcs]})
+
+
+def test_two_live_definitions_of_one_vreg_are_an_error():
+    # B: r = x + 7, then a second live r = x + 8; the store reads r.
+    p = _Prog()
+    r = p.plus7()
+    _redefine(p, r, "+", [p.x, p.const(8)])
+    b = p.store(r)
+    with pytest.raises(se.EquivalenceError, match="not single assignment"):
+        _check(b)
+
+
+def test_a_dead_definition_is_not_part_of_the_program():
+    # B: a dead (cycle -1) r = x + 7, then the live r = x + 8: B stores x + 8, not A's x + 7.
+    p = _Prog()
+    c7, c8 = p.const(7), p.const(8)
+    r = p.op("+", p.x, c7)
+    p.ops[-1]["cycle"] = -1
+    _redefine(p, r, "+", [p.x, c8])
+    b = p.store(r)
+    assert _check(b).verdict == "counterexample"
+
+
+def test_a_read_of_a_dead_only_definition_is_an_error():
+    # B's live op reads a constant whose only definition is dead.
+    p = _Prog()
+    c7 = p.const(7)
+    p.ops[-1]["cycle"] = -1
+    b = p.store(p.op("+", p.x, c7))
+    with pytest.raises(se.EquivalenceError, match="undefined VReg"):
+        _check(b)
+
+
+def test_constant_alternatives_with_one_immediate_are_allowed():
+    p = _Prog()
+    c7 = p.const(7)
+    p.ops.append({"id": len(p.ops), "opcode": "const", "dest": f"v{c7}_s", "cycle": 0, "source_info": {},
+                  "srcs": [{"Imm": 7}]})
+    b = p.store(p.op("+", p.x, c7))
+    assert _check(b).verdict == "proved"
+
+
+def _with_store_outside_memory(p):
+    r = p.plus7()
+    p.store(r)
+    return p.store(r, addr=p.const(TINY_LAYOUT.mem_size + 5))
+
+
+def test_a_store_outside_memory_is_a_trap():
+    b = _with_store_outside_memory(_Prog())
+    for result in (se.check_equivalence(_a(), b, values_only=True, shape=TINY),  # B only, values only
+                   se.check_equivalence(_a(), b, shape=TINY),                    # B only, all words
+                   se.check_equivalence(b, b, shape=TINY)):                      # both
+        assert result.verdict == "unproved", se.format_result(result)
+        assert any("outside memory" in u for u in result.unproved)
+
+
+@pytest.mark.parametrize("opcode", ["halt", "jump", "cond_jump", "pause"])
+def test_dest_less_control_flow_is_an_error(opcode):
+    p = _Prog()
+    r = p.plus7()
+    p._add(opcode, [], dest=False)
+    b = p.store(r)
+    with pytest.raises(se.EquivalenceError, match="no destination and is not a store"):
+        _check(b)
+
+
+def test_nothing_to_compare_is_an_error():
+    empty = {"ssa_ops": [], "vector_group_lanes": {}}
+    with pytest.raises(se.EquivalenceError, match="no word would be compared"):
+        se.check_equivalence(empty, empty, shape=TINY)
+
+
+# =============================================================================
+# main(): exit codes 0 proved, 1 counterexample, 2 not proved, 3 input error / checker error
+# =============================================================================
+
+
+def _main(tmp_path, a, b, *extra):
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a))
+    pb.write_text(json.dumps(b))
+    return se.main([str(pa), str(pb), "--shape", *map(str, TINY), *extra])
+
+
+def test_main_exit_codes(tmp_path):
+    assert _main(tmp_path, _a(), _a()) == 0
+    p = _Prog()
+    assert _main(tmp_path, _a(), p.store(p.op("+", p.x, p.const(8)))) == 1
+    p = _Prog()
+    rare = p.store(p.op("select", p.op("==", p.x, p.const(0x12345)), p.op("+", p.x, p.const(8)), p.plus7()))
+    assert _main(tmp_path, _a(), rare) == 2
+    p = _Prog()
+    r = p.plus7()
+    _redefine(p, r, "+", [p.x, p.const(8)])
+    assert _main(tmp_path, _a(), p.store(r)) == 3                      # EquivalenceError
+    p = _Prog()
+    assert _main(tmp_path, _a(), p.store(p.op("frob", p.x))) == 3      # any other exception
+    empty = {"ssa_ops": [], "vector_group_lanes": {}}
+    assert _main(tmp_path, empty, empty) == 3
+
+
+# =============================================================================
+# Inequivalent pairs for the remaining opcodes
+# =============================================================================
+
+
+@pytest.mark.parametrize("opcode,k_a,k_b", [("<", 1 << 29, 1 << 28), (">>", 3, 4), ("<<", 3, 4),
+                                            ("//", 3, 5), ("%", 3, 5), ("cdiv", 3, 5)])
+def test_inequivalent_pairs_for_each_opcode(opcode, k_a, k_b):
+    def prog(k):
+        p = _Prog()
+        return p.store(p.op(opcode, p.x, p.const(k)))
+    assert se.check_equivalence(prog(k_a), prog(k_a), shape=TINY).verdict == "proved"
+    result = se.check_equivalence(prog(k_a), prog(k_b), shape=TINY)
+    assert result.verdict == "counterexample", se.format_result(result)
+
+
+# =============================================================================
+# Real-emission mutants: lanes of vector groups, multiply_add / Mobius coefficients
+# =============================================================================
+
+
+def _groups(sched, read):
+    """Vector groups of `sched`: read groups (the key has a definer) or write groups."""
+    defined = {op["dest"].split("_")[0][1:] for op in sched["ssa_ops"] if op.get("dest")}
+    return sorted((k for k in sched["vector_group_lanes"] if (k in defined) == read), key=int)
+
+
+@pytest.mark.parametrize("read", [True, False], ids=["read-group (gather address lanes)", "write-group (gathered lanes)"])
+def test_swapped_lanes_of_a_vector_group_are_rejected(default, read):
+    mutant = copy.deepcopy(default[1])
+    key = _groups(mutant, read)[0]
+    lanes = mutant["vector_group_lanes"][key]
+    lanes[0], lanes[1] = lanes[1], lanes[0]
+    result = se.check_equivalence(default[1], mutant, shape=SHAPE)
+    assert result.verdict == "counterexample", se.format_result(result)
+
+
+def _swap_constant_operand(sched, pick):
+    """Replace operand 1 (a broadcast constant) of the first multiply_add `pick` accepts by
+    another broadcast constant vector of the program."""
+    mutant = copy.deepcopy(sched)
+    ops = mutant["ssa_ops"]
+    consts = {op["dest"]: op for op in ops if op["opcode"] == "vbroadcast"}
+    vecs = [op["dest"] for op in ops if op["opcode"] == "vbroadcast"]
+    for op in ops:
+        if op["opcode"] == "multiply_add" and pick(op):
+            cur = op["srcs"][1]["VReg"]["id"]
+            other = next(d for d in vecs if int(d[1:].split("_")[0]) != cur)
+            op["srcs"][1] = {"VReg": {"id": int(other[1:].split("_")[0]), "width": "vector"}}
+            assert other in consts
+            return mutant
+    raise AssertionError("no multiply_add to mutate")
+
+
+def test_wrong_multiply_add_coefficient_is_rejected(default):
+    hash_fma = lambda op: (op.get("source_info") or {}).get("phase") == "hash"  # noqa: E731
+    result = se.check_equivalence(default[1], _swap_constant_operand(default[1], hash_fma), shape=SHAPE)
+    assert result.verdict == "counterexample", se.format_result(result)
+
+
+def test_wrong_mobius_coefficient_is_rejected(tmp_path_factory):
+    _, mobius = _build(tmp_path_factory, "mobius-mutant", cached_select="mobius")
+    tree_fma = lambda op: (op.get("source_info") or {}).get("phase") == "tree_access"  # noqa: E731
+    result = se.check_equivalence(mobius, _swap_constant_operand(mobius, tree_fma), shape=SHAPE)
+    assert result.verdict == "counterexample", se.format_result(result)

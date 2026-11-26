@@ -28,7 +28,7 @@ uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/vo.json --values-
 uv run python -m verification.ssa_equivalence /tmp/a.json /tmp/bad.json --counterexample-out /tmp/cex.json
 ```
 
-JSONs written by the binding directly (no `run_options`) need `--shape ROUNDS BATCH HEIGHT`; a JSON that records its shape must match `--shape` and the other JSON. Exit status: 0 PROVED, 1 COUNTEREXAMPLE, 2 NOT PROVED, 3 input error (undefined VReg read, non-constant store address, a word stored twice, shapes disagree) or checker bug.
+JSONs written by the binding directly (no `run_options`) need `--shape ROUNDS BATCH HEIGHT`; a JSON that records its shape must match `--shape` and the other JSON. Exit status: 0 PROVED, 1 COUNTEREXAMPLE, 2 NOT PROVED, 3 input error (not single assignment, undefined VReg read (a VReg defined only by a dead op included), a dest-less op that is not a store, non-constant store address, a word stored twice, nothing to compare, shapes disagree) or any checker error.
 
 ## Reading the output
 
@@ -44,12 +44,12 @@ Compared words: every word either program stores (a word not stored keeps its in
 
 - **Preconditions** (`problem.build_mem_image`): header words fixed by the shape, every input index 0, tree and input values in [0, 2^30), extra room 0.
 - **SSA semantics**: ops are pure with machine semantics modulo 2^32; loads read the initial memory; stores write the final memory (same model as `kernel_dataflow`). Checked, not assumed: a constant-address load of a stored word must feed that store; other loads must have an address interval inside memory and away from stored words.
-- **No traps** (checked): every op of both programs, including value-dead ones still in the program, must provably not trap: load addresses inside memory and divisors (`//`, `%`, `cdiv`) nonzero, by intervals (R20). Otherwise NOT PROVED with the op named.
-- **Well-formed input** (checked, else input error): only the reserved zero VReg `v0` may be read without a definition; store addresses are constants; no word is stored twice.
+- **No traps** (checked): every op of both programs, including value-dead ones still in the program, must provably not trap: load addresses inside memory and divisors (`//`, `%`, `cdiv`) nonzero, by intervals (R25), and constant store addresses inside memory. Otherwise NOT PROVED with the op named.
+- **Well-formed input** (checked, else input error): single assignment over the live ops (two constants of one immediate may share a VReg); dead ops (cycle < 0) are not part of the program; only the reserved zero VReg `v0` may be read without a definition; every dest-less op is a store; store addresses are constants; no word is stored twice; at least one word is compared.
 
 ## How it works (for when it does not prove)
 
-1. Both programs are symbolically executed into one term store whose constructors normalise by proved identities: linear forms (R16), XOR sets (R17), equality as a difference (R18), 0/1 multiply_adds and products as selects (R4, R5, R19, with 0/1-ness from intervals R20), and the preconditions. Merged hash stages, mirrored index, pruned index work and the stage-5 deferral normalise to identical terms.
+1. Both programs are symbolically executed into one term store whose constructors normalise by proved identities: linear forms (R21), XOR sets (R22), equality as a difference (R23), 0/1 multiply_adds and products as selects (R4, R5, R24, with 0/1-ness from intervals R25), and the preconditions. Merged hash stages, mirrored index, pruned index work and the stage-5 deferral normalise to identical terms.
 2. Sweeping: terms of A and B with equal values on 32 random valid inputs are paired (no emitter metadata needed); each pair is proved by Z3 with shared subterms cut to interval-constrained variables, case-splitting on 0/1 select conditions (Mobius sums are slow for Z3 otherwise). Proven pairs are merged and later terms rebuilt over them, so queries stay small. Alpha-equivalent queries are answered once (thousands of lanes, about ten distinct queries).
 3. A new rewrite that does not prove: look at the `NOT PROVED` terms. Either add a normal form (with a Z3 proof in `verification/rewrites.py`, registered in `REWRITE_CHECKS`, cited in the constructor) or check that the residual query is small enough for Z3 (`--timeout-ms`, `--node-budget`).
 

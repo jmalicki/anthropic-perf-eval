@@ -31,15 +31,21 @@ stores write the final memory. This equals the machine's behaviour when every lo
 that the program also stores happens before that store. That is checked, not assumed: a
 constant-address load of a stored word must be in the dependency cone of that store (so every
 schedule orders it first), and a load with a non-constant address must have an address
-interval (R20) inside memory and disjoint from the stored words. A program that fails the
+interval (R25) inside memory and disjoint from the stored words. A program that fails the
 check is reported UNPROVED.
 
 NO TRAPS: PROVED also requires that no op of either program can trap under the
 preconditions, including ops whose value is dead but that are still in the program: every
 load address must be provably inside memory and every divisor (//, %, cdiv) provably
-nonzero, both by intervals (R20). Otherwise the result is UNPROVED with the reason. Reads of
-undefined VRegs (other than the reserved zero VReg v0, which reads scratch[0] = 0), stores
-to non-constant addresses and two stores of one word are input errors.
+nonzero, both by intervals (R25); a store to a constant address outside memory is a trap
+too. Otherwise the result is UNPROVED with the reason.
+
+INPUT ERRORS (exit 3, never a verdict): a program that is not single assignment (two live
+ops defining one VReg, other than two constants of the same immediate); a read of an
+undefined VReg (other than the reserved zero VReg v0, which reads scratch[0] = 0; a VReg
+defined only by a dead op, cycle < 0, is undefined: dead ops are not part of the program);
+an op without a destination that is not a store (halt, jump, ...); a store to a
+non-constant address; two stores of one word; no word to compare.
 
 So PROVED states: on every valid input neither program traps, and both leave the same value
 in every compared word.
@@ -49,10 +55,10 @@ How
 1. Normalised symbolic execution. Both programs are executed into one hash-consed term store
    whose constructors apply proved identities, so equal computations become the same term:
    constant folding (machine semantics), linear forms over Z/2^32 for +, -, constant
-   multiples, constant left shifts and multiply_add with a constant factor (R16), XOR sets
-   (R17), equality as a difference compared with zero (R18), a multiply_add or product whose
-   factor is 0/1 as a select (R4, R5, R19; 0/1-ness from intervals, R20), select(c, t, t) = t
-   (R19), and the preconditions (header loads and index loads become constants). The merged
+   multiples, constant left shifts and multiply_add with a constant factor (R21), XOR sets
+   (R22), equality as a difference compared with zero (R23), a multiply_add or product whose
+   factor is 0/1 as a select (R4, R5, R24; 0/1-ness from intervals, R25), select(c, t, t) = t
+   (R24), and the preconditions (header loads and index loads become constants). The merged
    hash stages (R8), the mirrored index (R9-R11), the pruned index work (R12) and the
    stage-5 constant deferral (R2) all normalise to identical terms this way.
 2. Sweeping with cut points (as in combinational equivalence checking). Every term is
@@ -74,7 +80,8 @@ Usage:
     uv run python -m verification.ssa_equivalence a.json b.json [--values-only]
         [--samples 32] [--seed 0] [--timeout-ms 20000] [--counterexample-out cex.json]
 
-Exit status: 0 proved, 1 counterexample, 2 not proved, 3 input error or checker bug.
+Exit status: 0 proved, 1 counterexample, 2 not proved, 3 input error or any checker error
+(an exception is never reported as a counterexample).
 """
 
 from __future__ import annotations
@@ -253,8 +260,8 @@ class NormTerms(Terms):
     """Hash-consed terms in normal form, each with its values on the sample inputs and an
     unsigned interval.
 
-    Term shapes: ("const", v); ("lin", c, ((atom, k), ...)) = c + sum k*atom (R16);
-    ("xor", c, (atoms...)) (R17); ("eqz", d) = (d == 0) (R18); ("sel", c, t, f);
+    Term shapes: ("const", v); ("lin", c, ((atom, k), ...)) = c + sum k*atom (R21);
+    ("xor", c, (atoms...)) (R22); ("eqz", d) = (d == 0) (R23); ("sel", c, t, f);
     ("mem", addr) for a load of an input word; (op, a, b) for the remaining ALU ops.
     Every constructor checks its result against the machine semantics of the op on the
     samples, so a wrong normalisation fails loudly instead of proving something false.
@@ -315,13 +322,13 @@ class NormTerms(Terms):
             alo, ahi = self.iv[atom]
             lo += s * alo if s > 0 else s * ahi
             hi += s * ahi if s > 0 else s * alo
-        for rep in (c, c - MOD):  # either representative of c (R20: reduction commutes)
+        for rep in (c, c - MOD):  # either representative of c (R25: reduction commutes)
             if 0 <= lo + rep and hi + rep <= MASK:
                 return (lo + rep, hi + rep)
         return TOP
 
     def _interval(self, term: tuple) -> tuple[int, int]:
-        """Sound unsigned interval of a term (rules proved in R20)."""
+        """Sound unsigned interval of a term (rules proved in R25)."""
         kind, iv = term[0], self.iv
         if kind == "const":
             return (term[1], term[1])
@@ -362,7 +369,7 @@ class NormTerms(Terms):
             raise AssertionError(f"normaliser bug: {what} -> {self.show(tid)} disagrees with machine semantics")
         return tid
 
-    # ---- linear forms (R16) -------------------------------------------------------------
+    # ---- linear forms (R21) -------------------------------------------------------------
 
     def _lin_parts(self, t: int) -> tuple[int, dict[int, int]]:
         term = self.defs[t]
@@ -394,7 +401,7 @@ class NormTerms(Terms):
     def scale(self, a: int, k: int) -> int:
         return self.linear(0, [(a, k % MOD)])
 
-    # ---- XOR sets (R17) -----------------------------------------------------------------
+    # ---- XOR sets (R22) -----------------------------------------------------------------
 
     def _xor_parts(self, t: int) -> tuple[int, set[int]]:
         term = self.defs[t]
@@ -416,7 +423,7 @@ class NormTerms(Terms):
             return next(iter(atoms))
         return self._intern(("xor", c, tuple(sorted(atoms))))
 
-    # ---- equality (R18), selects (R19) ---------------------------------------------------
+    # ---- equality (R23), selects (R24) ---------------------------------------------------
 
     def eqz(self, d: int) -> int:
         cd = self.const_value(d)
@@ -544,26 +551,82 @@ def _store_words(sched: dict) -> int:
     return n
 
 
-def build_program(sched: dict, terms: Terms, name: str) -> tuple[dict[int, tuple[int, str]], int]:
+def _live_ops(ops: list[dict]) -> list[dict]:
+    """The ops of the program: dead ops (cycle < 0, never emitted) are not part of it."""
+    return [op for op in ops if op.get("cycle") is None or op["cycle"] >= 0]
+
+
+def _vreg_id(dest: str) -> int:
+    return int(dest[1:].split("_")[0])
+
+
+def well_formed(sched: dict, name: str) -> dict:
+    """Check that `sched` is a single-assignment program the checker can read; return it with
+    its live ops only.
+
+    * Two live ops may define one VReg only if both are constants (``const`` / ``const_choice``)
+      of the same immediate (alternative encodings of one value). Anything else has no single
+      meaning; ``kernel_dataflow`` would read the first definition and ignore the second.
+    * Definitions come from live ops only, so a live op that reads a VReg defined only by a
+      dead op is a read of an undefined VReg (reported by ``build_program``).
+    * An op without a destination must be a ``store`` or ``vstore``: control flow (``halt``,
+      ``jump``, ``cond_jump``) and any other dest-less opcode would be skipped silently.
+    """
+    live = _live_ops(sched["ssa_ops"])
+    first: dict[int, dict] = {}
+    for op in live:
+        dest = op.get("dest")
+        if not dest:
+            if op["opcode"] not in ("store", "vstore"):
+                raise EquivalenceError(f"{name}: op {op['id']} ({op['opcode']!r}) has no destination and is not a "
+                                       "store; the checker models straight-line SSA only")
+            continue
+        vid = _vreg_id(dest)
+        if vid in first:
+            a, b = first[vid], op
+            consts = ("const", "const_choice")
+            same_const = (a["opcode"] in consts and b["opcode"] in consts
+                          and a["srcs"][0].get("Imm") is not None and a["srcs"][0].get("Imm") == b["srcs"][0].get("Imm"))
+            if not same_const:
+                raise EquivalenceError(f"{name}: v{vid} is defined by two live ops ({a['id']} {a['opcode']!r} and "
+                                       f"{b['id']} {b['opcode']!r}); the program is not single assignment")
+        else:
+            first[vid] = op
+    return {**sched, "ssa_ops": live}
+
+
+def build_program(sched: dict, terms: Terms, name: str,
+                  mem_size: int | None = None) -> tuple[dict[int, tuple[int, str]], int]:
     """Run ``kernel_dataflow.ssa_values`` with `terms`; return {address: (value, where)}.
 
-    Store addresses must be constants under the preconditions and every word may be stored
-    at most once (an SSA program has no order between two stores of one word).
+    The program is first checked by ``well_formed`` (live ops only, single assignment, no
+    control flow). Store addresses must be constants under the preconditions and every word
+    may be stored at most once (an SSA program has no order between two stores of one word).
+    A store to an address outside ``[0, mem_size)`` traps: it is recorded as a trap (with
+    ``NormTerms``, so the result is not PROVED) and the word is not a stored word.
     """
+    sched = well_formed(sched, name)
     values = ssa_values(sched, terms)
     dangling = sorted(set(values.undefined_vregs) - {ZERO_VREG})
     if dangling:
         raise EquivalenceError(f"{name}: reads undefined VReg(s) {['v%d' % v for v in dangling[:5]]}; only "
-                               f"v{ZERO_VREG} (scratch[0], always 0) may be read without a definition")
+                               f"v{ZERO_VREG} (scratch[0], always 0) may be read without a definition "
+                               "(a VReg defined only by a dead op counts as undefined)")
     stores: dict[int, tuple[int, str]] = {}
+    outside = 0
     for addr_tid, (val, where) in values.stores.items():
         addr = terms.const_value(addr_tid) if isinstance(terms, NormTerms) else addr_tid[0]
         if addr is None:
             raise EquivalenceError(f"{name}: {where} stores to a non-constant address {terms.show(addr_tid)}")
+        if mem_size is not None and not 0 <= addr < mem_size:
+            outside += 1
+            if isinstance(terms, NormTerms):
+                terms._trap(addr, f"{where} stores to address {addr}, outside memory [0, {mem_size})")
+            continue
         stores[addr] = (val, where)
-    if len(stores) != _store_words(sched):
+    if len(stores) + outside != _store_words(sched):
         raise EquivalenceError(f"{name}: some word is stored more than once ({_store_words(sched)} store "
-                               f"words, {len(stores)} distinct addresses); the SSA program does not order them")
+                               f"words, {len(stores) + outside} distinct addresses); the SSA program does not order them")
     return stores, len(sched["ssa_ops"])
 
 
@@ -612,7 +675,7 @@ class ConcreteTerms:
 
 def final_memory(sched: dict, image) -> dict[int, int]:
     """Concrete final values of the words `sched` stores, on initial memory `image`."""
-    stores, _ = build_program(sched, ConcreteTerms(image), "program")
+    stores, _ = build_program(sched, ConcreteTerms(image), "program", mem_size=len(image))
     return {addr: val[0] for addr, (val, _) in stores.items()}
 
 
@@ -633,7 +696,7 @@ def memory_order_problems(sched: dict, terms: NormTerms, stores: dict[int, tuple
     # Constant-address loads (including those folded by the preconditions): exact, via the
     # dependency sets of the concrete interpreter.
     interp = ConcreteTerms(layout.image, frozenset(stored))
-    concrete, _ = build_program(sched, interp, name)
+    concrete, _ = build_program(sched, interp, name, mem_size=layout.mem_size)
     deps_of = {addr: val[1] for addr, (val, _) in concrete.items()}
     for load_id, addr in interp.loads:
         if addr in deps_of and load_id not in deps_of[addr]:
@@ -875,7 +938,7 @@ class Sweeper:
             return self.memo[key]
         self.stats.queries += 1
         self.stats.max_query_nodes = max(self.stats.max_query_nodes, len(nodes))
-        # Case split on the select conditions known to be 0 or 1 (R20): every case is a
+        # Case split on the select conditions known to be 0 or 1 (R25): every case is a
         # select-free query, and the cases are exhaustive, so all UNSAT is a proof. Z3 is
         # slow on sums of selects (the Mobius form) but instant once the conditions are fixed.
         conds = sorted({n[1] for n in nodes if n[0] == "sel" and ivs[n[1]][1] <= 1})
@@ -977,11 +1040,14 @@ def check_equivalence(sched_a: dict, sched_b: dict, values_only: bool = False, s
     images = layout.sample_images(max(samples, 2), seed)
     terms = NormTerms(layout, images)
     terms.program = "A"
-    stores_a, n_a = build_program(sched_a, terms, "A")
+    stores_a, n_a = build_program(sched_a, terms, "A", mem_size=layout.mem_size)
     terms.program = "B"
-    stores_b, n_b = build_program(sched_b, terms, "B")
+    stores_b, n_b = build_program(sched_b, terms, "B", mem_size=layout.mem_size)
 
     words = layout.value_words() if values_only else sorted(set(stores_a) | set(stores_b))
+    if not words:
+        raise EquivalenceError("no word would be compared (neither program stores a word in memory); "
+                               "an empty comparison proves nothing")
 
     def final(stores, addr):
         return stores[addr][0] if addr in stores else terms.mem(terms.const(addr), record=False)
@@ -1094,6 +1160,9 @@ def main(argv=None) -> int:
         return 3
     except AssertionError as e:
         print(f"ssa equivalence: checker bug: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:  # noqa: BLE001 - any other failure is a checker error, never a verdict
+        print(f"ssa equivalence: checker error: {type(e).__name__}: {e}", file=sys.stderr)
         return 3
     print(format_result(result, args.a, args.b))
     if result.difference is not None and args.counterexample_out:
