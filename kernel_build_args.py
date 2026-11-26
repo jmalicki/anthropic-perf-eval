@@ -736,7 +736,8 @@ def args_to_build_kwargs(
 
     check_greedy_shape_combinations(get)
     check_encoding_option_combinations(get)
-    if get("use_greedy", False) and get("valu_shift", "optimize") == "alu":
+    # Not with --no-valu-shift: shifting is off, so --valu-shift alu shifts nothing.
+    if get("use_greedy", False) and get("valu_shift", "optimize") == "alu" and get("enable_valu_shift", True):
         import sys as _sys
         print("WARNING: --valu-shift alu under --use-greedy runs every shiftable vector op as 8 scalar ops, "
               "about one per cycle on the 12 scalar slots: expect a schedule several times longer "
