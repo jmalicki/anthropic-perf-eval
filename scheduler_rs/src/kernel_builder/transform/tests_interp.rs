@@ -2,22 +2,15 @@
 //! the program before and after each transform computes the same observable outputs on
 //! random inputs, and agrees with the reference kernel.
 //!
-//! Not `transform::interp`: that one treats loads as inputs keyed by destination VReg and
-//! stores as an ordered output list, which cannot express what these rules are about. The
-//! index rules remove loads (the initial index load) and stores (the index stores), rely on
-//! the contents of memory (initial indices 0), and the tree access gathers from addresses
-//! computed from the index. This interpreter runs on a full memory image of `problem.py`
-//! (`build_mem_image`) and compares the arrays the harness reads; it also supports
-//! `SelectChoice` / `vselect`, `<`, `==` and vector groups, which the emitted kernels use.
-
-use std::collections::HashMap;
+//! The interpreter is `transform::interp` (one for every rule; it follows lowering and models
+//! memory). This module runs it on a full memory image of `problem.py` (`build_mem_image`) and
+//! compares the arrays the harness reads.
 
 use super::tests::{clone_program, raw_program};
 use super::tests_index::configs;
 use crate::kernel_builder::config::{ProblemSpec, TransformKind, HASH_STAGES};
 use crate::kernel_builder::pipeline::passes::transform::apply_transform;
 use crate::kernel_builder::SsaProgram;
-use crate::types::{Opcode, Operand, VReg};
 
 /// Deterministic pseudo-random words.
 struct Rng(u64);
@@ -92,109 +85,19 @@ fn reference(mem: &[u32]) -> (Vec<u32>, Vec<u32>) {
     (idx, val)
 }
 
-fn alu(op: Opcode, a: u32, b: u32) -> u32 {
-    match op {
-        Opcode::Add => a.wrapping_add(b),
-        Opcode::Sub => a.wrapping_sub(b),
-        Opcode::Mul => a.wrapping_mul(b),
-        Opcode::Div => a / b,
-        Opcode::Mod => a % b,
-        Opcode::Xor => a ^ b,
-        Opcode::And => a & b,
-        Opcode::Or => a | b,
-        Opcode::Shl => a.checked_shl(b).unwrap_or(0),
-        Opcode::Shr => a.checked_shr(b).unwrap_or(0),
-        Opcode::Lt => (a < b) as u32,
-        Opcode::Eq => (a == b) as u32,
-        other => panic!("interp: no ALU semantics for {:?}", other),
-    }
-}
-
-/// Run `p` on `mem` (modified in place). Semantics follow `problem.py` (`alu`, `valu`, loads
-/// and stores; results mod 2^32). `SelectChoice`, `vselect` and `select` are
-/// `cond != 0 ? t : f` (the multiply-add encoding agrees for 0/1 conditions, which the
-/// emitter guarantees). A decomposed vector defines its 8 lanes; reading a group alias
-/// assembles its lanes. Barriers and control pseudo-ops are skipped.
+/// Run `p` on `mem` (modified in place) with `transform::interp::run`; an error (an op it
+/// refuses, SelectChoice lowerings that disagree, ...) fails the test.
 ///
 /// # Arguments
 /// * `p` - The program.
 /// * `mem` - Main memory.
 pub(super) fn run(p: &SsaProgram, mem: &mut [u32]) {
-    let mut regs: HashMap<VReg, Vec<u32>> = HashMap::new();
-    if let Some(z) = p.zero_vreg {
-        regs.insert(z, vec![0]);
-    }
-    let read = |regs: &HashMap<VReg, Vec<u32>>, v: VReg| -> Vec<u32> {
-        if let Some(x) = regs.get(&v) {
-            return x.clone();
-        }
-        if let Some(lanes) = p.vector_group_lanes.get(&v) {
-            return lanes
-                .iter()
-                .map(|l| regs.get(l).unwrap_or_else(|| panic!("interp: lane {:?} of {:?} unset", l, v))[0])
-                .collect();
-        }
-        panic!("interp: {:?} read before its definition", v)
-    };
-    for op in &p.ops {
-        let src = |k: usize, regs: &HashMap<VReg, Vec<u32>>| -> Vec<u32> {
-            match op.srcs[k] {
-                Operand::VReg(v) => read(regs, v),
-                Operand::Imm(i) => vec![i as u32],
-            }
-        };
-        let widen = |x: Vec<u32>, n: usize| -> Vec<u32> {
-            if x.len() == 1 {
-                vec![x[0]; n]
-            } else {
-                x
-            }
-        };
-        let out: Option<Vec<u32>> = match op.opcode {
-            Opcode::Barrier | Opcode::Halt | Opcode::Jump | Opcode::CondJump | Opcode::DebugPrint => None,
-            Opcode::ConstChoice | Opcode::Const | Opcode::AddImm => {
-                Some(vec![op.produces_constant.expect("constant op without its value") as u32])
-            }
-            Opcode::Vbroadcast => Some(vec![src(0, &regs)[0]; 8]),
-            Opcode::Load => Some(vec![mem[src(0, &regs)[0] as usize]]),
-            Opcode::Vload => {
-                let a = src(0, &regs)[0] as usize;
-                Some(mem[a..a + 8].to_vec())
-            }
-            Opcode::Store => {
-                mem[src(0, &regs)[0] as usize] = src(1, &regs)[0];
-                None
-            }
-            Opcode::Vstore => {
-                let a = src(0, &regs)[0] as usize;
-                mem[a..a + 8].copy_from_slice(&src(1, &regs));
-                None
-            }
-            Opcode::MultiplyAdd => {
-                let (a, b, c) = (src(0, &regs), src(1, &regs), src(2, &regs));
-                Some((0..8).map(|i| a[i].wrapping_mul(b[i]).wrapping_add(c[i])).collect())
-            }
-            Opcode::SelectChoice | Opcode::Vselect | Opcode::Select => {
-                let (c, t, f) = (src(0, &regs), src(1, &regs), src(2, &regs));
-                let n = c.len().max(t.len()).max(f.len());
-                let (c, t, f) = (widen(c, n), widen(t, n), widen(f, n));
-                Some((0..n).map(|i| if c[i] != 0 { t[i] } else { f[i] }).collect())
-            }
-            _ => {
-                let (a, b) = (src(0, &regs), src(1, &regs));
-                assert_eq!(a.len(), b.len(), "interp: operand widths of {:?}", op.opcode);
-                Some(a.iter().zip(&b).map(|(&x, &y)| alu(op.opcode, x, y)).collect())
-            }
-        };
-        if let (Some(d), Some(v)) = (op.dest, out) {
-            if let Some(ls) = p.vector_group_lanes.get(&d) {
-                for (k, l) in ls.iter().enumerate() {
-                    regs.insert(*l, vec![v[k]]);
-                }
-            }
-            regs.insert(d, v);
-        }
-    }
+    super::interp::run(p, mem).unwrap_or_else(|e| panic!("{}", e));
+}
+
+/// `run` following one `SelectChoice` lowering (see `interp::SelectLowering`).
+pub(super) fn run_with(p: &SsaProgram, mem: &mut [u32], select: super::interp::SelectLowering) {
+    super::interp::run_with(p, mem, select).unwrap_or_else(|e| panic!("{}", e));
 }
 
 pub(super) type Outputs = (Vec<u32>, Vec<u32>);
@@ -210,6 +113,20 @@ pub(super) fn outputs(p: &SsaProgram, spec: &ProblemSpec, seeds: &[u64]) -> Vec<
             let (mut mem, ip, vp) = memory(spec, seed);
             let expected = reference(&mem);
             run(p, &mut mem);
+            let b = spec.batch_size;
+            ((mem[ip..ip + b].to_vec(), mem[vp..vp + b].to_vec()), expected)
+        })
+        .collect()
+}
+
+/// `outputs` following one `SelectChoice` lowering (see `interp::SelectLowering`).
+pub(super) fn outputs_with(p: &SsaProgram, spec: &ProblemSpec, seeds: &[u64], select: super::interp::SelectLowering) -> Vec<(Outputs, Outputs)> {
+    seeds
+        .iter()
+        .map(|&seed| {
+            let (mut mem, ip, vp) = memory(spec, seed);
+            let expected = reference(&mem);
+            run_with(p, &mut mem, select);
             let b = spec.batch_size;
             ((mem[ip..ip + b].to_vec(), mem[vp..vp + b].to_vec()), expected)
         })
@@ -251,5 +168,79 @@ fn test_index_transforms_preserve_outputs() {
                 check_semantics(&spec, &ts, &label);
             }
         }
+    }
+}
+
+/// A program from `ops` (dest ids as given), with the lane map `lanes`.
+fn tiny(ops: Vec<crate::types::SsaOp>, lanes: Vec<(crate::types::VReg, Vec<crate::types::VReg>)>, vreg_count: u32) -> SsaProgram {
+    let mut ops = ops;
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = i;
+    }
+    SsaProgram {
+        vreg_def: ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect(),
+        ops,
+        vreg_count,
+        const_alternatives: Vec::new(),
+        zero_vreg: None,
+        vector_group_lanes: lanes.into_iter().collect(),
+    }
+}
+
+#[test]
+fn test_interp_rejects_a_malformed_vector_group() {
+    use crate::types::{Engine, Opcode, Operand, SsaOp, VReg};
+    // A vector alias with 7 scalar lanes, stored: an error, not a panic. With 8 lanes it runs.
+    let konst = |d: VReg, k: i64| {
+        let mut op = SsaOp::new(0, Engine::Load, Opcode::Const, Some(d), vec![Operand::Imm(k)]);
+        op.produces_constant = Some(k);
+        op
+    };
+    for n in [7u32, 8] {
+        let addr = VReg::scalar(0);
+        let lanes: Vec<VReg> = (1..=n).map(VReg::scalar).collect();
+        let key = VReg::vector(n + 1);
+        let mut ops = vec![konst(addr, 16)];
+        ops.extend(lanes.iter().map(|&l| konst(l, 3)));
+        ops.push(SsaOp::new(0, Engine::Store, Opcode::Vstore, None, vec![Operand::VReg(addr), Operand::VReg(key)]));
+        let p = tiny(ops, vec![(key, lanes)], n + 2);
+        let mut mem = vec![0u32; 64];
+        let r = super::interp::run_with(&p, &mut mem, super::interp::SelectLowering::Both);
+        if n == 7 {
+            assert!(r.as_ref().err().map_or(false, |e| e.contains("malformed")), "{:?}", r.err());
+        } else {
+            r.unwrap();
+            assert_eq!(&mem[16..24], &[3; 8]);
+        }
+    }
+}
+
+#[test]
+fn test_interp_reads_the_select_delta_only_for_the_multiply_add_lowering() {
+    use super::interp::{run_with, SelectLowering};
+    use crate::types::{Engine, Opcode, Operand, SsaOp, VReg};
+    // A SelectChoice whose delta is a scalar (wrong width): vselect does not read it and gives
+    // its result; the multiply_add lowering (and Both) report the width.
+    let konst = |d: VReg, k: i64| {
+        let mut op = SsaOp::new(0, Engine::Load, Opcode::Const, Some(d), vec![Operand::Imm(k)]);
+        op.produces_constant = Some(k);
+        op
+    };
+    let (one, five, nine, delta) = (VReg::scalar(0), VReg::scalar(1), VReg::scalar(2), VReg::scalar(3));
+    let (c, t, f, r) = (VReg::vector(4), VReg::vector(5), VReg::vector(6), VReg::vector(7));
+    let bc = |d: VReg, s: VReg| SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(d), vec![Operand::VReg(s)]);
+    let mut sel = SsaOp::new(0, Engine::Flow, Opcode::SelectChoice, Some(r), vec![Operand::VReg(c), Operand::VReg(t), Operand::VReg(f)]);
+    sel.delta_vreg = Some(delta);
+    let p = tiny(
+        vec![konst(one, 1), konst(five, 5), konst(nine, 9), konst(delta, 4), bc(c, one), bc(t, five), bc(f, nine), sel],
+        vec![],
+        8,
+    );
+    let mut mem = vec![0u32; 8];
+    let regs = run_with(&p, &mut mem, SelectLowering::Vselect).unwrap();
+    assert_eq!(regs[&r], vec![5; 8]);
+    for lowering in [SelectLowering::MultiplyAdd, SelectLowering::Both] {
+        let e = run_with(&p, &mut mem, lowering).err().expect("wrong-width delta");
+        assert!(e.contains("delta has the wrong width"), "{}", e);
     }
 }

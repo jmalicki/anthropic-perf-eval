@@ -28,6 +28,8 @@
 //! - `prune_index` - rule `prune-index` (shared wrap zero, depth-0 index update from a
 //!   provably zero index, initial index load dead)
 //! - `values_only` - rule `values-only`: the output contract "indices not observed"
+//! - `mirror_index` - rule `mirror-index`: the mirrored index `n = L_d - idx` for every index
+//!   value or none (catalogue rule 8), depths from the bit-path forms
 //! - `select_bits` - rule `select-bits-path`: read the branch bits instead of extracting them
 //!   from the index (catalogue rule 11), from bit-path forms proved on the ops
 //! - `report` - per-site and cascade cost deltas of a rewrite
@@ -37,6 +39,7 @@ pub mod cost;
 pub mod graph;
 pub mod hash_merge;
 pub mod interp;
+pub mod mirror_index;
 pub mod prune_index;
 pub mod report;
 pub mod rule;
@@ -55,12 +58,17 @@ mod tests_interp;
 #[cfg(test)]
 mod tests_select_bits;
 #[cfg(test)]
+mod tests_mirror_index;
+#[cfg(test)]
 mod tests_values;
+#[cfg(test)]
+mod tests_framework;
 
 pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};
 pub use graph::SsaGraph;
 pub use hash_merge::{apply_hash_merge, HashMergeReport, HashMergeRule, HashMergeSite, ProposalSource};
+pub use mirror_index::{apply_mirror_index, MirrorIndexRule, MirrorPlan};
 pub use prune_index::{apply_prune_index, PruneIndexRule, PruneIndexSite, PruneKind};
 pub use report::RuleReport;
 pub use rule::{Fact, FactSource, Proposal, Rejection, Rule};

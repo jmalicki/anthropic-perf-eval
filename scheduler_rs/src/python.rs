@@ -1135,6 +1135,8 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 /// as the root broadcast of round 0 already does): a bit derived from a loaded index is
 /// replaced by an earlier branch bit, which differs for a nonzero start. Mirrored and
 /// post-wrap sites need no such precondition.
+/// "mirror-index": every index value to the mirrored form n = L_d - idx, or none (the program
+/// `index_form="mirrored"` emits); see transform/mirror_index.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
     merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None, reassociate_gather_xor=false, index_early_terms="none", select_xor_pushdown="none",

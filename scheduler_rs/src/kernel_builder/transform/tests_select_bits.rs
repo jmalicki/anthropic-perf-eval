@@ -9,7 +9,7 @@ use super::graph::SsaGraph;
 use super::select_bits::{apply_select_bits, SelectBitsRule, SelectBitsSite};
 use super::tests::{canonical_ops, clone_program, flow90_plan, raw_program};
 use super::tests_index::check_parity;
-use super::tests_interp::{memory, outputs, run};
+use super::tests_interp::{memory, outputs, outputs_with, run_with};
 use crate::kernel_builder::config::{CachedSelect, IndexForm, ProblemSpec, SelectBitSource, TransformKind};
 use crate::kernel_builder::pipeline::passes::transform::apply_transform;
 use crate::kernel_builder::SsaProgram;
@@ -166,10 +166,15 @@ fn assert_same_outputs(before: &SsaProgram, after: &SsaProgram, spec: &ProblemSp
 /// `assert_same_outputs` it does not require `before` to be the kernel (a perturbed program
 /// computes something else; the rewrite must still keep it).
 fn assert_unchanged_outputs(before: &SsaProgram, after: &SsaProgram, spec: &ProblemSpec, label: &str) {
+    // A perturbed program's select conditions need not be 0/1, so its meaning can depend on
+    // the SelectChoice lowering: the rewrite must keep the outputs under each.
+    use super::interp::SelectLowering::{MultiplyAdd, Vselect};
     let seeds = [11u64, 4242];
-    let (b, a) = (outputs(before, spec, &seeds), outputs(after, spec, &seeds));
-    for (k, ((bo, _), (ao, _))) in b.iter().zip(&a).enumerate() {
-        assert_eq!(ao, bo, "{}: outputs differ after the rewrite (seed {})", label, seeds[k]);
+    for select in [Vselect, MultiplyAdd] {
+        let (b, a) = (outputs_with(before, spec, &seeds, select), outputs_with(after, spec, &seeds, select));
+        for (k, ((bo, _), (ao, _))) in b.iter().zip(&a).enumerate() {
+            assert_eq!(ao, bo, "{} ({:?}): outputs differ after the rewrite (seed {})", label, select, seeds[k]);
+        }
     }
 }
 
@@ -481,7 +486,7 @@ fn test_select_bits_on_some_sites_keeps_the_extraction() {
 
 /// Final (indices, values) of `p` on the problem.py image with random input values and
 /// initial indices drawn from {0, 1} (nonzero: the input precondition does not hold).
-fn outputs_nonzero_indices(p: &SsaProgram, spec: &ProblemSpec, seed: u64) -> (Vec<u32>, Vec<u32>) {
+fn outputs_nonzero_indices(p: &SsaProgram, spec: &ProblemSpec, seed: u64, select: super::interp::SelectLowering) -> (Vec<u32>, Vec<u32>) {
     let (mut mem, ip, vp) = memory(spec, seed);
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     for k in 0..spec.batch_size {
@@ -491,7 +496,8 @@ fn outputs_nonzero_indices(p: &SsaProgram, spec: &ProblemSpec, seed: u64) -> (Ve
         mem[ip + k] = (x & 1) as u32;
     }
     assert!(mem[ip..ip + spec.batch_size].iter().any(|&i| i != 0));
-    run(p, &mut mem);
+    // Outside the precondition the extracted "bits" need not be 0/1: one lowering at a time.
+    run_with(p, &mut mem, select);
     let b = spec.batch_size;
     (mem[ip..ip + b].to_vec(), mem[vp..vp + b].to_vec())
 }
@@ -508,7 +514,16 @@ fn test_select_bits_without_the_assumption_on_nonzero_initial_indices() {
         let first_pass_only = label.contains("zero-based") && label.starts_with("5r");
         assert_eq!(report.n_sites() == 0, first_pass_only, "{}: {}", label, report.n_sites());
         for seed in [1u64, 2, 3] {
-            assert_eq!(outputs_nonzero_indices(&q, &spec, seed), outputs_nonzero_indices(&p, &spec, seed), "{} seed {}", label, seed);
+            for select in [super::interp::SelectLowering::Vselect, super::interp::SelectLowering::MultiplyAdd] {
+                assert_eq!(
+                    outputs_nonzero_indices(&q, &spec, seed, select),
+                    outputs_nonzero_indices(&p, &spec, seed, select),
+                    "{} seed {} {:?}",
+                    label,
+                    seed,
+                    select
+                );
+            }
         }
     }
 }

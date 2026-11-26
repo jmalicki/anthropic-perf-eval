@@ -945,13 +945,18 @@ pub enum TransformKind {
     /// `select_bit_source = path` emits. Declares the input precondition "initial indices are
     /// 0" (the zero-based chain of the first pass starts at the loaded index).
     SelectBitsPath,
+    /// Every index value to the mirrored form `n = L_d - idx`, or none
+    /// (`transform::mirror_index`, rule 8, proofs R10, R15): the program
+    /// `index_form = mirrored` emits. Declares the input precondition "initial indices are 0".
+    MirrorIndex,
 }
 
 impl TransformKind {
     /// Parse the CLI/binding spelling.
     ///
     /// # Arguments
-    /// * `s` - `"hash-merge"`, `"prune-index"`, `"values-only"` or `"select-bits-path"`
+    /// * `s` - `"hash-merge"`, `"prune-index"`, `"values-only"`, `"select-bits-path"` or
+    ///   `"mirror-index"`
     ///
     /// # Returns
     /// The transform, or an error message naming the valid values.
@@ -961,8 +966,9 @@ impl TransformKind {
             "prune-index" => Ok(TransformKind::PruneIndex),
             "values-only" => Ok(TransformKind::ValuesOnly),
             "select-bits-path" => Ok(TransformKind::SelectBitsPath),
+            "mirror-index" => Ok(TransformKind::MirrorIndex),
             other => Err(format!(
-                "Invalid transform '{}': must be 'hash-merge', 'prune-index', 'values-only' or 'select-bits-path'",
+                "Invalid transform '{}': must be 'hash-merge', 'prune-index', 'values-only', 'select-bits-path' or 'mirror-index'",
                 other
             )),
         }
@@ -975,6 +981,7 @@ impl TransformKind {
             TransformKind::PruneIndex => "prune-index",
             TransformKind::ValuesOnly => "values-only",
             TransformKind::SelectBitsPath => "select-bits-path",
+            TransformKind::MirrorIndex => "mirror-index",
         }
     }
 }

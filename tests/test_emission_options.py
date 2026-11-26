@@ -101,7 +101,7 @@ def test_hash_merge_transform_equals_merge_hash_stages(tmp_path, rounds):
     assert len(rewritten_sched["ssa_ops"]) == len(merged_sched["ssa_ops"])
 
 
-TRANSFORM_FLAGS = {"hash-merge": "merge_hash_stages", "prune-index": "prune_dead_index", "values-only": "values_only"}
+TRANSFORM_FLAGS = {"hash-merge": "merge_hash_stages", "prune-index": "prune_dead_index", "values-only": "values_only"}  # boolean flags only
 
 
 @pytest.mark.parametrize("rounds", [3, 11])
@@ -147,6 +147,24 @@ def test_select_bits_transform_equals_select_bit_source_path(tmp_path, rounds, i
         assert rewritten["emission"][key] == emitted["emission"][key], key
     assert len(rewritten_sched["ssa_ops"]) == len(emitted_sched["ssa_ops"])
     assert vector_op_equivalents(rewritten) < vector_op_equivalents(extracted)
+
+
+@pytest.mark.parametrize("rounds", [3, 11, 12, 16])
+@pytest.mark.parametrize("cached_select,depth", [("standard", 3), ("bits", 4), ("mobius", 4)])
+@pytest.mark.parametrize("extra", [[], ["prune-index"], ["values-only"]], ids=lambda e: "+".join(e) or "alone")
+def test_mirror_index_transform_equals_index_form_mirrored(tmp_path, rounds, cached_select, depth, extra):
+    """--transform mirror-index rewrites the zero-based program into the one --index-form
+    mirrored emits: PROVED, PASSED (values only with values-only), same op counts, loads and
+    stores. 11 rounds end on the wrap round; 12 and 16 select after it."""
+    common = dict(cached_select=cached_select, tree_reduce_max_depth=depth)
+    flags = {TRANSFORM_FLAGS[t]: True for t in extra}
+    emitted, emitted_sched = build(tmp_path, rounds, index_form="mirrored", **flags, **common)
+    rewritten, rewritten_sched = build(tmp_path, rounds, transform=extra + ["mirror-index"], **common)
+    for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
+        assert rewritten["emission"][key] == emitted["emission"][key], key
+    assert len(rewritten_sched["ssa_ops"]) == len(emitted_sched["ssa_ops"])
+    for engine in ("load", "store", "flow"):
+        assert rewritten["engines"][engine]["ops"] == emitted["engines"][engine]["ops"], engine
 
 
 def test_transform_rejects_unknown_rule():

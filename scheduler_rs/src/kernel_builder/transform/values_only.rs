@@ -118,7 +118,13 @@ impl ValuesOnlyRule {
             }
             // Disjoint only if both accesses are proved inside their own arrays
             // (`MemoryLayout::may_overlap`); a different header word alone proves nothing.
-            let a = later.srcs.first().and_then(|s| s.as_vreg()).and_then(|a| values.address(graph, a));
+            // A load_offset reads at an address plus an offset the analysis does not model:
+            // unknown, so it may alias.
+            let a = if later.opcode == Opcode::LoadOffset {
+                None
+            } else {
+                later.srcs.first().and_then(|s| s.as_vreg()).and_then(|a| values.address(graph, a))
+            };
             if self.layout.may_overlap(Some(address), w, a, width(later)) {
                 return reject(format!("op {} ({:?}) may read the stored indices back", j, later.opcode));
             }

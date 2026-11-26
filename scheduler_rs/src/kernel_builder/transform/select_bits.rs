@@ -378,7 +378,7 @@ impl SelectBitsRule {
     ///
     /// # Returns
     /// The site, or why op `i` is not one.
-    pub fn match_at(&self, graph: &SsaGraph, values: &ValueFacts, paths: &BitPaths, i: usize) -> Result<SelectBitsSite, Rejection> {
+    pub fn match_at(&self, graph: &SsaGraph, _values: &ValueFacts, paths: &BitPaths, i: usize) -> Result<SelectBitsSite, Rejection> {
         let reject = |s: String| Err(Rejection(s));
         let op = &graph.ops[i];
         let Some(output) = op.dest else { return reject("op without a dest".into()) };
