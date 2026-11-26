@@ -516,8 +516,9 @@ Path-bit plans run within 31 words of the budget, and no plan-level proxy predic
 **Update: the shift count is a symptom, and a greedy term for stage 1 (heuristic)**
 (docs/GREEDY_SHAPE_ABLATION.md section 12). "VALU cycles left after the greedy's shifts"
 ranks plans because of an identity, not a mechanism. Vector ops left = 6 x cycles - idle
-vector slots, and the vector ALU is busy in every steady-state cycle. So a schedule that is
-longer for any reason shifts fewer ops.
+vector slots, and the vector ALU is busy in every steady-state cycle. So, with the same vector
+work and the same idle vector slots, a schedule that is longer for any reason shifts fewer ops
+(shifts = V - 6T + idle: more idle slots can offset more cycles).
 
 For `flow90.json`, 32 of its 42 cycles above the floor are needed by any schedule of that
 emission (static bound 1,029); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). Its 158 shifts "missing" against the
