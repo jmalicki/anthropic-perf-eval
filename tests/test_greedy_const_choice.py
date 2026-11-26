@@ -21,16 +21,16 @@ from verification.kernel_dataflow import check  # noqa: E402
 ROUNDS, BATCH, HEIGHT = 2, 16, 10
 
 
-def _build(**options):
+def _build(rounds=ROUNDS, batch=BATCH, **options):
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "sched.json")
-        instrs, stats = build_kernel_with_args(rounds=ROUNDS, batch_size=BATCH, use_greedy=True, verbose=False,
+        instrs, stats = build_kernel_with_args(rounds=rounds, batch_size=batch, use_greedy=True, verbose=False,
                                                output_json=path, **options)
         with open(path) as f:
             sched = json.load(f)
     instrs = json.loads(json.dumps(list(instrs)))
     assert check({"instrs": instrs}, sched).ok, "dataflow replay: kernel differs from its SSA program"
-    assert validate_kernel(instrs, HEIGHT, BATCH, ROUNDS, 123)
+    assert validate_kernel(instrs, HEIGHT, batch, rounds, 123)
     encodings = collections.Counter(op["engine"] for op in sched["ops"] if op.get("from_const_choice") is not None)
     n_const = sum(1 for op in sched["ssa_ops"] if op["opcode"] == "const_choice")
     sched["_stats"] = dict(stats)
@@ -55,9 +55,12 @@ def test_forced_select_choice_takes_effect_under_greedy():
 @pytest.mark.parametrize("policy", ["alu-first", "alu-when-load-full"])
 def test_const_policy_kernels_are_proved_and_valid(policy):
     """The derived constants read their operands at the derive's cycle: the dataflow replay
-    proves the kernel equals the SSA program, and the simulator validates it (in _build)."""
-    encodings, n_const, _ = _build(greedy_const_policy=policy)
+    proves the kernel equals the SSA program, and the simulator validates it (in _build).
+    4 rounds, batch 32: both policies derive constants there (at 2 rounds, batch 16 the
+    default shape derives none, so the test proved nothing about derivations)."""
+    encodings, n_const, _ = _build(rounds=4, batch=32, greedy_const_policy=policy)
     assert sum(encodings.values()) == n_const
+    assert encodings["alu"] > 0, f"control: {policy} derived nothing ({dict(encodings)})"
 
 
 def test_justify_with_alu_derived_constants():
@@ -80,6 +83,9 @@ def test_justify_with_alu_derived_constants():
     assert justified["_stats"]["cycles"] < plain["_stats"]["cycles"], (summary, plain["_stats"]["cycles"])
     cycles = lambda s: [op["cycle"] for op in s["ssa_ops"]]  # noqa: E731
     assert cycles(justified) != cycles(plain)
+    # Control: without the policy, justification changes this schedule too.
+    default = dict(shape, greedy_const_policy="default")
+    assert cycles(_build(greedy_justify=10, **default)[2]) != cycles(_build(**default)[2])
 
 
 @pytest.mark.parametrize("policy", ["alu-first", "alu-when-load-full"])
@@ -107,3 +113,62 @@ def test_const_policy_with_a_fixed_choices_rerun(policy, owner):
             assert len(slots) <= limits.get(engine, 99), f"cycle {c}: {len(slots)} {engine} slots"
     assert check({"instrs": instrs}, sched).ok, "dataflow replay: kernel differs from its SSA program"
     assert validate_kernel(instrs, HEIGHT, batch, rounds, 123)
+
+
+def test_forced_valu_shift_takes_effect_under_greedy():
+    """--valu-shift alu shifts every shiftable vector op, --valu-shift valu none (review of #86).
+    4 rounds, batch 32: the smallest size here where the default greedy shifts some (8)."""
+    def shifted(mode):
+        instrs, stats = build_kernel_with_args(rounds=4, batch_size=32, use_greedy=True, verbose=False, valu_shift=mode)
+        instrs = json.loads(json.dumps(list(instrs)))
+        assert validate_kernel(instrs, HEIGHT, 32, 4, 123)
+        return stats["valu_shifted"], instrs
+    default, _ = shifted("optimize")
+    alu, alu_instrs = shifted("alu")
+    valu, _ = shifted("valu")
+    assert 0 < default < alu, "control: the default shifts some, alu more"
+    assert valu == 0
+    shiftable = {"+", "-", "*", "^", "&", "|", "<<", ">>", "%", "<", "==", "//", "cdiv"}
+    on_valu = [s for b in alu_instrs for s in b.get("valu", []) if s[0] in shiftable]
+    assert not on_valu, f"--valu-shift alu left {len(on_valu)} shiftable ops on the vector ALU"
+
+
+def test_forced_vselect_takes_effect_under_greedy():
+    _, _, forced = _build(select_choice="vselect")
+    n_select = sum(1 for op in forced["ssa_ops"] if op["opcode"] == "select_choice")
+    vselects = sum(1 for op in forced["ops"] if op["engine"] == "flow" and op["slot"][0] == "vselect")
+    assert n_select > 0 and vselects == n_select
+
+
+@pytest.mark.parametrize("options, match", [
+    (dict(const_choice="load", enable_const_choice_hint_pass=True), "hint pass"),
+    (dict(const_choice="add_imm", hint_passes=True), "hint pass"),
+    (dict(select_choice="vselect", enable_select_choice_hint_pass=True), "hint pass"),
+    (dict(valu_shift="alu", enable_valu_shift_hint_pass=True), "hint pass"),
+    (dict(greedy_early_stagger=(8, 3)), "wavefront"),
+    (dict(greedy_const_policy="alu-first", const_choice="load"), "owns the ConstChoice"),
+    (dict(greedy_const_policy="alu-first", enable_const_choice_hint_pass=True), "owns the ConstChoice"),
+])
+def test_overridden_or_ignored_options_are_errors(options, match):
+    """Review of #86: options another option would silently override or ignore."""
+    with pytest.raises(ValueError, match=match):
+        _build(**options)
+
+
+def test_const_policy_under_cpsat_is_an_error():
+    with pytest.raises(ValueError, match="greedy-only|owns the ConstChoice"):
+        build_kernel_with_args(rounds=ROUNDS, batch_size=BATCH, use_greedy=False, verbose=False,
+                               greedy_const_policy="alu-first")
+
+
+def test_binding_rejects_overridden_options():
+    """Direct binding calls get the same check (Rust config::check_encoding_option_combinations)."""
+    import scheduler_rs
+
+    base = dict(forest_height=2, n_nodes=7, batch_size=8, rounds=1, verbose=False, use_cpsat=False)
+    with pytest.raises(ValueError, match="const_choice"):
+        scheduler_rs.build_tick_tock_kernel_ssa(**base, const_choice="load", enable_const_choice_hint_pass=True)
+    with pytest.raises(ValueError, match="greedy_early_stagger"):
+        scheduler_rs.build_tick_tock_kernel_ssa(**base, greedy_early_stagger=(8, 3))
+    with pytest.raises(ValueError, match="greedy_const_policy"):
+        scheduler_rs.build_tick_tock_kernel_ssa(**dict(base, use_cpsat=True), greedy_const_policy="alu-first")
