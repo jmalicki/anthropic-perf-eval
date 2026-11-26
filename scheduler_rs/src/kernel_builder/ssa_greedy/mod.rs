@@ -135,7 +135,7 @@ fn must_shift(
 /// any run that reaches the budget overshoots it (address assignment then rejects the
 /// kernel). The pressure policy's inflation and shift suppression are what keep a default
 /// run below the budget, which is why passing runs stop short of it.
-/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `Stall` forces only in a cycle where nothing else was placed (see [`BudgetForce::Stall`]), as the
 /// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
 /// in this one may have freed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,7 +143,9 @@ pub enum BudgetForce {
     /// Force one deferred op per cycle whenever it has a slot (default).
     #[default]
     SameCycle,
-    /// Force only when nothing else was placed in the cycle.
+    /// Force only when nothing else was placed in the cycle. Not necessarily a deadlock: a
+    /// cycle can be empty because ASAP inflation deferred every op that would free words for a
+    /// few cycles (docs/STALL_DEADLOCK.md).
     Stall,
 }
 
@@ -2409,6 +2411,10 @@ fn schedule_ssa_greedy_core(
     // Ready heap: (priority, op_idx) - min-heap via Reverse
     // Priority is the earliest cycle this op can be scheduled (ASAP)
     let mut ready_heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::new();
+    // SCHEDULER_DEADLOCK_DUMP=path: write the state at the first cycle `stall` forces (see
+    // `dump_deadlock_state`). A debugging aid; off unless the variable is set.
+    let deadlock_dump_path = std::env::var("SCHEDULER_DEADLOCK_DUMP").ok();
+    let mut deadlock_dumped = false;
 
     // Initialize with ops that have no dependencies (excluding dead stores)
     for (idx, op) in ops.iter().enumerate() {
@@ -2593,6 +2599,12 @@ fn schedule_ssa_greedy_core(
         // Try to schedule ready ops with retry for budget-constrained ops.
         // When an op frees VRegs, previously budget-failed ops may now fit.
         let mut budget_deferred: Vec<usize> = Vec::new();
+        // SCHEDULER_DEADLOCK_DUMP only: why each op in `budget_deferred` was last deferred this
+        // cycle ("budget": the hard check; "pressure": the policy's soft deferral), and the ops
+        // ASAP inflation deferred this cycle. Not read by the scheduler.
+        let dump_enabled = deadlock_dump_path.is_some() && !deadlock_dumped;
+        let mut deferral_reason: HashMap<usize, &'static str> = HashMap::new();
+        let mut inflation_deferred_ids: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
         // A split shift started this cycle: its destination block is reserved and scalar
@@ -2900,6 +2912,9 @@ fn schedule_ssa_greedy_core(
                             if inflated > cycle as i32 {
                                 deferred_by_bounds.push((inflated, idx));
                                 inflation_deferred_count += 1;
+                                if dump_enabled {
+                                    inflation_deferred_ids.push(idx);
+                                }
                                 inflation_stats.total_deferred += 1;
                                 inflation_stats.total_inflation_cycles += inflation as i64;
                                 if inflation > inflation_stats.max_inflation {
@@ -3223,6 +3238,9 @@ fn schedule_ssa_greedy_core(
                     // Defer for retry - liveness may decrease after other ops scheduled
                     diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
+                    if dump_enabled {
+                        deferral_reason.insert(idx, "budget");
+                    }
                     continue;
                 }
                 // Strategy-driven soft deferral (pressure awareness)
@@ -3233,6 +3251,9 @@ fn schedule_ssa_greedy_core(
                     scratch_budget,
                 ) {
                     budget_deferred.push(idx);
+                    if dump_enabled {
+                        deferral_reason.insert(idx, "pressure");
+                    }
                     continue;
                 }
 
@@ -3421,6 +3442,49 @@ fn schedule_ssa_greedy_core(
             diagnostics.split_only_cycles += 1;
         }
         if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
+            if let (Some(path), false, false) = (deadlock_dump_path.as_ref(), deadlock_dumped, force_same_cycle) {
+                deadlock_dumped = true;
+                let state = serde_json::json!({
+                    "cycle": cycle,
+                    "live_words": live.words,
+                    "budget": scratch_budget,
+                    "live": live_vregs.iter().map(|v| serde_json::json!({
+                        "vreg": v.id, "words": v.size(),
+                        "remaining_users": vreg_remaining_users.get(v).copied().unwrap_or(0),
+                    })).collect::<Vec<_>>(),
+                    // Ready ops deferred this cycle, with the reason they were last deferred.
+                    "budget_deferred": budget_deferred.iter().map(|&i| serde_json::json!({
+                        "id": ops[i].id, "reason": deferral_reason.get(&i).copied().unwrap_or("unknown"),
+                    })).collect::<Vec<_>>(),
+                    // Ops ASAP inflation deferred this cycle (each is also in `heap`).
+                    "inflation_deferred": inflation_deferred_ids.iter().map(|&i| ops[i].id).collect::<Vec<_>>(),
+                    // `priority` is the heap's order key, not a wait: every entry whose deps are
+                    // ready and that is in the window is offered again next cycle (inflation
+                    // may defer it again).
+                    "heap": ready_heap.iter().map(|Reverse((pri, i))| serde_json::json!({
+                        "id": ops[*i].id, "priority": pri,
+                        "in_window": wavefront.as_ref().map_or(true, |w| w.in_window(*i)),
+                    })).collect::<Vec<_>>(),
+                    "slots": {"valu": slots.valu_used, "alu": slots.alu_used, "load": slots.load_used,
+                              "flow": slots.flow_used, "store": slots.store_used},
+                });
+                // At most one dump per greedy run (the first cycle that reaches the force with
+                // `stall`, or with scratch model `pools`, before the slot check: that cycle may
+                // force nothing). The counter is per process and per path and counts dumps, not
+                // greedy runs: the first dump goes to `<path>`, the k-th to `<path>.<k-1>`.
+                static DUMPS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+                    std::sync::Mutex::new(std::collections::BTreeMap::new());
+                let n = {
+                    let mut dumps = DUMPS.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = dumps.entry(path.clone()).or_insert(0);
+                    *n += 1;
+                    *n - 1
+                };
+                let path = if n == 0 { path.clone() } else { format!("{}.{}", path, n) };
+                if let Err(e) = std::fs::write(&path, state.to_string()) {
+                    eprintln!("SCHEDULER_DEADLOCK_DUMP: cannot write {}: {}", path, e);
+                }
+            }
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
