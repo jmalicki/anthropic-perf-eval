@@ -31,7 +31,7 @@ use super::graph::SsaGraph;
 use super::hash_merge::ProposalSource;
 use super::report::{counts_of, dce_counts, sub, RuleReport};
 use super::rule::{AlternativeSpec, Fact, FactSource, Proposal, Rejection, Rule};
-use super::surgery::Surgery;
+use super::surgery::{Finished, Surgery};
 use super::values::{Assumption, MemoryLayout, ValueFacts};
 
 /// Rule id.
@@ -343,6 +343,7 @@ pub fn apply_prune_index(
     let mut surgery = Surgery::new(program)?;
     for s in &sites {
         *report.sites.entry(s.kind.as_str()).or_default() += 1;
+        report.add_facts(&s.facts);
         match counts_of([&surgery.ops()[s.op]]) {
             Ok(removed) => *report.site_classes.entry((s.kind.as_str(), sub(&[0; 10], &removed))).or_default() += 1,
             Err(e) => report.cost_error = Some(e),
@@ -350,7 +351,15 @@ pub fn apply_prune_index(
         surgery.remove(s.op);
         surgery.replace_uses(s.output, s.replacement);
     }
-    let (program, surgery_report) = surgery.finish()?;
+    let (program, surgery_report) = match surgery.finish_or_refuse()? {
+        Finished::Done(program, report) => (program, report),
+        Finished::Refused(program, why) => {
+            report.refused = Some(why);
+            report.sites = Default::default();
+            report.site_classes = Default::default();
+            return Ok((program, report));
+        }
+    };
     report.surgery = surgery_report;
     if let (Some(before), None) = (before, &report.cost_error) {
         match dce_counts(&program) {

@@ -680,3 +680,23 @@ fn test_prune_index_match_site_agrees_with_find_sites() {
         assert_eq!(rule.match_site(&g, &proposal).as_ref(), Ok(s), "op {}", s.op);
     }
 }
+
+#[test]
+fn test_rule_reports_carry_the_assumptions_used() {
+    // prune-index relies on InitialIndicesZero only for round 0's update; values-only always
+    // relies on IndicesNotObserved. The reports list them (and the layout), each once.
+    let p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+    let (_, prune) = super::prune_index::apply_prune_index(clone_program(&p), &PruneIndexRule::for_problem(256), |_| true).unwrap();
+    assert_eq!(prune.assumptions(), vec!["initial-indices-zero"]);
+    assert!(prune.facts.iter().any(|f| f.name == "memory_layout"));
+    assert!(prune.summary().contains("assumes initial-indices-zero"));
+    let (_, vo) = apply_values_only(clone_program(&p), &ValuesOnlyRule::for_problem(256), |_| true).unwrap();
+    assert_eq!(vo.assumptions(), vec!["indices-not-observed"]);
+    // A prune of a program whose zeros come from constants only (after the wrap, no round 0
+    // site selected) assumes nothing.
+    let p16 = raw_program(&ProblemSpec::default());
+    let rule = PruneIndexRule::for_problem(256);
+    let (_, post_wrap) = super::prune_index::apply_prune_index(clone_program(&p16), &rule, |s| s.round.map_or(false, |r| r >= 10)).unwrap();
+    assert!(post_wrap.n_sites() > 0);
+    assert!(post_wrap.assumptions().is_empty(), "{:?}", post_wrap.facts);
+}

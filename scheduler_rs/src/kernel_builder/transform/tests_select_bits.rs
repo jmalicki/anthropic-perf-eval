@@ -654,3 +654,54 @@ fn test_level_last_matches_the_proof_constants() {
         assert_eq!(level_last(k + 1), 2 * level_last(k) + 2, "k = {}", k);
     }
 }
+
+/// The vector `L_2 = 6` the zero-based depth-3 extraction subtracts from, and whether only
+/// extraction SUBs read it.
+fn mirroring_constant(p: &SsaProgram) -> (VReg, bool) {
+    let (and, _) = first_sites(p);
+    let sub = def(p, p.ops[and.op].srcs[0].as_vreg().unwrap());
+    let c = p.ops[sub].srcs[0].as_vreg().unwrap();
+    let only_subs = p.ops.iter().filter(|o| o.reads().any(|v| v == c)).all(|o| o.opcode == Opcode::Sub);
+    (c, only_subs)
+}
+
+#[test]
+fn test_select_bits_refuses_an_edit_that_drops_a_kept_live_constant() {
+    // The rewrite makes the L_2 vector dead (only the extraction SUBs read it). Named in
+    // another op's keep_live it may not be dropped: the program is refused, unchanged, instead
+    // of failing the surgery.
+    let spec = ProblemSpec { rounds: 5, cached_select: CachedSelect::Bits, tree_reduce_max_depth: 3, ..Default::default() };
+    let mut p = raw_program(&spec);
+    let (c, only_subs) = mirroring_constant(&p);
+    assert!(only_subs, "the L_2 vector has other readers; the test needs one only the extraction reads");
+    p.ops.last_mut().unwrap().keep_live = Some(vec![c]);
+    let before = canonical_ops(&p);
+    let (after, report) = apply_select_bits(p, &rule(), |_| true).expect("refused, not an error");
+    assert!(report.refused.as_deref().map_or(false, |r| r.contains("keep_live")), "{:?}", report.refused);
+    assert_eq!(report.n_sites(), 0);
+    assert_eq!(canonical_ops(&after), before);
+}
+
+#[test]
+fn test_select_bits_refuses_an_edit_that_drops_a_traced_op() {
+    let spec = ProblemSpec { rounds: 5, cached_select: CachedSelect::Bits, tree_reduce_max_depth: 3, ..Default::default() };
+    let mut p = raw_program(&spec);
+    let (c, _) = mirroring_constant(&p);
+    let d = def(&p, c);
+    p.ops[d].trace_id = Some("l2".into());
+    let before = canonical_ops(&p);
+    let (after, report) = apply_select_bits(p, &rule(), |_| true).expect("refused, not an error");
+    assert!(report.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", report.refused);
+    assert_eq!(canonical_ops(&after), before);
+}
+
+#[test]
+fn test_select_bits_report_carries_the_assumption_only_when_used() {
+    // Zero-based first pass: InitialIndicesZero; mirrored: nothing assumed.
+    let zb = raw_program(&spec5(IndexForm::ZeroBased));
+    let (_, r) = apply_select_bits(zb, &rule(), |_| true).unwrap();
+    assert_eq!(r.assumptions(), vec!["initial-indices-zero"]);
+    let m = raw_program(&spec5(IndexForm::Mirrored));
+    let (_, r) = apply_select_bits(m, &rule(), |_| true).unwrap();
+    assert!(r.n_sites() > 0 && r.assumptions().is_empty(), "{:?}", r.facts);
+}

@@ -89,6 +89,15 @@ impl Stamp {
     }
 }
 
+/// Outcome of `Surgery::finish_or_refuse`.
+pub enum Finished {
+    /// The rewritten program and the report.
+    Done(SsaProgram, SurgeryReport),
+    /// The edit was refused; the program as it was given (only `vreg_count` may have grown)
+    /// and the reason.
+    Refused(SsaProgram, String),
+}
+
 /// A `ConstChoice` whose alternatives the rewrite changed (coupling C13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlternativesChange {
@@ -556,6 +565,23 @@ impl Surgery {
     /// eliminated beyond what the rewrite killed) and the report, or an error if a removed
     /// value is still read.
     pub fn finish(self) -> Result<(SsaProgram, SurgeryReport), String> {
+        match self.finish_or_refuse()? {
+            Finished::Done(program, report) => Ok((program, report)),
+            Finished::Refused(_, why) => Err(why),
+        }
+    }
+
+    /// Apply the edits, or refuse them and hand the program back unchanged.
+    ///
+    /// The edit is refused (not an error) when it would drop an op that something still
+    /// depends on outside dataflow: a value named in a surviving op's `keep_live`, or an op
+    /// carrying a trace id. Removal of what a rewrite made dead (step 3) can reach such ops
+    /// that the rule never looked at (e.g. a constant broadcast only the removed ops read).
+    ///
+    /// # Returns
+    /// `Finished::Done` as `finish`, `Finished::Refused` with the original program and the
+    /// reason, or an error for an inconsistency.
+    pub fn finish_or_refuse(self) -> Result<Finished, String> {
         let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
         let resolve = |mut v: VReg| {
             let mut guard = 0;
@@ -662,6 +688,35 @@ impl Surgery {
                 break;
             }
         }
+        // Refuse, with the input unchanged, an edit that drops a kept-live value or a traced op.
+        {
+            let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
+            let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
+            let exists = |v: VReg| {
+                Some(v) == program.zero_vreg
+                    || graph.def_index(v).is_some()
+                    || graph.group_lanes(v).is_some()
+                    || graph.element_of(v).is_some()
+            };
+            let mut why: Option<String> = None;
+            for (op, _) in &kept {
+                if let Some(v) = op.keep_live.iter().flatten().copied().find(|&v| !exists(v)) {
+                    why = Some(format!("the edit would drop {:?}, which op {} keeps live (keep_live)", v, op.id));
+                    break;
+                }
+            }
+            if why.is_none() {
+                let survived: BTreeSet<usize> = kept.iter().filter_map(|(_, o)| *o).collect();
+                if let Some(i) = (0..program.ops.len())
+                    .find(|&i| live_before[i] && !survived.contains(&i) && program.ops[i].trace_id.is_some())
+                {
+                    why = Some(format!("the edit would drop op {}, which carries a trace id", i));
+                }
+            }
+            if let Some(why) = why {
+                return Ok(Finished::Refused(program, why));
+            }
+        }
         let (mut ops, origins): (Vec<SsaOp>, Vec<Option<usize>>) = kept.into_iter().unzip();
 
         // Nothing may read a value that no longer exists, and every value is defined before
@@ -699,7 +754,7 @@ impl Surgery {
                 vreg_def.entry(d).or_insert(i);
             }
         }
-        Ok((
+        Ok(Finished::Done(
             SsaProgram {
                 ops,
                 vreg_def,
