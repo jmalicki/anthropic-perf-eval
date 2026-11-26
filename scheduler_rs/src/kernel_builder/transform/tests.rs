@@ -1484,6 +1484,75 @@ fn test_surgery_checks_inserted_readers_before_a_move() {
 }
 
 #[test]
+fn test_transform_pass_keeps_the_program_on_an_error() {
+    use crate::kernel_builder::config::TransformKind;
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+    // prune-index without a batch size fails after hash-merge succeeded: the context keeps
+    // the hash-merged program (for the error export), not an empty one.
+    let spec = ProblemSpec { rounds: 2, ..Default::default() };
+    let (merged, _) = apply_hash_merge(raw_program(&spec), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    let mut config = PipelineConfig::default();
+    config.compiler.transforms = vec![TransformKind::HashMerge, TransformKind::PruneIndex];
+    config.compiler.transform_batch_size = None;
+    let mut ctx = PipelineContext::new(raw_program(&spec), config);
+    let err = ctx.run_greedy_pipeline(false).err().expect("prune-index needs the batch size");
+    assert!(err.contains("batch size"), "{}", err);
+    assert_eq!(canonical_ops(&crate::kernel_builder::SsaProgram { ops: ctx.ops.clone(), ..clone_program(&merged) }), canonical_ops(&merged));
+}
+
+#[test]
+fn test_hash_merge_keeps_the_xor_operand_order() {
+    use crate::types::Opcode;
+    // A traced r = s ^ t (shift first) becomes h ^ l (the merged form of the shift first).
+    let mut p = one_site_program();
+    let xor = p.ops.iter().position(|o| o.opcode == Opcode::Xor).unwrap();
+    let shl = p.ops.iter().position(|o| o.opcode == Opcode::Shl).unwrap();
+    if p.ops[xor].srcs[0].as_vreg() != p.ops[shl].dest {
+        p.ops[xor].srcs.swap(0, 1);
+    }
+    p.ops[xor].trace_id = Some("r".into());
+    // k = 3 (not 0), so that h and l have different multipliers.
+    p.ops[7].srcs[0] = crate::types::Operand::Imm(3);
+    p.ops[7].produces_constant = Some(3);
+    p.ops[8].produces_constant = Some(3);
+    let (m, k) = (p.ops[1].produces_constant.unwrap(), 3);
+    assert_ne!((m << k) & 0xFFFF_FFFF, m & 0xFFFF_FFFF);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1);
+    let g = SsaGraph::new(&after.ops, &after.vector_group_lanes);
+    let r = after.ops.iter().find(|o| o.trace_id.as_deref() == Some("r")).unwrap();
+    let multiplier = |v| g.broadcast_const(g.def_op(v).unwrap().srcs[1].as_vreg().unwrap());
+    assert_eq!(multiplier(r.srcs[0].as_vreg().unwrap()), Some((m << k) & 0xFFFF_FFFF), "first operand is h");
+    assert_eq!(multiplier(r.srcs[1].as_vreg().unwrap()), Some(m & 0xFFFF_FFFF), "second operand is l");
+}
+
+#[test]
+fn test_surgery_drops_a_dead_reader_of_an_alias_whose_lanes_are_gone() {
+    use super::surgery::Surgery;
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // Eight scalar lanes assembled under an alias K, read only by an already-dead op. Removing
+    // a lane leaves K undefined: the dead reader goes with it.
+    let mut p = one_site_program();
+    let lanes: Vec<VReg> = (0..8).map(|k| VReg::scalar(p.vreg_count + k)).collect();
+    let key = VReg::vector(p.vreg_count + 8);
+    let dead = VReg::vector(p.vreg_count + 9);
+    p.vreg_count += 10;
+    let first_lane = p.ops.len();
+    for (k, &l) in lanes.iter().enumerate() {
+        let mut op = SsaOp::new(p.ops.len(), Engine::Load, Opcode::ConstChoice, Some(l), vec![Operand::Imm(100 + k as i64)]);
+        op.produces_constant = Some(100 + k as i64);
+        p.ops.push(op);
+    }
+    p.vector_group_lanes.insert(key, lanes);
+    p.ops.push(SsaOp::new(p.ops.len(), Engine::Valu, Opcode::Add, Some(dead), vec![Operand::VReg(key), Operand::VReg(key)]));
+    let mut surgery = Surgery::new(p).unwrap();
+    surgery.remove(first_lane);
+    let (after, report) = surgery.finish().unwrap();
+    assert!(!after.ops.iter().any(|o| o.dest == Some(dead)));
+    assert!(report.dropped_dead >= 1);
+}
+
+#[test]
 fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
     use super::surgery::{Stamp, Surgery};
     use crate::types::{Engine, Opcode, Operand};
