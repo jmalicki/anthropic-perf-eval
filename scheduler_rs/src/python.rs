@@ -1051,8 +1051,10 @@ pyo3::create_exception!(
     ScratchBudgetExceeded,
     pyo3::exceptions::PyRuntimeError,
     "The schedule does not fit the scratch budget. args = (message, peak_live, budget): the \
-     numbers of the accounting that raised it (see KernelBuilderError::BudgetExceeded). A \
-     RuntimeError subclass, so callers that catch RuntimeError still do."
+     numbers of the accounting that raised it (see KernelBuilderError::BudgetExceeded: the \
+     greedy pipeline's checks and the CP-SAT pipeline's final address assignment; per-section \
+     CP-SAT and merged-hint budget failures are plain RuntimeErrors). A RuntimeError subclass, \
+     so callers that catch RuntimeError still do."
 );
 
 /// Python exception for a kernel build error: `ScratchBudgetExceeded` (typed, with peak_live

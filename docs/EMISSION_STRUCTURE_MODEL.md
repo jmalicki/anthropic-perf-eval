@@ -25,8 +25,10 @@ runs 1,099 against 1,033 / 1,035 for `path_flow90.json`, which is itself a stage
 bits, cap `flow=0.9`). The 1,104 plateau is gone: 28 plans give 19 different cycle counts.
 Among plans within 30 cycles of the best, no lower bound stage 1 computes ranks them (index
 bits: floor Spearman rho -0.54, exact static bound -0.29, on plans the surrogates themselves
-chose; section 10.0.3). The spread follows how many vector ops the greedy moves to the ALU
-(rho +0.93, measured after the build), which stage 1 does not model. How close stage 1 gets
+chose; section 10.0.3). The spread tracks how many vector ops the greedy moves to the ALU
+(rho +0.93, measured after the build). That is a post-build diagnostic, not a cause: by the
+identity V - s = 6T - I (#76) a longer schedule leaves more vector work on the VALU whatever
+made it longer. How close stage 1 gets
 depends on what picks among plans of equal floor, not on the floor: five index-bit plans share
 the optimal floor 989 and run 1,067 to 1,414, so the floor alone is good to about 375 cycles;
 the lateness tie-break picks the one at 1,073 (34 above the best) and the cap `flow=0.92` one at
@@ -440,9 +442,11 @@ plans. Path bits: best loop plan 1,099 / 1,101 against 1,033 / 1,035 for `path_f
 The 1,104 plateau of PR #69 is gone: 28 index-bit plans give 19 different cycle counts.
 Stage 1 still cannot rank plans near the optimum. Among the 13 plans within 30 cycles of the
 best, the floor has Spearman rho -0.54, the floor with window rows -0.29, and the exact static
-bound -0.29. What does rank them is a quantity measured after the build: the vector work the
-greedy leaves on the VALU after its own shifts (rho +0.93, Pearson +0.96). Stage 1 assumes the
-best VALU/ALU split instead. Resolution, index bits: the floor alone does not resolve plans.
+bound -0.29. A quantity measured after the build tracks them: the vector work the greedy
+leaves on the VALU after its own shifts (rho +0.93, Pearson +0.96). It is a post-build
+diagnostic, not a cause: by the identity V - s = 6T - I (#76; vector ops, shifts, cycles, idle
+vector slots) a schedule that is longer for any reason leaves more vector work on the VALU.
+Stage 1 assumes the best VALU/ALU split. Resolution, index bits: the floor alone does not resolve plans.
 Five built plans share the optimal floor 989 and run 1,067, 1,072, 1,073, 1,073 and 1,414, so
 the floor is good to about 375 cycles. What stage 1 returns among them is set by its tie-break:
 the lateness tie-break returns the plan at 1,073, 34 above the best, and the cap `flow=0.92`
@@ -558,9 +562,8 @@ The path "near" subset has 3 plans, too few to report. Reading:
 - The floor alone resolves nothing among the index-bit plans at floor 989 (1,067 to 1,414); the
   tie-break picks 1,073 and the learned cap 1,039. With path bits the cap decides: `flow=0.9`
   ranks `path_flow90.json` (the best) first, `flow=0.92` misses it by 66. Below that, the
-  ranking is set by the greedy's shift decisions, which stage 1 does not model. A stage-1 term
-  for it would have to predict the greedy's shifts, which depend on the greedy, not only on the
-  plan.
+  ranking tracks the vector work left on the VALU after the greedy's shifts, a post-build
+  diagnostic that follows from the cycle count (#76), not a cause stage 1 could model.
 
 Caveats for every coefficient in the table: the plans were chosen by these surrogates (a
 restricted range, 22 index-bit loop plans at floors 989 to 1,049, with heavy ties: 4 at floor 989,
@@ -582,7 +585,10 @@ predictor stage 1 can use.
 - No build failed the scratch budget. `Stage2.evaluate` now records a budget failure as a
   failed plan with its peak (it raised before), and the report lists such plans. Only the
   builder's typed failure counts (`scheduler_rs.ScratchBudgetExceeded`, args message, peak_live,
-  budget, raised from `KernelBuilderError::BudgetExceeded`); any other error is re-raised.
+  budget, raised from `KernelBuilderError::BudgetExceeded`: the greedy pipeline's scheduler
+  and address-assignment checks and the CP-SAT pipeline's final address assignment); any other
+  error is re-raised. Per-section CP-SAT and merged-hint budget failures are still
+  `KernelBuilderError::Other` and so a plain `RuntimeError`, not a recorded plan outcome.
   `tests/test_emission_loop.py` checks it with a real over-budget build (batch 32 under a
   300-word budget).
 - With path bits, 7 of 16 builds sit at exactly 1,505 words, 31 below the budget, and all of
