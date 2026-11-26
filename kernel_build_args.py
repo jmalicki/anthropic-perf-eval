@@ -541,7 +541,8 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "the budget. 'same-cycle' (default) forces one deferred op per cycle whenever it has "
                             "a slot, so a run that reaches the budget overshoots it and fails address "
                             "assignment; 'stall' forces only in a cycle where nothing else was placed, as the "
-                            "pools model does (docs/SCRATCH_CEILING_DIAGNOSIS.md)")
+                            "pools model does (docs/SCRATCH_CEILING_DIAGNOSIS.md). Not safe on every plan: a run can "
+                            "paint itself in and then stay over budget (docs/STALL_DEADLOCK.md)")
     group.add_argument("--greedy-select-overflow-limit", type=_positive_int, default=None, metavar="N",
                        help="With --greedy-select-overflow valu: at most N selects take the multiply_add form "
                             "(default: no limit). The structure model's floor resolution gives one value")

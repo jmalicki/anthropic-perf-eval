@@ -251,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(spec, f)
         spec_path = f.name
     cmd = generator_command(args, extra)
+    spec["generator_args"] = cmd[2:]  # recorded in the report: the model settings it used
+    with open(spec_path, "w") as f:
+        json.dump(spec, f)
     print("Window probe spec:", json.dumps(spec), flush=True)
     print("Command: CPSAT_WINDOW_PROBE=" + spec_path + " " + " ".join(cmd), flush=True)
     try:

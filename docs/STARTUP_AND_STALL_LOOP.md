@@ -29,7 +29,9 @@ schedule's slots without a counterfactual build.
   enough.
   **Budget: stall + 0.98 is not safe on every plan.** 3 of the 28 new path-bit builds fail the
   scratch budget (peaks 1,761, 1,809, 1,817): the greedy reaches a cycle where nothing can be
-  placed at 1,528 live words (a real deadlock), forces an op and stays over budget for 265 to
+  placed at 1,528 live words (no operation was placed: ASAP inflation had deferred the other
+  ready ops before their budget checks, and whether they could have freed enough words was not
+  established; not shown to have no in-budget schedule, docs/STALL_DEADLOCK.md), forces an op and stays over budget for 265 to
   874 cycles. 0 of the index builds and 0 of the 85 earlier builds fail. They are recorded as
   failed plans, not tuned around.
 - **B, start-up: 1,033 -> 1,030** (1,032 simulated; PROVED, PASSED, `check_upstream.sh
@@ -83,7 +85,7 @@ machine load; the top-k rerun uses deterministic-time solves; the builds are det
 | top-k, floor, 14 levels | scores 989 to 1,002: 1,051 to 1,334 | scores 973 to 986: 1,066 to 1,246 (1 failed) |
 | top-k, greedy model, 14 levels | scores 1,030 to 1,043: 1,052 to 1,423 | scores 1,011 to 1,025: 1,055 to 1,481 (2 failed, 1 level skipped) |
 | plans scoring at or below the best known plan | floor 997: 100+; model 1,043: 100+ | floor 980: 100+; model 1,023: 100+ |
-| failed / over budget | 0 / 0 | 3 / 3 (peaks 1,761 to 1,817: deadlock at the budget) |
+| failed / over budget | 0 / 0 | 3 / 3 (peaks 1,761 to 1,817: greedy stuck at the budget) |
 | peak live scratch (incl. the zero word) | 1,057 to 1,473 | 1,057 to 1,536 |
 
 **Top-k, corrected.** The first version built the 8 unbuilt plans the solver returned in turn;

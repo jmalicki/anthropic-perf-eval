@@ -1,0 +1,41 @@
+{
+ "format": "emission-plan/1",
+ "rounds": 16,
+ "groups": 32,
+ "forest_height": 10,
+ "access": [
+  "bits",
+  "bits-flow",
+  "bits-flow",
+  "bits-flow",
+  {
+   "gather": 4,
+   "bits-flow": 19,
+   "mobius": 9
+  },
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "gather",
+  "bits",
+  "bits-flow",
+  {
+   "bits": 29,
+   "bits-flow": 3
+  },
+  "bits-flow",
+  "gather"
+ ],
+ "context": {
+  "rounds": 16,
+  "batch_size": 256,
+  "forest_height": 10,
+  "merge_hash_stages": true,
+  "index_form": "mirrored",
+  "select_bit_source": "path",
+  "values_only": false
+ },
+ "comment": "topk-greedy-model6 (stall deadlock)"
+}

@@ -1,0 +1,60 @@
+{
+  "spec": {
+    "window_sizes": [
+      60
+    ],
+    "stride_fraction": 0.5,
+    "encodings": [
+      "free"
+    ],
+    "sweep": false,
+    "rolling": true,
+    "cycle_range": [
+      60,
+      120
+    ],
+    "deterministic_time": 60.0,
+    "time_limit_secs": 1800.0,
+    "workers": 4,
+    "asap_alap_tightening": null,
+    "ignore_subsolvers": [
+      "max_lp",
+      "max_lp_sym",
+      "reduced_costs",
+      "pseudo_costs"
+    ],
+    "prune": false,
+    "output": "/private/tmp/claude-501/-Users-josephmalicki-src-anthropic-perf-eval/8e8887ce-e7f9-42b5-bfee-4ffb914a62e1/scratchpad/wp/path_C.json"
+  },
+  "num_ops": 10441,
+  "base_makespan": 1032,
+  "base_check_status": "optimal (makespan 1032, 1.9s)",
+  "entries": [
+    {
+      "phase": "rolling",
+      "w": 60,
+      "start": 60,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 2.796475375,
+      "before": 740,
+      "inside": 563,
+      "after": 9138,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    }
+  ],
+  "rolling_final": [
+    [
+      60,
+      1032
+    ]
+  ],
+  "rolling_checks": []
+}

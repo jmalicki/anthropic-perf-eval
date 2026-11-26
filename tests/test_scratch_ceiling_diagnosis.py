@@ -107,3 +107,28 @@ def test_blame_attributes_a_vector_select_to_the_vector_alu():
     lowered[6] = {"id": 6, "engine": "flow", "opcode": "vselect", "cycle": 1, "from_select_choice": 6}
     use, _, _ = _uses(sched)
     assert blame(7, executed_ops(sched), use) == ("flow", False, 6)
+
+
+def test_operand_ready_after_two_op_select():
+    """Review of #88 (stacked from #82): a two-op select issued at cycle 4 writes its result
+    with the multiply_add at cycle 5 (lowered id 1000001, `from_select_choice` 1), so its load
+    reader is ready at 6, not 5. A single-cycle producer stays ready at cycle + 1."""
+    from scripts.scratch_ceiling_diagnosis import _operand_ready, executed_ops
+
+    ssa_ops = [
+        {"id": 0, "engine": "load", "opcode": "const", "dep_ids": [], "cycle": 0},
+        {"id": 1, "engine": "flow", "opcode": "select_choice", "dep_ids": [0], "cycle": 4},
+        {"id": 2, "engine": "load", "opcode": "load", "dep_ids": [1], "cycle": 6},
+        {"id": 3, "engine": "load", "opcode": "load", "dep_ids": [0], "cycle": 1},
+    ]
+    lowered = [
+        {"id": 0, "engine": "load", "cycle": 0},
+        {"id": 1, "engine": "valu", "cycle": 4},
+        {"id": 1000001, "engine": "valu", "cycle": 5, "from_select_choice": 1},
+        {"id": 2, "engine": "load", "cycle": 6},
+        {"id": 3, "engine": "load", "cycle": 1},
+    ]
+    ops = executed_ops({"total_cycles": 7, "ops": lowered, "ssa_ops": ssa_ops})
+    assert ops[1]["engine"] == "valu"
+    assert _operand_ready(ops[2], ops) == 6
+    assert _operand_ready(ops[3], ops) == 1

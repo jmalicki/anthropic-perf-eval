@@ -1,0 +1,55 @@
+{
+  "spec": {
+    "window_sizes": [
+      110
+    ],
+    "stride_fraction": 0.5,
+    "encodings": [
+      "free"
+    ],
+    "sweep": true,
+    "rolling": false,
+    "cycle_range": [
+      0,
+      1
+    ],
+    "deterministic_time": 300.0,
+    "time_limit_secs": 3600.0,
+    "workers": 4,
+    "asap_alap_tightening": null,
+    "ignore_subsolvers": [
+      "max_lp",
+      "max_lp_sym",
+      "reduced_costs",
+      "pseudo_costs"
+    ],
+    "prune": true,
+    "output": "/private/tmp/claude-501/-Users-josephmalicki-src-anthropic-perf-eval/8e8887ce-e7f9-42b5-bfee-4ffb914a62e1/scratchpad/wp/path_A.json"
+  },
+  "num_ops": 10441,
+  "base_makespan": 1032,
+  "base_check_status": "optimal (makespan 1032, 1.6s)",
+  "entries": [
+    {
+      "phase": "sweep",
+      "w": 110,
+      "start": 0,
+      "encodings": "free",
+      "status": "feasible",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1024,
+      "saved_bound": 8,
+      "wall_secs": 2235.254173208,
+      "before": 0,
+      "inside": 1203,
+      "after": 9238,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    }
+  ],
+  "rolling_final": [],
+  "rolling_checks": []
+}

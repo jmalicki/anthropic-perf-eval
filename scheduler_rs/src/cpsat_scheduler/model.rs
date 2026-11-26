@@ -4476,12 +4476,33 @@ pub fn schedule_ssa_cpsat(
             model.proto().constraints.len()
         );
     }
+    let (num_variables, num_constraints) = (model.proto().variables.len(), model.proto().constraints.len());
     let response = model.solve_with_parameters(&params);
     if window.is_some() {
         eprintln!(
             "[window probe]   solve: {:.1}s wall, {:.1} deterministic time",
             response.wall_time, response.deterministic_time
         );
+        let optimal = response.status() == cp_sat::proto::CpSolverStatus::Optimal
+            || response.status() == cp_sat::proto::CpSolverStatus::Infeasible;
+        let stop = if optimal {
+            "proved"
+        } else if response.wall_time >= time_limit_secs * 0.999
+            && deterministic_budget.map_or(true, |d| response.deterministic_time < d)
+        {
+            "wall-clock backstop"
+        } else if deterministic_budget.is_some_and(|d| response.deterministic_time >= d) {
+            "deterministic budget"
+        } else {
+            "other"
+        };
+        *super::window::LAST_WINDOW_SOLVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(super::window::WindowSolveStats {
+            num_variables,
+            num_constraints,
+            wall_secs: response.wall_time,
+            deterministic_time: response.deterministic_time,
+            stop: stop.to_string(),
+        });
     }
     let solve_time = start_time.elapsed().as_secs_f64();
     // A deterministic budget only makes the run reproducible if the solve ended on it (or on
