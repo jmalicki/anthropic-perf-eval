@@ -153,7 +153,10 @@ def main():
         print(f"  per_section_optimize_secs={per_section_optimize}")
     if args.const_choice != "optimize" or args.select_choice != "optimize" or args.valu_shift != "optimize":
         print(f"  const_choice={args.const_choice}, select_choice={args.select_choice}, valu_shift={args.valu_shift}")
-    build_kwargs = args_to_build_kwargs(args)
+    try:
+        build_kwargs = args_to_build_kwargs(args)
+    except ValueError as e:  # an option combination that would be ignored or overridden
+        parser.error(str(e))
     emission = non_default_emission_options(build_kwargs)
     if emission:
         print("  emission options: " + ", ".join(f"{k}={v}" for k, v in emission.items()))

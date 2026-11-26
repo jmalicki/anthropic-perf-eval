@@ -165,3 +165,14 @@ def test_binding_rejects_overridden_options():
         scheduler_rs.build_tick_tock_kernel_ssa(**base, greedy_early_stagger=(8, 3))
     with pytest.raises(ValueError, match="greedy_const_policy"):
         scheduler_rs.build_tick_tock_kernel_ssa(**dict(base, use_cpsat=True), greedy_const_policy="alu-first")
+
+
+def test_valu_shift_alu_warning_only_when_shifting_is_on(capsys):
+    """The slow-mode warning for --valu-shift alu under the greedy is not printed with
+    --no-valu-shift (enable_valu_shift=False), where the mode shifts nothing."""
+    from kernel_build_args import args_to_build_kwargs
+
+    args_to_build_kwargs(None, use_greedy=True, valu_shift="alu", use_git_sha=False)
+    assert "--valu-shift alu" in capsys.readouterr().err
+    args_to_build_kwargs(None, use_greedy=True, valu_shift="alu", enable_valu_shift=False, use_git_sha=False)
+    assert "--valu-shift alu" not in capsys.readouterr().err
