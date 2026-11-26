@@ -87,6 +87,14 @@ Accounted (`scratch_ceiling_diagnosis gap`, cycles): path default 21 = 20.5 idle
 (path): default full to cycle 50, then 0 to 2; alu-first full to cycle 37, idle 39 to 50, then
 the same ramp.
 
+**With a fixed-encodings rerun** (a hint pass or `--schedule-with-fixed-choices`, which rerun
+the greedy with the first run's encodings fixed): the rerun schedules each derived constant as
+the ALU op it lowers to, after both producers (visible and still live, as the policy itself
+requires), or, where it cannot, as a load that is then recorded as `Load`
+(`reconcile_const_choice_encodings`). Before the review of #86 the rerun always counted it as a
+load while lowering still emitted the ALU derivation: 13 scalar ops in a cycle and a wrong
+value at 4 rounds, batch 32 (`test_const_policy_with_a_fixed_choices_rerun`).
+
 ## 2. Early stagger
 
 `--greedy-early-stagger K:S` (`EarlyStagger` in `ssa_greedy/wavefront.rs`): chain `rank` gets

@@ -102,7 +102,7 @@ pub struct GreedyShape {
 /// any run that reaches the budget overshoots it (address assignment then rejects the
 /// kernel). The pressure policy's inflation and shift suppression are what keep a default
 /// run below the budget, which is why passing runs stop short of it.
-/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `Stall` forces only in a cycle where nothing else was placed (the greedy is stuck), as the
 /// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
 /// in this one may have freed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1592,6 +1592,26 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 /// # Returns
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
 /// [`schedule_ssa_greedy_with_liveness_agreement`].
+/// After a greedy rerun with fixed ConstChoice encodings: every fixed `AluDerive` the rerun
+/// did not place as a derivation (`derived`, the rerun's `GreedyDiagnostics::const_alu_derive`)
+/// was scheduled as a load, so record it as `Load`; lowering then emits what was scheduled.
+///
+/// # Returns
+/// How many derivations became loads.
+pub(crate) fn reconcile_const_choice_encodings(
+    encodings: &mut HashMap<usize, ConstChoiceEncoding>,
+    derived: &HashMap<usize, crate::types::AluDeriveInfo>,
+) -> usize {
+    let mut demoted = 0;
+    for (id, enc) in encodings.iter_mut() {
+        if matches!(enc, ConstChoiceEncoding::AluDerive(_)) && !derived.contains_key(id) {
+            *enc = ConstChoiceEncoding::Load;
+            demoted += 1;
+        }
+    }
+    demoted
+}
+
 pub(crate) fn schedule_ssa_greedy_shaped(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -2881,10 +2901,30 @@ fn schedule_ssa_greedy_core(
                         }
                     };
                     if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
-                        if matches!(enc, ConstChoiceEncoding::AddImm) {
-                            Engine::Flow
-                        } else {
-                            Engine::Load
+                        match enc {
+                            ConstChoiceEncoding::AddImm => Engine::Flow,
+                            ConstChoiceEncoding::AluDerive(info) => {
+                                // A derivation of the first run: honour it only where it is
+                                // sound as the policy path makes it (both producers scheduled
+                                // in an earlier cycle and still live, ALU room); otherwise
+                                // the rerun loads the constant and the caller records Load
+                                // (`reconcile_const_choice_encodings`). Never an ALU op the
+                                // slot count and the precedences do not see.
+                                let producer_ok = |id: usize| {
+                                    id_to_idx.get(&id).is_some_and(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                };
+                                if slots.alu_used < 12 && producer_ok(info.left_op_id) && producer_ok(info.right_op_id) {
+                                    const_derive = Some(info.clone());
+                                    Engine::Alu
+                                } else {
+                                    Engine::Load
+                                }
+                            }
+                            _ => Engine::Load,
                         }
                     } else if const_choice_fixed_to_load {
                         Engine::Load
@@ -3319,7 +3359,18 @@ fn schedule_ssa_greedy_core(
                     "slots": {"valu": slots.valu_used, "alu": slots.alu_used, "load": slots.load_used,
                               "flow": slots.flow_used, "store": slots.store_used},
                 });
-                if let Err(e) = std::fs::write(path, state.to_string()) {
+                // One dump per greedy run; a build that runs the greedy again writes the n-th
+                // dump to `<path>.<n>` instead of overwriting the first.
+                static DUMPS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+                    std::sync::Mutex::new(std::collections::BTreeMap::new());
+                let n = {
+                    let mut dumps = DUMPS.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = dumps.entry(path.clone()).or_insert(0);
+                    *n += 1;
+                    *n - 1
+                };
+                let path = if n == 0 { path.clone() } else { format!("{}.{}", path, n) };
+                if let Err(e) = std::fs::write(&path, state.to_string()) {
                     eprintln!("SCHEDULER_DEADLOCK_DUMP: cannot write {}: {}", path, e);
                 }
             }
