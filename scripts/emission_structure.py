@@ -30,6 +30,7 @@ Design: docs/EMISSION_STRUCTURE_MODEL.md. In short:
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import itertools
 import json
@@ -177,6 +178,51 @@ def choice_floor(counts: Mapping[str, int]) -> dict:
                 binding.append(engine)
     return {"cycles": t, "binding": binding, "resolution": res,
             "vector_op_equivalents": vector_op_equivalents(c, res)}
+
+
+# Op kinds of a window row (scripts/emission_loop.py). A SelectChoice is charged as 1 flow slot
+# or 1 fixed vector op whatever its FMA form (the 2-op form's subtract may be shared, as the
+# proved reference model of verification/static_bounds_proof.py assumes); ConstChoices and
+# eliminable vbroadcasts are not charged.
+WINDOW_CATEGORIES = ("vec_fixed", "vec_shiftable", "alu", "load", "store", "flow", "select")
+
+
+def _window_fits(c: Mapping[str, int], span: int, cap: Mapping[str, int], vlen: int) -> bool:
+    if span < 0:
+        return False
+    if c["load"] > cap["load"] * span or c["store"] > cap["store"] * span or c["flow"] > cap["flow"] * span:
+        return False
+    on_flow = min(c["select"], cap["flow"] * span - c["flow"])  # a select on flow frees a VALU slot
+    vector = c["vec_fixed"] + c["vec_shiftable"] + c["select"] - on_flow
+    alu_room = cap["alu"] * span - c["alu"]
+    if alu_room < 0:
+        return False
+    return max(0, vector - cap["valu"] * span) <= min(c["vec_shiftable"], alu_room // vlen)
+
+
+def window_floor(counts: Mapping[str, int], cap: Mapping[str, int] = CAP, vlen: int = VLEN) -> int:
+    """Fewest cycles that can hold ops with these WINDOW_CATEGORIES counts, every choice
+    resolved in the best way (selects on flow or the VALU, shiftable vector ops on the VALU or
+    as `vlen` scalar slots). 0 for no ops. Monotone in every count.
+
+    A window row (docs/EMISSION_STRUCTURE_MODEL.md section 10) is makespan >= t + q +
+    window_floor(ops with head >= t and tail >= q): their slots all lie in cycles
+    [t, makespan - 1 - q]. verification/window_rows_proof.py: the coupling of engines in
+    `_window_fits` is proved by Z3 for all counts (WR3); the whole row is a randomized check (WR1).
+    """
+    c = {k: int(counts.get(k, 0)) for k in WINDOW_CATEGORIES}
+    if not any(c.values()):
+        return 0
+    lo, hi = 1, max(1, sum(c.values()))
+    while not _window_fits(c, hi, cap, vlen):
+        hi *= 2
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _window_fits(c, mid, cap, vlen):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 # ----------------------------------------------------------------------------
@@ -572,9 +618,65 @@ def load_or_calibrate(ctx: Context, path: str | None, workdir: str, log=print) -
 # ----------------------------------------------------------------------------
 # The optimisation model
 # ----------------------------------------------------------------------------
+def plan_group_counts(rows: Sequence[Sequence[str]], ctx: Context) -> dict[tuple[int, str], int]:
+    """Groups per (choice round, encoding) of a plan: what `solve_plan` decides (its rows are
+    rebuilt from these counts in a fixed order, so two plans with equal counts are one plan
+    to the model; with `values_only` the tail patterns are part of the decision too, see
+    `plan_model_key`)."""
+    return {(r, e): rows[r].count(e) for r in ctx.choice_rounds() for e in set(rows[r])}
+
+
+def plan_tail_pattern_counts(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]:
+    """Groups per tail pattern ('g'/'s' per tail round), {} when patterns do not matter."""
+    if not ctx.tail_patterns():
+        return {}
+    tail = ctx.tail_rounds()
+    out: dict[str, int] = collections.Counter(
+        "".join("g" if rows[r][g] == "gather" else "s" for r in tail) for g in range(ctx.n_groups))
+    return dict(out)
+
+
+def plan_model_key(rows: Sequence[Sequence[str]], ctx: Context) -> dict[str, int]:
+    """Everything `solve_plan` decides about a plan, as JSON-friendly keys: "round:encoding"
+    group counts and, with `values_only`, "tail:pattern" counts. Two plans with the same key
+    are the same plan to the model; `canonical_rows` is the arrangement it emits for it."""
+    key = {f"{r}:{e}": v for (r, e), v in plan_group_counts(rows, ctx).items()}
+    key.update({f"tail:{p}": v for p, v in plan_tail_pattern_counts(rows, ctx).items()})
+    return key
+
+
+def rows_from_counts(ctx: Context, chosen: Mapping[tuple[int, str], int], pattern_values: Mapping[str, int],
+                     fixed: Mapping[int, str] | None = None) -> list[list[str]]:
+    """The rows `solve_plan` emits for solved counts: per choice round, contiguous runs in
+    ENCODINGS order; with tail patterns, each group its pattern (in pattern order) and the
+    select groups of each tail round their bit-driven encodings in a fixed order."""
+    g = ctx.n_groups
+    rows = baseline_rows(ctx)
+    for r, e in (fixed or {}).items():  # rounds outside the choice rounds (e.g. the root) keep their fixed encoding
+        rows[r] = [e] * g
+    for r in ctx.choice_rounds():
+        rows[r] = [e for e in ENCODINGS for _ in range(chosen.get((r, e), 0))]
+    patterns = ctx.tail_patterns()
+    if patterns:
+        group_pattern = [p for p in patterns for _ in range(pattern_values.get(p, 0))]
+        for i, r in enumerate(ctx.tail_rounds()):
+            selects = [e for e in BIT_DRIVEN for _ in range(chosen.get((r, e), 0))]
+            rows[r] = ["gather" if p[i] == "g" else selects.pop(0) for p in group_pattern]
+    return rows
+
+
+def canonical_rows(rows: Sequence[Sequence[str]], ctx: Context) -> list[list[str]]:
+    """The arrangement `solve_plan` would emit for this plan's `plan_model_key`. A plan equal
+    to it is the one the model can return; any other arrangement with the same key (a
+    hand-made seed, say) is a different build but the same model point."""
+    return rows_from_counts(ctx, plan_group_counts(rows, ctx), plan_tail_pattern_counts(rows, ctx))
+
+
 def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Mapping[int, str] | None = None,
                time_limit: float = 60.0, tie_break: bool = True, max_util: Mapping[str, float] | None = None,
-               lateness: bool = True) -> dict:
+               lateness: bool = True, nogoods: Sequence[Mapping] | None = None, incumbent: int | None = None,
+               windows: Sequence[Mapping] | None = None, floor_incumbent: int | None = None,
+               deterministic_time: float | None = None) -> dict:
     """Plan minimising choice_floor of the predicted counts (CP-SAT, exact, single worker so
     that the same inputs give the same plan).
 
@@ -594,10 +696,29 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             may use. Minimises T under that headroom instead of the bare floor: a greedy
             schedule lands far above the floor when two engines saturate at once
             (docs/EMISSION_STRUCTURE_MODEL.md). The plan's own floor is reported too.
+        nogoods: plans to exclude, each as `plan_model_key` (keys "round:encoding" strings or
+            (round, encoding) tuples, plus "tail:pattern" with values_only); one no-good cut
+            per plan. It excludes every arrangement with that key, so only give it plans whose
+            rows are `canonical_rows` (the ones this model emits for the key).
+        incumbent: the objective (T, or M with `windows`) must be below this. Prunes soundly
+            only when the objective is a lower bound on the cycles being compared (with
+            `windows` built from an observed row table it is not: a heuristic cut).
+        floor_incumbent: the capacity floor T must be below this. Sound when compared with
+            scheduled cycles of the same emission (the floor is a lower bound on any schedule).
+        deterministic_time: CP-SAT deterministic-time budget per solve (the solver's own work
+            counter), so that the same inputs give the same plan whatever the machine load;
+            `time_limit` stays as a wall-clock backstop. Each solve's status and whether it
+            stopped on the wall clock are returned under "solves".
+        windows: time-aware rows (scripts/emission_loop.py, `RowTable.window_specs`), each
+            {"t", "q", "const": {cat: n}, "per_group": {(round, encoding) or "r:e": {cat: n}}}.
+            With them the objective is M >= T and, per window, M >= t + q + the window's
+            choice floor (`window_floor`) of the counts it holds; otherwise T.
 
     Returns:
         {"rows", "floor" (choice_floor of the plan), "capped_cycles" (T under max_util),
-        "counts", "status"}.
+        "objective" (T, or M with windows), "counts", "status", "tie_break", "solves" (per
+        CP-SAT solve: phase, status, wall and deterministic time, stopped_on_wall_clock)};
+        with nogoods or an incumbent, {"status": "infeasible", "solves"} when no plan is left.
     """
     ctx = table.context
     g = ctx.n_groups
@@ -706,14 +827,85 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             "flow": cnt["flow"] + s1 + s2 + cf + cfa, "valu": vector - sh}
     for engine, ratio in caps.items():
         m.Add(ratio.denominator * used[engine] <= ratio.numerator * CAP[engine] * t)
-    m.Minimize(t)
+
+    def n_key(key):
+        if isinstance(key, str):
+            r, _, e = key.partition(":")
+            return int(r), e
+        return int(key[0]), key[1]
+
+    for i, plan in enumerate(nogoods or []):
+        want = {n_key(k): int(v) for k, v in plan.items() if not (isinstance(k, str) and k.startswith("tail:"))}
+        want_tail = {k[len("tail:"):]: int(v) for k, v in plan.items() if isinstance(k, str) and k.startswith("tail:")}
+        differs = []
+        for key, var in n.items():
+            b = m.NewBoolVar(f"nogood_{i}_{key[0]}_{key[1]}")
+            m.Add(var != want.get(key, 0)).OnlyEnforceIf(b)
+            differs.append(b)
+        if want_tail:  # with values_only the tail patterns are part of the plan
+            for p, var in pattern_count.items():
+                b = m.NewBoolVar(f"nogood_{i}_tail_{p}")
+                m.Add(var != want_tail.get(p, 0)).OnlyEnforceIf(b)
+                differs.append(b)
+        # A key the model cannot express (an encoding not allowed here) already differs.
+        if all(k in n or v == 0 for k, v in want.items()) and all(p in pattern_count or v == 0
+                                                                  for p, v in want_tail.items()):
+            m.AddBoolOr(differs)
+
+    objective = t
+    if windows:
+        objective = m.NewIntVar(1, t_max + 10 ** 6, "M")
+        m.Add(objective >= t)
+        for w_i, w in enumerate(windows):
+            per = {n_key(k): v for k, v in w["per_group"].items()}
+            cnt_w = {}
+            for c in WINDOW_CATEGORIES:
+                expr = int(w["const"].get(c, 0))
+                for key, coef in per.items():
+                    if coef.get(c) and key in n:
+                        expr = expr + int(coef[c]) * n[key]
+                cnt_w[c] = expr
+            span = objective - int(w["t"]) - int(w["q"])
+            sf = m.NewIntVar(0, big, f"w{w_i}_select_flow")
+            sh = m.NewIntVar(0, big, f"w{w_i}_shifted")
+            m.Add(sf <= cnt_w["select"])
+            m.Add(sh <= cnt_w["vec_shiftable"])
+            m.Add(cnt_w["load"] <= CAP["load"] * span)
+            m.Add(cnt_w["store"] <= CAP["store"] * span)
+            m.Add(cnt_w["flow"] + sf <= CAP["flow"] * span)
+            m.Add(cnt_w["vec_fixed"] + cnt_w["vec_shiftable"] + cnt_w["select"] - sf - sh <= CAP["valu"] * span)
+            m.Add(cnt_w["alu"] + VLEN * sh <= CAP["alu"] * span)
+    if incumbent is not None:
+        m.Add(objective <= int(incumbent) - 1)
+    if floor_incumbent is not None:
+        m.Add(t <= int(floor_incumbent) - 1)
+    m.Minimize(objective)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    if deterministic_time is not None:
+        solver.parameters.max_deterministic_time = deterministic_time
     solver.parameters.num_workers = 1
-    status = solver.Solve(m)
+    solves = []
+
+    def run(phase):
+        st = solver.Solve(m)
+        wall = solver.WallTime()
+        solves.append({
+            "phase": phase, "status": solver.StatusName(st), "wall_time": round(wall, 3),
+            "deterministic_time": round(solver.deterministic_time, 4),
+            # Ended on the wall clock rather than on optimality/infeasibility or the
+            # deterministic budget: the result then depends on machine load.
+            "stopped_on_wall_clock": st not in (cp_model.OPTIMAL, cp_model.INFEASIBLE) and wall >= 0.98 * time_limit,
+        })
+        return st
+
+    status = run("main")
+    if status == cp_model.INFEASIBLE and (nogoods or incumbent is not None or floor_incumbent is not None):
+        return {"status": "infeasible", "solves": solves}
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"structure model: {solver.StatusName(status)}")
+    best_obj = solver.Value(objective)
     best_t = solver.Value(t)
     proven = status == cp_model.OPTIMAL
     # Snapshots of the solved values: rows are rebuilt only from these, so a tie-break that ends
@@ -721,6 +913,18 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
     chosen = {key: solver.Value(var) for key, var in n.items()}
     pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
     tie_break_status = "not run"
+    if windows and tie_break:
+        # Among plans with the best M, the lowest floor T, then the usual tie-breaks.
+        m.Add(objective == best_obj)
+        m.Minimize(t)
+        for key, val in chosen.items():
+            m.AddHint(n[key], val)
+        status_t = run("windows_floor")
+        if status_t in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            best_t = solver.Value(t)
+            chosen = {key: solver.Value(var) for key, var in n.items()}
+            pattern_values = {p: solver.Value(var) for p, var in pattern_count.items()}
+        proven = proven and status_t == cp_model.OPTIMAL
     if tie_break:
         m.Add(t == best_t)
         mixes = sum(u.values()) - len(ctx.choice_rounds())
@@ -730,9 +934,10 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
         late_max = ctx.rounds * ctx.rounds * g + 1
         # Lexicographic: mixes, then lateness, then work in scalar-op units (a vector op is 8).
         m.Minimize(mixes * (late_max * work_max) + late * work_max + work)
+        m.ClearHints()  # the windows' T solve may have hinted these already
         for var, val in zip(list(n.values()), [solver.Value(v) for v in n.values()]):
             m.AddHint(var, val)
-        status2 = solver.Solve(m)
+        status2 = run("tie_break")
         tie_break_status = solver.StatusName(status2)
         if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             chosen = {key: solver.Value(var) for key, var in n.items()}
@@ -741,32 +946,15 @@ def solve_plan(table: CostTable, encodings: Iterable[str] = ENCODINGS, fixed: Ma
             raise RuntimeError(f"structure model tie-break: {tie_break_status}")
         # UNKNOWN (time limit without an incumbent): keep the first solve's plan.
 
-    rows = baseline_rows(ctx)
-    for r, e in fixed.items():  # rounds outside the choice rounds (e.g. the root) keep their fixed encoding
-        rows[r] = [e] * g
-    for r in ctx.choice_rounds():
-        row = []
-        for e in ENCODINGS:  # contiguous runs, in a fixed encoding order
-            if (r, e) in n:
-                row += [e] * chosen[r, e]
-        rows[r] = row
-    if patterns:
-        # Give each group its pattern (in pattern order), then the select groups of each tail
-        # round their bit-driven encodings in a fixed order with the solved counts.
-        group_pattern = [p for p in patterns for _ in range(pattern_values[p])]
-        for i, r in enumerate(tail):
-            selects = [e for e in BIT_DRIVEN if (r, e) in n for _ in range(chosen[r, e])]
-            row = []
-            for p in group_pattern:
-                row.append("gather" if p[i] == "g" else selects.pop(0))
-            rows[r] = row
+    rows = rows_from_counts(ctx, chosen, pattern_values, fixed)
     counts = table.predict(rows)
     floor = choice_floor(counts)
     assert floor["cycles"] <= best_t, (floor["cycles"], best_t)
-    if proven and not caps:
+    if proven and not caps and (tie_break or not windows):
         assert floor["cycles"] == best_t, (floor["cycles"], best_t)
     return {"rows": rows, "floor": floor, "capped_cycles": best_t, "counts": counts,
-            "status": "optimal" if proven else "feasible", "tie_break": tie_break_status}
+            "objective": best_obj, "status": "optimal" if proven else "feasible", "tie_break": tie_break_status,
+            "solves": solves}
 
 
 def _solve_plan_child(table_json, kwargs):
@@ -871,6 +1059,7 @@ NAMED_PLANS = {
     "mobius+depth4-after-wrap": ("mobius", "after-wrap"),
     "bits+depth4": ("bits", "all"),
     "bits-flow+depth4": ("bits-flow", "all"),
+    "mobius+depth4": ("mobius", "all"),
 }
 
 
@@ -918,6 +1107,7 @@ def measure(rows, table: CostTable, workdir: str, name: str, shaped: bool, upstr
     save_kernel_to_json(instrs, kernel_path, ctx.forest_height, ctx.batch_size, ctx.rounds, 123,
                         values_only=ctx.values_only)
     row["kernel"] = kernel_path
+    row["sched_json"] = os.path.abspath(path)
     row["upstream_strict"] = None
     if upstream:
         import subprocess
@@ -1026,9 +1216,14 @@ def _print_counts(label, counts):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["loop"]:  # the stage 1 / stage 2 feedback loop lives in its own module
+        from scripts import emission_loop
+        return emission_loop.main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["calibrate", "check", "predict", "solve", "sweep", "measure", "table",
-                                        "scatter"])
+                                        "scatter", "loop"],
+                    help="loop: closed loop with the shaped greedy (scripts/emission_loop.py; loop --help)")
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--forest-height", type=int, default=10)
