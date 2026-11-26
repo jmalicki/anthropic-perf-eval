@@ -624,7 +624,12 @@ fn test_hash_merge_matches_the_proved_instance_only_once() {
     let expected = crate::kernel_builder::config::merged_hash_stage_constants(2).unwrap();
     for s in &sites {
         assert_eq!(s.merged, expected);
-        assert!(s.facts.iter().any(|f| f.name == "proof_instance" && f.value.starts_with("R8")));
+        // The proved instance, not the general identity (which also gives these constants).
+        assert!(
+            s.facts.iter().any(|f| f.name == "proof_instance" && f.value == "R8-hash-stage-merge (stages 2+3)"),
+            "{:?}",
+            s.facts
+        );
     }
     // Stage 0 (read by stage 1's xor and shift right), stage 4 (read by stage 5's shift right)
     // and the index update (addend not constant) are rejected.
@@ -1119,25 +1124,194 @@ fn test_hash_merge_rejects_vector_group_sites_per_site() {
     assert_first_site_rejected(result, "kept live");
 }
 
+/// The value an ALU encoding computes from its operands, mod 2^32 (`None` for Load / AddImm).
+fn encoding_value(e: &crate::types::ConstEncoding) -> Option<i64> {
+    use crate::types::ConstEncoding;
+    const MASK: i64 = 0xFFFF_FFFF;
+    Some(match *e {
+        ConstEncoding::Load | ConstEncoding::AddImm { .. } => return None,
+        ConstEncoding::Add { a_value, b_value } => a_value.wrapping_add(b_value) & MASK,
+        ConstEncoding::Sub { a_value, b_value } => a_value.wrapping_sub(b_value) & MASK,
+        ConstEncoding::Mul { a_value, b_value } => a_value.wrapping_mul(b_value) & MASK,
+        ConstEncoding::Shift { base_value, shift_amount } => (base_value << shift_amount) & MASK,
+    })
+}
+
 #[test]
 fn test_hash_merge_keeps_foreign_const_alternatives() {
-    use crate::types::{ConstEncoding, Opcode};
+    use crate::types::{ConstEncoding, Opcode, Operand};
     // A ConstChoice whose alternatives are not the emitter's function of the constants before
-    // it: the program is still rewritten. Its alternatives are kept, less any ALU derivation
-    // whose operands no longer exist before it.
-    let mut p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
-    let c2 = crate::kernel_builder::config::HASH_STAGES[2].1;
-    let target = p.ops.iter().rposition(|o| o.opcode == Opcode::ConstChoice && o.produces_constant.map_or(false, |v| v > 100)).unwrap();
-    let value = p.ops[target].produces_constant.unwrap();
-    let derived = ConstEncoding::Add { a_value: c2, b_value: value.wrapping_sub(c2) };
-    let foreign = ConstEncoding::Add { a_value: 1, b_value: 2 };
-    p.ops[target].const_alternatives = Some(vec![ConstEncoding::Load, foreign.clone(), derived.clone()]);
+    // it: the program is still rewritten. Its alternatives are kept as given, less any ALU
+    // derivation whose operands no longer exist before it.
+    let spec = ProblemSpec { rounds: 2, ..Default::default() };
+    let consts = |p: &crate::kernel_builder::SsaProgram| -> std::collections::BTreeSet<i64> {
+        p.ops.iter().filter(|o| o.opcode == Opcode::ConstChoice).filter_map(|o| o.produces_constant).collect()
+    };
+    let mut p = raw_program(&spec);
+    let (merged, _) = apply_hash_merge(raw_program(&spec), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    let (before, after_consts) = (consts(&p), consts(&merged));
+    // A constant the rewrite removes, and the first one after it that stays and is no site's
+    // operand. Its value becomes `g + w` (w: a surviving constant before it), so that
+    // `Add { g, w }` is a valid derivation that loses its operand g in the rewrite.
+    let site_values: std::collections::BTreeSet<i64> = {
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        merge_rule(ProposalSource::Ops).find_sites(&g).0.iter().flat_map(|s| s.values).collect()
+    };
+    let is_const = |i: usize| p.ops[i].opcode == Opcode::ConstChoice;
+    let value_at = |i: usize| p.ops[i].produces_constant.unwrap();
+    let ig = (0..p.ops.len()).find(|&i| is_const(i) && !after_consts.contains(&value_at(i))).expect("a removed constant");
+    let g = value_at(ig);
+    let target = (ig + 1..p.ops.len())
+        .find(|&i| is_const(i) && after_consts.contains(&value_at(i)) && !site_values.contains(&value_at(i)))
+        .expect("a surviving constant after it");
+    let w = (0..target)
+        .filter(|&i| is_const(i) && after_consts.contains(&value_at(i)) && value_at(i) != 0)
+        .map(value_at)
+        .find(|&w| !before.contains(&((g + w) & 0xFFFF_FFFF)))
+        .expect("a surviving operand");
+    let value = (g + w) & 0xFFFF_FFFF;
+    let derived = ConstEncoding::Add { a_value: g, b_value: w };
+    // Not the emitter's order (Load, AddImm, derivations).
+    let foreign = vec![derived.clone(), ConstEncoding::AddImm { value }, ConstEncoding::Load];
+    for e in &foreign {
+        assert!(encoding_value(e).map_or(true, |v| v == value), "{:?} does not produce {}", e, value);
+    }
+    p.ops[target].srcs[0] = Operand::Imm(value);
+    p.ops[target].produces_constant = Some(value);
+    p.ops[target].const_alternatives = Some(foreign);
     let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
     assert_eq!(report.sites, 64);
     let op = after.ops.iter().find(|o| o.opcode == Opcode::ConstChoice && o.produces_constant == Some(value)).unwrap();
-    // C2 is gone, so the derivation from it is dropped; the rest is kept as given.
-    assert_eq!(op.const_alternatives.as_ref().unwrap(), &vec![ConstEncoding::Load, foreign]);
+    // g is gone, so the derivation from it is dropped; the rest is kept in the given order.
+    assert_eq!(op.const_alternatives.as_ref().unwrap(), &vec![ConstEncoding::AddImm { value }, ConstEncoding::Load]);
     assert_eq!(report.surgery.foreign_alternatives, 1);
+}
+
+#[test]
+fn test_merged_constants_reduce_addends_before_adding() {
+    use super::hash_merge::merged_constants;
+    // Addends outside 0..2^32 (the matcher does not range-check them): the sum is taken mod
+    // 2^32 without overflowing i64 (which panics in debug builds).
+    let (m1, c1, m2, c2) = merged_constants(3, i64::MAX, i64::MAX, 4);
+    assert_eq!(c1, (0xFFFF_FFFFi64 * 2) & 0xFFFF_FFFF);
+    assert_eq!((m1, m2, c2), (3, 48, (i64::MAX << 4) & 0xFFFF_FFFF));
+    assert_eq!(merged_constants(1, -1, 2, 0).1, 1);
+    assert_eq!(merged_constants(1, i64::MIN, -1, 0).1, 0xFFFF_FFFF);
+}
+
+#[test]
+fn test_hash_merge_leaves_kept_live_operands_in_place() {
+    // An op before the anchor names a site operand in keep_live (a lifetime extension, not a
+    // read). The regroup must leave that operand where it is: moved after the anchor, it
+    // would be defined after the op that keeps it live.
+    let (_, base) = rewrite_mutated(|_, _| {}).unwrap();
+    assert!(base.regroup_skipped.is_none());
+    // The operands of the first site that something besides the sites reads (the others are
+    // removed with the sites; a keep_live naming one of those is a different refusal).
+    let shared: Vec<usize> = {
+        let p = raw_program(&ProblemSpec { rounds: 2, ..Default::default() });
+        let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+        let sites = merge_rule(ProposalSource::Ops).find_sites(&g).0;
+        let removed: std::collections::BTreeSet<usize> = sites.iter().flat_map(|s| s.ops()).collect();
+        (0..4).filter(|&k| g.readers(g.def_index(sites[0].operands[k]).unwrap()).iter().any(|r| !removed.contains(r))).collect()
+    };
+    assert!(!shared.is_empty());
+    let mut fewer_moved = false;
+    for &pick in &shared {
+        let (after, report) = rewrite_mutated(|p, s| {
+            let v = s.operands[pick];
+            let d = p.ops.iter().position(|o| o.dest == Some(v)).unwrap();
+            p.ops[d + 1].keep_live = Some(vec![v]);
+        })
+        .unwrap_or_else(|e| panic!("operand {}: {}", pick, e));
+        assert_eq!(report.sites, 64, "operand {}: {:?}", pick, report.rejections);
+        assert!(report.regroup_skipped.is_none(), "operand {}: {:?}", pick, report.regroup_skipped);
+        super::surgery::Surgery::check(&after).unwrap();
+        fewer_moved |= report.surgery.moved < base.surgery.moved;
+    }
+    // At least one kept-live operand is one the regroup would otherwise move.
+    assert!(fewer_moved && base.surgery.moved > 0);
+}
+
+/// One synthetic hash site: 0 vload a, 1-2 constant and broadcast M, 3-4 C, 5-6 D, 7-8 K,
+/// then the site and its stores.
+fn one_site_program() -> crate::kernel_builder::SsaProgram {
+    synthetic_hash_program(5, 1).0
+}
+
+#[test]
+fn test_surgery_moves_an_op_once() {
+    use super::surgery::Surgery;
+    let p = one_site_program();
+    let m = p.ops[1].dest.unwrap();
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[1, 2], 7).unwrap();
+    // A second placement of op 1 is refused, and the first one stands.
+    let err = surgery.move_after(&[1], 8).unwrap_err();
+    assert!(err.contains("already moved"), "{}", err);
+    let (after, report) = surgery.finish().unwrap();
+    assert_eq!(report.moved, 2);
+    assert_eq!(after.ops.iter().filter(|o| o.dest == Some(m)).count(), 1);
+    let at = |v| after.ops.iter().position(|o| o.dest == Some(v)).unwrap();
+    assert!(at(p.ops[7].dest.unwrap()) < at(m) && at(m) < at(p.ops[8].dest.unwrap()));
+    // A removed op has no placement to move.
+    let mut surgery = Surgery::new(p).unwrap();
+    surgery.remove(3);
+    let err = surgery.move_after(&[3], 8).unwrap_err();
+    assert!(err.contains("removed"), "{}", err);
+}
+
+#[test]
+fn test_surgery_reuses_a_moved_constant_only_where_it_now_is() {
+    use super::surgery::{Stamp, Surgery};
+    let p = one_site_program();
+    let (m, bm) = (p.ops[1].dest.unwrap(), p.ops[2].dest.unwrap());
+    let value = p.ops[1].produces_constant.unwrap();
+    let stamp = Stamp::of(&p.ops[1]);
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[1, 2], 7).unwrap();
+    // Before op 7 the moved constant and broadcast are not there yet: new ones.
+    let early = surgery.constant(value, 3, &stamp);
+    assert_ne!(early, m);
+    assert_ne!(surgery.broadcast(m, 3, &stamp), bm);
+    // From op 7 on they are.
+    assert_eq!(surgery.constant(value, 7, &stamp), m);
+    assert_eq!(surgery.broadcast(m, 8, &stamp), bm);
+    surgery.finish().unwrap();
+}
+
+#[test]
+fn test_surgery_does_not_move_a_kept_live_value_past_its_keeper() {
+    use super::surgery::Surgery;
+    let mut p = one_site_program();
+    p.ops[3].keep_live = Some(vec![p.ops[1].dest.unwrap()]);
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
+    assert!(err.contains("kept live by op 3"), "{}", err);
+    // Nothing was recorded.
+    let (after, report) = surgery.finish().unwrap();
+    assert_eq!(report.moved, 0);
+    assert_eq!(after.ops[1].dest, p.ops[1].dest);
+    // Past the keeper too, it may move.
+    let mut surgery = Surgery::new(p).unwrap();
+    surgery.move_after(&[1, 2, 3, 4], 7).unwrap();
+    surgery.finish().unwrap();
+}
+
+#[test]
+fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
+    use super::surgery::{Stamp, Surgery};
+    use crate::types::{Engine, Opcode, Operand};
+    // A caller-built op redefining an existing VReg right before it: liveness would follow
+    // the first definer and silently drop the original one.
+    let p = one_site_program();
+    let m = p.ops[1].dest.unwrap();
+    let mut op = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(m), vec![Operand::Imm(9)]);
+    op.produces_constant = Some(9);
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.insert_before(1, op, &Stamp::of(&p.ops[1]));
+    let err = surgery.finish().err().expect("a second definer is rejected");
+    assert!(err.contains("defined more than once"), "{}", err);
 }
 
 #[test]

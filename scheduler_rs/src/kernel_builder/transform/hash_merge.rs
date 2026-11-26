@@ -122,7 +122,9 @@ impl HashMergeSite {
 /// # Returns
 /// `(m1, c1, m2, c2)` with `m1 = m`, `c1 = c + d`, `m2 = m << k`, `c2 = c << k`, mod 2^32.
 pub fn merged_constants(m: i64, c: i64, d: i64, k: i64) -> (i64, i64, i64, i64) {
-    (m & MASK, (c + d) & MASK, (m << k) & MASK, (c << k) & MASK)
+    // Each addend is reduced first: the matcher does not range-check them, and `c + d` on raw
+    // `i64`s can overflow (a panic in debug builds) where the sum mod 2^32 is well defined.
+    (m & MASK, ((c & MASK) + (d & MASK)) & MASK, (m << k) & MASK, (c << k) & MASK)
 }
 
 fn vreg_srcs(op: &SsaOp) -> Option<Vec<VReg>> {
@@ -490,12 +492,16 @@ pub fn apply_hash_merge(
         for s in &sites {
             for &v in &s.operands {
                 let d = graph.def_index(v).unwrap();
-                if d >= anchor || graph.readers(d).iter().all(|r| removed.contains(r)) {
+                // A kept-live operand stays where it is: `keep_live` is not a read, so the
+                // reader check of `move_after` would not see the op that keeps it.
+                if d >= anchor || graph.is_kept_live(v) || graph.readers(d).iter().all(|r| removed.contains(r)) {
                     continue;
                 }
-                if let Some(sd) = graph.def_op(v).and_then(|b| b.srcs[0].as_vreg()).and_then(|sv| graph.def_index(sv)) {
-                    if graph.readers(sd).iter().all(|&r| r == d || r > anchor) {
-                        regroup.insert(sd);
+                if let Some(sv) = graph.def_op(v).and_then(|b| b.srcs[0].as_vreg()) {
+                    if let Some(sd) = graph.def_index(sv) {
+                        if !graph.is_kept_live(sv) && graph.readers(sd).iter().all(|&r| r == d || r > anchor) {
+                            regroup.insert(sd);
+                        }
                     }
                 }
                 regroup.insert(d);
