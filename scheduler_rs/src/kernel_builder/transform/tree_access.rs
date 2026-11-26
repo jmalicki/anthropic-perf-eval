@@ -174,7 +174,7 @@ impl Rule for TreeAccessRule {
             by_id
                 .entry(tag.id)
                 .or_insert_with(|| Proposal {
-                    region_id: tag.id,
+                    region_id: Some(tag.id),
                     round: tag.round,
                     group: tag.group,
                     depth: tag.depth,
