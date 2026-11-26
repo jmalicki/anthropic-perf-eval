@@ -1681,7 +1681,9 @@ pub fn compute_liveness_curve(
         events.push((interval.start, vreg, true)); // becoming live
         events.push((interval.end, vreg, false)); // dying (at end cycle)
     }
-    events.sort_by_key(|(cycle, _, is_start)| (*cycle, !*is_start)); // ends before starts at same cycle
+    // Ends before starts at the same cycle; then by VReg, so `becoming_live` / `dying` do not
+    // follow the hash order of `intervals`.
+    events.sort_by_key(|(cycle, vreg, is_start)| (*cycle, !*is_start, vreg.id, vreg.size()));
 
     // Track currently live VRegs
     let mut live_set: HashSet<VReg> = HashSet::new();

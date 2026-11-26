@@ -395,6 +395,7 @@ Full explanation: [verification/README.md](verification/README.md) § "Z3 vs CP-
 | `docs/ISA_REFERENCE.md` | Complete instruction set documentation |
 | `docs/4-round-phase-results.md` | Recorded 4-round optimization progress |
 | `docs/EMISSION_ABLATION.md` | Emission options (fewer ops per kernel): what each removes, its proof, the 16-round ablation table, recommendation |
+| `scripts/measure_baseline.py` | Measures the original scalar baseline (`perf_takehome.py` at `dceff1151fb8…`, pinned by full sha and sha256) on the vendored upstream simulator: 147,734 cycles at 16 rounds / batch 256; `--save` writes the kernel for `scripts/kernel_lift.py` (docs/BASELINE_TO_BEST_GAP.md) |
 | `scripts/emission_ablation.py` | Rebuilds that table: per configuration builds, proves, validates, runs upstream, reports ops, loads, flow, floor, cycles |
 | `docs/ENERGETIC_REASONING_FOR_UNIT_TASKS.md` | Why stronger cumulative propagation cannot raise the bound for unit tasks, what precedence plus capacity adds, the unsound rule that was removed, the rule in `resource_bounds.rs` and where shifted lanes weaken it, measurements; research notes with sources in `docs/research/` |
 | `docs/ASAP_ALAP_SLOT_TIGHTENING.md` | **Canonical design:** slot tightening rules (R_entailed, R_precedence_only), strong guarantee, tried-and-unsafe (R_precedence_demand), implementation flags |
