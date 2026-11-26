@@ -5687,6 +5687,32 @@ fn schedule_with_const_policy(
     diagnostics.const_alu_derive
 }
 
+/// Review of #86: a producer that is visible (an earlier cycle) but already dead must not be
+/// derived from. 8 is read only by `8 + 8`, early; 16 (= 8 + 8, its only derivation: the
+/// other constants sum to nothing here) is emitted last, so it is placed after 8 is dead.
+/// Without the liveness condition the greedy would read 8's word after it was freed.
+#[test]
+fn test_const_policy_never_derives_from_a_dead_constant() {
+    let mut emit = SsaEmitContext::new();
+    let c8 = emit.emit_const_choice(8);
+    let others: Vec<VReg> = [1001i64, 2003, 4007, 8009, 16019, 32003].iter().map(|&v| emit.emit_const_choice(v)).collect();
+    let c16 = emit.emit_const_choice(16);
+    let mut acc = emit.emit_alu(Opcode::Add, c8, c8); // the only reader of 8
+    for v in others.iter().chain([c16].iter()) {
+        acc = emit.emit_alu(Opcode::Add, acc, *v);
+    }
+    let addr = emit.emit_const(100);
+    emit.emit_store(addr, acc);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let id8 = emit.ops[0].id;
+    let id16 = emit.ops[7].id;
+    let derived = schedule_with_const_policy(&mut emit, ConstPolicy::AluFirst);
+    let cycle = |id: usize| emit.ops.iter().find(|o| o.id == id).unwrap().cycle;
+    let reader = emit.ops[8].cycle; // 8 + 8
+    assert!(cycle(id16) > reader, "control: 16 is placed after 8's last reader ({} vs {})", cycle(id16), reader);
+    assert!(!derived.contains_key(&id16), "16 = 8 + 8 needs 8, which is dead by then: {:?}", derived.get(&id16));
+}
+
 /// Review of #86: a rerun with fixed encodings (hint passes, --schedule-with-fixed-choices)
 /// schedules a fixed `AluDerive` as the ALU op it lowers to, after its producers, or, where
 /// that is not sound, as a load that `reconcile_const_choice_encodings` records as `Load`.

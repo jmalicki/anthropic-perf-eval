@@ -1149,8 +1149,87 @@ pub fn check_greedy_shape_combinations(
     Ok(())
 }
 
+/// Reject encoding options another option would silently override or ignore (the same
+/// rules as `kernel_build_args.check_encoding_option_combinations`; review of #86).
+///
+/// # Returns
+/// `Err` naming the options for: an early stagger without the wavefront priority; a forced
+/// `const_choice` / `select_choice` / `valu_shift` (not "optimize") with the hint pass that
+/// would overwrite it; a `greedy_const_policy` other than "default" under CP-SAT, with a
+/// forced `const_choice`, or with the const-choice hint pass.
+#[allow(clippy::too_many_arguments)]
+pub fn check_encoding_option_combinations(
+    greedy_priority: GreedyPriorityKind,
+    greedy_early_stagger: Option<(usize, u32)>,
+    use_cpsat: bool,
+    const_choice: &str,
+    select_choice: &str,
+    valu_shift: &str,
+    enable_const_choice_hint_pass: bool,
+    enable_select_choice_hint_pass: bool,
+    enable_valu_shift_hint_pass: bool,
+    greedy_const_policy: &str,
+) -> Result<(), String> {
+    if greedy_early_stagger.is_some() && greedy_priority != GreedyPriorityKind::Wavefront {
+        return Err("greedy_early_stagger (--greedy-early-stagger) staggers the wavefront priority only; \
+                    it needs greedy_priority = 'wavefront' (--greedy-priority wavefront)"
+            .to_string());
+    }
+    for (name, forced, hint) in [
+        ("const_choice", const_choice, enable_const_choice_hint_pass),
+        ("select_choice", select_choice, enable_select_choice_hint_pass),
+        ("valu_shift", valu_shift, enable_valu_shift_hint_pass),
+    ] {
+        if forced != "optimize" && hint {
+            return Err(format!(
+                "{} = '{}' forces the encoding, and the {} hint pass would overwrite it; use one or the other",
+                name, forced, name
+            ));
+        }
+    }
+    if greedy_const_policy != "default" {
+        let owner = if use_cpsat {
+            Some("CP-SAT (the policy is greedy-only: the CP-SAT hint cannot name an ALU derivation)".to_string())
+        } else if const_choice != "optimize" {
+            Some(format!("const_choice = '{}'", const_choice))
+        } else if enable_const_choice_hint_pass {
+            Some("the const-choice hint pass".to_string())
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
+            return Err(format!(
+                "greedy_const_policy = '{}' (--greedy-const-policy) is ignored when {} owns the ConstChoice encoding",
+                greedy_const_policy, owner
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_check_encoding_option_combinations() {
+        use super::{check_encoding_option_combinations as check, GreedyPriorityKind::*};
+        let ok = |p, s, cpsat, cc: &str, sc: &str, vs: &str, h: (bool, bool, bool), pol: &str| {
+            check(p, s, cpsat, cc, sc, vs, h.0, h.1, h.2, pol)
+        };
+        let none = (false, false, false);
+        assert!(ok(Fifo, None, true, "optimize", "optimize", "optimize", none, "default").is_ok());
+        assert!(ok(Wavefront, Some((8, 3)), false, "load", "fma", "alu", none, "default").is_ok());
+        assert!(ok(Wavefront, None, false, "optimize", "optimize", "optimize", (true, true, true), "default").is_ok());
+        assert!(ok(Wavefront, None, false, "optimize", "optimize", "optimize", (false, true, true), "alu-first").is_ok());
+        // Each ignored or overridden combination is an error.
+        assert!(ok(Fifo, Some((8, 3)), false, "optimize", "optimize", "optimize", none, "default").is_err());
+        assert!(ok(Fifo, None, false, "load", "optimize", "optimize", (true, false, false), "default").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "vselect", "optimize", (false, true, false), "default").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "optimize", "valu", (false, false, true), "default").is_err());
+        assert!(ok(Fifo, None, true, "optimize", "optimize", "optimize", none, "alu-first").is_err());
+        assert!(ok(Fifo, None, false, "add_imm", "optimize", "optimize", none, "alu-first").is_err());
+        assert!(ok(Fifo, None, false, "optimize", "optimize", "optimize", (true, false, false), "alu-when-load-full").is_err());
+    }
+
     #[test]
     fn test_check_greedy_shape_combinations() {
         use super::{check_greedy_shape_combinations as check, GreedyPriorityKind::*};
