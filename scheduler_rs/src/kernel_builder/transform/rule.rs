@@ -25,6 +25,10 @@ pub enum FactSource {
     /// Read from the region tag only. Labels such as round and group are identity, not
     /// semantics; any fact with this source is one an analysis must supply for untagged code.
     Tag,
+    /// A declared assumption about the program's inputs or about which outputs are observed
+    /// (`values::Assumption`): not derivable from the ops, so the run must state it and a rule
+    /// that relies on it refuses the site when it is not declared.
+    Assumption,
 }
 
 impl FactSource {
@@ -34,6 +38,7 @@ impl FactSource {
             FactSource::Structure => "structure",
             FactSource::Program => "program",
             FactSource::Tag => "tag",
+            FactSource::Assumption => "assumption",
         }
     }
 }

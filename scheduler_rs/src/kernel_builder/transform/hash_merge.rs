@@ -533,7 +533,10 @@ pub fn apply_hash_merge(
         };
         let (l_op, l) = vec_op(&mut surgery, Opcode::MultiplyAdd, [s.input, v_m1, v_c1]);
         let (h_op, h) = vec_op(&mut surgery, Opcode::MultiplyAdd, [s.input, v_m2, v_c2]);
-        let (mut r_op, r) = vec_op(&mut surgery, Opcode::Xor, [l, h, h]);
+        // l stands for t = x + D and h for s = x << K: keep the original operand order (a traced
+        // op records its inputs in that order).
+        let s_first = surgery.ops()[s.xor].srcs[0].as_vreg() == surgery.ops()[s.shl].dest;
+        let (mut r_op, r) = vec_op(&mut surgery, Opcode::Xor, if s_first { [h, l, l] } else { [l, h, h] });
         r_op.trace_id = surgery.ops()[s.xor].trace_id.clone();
         let inserted = [l_op, h_op, r_op];
 

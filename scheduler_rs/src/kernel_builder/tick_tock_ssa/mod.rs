@@ -112,6 +112,9 @@ pub struct SsaScheduleResult {
     /// `address_result.pool_peaks`; the CP-SAT path on the model's timeline, where it decides
     /// which sections the per-section CP-SAT repairs.
     pub section_check_peak: Option<usize>,
+    /// Per transform applied (`--transform`), in order: its name and the sites it rewrote. The
+    /// caller decides from this, not from the request, whether e.g. the indices are still stored.
+    pub transform_sites: Vec<(String, usize)>,
 }
 
 /// SSA-based TickTock Kernel Builder.
@@ -686,6 +689,7 @@ pub fn export_partial_result_on_error(
         scratch_relaxed: ctx.config.compiler.is_relaxed_scratch(),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
         section_check_peak: ctx.section_check_peak,
+        transform_sites: ctx.transform_sites.clone(),
     };
 
     // Build error message for comment
@@ -871,6 +875,8 @@ impl SsaTickTockKernelBuilder {
         let mut config = PipelineConfig {
             compiler: super::config::CompilerConfig {
                 enable_valu_shift,
+                transform_batch_size: Some(self.config.spec.batch_size),
+                transform_n_nodes: Some(self.config.spec.n_nodes),
                 ..self.config.compiler.clone()
             },
             scratch_budget: scratch_budget_override
@@ -1009,6 +1015,8 @@ impl SsaTickTockKernelBuilder {
         let config = PipelineConfig {
             compiler: super::config::CompilerConfig {
                 enable_valu_shift,
+                transform_batch_size: Some(self.config.spec.batch_size),
+                transform_n_nodes: Some(self.config.spec.n_nodes),
                 ..self.config.compiler.clone()
             },
             scratch_budget: self.config.compiler.scratch_size,

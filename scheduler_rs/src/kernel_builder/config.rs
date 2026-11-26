@@ -918,6 +918,14 @@ pub struct CompilerConfig {
     /// Unlike the other fields these change the ops; they are compiler passes, not emission
     /// options, because they read only the program, never emitter state.
     pub transforms: Vec<TransformKind>,
+    /// Batch size of the problem, for the transforms' memory layout facts (where the indices
+    /// array ends). Set by the kernel builder from `ProblemSpec::batch_size`; `None` makes
+    /// `prune-index` and `values-only` refuse to run.
+    pub transform_batch_size: Option<usize>,
+    /// Tree size of the problem, for the transforms' memory layout (the tree's extent, so a
+    /// tree access can be shown not to alias the indices). `None`: no tree access is taken to
+    /// be inside the tree (sound, less precise).
+    pub transform_n_nodes: Option<usize>,
 }
 
 /// A rewrite rule the pipeline can apply to the finished program (`--transform`).
@@ -925,20 +933,32 @@ pub struct CompilerConfig {
 pub enum TransformKind {
     /// Hash stages 2+3 in three ops (`transform::hash_merge`, catalogue rule 3, proof R8).
     HashMerge,
+    /// Wrap-round zero shared, depth-0 index update from a provably zero index, initial index
+    /// load dead (`transform::prune_index`, catalogue rules 5-7, proof R12). Declares the input
+    /// precondition "initial indices are 0".
+    PruneIndex,
+    /// Declares the output contract "final indices are not observed": index stores stop being
+    /// roots and dead code elimination does the rest (`transform::values_only`, rule 9).
+    ValuesOnly,
 }
 
 impl TransformKind {
     /// Parse the CLI/binding spelling.
     ///
     /// # Arguments
-    /// * `s` - `"hash-merge"`
+    /// * `s` - `"hash-merge"`, `"prune-index"` or `"values-only"`
     ///
     /// # Returns
     /// The transform, or an error message naming the valid values.
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "hash-merge" => Ok(TransformKind::HashMerge),
-            other => Err(format!("Invalid transform '{}': must be 'hash-merge'", other)),
+            "prune-index" => Ok(TransformKind::PruneIndex),
+            "values-only" => Ok(TransformKind::ValuesOnly),
+            other => Err(format!(
+                "Invalid transform '{}': must be 'hash-merge', 'prune-index' or 'values-only'",
+                other
+            )),
         }
     }
 
@@ -946,6 +966,8 @@ impl TransformKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             TransformKind::HashMerge => "hash-merge",
+            TransformKind::PruneIndex => "prune-index",
+            TransformKind::ValuesOnly => "values-only",
         }
     }
 }
@@ -1002,6 +1024,8 @@ impl Default for CompilerConfig {
             cpsat_scratch_constraint: true,
             scratch_model: ScratchModel::default(),
             transforms: Vec::new(),
+            transform_batch_size: None,
+            transform_n_nodes: None,
         }
     }
 }

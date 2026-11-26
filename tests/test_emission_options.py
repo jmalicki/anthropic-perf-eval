@@ -39,13 +39,26 @@ def build(tmp_path, rounds, **options):
         sched = json.load(f)
     report = check({"instrs": instrs}, sched)
     assert report.ok, report.findings[:2]  # PROVED: kernel equals the SSA program
-    values_only = bool(options.get("values_only"))
+    values_only = bool(options.get("values_only")) or "values-only" in (options.get("transform") or [])
     # PASSED: values and indices match the reference (values only for --values-only kernels).
     assert validate_kernel(instrs, 10, BATCH, rounds, SEED, values_only=values_only)
-    if values_only:
-        # The flag changes the output: the indices in memory are not the reference's.
+    if values_only and rounds % 11 != 0:
+        # The flag changes the output: the indices in memory are not the reference's (unless
+        # the last round is the wrap round, height 10: then every final index is 0, as the
+        # untouched input indices are).
         assert not validate_kernel(instrs, 10, BATCH, rounds, SEED)
-    return sr.analyze(sched), sched
+    rep = sr.analyze(sched)
+    rep["transform_sites"] = [tuple(x) for x in stats.get("transform_sites", [])]
+    return rep, sched
+
+
+def opcode_counts(sched):
+    """(engine, opcode) -> number of SSA ops scheduled."""
+    counts = {}
+    for o in sched["ssa_ops"]:
+        key = (o["engine"], o["opcode"])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def vector_op_equivalents(rep):
@@ -86,6 +99,37 @@ def test_hash_merge_transform_equals_merge_hash_stages(tmp_path, rounds):
     for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
         assert rewritten["emission"][key] == merged["emission"][key], key
     assert len(rewritten_sched["ssa_ops"]) == len(merged_sched["ssa_ops"])
+
+
+TRANSFORM_FLAGS = {"hash-merge": "merge_hash_stages", "prune-index": "prune_dead_index", "values-only": "values_only"}
+
+
+@pytest.mark.parametrize("rounds", [3, 11])
+@pytest.mark.parametrize("index_form", ["zero-based", "mirrored"])
+@pytest.mark.parametrize("transforms", [["prune-index"], ["values-only"], ["values-only", "prune-index"],
+                                        ["prune-index", "values-only", "hash-merge"]], ids="+".join)
+def test_index_transforms_equal_their_flags(tmp_path, rounds, index_form, transforms):
+    """--transform prune-index / values-only rewrite the default program into the one the flags
+    emit: PROVED, PASSED (values only with values-only), same op counts. 11 rounds end on the
+    wrap round, so the shared zero vector is the stored index."""
+    flags = {TRANSFORM_FLAGS[t]: True for t in transforms}
+    emitted, emitted_sched = build(tmp_path, rounds, index_form=index_form, **flags)
+    rewritten, rewritten_sched = build(tmp_path, rounds, index_form=index_form, transform=transforms)
+    # Each transform did what it claims: prune-index has nothing to rewrite on the mirrored
+    # index (no zero-based update, C2; the flag is then a no-op too, which this test checks
+    # explicitly rather than by equal counts); every other transform rewrote sites.
+    for name, sites in rewritten["transform_sites"]:
+        if name == "prune-index" and index_form == "mirrored":
+            assert sites == 0, (name, sites)
+        else:
+            assert sites > 0, (name, sites)
+    assert [name for name, _ in rewritten["transform_sites"]] == transforms
+    for key in ("vector_ops", "non_shiftable_vector_ops", "native_scalar_ops", "vector_op_equivalents"):
+        assert rewritten["emission"][key] == emitted["emission"][key], key
+    assert len(rewritten_sched["ssa_ops"]) == len(emitted_sched["ssa_ops"])
+    assert opcode_counts(rewritten_sched) == opcode_counts(emitted_sched)
+    for engine in ("load", "store"):
+        assert rewritten["engines"][engine]["ops"] == emitted["engines"][engine]["ops"], engine
 
 
 def test_transform_rejects_unknown_rule():
@@ -359,3 +403,24 @@ def test_depth4_select_rounds_rejects_unknown_value():
     with pytest.raises(ValueError, match="depth4_select_rounds"):
         scheduler_rs.build_tick_tock_kernel_ssa(
             forest_height=10, n_nodes=2047, batch_size=BATCH, rounds=2, verbose=False, depth4_select_rounds="last")
+
+
+# ---------------------------------------------------------------------------
+# Validation follows what the build did, not what was requested
+# ---------------------------------------------------------------------------
+def test_indices_unobserved_follows_the_outcome():
+    """--transform values-only that rewrote nothing (or was refused) leaves the index stores in
+    place: the indices must then be validated."""
+    from generate_ssa_kernel import indices_unobserved_after_build as f
+    assert f(True, None, {})
+    assert not f(False, None, {"transform_sites": [("values-only", 4)]})
+    assert f(False, ["values-only"], {"transform_sites": [("values-only", 4)]})
+    assert not f(False, ["values-only"], {"transform_sites": [("values-only", 0)]})
+    assert not f(False, ["values-only"], {"transform_sites": []})
+    assert not f(False, ["prune-index", "values-only"], {"transform_sites": [("prune-index", 3), ("values-only", 0)]})
+
+
+def test_stats_report_transform_sites(tmp_path):
+    # 2 rounds: no wrap round, so prune-index has one site per group (round 0's update).
+    rep, _ = build(tmp_path, 2, transform=["prune-index", "values-only"])
+    assert rep["transform_sites"] == [("prune-index", BATCH // 8), ("values-only", BATCH // 8)]

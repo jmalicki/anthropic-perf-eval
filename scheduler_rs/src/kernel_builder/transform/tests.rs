@@ -277,7 +277,7 @@ fn test_gather_tag_on_partial_region_is_rejected() {
 
 /// Every op printed with VRegs renamed in order of first appearance (lanes of a vector group
 /// named right after the group), and region ids dropped (they are dense per emission).
-fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<String> {
+pub(super) fn canonical_ops(program: &crate::kernel_builder::SsaProgram) -> Vec<String> {
     use crate::types::{Operand, VReg};
     use std::collections::HashMap;
     let mut names: HashMap<VReg, usize> = HashMap::new();
@@ -450,7 +450,7 @@ fn test_apply_rejects_a_choice_outside_the_cached_levels() {
 // Hash merge: a peephole on the finished program
 // ----------------------------------------------------------------------------
 
-fn raw_program(spec: &ProblemSpec) -> crate::kernel_builder::SsaProgram {
+pub(super) fn raw_program(spec: &ProblemSpec) -> crate::kernel_builder::SsaProgram {
     let config = KernelConfig { spec: spec.clone(), ..KernelConfig::new(spec.forest_height, spec.n_nodes, spec.batch_size, spec.rounds) };
     SsaTickTockKernelBuilder::new(config).build()
 }
@@ -459,7 +459,7 @@ fn merge_rule(source: ProposalSource) -> HashMergeRule {
     HashMergeRule { source }
 }
 
-fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder::SsaProgram {
+pub(super) fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder::SsaProgram {
     crate::kernel_builder::SsaProgram {
         ops: p.ops.clone(),
         vreg_def: p.vreg_def.clone(),
@@ -481,7 +481,7 @@ fn clone_program(p: &crate::kernel_builder::SsaProgram) -> crate::kernel_builder
 ///
 /// # Returns
 /// The first other difference, and the indices of ops differing only by the leaked label.
-fn first_difference(a: &[String], b: &[String]) -> (Option<String>, Vec<usize>) {
+pub(super) fn first_difference(a: &[String], b: &[String]) -> (Option<String>, Vec<usize>) {
     let mut leaked = Vec::new();
     for i in 0..a.len().min(b.len()) {
         if a[i] == b[i] {
@@ -510,16 +510,23 @@ fn check_hash_merge_parity(spec: &ProblemSpec, label: &str) -> HashMergeReport {
     if let Some(d) = diff {
         panic!("{}: {}", label, d);
     }
-    // The leak lands on a setup op, never on a hash op.
+    // The leak lands on exactly one known op, or none: the first op written after the hash
+    // constants, i.e. the first op of the selection setup (an ALU add, no region). Any other
+    // label difference fails the gate.
+    use crate::types::{EmissionPhase, Engine, Opcode};
+    let first_selection_setup =
+        rewritten.ops.iter().position(|o| o.source_info.as_ref().map_or(false, |s| s.phase == EmissionPhase::ValuSelectionInit));
     for &i in &leaked {
-        assert!(rewritten.ops[i].region.is_none(), "{}: label leak on {:?}", label, rewritten.ops[i]);
+        let op = &rewritten.ops[i];
+        assert_eq!(Some(i), first_selection_setup, "{}: label leak on {:?}", label, op);
+        assert!(op.region.is_none() && op.engine == Engine::Alu && op.opcode == Opcode::Add, "{}: label leak on {:?}", label, op);
     }
     eprintln!("{}: {} sites, op-for-op parity, {} op(s) with the leaked label", label, report.sites, leaked.len());
     report
 }
 
 /// The flow90 plan (docs/emission_plans/flow90.json), read from the file.
-fn flow90_plan(spec: &ProblemSpec) -> Vec<Vec<AccessEncoding>> {
+pub(super) fn flow90_plan(spec: &ProblemSpec) -> Vec<Vec<AccessEncoding>> {
     use AccessEncoding::*;
     let named = |s: &str| AccessEncoding::from_str(s).unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/emission_plans/flow90.json");
@@ -1381,18 +1388,29 @@ fn test_hash_merge_keeps_a_kept_live_constant() {
 }
 
 #[test]
-fn test_hash_merge_leaves_no_keep_live_only_reference() {
+fn test_transforms_leave_no_keep_live_only_reference() {
+    use crate::kernel_builder::config::TransformKind::{self, *};
+    use crate::kernel_builder::pipeline::passes::transform::apply_transform_with;
     use crate::types::VReg;
-    // Pipeline dead code elimination (DcePass, after TransformPass) follows `srcs` only. On the
-    // emitter's programs every keep_live value is also read through `srcs` (the round R-2 hash
-    // output, read by round R-1), and the rewrite keeps it that way.
+    // Pipeline dead code elimination (DcePass, after TransformPass) follows `srcs` only
+    // (BUGS.md). On the emitter's programs every keep_live value is also read through `srcs`
+    // (the round R-2 hash output, read by round R-1), and every transform keeps it that way,
+    // alone and combined.
+    let combos: [&[TransformKind]; 4] = [&[HashMerge], &[PruneIndex], &[ValuesOnly], &[HashMerge, PruneIndex, ValuesOnly]];
     for rounds in [2, 16] {
-        let (p, report) = apply_hash_merge(raw_program(&ProblemSpec { rounds, ..Default::default() }), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
-        assert_eq!(report.sites, rounds * 32);
-        let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
-        let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
-        assert_eq!(kept.len(), 32, "rounds {}", rounds);
-        assert!(kept.iter().all(|v| read.contains(v)), "rounds {}: a keep_live-only value", rounds);
+        let spec = ProblemSpec { rounds, ..Default::default() };
+        for combo in combos {
+            let mut p = raw_program(&spec);
+            for &t in combo {
+                let (next, outcome) = apply_transform_with(p, t, Some(spec.batch_size), Some(spec.n_nodes)).unwrap();
+                assert!(outcome.sites > 0 && outcome.refused.is_none(), "rounds {} {:?}: {}", rounds, t, outcome.summary);
+                p = next;
+            }
+            let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
+            let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
+            assert_eq!(kept.len(), 32, "rounds {} {:?}", rounds, combo);
+            assert!(kept.iter().all(|v| read.contains(v)), "rounds {} {:?}: a keep_live-only value", rounds, combo);
+        }
     }
 }
 
@@ -1463,6 +1481,75 @@ fn test_surgery_checks_inserted_readers_before_a_move() {
     let err = surgery.move_after(&[1, 2], 7).unwrap_err();
     assert!(err.contains("inserted next to op 5"), "{}", err);
     surgery.finish().unwrap();
+}
+
+#[test]
+fn test_transform_pass_keeps_the_program_on_an_error() {
+    use crate::kernel_builder::config::TransformKind;
+    use crate::kernel_builder::pipeline::{PipelineConfig, PipelineContext};
+    // prune-index without a batch size fails after hash-merge succeeded: the context keeps
+    // the hash-merged program (for the error export), not an empty one.
+    let spec = ProblemSpec { rounds: 2, ..Default::default() };
+    let (merged, _) = apply_hash_merge(raw_program(&spec), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    let mut config = PipelineConfig::default();
+    config.compiler.transforms = vec![TransformKind::HashMerge, TransformKind::PruneIndex];
+    config.compiler.transform_batch_size = None;
+    let mut ctx = PipelineContext::new(raw_program(&spec), config);
+    let err = ctx.run_greedy_pipeline(false).err().expect("prune-index needs the batch size");
+    assert!(err.contains("batch size"), "{}", err);
+    assert_eq!(canonical_ops(&crate::kernel_builder::SsaProgram { ops: ctx.ops.clone(), ..clone_program(&merged) }), canonical_ops(&merged));
+}
+
+#[test]
+fn test_hash_merge_keeps_the_xor_operand_order() {
+    use crate::types::Opcode;
+    // A traced r = s ^ t (shift first) becomes h ^ l (the merged form of the shift first).
+    let mut p = one_site_program();
+    let xor = p.ops.iter().position(|o| o.opcode == Opcode::Xor).unwrap();
+    let shl = p.ops.iter().position(|o| o.opcode == Opcode::Shl).unwrap();
+    if p.ops[xor].srcs[0].as_vreg() != p.ops[shl].dest {
+        p.ops[xor].srcs.swap(0, 1);
+    }
+    p.ops[xor].trace_id = Some("r".into());
+    // k = 3 (not 0), so that h and l have different multipliers.
+    p.ops[7].srcs[0] = crate::types::Operand::Imm(3);
+    p.ops[7].produces_constant = Some(3);
+    p.ops[8].produces_constant = Some(3);
+    let (m, k) = (p.ops[1].produces_constant.unwrap(), 3);
+    assert_ne!((m << k) & 0xFFFF_FFFF, m & 0xFFFF_FFFF);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1);
+    let g = SsaGraph::new(&after.ops, &after.vector_group_lanes);
+    let r = after.ops.iter().find(|o| o.trace_id.as_deref() == Some("r")).unwrap();
+    let multiplier = |v| g.broadcast_const(g.def_op(v).unwrap().srcs[1].as_vreg().unwrap());
+    assert_eq!(multiplier(r.srcs[0].as_vreg().unwrap()), Some((m << k) & 0xFFFF_FFFF), "first operand is h");
+    assert_eq!(multiplier(r.srcs[1].as_vreg().unwrap()), Some(m & 0xFFFF_FFFF), "second operand is l");
+}
+
+#[test]
+fn test_surgery_drops_a_dead_reader_of_an_alias_whose_lanes_are_gone() {
+    use super::surgery::Surgery;
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // Eight scalar lanes assembled under an alias K, read only by an already-dead op. Removing
+    // a lane leaves K undefined: the dead reader goes with it.
+    let mut p = one_site_program();
+    let lanes: Vec<VReg> = (0..8).map(|k| VReg::scalar(p.vreg_count + k)).collect();
+    let key = VReg::vector(p.vreg_count + 8);
+    let dead = VReg::vector(p.vreg_count + 9);
+    p.vreg_count += 10;
+    let first_lane = p.ops.len();
+    for (k, &l) in lanes.iter().enumerate() {
+        let mut op = SsaOp::new(p.ops.len(), Engine::Load, Opcode::ConstChoice, Some(l), vec![Operand::Imm(100 + k as i64)]);
+        op.produces_constant = Some(100 + k as i64);
+        p.ops.push(op);
+    }
+    p.vector_group_lanes.insert(key, lanes);
+    p.ops.push(SsaOp::new(p.ops.len(), Engine::Valu, Opcode::Add, Some(dead), vec![Operand::VReg(key), Operand::VReg(key)]));
+    let mut surgery = Surgery::new(p).unwrap();
+    surgery.remove(first_lane);
+    let (after, report) = surgery.finish().unwrap();
+    assert!(!after.ops.iter().any(|o| o.dest == Some(dead)));
+    assert!(report.dropped_dead >= 1);
 }
 
 #[test]

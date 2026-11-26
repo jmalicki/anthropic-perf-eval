@@ -114,6 +114,9 @@ pub struct PipelineContext {
     pub zero_vreg: Option<VReg>,
     /// Maps vector group alias VRegs to their 8 scalar lane VRegs (for scatter loads).
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+    /// Per transform applied by `TransformPass`, in order: its name and the sites it rewrote
+    /// (0 when it matched nothing or refused the program).
+    pub transform_sites: Vec<(String, usize)>,
 
     // --- Scheduling state ---
     /// ASAP/ALAP bounds (populated by ComputeBoundsPass, consumed by greedy + CP-SAT).
@@ -171,6 +174,7 @@ impl PipelineContext {
             const_alternatives,
             zero_vreg,
             vector_group_lanes,
+            transform_sites: Vec::new(),
             bounds: None,
             greedy_decisions: SchedulingDecisions::default(),
             final_decisions: SchedulingDecisions::default(),
@@ -490,6 +494,7 @@ impl PipelineContext {
             scratch_relaxed: self.config.compiler.is_relaxed_scratch(),
             vector_group_lanes: self.vector_group_lanes,
             section_check_peak: self.section_check_peak,
+            transform_sites: self.transform_sites,
         })
     }
 }
