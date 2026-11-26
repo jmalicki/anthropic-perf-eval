@@ -187,12 +187,12 @@ reduced-model sweep gains should not be trusted without `--no-prune`. On the
 index kernel the reduced sweep and rolling pass found no gain (bounds of 1 left open); the
 full model closes them.
 
-## Dependency on #92
+## Lands with #91 and #92
 
 The runs in table A and the first reduced-model runs used `CPSAT_SECTION_CHECK_TIMELINE=model`,
 an analysis switch in this branch's `tick_tock_ssa` that is not recorded in `run_options`. #92
 removes it: its section check counts with the allocator's intervals and needs no switch. This
-branch must not land on main without #92.
+branch lands on main together with #91 and #92, in that order.
 
 ## Commands
 
