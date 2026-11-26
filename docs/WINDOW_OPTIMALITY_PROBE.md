@@ -2,11 +2,11 @@
 
 **Question.** At 16 rounds the whole-program CP-SAT solve never improves on its greedy warm start. Is the warm start locally near-optimal, or is the model too big for the solver to find improvements that exist? The answer feeds the decision on windowed or rolling-horizon CP-SAT.
 
-**Short answer (partial data, see [Status](#status)).**
-- The warm start is not locally optimal. With free encodings, about half of all 25-cycle windows and most 50-cycle windows can each be shortened by one cycle, proven optimal in most cases.
-- Applied in sequence, those gains add up. A rolling pass of 25-cycle windows took 1,399 to 1,393 cycles over the first 370 cycles of the schedule.
+**Short answer (partial data, see [Status](#status)).** Every gain below was found on the reduced model and is **not confirmed by the full model** (the two models later disagreed on a path-bit kernel: BUGS.md, docs/STARTUP_WINDOW_PROBE.md); read them as reduced-model results.
+- On the reduced model, the warm start is not locally optimal. With free encodings, about half of all 25-cycle windows and most 50-cycle windows can each be shortened by one cycle, proven optimal in most cases.
+- Applied in sequence, those reduced-model gains add up. A rolling pass (incomplete, not re-checked on the full model) of 25-cycle windows took 1,399 to 1,393 cycles over the first 370 cycles of the schedule.
 - Almost all of the gain needs different encodings, mainly VALU shift. With encodings fixed, 1 of 107 windows improves.
-- So whole-program CP-SAT is failing on scale: the improvements exist and its search does not reach them.
+- If the full model confirms them, whole-program CP-SAT is failing on scale: the improvements exist and its search does not reach them. Not confirmed.
 
 Tooling: `scripts/window_optimality_probe.py`, `scheduler_rs/src/cpsat_scheduler/window.rs`, skill `.cursor/skills/use-window-probe/SKILL.md`.
 
@@ -45,13 +45,13 @@ Window `[a, a+W)`. The model is the full-kernel model from `schedule_ssa_cpsat`,
 
 **Objective: makespan alone.** When the last op is after the window, minimising the makespan maximises `delta`, the number of cycles by which the rest of the schedule can start earlier. That is the real makespan gain from compacting the window. The other option is to minimise the window's own span with the rest pinned. A shorter span need not move anything after the window, so it overstates the gain. Moving the After block keeps every constraint among After ops intact. The model still checks everything that crosses a boundary: precedence from Before and Inside ops; slot capacity where Inside and After ops now share cycles; and the scratch budget over the whole schedule, so a value defined before the window and read after it is counted at every cycle it is live.
 
-**Reduced model (exact).** Every op outside the window is pinned, so an op far from it only matters through constraints shared with nearby ops. `CpsatWindow::pruned_ops` marks the ops whose slots end before `a - W - 1`, or start at or after `max(a + 2W + 2, last Before slot + W + 3)`. Nothing that can move ever reaches those cycles:
+**Reduced model (meant to be exact; see below).** Every op outside the window is pinned, so an op far from it only matters through constraints shared with nearby ops. `CpsatWindow::pruned_ops` marks the ops whose slots end before `a - W - 1`, or start at or after `max(a + 2W + 2, last Before slot + W + 3)`. Nothing that can move ever reaches those cycles:
 - Inside ops stay in `[a, a+W)`;
 - the After block moves at most `W` earlier;
 - the SUBs are pinned or kept in the window;
 - every dependency edge between a marked op and an unmarked one is at least two cycles long, the largest latency.
 
-`restrict_to_window` keeps the unmarked ops, plus, for each value that touches them, its def and its latest marked reader (so its scratch interval is exact), plus the op with the last slot. Marked ops that remain are left out of every cumulative. A 16-round W=50 window drops from 12,356 to 1,585 ops. It produces the same presolved model (4,082 variables, 13,716 constraints) and the same result (saved 1, optimal at 8.5 deterministic time) as the unreduced model. `pruning_far_ops_keeps_the_window_optimum` and `reduced_model_with_cse_group_matches_full_model` check the same on small programs, including re-solving each expanded schedule on the full model with every op pinned. The rolling pass re-checks its final schedule the same way.
+`restrict_to_window` keeps the unmarked ops, plus, for each value that touches them, its def and its latest marked reader (so its scratch interval is exact), plus the op with the last slot. Marked ops that remain are left out of every cumulative. A 16-round W=50 window drops from 12,356 to 1,585 ops. It produces the same presolved model (4,082 variables, 13,716 constraints) and the same result (saved 1, optimal at 8.5 deterministic time) as the unreduced model on that window. On a path-bit kernel the reduced and full models later disagreed (unresolved: BUGS.md, docs/STARTUP_WINDOW_PROBE.md), so treat reduced-model gains as unconfirmed until re-checked with `--no-prune`. `pruning_far_ops_keeps_the_window_optimum` and `reduced_model_with_cse_group_matches_full_model` check the same on small programs, including re-solving each expanded schedule on the full model with every op pinned. The rolling pass re-checks its final schedule the same way.
 
 **Budgets.**
 - 20 units of deterministic time per window, with a 900 s wall-clock backstop and 2 workers.
@@ -64,6 +64,8 @@ Window `[a, a+W)`. The model is the full-kernel model from `schedule_ssa_cpsat`,
 Reference: 1,399 cycles. "Saved" is per window, against the reference. "Bound" is the most the window could save: the reference makespan minus CP-SAT's proven bound.
 
 ### Independent sweep
+
+Reduced model (`restrict_to_window`); the gains are unconfirmed by the full model (`--no-prune`), which was not run on these windows.
 
 | W | encodings | windows | proven optimal | improved | saved per improved window | max bound (open windows) | improved by phase | median / max s |
 |---|---|---|---|---|---|---|---|---|
@@ -82,6 +84,8 @@ Notes:
 - **Window boundary follow-up.** The original W=25 sweep reported four infeasible free windows and five infeasible fixed windows among starts 26, 481, 624, 793 and 962. In the saved fixed model at 481, the reference used a one-cycle vselect at 505. An unconditional constraint also required its unused FMA cycle (506) to fit before the window ended. The window now applies that constraint only when the FMA executes. With this change and the preceding reference-domain fix, all five starts solved to optimality at 1,399 cycles in both modes (one worker, deterministic budget 5). All five generator runs passed symbolic replay and numeric validation of the reference kernel. The table retains the original sweep counts and timings.
 
 ### Rolling pass (what rolling-horizon CP-SAT would get)
+
+Reduced model, unconfirmed: the pass stopped at cycle 370, so its schedule was never re-checked on the full model or lowered.
 
 | W | windows | improved | final makespan | saved | complete |
 |---|---|---|---|---|---|
@@ -104,7 +108,7 @@ A sweep needs one model build per window. Before PR #60 that build alone took 45
 
 1. **Build it.** The whole-program solve's failure is one of scale. Improvements exist in roughly every other 25-cycle window and in most 50-cycle windows, and CP-SAT proves them in seconds to minutes once the model is the window's. The whole-program model has 109,240 variables and 584,831 constraints, and its LP workers spend their budget loading. It does not find them.
 2. **Keep encodings free inside the window.** That is where the gain is: fixed encodings find 1 cycle in 107 windows, free ones 49. A windowed pass that only reorders is not worth building.
-3. **Use the reduced model and leave out the max-LP workers.** The reduction is exact and cuts the model about 8 times at W=50. Without it, and with the max-LP workers in, a single window ran out of wall time at 2.7 deterministic time.
+3. **Use the reduced model and leave out the max-LP workers.** The reduction is meant to be exact (it was on the window checked here, but disagreed with the full model on a path-bit kernel: BUGS.md, docs/STARTUP_WINDOW_PROBE.md; re-check improving windows with `--no-prune`) and cuts the model about 8 times at W=50. Without it, and with the max-LP workers in, a single window ran out of wall time at 2.7 deterministic time.
 4. **Window size.** W=25 closes most windows in seconds. W=50 finds an improvement in more windows (29 of 37) but takes about 15 times longer per window. A rolling pass at W=25 to 50 with stride W, roughly 30 to 60 solves, is the practical shape. The expected gain from the data so far is on the order of 20 cycles (1.5 %). That is useful but modest; the capacity floor for this emission is 1,271.
 5. **Also look at the greedy's shift policy.** Nearly every gain comes from re-deciding VALU shifts locally. A better shift rule in the greedy could capture part of this without any solver.
 

@@ -1,0 +1,132 @@
+{
+  "spec": {
+    "window_sizes": [
+      60,
+      110
+    ],
+    "stride_fraction": 0.5,
+    "encodings": [
+      "free"
+    ],
+    "sweep": true,
+    "rolling": false,
+    "cycle_range": [
+      0,
+      61
+    ],
+    "deterministic_time": 120.0,
+    "time_limit_secs": 1800.0,
+    "workers": 4,
+    "asap_alap_tightening": "none",
+    "ignore_subsolvers": [
+      "max_lp",
+      "max_lp_sym",
+      "reduced_costs",
+      "pseudo_costs"
+    ],
+    "prune": false,
+    "output": "/private/tmp/claude-501/-Users-josephmalicki-src-anthropic-perf-eval/8e8887ce-e7f9-42b5-bfee-4ffb914a62e1/scratchpad/wp/path_full_notight.json"
+  },
+  "num_ops": 10441,
+  "base_makespan": 1032,
+  "base_check_status": "optimal (makespan 1032, 1.9s)",
+  "entries": [
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 0,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 2.697176958,
+      "before": 0,
+      "inside": 739,
+      "after": 9702,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 30,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 2.779801125,
+      "before": 366,
+      "inside": 645,
+      "after": 9430,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 60,
+      "start": 60,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 2.830897417,
+      "before": 740,
+      "inside": 563,
+      "after": 9138,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 110,
+      "start": 0,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 3.4279967080000002,
+      "before": 0,
+      "inside": 1203,
+      "after": 9238,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "sweep",
+      "w": 110,
+      "start": 55,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1032,
+      "saved_bound": 0,
+      "wall_secs": 3.3887140000000002,
+      "before": 695,
+      "inside": 1050,
+      "after": 8696,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    }
+  ],
+  "rolling_final": [],
+  "rolling_checks": []
+}

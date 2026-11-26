@@ -54,8 +54,10 @@ are analysis only, never kernels.
    nothing was placed, as the `pools` model already does. With it the hard
    check holds the budget on the plans measured here: the ceiling plan with the pressure
    policy off runs at peak 1,535 and 1,049 cycles. **It does not hold it on every plan:** a run
-   can reach a cycle where nothing was placed (no single ready op fits within the budget; not
-   shown to be a state with no in-budget schedule, docs/STALL_DEADLOCK.md), and then it forces
+   can reach a cycle where no operation was placed (ASAP inflation had deferred the other ready
+   ops before their budget checks; whether they could have freed enough words was not
+   established, docs/STALL_DEADLOCK.md; nor was it shown to be a state with no in-budget
+   schedule), and then it forces
    and can stay over budget; under `stall` + 0.98, 3 of 28 later path-bit plans did that (peaks 1,761 to
    1,817; docs/STARTUP_AND_STALL_LOOP.md section A), so `stall` is not a safe judge. The best kernels do not change (1,033 / 1,034, 1,039): their
    gap is not scratch. Every ceiling plan improves by 8 to 78 cycles, none below 1,033.

@@ -1,0 +1,93 @@
+{
+  "spec": {
+    "window_sizes": [
+      60
+    ],
+    "stride_fraction": 0.5,
+    "encodings": [
+      "free"
+    ],
+    "sweep": false,
+    "rolling": true,
+    "cycle_range": [
+      0,
+      120
+    ],
+    "deterministic_time": 60.0,
+    "time_limit_secs": 1800.0,
+    "workers": 4,
+    "asap_alap_tightening": null,
+    "ignore_subsolvers": [
+      "max_lp",
+      "max_lp_sym",
+      "reduced_costs",
+      "pseudo_costs"
+    ],
+    "prune": true,
+    "output": "/private/tmp/claude-501/-Users-josephmalicki-src-anthropic-perf-eval/8e8887ce-e7f9-42b5-bfee-4ffb914a62e1/scratchpad/wp/path_B.json"
+  },
+  "num_ops": 10441,
+  "base_makespan": 1032,
+  "base_check_status": "optimal (makespan 1032, 1.9s)",
+  "entries": [
+    {
+      "phase": "rolling",
+      "w": 60,
+      "start": 0,
+      "encodings": "free",
+      "status": "feasible",
+      "reference_makespan": 1032,
+      "makespan": 1032,
+      "saved": 0,
+      "lb": 1031,
+      "saved_bound": 1,
+      "wall_secs": 293.513517875,
+      "before": 0,
+      "inside": 739,
+      "after": 9702,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    },
+    {
+      "phase": "rolling",
+      "w": 60,
+      "start": 60,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1032,
+      "makespan": 1031,
+      "saved": 1,
+      "lb": 1031,
+      "saved_bound": 1,
+      "wall_secs": 238.245011167,
+      "before": 740,
+      "inside": 563,
+      "after": 9138,
+      "shift_changes": 73,
+      "select_changes": 11,
+      "const_changes": 0
+    },
+    {
+      "phase": "rolling",
+      "w": 60,
+      "start": 119,
+      "encodings": "free",
+      "status": "optimal",
+      "reference_makespan": 1031,
+      "makespan": 1031,
+      "saved": 0,
+      "lb": 1031,
+      "saved_bound": 0,
+      "wall_secs": 0.798556709,
+      "before": 1304,
+      "inside": 597,
+      "after": 8540,
+      "shift_changes": 0,
+      "select_changes": 0,
+      "const_changes": 0
+    }
+  ],
+  "rolling_final": [],
+  "rolling_checks": []
+}
