@@ -184,10 +184,16 @@ def test_forced_shifts_are_ignored_outside_optimize_by_the_greedy_alone(tmp_path
     """use_cpsat=False with --valu-shift valu|alu: the forced set is not applied.
 
     The CP-SAT model reads the forced set only under `optimize`, and the greedy must agree
-    in both pipelines. (Whether the greedy-only build applies `alu` itself is a separate
-    open entry in BUGS.md: today it does not, so nothing is shifted in either mode.)
+    in both pipelines. The whole-kernel mode decides instead: `valu` shifts nothing, `alu`
+    shifts every shiftable vector op (greedy-only builds apply it since #86), so the forced
+    ops are shifted there as part of the mode, not because they are in the set.
     """
     forced = _two_vector_ops_the_greedy_runs_together(tmp_path)
     sched, _ = _forced_shift_build(tmp_path, forced, verbose=False, use_cpsat=False, valu_shift=valu_shift)
-    assert [len(_lowered_lanes(sched, op_id)) for op_id in forced] == [0, 0]
-    assert sched["valu_shifted"] == 0
+    lanes = [len(_lowered_lanes(sched, op_id)) for op_id in forced]
+    if valu_shift == "valu":
+        assert lanes == [0, 0]
+        assert sched["valu_shifted"] == 0
+    else:
+        assert lanes == [8, 8]
+        assert sched["valu_shifted"] > len(forced), "alu shifts every shiftable op, not just the set"
