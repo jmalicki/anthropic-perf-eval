@@ -60,9 +60,10 @@ def test_clean_cpsat_kernel_is_proved(tmp_path_factory):
     """CP-SAT exercises the alternative encodings (shifted ops, FMA selects, add_imm)."""
     # The solve stops on CP-SAT's work count, not the clock, so every machine checks the same
     # schedule. 1.0 reaches the same makespan as an unbounded solve (36 cycles, ~5 s locally,
-    # first solution at 0.05 s from the greedy hint); the 120 s wall limit is only a backstop.
+    # first solution at 0.05 s from the greedy hint). The 60 s wall limit is only a backstop and
+    # stays below pytest's 120 s timeout (pyproject.toml), leaving room for the build and check.
     kernel, sched = _build(tmp_path_factory, "cpsat", rounds=2, use_cpsat=True,
-                           cpsat_deterministic_time=1.0, cpsat_time_limit=120.0)
+                           cpsat_deterministic_time=1.0, cpsat_time_limit=60.0)
     report = check(kernel, sched)
     assert report.ok, report.findings[:3]
 
