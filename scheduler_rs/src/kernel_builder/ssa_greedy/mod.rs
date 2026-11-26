@@ -1811,7 +1811,10 @@ fn schedule_ssa_greedy_shaped_once(
     shifted_lane_cycles: &mut HashMap<usize, Vec<i32>>,
 ) -> Result<((usize, bool, usize), LivenessAgreement), String> {
     shifted_lane_cycles.clear();
-    // Derivations of an earlier run (the `pools` rerun) are not this run's.
+    // Defensive: this run's derivations only. Every caller today passes fresh diagnostics
+    // (the pipeline creates them, and the `pools` rerun replaces them with
+    // `GreedyDiagnostics::new` first), so this changes no build; it guards a caller that
+    // reuses one `GreedyDiagnostics` across runs.
     diagnostics.const_alu_derive.clear();
     let mut trace = CounterTrace::default();
     let result = schedule_ssa_greedy_core(

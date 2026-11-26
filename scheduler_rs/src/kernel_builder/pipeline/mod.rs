@@ -429,6 +429,12 @@ impl PipelineContext {
             lb_cycles: self.cpsat_extra.as_ref().and_then(|e| e.lb_cycles),
             cpsat_scratch_budget: self.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
             scratch_relaxed: self.config.compiler.is_relaxed_scratch(),
+            greedy_justify_summary: self
+                .reports
+                .iter()
+                .rev()
+                .find(|r| r.name == "GreedyJustify")
+                .map(|r| r.detail.clone()),
             vector_group_lanes: self.vector_group_lanes,
         })
     }

@@ -123,6 +123,20 @@ pass's scratch check and in its address-assignment trial. Before, the pass skipp
 schedule with one. All rows: 16 rounds, `--use-greedy --validate`, PROVED and PASSED, no
 build over the scratch budget unless marked.
 
+Data: the sweep, rewrites and neighbours tables below are
+`docs/emission_plans/justify_on_best_sweep.json` (every row with its command line), rebuilt
+and compared by `uv run python -m scripts.justify_on_best_sweep` and by the ci_only test
+`tests/test_justify_on_best_sweep.py`. The justify 0 / 10 rows of the removal table are
+pinned by `tests/test_justify_on_best_pin.py` (ci_only); the justify 50 column was measured
+once and is not in the data.
+
+**What this branch's code change does and does not explain.** The change is that
+justification now models ALU-derived constants, so it runs with `--greedy-const-policy
+alu-first` (before, it skipped such schedules): that is the `alu-first` rows (1,026 -> 1,016).
+The headline 1,012 / 1,033 uses the default const policy (no derived constants) and does not
+depend on it: the neighbours table rebuilt on `critical-path` (#91, without this change)
+gives the same cycles in every row. It is a measurement recorded here.
+
 **Measured by removal** (justify on/off, every other flag fixed; best flags + path
 `--reassociate-gather-xor` + chain-first + native-first, index `--index-early-terms final`):
 
@@ -197,11 +211,15 @@ index 1,035, 142.7x). Path 1,012 holds at staggers 8 to 10 and with or without t
 priorities; the gain needs 32 groups in flight (28: +2, 24: +14). Justification is worth 32
 cycles on path and 14 on index with these rewrites: without it the rewrites run slower than
 the baseline (section 3), with it they give the best kernels. Pinned by
-`tests/test_justify_on_best_pin.py` (ci_only).
+`tests/test_justify_on_best_pin.py` (ci_only; also the `alu-first` pair 1,026 -> 1,016, the
+only rows that need this branch's change).
 
-**As a CP-SAT hint.** The justified schedules are solutions of the CP-SAT model. Checked
-with the window probe's all-fixed check (every op pinned) on `section-check-timeline`
-(87f4e80, its scratch-model fix) with this branch merged in locally, best flags plus
+**As a CP-SAT hint (measured on a local merge, not reproducible from this branch).** The
+justified schedules are solutions of the CP-SAT model. Checked with the window probe's
+all-fixed check (every op pinned) on `section-check-timeline` (#92, 87f4e80, its
+scratch-model fix) with this branch merged in locally and never pushed; on this branch alone
+the per-section check overcount (BUGS.md) blocks it, so the result cannot be reproduced here
+until #92 lands. Best flags plus
 `--greedy-justify 10 --cpsat-split-shift-hint`, `--no-sweep --no-rolling`:
 
 | Plan | greedy (CP-SAT pipeline, full bounds) | justified, inside every ASAP/ALAP domain | all-fixed check |

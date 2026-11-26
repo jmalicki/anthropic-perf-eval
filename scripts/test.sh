@@ -7,6 +7,9 @@
 #   ./scripts/test.sh proofs     # Z3: liveness theorems, rewrite identities, allocation conjectures, static makespan bounds, memory-alias rules
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
 #   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
+#   ./scripts/test.sh ci-only    # pytest -m ci_only: 16-round pin builds (CI; not part of 'all')
+#
+# Tests marked @pytest.mark.ci_only are deselected by every other pytest run (pyproject addopts).
 #
 # Extra arguments after the suite name are passed through, e.g.
 #   ./scripts/test.sh rust -- test_vector_group
@@ -44,9 +47,16 @@ run_python() {
       tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
       tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
       tests/test_cpsat_lane_model.py tests/test_emission_options.py tests/test_emission_ablation.py tests/test_emission_plan.py tests/test_emission_structure.py tests/test_kernel_lift.py tests/test_scratch_time_overcount.py tests/test_static_bounds.py tests/test_window_optimality_probe.py tests/test_test_slot.py \
+      tests/test_critical_path_rewrites.py tests/test_greedy_const_choice.py \
       solver/test_slot_utilization.py
   fi
   uv run pytest -q "$@"
+}
+run_ci_only() {
+  if [ $# -eq 0 ]; then
+    set -- tests
+  fi
+  uv run pytest -q -m ci_only "$@"
 }
 run_proofs() {
   uv run python -m verification.verify -q "$@"
@@ -78,6 +88,7 @@ case "$suite" in
   proofs) run_proofs "$@" ;;
   kernel) run_kernel "$@" ;;
   upstream) run_upstream "$@" ;;
+  ci-only) run_ci_only "$@" ;;
   all) for s in rust python proofs kernel upstream; do "$(pwd)/scripts/test.sh" "$s"; done ;;
-  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | all)" >&2; exit 2 ;;
+  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | ci-only | all)" >&2; exit 2 ;;
 esac

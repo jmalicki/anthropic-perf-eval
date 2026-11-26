@@ -730,10 +730,10 @@ fn list_schedule(graph: &Graph, reversed: bool, key: &[i64]) -> Result<Times, St
 // ============================================================================
 
 /// A copy of the pipeline's schedule state that candidates are written to and checked in.
-struct Workspace {
-    ops: Vec<SsaOp>,
-    shifted_ops: HashSet<usize>,
-    shifted_lane_cycles: HashMap<usize, Vec<i32>>,
+pub(super) struct Workspace {
+    pub(super) ops: Vec<SsaOp>,
+    pub(super) shifted_ops: HashSet<usize>,
+    pub(super) shifted_lane_cycles: HashMap<usize, Vec<i32>>,
 }
 
 /// Why a candidate was dropped.
@@ -756,7 +756,7 @@ enum Rejection {
 ///
 /// # Returns
 /// The peak, or the reason the schedule does not fit.
-fn scratch_check(
+pub(super) fn scratch_check(
     work: &Workspace,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     select_fma_ops: &HashSet<usize>,

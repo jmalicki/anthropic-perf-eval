@@ -6351,23 +6351,102 @@ fn test_justify_models_alu_derived_constants() {
     assert!(err.contains("ALU-derived constant"), "{}", err);
 }
 
-/// A budget below the input's extended peak but at or above its unextended peak: every
-/// candidate is checked with the extension, so the pass cannot accept one that address
-/// assignment would place over the budget.
+/// The scratch check every candidate goes through uses the extended lifetimes. On the
+/// hand-made schedule (the derive four cycles after its producers' last other read) the peak
+/// is 2 words without the extension and 3 with it. A budget of 2 is rejected with the
+/// derivations (and would be accepted without them, which is what the check must not do); a
+/// budget of 3 is accepted. Both with and without the allocator trial.
 #[test]
 fn test_justify_alu_derive_budget_uses_extended_lifetimes() {
+    use super::justify::{scratch_check, Workspace};
+    let (mut emit, encodings) = emit_derived_constant();
+    for (i, c) in [0, 0, 5, 1, 6, 7].into_iter().enumerate() {
+        emit.ops[i].cycle = c;
+    }
+    let (ext, unext) = (allocator_peak(&emit.ops, &encodings, true), allocator_peak(&emit.ops, &encodings, false));
+    assert_eq!((unext, ext), (2, 3), "control: the extension adds one word here");
+    let derives: HashMap<usize, crate::types::AluDeriveInfo> = encodings
+        .iter()
+        .filter_map(|(id, e)| match e {
+            ConstChoiceEncoding::AluDerive(info) => Some((*id, info.clone())),
+            _ => None,
+        })
+        .collect();
+    let work = Workspace { ops: emit.ops.clone(), shifted_ops: HashSet::new(), shifted_lane_cycles: HashMap::new() };
+    for allocator in [None, Some(crate::address_assign::AddressAssignConfig::default())] {
+        let config = |budget: usize| JustifyConfig { scratch_budget: budget, allocator: allocator.clone(), ..justify_config(5) };
+        let check = |budget: usize, d: &HashMap<usize, crate::types::AluDeriveInfo>| {
+            scratch_check(&work, None, &HashSet::new(), d, &config(budget))
+        };
+        let tight = check(unext, &derives);
+        assert!(tight.is_err(), "budget {} with derivations must be rejected: {:?}", unext, tight);
+        assert!(check(unext, &HashMap::new()).is_ok(), "control: without the extension budget {} fits", unext);
+        assert_eq!(check(ext, &derives), Ok(ext), "budget {} fits exactly", ext);
+    }
+
+    // End to end: with the budget at the input's unextended peak the pass still only returns
+    // schedules that fit under address assignment's accounting.
     let (mut emit, encodings) = emit_derived_constant();
     for (i, c) in [0, 0, 5, 1, 6, 7].into_iter().enumerate() {
         emit.ops[i].cycle = c;
     }
     let (mut shifted, mut lanes) = (HashSet::new(), HashMap::new());
+    let config = JustifyConfig { scratch_budget: unext, ..justify_config(5) };
     let outcome = justify_schedule(
-        &mut emit.ops, true, &mut shifted, &mut lanes, &encodings, &HashMap::new(), None, None, &justify_config(5),
+        &mut emit.ops, true, &mut shifted, &mut lanes, &encodings, &HashMap::new(), None, None, &config,
     )
     .unwrap();
-    // Whatever was accepted fits the budget under address assignment's own accounting.
-    assert!(allocator_peak(&emit.ops, &encodings, true) <= 1536);
-    assert_eq!(outcome.peak_live_after, allocator_peak(&emit.ops, &encodings, true));
+    assert!(outcome.cycles_after < outcome.cycles_before, "{}", outcome.summary());
+    assert!(allocator_peak(&emit.ops, &encodings, true) <= unext);
+}
+
+/// 8 and 16 loaded; 24 derived as 8 + 16; `16 + 24` stored. The constant 8 is read only by
+/// the derivation (no op has it as a source), and `[c8, c16, c24, sum, store]` at cycles
+/// 0, 0, 3, 4, 5. Returns the program and the derivation.
+fn emit_constant_read_only_by_derivation() -> (SsaEmitContext, HashMap<usize, crate::types::AluDeriveInfo>) {
+    let mut emit = SsaEmitContext::new();
+    let c8 = emit.emit_const_choice(8);
+    let c16 = emit.emit_const_choice(16);
+    let c24 = emit.emit_const_choice(24);
+    let sum = emit.emit_alu(Opcode::Add, c16, c24);
+    emit.emit_store_imm(100, sum);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    for (i, c) in [0, 0, 3, 4, 5].into_iter().enumerate() {
+        emit.ops[i].cycle = c;
+    }
+    let derive = HashMap::from([(
+        emit.ops[2].id,
+        crate::types::AluDeriveInfo { left_op_id: emit.ops[0].id, right_op_id: emit.ops[1].id, opcode: Opcode::Add },
+    )]);
+    let _ = c8;
+    (emit, derive)
+}
+
+/// Review of #93: address assignment extends an AluDerive producer only if it has an
+/// interval. A producer read only by derivations still gets one (its definition), so the
+/// extension applies: the constant 8 stays live until the derive reads it at cycle 3.
+#[test]
+fn test_alu_derive_extends_a_producer_read_only_by_derivations() {
+    let (emit, derive) = emit_constant_read_only_by_derivation();
+    let c8 = emit.ops[0].dest.unwrap();
+    let plain = crate::address_assign::AddressAssignConfig::default();
+    let without = crate::address_assign::compute_live_intervals(&plain, &emit.ops).unwrap();
+    assert_eq!((without[&c8].start, without[&c8].end), (0, 1), "control: a value nothing reads lives [D, D + 1]");
+    let config = crate::address_assign::AddressAssignConfig { const_alu_derive_ops: derive, ..Default::default() };
+    let with = crate::address_assign::compute_live_intervals(&config, &emit.ops).unwrap();
+    assert_eq!((with[&c8].start, with[&c8].end), (0, 3), "live until the derive's read");
+}
+
+/// A derive whose producer is not in the scheduled ops would read an unassigned word; the
+/// debug assertion catches it instead of skipping the extension.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "has no live interval")]
+fn test_alu_derive_without_its_producer_is_asserted() {
+    let (emit, derive) = emit_constant_read_only_by_derivation();
+    let without_producer: Vec<SsaOp> = emit.ops[1..].to_vec();
+    let config = crate::address_assign::AddressAssignConfig { const_alu_derive_ops: derive, ..Default::default() };
+    let _ = crate::address_assign::compute_live_intervals(&config, &without_producer);
 }
 
 /// The greedy's own `alu-first` schedule of five derivable constants: the pass accepts it as

@@ -4,6 +4,8 @@ every other flag fixed.
 
 - `path_flow90.json` with path bits, the shaped load-tail greedy, chain-first + native-first
   and R16 (`--reassociate-gather-xor`): 1,031 -> 1,016.
+- The same with `--greedy-const-policy alu-first` (ALU-derived constants, which justification
+  now models): 1,026 -> 1,016.
 - The same with R16 + R17 final + R18 first-pass: 1,044 -> 1,012.
 - `flow90.json` (index) with R16 + R17 final + R18 first-pass: 1,047 -> 1,033.
 
@@ -31,6 +33,7 @@ SHAPED = dict(use_greedy=True, greedy_barriers="none", greedy_priority="wavefron
 PATH = dict(plan="path_flow90.json", select_bit_source="path", greedy_flow_priority="chain-first",
             greedy_alu_priority="native-first", reassociate_gather_xor=True)
 REWRITES = dict(reassociate_gather_xor=True, index_early_terms="final", select_xor_pushdown="first-pass")
+PATH_ALU_FIRST = dict(PATH, greedy_const_policy="alu-first")
 PATH_ALL = dict(PATH, **REWRITES)
 INDEX_ALL = dict(plan="flow90.json", **REWRITES)
 
@@ -39,6 +42,8 @@ INDEX_ALL = dict(plan="flow90.json", **REWRITES)
 @pytest.mark.parametrize("name,options,justify,cycles", [
     ("path R16", PATH, 0, 1031),
     ("path R16", PATH, 10, 1016),
+    ("path R16 alu-first", PATH_ALU_FIRST, 0, 1026),
+    ("path R16 alu-first", PATH_ALU_FIRST, 10, 1016),
     ("path R16+R17+R18", PATH_ALL, 0, 1044),
     ("path R16+R17+R18", PATH_ALL, 10, 1012),
     ("index R16+R17+R18", INDEX_ALL, 0, 1047),
@@ -55,6 +60,12 @@ def test_justify_on_best_cycles(name, options, justify, cycles):
             sched = json.load(f)
     instrs = json.loads(json.dumps(list(instrs)))
     assert stats["cycles"] == cycles, name
+    if justify:
+        summary = stats["greedy_justify_summary"]
+        assert summary and not summary.startswith("skipped"), summary
+    if options.get("greedy_const_policy") == "alu-first":
+        assert any(op.get("from_const_choice") is not None and op["engine"] == "alu" for op in sched["ops"]), \
+            "control: alu-first derives constants on the scalar ALU"
     assert not stats["budget_exceeded"]
     assert check({"instrs": instrs}, sched).ok
     assert validate_kernel(instrs, 10, 256, 16, 123)

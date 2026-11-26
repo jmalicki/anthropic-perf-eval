@@ -116,7 +116,7 @@ uv run tests/submission_tests.py
 
 `uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
 
-**Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, use a pytest marker (e.g. `@pytest.mark.ci_only`) and run default with `-m "not ci_only"`; document in `pyproject.toml`.
+**Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, mark the test `@pytest.mark.ci_only`: `pyproject.toml` deselects it in every pytest run (`addopts = "-m 'not ci_only'"`), and CI runs them in their own step, `./scripts/test.sh ci-only` (`pytest -m ci_only`; a later `-m` replaces the default).
 
 ### CI
 

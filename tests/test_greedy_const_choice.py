@@ -33,6 +33,7 @@ def _build(**options):
     assert validate_kernel(instrs, HEIGHT, BATCH, ROUNDS, 123)
     encodings = collections.Counter(op["engine"] for op in sched["ops"] if op.get("from_const_choice") is not None)
     n_const = sum(1 for op in sched["ssa_ops"] if op["opcode"] == "const_choice")
+    sched["_stats"] = dict(stats)
     return encodings, n_const, sched
 
 
@@ -71,3 +72,11 @@ def test_justify_with_alu_derived_constants():
                                if op.get("from_const_choice") is not None and op["engine"] == "alu")
     assert derived(plain), "control: alu-first derives a constant on the scalar ALU"
     assert derived(justified) == derived(plain)
+    # The pass ran on this input (before, it skipped any schedule with a derived constant).
+    summary = justified["_stats"]["greedy_justify_summary"]
+    assert plain["_stats"]["greedy_justify_summary"] in (None, "off")
+    assert summary and summary != "off" and not summary.startswith("skipped"), summary
+    assert "fell back" not in summary and "failed verification" not in summary, summary
+    assert justified["_stats"]["cycles"] < plain["_stats"]["cycles"], (summary, plain["_stats"]["cycles"])
+    cycles = lambda s: [op["cycle"] for op in s["ssa_ops"]]  # noqa: E731
+    assert cycles(justified) != cycles(plain)

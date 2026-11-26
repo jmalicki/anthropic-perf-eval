@@ -1664,6 +1664,7 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     stats.set_item("peak_live", result.address_result.peak_live)?;
     stats.set_item("max_addr", result.address_result.max_addr)?;
     stats.set_item("budget_exceeded", result.budget_exceeded)?;
+    stats.set_item("greedy_justify_summary", result.greedy_justify_summary.clone())?;
     stats.set_item("scratch_size", result.address_result.budget)?;
     stats.set_item("scratch_constraint", scratch_constraint)?;
     stats.set_item("relaxed_scratch", result.scratch_relaxed)?;
