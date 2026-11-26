@@ -75,6 +75,18 @@ def counts_key(rows, ctx: es.Context) -> dict[str, int]:
     return {f"{r}:{e}": v for (r, e), v in es.plan_group_counts(rows, ctx).items()}
 
 
+def scratch_budget_error(e: BaseException) -> dict | None:
+    """{"peak_live", "budget"} if `e` is the builder's typed scratch-budget failure
+    (`scheduler_rs.ScratchBudgetExceeded`, args (message, peak_live, budget)), else None. Any
+    other error, whatever its message, is not a plan outcome and is re-raised by the caller."""
+    import scheduler_rs
+
+    if not isinstance(e, scheduler_rs.ScratchBudgetExceeded):
+        return None
+    _, peak_live, budget = e.args
+    return {"peak_live": int(peak_live), "budget": int(budget)}
+
+
 def is_canonical(rows, ctx: es.Context) -> bool:
     """True if `solve_plan` emits exactly these rows for their model point."""
     return [list(r) for r in rows] == es.canonical_rows(rows, ctx)
@@ -232,6 +244,8 @@ class RowTable:
         return bad
 
     def _axis(self, values) -> list[int]:
+        if self.max_axis < 2:
+            raise ValueError(f"max_axis {self.max_axis}: needs at least 2 (the first and last values)")
         vals = sorted(set(values))
         if len(vals) <= self.max_axis:
             return vals
@@ -386,6 +400,10 @@ def schedule_summary(sched: Mapping) -> dict:
         "scheduled_floor_binds": rep["floor"]["binding"],
         "static_bound_any": (rep.get("static_bound") or {}).get("any", {}).get("bound"),
         "valu_shifted": rep["emission"]["vector_ops_shifted_to_alu"],
+        # Lowered vector ops that come from SelectChoices run as multiply_adds (none with the
+        # loop's greedy flags, which run every select as a flow vselect).
+        "select_ops_on_valu": sum(1 for o in sched.get("ops") or []
+                                  if o.get("from_select_choice") is not None and o.get("engine") == "valu"),
     }
 
 
@@ -394,13 +412,17 @@ class Stage2:
     needs in a state file so that later runs reuse the builds."""
 
     def __init__(self, table: es.CostTable, workdir: str, state_path: str | None = None, log=print,
-                 keep_files: bool = False, fingerprint: Mapping | None = None, check_scheduler: bool = True):
+                 keep_files: bool = False, greedy_extra: Mapping | None = None, fingerprint: Mapping | None = None,
+                 check_scheduler: bool = True):
         self.table = table
         self.ctx = table.context
         self.workdir = workdir
         self.state_path = state_path
         self.log = log or (lambda *a, **k: None)
         self.keep_files = keep_files
+        # Scheduler options on top of the shaped flags. Part of the state: builds made with
+        # other options are not comparable, so a state file refuses a different setting.
+        self.greedy_extra = dict(greedy_extra or {})
         # Stage-1 CP-SAT deterministic-time budget per solve (None: wall clock only).
         self.deterministic_time: float | None = None
         self.builds: dict[str, dict] = {}
@@ -415,6 +437,10 @@ class Stage2:
                 state = json.load(f)
             if es.Context(**state["context"]) != self.ctx:
                 raise ValueError(f"{state_path} is for another context")
+            if greedy_extra is not None and state.get("greedy_extra", {}) != self.greedy_extra:
+                raise ValueError(f"{state_path} was built with greedy options {state.get('greedy_extra', {})}, "
+                                 f"not {self.greedy_extra}")
+            self.greedy_extra = state.get("greedy_extra", {})
             recorded = state.get("scheduler")
             if check_scheduler and state["builds"] and recorded != self.scheduler:
                 raise ValueError(f"{state_path} holds builds from scheduler {recorded or 'unrecorded'}, not the "
@@ -427,13 +453,32 @@ class Stage2:
 
     def save(self):
         if self.state_path:
-            es.write_json_atomic(self.state_path, {"context": asdict(self.ctx), "scheduler": self.scheduler,
+            es.write_json_atomic(self.state_path, {"context": asdict(self.ctx), "greedy_extra": self.greedy_extra,
+                                                   "scheduler": self.scheduler,
                                                    "builds": self.builds, "row_table": self.rowtable.to_json(),
                                                    "trace": self.trace})
 
     def best(self) -> dict | None:
         ok = [b for b in self.builds.values() if b["valid"]]
         return min(ok, key=lambda b: (b["cycles"], b["simulator_cycles"])) if ok else None
+
+    def _failed(self, rows, name: str, key: str, error: str, peak_live: int | None = None) -> dict:
+        """Record a plan the scheduler could not build within the scratch budget
+        (`scheduler_rs.ScratchBudgetExceeded`, whose peak_live is passed in)."""
+        counts = self.table.predict(rows)
+        rec = {
+            "name": name, "plan": describe_plan(rows), "rows": [list(r) for r in rows],
+            "group_counts": counts_key(rows, self.ctx), "counts": counts,
+            "predicted_floor": es.choice_floor(counts)["cycles"], "emitted_floor": None,
+            "counts_match": None, "cycles": None, "simulator_cycles": None, "proved": False, "passed": False,
+            "valid": False, "peak_live": peak_live, "budget_exceeded": True,
+            "error": error[:2000], "summary": None, "row_violations_on_merge": [], "kernel": None,
+        }
+        self.builds[key] = rec
+        self.built_now += 1
+        self.save()
+        self.log(f"    FAILED {name}: {rec['plan']} -> floor {rec['predicted_floor']}: {error[:300]}")
+        return rec
 
     def evaluate(self, rows, name: str, row_table_for_check: RowTable | None = None) -> tuple[dict, bool]:
         """(build record, built now?). Builds, proves (dataflow replay) and validates a plan
@@ -442,8 +487,14 @@ class Stage2:
         if key in self.builds:
             return self.builds[key], False
         stem = os.path.splitext(os.path.basename(self.state_path or "loop"))[0]
-        row = es.measure(rows, self.table, self.workdir, name=f"{stem}_b{len(self.builds)}", shaped=True,
-                         upstream=False)
+        try:
+            row = es.measure(rows, self.table, self.workdir, name=f"{stem}_b{len(self.builds)}", shaped=True,
+                             upstream=False, greedy_extra=self.greedy_extra)
+        except Exception as e:  # noqa: BLE001 - only a scratch-budget failure is a plan outcome
+            budget = scratch_budget_error(e)
+            if budget is None:
+                raise
+            return self._failed(rows, name, key, f"{type(e).__name__}: {e}", peak_live=budget["peak_live"]), True
         with open(row["sched_json"]) as f:
             sched = json.load(f)
         obs = observe(rows, sched, self.ctx)
@@ -460,7 +511,8 @@ class Stage2:
             "counts_match": row["counts_match"], "cycles": row["cycles"],
             "simulator_cycles": row["simulator_cycles"], "proved": row["proved"], "passed": row["passed"],
             "valid": bool(row["counts_match"] and row["proved"] and row["passed"]),
-            "peak_live": row["peak_live"], "summary": summary,
+            "peak_live": row["peak_live"], "max_addr": row.get("max_addr"), "budget_exceeded": False,
+            "summary": summary,
             "row_violations_on_merge": violations, "kernel": row["kernel"],
             # The plan's window bound with the row table before it was merged (what a solve
             # would have used) and after; before > after means the table overestimated it.
@@ -475,7 +527,8 @@ class Stage2:
                 os.unlink(row["kernel"])
         self.save()
         self.log(f"    built {name}: {rec['plan']} -> floor {rec['predicted_floor']}, "
-                 f"{rec['cycles']} / {rec['simulator_cycles']} cycles, proved={rec['proved']} passed={rec['passed']}")
+                 f"{rec['cycles']} / {rec['simulator_cycles']} cycles, peak live {rec['peak_live']}, "
+                 f"proved={rec['proved']} passed={rec['passed']}")
         return rec, True
 
 
@@ -583,6 +636,10 @@ def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, ste
             best_rec, best_caps, tried, stale = rec, dict(caps), set(), 0
         else:
             stale += 1
+        if best_rec is None:  # nothing valid yet (e.g. the plan overflowed the scratch budget)
+            _record(stage2, mode, it, res, rec, built, f"caps {caps or 'none'}: no valid build; stop",
+                    {"caps": dict(caps)})
+            break
         use = plan_use(best_rec["counts"], capped_floor(best_rec["counts"], best_caps))
         steady = best_rec["summary"]["steady_pct"]
         candidates = pick(use, steady, tried)
@@ -654,10 +711,12 @@ def loop_rows(stage2: Stage2, budget: int, patience: int, time_limit: float, cut
         stale = 0 if improved else stale + 1
         _record(stage2, "rows", it, res, rec, built,
                 f"no-good on this plan; row table refined from it; "
-                + (f"floor < {best['cycles']}" if cut == "sound" else f"M < {best['cycles']} + overestimate")
+                + ("no valid incumbent yet, no cut" if best is None else
+                   f"floor < {best['cycles']}" if cut == "sound" else f"M < {best['cycles']} + overestimate")
                 + (" (new best)" if improved else ""),
                 {"windows": len(specs), "rows_bound": predicted["bound"], "rows_window": [predicted["t"], predicted["q"]],
-                 "violations": len(violations), "static_bound_any": rec["summary"]["static_bound_any"]})
+                 "violations": len(violations),
+                 "static_bound_any": (rec["summary"] or {}).get("static_bound_any")})
         if stale >= patience:
             break
     return best
@@ -712,13 +771,29 @@ def surrogates(stage2: Stage2, caps: Mapping[str, float] | None) -> list[dict]:
             "capped_floor_flow90": capped_floor(b["counts"], {"flow": 0.9}),
             "static_bound_any": b["summary"]["static_bound_any"],
             "rows_le_cycles": max(b["predicted_floor"], rb["bound"]) <= b["cycles"],
+            "peak_live": b.get("peak_live"), "max_addr": b.get("max_addr"),
+            # Post-build diagnostic, not a stage-1 surrogate: vector work the greedy left on the
+            # VALU (native vector ops not shifted, plus selects lowered to multiply_adds on the
+            # VALU), in VALU cycles. Builds recorded before the select count was kept have none
+            # (their greedy flags put every select on flow). Stage 1 assumes the best split.
+            "valu_after_greedy_shift": math.ceil((b["counts"]["vec_fixed"] + b["counts"]["vec_shiftable"]
+                                                  - b["summary"]["valu_shifted"]
+                                                  + b["summary"].get("select_ops_on_valu", 0)) / es.CAP["valu"]),
         })
     return out
 
 
+def failed_builds(stage2: Stage2) -> list[dict]:
+    """Plans the scheduler could not build within the scratch budget (or that failed a check)."""
+    return [{"name": b["name"], "plan": b["plan"], "floor": b["predicted_floor"], "peak_live": b.get("peak_live"),
+             "budget_exceeded": b.get("budget_exceeded"), "error": (b.get("error") or "")[:300]}
+            for b in stage2.builds.values() if not b["valid"]]
+
+
 def correlation_table(points: Sequence[Mapping], subset: str = "all") -> list[dict]:
     rows = []
-    for name in ("floor", "floor_plus_rows", "capped_floor", "capped_floor_flow90", "static_bound_any"):
+    for name in ("floor", "floor_plus_rows", "capped_floor", "capped_floor_flow90", "static_bound_any",
+                 "valu_after_greedy_shift"):
         pts = [(p[name], p["cycles"]) for p in points if p.get(name) is not None]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         rows.append({"surrogate": name, "subset": subset, "n": len(pts), "pearson": pearson(xs, ys),
@@ -762,6 +837,13 @@ def main(argv=None) -> int:
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--forest-height", type=int, default=10)
+    ap.add_argument("--select-bit-source", choices=["index", "path"], default="index")
+    ap.add_argument("--load-tail", action="store_true",
+                    help="add the load-tail greedy flags to the shaped ones: " +
+                    " ".join(f"{k}={v}" for k, v in es.LOAD_TAIL_GREEDY.items()) +
+                    " (stored in the state; a state refuses a different setting)")
+    ap.add_argument("--near", type=int, default=30,
+                    help="report: the near-optimal subset is the valid builds within this many cycles of the best")
     ap.add_argument("--table", help="cost table JSON (default: the calibrated cache of the context)")
     ap.add_argument("--state", required=True, help="state JSON: builds, row table, trace (reused across runs)")
     ap.add_argument("--workdir", help="scheduler JSONs and kernels (default: next to --state)")
@@ -787,11 +869,16 @@ def main(argv=None) -> int:
     ap.add_argument("--extra-state", action="append", default=[],
                     help="report: also count the builds (and row observations) of these state files")
     args = ap.parse_args(argv)
-    ctx = es.Context(rounds=args.rounds, batch_size=args.batch_size, forest_height=args.forest_height)
+    if args.max_axis is not None and args.max_axis < 2:
+        ap.error(f"--max-axis {args.max_axis}: needs at least 2 (the first and last head and tail values)")
+    ctx = es.Context(rounds=args.rounds, batch_size=args.batch_size, forest_height=args.forest_height,
+                     select_bit_source=args.select_bit_source)
     workdir = args.workdir or os.path.join(os.path.dirname(os.path.abspath(args.state)), "builds")
     os.makedirs(workdir, exist_ok=True)
     table = es.load_or_calibrate(ctx, args.table, workdir)
-    stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, check_scheduler=args.command == "run")
+    greedy_extra = es.LOAD_TAIL_GREEDY if args.load_tail else ({} if args.command == "run" else None)
+    stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra,
+                    check_scheduler=args.command == "run")
     stage2.deterministic_time = args.deterministic_time or None
     if args.max_axis:
         stage2.rowtable.max_axis = args.max_axis
@@ -834,8 +921,11 @@ def main(argv=None) -> int:
         stage2.state_path = None  # a merged view: never written back
     points = surrogates(stage2, caps_found)
     loop_names = [p for p in points if not p["name"].startswith("seed")]
-    corr = correlation_table(points, "all builds") + correlation_table(loop_names, "loop plans")
     best = stage2.best()
+    near = [p for p in points if best and p["cycles"] <= best["cycles"] + args.near]
+    corr = (correlation_table(points, "all builds") + correlation_table(loop_names, "loop plans")
+            + correlation_table(near, f"within {args.near} of best"))
+    failed = failed_builds(stage2)
     print(format_trace(stage2.trace))
     print()
     print(f"capped floor uses caps {caps_found}")
@@ -848,12 +938,22 @@ def main(argv=None) -> int:
     print(f"loop plans contradicting the row table learned before them: {len(viol_plans)} of {len(loop_builds)} "
           f"({sum(len(b['row_violations_on_merge']) for b in viol_plans)} class fields); "
           f"of those, the plan's own window bound was overestimated on {len(over)}")
+    print(f"greedy options on top of the shaped flags: {stage2.greedy_extra or 'none'}")
+    hist = collections.Counter(p["cycles"] for p in points)
+    print("cycles over valid plans (cycles: plans): " + ", ".join(f"{c}: {n}" for c, n in sorted(hist.items())))
+    peaks = [p["peak_live"] for p in points if p.get("peak_live") is not None]
+    if peaks:
+        print(f"peak live scratch over valid plans: {min(peaks)} to {max(peaks)} words")
+    print(f"plans that failed (scratch budget or a check): {len(failed)}")
+    for b in failed:
+        print(f"  {b['name']}: {b['plan']} (floor {b['floor']}, peak {b['peak_live']}): {b['error'][:160]}")
     if best:
         print(f"best: {best['plan']} -> {best['cycles']} / {best['simulator_cycles']} cycles "
               f"(floor {best['predicted_floor']}, kernel {best['kernel']})")
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"trace": stage2.trace, "correlations": corr, "points": points, "best": best,
+            json.dump({"context": asdict(stage2.ctx), "greedy_extra": stage2.greedy_extra, "trace": stage2.trace,
+                       "correlations": corr, "points": points, "failed": failed, "best": best,
                        "caps": caps_found}, f, indent=1)
     return 0
 
