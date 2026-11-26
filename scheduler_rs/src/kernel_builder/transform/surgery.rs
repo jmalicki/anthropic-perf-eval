@@ -192,9 +192,9 @@ pub(super) fn recompute_alternatives(ops: &[SsaOp], zero: bool, foreign: impl Fn
 
 /// Which ops dead code elimination keeps, by index.
 ///
-/// A value named in a kept op's `keep_live` is kept too (with what it reads): the emitter's
-/// dead code elimination follows `srcs` only, so on this private copy the `keep_live` entries
-/// are appended to `srcs`.
+/// A value named in a kept op's `keep_live` or `delta_vreg` is kept too (with what it reads):
+/// the emitter's dead code elimination follows `srcs` only, so on this private copy those
+/// entries are appended to `srcs`.
 fn dce_live(ops: &[SsaOp], program: &SsaProgram) -> Vec<bool> {
     let mut ops: Vec<SsaOp> = ops.to_vec();
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
@@ -202,6 +202,9 @@ fn dce_live(ops: &[SsaOp], program: &SsaProgram) -> Vec<bool> {
         op.id = i;
         if let Some(keep) = op.keep_live.clone() {
             op.srcs.extend(keep.into_iter().map(Operand::VReg));
+        }
+        if let Some(delta) = op.delta_vreg {
+            op.srcs.push(Operand::VReg(delta));
         }
         if let Some(d) = op.dest {
             vreg_def.entry(d).or_insert(i);
@@ -430,6 +433,13 @@ impl Surgery {
             if let Some(r) = keeper {
                 return Err(format!("op {} is kept live by op {} before op {}", idx, r, at));
             }
+            // A new op queued next to an original op at or before `at` that reads it (or keeps
+            // it live).
+            let queued = self.before.range(..=at).chain(self.after.range(..=at));
+            let reads_idx = |op: &SsaOp| op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| definer(v) == Some(idx));
+            if let Some((&k, _)) = queued.into_iter().find(|(_, slots)| slots.iter().any(|s| matches!(s, Slot::New(op) if reads_idx(op)))) {
+                return Err(format!("op {} is read by an op inserted next to op {} before op {}", idx, k, at));
+            }
         }
         for idx in group {
             self.moved.insert(idx, at);
@@ -468,7 +478,9 @@ impl Surgery {
 
     /// Every reader of `old` reads `new` instead.
     pub fn replace_uses(&mut self, old: VReg, new: VReg) {
-        self.rename.insert(old, new);
+        if old != new {
+            self.rename.insert(old, new);
+        }
     }
 
     /// The scalar constant `value` visible right after original op `after`: an existing
@@ -572,12 +584,20 @@ impl Surgery {
     /// value is still read.
     pub fn finish(self) -> Result<(SsaProgram, SurgeryReport), String> {
         let Surgery { program, removed, mut before, mut after, moved, rename, foreign, .. } = self;
+        // Every rename chain must end (resolve below then terminates).
+        for &start in rename.keys() {
+            let mut seen: HashSet<VReg> = HashSet::from([start]);
+            let mut v = start;
+            while let Some(&to) = rename.get(&v) {
+                if !seen.insert(to) {
+                    return Err(format!("rename cycle through {:?}", start));
+                }
+                v = to;
+            }
+        }
         let resolve = |mut v: VReg| {
-            let mut guard = 0;
             while let Some(&to) = rename.get(&v) {
                 v = to;
-                guard += 1;
-                assert!(guard < 1000, "rename cycle");
             }
             v
         };
@@ -654,7 +674,7 @@ impl Surgery {
             let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
             let dangling = |op: &SsaOp| {
-                op_reads(op).any(|v| {
+                op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| {
                     Some(v) != program.zero_vreg
                         && graph.def_index(v).is_none()
                         && graph.group_lanes(v).is_none()
