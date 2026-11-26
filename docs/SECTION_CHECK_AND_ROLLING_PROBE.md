@@ -94,9 +94,13 @@ way, and `scripts/cpsat_model_identity.py` records made before this change no lo
 feasible), but the search changes, so any documented CP-SAT result can move. At risk: the
 4-round 485 (CLAUDE.md), the CP-SAT tables of docs/CPSAT_CONFIG_ABLATION.md,
 docs/CPSAT_LANE_MODEL.md, docs/GREEDY_SHAPE_ABLATION.md (CP-SAT from each greedy start) and
-docs/4-round-phase-results.md, and the window-probe results of docs/STARTUP_WINDOW_PROBE.md
-and docs/WINDOW_OPTIMALITY_PROBE.md. Re-measured: see "Re-measured after the model change"
-below; everything else is not re-measured.
+docs/4-round-phase-results.md, the CP-SAT table of docs/RELAXED_SCRATCH_REFERENCE.md (4 rounds
+shaped 425, default 455, 16 rounds shaped 1,399, with model sizes and bounds), the solver
+timings of docs/CPSAT_FEATURE_SURVEY.md section 2 (from old logs), and the window-probe results
+of docs/STARTUP_WINDOW_PROBE.md table A (its table B already uses this model) and
+docs/WINDOW_OPTIMALITY_PROBE.md. Those numbers stay as measurements attributed to the model
+they were taken with; they are not replaced. Re-measured: see "Re-measured after the model
+change" below; everything else is not re-measured.
 
 ### Constants derived across sections
 
