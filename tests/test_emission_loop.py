@@ -299,3 +299,19 @@ def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
     assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
                      check_scheduler=False).scheduler == {"extension_sha256": "a"}
     assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
+
+
+def test_error_fingerprints_never_match(table, tmp_path):
+    """Review of #76: a fingerprint that failed is a mismatch, even against an equal failure."""
+    assert el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "a"})
+    assert not el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "b"})
+    err = {"error": "scheduler_rs not installed"}
+    assert not el.same_scheduler(err, dict(err))
+    assert not el.same_scheduler(None, {"extension_sha256": "a"})
+    state = tmp_path / "state.json"
+    stage2 = el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint=err)
+    rows = es.baseline_rows(CTX)
+    stage2.builds[el.plan_key(rows)] = _fake_build(rows)
+    stage2.save()
+    with pytest.raises(ValueError, match="not comparable"):
+        el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint=dict(err))
