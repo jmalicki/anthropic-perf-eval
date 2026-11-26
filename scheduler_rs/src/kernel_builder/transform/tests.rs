@@ -1249,8 +1249,8 @@ fn test_hash_merge_leaves_kept_live_operands_in_place() {
     assert!(fewer_moved && base.surgery.moved > 0);
 }
 
-/// One synthetic hash site: 0 vload a, 1-2 constant and broadcast M, 3-4 C, 5-6 D, 7-8 K,
-/// then the site and its stores.
+/// One synthetic hash site: 0-2 address constants (load, two stores), 3 vload a, 4-5
+/// constant and broadcast M, 6-7 C, 8-9 D, 10-11 K, then the site and its stores.
 fn one_site_program() -> crate::kernel_builder::SsaProgram {
     synthetic_hash_program(5, 1).0
 }
@@ -1259,21 +1259,21 @@ fn one_site_program() -> crate::kernel_builder::SsaProgram {
 fn test_surgery_moves_an_op_once() {
     use super::surgery::Surgery;
     let p = one_site_program();
-    let m = p.ops[1].dest.unwrap();
+    let m = p.ops[4].dest.unwrap();
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[1, 2], 7).unwrap();
-    // A second placement of op 1 is refused, and the first one stands.
-    let err = surgery.move_after(&[1], 8).unwrap_err();
+    surgery.move_after(&[4, 5], 10).unwrap();
+    // A second placement of op 4 is refused, and the first one stands.
+    let err = surgery.move_after(&[4], 11).unwrap_err();
     assert!(err.contains("already moved"), "{}", err);
     let (after, report) = surgery.finish().unwrap();
     assert_eq!(report.moved, 2);
     assert_eq!(after.ops.iter().filter(|o| o.dest == Some(m)).count(), 1);
     let at = |v| after.ops.iter().position(|o| o.dest == Some(v)).unwrap();
-    assert!(at(p.ops[7].dest.unwrap()) < at(m) && at(m) < at(p.ops[8].dest.unwrap()));
+    assert!(at(p.ops[10].dest.unwrap()) < at(m) && at(m) < at(p.ops[11].dest.unwrap()));
     // A removed op has no placement to move.
     let mut surgery = Surgery::new(p).unwrap();
-    surgery.remove(3);
-    let err = surgery.move_after(&[3], 8).unwrap_err();
+    surgery.remove(6);
+    let err = surgery.move_after(&[6], 11).unwrap_err();
     assert!(err.contains("removed"), "{}", err);
 }
 
@@ -1281,18 +1281,18 @@ fn test_surgery_moves_an_op_once() {
 fn test_surgery_reuses_a_moved_constant_only_where_it_now_is() {
     use super::surgery::{Stamp, Surgery};
     let p = one_site_program();
-    let (m, bm) = (p.ops[1].dest.unwrap(), p.ops[2].dest.unwrap());
-    let value = p.ops[1].produces_constant.unwrap();
-    let stamp = Stamp::of(&p.ops[1]);
+    let (m, bm) = (p.ops[4].dest.unwrap(), p.ops[5].dest.unwrap());
+    let value = p.ops[4].produces_constant.unwrap();
+    let stamp = Stamp::of(&p.ops[4]);
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[1, 2], 7).unwrap();
-    // Before op 7 the moved constant and broadcast are not there yet: new ones.
-    let early = surgery.constant(value, 3, &stamp);
+    surgery.move_after(&[4, 5], 10).unwrap();
+    // Before op 10 the moved constant and broadcast are not there yet: new ones.
+    let early = surgery.constant(value, 6, &stamp);
     assert_ne!(early, m);
-    assert_ne!(surgery.broadcast(m, 3, &stamp), bm);
-    // From op 7 on they are.
-    assert_eq!(surgery.constant(value, 7, &stamp), m);
-    assert_eq!(surgery.broadcast(m, 8, &stamp), bm);
+    assert_ne!(surgery.broadcast(m, 6, &stamp), bm);
+    // From op 10 on they are.
+    assert_eq!(surgery.constant(value, 10, &stamp), m);
+    assert_eq!(surgery.broadcast(m, 11, &stamp), bm);
     surgery.finish().unwrap();
 }
 
@@ -1300,17 +1300,17 @@ fn test_surgery_reuses_a_moved_constant_only_where_it_now_is() {
 fn test_surgery_does_not_move_a_kept_live_value_past_its_keeper() {
     use super::surgery::Surgery;
     let mut p = one_site_program();
-    p.ops[3].keep_live = Some(vec![p.ops[1].dest.unwrap()]);
+    p.ops[6].keep_live = Some(vec![p.ops[4].dest.unwrap()]);
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
-    assert!(err.contains("kept live by op 3"), "{}", err);
+    let err = surgery.move_after(&[4, 5], 10).unwrap_err();
+    assert!(err.contains("kept live by op 6"), "{}", err);
     // Nothing was recorded.
     let (after, report) = surgery.finish().unwrap();
     assert_eq!(report.moved, 0);
-    assert_eq!(after.ops[1].dest, p.ops[1].dest);
+    assert_eq!(after.ops[4].dest, p.ops[4].dest);
     // Past the keeper too, it may move.
     let mut surgery = Surgery::new(p).unwrap();
-    surgery.move_after(&[1, 2, 3, 4], 7).unwrap();
+    surgery.move_after(&[4, 5, 6, 7], 10).unwrap();
     surgery.finish().unwrap();
 }
 
@@ -1318,45 +1318,45 @@ fn test_surgery_does_not_move_a_kept_live_value_past_its_keeper() {
 fn test_surgery_checks_where_moved_readers_and_keepers_are() {
     use super::surgery::Surgery;
     let p = one_site_program();
-    // Op 2 (broadcast of M) reads op 1 (M). Moved after op 5, the reader is before op 7:
-    // M cannot follow op 7.
+    // Op 5 (broadcast of M) reads op 4 (M). Moved after op 8, the reader is before op 10:
+    // M cannot follow op 10.
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[2], 5).unwrap();
-    let err = surgery.move_after(&[1], 7).unwrap_err();
-    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.move_after(&[5], 8).unwrap();
+    let err = surgery.move_after(&[4], 10).unwrap_err();
+    assert!(err.contains("read by op 5"), "{}", err);
     surgery.finish().unwrap();
     // At the same anchor the reader moved first comes first: its operand cannot follow.
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[2], 7).unwrap();
-    let err = surgery.move_after(&[1], 7).unwrap_err();
-    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.move_after(&[5], 10).unwrap();
+    let err = surgery.move_after(&[4], 10).unwrap_err();
+    assert!(err.contains("read by op 5"), "{}", err);
     surgery.finish().unwrap();
-    // The other order is valid: the reader after op 7, its operand after op 5.
+    // The other order is valid: the reader after op 10, its operand after op 8.
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[2], 7).unwrap();
-    surgery.move_after(&[1], 5).unwrap();
+    surgery.move_after(&[5], 10).unwrap();
+    surgery.move_after(&[4], 8).unwrap();
     surgery.finish().unwrap();
-    // The same for an op that names M in keep_live: moved after op 5, it is before op 7.
+    // The same for an op that names M in keep_live: moved after op 8, it is before op 10.
     let mut q = clone_program(&p);
-    q.ops[3].keep_live = Some(vec![p.ops[1].dest.unwrap()]);
+    q.ops[6].keep_live = Some(vec![p.ops[4].dest.unwrap()]);
     let mut surgery = Surgery::new(q).unwrap();
-    surgery.move_after(&[3, 4], 5).unwrap();
-    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
-    assert!(err.contains("kept live by op 3"), "{}", err);
+    surgery.move_after(&[6, 7], 8).unwrap();
+    let err = surgery.move_after(&[4, 5], 10).unwrap_err();
+    assert!(err.contains("kept live by op 6"), "{}", err);
     surgery.finish().unwrap();
 }
 
 #[test]
 fn test_surgery_drops_a_moved_op_that_is_then_removed() {
     use super::surgery::{Stamp, Surgery};
-    // Move the broadcast of M after op 7, then replace it there by a new op with the same
+    // Move the broadcast of M after op 10, then replace it there by a new op with the same
     // destination: the moved copy must not be placed as well.
     let p = one_site_program();
-    let bm = p.ops[2].dest.unwrap();
+    let bm = p.ops[5].dest.unwrap();
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.move_after(&[1, 2], 7).unwrap();
-    surgery.remove(2);
-    surgery.insert_after(7, p.ops[2].clone(), &Stamp::of(&p.ops[2]));
+    surgery.move_after(&[4, 5], 10).unwrap();
+    surgery.remove(5);
+    surgery.insert_after(10, p.ops[5].clone(), &Stamp::of(&p.ops[5]));
     let (after, _) = surgery.finish().unwrap();
     assert_eq!(after.ops.iter().filter(|o| o.dest == Some(bm)).count(), 1);
 }
@@ -1429,8 +1429,8 @@ fn test_hash_merge_drops_a_dead_keeper_of_a_removed_value() {
     // An unused broadcast (already dead) names the scalar D in keep_live. The rewrite removes
     // D's last live reader, so D goes, and the dead keeper with it.
     let mut p = one_site_program();
-    let d = p.ops[5].dest.unwrap();
-    let mut op = SsaOp::new(p.ops.len(), Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(p.vreg_count)), vec![Operand::VReg(p.ops[1].dest.unwrap())]);
+    let d = p.ops[8].dest.unwrap();
+    let mut op = SsaOp::new(p.ops.len(), Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(p.vreg_count)), vec![Operand::VReg(p.ops[4].dest.unwrap())]);
     p.vreg_count += 1;
     op.keep_live = Some(vec![d]);
     p.ops.push(op);
@@ -1447,7 +1447,7 @@ fn test_hash_merge_keeps_a_value_read_by_a_select_delta() {
     // A live SelectChoice reads the broadcast of D as its delta (not in srcs). The rewrite
     // removes D's other reader (the site's add); the broadcast must stay for the select.
     let mut p = one_site_program();
-    let (a, bd) = (p.ops[0].dest.unwrap(), p.ops[6].dest.unwrap());
+    let (a, bd) = (p.ops[3].dest.unwrap(), p.ops[9].dest.unwrap());
     let sel = VReg::vector(p.vreg_count);
     p.vreg_count += 1;
     let mut op = SsaOp::new(p.ops.len(), Engine::Flow, Opcode::SelectChoice, Some(sel), vec![Operand::VReg(a), Operand::VReg(a), Operand::VReg(a)]);
@@ -1463,7 +1463,7 @@ fn test_hash_merge_keeps_a_value_read_by_a_select_delta() {
 fn test_surgery_rename_cycle_is_an_error() {
     use super::surgery::Surgery;
     let p = one_site_program();
-    let (m, c) = (p.ops[2].dest.unwrap(), p.ops[4].dest.unwrap());
+    let (m, c) = (p.ops[5].dest.unwrap(), p.ops[7].dest.unwrap());
     // An identity rename is nothing.
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
     surgery.replace_uses(m, m);
@@ -1480,15 +1480,15 @@ fn test_surgery_rename_cycle_is_an_error() {
 fn test_surgery_checks_inserted_readers_before_a_move() {
     use super::surgery::{Stamp, Surgery};
     use crate::types::{Engine, Opcode, Operand};
-    // A new op inserted before op 5 reads M (op 1): M cannot move after op 7.
+    // A new op inserted before op 8 reads M (op 4): M cannot move after op 10.
     let p = one_site_program();
-    let m = p.ops[1].dest.unwrap();
+    let m = p.ops[4].dest.unwrap();
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
     let dest = surgery.fresh(true);
     let op = SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(dest), vec![Operand::VReg(m)]);
-    surgery.insert_before(5, op, &Stamp::of(&p.ops[1]));
-    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
-    assert!(err.contains("inserted next to op 5"), "{}", err);
+    surgery.insert_before(8, op, &Stamp::of(&p.ops[4]));
+    let err = surgery.move_after(&[4, 5], 10).unwrap_err();
+    assert!(err.contains("inserted next to op 8"), "{}", err);
     surgery.finish().unwrap();
 }
 
@@ -1536,10 +1536,10 @@ fn test_hash_merge_keeps_the_xor_operand_order() {
     }
     p.ops[xor].trace_id = Some("r".into());
     // k = 3 (not 0), so that h and l have different multipliers.
-    p.ops[7].srcs[0] = crate::types::Operand::Imm(3);
-    p.ops[7].produces_constant = Some(3);
-    p.ops[8].produces_constant = Some(3);
-    let (m, k) = (p.ops[1].produces_constant.unwrap(), 3);
+    p.ops[10].srcs[0] = crate::types::Operand::Imm(3);
+    p.ops[10].produces_constant = Some(3);
+    p.ops[11].produces_constant = Some(3);
+    let (m, k) = (p.ops[4].produces_constant.unwrap(), 3);
     assert_ne!((m << k) & 0xFFFF_FFFF, m & 0xFFFF_FFFF);
     let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
     assert_eq!(report.sites, 1);
@@ -1610,11 +1610,11 @@ fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
     // A caller-built op redefining an existing VReg right before it: liveness would follow
     // the first definer and silently drop the original one.
     let p = one_site_program();
-    let m = p.ops[1].dest.unwrap();
+    let m = p.ops[4].dest.unwrap();
     let mut op = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(m), vec![Operand::Imm(9)]);
     op.produces_constant = Some(9);
     let mut surgery = Surgery::new(clone_program(&p)).unwrap();
-    surgery.insert_before(1, op, &Stamp::of(&p.ops[1]));
+    surgery.insert_before(4, op, &Stamp::of(&p.ops[4]));
     let err = surgery.finish().err().expect("a second definer is rejected");
     assert!(err.contains("defined more than once"), "{}", err);
 }

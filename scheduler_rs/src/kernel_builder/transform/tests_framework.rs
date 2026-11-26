@@ -40,16 +40,17 @@ fn test_surgery_refuses_a_vreg_count_not_above_the_ids_in_use() {
 }
 
 #[test]
-fn test_hash_merge_refuses_dropping_a_kept_live_constant() {
-    // D (stage 3's constant broadcast) dies when every site is merged; named in keep_live it
-    // may not be dropped.
+fn test_hash_merge_keeps_a_kept_live_constant_it_would_drop() {
+    // D (stage 3's constant broadcast) dies when every site is merged. Named in keep_live it
+    // is kept (the surgery's liveness counts keep_live), and the sites are still merged.
     let mut p = two_rounds();
     let d = first_hash_site(&p).operands[2];
     p.ops.last_mut().unwrap().keep_live = Some(vec![d]);
-    let before = canonical_ops(&p);
     let (after, report) = apply_hash_merge(p, &HashMergeRule::default(), |_| true).unwrap();
-    assert!(report.refused.as_deref().map_or(false, |r| r.contains("keep_live")), "{:?}", report.refused);
-    assert_eq!(canonical_ops(&after), before);
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    assert_eq!(report.sites, 64);
+    assert!(after.ops.iter().any(|o| o.dest == Some(d)), "the kept-live constant was dropped");
+    super::surgery::Surgery::check(&after).unwrap();
 }
 
 #[test]
