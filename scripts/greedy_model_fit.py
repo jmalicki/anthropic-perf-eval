@@ -4,6 +4,7 @@
     uv run python -m scripts.greedy_model_fit                 # fit, leave-one-out, rankings, out-of-sample
     uv run python -m scripts.greedy_model_fit --check         # exit 1 unless it reproduces GREEDY_MODEL
                                                               # and the numbers below
+    uv run python -m scripts.greedy_model_fit --judge stall-0.98 --check   # GREEDY_MODEL_STALL
     uv run python -m scripts.greedy_model_fit collect --state S.json [...] [--measured M.json] --out D.json
 
 The model (scripts/emission_structure.py, docs/GREEDY_SHAPE_ABLATION.md section 12.3) is
@@ -54,11 +55,19 @@ GRID = list(itertools.product(range(10, 41), range(800, 921, 5), [x / 100 for x 
 TRAIN_MAX_CYCLES = 1200
 NEAR = 30
 
-# What --check requires (docs/GREEDY_SHAPE_ABLATION.md section 12.3 quotes these).
+# Judges: the greedy configuration whose cycles the model predicts. Each build record carries
+# its judge ("default" when absent): "default" = shaped flags + LOAD_TAIL_GREEDY (the PR #74
+# loop); "stall-0.98" = that + greedy_budget_force=stall, pressure_inflation_threshold=0.98.
+JUDGES = {"default": "GREEDY_MODEL", "stall-0.98": "GREEDY_MODEL_STALL"}
+
+# What --check requires per judge (docs/GREEDY_SHAPE_ABLATION.md section 12.3 and
+# docs/STARTUP_AND_STALL_LOOP.md section A quote these); the fit must also equal the judge's
+# constants in scripts/emission_structure.py.
 EXPECTED = {
-    "train_plans": 24,
-    "fit": {"a_load": 19, "flow0": 900, "b_flow_x100": 75, "a_floor": 32},
-    "loo_mae": 6.2, "loo_max": 18,
+    "default": {"train_plans": 24, "fit": {"a_load": 19, "flow0": 900, "b_flow_x100": 75, "a_floor": 32},
+                "loo_mae": 6.2, "loo_max": 18},
+    "stall-0.98": {"train_plans": 41, "fit": {"a_load": 13, "flow0": 900, "b_flow_x100": 80, "a_floor": 52},
+                   "loo_mae": 5.6, "loo_max": 18},
 }
 
 
@@ -88,11 +97,16 @@ def as_model(th):
     return {"a_load": int(a_load), "flow0": int(flow0), "b_flow_x100": int(round(b_flow * 100)), "a_floor": int(a_floor)}
 
 
-def load(path=DATA):
+def load(path=DATA, judge="default"):
+    """The builds of one judge, with their model features."""
+    if judge not in JUDGES:
+        raise ValueError(f"judge {judge!r}; one of {sorted(JUDGES)}")
     with open(path) as f:
         data = json.load(f)
+    data["builds"] = [b for b in data["builds"] if b.get("judge", "default") == judge]
     for b in data["builds"]:
         b["features"] = features(b["counts"])
+    data["judge"] = judge
     return data
 
 
@@ -130,24 +144,36 @@ def analyse(data) -> dict:
     out["out_of_sample"] = [{"name": b["name"], "bit_source": b["bit_source"], "predicted": predict(b["features"], th),
                              "cycles": b["cycles"], "error": predict(b["features"], th) - b["cycles"]}
                             for b in builds if b["use"] == "out_of_sample"]
+    summary = {}
+    for src in ("index", "path"):
+        err = [o["error"] for o in out["out_of_sample"] if o["bit_source"] == src and o["cycles"] < TRAIN_MAX_CYCLES]
+        if err:
+            summary[src] = {"n": len(err), "mae": round(float(np.mean(np.abs(err))), 1),
+                            "mean_error": round(float(np.mean(err)), 1)}
+    out["out_of_sample_summary"] = summary  # plans under TRAIN_MAX_CYCLES
+    out["judge"] = data.get("judge", "default")
     return out
 
 
 def check(res) -> list[str]:
+    judge = res.get("judge", "default")
     bad = []
-    for k, v in EXPECTED.items():
+    for k, v in EXPECTED[judge].items():
         if res[k] != v:
             bad.append(f"{k}: computed {res[k]}, expected {v}")
-    gm = {k: es.GREEDY_MODEL[k] for k in ("a_load", "flow0", "b_flow_x100", "a_floor")}
+    name = JUDGES[judge]
+    gm = {k: getattr(es, name)[k] for k in ("a_load", "flow0", "b_flow_x100", "a_floor")}
     if res["fit"] != gm:
-        bad.append(f"fit {res['fit']} != es.GREEDY_MODEL {gm}")
+        bad.append(f"fit {res['fit']} != es.{name} {gm}")
     return bad
 
 
 def report(res):
     f = lambda v: "-" if v is None else f"{v:+.2f}"  # noqa: E731
+    name = JUDGES[res.get("judge", "default")]
+    print(f"judge: {res.get('judge', 'default')}")
     print(f"training plans: {res['train_plans']} (index-bit loop builds under {TRAIN_MAX_CYCLES} cycles)")
-    print(f"fit: {res['fit']}  (es.GREEDY_MODEL {es.GREEDY_MODEL})")
+    print(f"fit: {res['fit']}  (es.{name} {getattr(es, name)})")
     ls = res["loo_spearman"]
     print(f"leave-one-out (constants refitted per plan; the form was chosen on these plans): MAE {res['loo_mae']}, "
           f"max {res['loo_max']}; Spearman all({ls['n_all']}) {f(ls['all'])}, near({ls['n_near']}) {f(ls['near'])}")
@@ -155,14 +181,28 @@ def report(res):
         print(f"in-sample {src}: all({r['n_all']}) Spearman {f(r['spearman_all'])} Pearson {f(r['pearson_all'])}; "
               f"loop plans({r['n_loop']}) Spearman {f(r['spearman_loop'])}; "
               f"near({r['n_near']}, selected on cycles) Spearman {f(r['spearman_near'])}")
-    print("out of sample (plans stage 1 chose with the model, built afterwards):")
+    print("out of sample (plans built after the fit: default judge, stage 1 chose them with the model; "
+          "stall-0.98, the top-k rerun):")
     for o in res["out_of_sample"]:
         print(f"  {o['name']} ({o['bit_source']}): predicted {o['predicted']:.0f}, ran {o['cycles']} "
               f"(error {o['error']:+.0f})")
+    for src, s in res.get("out_of_sample_summary", {}).items():
+        print(f"out of sample {src}, under {TRAIN_MAX_CYCLES} cycles: {s['n']} plans, MAE {s['mae']}, "
+              f"mean error {s['mean_error']:+}")
 
 
-def collect(states, measured, out):
-    """Dataset from loop state files (use "loop") and measured plans (use "out_of_sample")."""
+NOTE = ("Builds behind es.GREEDY_MODEL (judge 'default') and es.GREEDY_MODEL_STALL (judge 'stall-0.98') "
+        "(scripts/greedy_model_fit.py). 16 rounds, batch 256, --merge-hash-stages --index-form mirrored, shaped "
+        "greedy + LOAD_TAIL_GREEDY (stall-0.98: + greedy_budget_force=stall, pressure_inflation_threshold=0.98); "
+        "greedy development measurements, every build PROVED and PASSED.")
+
+
+def collect(states, measured, out, judge="default"):
+    """Records for one judge from loop state files (use "loop") and measured plans (use
+    "out_of_sample"), written into `out`: records of other judges already there are kept,
+    those of this judge are replaced."""
+    if judge not in JUDGES:
+        raise ValueError(f"judge {judge!r}; one of {sorted(JUDGES)}")
     builds, seen = [], set()
     for path in states:
         with open(path) as f:
@@ -175,15 +215,16 @@ def collect(states, measured, out):
             builds.append({"name": b["name"], "use": "loop", "bit_source": ctx.select_bit_source,
                            "source": os.path.basename(path), "plan": b["plan"], "rows": b["rows"],
                            "counts": b["counts"], "cycles": b["cycles"], "simulator_cycles": b["simulator_cycles"],
-                           "greedy_extra": st.get("greedy_extra")})
+                           "greedy_extra": st.get("greedy_extra"), "judge": judge})
     for path in measured:
         with open(path) as f:
             for m in json.load(f):
-                builds.append(dict(m, use="out_of_sample"))
+                builds.append(dict(m, use="out_of_sample", judge=judge))
+    if os.path.exists(out):
+        with open(out) as f:
+            builds = [b for b in json.load(f)["builds"] if b.get("judge", "default") != judge] + builds
     es.write_json_atomic(out, {
-        "note": "Builds behind es.GREEDY_MODEL (scripts/greedy_model_fit.py). 16 rounds, batch 256, "
-                "--merge-hash-stages --index-form mirrored, shaped greedy + LOAD_TAIL_GREEDY; greedy development "
-                "measurements, every build PROVED and PASSED.",
+        "note": NOTE,
         "builds": builds})
     print(f"{len(builds)} builds written to {out}")
 
@@ -193,6 +234,8 @@ def main(argv=None) -> int:
     ap.add_argument("command", nargs="?", default="fit", choices=["fit", "collect"])
     ap.add_argument("--data", default=DATA)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--judge", default="default", choices=sorted(JUDGES),
+                    help="which judge's records to fit (collect: which judge to tag them with)")
     ap.add_argument("--json", help="fit: also write the results here")
     ap.add_argument("--state", action="append", default=[], help="collect: loop state files")
     ap.add_argument("--measured", action="append", default=[], help="collect: JSON lists of out-of-sample builds")
@@ -200,10 +243,11 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.command == "collect":
         if not args.out:
-            ap.error("collect needs --out (it does not merge into --data, so it never writes there)")
-        collect(args.state, args.measured, args.out)
+            ap.error("collect needs --out (it rewrites this judge's records in that file, so the "
+                     "checked-in dataset is only written when named)")
+        collect(args.state, args.measured, args.out, judge=args.judge)
         return 0
-    res = analyse(load(args.data))
+    res = analyse(load(args.data, args.judge))
     report(res)
     if args.json:
         with open(args.json, "w") as f:

@@ -61,7 +61,7 @@ from scripts import emission_structure as es  # noqa: E402
 from solver.emission_plan import describe_plan, expand_plan, load_plan  # noqa: E402
 
 CAPPABLE = ("load", "flow", "valu")
-MODES = ("nogood", "caps", "caps-underfilled", "rows")
+MODES = ("nogood", "caps", "caps-underfilled", "rows", "topk-floor", "topk-greedy-model")
 DEFAULT_SEEDS = ("gather", "bits+depth4", "bits-flow+depth4", "mobius+depth4",
                  "docs/emission_plans/floor_optimal.json", "docs/emission_plans/flow90.json")
 
@@ -517,7 +517,8 @@ class Stage2:
             "counts_match": row["counts_match"], "cycles": row["cycles"],
             "simulator_cycles": row["simulator_cycles"], "proved": row["proved"], "passed": row["passed"],
             "valid": bool(row["counts_match"] and row["proved"] and row["passed"]),
-            "peak_live": row["peak_live"], "max_addr": row.get("max_addr"), "budget_exceeded": False,
+            "peak_live": row["peak_live"], "max_addr": row.get("max_addr"),
+            "budget_exceeded": row["budget_exceeded"],
             "summary": summary,
             "row_violations_on_merge": violations, "kernel": row["kernel"],
             # The plan's window bound with the row table before it was merged (what a solve
@@ -602,6 +603,121 @@ def loop_nogood(stage2: Stage2, budget: int, patience: int, time_limit: float,
         if stale >= patience:
             break
     return best
+
+
+def loop_topk(stage2: Stage2, k: int, time_limit: float, objective: str, per_level: int = 1,
+              retries: int = 20) -> dict:
+    """Plain selection by a stage-1 score: build plans in order of increasing score and judge
+    each with the greedy. `objective` "floor" (the capacity floor, a bound) or
+    "greedy-model" (GREEDY_MODEL, a fitted heuristic).
+
+    The score has large tie plateaus (many plans share the optimum), so "the k best plans"
+    is not well defined: this enumerates **score levels**. For level L (starting at the
+    lowest score among unbuilt plans) it asks the solver for an unbuilt plan with score <= L
+    and objective >= L, computes the plan's own score (`plan_score`: the objective variable
+    is only an upper relaxation of it) and builds it if it is exactly L; a plan below L is
+    excluded and the solve repeated (at most `retries` times, then the level is skipped).
+    After `per_level` plans, or when no unbuilt plan scores at most L, it moves to L + 1.
+    Each record carries its score and level index (1 = the first level of this run).
+    No-goods are per model point (`plan_model_key`: the per-(round, encoding) group counts):
+    plans that differ only in which groups use an encoding are one plan here. The run ends "exhausted"
+    only when no level was skipped; otherwise its last record is "incomplete" and lists the
+    skipped levels (`exhausted`, `skipped_levels`, `rejected_unbuilt` in the record). Solves use the
+    loop's deterministic-time budget. No incumbent bound, no patience stop: all k builds are
+    made."""
+    if objective not in ("floor", "greedy-model"):
+        raise ValueError(f"topk objective {objective!r}")
+    if per_level < 1:
+        raise ValueError("per_level must be at least 1")
+    mode = f"topk-{objective}"
+    gm = {} if objective == "greedy-model" else None
+    best = stage2.best()
+    # Plans that came up below the level being enumerated: excluded for the rest of the run and
+    # never built (their level was already full, or was skipped).
+    rejected: list = []
+    # Levels given up after `retries` tries: plans of exactly that score may remain unbuilt.
+    skipped: list = []
+    level, levels_seen, at_level, builds, it = None, 0, 0, 0, 0
+    while builds < k:
+        if level is None:
+            res = solve(stage2, nogoods=_built_nogoods(stage2), time_limit=time_limit, greedy_model=gm,
+                        tie_break=False)
+            if res["status"] == "infeasible":
+                _record(stage2, mode, it, res, None, False, "exhausted: no unbuilt plan")
+                break
+            level = es.plan_score(stage2.table, res["rows"], objective)
+        else:
+            res = None
+            for _ in range(retries + 1):
+                res = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                            greedy_model=gm, tie_break=False, incumbent=level + 1, min_objective=level)
+                if res["status"] == "infeasible" or es.plan_score(stage2.table, res["rows"], objective) == level:
+                    break
+                rejected.append(es.plan_model_key(res["rows"], stage2.ctx))
+            else:
+                res = {"status": "skipped"}
+                skipped.append(level)
+            if res["status"] != "optimal" and res["status"] != "feasible":
+                _record(stage2, mode, it, res, None, False,
+                        f"level {level}: " + ("no unbuilt plan" if res["status"] == "infeasible"
+                                              else f"no plan of exactly this score in {retries} tries"))
+                at_level, it = 0, it + 1
+                if res["status"] == "infeasible":
+                    # No remaining (unbuilt, not rejected) plan scores <= level: the objective
+                    # can always be raised to meet min_objective. The lowest score left is the
+                    # next non-empty level; none left means the enumeration is done (before,
+                    # this stepped level + 1 with one solve each, up to 10^6).
+                    nxt = solve(stage2, nogoods=_built_nogoods(stage2) + rejected, time_limit=time_limit,
+                                greedy_model=gm, tie_break=False)
+                    if nxt["status"] == "infeasible":
+                        end = {"exhausted": not skipped, "skipped_levels": list(skipped),
+                               "rejected_unbuilt": len(rejected)}
+                        if skipped:
+                            msg = (f"incomplete: no plan left outside the built and rejected ones, but levels "
+                                   f"{skipped} were skipped after {retries} tries, so plans of those scores "
+                                   f"may remain unbuilt; {len(rejected)} rejected plans were never built")
+                        else:
+                            msg = (f"exhausted: no unbuilt plan left; {len(rejected)} plans rejected at a "
+                                   "level above their own (their level already had per_level builds) were not built")
+                        _record(stage2, mode, it, nxt, None, False, msg, extra=end)
+                        break
+                    level = max(level + 1, es.plan_score(stage2.table, nxt["rows"], objective))
+                else:
+                    level += 1
+                if level > 10 ** 6:
+                    break
+                continue
+        if at_level == 0:
+            levels_seen += 1
+        at_level += 1
+        rec, built = stage2.evaluate(res["rows"], f"{mode}{it}")
+        builds += 1
+        improved = rec["valid"] and (best is None or rec["cycles"] < best["cycles"])
+        best = rec if improved else best
+        _record(stage2, mode, it, res, rec, built,
+                f"score {level} ({objective}), level {levels_seen} of this run, plan {at_level} at that level"
+                + (" (new best)" if improved else ""),
+                extra={"score": level, "level": levels_seen, "at_level": at_level})
+        it += 1
+        if at_level >= per_level:
+            level, at_level = level + 1, 0
+    return best
+
+
+def topk_summary(stage2: Stage2, objective: str, limit: int = 200) -> dict:
+    """Where the greedy's best known plan sits in the score order: its score, and how many
+    plans (distinct group counts) score at most that, counted up to `limit`."""
+    best = stage2.best()
+    if best is None:
+        return {}
+    score = es.plan_score(stage2.table, best["rows"], objective)
+    counted = es.count_plans_at_most_isolated(stage2.table, score=score, objective=objective, limit=limit,
+                                              deterministic_time=stage2.deterministic_time or 5.0)
+    built = [b for b in stage2.builds.values() if b["valid"]]
+    scores = sorted(es.plan_score(stage2.table, b["rows"], objective) for b in built)
+    return {"objective": objective, "best_plan": best["plan"], "best_cycles": best["cycles"],
+            "best_score": score, "plans_at_or_below_score": counted["count"],
+            "count_complete": counted["complete"], "lowest_score_built": scores[0] if scores else None}
 
 
 def loop_caps(stage2: Stage2, budget: int, patience: int, time_limit: float, step: float = 0.04,
@@ -839,6 +955,85 @@ def resolve_plan(spec: str, ctx: es.Context):
     return os.path.basename(spec), expand_plan(load_plan(path), ctx.rounds, ctx.n_groups, ctx.forest_height)
 
 
+def parse_greedy_options(specs: Sequence[str]) -> dict:
+    """KEY=VALUE strings to build options: ints, floats and true/false are converted."""
+    out = {}
+    for spec in specs:
+        key, sep, value = spec.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--greedy-option {spec!r}: expected KEY=VALUE")
+        if value.lower() in ("true", "false"):
+            out[key] = value.lower() == "true"
+            continue
+        for conv in (int, float):
+            try:
+                out[key] = conv(value)
+                break
+            except ValueError:
+                pass
+        else:
+            out[key] = value
+    return out
+
+
+# Options the loop's context or pipeline fixes: a --greedy-option may not change them.
+LOOP_FIXED_OPTIONS = frozenset({"use_greedy", "rounds", "batch_size", "forest_height", "n_nodes", "emission_plan",
+                                "output_json", "cached_select", "tree_reduce_max_depth", "depth4_select_rounds"})
+
+
+def build_option_names() -> frozenset:
+    """Every option name `kernel_build_args.args_to_build_kwargs` reads (the build accepts
+    nothing else; an unread name is silently ignored there)."""
+    from kernel_build_args import args_to_build_kwargs
+
+    names = set()
+
+    class _Recorder:
+        def __getattr__(self, name):
+            names.add(name)
+            raise AttributeError(name)  # getattr(args, name, default) then uses the default
+
+    args_to_build_kwargs(_Recorder(), use_git_sha=False)
+    return frozenset(names)
+
+
+# Build options that change a greedy-only build's schedule, besides every greedy_* and
+# pressure_* option. Not allowed: CP-SAT-only options (cpsat_*, force_zero_gap,
+# per_section_optimize_secs, asap_alap_tightening, ...: no effect under --use-greedy), emission
+# options (they change the op counts the loop's cost table predicts), output and diagnostic
+# options, and the relaxed-scratch analysis switches. --const-choice / --select-choice /
+# --valu-shift take effect under the greedy since #86.
+GREEDY_BUILD_OPTIONS = frozenset({
+    "scheduling_pressure_policy", "scratch_model", "enable_valu_shift", "hint_passes",
+    "const_choice", "select_choice", "valu_shift",
+    "enable_const_choice_hint_pass", "enable_select_choice_hint_pass", "enable_valu_shift_hint_pass",
+    "enable_schedule_with_fixed_choices",
+})
+
+
+def affects_greedy_build(name: str) -> bool:
+    return name.startswith(("greedy_", "pressure_")) or name in GREEDY_BUILD_OPTIONS
+
+
+def validate_greedy_options(options: Mapping, ctx: es.Context) -> None:
+    """Reject --greedy-option keys the build would ignore (a typo, or an option that does
+    nothing in a greedy build, would otherwise build with the default judge while the state
+    records the option) and keys the loop fixes."""
+    known = build_option_names()
+    fixed = LOOP_FIXED_OPTIONS | set(ctx.build_options())
+    unknown = sorted(k for k in options if k not in known)
+    clashing = sorted(k for k in options if k in fixed)
+    no_effect = sorted(k for k in options if k in known and k not in fixed and not affects_greedy_build(k))
+    if unknown:
+        raise ValueError(f"--greedy-option: unknown build option(s) {unknown}; the build reads "
+                         f"{len(known)} names, e.g. greedy_budget_force, pressure_inflation_threshold")
+    if clashing:
+        raise ValueError(f"--greedy-option: {clashing} are fixed by the loop's context or pipeline")
+    if no_effect:
+        raise ValueError(f"--greedy-option: {no_effect} do not affect a greedy build (CP-SAT-only, emission or "
+                         f"output options); allowed: greedy_*, pressure_*, {', '.join(sorted(GREEDY_BUILD_OPTIONS))}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="emission_structure loop", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -851,6 +1046,14 @@ def main(argv=None) -> int:
                     help="add the load-tail greedy flags to the shaped ones: " +
                     " ".join(f"{k}={v}" for k, v in es.LOAD_TAIL_GREEDY.items()) +
                     " (stored in the state; a state refuses a different setting)")
+    ap.add_argument("--per-level", type=int, default=1,
+                    help="topk modes: plans built per score level before moving to the next level")
+    ap.add_argument("--count-limit", type=int, default=200,
+                    help="topk modes: count plans at or below the best plan's score up to this many")
+    ap.add_argument("--greedy-option", action="append", default=[], metavar="KEY=VALUE",
+                    help="greedy build option on top of the shaped (and load-tail) flags, e.g. "
+                         "greedy_budget_force=stall or pressure_inflation_threshold=0.98 (stored in the "
+                         "state like --load-tail)")
     ap.add_argument("--near", type=int, default=30,
                     help="report: the near-optimal subset is the valid builds within this many cycles of the best")
     ap.add_argument("--table", help="cost table JSON (default: the calibrated cache of the context)")
@@ -885,7 +1088,12 @@ def main(argv=None) -> int:
     workdir = args.workdir or os.path.join(os.path.dirname(os.path.abspath(args.state)), "builds")
     os.makedirs(workdir, exist_ok=True)
     table = es.load_or_calibrate(ctx, args.table, workdir)
-    greedy_extra = es.LOAD_TAIL_GREEDY if args.load_tail else ({} if args.command == "run" else None)
+    greedy_extra = dict(es.LOAD_TAIL_GREEDY) if args.load_tail else ({} if args.command == "run" else None)
+    if args.greedy_option:
+        extra_options = parse_greedy_options(args.greedy_option)
+        validate_greedy_options(extra_options, ctx)
+        greedy_extra = dict(greedy_extra or {})
+        greedy_extra.update(extra_options)
     stage2 = Stage2(table, workdir, args.state, keep_files=args.keep_files, greedy_extra=greedy_extra,
                     check_scheduler=args.command == "run")
     stage2.deterministic_time = args.deterministic_time or None
@@ -914,6 +1122,17 @@ def main(argv=None) -> int:
             elif m in ("caps", "caps-underfilled"):
                 rule = "saturated" if m == "caps" else "underfilled"
                 caps_found = loop_caps(stage2, n_iter, args.patience, args.time_limit, rule=rule, mode=m)["caps"]
+            elif m.startswith("topk-"):
+                obj = m[len("topk-"):]
+                loop_topk(stage2, n_iter, args.time_limit, obj, per_level=args.per_level)
+                summary = topk_summary(stage2, obj, limit=args.count_limit)
+                stage2.trace.append({"mode": m, "iter": "summary", "built": False, "summary": summary,
+                                     "feedback": "best known plan: score {best_score}, {plans_at_or_below_score}{plus} "
+                                                 "plans at or below it".format(
+                                                     plus="" if summary.get("count_complete") else "+", **summary)
+                                     if summary else "no valid build"})
+                stage2.save()
+                print(f"  {m} summary: {summary}")
             else:
                 loop_rows(stage2, n_iter, args.patience, args.time_limit, cut=args.rows_cut)
         print(f"{stage2.built_now} plans built in this run, {len(stage2.builds)} in the state")
