@@ -1,9 +1,9 @@
 //! The rule interface: propose candidate sites, match them structurally, name alternatives.
 //!
 //! A rule has three parts:
-//! * `propose`: where to look. Today proposals come from emitter region tags
-//!   (`SsaOp::region`); a future analysis may propose sites in untagged SSA (e.g. a lifted
-//!   kernel). A proposal carries no meaning: it is a list of ops and the labels the tag
+//! * `propose`: where to look. Proposals come from emitter region tags (`SsaOp::region`,
+//!   tree access) or from the ops alone (every candidate anchor op, hash merge), which also
+//!   works on untagged SSA such as a lifted kernel. A proposal carries no meaning: it is a list of ops and the labels the tag
 //!   claimed.
 //! * `match_site`: verify the shape from the ops' definitions and bind everything the
 //!   replacement builders need (inputs, outputs, the ops of the site). A wrong proposal is
@@ -52,8 +52,8 @@ pub struct Fact {
 /// A place to look for a site: the ops a region tag groups and the labels it claims.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
-    /// Region id of the tag that proposed it.
-    pub region_id: u32,
+    /// Region id of the tag that proposed it; `None` for a proposal found from the ops alone.
+    pub region_id: Option<u32>,
     /// Claimed round.
     pub round: Option<u32>,
     /// Claimed group.
