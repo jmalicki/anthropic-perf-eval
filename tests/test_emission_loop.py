@@ -451,3 +451,40 @@ def test_valu_diagnostic_counts_selects_on_the_valu(table):
     with_selects = dict(base, summary=dict(base["summary"], select_ops_on_valu=6 * 7))
     stage2.builds = {"a": with_selects}
     assert el.surrogates(stage2, None)[0]["valu_after_greedy_shift"] == -(-(native + 42) // es.CAP["valu"])
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #76)
+# ----------------------------------------------------------------------------
+def _failing_stage2(table, tmp_path, monkeypatch):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    monkeypatch.setattr(el, "solve", lambda *a, **k: {"status": "optimal", "rows": rows, "solves": []})
+    monkeypatch.setattr(stage2, "evaluate", lambda r, name, *a, **k: (
+        stage2._failed(r, name, el.plan_key(r), "ScratchBudgetExceeded: test", peak_live=1600), True))
+    return stage2
+
+
+def test_nogood_loop_survives_failed_builds_without_incumbent(table, tmp_path, monkeypatch):
+    """Every candidate fails the scratch budget and there is no valid incumbent: the no-good
+    loop records them and goes on (before, its feedback read best['cycles'] from None)."""
+    stage2 = _failing_stage2(table, tmp_path, monkeypatch)
+    assert el.loop_nogood(stage2, 2, 5, 1.0) is None
+    entries = [e for e in stage2.trace if e["mode"] == "nogood"]
+    assert len(entries) == 2 and all("no valid incumbent" in e["feedback"] for e in entries)
+
+
+def test_report_refuses_extra_state_with_other_greedy_options(table, tmp_path):
+    rows = es.baseline_rows(CTX)
+    paths = []
+    for name, extra in (("a.json", {"greedy_load_priority": "final-last"}), ("b.json", {})):
+        st = el.Stage2(table, str(tmp_path), str(tmp_path / name), log=None, greedy_extra=extra,
+                       fingerprint={"extension_sha256": "x"})
+        st.builds[el.plan_key(rows)] = dict(_fake_build(rows), counts=table.predict(rows))
+        st.save()
+        paths.append(str(tmp_path / name))
+    table_path = tmp_path / "table.json"
+    table_path.write_text(json.dumps(table.to_json()))
+    with pytest.raises(SystemExit):
+        el.main(["report", "--batch-size", "32", "--state", paths[0], "--extra-state", paths[1],
+                 "--table", str(table_path)])
