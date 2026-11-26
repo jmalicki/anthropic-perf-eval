@@ -34,7 +34,7 @@ pub mod wavefront;
 pub use wavefront::EarlyStagger;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::kernel_builder::memory_deps::{check_memory_edges, memory_predecessors, memory_successors};
 
@@ -91,6 +91,39 @@ pub struct GreedyShape {
     /// When an op the scratch budget check deferred is forced past the budget (see
     /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
     pub budget_force: BudgetForce,
+    /// Ids of ops that must run shifted (8 scalar ALU ops, never a vector slot): the
+    /// individually forced shifts of a what-if run, which the CP-SAT model fixes to 1. Not a
+    /// shape switch, but it travels with them to every scheduling run. Only shiftable vector
+    /// ops count, and only when the scheduler decides shifts itself (shifting enabled, no
+    /// `fixed_shifted_ops`); see [`must_shift`]. Empty (the default) changes nothing.
+    pub forced_shift_ops: BTreeSet<usize>,
+}
+
+/// Whether `op` must be placed shifted because its shift is individually forced.
+///
+/// This mirrors the CP-SAT model, which fixes the shift literal of an op in the forced set
+/// only if the op is shiftable and the shift mode is `optimize`: with shifting disabled or a
+/// complete fixed encoding (`fixed_shifted_ops`, i.e. `--valu-shift alu|valu` or the
+/// fixed-choices pass) the forced set is not consulted.
+///
+/// # Arguments
+/// * `op` - The op about to be placed
+/// * `shape` - Carries the forced set
+/// * `enable_valu_shift` - Whether shifting is enabled for this run
+/// * `fixed_shifted_ops` - The complete fixed shift encoding, if any
+///
+/// # Returns
+/// `true` if every scheduling path must give the op 8 scalar slots and record it as shifted.
+fn must_shift(
+    op: &SsaOp,
+    shape: &GreedyShape,
+    enable_valu_shift: bool,
+    fixed_shifted_ops: Option<&HashSet<usize>>,
+) -> bool {
+    enable_valu_shift
+        && fixed_shifted_ops.is_none()
+        && shape.forced_shift_ops.contains(&op.id)
+        && can_ssa_valu_shift_to_alu(op)
 }
 
 /// Scratch model `words`: when the greedy forces an op that the budget check deferred.
@@ -102,7 +135,7 @@ pub struct GreedyShape {
 /// any run that reaches the budget overshoots it (address assignment then rejects the
 /// kernel). The pressure policy's inflation and shift suppression are what keep a default
 /// run below the budget, which is why passing runs stop short of it.
-/// `Stall` forces only in a cycle where nothing else was placed (the greedy is stuck), as the
+/// `Stall` forces only in a cycle where nothing else was placed (see [`BudgetForce::Stall`]), as the
 /// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
 /// in this one may have freed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1041,14 +1074,25 @@ fn release_read_values(
 ) {
     let delta_read = trace.delta_readers.contains(&op.id);
     let fma = trace.fma_selects.contains(&op.id);
+    // What a multiply_add select reads at cycle + 1: its sources, its delta and their group
+    // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
+    // address assignment counts it (`use_cycles`).
+    let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
-        // A vselect does not read the delta: no read, only one holder fewer.
-        if !(delta_read && !fma && op.delta_vreg == Some(*vreg)) {
-            let end = cycle as i32 + i32::from(fma);
+        // A vselect does not read the delta: no read, only one holder fewer. Unless the
+        // same VReg is also a direct source or keep-live read of the select (e.g. the
+        // condition is the delta), which the vselect does read at this cycle.
+        let delta_only = delta_read
+            && !fma
+            && op.delta_vreg == Some(*vreg)
+            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
+            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        if !delta_only {
+            let end = cycle as i32 + i32::from(fma && fma_reads.contains(vreg));
             let e = trace.read_end.entry(*vreg).or_insert(end);
             *e = (*e).max(end);
         }
@@ -1095,6 +1139,17 @@ fn release_read_values(
 /// the select's form only when it places it, so a select that may take the multiply_add form
 /// holds its delta until then (released early again if it takes the vselect form, see
 /// [`release_read_values`]). May contain duplicates.
+/// What a select in the multiply_add form reads at cycle + 1: its operands, its delta and their
+/// vector-group aliases. Its `keep_live` values are not among them (held through its own cycle).
+fn multiply_add_reads(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> HashSet<VReg> {
+    op.srcs
+        .iter()
+        .filter_map(|s| s.as_vreg())
+        .chain(op.delta_vreg)
+        .flat_map(|v| std::iter::once(v).chain(liveness_aliases.get(&v).into_iter().flatten().copied()))
+        .collect()
+}
+
 fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
@@ -1721,7 +1776,15 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &words_shape,
         shifted_lane_cycles,
     )?;
-    let fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    // Every select the run lowered as a multiply_add: the caller's set (overflow placements)
+    // and the selects forced to that form, which the caller only adds after the call returns.
+    // The local copy leaves the caller's set to the caller.
+    let mut fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    if let Some(fixed) = fixed_select_choice_encoding {
+        fma_now.extend(
+            fixed.iter().filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma)).map(|(id, _)| *id),
+        );
+    }
     let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now, &diagnostics.const_alu_derive)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
@@ -2562,6 +2625,12 @@ fn schedule_ssa_greedy_core(
         // Try to schedule ready ops with retry for budget-constrained ops.
         // When an op frees VRegs, previously budget-failed ops may now fit.
         let mut budget_deferred: Vec<usize> = Vec::new();
+        // SCHEDULER_DEADLOCK_DUMP only: why each op in `budget_deferred` was last deferred this
+        // cycle ("budget": the hard check; "pressure": the policy's soft deferral), and the ops
+        // ASAP inflation deferred this cycle. Not read by the scheduler.
+        let dump_enabled = deadlock_dump_path.is_some() && !deadlock_dumped;
+        let mut deferral_reason: HashMap<usize, &'static str> = HashMap::new();
+        let mut inflation_deferred_ids: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
         // A split shift started this cycle: its destination block is reserved and scalar
@@ -2869,6 +2938,9 @@ fn schedule_ssa_greedy_core(
                             if inflated > cycle as i32 {
                                 deferred_by_bounds.push((inflated, idx));
                                 inflation_deferred_count += 1;
+                                if dump_enabled {
+                                    inflation_deferred_ids.push(idx);
+                                }
                                 inflation_stats.total_deferred += 1;
                                 inflation_stats.total_inflation_cycles += inflation as i64;
                                 if inflation > inflation_stats.max_inflation {
@@ -3046,7 +3118,11 @@ fn schedule_ssa_greedy_core(
                         && engine == Engine::Valu
                         && can_ssa_valu_shift_to_alu(&ops[idx])
                 };
-                let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
+                // An individually forced shift is placed like a fixed one: 8 scalar slots or
+                // not at all in this cycle, whatever the pressure policy says about shifting.
+                let forced_shift = must_shift(&ops[idx], shape, enable_valu_shift, fixed_shifted_ops);
+                let must_place_shifted =
+                    fixed_shifted_ops.map_or(false, |s| s.contains(&op_id)) || forced_shift;
 
                 // Proactive shift (shift policy other than `when-full`): run this op on the
                 // scalar ALU although a vector slot is free.
@@ -3158,19 +3234,28 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                // A select taking the multiply_add form holds what it reads to cycle + 1.
-                let holds_reads = engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice;
+                // A select taking the multiply_add form holds what the multiply_add reads to
+                // cycle + 1; a keep_live-only value is released at this cycle, as in the release loop.
+                let held_to_next: HashSet<VReg> =
+                    if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice {
+                        multiply_add_reads(&ops[idx], &liveness_aliases)
+                    } else {
+                        HashSet::new()
+                    };
                 let freed: Vec<VReg> = liveness_release_vregs(
                     &ops[idx],
                     &liveness_aliases,
                     trace.delta_readers.contains(&op_id),
                 )
                     .into_iter()
-                    .filter(|_| !holds_reads)
+                    .filter(|vreg| !held_to_next.contains(vreg))
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
                             && write_groups.releasable_at(vreg, cycle)
+                            // A multiply_add select read it this cycle: the release loop holds
+                            // it to cycle + 1, so it is not freed for this op's write.
+                            && trace.read_end.get(vreg).map_or(true, |&end| end <= cycle as i32)
                     })
                     .collect();
                 let words_freed: usize = freed.iter().map(|v| v.size()).sum();
@@ -3179,6 +3264,9 @@ fn schedule_ssa_greedy_core(
                     // Defer for retry - liveness may decrease after other ops scheduled
                     diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
+                    if dump_enabled {
+                        deferral_reason.insert(idx, "budget");
+                    }
                     continue;
                 }
                 // Strategy-driven soft deferral (pressure awareness)
@@ -3189,6 +3277,9 @@ fn schedule_ssa_greedy_core(
                     scratch_budget,
                 ) {
                     budget_deferred.push(idx);
+                    if dump_enabled {
+                        deferral_reason.insert(idx, "pressure");
+                    }
                     continue;
                 }
 
@@ -3387,16 +3478,26 @@ fn schedule_ssa_greedy_core(
                         "vreg": v.id, "words": v.size(),
                         "remaining_users": vreg_remaining_users.get(v).copied().unwrap_or(0),
                     })).collect::<Vec<_>>(),
-                    "budget_deferred": budget_deferred.iter().map(|&i| ops[i].id).collect::<Vec<_>>(),
+                    // Ready ops deferred this cycle, with the reason they were last deferred.
+                    "budget_deferred": budget_deferred.iter().map(|&i| serde_json::json!({
+                        "id": ops[i].id, "reason": deferral_reason.get(&i).copied().unwrap_or("unknown"),
+                    })).collect::<Vec<_>>(),
+                    // Ops ASAP inflation deferred this cycle (each is also in `heap`).
+                    "inflation_deferred": inflation_deferred_ids.iter().map(|&i| ops[i].id).collect::<Vec<_>>(),
+                    // `priority` is the heap's order key, not a wait: every entry whose deps are
+                    // ready and that is in the window is offered again next cycle (inflation
+                    // may defer it again).
                     "heap": ready_heap.iter().map(|Reverse((pri, i))| serde_json::json!({
-                        "id": ops[*i].id, "ready_at": pri,
+                        "id": ops[*i].id, "priority": pri,
                         "in_window": wavefront.as_ref().map_or(true, |w| w.in_window(*i)),
                     })).collect::<Vec<_>>(),
                     "slots": {"valu": slots.valu_used, "alu": slots.alu_used, "load": slots.load_used,
                               "flow": slots.flow_used, "store": slots.store_used},
                 });
-                // One dump per greedy run; a build that runs the greedy again writes the n-th
-                // dump to `<path>.<n>` instead of overwriting the first.
+                // At most one dump per greedy run (the first cycle that reaches the force with
+                // `stall`, or with scratch model `pools`, before the slot check: that cycle may
+                // force nothing). The counter is per process and per path and counts dumps, not
+                // greedy runs: the first dump goes to `<path>`, the k-th to `<path>.<k-1>`.
                 static DUMPS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
                     std::sync::Mutex::new(std::collections::BTreeMap::new());
                 let n = {
@@ -3456,7 +3557,9 @@ fn schedule_ssa_greedy_core(
                     && engine == Engine::Valu
                     && can_ssa_valu_shift_to_alu(&ops[force_idx])
             };
-            let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id));
+            // Forced shifts keep their encoding on this path too (see the normal path).
+            let must_place_shifted = fixed_shifted_ops.map_or(false, |s| s.contains(&op_id))
+                || must_shift(&ops[force_idx], shape, enable_valu_shift, fixed_shifted_ops);
 
             // Take the slot first; budget accounting below only runs for an op that has one.
             // When must_place_shifted use the shift-only path; otherwise try with the strategy

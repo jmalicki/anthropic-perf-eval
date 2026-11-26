@@ -88,6 +88,15 @@ def _uses(sched: dict):
     return use, loads, shifted
 
 
+def executed_ops(sched: dict) -> dict:
+    """Scheduled SSA ops by id, each with the engine that executes it: a SelectChoice lowered to
+    a multiply_add keeps SSA engine flow but runs on the vector ALU (a vselect stays flow)."""
+    on_valu = {low["from_select_choice"] for low in sched["ops"]
+               if low.get("from_select_choice") is not None and low["engine"] == "valu"}
+    return {o["id"]: (dict(o, engine="valu") if o["id"] in on_valu else o)
+            for o in sched["ssa_ops"] if o["cycle"] >= 0}
+
+
 def _operand_ready(op: dict, ops: dict) -> int:
     return max((ops[d]["cycle"] + 1 for d in op["dep_ids"] if d in ops), default=0)
 
@@ -125,7 +134,7 @@ def gap_report(sched: dict, row: dict | None = None) -> dict:
     row = row or load_row(sched)
     t, q, w = row["t"], row["q"], row["w"]
     total = sched["total_cycles"]
-    ops = {o["id"]: o for o in sched["ssa_ops"] if o["cycle"] >= 0}
+    ops = executed_ops(sched)
     use, loads, _ = _uses(sched)
     end = total - q
     misplaced = [i for c, i in loads if i in row["window_ids"] and not t <= c < end]

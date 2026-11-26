@@ -37,6 +37,15 @@ Output is written to `scheduler_output_whatif.json` by default. The script print
 - **From scheduler output JSON:** Open the JSON (e.g. `scheduler_output.json`) and use the `ops` array; each op has an `id` field. Filter by `engine: "valu"` and optionally by opcode (non-vbroadcast, non-multiply_add are "VALU other" / shiftable).
 - **From per-decile workflow:** Run [slot_usage_by_decile.py](../../../scripts/slot_usage_by_decile.py) to see which deciles have high "VALU other"; then inspect the JSON for ops in that decile (cycle range) with engine VALU and shiftable opcode.
 
+## How the forced shift is applied
+
+`forced_shifts=[op ids]` is a hard constraint of the CP-SAT model (the op's shift literal is fixed to 1) and the greedy scheduler honours it too:
+
+- **Greedy:** a forced op is placed as 8 scalar ALU ops in one cycle on every path (normal, force-schedule, and when the pressure policy blocks shifting); it waits for a cycle with 8 free scalar slots and never takes a vector slot. The greedy log line reports it (`N VALU shifted`).
+- **CP-SAT:** the greedy schedule is the warm start and bounds the model (ALAP cap = greedy cycle + slack, horizon). Because the greedy placed the forced ops shifted, the solver log should read `The solution hint is complete and is feasible`. If it reads `complete, but it is infeasible`, see the open BUGS.md entry on per-section repair.
+- **Greedy alone** (`use_cpsat=False` on the binding): the emitted kernel runs the forced ops as scalar ops as well.
+- **Where it applies:** only to shiftable vector ops (not `vbroadcast`, `multiply_add`, or non-vector ops), only with VALU shift enabled, and only under `--valu-shift optimize`; under `alu` / `valu` the set is ignored, by the model and by the greedy, with or without CP-SAT (`PipelineConfig::forced_shift_ids` is the one place that decides). Ids that do not qualify are ignored silently.
+
 ## Limitation
 
 Only **force shift** (op must shift to ALU) is supported. **Force not shift** (`--force-shift false`) is not implemented; the script reports this and runs normal optimization.
