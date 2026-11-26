@@ -98,6 +98,34 @@ docs/4-round-phase-results.md, and the window-probe results of docs/STARTUP_WIND
 and docs/WINDOW_OPTIMALITY_PROBE.md. Re-measured: see "Re-measured after the model change"
 below; everything else is not re-measured.
 
+### Constants derived across sections
+
+An ALU-derived constant (`ConstChoiceEncoding::AluDerive`) has no operand; its lowered op
+reads its two producers at its own cycle. The per-section repair's live-in, live-out and
+live-through values follow operands only, so a producer in the repaired section whose derived
+constant sits in a later section was not live out, and the per-section model could end its
+interval early while address assignment and the post-merge check keep it live (the
+post-merge check would then fail the build). `extend_section_liveness_for_alu_derive` adds
+these reads (test `test_alu_derived_constants_extend_section_liveness`).
+
+### `--cpsat-greedy-bounds policy-only` and justification
+
+`policy-only` applies to the greedy, the hint passes and `--greedy-justify`: with it the CP-SAT
+pipeline computes exactly the greedy-only schedule, op and lane cycles, with and without
+justification (`test_cpsat_greedy_policy_bounds_gives_the_greedy_only_schedule`; the default
+`full` differs). Before this fix justification stayed domain-clamped in the CP-SAT pipeline;
+the table B runs of docs/STARTUP_WINDOW_PROBE.md were not affected (their justify passes
+rejected 0 candidates for the domains and reached the greedy-only 1,012 / 1,033).
+
+### Whole-kernel CP-SAT from the 1,038 index kernel
+
+`--cpsat-greedy-bounds policy-only --cpsat-split-shift-hint`, deterministic time 1,200 (it
+ended the solve: 1,391.6 deterministic, 6,002 s wall, well under the 10,800 s backstop). The
+hint was accepted as complete and feasible; two later solutions changed only the tie-breaker.
+Result: 1,038 cycles, bound 1,000 (presolve's, never improved), gap 3.66%, PROVED and PASSED.
+From the best greedy start, whole-program CP-SAT does not improve the greedy within this
+budget.
+
 ### Re-measured after the model change
 
 4 rounds, default emission, `--no-valu-shift` (the configuration of CLAUDE.md's 485, which came

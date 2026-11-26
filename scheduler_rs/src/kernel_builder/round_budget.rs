@@ -439,6 +439,65 @@ impl ScratchAliases {
     }
 }
 
+/// Extend a section's live-in, live-out and live-through values with the reads of
+/// ALU-derived constants (`ConstChoiceEncoding::AluDerive`). Such a constant has no operand;
+/// its lowered op reads its two producers at its own cycle, so `ScratchAliases::live_in` and
+/// `live_after`, which follow operands, miss a producer whose derived constant sits in
+/// another section, and the per-section model would end the producer's interval too early
+/// (address assignment and the post-merge check keep it live).
+///
+/// # Arguments
+/// * `ops`, `boundaries`, `section_k`, `defs` - As for `live_after`
+/// * `alu_derive` - ALU-derived constants of the current schedule, by op id
+/// * `filtered_global_indices` - The segment's ops (global indices) as given to the solve
+/// * `live_in` - (value, segment index of its last reader), extended in place
+/// * `live_out`, `live_through` - Extended in place
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extend_section_liveness_for_alu_derive(
+    ops: &[SsaOp],
+    boundaries: &[(usize, usize)],
+    section_k: usize,
+    defs: &HashMap<VReg, usize>,
+    alu_derive: &HashMap<usize, crate::types::AluDeriveInfo>,
+    filtered_global_indices: &[usize],
+    live_in: &mut Vec<(VReg, usize)>,
+    live_out: &mut HashSet<VReg>,
+    live_through: &mut HashSet<VReg>,
+) {
+    let section_of_op = |global: usize| boundaries.iter().position(|&(s, e)| global >= s && global < e);
+    let index_of_id: HashMap<usize, usize> = ops.iter().enumerate().map(|(i, op)| (op.id, i)).collect();
+    let mut derive_ids: Vec<&usize> = alu_derive.keys().collect();
+    derive_ids.sort();
+    for derive_id in derive_ids {
+        let info = &alu_derive[derive_id];
+        let Some(&derive_idx) = index_of_id.get(derive_id) else { continue };
+        if ops[derive_idx].cycle < 0 {
+            continue;
+        }
+        let Some(derive_sec) = section_of_op(derive_idx) else { continue };
+        for producer_id in [info.left_op_id, info.right_op_id] {
+            let Some(value) = index_of_id.get(&producer_id).and_then(|&i| ops[i].dest) else { continue };
+            let Some(&def_sec) = defs.get(&value) else { continue };
+            if derive_sec > section_k && def_sec == section_k {
+                live_out.insert(value);
+            } else if derive_sec > section_k && def_sec < section_k {
+                live_through.insert(value);
+            } else if derive_sec == section_k && def_sec < section_k {
+                let Some(seg_idx) = filtered_global_indices.iter().position(|&g| g == derive_idx) else { continue };
+                match live_in.iter_mut().find(|(v, _)| *v == value) {
+                    Some(entry) => {
+                        if ops[filtered_global_indices[entry.1]].cycle < ops[derive_idx].cycle {
+                            entry.1 = seg_idx;
+                        }
+                    }
+                    None => live_in.push((value, seg_idx)),
+                }
+            }
+        }
+    }
+    live_in.sort();
+}
+
 /// Build cycle hints for a single section in **local** cycle space (0-based).
 ///
 /// Per-round CP-SAT runs on segment ops only and uses cycles 0..makespan locally.
@@ -493,6 +552,42 @@ mod tests {
         op.dep_ids = deps.into_iter().collect();
         op.cycle = cycle;
         op
+    }
+
+    /// An ALU-derived constant reads its two producers without operands: a producer defined in
+    /// section 0 and read only by a derived constant in section 2 is live out of section 0 and
+    /// live through section 1, and live into section 2 until the derived constant.
+    #[test]
+    fn test_alu_derived_constants_extend_section_liveness() {
+        use crate::types::AluDeriveInfo;
+        let a = VReg::scalar(1);
+        let b = VReg::scalar(2);
+        let mut ops = vec![
+            make_op_with_cycle(0, Engine::Alu, Opcode::Add, Some(a), vec![], vec![], 0),
+            make_op_with_cycle(1, Engine::Alu, Opcode::Add, Some(b), vec![], vec![], 0),
+            make_op_with_cycle(2, Engine::Flow, Opcode::Barrier, None, vec![], vec![], -1),
+            make_op_with_cycle(3, Engine::Alu, Opcode::Add, Some(VReg::scalar(3)), vec![], vec![], 1),
+            make_op_with_cycle(4, Engine::Flow, Opcode::Barrier, None, vec![], vec![], -1),
+            make_op_with_cycle(5, Engine::Load, Opcode::ConstChoice, Some(VReg::scalar(4)), vec![], vec![], 2),
+        ];
+        ops[2].dest = None;
+        ops[4].dest = None;
+        let boundaries = section_boundaries(&ops);
+        assert_eq!(boundaries.len(), 3, "{:?}", boundaries);
+        let defs = vreg_def_section(&ops, &boundaries);
+        let alu: HashMap<usize, AluDeriveInfo> =
+            [(5, AluDeriveInfo { left_op_id: 0, right_op_id: 1, opcode: Opcode::Add })].into_iter().collect();
+        let run = |k: usize| {
+            let (s, e) = boundaries[k];
+            let filtered: Vec<usize> = (s..e).filter(|&i| ops[i].opcode != Opcode::Barrier).collect();
+            let (mut lin, mut lout, mut lthr) = (Vec::new(), HashSet::new(), HashSet::new());
+            extend_section_liveness_for_alu_derive(&ops, &boundaries, k, &defs, &alu, &filtered, &mut lin, &mut lout, &mut lthr);
+            (lin, lout, lthr)
+        };
+        let both: HashSet<VReg> = [a, b].into_iter().collect();
+        assert_eq!(run(0).1, both);
+        assert_eq!(run(1).2, both);
+        assert_eq!(run(2).0, vec![(a, 0), (b, 0)]);
     }
 
     /// A chain where each input dies as the next value is written: the cycle count holds two

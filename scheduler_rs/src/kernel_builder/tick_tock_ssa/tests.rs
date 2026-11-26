@@ -4631,7 +4631,7 @@ fn section_check_and_allocator_peaks(configure: impl FnOnce(&mut KernelConfig)) 
 /// exactly what address assignment counts on the phase timeline (the CP-SAT default), with
 /// and without split shifts (whose lanes run in two cycles) and with and without round
 /// barriers; the cycle timeline counts at least as much. Before, the check had no lane
-/// cycles and counted on the cycle timeline: 1,597 words against the allocator's 1,483 on
+/// cycles and counted on the cycle timeline: 1,597 words against the allocator's 1,496 on
 /// the best 16-round greedy kernel (BUGS.md).
 #[test]
 fn test_section_check_counts_what_the_allocator_counts() {
@@ -4686,4 +4686,59 @@ fn test_merge_section_const_encodings() {
     assert_eq!(add_imm, [3, 4, 8].into_iter().collect::<HashSet<_>>());
     assert_eq!(alu.keys().copied().collect::<std::collections::BTreeSet<_>>(), [2, 9].into_iter().collect());
     assert_eq!(alu[&2].left_op_id, 16);
+}
+
+/// Greedy (and justified) cycles of a 4-round shaped kernel as the greedy-only pipeline or the
+/// CP-SAT pipeline computes them, before any CP-SAT solve: the op cycles and the lane cycles.
+#[cfg(feature = "cpsat")]
+fn pipeline_greedy_schedule(
+    justify: usize,
+    cpsat: bool,
+    policy_only: bool,
+) -> (Vec<i32>, std::collections::BTreeMap<usize, Vec<i32>>) {
+    use crate::kernel_builder::pipeline::passes::{
+        ComputeBoundsPass, ComputeDependenciesPass, DcePass, GreedyJustifyPass, GreedySchedulePass,
+    };
+    use crate::kernel_builder::pipeline::{CpSatPipelineConfig, PipelineConfig, PipelineContext};
+    let mut config = KernelConfig::new(10, 2047, 256, 4);
+    configure_wavefront(&mut config);
+    config.compiler.greedy_split_shift = true;
+    config.compiler.cpsat_split_shift_hint = true;
+    config.compiler.greedy_justify_iterations = justify;
+    config.compiler.cpsat_greedy_policy_bounds = policy_only;
+    let program = SsaTickTockKernelBuilder::new(config.clone()).build();
+    let budget = config.compiler.effective_scratch_budget(program.zero_vreg.is_some());
+    let pipeline = PipelineConfig {
+        compiler: crate::kernel_builder::config::CompilerConfig { enable_valu_shift: true, ..config.compiler.clone() },
+        scratch_budget: budget,
+        cpsat: cpsat.then(CpSatPipelineConfig::default),
+        ..Default::default()
+    };
+    let mut ctx = PipelineContext::new(program, pipeline);
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&DcePass).unwrap();
+    ctx.run_pass(&ComputeDependenciesPass).unwrap();
+    ctx.run_pass(&ComputeBoundsPass).unwrap();
+    ctx.run_pass(&GreedySchedulePass).unwrap();
+    if justify > 0 {
+        ctx.run_pass(&GreedyJustifyPass).unwrap();
+    }
+    let cycles = ctx.ops.iter().map(|op| op.cycle).collect();
+    let lanes = ctx.greedy_decisions.shifted_alu_cycles.into_iter().collect();
+    (cycles, lanes)
+}
+
+/// `--cpsat-greedy-bounds policy-only`: the greedy that feeds CP-SAT, and the justification
+/// after it, compute exactly the greedy-only schedule (op and lane cycles), with and without
+/// `--greedy-justify`. With the default (`full`) the CP-SAT pipeline's greedy differs here.
+#[cfg(feature = "cpsat")]
+#[test]
+fn test_cpsat_greedy_policy_bounds_gives_the_greedy_only_schedule() {
+    for justify in [0, 10] {
+        let greedy_only = pipeline_greedy_schedule(justify, false, false);
+        let policy_only = pipeline_greedy_schedule(justify, true, true);
+        assert!(greedy_only == policy_only, "justify {}: policy-only CP-SAT greedy differs from greedy-only", justify);
+    }
+    let full = pipeline_greedy_schedule(0, true, false);
+    assert!(full != pipeline_greedy_schedule(0, false, false), "full bounds should shape the CP-SAT greedy differently here");
 }

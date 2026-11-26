@@ -1122,7 +1122,7 @@ impl SsaTickTockKernelBuilder {
         // as the allocator counts them, exceed the budget (a section within it can still lack
         // an address layout; the check bounds words). Before, the check had no lane cycles and fell
         // back to the cycle timeline to stay on the safe side, which overcounted (1,597
-        // words against an exact 1,483 on the best greedy kernels) and sent within-budget
+        // words against the allocator's 1,496 on the 1,030-cycle path kernel) and sent within-budget
         // schedules to the repair (BUGS.md).
         let vreg_def_sec = vreg_def_section(&ctx.ops, &boundaries);
         let scratch_aliases = ScratchAliases::new(&ctx.vector_group_lanes, |v| vreg_def_sec.contains_key(v));
@@ -1165,8 +1165,8 @@ impl SsaTickTockKernelBuilder {
                 "================================================================================"
             );
             eprintln!(
-                "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} words)",
-                ctx.config.compiler.scratch_size
+                "  CHECKING EACH ROUND FOR SCRATCH BUDGET (budget = {} assignable words of {})",
+                effective_budget, ctx.config.compiler.scratch_size
             );
             eprintln!(
                 "  Sections that exceed budget will get a per-section CP-SAT run (feasibility)."
@@ -1336,11 +1336,16 @@ impl SsaTickTockKernelBuilder {
                     actually_rescheduled_op_ids.insert(ctx.ops[gi].id);
                 }
 
-                let initial_live = scratch_aliases.live_in(
+                let mut initial_live = scratch_aliases.live_in(
                     &ctx.ops, &boundaries, k, &vreg_def_sec, &filtered_global_indices,
                 );
-                let (live_out, live_through) =
+                let (mut live_out, mut live_through) =
                     scratch_aliases.live_after(&ctx.ops, &boundaries, k, &vreg_def_sec);
+                // ALU-derived constants read their producers without operands.
+                super::round_budget::extend_section_liveness_for_alu_derive(
+                    &ctx.ops, &boundaries, k, &vreg_def_sec, &current_alu_derive,
+                    &filtered_global_indices, &mut initial_live, &mut live_out, &mut live_through,
+                );
                 let (section_time_limit, section_stop_first) = match per_section_optimize_secs {
                     Some(t) if t > 0.0 => (t, false),
                     _ => {
