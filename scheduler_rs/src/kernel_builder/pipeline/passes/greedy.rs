@@ -165,6 +165,12 @@ impl Pass for GreedySchedulePass {
         let forced = ForcedEncodings::from_context(ctx);
         let mut diagnostics = ssa_greedy::GreedyDiagnostics::new(ctx.config.greedy_verbose);
         let mut shape = ctx.config.compiler.greedy_shape();
+        // Individually forced shifts (what-if runs) are fixed to 1 in the CP-SAT model, so the
+        // greedy must place those ops shifted too: its shift decisions and cycles become the
+        // hint, the ALAP cap and the horizon, and are only valid for a schedule that honours
+        // them. Under --valu-shift alu|valu the model ignores the set, and so does the greedy,
+        // with or without CP-SAT: `forced_shift_ids` is empty outside `optimize`.
+        shape.forced_shift_ops = ctx.config.forced_shift_ids();
         // A split shift reaches CP-SAT only as per-lane hints (cpsat_split_shift_hint);
         // without them the hint has one cycle per op and cannot describe it.
         if is_cpsat_pipeline && !ctx.config.compiler.cpsat_split_shift_hint {
@@ -285,7 +291,8 @@ impl Pass for GreedySchedulePass {
 /// shift encoding, no hint pass, no fixed-choices reschedule); split shifts are used
 /// under the same condition as in `GreedySchedulePass`. When CP-SAT follows, an accepted
 /// schedule must also keep every op inside its ASAP/ALAP domain, since it becomes the hint.
-/// With individually forced shifts (what-if runs) the pass does not run at all.
+/// With individually forced shifts (what-if runs; `PipelineConfig::forced_shift_ids`, with or
+/// without CP-SAT) the pass does not run at all.
 pub struct GreedyJustifyPass;
 
 impl Pass for GreedyJustifyPass {
@@ -343,15 +350,14 @@ impl Pass for GreedyJustifyPass {
         #[cfg(not(feature = "cpsat"))]
         let is_cpsat_pipeline = false;
 
-        // Individually forced shifts (what-if runs) are hard constraints of the CP-SAT model
-        // that the greedy does not see: its schedule may not be a schedule of that model, yet
-        // its length still sets the model's horizon and latest cycles. A shorter schedule
-        // would tighten those around encodings the model forbids, so the pass does not run.
-        #[cfg(feature = "cpsat")]
-        let has_forced_shifts =
-            ctx.config.cpsat.as_ref().is_some_and(|c| c.forced_shifts.as_ref().is_some_and(|ids| !ids.is_empty()));
-        #[cfg(not(feature = "cpsat"))]
-        let has_forced_shifts = false;
+        // Individually forced shifts (what-if runs) are hard constraints of the CP-SAT model,
+        // and the greedy places those ops shifted (`GreedyShape::forced_shift_ops`). The
+        // justification passes do not know the forced set and choose every shift themselves,
+        // so they could move a forced op back to a vector slot; the pass does not run. The
+        // set is read from the same source as the greedy's (the CP-SAT configuration, or the
+        // greedy-only build's own set), so `use_cpsat=False` with forced shifts is covered.
+        // Outside `--valu-shift optimize` the set does not apply and is empty here.
+        let has_forced_shifts = !ctx.config.forced_shift_ids().is_empty();
         if has_forced_shifts {
             let summary = "skipped: individually forced shifts are set".to_string();
             announce(ctx, &summary);

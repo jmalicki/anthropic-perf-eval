@@ -1584,6 +1584,11 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             },
         };
         let enable_valu_shift = builder.config.compiler.enable_valu_shift;
+        // A forced shift is a statement about the kernel's encoding, so the greedy-only build
+        // honours it as well. The mode travels with the set: it applies only under `optimize`
+        // (decided in `PipelineConfig::forced_shift_ids`, for both pipelines).
+        builder.greedy_forced_shifts = forced_shifts_set;
+        builder.greedy_valu_shift_mode = valu_shift_mode;
         builder
             .build_and_schedule_greedy(enable_valu_shift, None, verbose)
             .map_err(|e| kernel_build_error_to_py("SSA build failed", e))?
