@@ -510,9 +510,16 @@ fn check_hash_merge_parity(spec: &ProblemSpec, label: &str) -> HashMergeReport {
     if let Some(d) = diff {
         panic!("{}: {}", label, d);
     }
-    // The leak lands on a setup op, never on a hash op.
+    // The leak lands on exactly one known op, or none: the first op written after the hash
+    // constants, i.e. the first op of the selection setup (an ALU add, no region). Any other
+    // label difference fails the gate.
+    use crate::types::{EmissionPhase, Engine, Opcode};
+    let first_selection_setup =
+        rewritten.ops.iter().position(|o| o.source_info.as_ref().map_or(false, |s| s.phase == EmissionPhase::ValuSelectionInit));
     for &i in &leaked {
-        assert!(rewritten.ops[i].region.is_none(), "{}: label leak on {:?}", label, rewritten.ops[i]);
+        let op = &rewritten.ops[i];
+        assert_eq!(Some(i), first_selection_setup, "{}: label leak on {:?}", label, op);
+        assert!(op.region.is_none() && op.engine == Engine::Alu && op.opcode == Opcode::Add, "{}: label leak on {:?}", label, op);
     }
     eprintln!("{}: {} sites, op-for-op parity, {} op(s) with the leaked label", label, report.sites, leaked.len());
     report
@@ -1381,18 +1388,29 @@ fn test_hash_merge_keeps_a_kept_live_constant() {
 }
 
 #[test]
-fn test_hash_merge_leaves_no_keep_live_only_reference() {
+fn test_transforms_leave_no_keep_live_only_reference() {
+    use crate::kernel_builder::config::TransformKind::{self, *};
+    use crate::kernel_builder::pipeline::passes::transform::apply_transform_with;
     use crate::types::VReg;
-    // Pipeline dead code elimination (DcePass, after TransformPass) follows `srcs` only. On the
-    // emitter's programs every keep_live value is also read through `srcs` (the round R-2 hash
-    // output, read by round R-1), and the rewrite keeps it that way.
+    // Pipeline dead code elimination (DcePass, after TransformPass) follows `srcs` only
+    // (BUGS.md). On the emitter's programs every keep_live value is also read through `srcs`
+    // (the round R-2 hash output, read by round R-1), and every transform keeps it that way,
+    // alone and combined.
+    let combos: [&[TransformKind]; 4] = [&[HashMerge], &[PruneIndex], &[ValuesOnly], &[HashMerge, PruneIndex, ValuesOnly]];
     for rounds in [2, 16] {
-        let (p, report) = apply_hash_merge(raw_program(&ProblemSpec { rounds, ..Default::default() }), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
-        assert_eq!(report.sites, rounds * 32);
-        let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
-        let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
-        assert_eq!(kept.len(), 32, "rounds {}", rounds);
-        assert!(kept.iter().all(|v| read.contains(v)), "rounds {}: a keep_live-only value", rounds);
+        let spec = ProblemSpec { rounds, ..Default::default() };
+        for combo in combos {
+            let mut p = raw_program(&spec);
+            for &t in combo {
+                let (next, outcome) = apply_transform_with(p, t, Some(spec.batch_size), Some(spec.n_nodes)).unwrap();
+                assert!(outcome.sites > 0 && outcome.refused.is_none(), "rounds {} {:?}: {}", rounds, t, outcome.summary);
+                p = next;
+            }
+            let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
+            let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
+            assert_eq!(kept.len(), 32, "rounds {} {:?}", rounds, combo);
+            assert!(kept.iter().all(|v| read.contains(v)), "rounds {} {:?}: a keep_live-only value", rounds, combo);
+        }
     }
 }
 
