@@ -516,13 +516,16 @@ fn test_values_only_delta_table() {
         }
     }
     // Pinned rows (the measured table, not a formula): the per-site, shared and total deltas.
+    // Since #79 DCE drops alternatives that name a constant it removed: where values-only kills
+    // the pointer load's address constant 5, 6 loses `1 + 5` and is no longer ALU-derivable,
+    // so one more constant moves from const_alu to const (+1 / -2 instead of -1).
     for row in [
         "| 2 | ZeroBased | Index | standard | 32 x [vec_fixed -1, vec_shiftable -2, alu -1, store -1] | 0 | vec_fixed -32, vec_shiftable -64, alu -32, store -32 |",
-        "| 2 | ZeroBased | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -3, alu -2, load -1, store -1] | vec_fixed -1, load -1, const_alu -1 | vec_fixed -65, vec_shiftable -96, alu -64, load -33, store -32, const_alu -1 |",
-        "| 2 | Mirrored | Index | standard | 32 x [vec_fixed -1, vec_shiftable -2, alu -1, store -1] | vec_fixed -2, alu -1, load -1, const_alu -1 | vec_fixed -34, vec_shiftable -64, alu -33, load -1, store -32, const_alu -1 |",
+        "| 2 | ZeroBased | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -3, alu -2, load -1, store -1] | vec_fixed -1, load -1, const +1, const_alu -2 | vec_fixed -65, vec_shiftable -96, alu -64, load -33, store -32, const +1, const_alu -2 |",
+        "| 2 | Mirrored | Index | standard | 32 x [vec_fixed -1, vec_shiftable -2, alu -1, store -1] | vec_fixed -2, alu -1, load -1, const +1, const_alu -2 | vec_fixed -34, vec_shiftable -64, alu -33, load -1, store -32, const +1, const_alu -2 |",
         "| 16 | ZeroBased | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -3, alu -1, store -1] | 0 | vec_fixed -64, vec_shiftable -96, alu -32, store -32 |",
         "| 16 | ZeroBased | Path | Bits | 32 x [vec_fixed -6, vec_shiftable -6, alu -1, store -1] | 0 | vec_fixed -192, vec_shiftable -192, alu -32, store -32 |",
-        "| 16 | Mirrored | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -2, alu -1, store -1] | vec_fixed -1, load -1, const_alu -1 | vec_fixed -65, vec_shiftable -64, alu -32, load -1, store -32, const_alu -1 |",
+        "| 16 | Mirrored | Index | Bits | 32 x [vec_fixed -2, vec_shiftable -2, alu -1, store -1] | vec_fixed -1, load -1, const +1, const_alu -2 | vec_fixed -65, vec_shiftable -64, alu -32, load -1, store -32, const +1, const_alu -2 |",
     ] {
         assert!(rows.iter().any(|r| r == row), "missing or changed row: {}", row);
     }
