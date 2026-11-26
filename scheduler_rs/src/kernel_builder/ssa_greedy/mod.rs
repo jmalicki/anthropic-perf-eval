@@ -81,6 +81,30 @@ pub struct GreedyShape {
     /// Where a SelectChoice that has a one-op `multiply_add` form may run (see
     /// [`SelectOverflow`]).
     pub select_overflow: SelectOverflow,
+    /// When an op the scratch budget check deferred is forced past the budget (see
+    /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
+    pub budget_force: BudgetForce,
+}
+
+/// Scratch model `words`: when the greedy forces an op that the budget check deferred.
+///
+/// The budget check defers an op whose destination would take the live words over the
+/// budget. With `SameCycle` (default, the historical behaviour) the deferred op with the
+/// highest last-use count is then forced in the same cycle whenever it has a slot, even if
+/// other ops were placed in that cycle, so the check holds one op per cycle at most and
+/// any run that reaches the budget overshoots it (address assignment then rejects the
+/// kernel). The pressure policy's inflation and shift suppression are what keep a default
+/// run below the budget, which is why passing runs stop short of it.
+/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
+/// in this one may have freed words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetForce {
+    /// Force one deferred op per cycle whenever it has a slot (default).
+    #[default]
+    SameCycle,
+    /// Force only when nothing else was placed in the cycle.
+    Stall,
 }
 
 /// Wavefront only: the order in which ready flow ops are offered the flow slot. Other
@@ -549,6 +573,13 @@ pub(crate) struct GreedyDiagnostics {
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
     last_cycle: Option<usize>,
+    /// Times the hard budget check (live words after the op > budget) deferred an op; an op
+    /// retried in the same cycle counts once per rejection.
+    pub budget_check_deferrals: usize,
+    /// Ops forced past the budget by the force-schedule path.
+    pub forced_past_budget: usize,
+    /// Cycles whose only placement was the first part of a split shift.
+    pub split_only_cycles: usize,
 }
 
 impl GreedyDiagnostics {
@@ -964,15 +995,7 @@ fn release_read_values(
     // What a multiply_add select reads at cycle + 1: its sources, its delta and their group
     // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
     // address assignment counts it (`use_cycles`).
-    let fma_reads: HashSet<VReg> = if fma {
-        let direct: Vec<VReg> = op.srcs.iter().filter_map(|s| s.as_vreg()).chain(op.delta_vreg).collect();
-        direct
-            .iter()
-            .flat_map(|v| std::iter::once(*v).chain(liveness_aliases.get(v).into_iter().flatten().copied()))
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
@@ -1034,6 +1057,17 @@ fn release_read_values(
 /// the select's form only when it places it, so a select that may take the multiply_add form
 /// holds its delta until then (released early again if it takes the vselect form, see
 /// [`release_read_values`]). May contain duplicates.
+/// What a select in the multiply_add form reads at cycle + 1: its operands, its delta and their
+/// vector-group aliases. Its `keep_live` values are not among them (held through its own cycle).
+fn multiply_add_reads(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> HashSet<VReg> {
+    op.srcs
+        .iter()
+        .filter_map(|s| s.as_vreg())
+        .chain(op.delta_vreg)
+        .flat_map(|v| std::iter::once(v).chain(liveness_aliases.get(&v).into_iter().flatten().copied()))
+        .collect()
+}
+
 fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
@@ -2431,6 +2465,9 @@ fn schedule_ssa_greedy_core(
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
+        // A split shift started this cycle: its destination block is reserved and scalar
+        // slots are taken, so the cycle is not a deadlock for `BudgetForce::Stall`.
+        let mut split_started_this_cycle = false;
 
         // Finish last cycle's split shift before anything else takes scalar slots: its
         // remaining lanes run now and the op completes in this cycle.
@@ -2887,6 +2924,7 @@ fn schedule_ssa_greedy_core(
                                 vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
                             if has_reader && pools.fits(&live.after(&added, &[]), scratch_budget) {
                                 slots.alu_used += free_alu;
+                                split_started_this_cycle = true;
                                 split_carry = Some(SplitShift {
                                     idx,
                                     first_cycle: cycle as i32,
@@ -2938,15 +2976,21 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                // A select taking the multiply_add form holds what it reads to cycle + 1.
-                let holds_reads = engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice;
+                // A select taking the multiply_add form holds what the multiply_add reads to
+                // cycle + 1; a keep_live-only value is released at this cycle, as in the release loop.
+                let held_to_next: HashSet<VReg> =
+                    if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice {
+                        multiply_add_reads(&ops[idx], &liveness_aliases)
+                    } else {
+                        HashSet::new()
+                    };
                 let freed: Vec<VReg> = liveness_release_vregs(
                     &ops[idx],
                     &liveness_aliases,
                     trace.delta_readers.contains(&op_id),
                 )
                     .into_iter()
-                    .filter(|_| !holds_reads)
+                    .filter(|vreg| !held_to_next.contains(vreg))
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
@@ -2960,6 +3004,7 @@ fn schedule_ssa_greedy_core(
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
                 if !pools.fits(&live.after(&added, &freed), scratch_budget) {
                     // Defer for retry - liveness may decrease after other ops scheduled
+                    diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
                     continue;
                 }
@@ -3140,7 +3185,21 @@ fn schedule_ssa_greedy_core(
         // the op waits for a later cycle, and the force path runs only when nothing at all
         // was scheduled this cycle. (Without capacities the historical behaviour is kept: a
         // deferred op that has a slot is forced in the same cycle.)
-        if !budget_deferred.is_empty() && (pools.caps.is_none() || scheduled_this_cycle == 0) {
+        //
+        // `BudgetForce::Stall` gives the words model the same rule: an op the budget check
+        // deferred waits while anything else is placed, and is forced only in a cycle where
+        // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
+        let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
+        // With `Stall`, a cycle whose only placement was a split-shift start is not a
+        // deadlock either, with or without pool capacities (`pools` changes only
+        // `force_same_cycle` above). Defensive: a split starts only
+        // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
+        // the same cycle (`split_only_cycles` stays 0; checked in the tests).
+        let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
+        if split_started_this_cycle && scheduled_this_cycle == 0 {
+            diagnostics.split_only_cycles += 1;
+        }
+        if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
@@ -3217,6 +3276,7 @@ fn schedule_ssa_greedy_core(
                     format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
+                diagnostics.forced_past_budget += 1;
                 let mut force_shifted = false;
                 match force_place_result {
                     SlotResult::Placed => {
@@ -3494,6 +3554,13 @@ fn schedule_ssa_greedy_core(
             inflation_stats.net_liveness_blocks,
             inflation_stats.pass_through_blocks,
             inflation_stats.breaker_activations,
+        );
+    }
+
+    if diagnostics.verbose {
+        eprintln!(
+            "Greedy budget check: {} deferrals, {} ops forced past the budget",
+            diagnostics.budget_check_deferrals, diagnostics.forced_past_budget
         );
     }
 

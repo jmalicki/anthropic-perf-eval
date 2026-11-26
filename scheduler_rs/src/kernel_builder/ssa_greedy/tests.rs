@@ -4630,6 +4630,83 @@ fn test_pools_greedy_same_schedule_when_pools_do_not_bind() {
     assert_eq!(cycles(&words.ops), cycles(&pools.ops));
 }
 
+/// Three broadcasts of one scalar are ready in the same cycle, and the budget fits only two
+/// (plus the scalar and the store address). The add of the first two frees both one cycle later.
+fn emit_three_broadcasts() -> SsaEmitContext {
+    let mut emit = SsaEmitContext::new();
+    let s = emit.emit_const(1);
+    let v1 = emit.emit_vbroadcast_force(s);
+    let v2 = emit.emit_vbroadcast_force(s);
+    let v3 = emit.emit_vbroadcast_force(s);
+    let w = emit.emit_valu(Opcode::Add, v1, v2);
+    let x = emit.emit_valu(Opcode::Add, w, v3);
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, x);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    emit
+}
+
+/// Schedule with the given budget-force rule (words model, no shifting).
+///
+/// # Returns
+/// `(budget_exceeded, peak live words)`.
+fn schedule_with_budget_force(emit: &mut SsaEmitContext, budget: usize, force: BudgetForce) -> (bool, usize) {
+    let shape = GreedyShape { budget_force: force, ..Default::default() };
+    let ((_, budget_exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut GreedyDiagnostics::new(false),
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the broadcasts");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (budget_exceeded, peak)
+}
+
+/// `--greedy-budget-force stall`: a budget-deferred op waits while other ops are placed in
+/// the cycle, so the run stays within the budget. The default (`same-cycle`) forces the
+/// third broadcast in the cycle the first two were placed and goes over: the control shows
+/// the program exercises the difference.
+#[test]
+fn test_budget_force_stall_keeps_words_budget_where_same_cycle_does_not() {
+    let budget = 2 * VLEN + 2;
+    let (same_exceeded, same_peak) =
+        schedule_with_budget_force(&mut emit_three_broadcasts(), budget, BudgetForce::SameCycle);
+    assert!(
+        same_exceeded && same_peak > budget,
+        "control: same-cycle should force the third broadcast over the budget (peak {})",
+        same_peak
+    );
+    let (stall_exceeded, stall_peak) =
+        schedule_with_budget_force(&mut emit_three_broadcasts(), budget, BudgetForce::Stall);
+    assert!(!stall_exceeded, "stall forced an op although the cycle placed others");
+    assert!(stall_peak <= budget, "stall peak {} > budget {}", stall_peak, budget);
+}
+
+/// A real deadlock still forces with `stall`: the scheduler completes and reports it.
+#[test]
+fn test_budget_force_stall_still_breaks_deadlock() {
+    let (exceeded, _) = schedule_with_budget_force(&mut emit_three_broadcasts(), VLEN, BudgetForce::Stall);
+    assert!(exceeded, "budget below two vectors: the add can only run over budget");
+}
+
 /// The greedy scheduler respects kept memory edges: a load after a store to its word runs at
 /// least one cycle later (RAW), a store over a word read earlier runs no earlier than the
 /// read (WAR, latency 0), and two stores to one word are a cycle apart (WAW). Without the
@@ -5380,6 +5457,50 @@ fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
     assert!(checked > 0, "control: some budget runs with a multiply-add select and is kept");
 }
 
+/// Review of #76 (CodeRabbit, third pass; fix in #82): the fit estimate of a select in the
+/// multiply_add form must hold only what the multiply_add reads (sources, delta, their group
+/// aliases) to cycle + 1. A `keep_live`-only vector is released at the select's cycle, so the
+/// select's destination may reuse its words. Four vector inputs, a `keep_live` vector and a
+/// scalar take 41 words; at budget 41 the estimate was 49, the select was deferred with nothing
+/// else ready, and the force path reported the budget exceeded.
+#[test]
+fn test_fit_estimate_frees_keep_live_only_value_of_multiply_add_select() {
+    let mut emit = SsaEmitContext::new();
+    let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+        let c = emit.emit_const(v);
+        emit.emit_vbroadcast(c)
+    };
+    let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+    let cond = vec_of(&mut emit, 1);
+    let held = vec_of(&mut emit, 7);
+    let t = emit.emit_valu(Opcode::Add, b, d);
+    let s = emit.emit_select_choice_shared_delta(cond, t, d, b);
+    emit.ops.last_mut().unwrap().keep_live = Some(vec![held]);
+    let select_id = emit.ops.last().unwrap().id;
+    let addr = emit.emit_const(100);
+    emit.emit_vstore(addr, s);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let forced: HashMap<usize, SelectChoiceEncoding> = [(select_id, SelectChoiceEncoding::Fma)].into_iter().collect();
+    let budget = 41;
+    let mut fma = HashSet::new();
+    let ((_, exceeded, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops, true, &mut HashSet::new(), budget, Some(&mut fma), None, None, None,
+        &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None,
+        Some(&forced), &mut GreedyDiagnostics::new(false), &GreedyShape::default(), &mut HashMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("scheduler error: {}", e));
+    assert!(agreement.agrees(), "{}", agreement);
+    let scheduled: Vec<SsaOp> = emit.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
+    let config = crate::address_assign::AddressAssignConfig {
+        select_fma_ops: [select_id].into_iter().collect(),
+        ..Default::default()
+    };
+    let intervals = crate::address_assign::compute_live_intervals(&config, &scheduled).unwrap();
+    let peak = crate::address_assign::compute_peak_liveness(&intervals);
+    assert!(peak <= budget, "control: the schedule fits in {} words (interval peak {})", budget, peak);
+    assert!(!exceeded, "the select fits by reusing the keep_live vector's words (interval peak {})", peak);
+}
+
 /// Review of #76 (CodeRabbit, second pass): the pools check must measure selects forced to the
 /// multiply_add form by `fixed_select_choice_encoding` with their cycle + 1 reads. Before, only
 /// the caller's set (which gets forced selects after the call) went into the measurement, so a
@@ -5645,6 +5766,74 @@ fn test_load_priority_final_last_budget_deferral() {
     for budget in [8, 16, 1536] {
         assert_eq!(ahead_at(budget), 0, "budget {}", budget);
     }
+}
+
+/// `stall` under the shaped pipeline's settings: adaptive policy with ASAP inflation (policy
+/// bounds), wavefront priority, VALU shift and split shifts, with budgets that bind. 24
+/// independent chains of vector adds off one broadcast: a running chain holds one vector
+/// and each step frees what it adds, so no budget of at least three vectors deadlocks. The
+/// run must stay within the budget and never force; returns (budget_exceeded, peak,
+/// diagnostics) for `force`.
+fn schedule_chains_shaped(budget: usize, force: BudgetForce, split_shift: bool) -> (bool, usize, GreedyDiagnostics) {
+    let (mut emit, _) = emit_independent_chains(24, 6);
+    let asap = crate::cpsat_scheduler::bounds::compute_ssa_asap(&emit.ops, &HashSet::new());
+    let max_asap = asap.values().copied().max().unwrap_or(0);
+    let alap = crate::cpsat_scheduler::bounds::compute_ssa_alap(&emit.ops, max_asap + 20, &HashSet::new());
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 2, groups_in_flight: None },
+        split_shift,
+        budget_force: force,
+        ..Default::default()
+    };
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let ((_, exceeded, peak), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        true,
+        &mut HashSet::new(),
+        budget,
+        None,
+        None,
+        None,
+        None,
+        &GreedyBoundsUsage::PolicyOnly { asap: &asap, alap: &alap },
+        &pressure_policy::AdaptivePolicy::default(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the chains");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    (exceeded, peak, diagnostics)
+}
+
+#[test]
+fn test_budget_force_stall_holds_the_budget_in_the_shaped_pipeline() {
+    let mut control_overshoots = 0;
+    for budget in [3 * VLEN + 1, 5 * VLEN + 1, 8 * VLEN + 1, 12 * VLEN + 1] {
+        for split_shift in [false, true] {
+            let (exceeded, peak, diag) = schedule_chains_shaped(budget, BudgetForce::Stall, split_shift);
+            assert!(!exceeded && diag.forced_past_budget == 0, "stall forced at budget {} split {}", budget, split_shift);
+            assert!(peak <= budget, "stall peak {} > budget {} (split {})", peak, budget, split_shift);
+            // A split shift starts only with 1 to 7 scalar slots free, i.e. after a counted
+            // placement on the scalar ALU in the same cycle (a carried split's completion, a
+            // native op or a whole shift): a cycle whose only placement is a split start
+            // does not occur. The stall rule still treats one as progress, defensively.
+            assert_eq!(diag.split_only_cycles, 0);
+            let (same_exceeded, same_peak, _) = schedule_chains_shaped(budget, BudgetForce::SameCycle, split_shift);
+            if same_exceeded || same_peak > budget {
+                control_overshoots += 1;
+            }
+        }
+    }
+    assert!(control_overshoots > 0, "control: same-cycle never overshot, so the budgets do not bind");
 }
 
 // =========================================================================

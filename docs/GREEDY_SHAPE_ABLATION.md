@@ -919,8 +919,11 @@ plans, so 32 is the first of a tie, not a measured offset.
 - Where the 1,039 schedules' 10 cycles above the static bound go (an upper bound on what scheduling could recover).
 - A select-resolution rule that wins on both the index and the path plans. Overflow keyed
   to a target count or to the scalar ALU's slack was not tried beyond the limits above.
-- A scratch term for path-bit plans. The 1,505-word ceiling's cause was not checked beyond
-  `--scratch-budget-override`.
+- A scratch term for path-bit plans. The 1,505-word ceiling is explained in
+  docs/SCRATCH_CEILING_DIAGNOSIS.md: the pressure policy, needed because the `words` model
+  forces budget-deferred ops in the same cycle (`--greedy-budget-force stall` removes the
+  same-cycle force; not safe on every plan: 3 of 28 path-bit plans exceed the budget, see
+  docs/STARTUP_AND_STALL_LOOP.md, which arrives with #83; diagnosed in docs/STALL_DEADLOCK.md, #88).
 - The model in other contexts (rounds, batch, values-only).
 - CP-SAT on any of these emissions (no whole-program CP-SAT, by the machine rules).
 

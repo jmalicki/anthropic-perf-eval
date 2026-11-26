@@ -45,3 +45,15 @@ def test_es_formula_is_the_fitted_formula():
         {k: es.GREEDY_MODEL[k] for k in ("a_load", "flow0", "b_flow_x100", "a_floor")})]
     for b in gf.load()["builds"]:
         assert es.greedy_model_cycles(b["counts"]) == gf.predict(b["features"], th)
+
+
+def test_collect_requires_out(tmp_path):
+    """Review of #82: `collect` without --out must not overwrite the checked-in dataset."""
+    import pytest
+    from scripts import greedy_model_fit as gmf
+
+    data = tmp_path / "data.json"
+    data.write_text('{"builds": [1]}')
+    with pytest.raises(SystemExit):
+        gmf.main(["collect", "--data", str(data)])
+    assert data.read_text() == '{"builds": [1]}'
