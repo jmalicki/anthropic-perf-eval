@@ -1,0 +1,52 @@
+name: Set up OR-Tools (prebuilt C++ archive)
+description: >
+  Download Google's prebuilt OR-Tools C++ archive for Ubuntu (it bundles protobuf and abseil,
+  headers and shared libraries), cache it, and export ORTOOLS_PREFIX, LIBRARY_PATH and
+  LD_LIBRARY_PATH for the cp_sat build and for loading libortools at run time.
+  The runner image must match `ubuntu` (the archive is built per Ubuntu release).
+
+inputs:
+  version:
+    description: OR-Tools release tag without the leading v
+    default: "9.15"
+  build:
+    description: Build number in the archive name
+    default: "6755"
+  ubuntu:
+    description: Ubuntu release the archive was built for (must match runs-on)
+    default: "24.04"
+  sha256:
+    description: SHA-256 of the archive
+    default: 6f389320672cee00b78aacefb2bde33fef0bb988c3b2735573b9fffd1047fbda
+
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/ortools
+        key: ortools-${{ runner.os }}-${{ runner.arch }}-ubuntu${{ inputs.ubuntu }}-${{ inputs.version }}.${{ inputs.build }}
+
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        archive="or-tools_amd64_ubuntu-${{ inputs.ubuntu }}_cpp_v${{ inputs.version }}.${{ inputs.build }}.tar.gz"
+        curl -fsSL -o "$RUNNER_TEMP/$archive" \
+          "https://github.com/google/or-tools/releases/download/v${{ inputs.version }}/$archive"
+        echo "${{ inputs.sha256 }}  $RUNNER_TEMP/$archive" | sha256sum -c -
+        mkdir -p ~/ortools
+        tar xzf "$RUNNER_TEMP/$archive" --strip-components=1 -C ~/ortools
+
+    # cp_sat's build.rs falls back to $ORTOOLS_PREFIX/include for abseil and protobuf headers
+    # when brew is absent; scheduler_rs's build.rs links -lprotobuf via LIBRARY_PATH.
+    # scheduler_rs/.cargo/config.toml's Homebrew [env] values apply only when these are unset.
+    - shell: bash
+      run: |
+        prefix="$HOME/ortools"
+        test -f "$prefix/include/ortools/sat/cp_model.h"
+        {
+          echo "ORTOOLS_PREFIX=$prefix"
+          echo "LIBRARY_PATH=$prefix/lib"
+          echo "LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        } >> "$GITHUB_ENV"

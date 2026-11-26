@@ -15,24 +15,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BUILD_FROM_PROJECT_ROOT: "1"
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_NO_INSTALL_CLEANUP: "1"
-  HOMEBREW_NO_ENV_HINTS: "1"
 
 jobs:
   # scheduler_rs unit tests (debug profile, --features cpsat).
   rust:
     name: Rust tests (scheduler_rs)
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
-        run: |
-          brew install or-tools
-          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
-          brew list --versions or-tools protobuf abseil
+      # Prebuilt C++ archive (bundles protobuf and abseil); cached between runs.
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -58,7 +53,7 @@ jobs:
   # Release build of the extension, then everything that imports it.
   python:
     name: Python tests, proofs, kernel builds
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04  # must match the OR-Tools archive (setup-ortools)
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -66,11 +61,9 @@ jobs:
           # scripts/measure_baseline.py reads the original baseline builder from an old commit
           fetch-depth: 0
 
-      - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
-        run: |
-          brew install or-tools
-          echo "ORTOOLS_PREFIX=$(brew --prefix or-tools)" >> "$GITHUB_ENV"
-          brew list --versions or-tools protobuf abseil
+      # Prebuilt C++ archive (bundles protobuf and abseil); cached between runs.
+      - name: Install OR-Tools
+        uses: ./.github/actions/setup-ortools
 
       - uses: astral-sh/setup-uv@v7
         with:
