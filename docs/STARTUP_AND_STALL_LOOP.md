@@ -218,8 +218,12 @@ uv run generate_ssa_kernel.py $F --emission-plan docs/emission_plans/path_flow90
 uv run python -m scripts.scratch_ceiling_diagnosis gap both.json
 # Loop A (per bit source; one heavy job at a time):
 J="--load-tail --greedy-option greedy_budget_force=stall --greedy-option pressure_inflation_threshold=0.98"
-uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
-  --modes nogood,caps,caps-underfilled,rows --budget 8   # + seeds, see section A
+# The eight seeds of section A (--seed-plan replaces the default list, so all are named):
+SEEDS="--seed-plan gather --seed-plan bits+depth4 --seed-plan bits-flow+depth4 --seed-plan mobius+depth4 \
+  --seed-plan docs/emission_plans/floor_optimal.json --seed-plan docs/emission_plans/flow90.json \
+  --seed-plan docs/emission_plans/path_flow90.json --seed-plan docs/emission_plans/path_nogood_capped0.json"
+uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J $SEEDS \
+  --modes nogood,caps,caps-underfilled,rows --budget 8
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \
   --nogood-caps flow=0.92 --modes nogood --budget 8
 uv run python -m scripts.emission_structure loop run --select-bit-source path --state path.json $J \

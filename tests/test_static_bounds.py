@@ -183,7 +183,7 @@ def _build(tmp_path_factory, name, **kwargs):
         return json.load(f)
 
 
-@pytest.fixture(scope="module", params=["greedy", "cpsat"])
+@pytest.fixture(scope="module", params=["greedy", pytest.param("cpsat", marks=pytest.mark.deep)])
 def kernel(request, tmp_path_factory):
     if request.param == "greedy":
         return _build(tmp_path_factory, "greedy")

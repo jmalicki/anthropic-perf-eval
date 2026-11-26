@@ -1044,15 +1044,7 @@ fn release_read_values(
     // What a multiply_add select reads at cycle + 1: its sources, its delta and their group
     // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
     // address assignment counts it (`use_cycles`).
-    let fma_reads: HashSet<VReg> = if fma {
-        let direct: Vec<VReg> = op.srcs.iter().filter_map(|s| s.as_vreg()).chain(op.delta_vreg).collect();
-        direct
-            .iter()
-            .flat_map(|v| std::iter::once(*v).chain(liveness_aliases.get(v).into_iter().flatten().copied()))
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
@@ -1114,6 +1106,17 @@ fn release_read_values(
 /// the select's form only when it places it, so a select that may take the multiply_add form
 /// holds its delta until then (released early again if it takes the vselect form, see
 /// [`release_read_values`]). May contain duplicates.
+/// What a select in the multiply_add form reads at cycle + 1: its operands, its delta and their
+/// vector-group aliases. Its `keep_live` values are not among them (held through its own cycle).
+fn multiply_add_reads(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> HashSet<VReg> {
+    op.srcs
+        .iter()
+        .filter_map(|s| s.as_vreg())
+        .chain(op.delta_vreg)
+        .flat_map(|v| std::iter::once(v).chain(liveness_aliases.get(&v).into_iter().flatten().copied()))
+        .collect()
+}
+
 fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
@@ -3159,15 +3162,21 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                // A select taking the multiply_add form holds what it reads to cycle + 1.
-                let holds_reads = engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice;
+                // A select taking the multiply_add form holds what the multiply_add reads to
+                // cycle + 1; a keep_live-only value is released at this cycle, as in the release loop.
+                let held_to_next: HashSet<VReg> =
+                    if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice {
+                        multiply_add_reads(&ops[idx], &liveness_aliases)
+                    } else {
+                        HashSet::new()
+                    };
                 let freed: Vec<VReg> = liveness_release_vregs(
                     &ops[idx],
                     &liveness_aliases,
                     trace.delta_readers.contains(&op_id),
                 )
                     .into_iter()
-                    .filter(|_| !holds_reads)
+                    .filter(|vreg| !held_to_next.contains(vreg))
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
