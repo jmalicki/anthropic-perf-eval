@@ -2,7 +2,8 @@
 `path_flow90.json` with path bits and the shaped load-tail greedy, `--greedy-flow-priority
 chain-first --greedy-alu-priority native-first` gives 1,030 cycles against 1,033 without them,
 and each alone 1,031 / 1,033 (the measured-by-removal table). Greedy builds are deterministic,
-so a change in these numbers means the scheduler changed. 16-round builds: CI only.
+so a change in these numbers means the scheduler changed. 16-round builds: marked ci_only, deselected by default once #93 lands (on this branch the
+marker is only registered, so a plain pytest run still builds them).
 """
 import json
 import os
