@@ -31,6 +31,7 @@
 pub mod justify;
 pub mod pressure_policy;
 pub mod wavefront;
+pub use wavefront::EarlyStagger;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -76,6 +77,118 @@ pub struct GreedyShape {
     pub shift_policy: ShiftPolicy,
     /// Wavefront only: which ready loads get the load slots (see [`LoadPriority`]).
     pub load_priority: LoadPriority,
+    /// Wavefront only: which ready flow ops get the flow slot (see [`FlowPriority`]).
+    pub flow_priority: FlowPriority,
+    /// Where a SelectChoice that has a one-op `multiply_add` form may run (see
+    /// [`SelectOverflow`]).
+    pub select_overflow: SelectOverflow,
+    /// Wavefront only: native scalar ops before vector ops (see [`AluPriority`]).
+    pub alu_priority: AluPriority,
+    /// Where a ConstChoice is materialised (see [`ConstPolicy`]).
+    pub const_policy: ConstPolicy,
+    /// Wavefront only: a different stagger for the first groups (see [`EarlyStagger`]).
+    pub early_stagger: Option<EarlyStagger>,
+    /// When an op the scratch budget check deferred is forced past the budget (see
+    /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
+    pub budget_force: BudgetForce,
+}
+
+/// Scratch model `words`: when the greedy forces an op that the budget check deferred.
+///
+/// The budget check defers an op whose destination would take the live words over the
+/// budget. With `SameCycle` (default, the historical behaviour) the deferred op with the
+/// highest last-use count is then forced in the same cycle whenever it has a slot, even if
+/// other ops were placed in that cycle, so the check holds one op per cycle at most and
+/// any run that reaches the budget overshoots it (address assignment then rejects the
+/// kernel). The pressure policy's inflation and shift suppression are what keep a default
+/// run below the budget, which is why passing runs stop short of it.
+/// `Stall` forces only in a cycle where nothing else was placed (a real deadlock), as the
+/// `pools` model does: otherwise the deferred op waits for the next cycle, when ops placed
+/// in this one may have freed words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetForce {
+    /// Force one deferred op per cycle whenever it has a slot (default).
+    #[default]
+    SameCycle,
+    /// Force only when nothing else was placed in the cycle.
+    Stall,
+}
+
+/// Wavefront only: the order in which ready flow ops are offered the flow slot. Other
+/// engines keep their order.
+///
+/// The selects of the first rounds (before the mid-kernel gathers) and those of the last
+/// rounds (after them) share the one flow slot in the middle of the schedule: early groups
+/// are in their last select rounds while late groups are still in their first ones. Under
+/// the wavefront key the early groups' late selects go first, and the late groups reach the
+/// load stream late (docs/GREEDY_SHAPE_ABLATION.md section 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowPriority {
+    /// Wavefront key (default).
+    #[default]
+    Key,
+    /// Flow ops that feed a non-final load (a load that some later load depends on, e.g. a
+    /// mid-kernel gather) before the other flow ops, then key.
+    FeedsLoadFirst,
+    /// Flow ops by chain (group) rank first, then key; shared ops first. The first groups'
+    /// selects of the first rounds are not overtaken by later groups' earlier selects, so they
+    /// reach their first gather sooner (docs/STARTUP_AND_STALL_LOOP.md).
+    ChainFirst,
+}
+
+/// Where the greedy materialises a ConstChoice (a constant with alternative encodings).
+///
+/// `Default` (the historical rule): `add_imm` on the flow slot when it is free and no other
+/// flow op is ready in the cycle, else a load. The other policies may also derive the constant
+/// on the scalar ALU from constants already materialised: the `ConstEncoding::{Add, Sub, Mul,
+/// Shift}` alternatives the emitter offers, else `a + b` for any two constants a, b > 0 with
+/// a + b = value < 2^31 (e.g. the batch address offsets 8g); only from producers scheduled in an earlier cycle
+/// whose values are still live in the scheduler's counter, so the read needs no lifetime
+/// extension (address assignment's AluDerive pass then changes nothing). Greedy-only: the
+/// CP-SAT pipeline keeps `Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConstPolicy {
+    /// add_imm when flow is free and idle, else load (default).
+    #[default]
+    Default,
+    /// ALU derivation when an alternative's operands are live and a scalar slot is free; else
+    /// the default rule.
+    AluFirst,
+    /// A load while a load slot is free; else ALU derivation; else the default rule.
+    AluWhenLoadFull,
+}
+
+/// Wavefront only: the order in which ready scalar-ALU work is offered the 12 scalar slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AluPriority {
+    /// Wavefront key (default): native scalar ops and shiftable vector ops in one order.
+    #[default]
+    Key,
+    /// Native scalar-ALU ops (e.g. address adds) before every vector op of the cycle, so a
+    /// vector op shifted to the scalar ALU never takes a slot a ready native op needs.
+    NativeFirst,
+}
+
+/// Where a SelectChoice with a precomputed delta (one `multiply_add` on the vector ALU, or
+/// one `vselect` on flow; both visible one cycle later) runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectOverflow {
+    /// Always flow (default): the greedy never takes the multiply_add form.
+    #[default]
+    Never,
+    /// Flow when the flow slot is free in this cycle; otherwise the vector ALU when it has a
+    /// free slot, for at most `limit` selects over the run (`None` = no limit).
+    Valu { limit: Option<usize> },
+}
+
+impl SelectOverflow {
+    /// Whether one more select may take the multiply_add form after `taken` have.
+    fn allows(&self, taken: usize) -> bool {
+        match *self {
+            SelectOverflow::Never => false,
+            SelectOverflow::Valu { limit } => limit.map_or(true, |l| taken < l),
+        }
+    }
 }
 
 /// Wavefront only: the order in which ready loads are offered the two load slots. Other
@@ -504,6 +617,16 @@ pub(crate) struct GreedyDiagnostics {
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
     last_cycle: Option<usize>,
+    /// Out: ConstChoices the scheduler derived on the scalar ALU (op id -> operands), under a
+    /// [`ConstPolicy`] other than `Default`. Lowering and address assignment need them.
+    pub const_alu_derive: HashMap<usize, crate::types::AluDeriveInfo>,
+    /// Times the hard budget check (live words after the op > budget) deferred an op; an op
+    /// retried in the same cycle counts once per rejection.
+    pub budget_check_deferrals: usize,
+    /// Ops forced past the budget by the force-schedule path.
+    pub forced_past_budget: usize,
+    /// Cycles whose only placement was the first part of a split shift.
+    pub split_only_cycles: usize,
 }
 
 impl GreedyDiagnostics {
@@ -723,12 +846,18 @@ pub(super) fn format_live_usage_breakdown(
 /// # Arguments
 /// * `op` - The op being scheduled (reads its `srcs` and holds its `keep_live` values)
 /// * `liveness_aliases` - Lane → group VReg (both group kinds); write-group VReg → lanes
+/// * `delta_read` - The op is a SelectChoice that may take its one-op multiply_add form, so
+///   its precomputed delta counts as read (see [`liveness_read_vregs`])
 ///
 /// # Returns
 /// The VRegs the op reads or keeps live, then their aliases, each exactly once.
-fn liveness_release_vregs(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> Vec<VReg> {
+fn liveness_release_vregs(
+    op: &SsaOp,
+    liveness_aliases: &HashMap<VReg, Vec<VReg>>,
+    delta_read: bool,
+) -> Vec<VReg> {
     let mut released: Vec<VReg> = Vec::with_capacity(op.srcs.len());
-    for vreg in liveness_read_vregs(op) {
+    for vreg in liveness_read_vregs(op, delta_read) {
         if !released.contains(&vreg) {
             released.push(vreg);
         }
@@ -908,18 +1037,56 @@ fn release_read_values(
     vreg_expiry_heap: &mut BinaryHeap<Reverse<(i32, VReg)>>,
     trace: &mut CounterTrace,
 ) {
-    for vreg in &liveness_release_vregs(op, liveness_aliases) {
+    let delta_read = trace.delta_readers.contains(&op.id);
+    let fma = trace.fma_selects.contains(&op.id);
+    // What a multiply_add select reads at cycle + 1: its sources, its delta and their group
+    // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
+    // address assignment counts it (`use_cycles`).
+    let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
+    for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
+        // A vselect does not read the delta: no read, only one holder fewer. Unless the
+        // same VReg is also a direct source or keep-live read of the select (e.g. the
+        // condition is the delta), which the vselect does read at this cycle.
+        let delta_only = delta_read
+            && !fma
+            && op.delta_vreg == Some(*vreg)
+            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
+            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        if !delta_only {
+            let end = cycle as i32 + i32::from(fma && fma_reads.contains(vreg));
+            let e = trace.read_end.entry(*vreg).or_insert(end);
+            *e = (*e).max(end);
+        }
         if *remaining != 0 || !live_vregs.contains(vreg) {
             continue;
         }
         if write_groups.releasable_at(vreg, cycle) {
-            live_vregs.remove(vreg);
-            live.remove(vreg);
-            trace.release(vreg, cycle);
+            match trace.read_end.get(vreg).copied() {
+                // A multiply_add select read it this cycle: held through this cycle.
+                Some(end) if end > cycle as i32 => vreg_expiry_heap.push(Reverse((end, *vreg))),
+                // Held only for selects that took the vselect form: its interval ended at
+                // its last real read. Give the words back from then on (the counter was
+                // conservative in between).
+                Some(end) if end < cycle as i32 => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    let start = trace.spans.get(vreg).map_or(end, |s| s.0);
+                    let end = end.max(start);
+                    for c in end.max(0) as usize..cycle.min(trace.cycle_end_live.len()) {
+                        trace.cycle_end_live[c] -= vreg.size();
+                    }
+                    trace.release(vreg, end as usize);
+                }
+                _ => {
+                    live_vregs.remove(vreg);
+                    live.remove(vreg);
+                    trace.release(vreg, cycle);
+                }
+            }
         } else if let Some(&hold_until) = write_groups.hold_until.get(vreg) {
             // Written out, but an unread lane holds the block one more cycle.
             if write_groups.pending_writes.get(vreg).map_or(true, |&p| p == 0) {
@@ -931,12 +1098,29 @@ fn release_read_values(
 }
 
 /// VRegs an op holds until it runs: its VReg operands and its `keep_live` list
-/// (the same reads `address_assign`'s `LivenessUse` reports). May contain duplicates.
-fn liveness_read_vregs(op: &SsaOp) -> impl Iterator<Item = VReg> + '_ {
+/// (the same reads `address_assign`'s `LivenessUse` reports), and with `delta_read` the
+/// precomputed delta of a SelectChoice. Address assignment holds the delta (and every
+/// operand) of a select in `select_fma_ops` to the select's cycle + 1; the greedy decides
+/// the select's form only when it places it, so a select that may take the multiply_add form
+/// holds its delta until then (released early again if it takes the vselect form, see
+/// [`release_read_values`]). May contain duplicates.
+/// What a select in the multiply_add form reads at cycle + 1: its operands, its delta and their
+/// vector-group aliases. Its `keep_live` values are not among them (held through its own cycle).
+fn multiply_add_reads(op: &SsaOp, liveness_aliases: &HashMap<VReg, Vec<VReg>>) -> HashSet<VReg> {
+    op.srcs
+        .iter()
+        .filter_map(|s| s.as_vreg())
+        .chain(op.delta_vreg)
+        .flat_map(|v| std::iter::once(v).chain(liveness_aliases.get(&v).into_iter().flatten().copied()))
+        .collect()
+}
+
+fn liveness_read_vregs(op: &SsaOp, delta_read: bool) -> impl Iterator<Item = VReg> + '_ {
     op.srcs
         .iter()
         .filter_map(|src| src.as_vreg())
         .chain(op.keep_live.iter().flatten().copied())
+        .chain(op.delta_vreg.filter(|_| delta_read))
 }
 
 // ============================================================================
@@ -1003,6 +1187,15 @@ struct CounterTrace {
     cycle_end_live: Vec<usize>,
     /// Per value: the cycle it was added to the counter and the cycle it was released.
     spans: HashMap<VReg, (i32, Option<i32>)>,
+    /// Op ids of the SelectChoice ops whose precomputed delta the counter treats as read
+    /// (those that may take the one-op multiply_add form in this run).
+    delta_readers: HashSet<usize>,
+    /// Op ids of the SelectChoice ops placed in the one-op multiply_add form. Address
+    /// assignment (`select_fma_ops`) holds their operands and delta to cycle + 1.
+    fma_selects: HashSet<usize>,
+    /// Per value: the cycle its interval ends at given the reads so far (a read at cycle c
+    /// ends it at c, a multiply_add select's read at c + 1).
+    read_end: HashMap<VReg, i32>,
 }
 
 impl CounterTrace {
@@ -1020,6 +1213,8 @@ impl CounterTrace {
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of shifted ops whose lanes are not all in the
 ///   op's cycle (split shifts); empty otherwise
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds (address assignment's
+///   `select_fma_ops`: their reads are held to cycle + 1)
 ///
 /// # Returns
 /// `(curve, peak, intervals)`: `curve[t]` is the live words at cycle `t`; `peak` is
@@ -1028,9 +1223,10 @@ pub(super) fn interval_liveness_curve(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>), String> {
     let (curve, peak, intervals, _, _) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     Ok((curve, peak, intervals))
 }
 
@@ -1041,6 +1237,7 @@ fn interval_liveness_inputs(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<(Vec<usize>, usize, HashMap<VReg, LiveInterval>, AddressAssignConfig, Vec<SsaOp>), String> {
     let scheduled: Vec<SsaOp> = ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
     // A group none of whose VRegs is written by a scheduled op occupies nothing.
@@ -1055,6 +1252,7 @@ fn interval_liveness_inputs(
     let config = AddressAssignConfig {
         vector_group_lanes: groups,
         shifted_alu_cycles: shifted_lane_cycles.clone(),
+        select_fma_ops: select_fma_ops.clone(),
         ..Default::default()
     };
     let intervals = compute_live_intervals(&config, &scheduled)?;
@@ -1097,7 +1295,7 @@ fn compare_counter_with_intervals(
 ) -> Result<LivenessAgreement, String> {
     let cycle_end_live = &trace.cycle_end_live;
     let (curve, interval_peak, intervals) =
-        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &trace.fma_selects)?;
     let mut agreement = LivenessAgreement {
         counter_peak,
         counter_cycle_end_peak: cycle_end_live.iter().copied().max().unwrap_or(0),
@@ -1421,6 +1619,26 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 /// # Returns
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
 /// [`schedule_ssa_greedy_with_liveness_agreement`].
+/// After a greedy rerun with fixed ConstChoice encodings: every fixed `AluDerive` the rerun
+/// did not place as a derivation (`derived`, the rerun's `GreedyDiagnostics::const_alu_derive`)
+/// was scheduled as a load, so record it as `Load`; lowering then emits what was scheduled.
+///
+/// # Returns
+/// How many derivations became loads.
+pub(crate) fn reconcile_const_choice_encodings(
+    encodings: &mut HashMap<usize, ConstChoiceEncoding>,
+    derived: &HashMap<usize, crate::types::AluDeriveInfo>,
+) -> usize {
+    let mut demoted = 0;
+    for (id, enc) in encodings.iter_mut() {
+        if matches!(enc, ConstChoiceEncoding::AluDerive(_)) && !derived.contains_key(id) {
+            *enc = ConstChoiceEncoding::Load;
+            demoted += 1;
+        }
+    }
+    demoted
+}
+
 pub(crate) fn schedule_ssa_greedy_shaped(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -1511,7 +1729,16 @@ pub(crate) fn schedule_ssa_greedy_shaped(
         &words_shape,
         shifted_lane_cycles,
     )?;
-    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles)?;
+    // Every select the run lowered as a multiply_add: the caller's set (overflow placements)
+    // and the selects forced to that form, which the caller only adds after the call returns.
+    // The local copy leaves the caller's set to the caller.
+    let mut fma_now: HashSet<usize> = select_choice_fma_ops.as_deref().cloned().unwrap_or_default();
+    if let Some(fixed) = fixed_select_choice_encoding {
+        fma_now.extend(
+            fixed.iter().filter(|(_, enc)| matches!(enc, SelectChoiceEncoding::Fma)).map(|(id, _)| *id),
+        );
+    }
+    let peaks = scratch_pool_peaks(ops, vector_group_lanes, shifted_lane_cycles, &fma_now)?;
     if first.0 .1 || peaks.split_words() <= scratch_budget {
         // Within the pools already, or over budget even on words (reported as such).
         return Ok(first);
@@ -1581,6 +1808,7 @@ pub(crate) fn schedule_ssa_greedy_shaped(
 /// * `ops` - Ops with assigned cycles; negative cycles (skipped dead stores) are ignored
 /// * `vector_group_lanes` - Vector groups, as passed to the scheduler
 /// * `shifted_lane_cycles` - Per-lane cycles of split shifts
+/// * `select_fma_ops` - SelectChoice ops lowered as multiply_adds
 ///
 /// # Returns
 /// The pool peaks, or the interval computation's error.
@@ -1588,9 +1816,10 @@ pub(super) fn scratch_pool_peaks(
     ops: &[SsaOp],
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     shifted_lane_cycles: &HashMap<usize, Vec<i32>>,
+    select_fma_ops: &HashSet<usize>,
 ) -> Result<crate::address_assign::PoolPeaks, String> {
     let (_, _, intervals, config, scheduled) =
-        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles)?;
+        interval_liveness_inputs(ops, vector_group_lanes, shifted_lane_cycles, select_fma_ops)?;
     let spans = crate::address_assign::compute_value_spans(
         &intervals,
         &crate::address_assign::last_write_cycles(&scheduled, &config),
@@ -1826,6 +2055,35 @@ fn schedule_ssa_greedy_core(
         HashSet::new()
     };
 
+    // ConstPolicy: per ConstChoice, its ALU alternatives as (left value, right value, opcode),
+    // and per constant value the ops that produce it.
+    let mut const_derivations: HashMap<usize, Vec<(i64, i64, Opcode)>> = HashMap::new();
+    let mut value_producers: HashMap<i64, Vec<usize>> = HashMap::new();
+    if shape.const_policy != ConstPolicy::Default {
+        for (idx, op) in ops.iter().enumerate() {
+            if let (Some(v), Some(d)) = (op.produces_constant, op.dest) {
+                if d.is_scalar() {
+                    value_producers.entry(v).or_default().push(idx);
+                }
+            }
+            if op.opcode != Opcode::ConstChoice {
+                continue;
+            }
+            let alts: Vec<(i64, i64, Opcode)> = op
+                .const_alternatives
+                .iter()
+                .flatten()
+                .filter_map(|enc| {
+                    let deps = enc.dependencies();
+                    Some((*deps.first()?, *deps.get(1)?, enc.alu_opcode()?))
+                })
+                .collect();
+            if !alts.is_empty() {
+                const_derivations.insert(idx, alts);
+            }
+        }
+    }
+
     // A SelectChoice fixed to the multiply-add path without a precomputed delta (it has a
     // sub_temp: subtract at its cycle, multiply_add one cycle later) makes its result visible
     // one cycle later than the vselect path. The CP-SAT model requires that extra cycle
@@ -1885,6 +2143,18 @@ fn schedule_ssa_greedy_core(
     // Skip AddImm alternatives when building vreg_def (use Load's definition)
     let mut vreg_def: HashMap<VReg, usize> = HashMap::new();
     let mut vreg_users: HashMap<VReg, HashSet<usize>> = HashMap::new();
+    // Selects that may take the one-op multiply_add form hold their delta (address
+    // assignment reads it at cycle + 1 when they do): with select overflow, any select with a
+    // delta the hint pass does not own; with fixed encodings, those fixed to the FMA path.
+    trace.delta_readers = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::SelectChoice && op.delta_vreg.is_some())
+        .filter(|op| match fixed_select_choice_encoding {
+            Some(fixed) => matches!(fixed.get(&op.id), Some(SelectChoiceEncoding::Fma)),
+            None => !select_choice_fixed_to_vselect && shape.select_overflow != SelectOverflow::Never,
+        })
+        .map(|op| op.id)
+        .collect();
 
     for (idx, op) in ops.iter().enumerate() {
         if let Some(dest) = op.dest {
@@ -1895,7 +2165,7 @@ fn schedule_ssa_greedy_core(
         }
         // Still track users from AddImm alternatives (they read zero_vreg).
         // `keep_live` values count as read: address assignment holds them until this op.
-        for vreg in liveness_read_vregs(op) {
+        for vreg in liveness_read_vregs(op, trace.delta_readers.contains(&op.id)) {
             vreg_users.entry(vreg).or_default().insert(idx);
         }
     }
@@ -2036,6 +2306,7 @@ fn schedule_ssa_greedy_core(
             &dead_store_indices,
             stagger_cycles,
             groups_in_flight,
+            shape.early_stagger,
         )?),
     };
     if diagnostics.verbose {
@@ -2194,6 +2465,9 @@ fn schedule_ssa_greedy_core(
     // multiply-add path in this cycle (see fma_extra_latency): the subtract runs at the
     // select's cycle, the multiply_add one cycle later, one vector slot each.
     let mut fma_carry: usize = 0;
+    // SelectChoice ops this run placed on the vector ALU in their one-op multiply_add form
+    // (`SelectOverflow::Valu`); reported with the other multiply-add selects at the end.
+    let mut overflow_select_fma: HashSet<usize> = HashSet::new();
 
     // ASAP inflation diagnostics
     let mut inflation_stats = InflationStats::default();
@@ -2288,6 +2562,9 @@ fn schedule_ssa_greedy_core(
         let mut budget_deferred: Vec<usize> = Vec::new();
         let mut made_progress = true;
         let mut scheduled_this_cycle: usize = 0;
+        // A split shift started this cycle: its destination block is reserved and scalar
+        // slots are taken, so the cycle is not a deadlock for `BudgetForce::Stall`.
+        let mut split_started_this_cycle = false;
 
         // Finish last cycle's split shift before anything else takes scalar slots: its
         // remaining lanes run now and the op completes in this cycle.
@@ -2434,6 +2711,31 @@ fn schedule_ssa_greedy_core(
                     _ => loads.sort_by_key(|&idx| (!w.feeds_load(idx), w.key(idx), idx)),
                 }
                 for (&p, idx) in positions.iter().zip(loads) {
+                    ready_this_cycle[p] = idx;
+                }
+            }
+            if shape.flow_priority == FlowPriority::ChainFirst {
+                let positions: Vec<usize> = (0..ready_this_cycle.len())
+                    .filter(|&p| ops[ready_this_cycle[p]].engine == Engine::Flow)
+                    .collect();
+                let mut flows: Vec<usize> = positions.iter().map(|&p| ready_this_cycle[p]).collect();
+                flows.sort_by_key(|&idx| (w.chain(idx).map_or(0, |r| r + 1), w.key(idx), idx));
+                for (&p, idx) in positions.iter().zip(flows) {
+                    ready_this_cycle[p] = idx;
+                }
+            }
+            if shape.alu_priority == AluPriority::NativeFirst {
+                // Stable: natives keep their order among themselves, as does everything else.
+                ready_this_cycle.sort_by_key(|&idx| ops[idx].engine != Engine::Alu);
+            }
+            if shape.flow_priority == FlowPriority::FeedsLoadFirst {
+                // Same for the flow ops (ConstChoice is a load-engine op in the SSA).
+                let positions: Vec<usize> = (0..ready_this_cycle.len())
+                    .filter(|&p| ops[ready_this_cycle[p]].engine == Engine::Flow)
+                    .collect();
+                let mut flows: Vec<usize> = positions.iter().map(|&p| ready_this_cycle[p]).collect();
+                flows.sort_by_key(|&idx| (!w.feeds_nonfinal_load(idx), w.key(idx), idx));
+                for (&p, idx) in positions.iter().zip(flows) {
                     ready_this_cycle[p] = idx;
                 }
             }
@@ -2622,19 +2924,88 @@ fn schedule_ssa_greedy_core(
                 // When fixed_const_choice_encoding is Some (schedule-with-fixed-choices), use the map.
                 // SelectChoice: when fixed_select_choice_encoding is Some, use map (Fma => VALU, Vselect => Flow).
                 let op_id = ops[idx].id;
+                let mut const_derive: Option<crate::types::AluDeriveInfo> = None;
                 let engine = if ops[idx].opcode == Opcode::ConstChoice {
-                    if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
-                        if matches!(enc, ConstChoiceEncoding::AddImm) {
+                    let default_rule = |slots: &SlotTracker| {
+                        if slots.flow_used < 1 && flow_other_ready == 0 {
                             Engine::Flow
                         } else {
                             Engine::Load
                         }
+                    };
+                    if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
+                        match enc {
+                            ConstChoiceEncoding::AddImm => Engine::Flow,
+                            ConstChoiceEncoding::AluDerive(info) => {
+                                // A derivation of the first run: honour it only where it is
+                                // sound as the policy path makes it (both producers scheduled
+                                // in an earlier cycle and still live, ALU room); otherwise
+                                // the rerun loads the constant and the caller records Load
+                                // (`reconcile_const_choice_encodings`). Never an ALU op the
+                                // slot count and the precedences do not see.
+                                let producer_ok = |id: usize| {
+                                    id_to_idx.get(&id).is_some_and(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                };
+                                if slots.alu_used < 12 && producer_ok(info.left_op_id) && producer_ok(info.right_op_id) {
+                                    const_derive = Some(info.clone());
+                                    Engine::Alu
+                                } else {
+                                    Engine::Load
+                                }
+                            }
+                            _ => Engine::Load,
+                        }
                     } else if const_choice_fixed_to_load {
                         Engine::Load
-                    } else if slots.flow_used < 1 && flow_other_ready == 0 {
-                        Engine::Flow
-                    } else {
+                    } else if shape.const_policy == ConstPolicy::Default {
+                        default_rule(&slots)
+                    } else if shape.const_policy == ConstPolicy::AluWhenLoadFull && slots.load_used < 2 {
                         Engine::Load
+                    } else {
+                        const_derive = if slots.alu_used < 12 {
+                            // A producer of `value` scheduled in an earlier cycle whose value
+                            // is still live (so the read needs no lifetime extension).
+                            let live_producer = |value: i64| {
+                                value_producers.get(&value).and_then(|ps| {
+                                    ps.iter().copied().find(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                })
+                            };
+                            let derive = |a: i64, b: i64, opcode: Opcode| {
+                                Some(crate::types::AluDeriveInfo {
+                                    left_op_id: ops[live_producer(a)?].id,
+                                    right_op_id: ops[live_producer(b)?].id,
+                                    opcode,
+                                })
+                            };
+                            // The emitter's alternatives first, then any two live constants
+                            // that add up to the value (non-negative, below 2^31: no wrap).
+                            let target = ops[idx].produces_constant;
+                            const_derivations
+                                .get(&idx)
+                                .and_then(|alts| alts.iter().find_map(|&(a, b, opcode)| derive(a, b, opcode)))
+                                .or_else(|| {
+                                    let v = target.filter(|&v| v > 0 && v < (1i64 << 31))?;
+                                    let mut values: Vec<i64> =
+                                        value_producers.keys().copied().filter(|&a| a > 0 && a < v).collect();
+                                    values.sort_unstable_by(|x, y| y.cmp(x));
+                                    values.into_iter().find_map(|a| derive(a, v - a, Opcode::Add))
+                                })
+                        } else {
+                            None
+                        };
+                        if const_derive.is_some() {
+                            Engine::Alu
+                        } else {
+                            default_rule(&slots)
+                        }
                     }
                 } else if ops[idx].opcode == Opcode::SelectChoice {
                     if let Some(enc) = fixed_select_choice_encoding.and_then(|m| m.get(&op_id)) {
@@ -2645,6 +3016,13 @@ fn schedule_ssa_greedy_core(
                         }
                     } else if select_choice_fixed_to_vselect {
                         Engine::Flow
+                    } else if shape.select_overflow.allows(overflow_select_fma.len())
+                        && ops[idx].delta_vreg.is_some()
+                        && slots.flow_used >= 1
+                        && slots.valu_used < 6
+                    {
+                        // Flow slot taken this cycle: the one-op multiply_add form.
+                        Engine::Valu
                     } else {
                         ops[idx].engine // default Flow (vselect)
                     }
@@ -2726,6 +3104,7 @@ fn schedule_ssa_greedy_core(
                                 vreg_remaining_users.get(&counted).is_some_and(|&n| n > 0);
                             if has_reader && pools.fits(&live.after(&added, &[]), scratch_budget) {
                                 slots.alu_used += free_alu;
+                                split_started_this_cycle = true;
                                 split_carry = Some(SplitShift {
                                     idx,
                                     first_cycle: cycle as i32,
@@ -2777,18 +3156,35 @@ fn schedule_ssa_greedy_core(
                 let words_added: usize = added.iter().map(|v| v.size()).sum();
                 // Exactly what the release loop below frees: every value (operand, keep_live
                 // or vector-group alias) for which this op is the last remaining reader.
-                let freed: Vec<VReg> = liveness_release_vregs(&ops[idx], &liveness_aliases)
+                // A select taking the multiply_add form holds what the multiply_add reads to
+                // cycle + 1; a keep_live-only value is released at this cycle, as in the release loop.
+                let held_to_next: HashSet<VReg> =
+                    if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice {
+                        multiply_add_reads(&ops[idx], &liveness_aliases)
+                    } else {
+                        HashSet::new()
+                    };
+                let freed: Vec<VReg> = liveness_release_vregs(
+                    &ops[idx],
+                    &liveness_aliases,
+                    trace.delta_readers.contains(&op_id),
+                )
                     .into_iter()
+                    .filter(|vreg| !held_to_next.contains(vreg))
                     .filter(|vreg| {
                         vreg_remaining_users.get(vreg).map_or(false, |&n| n == 1)
                             && live_vregs.contains(vreg)
                             && write_groups.releasable_at(vreg, cycle)
+                            // A multiply_add select read it this cycle: the release loop holds
+                            // it to cycle + 1, so it is not freed for this op's write.
+                            && trace.read_end.get(vreg).map_or(true, |&end| end <= cycle as i32)
                     })
                     .collect();
                 let words_freed: usize = freed.iter().map(|v| v.size()).sum();
                 // Net pressure change: add new VReg, subtract freed VRegs (same-cycle reuse)
                 if !pools.fits(&live.after(&added, &freed), scratch_budget) {
                     // Defer for retry - liveness may decrease after other ops scheduled
+                    diagnostics.budget_check_deferrals += 1;
                     budget_deferred.push(idx);
                     continue;
                 }
@@ -2826,6 +3222,20 @@ fn schedule_ssa_greedy_core(
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&idx) {
                             fma_carry += 1;
+                        }
+                        if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
+                            && fixed_select_choice_encoding.is_none()
+                        {
+                            overflow_select_fma.insert(op_id);
+                        }
+                        if let Some(info) = const_derive.take() {
+                            debug_assert_eq!(engine, Engine::Alu);
+                            diagnostics.const_alu_derive.insert(op_id, info);
+                        }
+                        if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
+                            && ops[idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
                         }
                         // Record ConstChoice scheduled as add_imm for lowering (skip when hint pass or fixed encoding owns)
                         if fixed_const_choice_encoding.is_none()
@@ -2959,7 +3369,21 @@ fn schedule_ssa_greedy_core(
         // the op waits for a later cycle, and the force path runs only when nothing at all
         // was scheduled this cycle. (Without capacities the historical behaviour is kept: a
         // deferred op that has a slot is forced in the same cycle.)
-        if !budget_deferred.is_empty() && (pools.caps.is_none() || scheduled_this_cycle == 0) {
+        //
+        // `BudgetForce::Stall` gives the words model the same rule: an op the budget check
+        // deferred waits while anything else is placed, and is forced only in a cycle where
+        // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
+        let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
+        // With `Stall`, a cycle whose only placement was a split-shift start is not a
+        // deadlock either, with or without pool capacities (`pools` changes only
+        // `force_same_cycle` above). Defensive: a split starts only
+        // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
+        // the same cycle (`split_only_cycles` stays 0; checked in the tests).
+        let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
+        if split_started_this_cycle && scheduled_this_cycle == 0 {
+            diagnostics.split_only_cycles += 1;
+        }
+        if !budget_deferred.is_empty() && (force_same_cycle || (scheduled_this_cycle == 0 && !stall_progress)) {
             // Sort by LUC and pick the best one
             budget_deferred.sort_by(|&a, &b| {
                 compute_luc(ops, &vreg_remaining_users, b).cmp(&compute_luc(
@@ -3036,11 +3460,17 @@ fn schedule_ssa_greedy_core(
                     format_live_usage_breakdown(ops, &live_vregs, cycle, live.words, scratch_budget)
                 });
                 budget_exceeded = true;
+                diagnostics.forced_past_budget += 1;
                 let mut force_shifted = false;
                 match force_place_result {
                     SlotResult::Placed => {
                         if engine == Engine::Valu && fma_extra_latency.contains(&force_idx) {
                             fma_carry += 1;
+                        }
+                        if engine == Engine::Valu && ops[force_idx].opcode == Opcode::SelectChoice
+                            && ops[force_idx].delta_vreg.is_some()
+                        {
+                            trace.fma_selects.insert(op_id);
                         }
                     }
                     SlotResult::Shifted => {
@@ -3245,6 +3675,12 @@ fn schedule_ssa_greedy_core(
     // these collections will be empty. The tracking code remains for compatibility
     // but will not find any expanded SelectChoice ops.
     // =========================================================================
+    if select_choice_fma_ops.is_none() && !overflow_select_fma.is_empty() {
+        // Lowering would emit these as vselects on the flow slot the greedy did not count.
+        return Err("select overflow placed SelectChoice ops on the vector ALU, but the caller \
+                    does not collect multiply-add selects"
+            .to_string());
+    }
     if let Some(fma_ops) = select_choice_fma_ops {
         // When select_choice_fixed_to_vselect (hint pass enabled), leave set empty so hint pass owns the decision.
         if !select_choice_fixed_to_vselect {
@@ -3260,6 +3696,7 @@ fn schedule_ssa_greedy_core(
             }
             fma_ops.extend(selectchoice_to_fma);
         }
+        fma_ops.extend(overflow_select_fma.iter().copied());
     }
 
     if let Some(sub_cycles) = select_sub_cycles {
@@ -3301,6 +3738,13 @@ fn schedule_ssa_greedy_core(
             inflation_stats.net_liveness_blocks,
             inflation_stats.pass_through_blocks,
             inflation_stats.breaker_activations,
+        );
+    }
+
+    if diagnostics.verbose {
+        eprintln!(
+            "Greedy budget check: {} deferrals, {} ops forced past the budget",
+            diagnostics.budget_check_deferrals, diagnostics.forced_past_budget
         );
     }
 

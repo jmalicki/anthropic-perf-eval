@@ -1299,6 +1299,173 @@ fn test_surgery_does_not_move_a_kept_live_value_past_its_keeper() {
 }
 
 #[test]
+fn test_surgery_checks_where_moved_readers_and_keepers_are() {
+    use super::surgery::Surgery;
+    let p = one_site_program();
+    // Op 2 (broadcast of M) reads op 1 (M). Moved after op 5, the reader is before op 7:
+    // M cannot follow op 7.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 5).unwrap();
+    let err = surgery.move_after(&[1], 7).unwrap_err();
+    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.finish().unwrap();
+    // At the same anchor the reader moved first comes first: its operand cannot follow.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 7).unwrap();
+    let err = surgery.move_after(&[1], 7).unwrap_err();
+    assert!(err.contains("read by op 2"), "{}", err);
+    surgery.finish().unwrap();
+    // The other order is valid: the reader after op 7, its operand after op 5.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[2], 7).unwrap();
+    surgery.move_after(&[1], 5).unwrap();
+    surgery.finish().unwrap();
+    // The same for an op that names M in keep_live: moved after op 5, it is before op 7.
+    let mut q = clone_program(&p);
+    q.ops[3].keep_live = Some(vec![p.ops[1].dest.unwrap()]);
+    let mut surgery = Surgery::new(q).unwrap();
+    surgery.move_after(&[3, 4], 5).unwrap();
+    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
+    assert!(err.contains("kept live by op 3"), "{}", err);
+    surgery.finish().unwrap();
+}
+
+#[test]
+fn test_surgery_drops_a_moved_op_that_is_then_removed() {
+    use super::surgery::{Stamp, Surgery};
+    // Move the broadcast of M after op 7, then replace it there by a new op with the same
+    // destination: the moved copy must not be placed as well.
+    let p = one_site_program();
+    let bm = p.ops[2].dest.unwrap();
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.move_after(&[1, 2], 7).unwrap();
+    surgery.remove(2);
+    surgery.insert_after(7, p.ops[2].clone(), &Stamp::of(&p.ops[2]));
+    let (after, _) = surgery.finish().unwrap();
+    assert_eq!(after.ops.iter().filter(|o| o.dest == Some(bm)).count(), 1);
+}
+
+#[test]
+fn test_hash_merge_keeps_a_kept_live_constant() {
+    use crate::types::{Opcode, Operand};
+    // m = 3, c = 5, d = 7, k = 1, and the surviving last store names the scalar constant 7 in
+    // keep_live. The rewrite removes the last reader of 7 (the broadcast of D); dead code
+    // elimination must keep 7 for the store. Without the keeper, 7 goes with the site.
+    let build = |keep: bool| {
+        let (mut p, _) = synthetic_hash_program(11, 1);
+        let consts: Vec<usize> = (0..p.ops.len()).filter(|&i| p.ops[i].opcode == Opcode::ConstChoice).collect();
+        for (&i, value) in consts.iter().zip([3i64, 5, 7, 1]) {
+            p.ops[i].srcs[0] = Operand::Imm(value);
+            p.ops[i].produces_constant = Some(value);
+            p.ops[i + 1].produces_constant = Some(value);
+        }
+        let seven = p.ops[consts[2]].dest.unwrap();
+        if keep {
+            p.ops.last_mut().unwrap().keep_live = Some(vec![seven]);
+        }
+        (p, seven)
+    };
+    let defines = |p: &crate::kernel_builder::SsaProgram, v| p.ops.iter().any(|o| o.dest == Some(v));
+    let (p, seven) = build(true);
+    let before = clone_program(&p);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1, "{:?}", report.rejections);
+    assert!(defines(&after, seven));
+    super::surgery::Surgery::check(&after).unwrap();
+    assert_same_values(&before, &after, 3);
+    let (p, seven) = build(false);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1);
+    assert!(!defines(&after, seven));
+    assert!(report.surgery.cascaded.iter().any(|&(_, _, c)| c == Some(7)), "{:?}", report.surgery.cascaded);
+}
+
+#[test]
+fn test_hash_merge_leaves_no_keep_live_only_reference() {
+    use crate::types::VReg;
+    // Pipeline dead code elimination (DcePass, after TransformPass) follows `srcs` only. On the
+    // emitter's programs every keep_live value is also read through `srcs` (the round R-2 hash
+    // output, read by round R-1), and the rewrite keeps it that way.
+    for rounds in [2, 16] {
+        let (p, report) = apply_hash_merge(raw_program(&ProblemSpec { rounds, ..Default::default() }), &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+        assert_eq!(report.sites, rounds * 32);
+        let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
+        let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
+        assert_eq!(kept.len(), 32, "rounds {}", rounds);
+        assert!(kept.iter().all(|v| read.contains(v)), "rounds {}: a keep_live-only value", rounds);
+    }
+}
+
+#[test]
+fn test_hash_merge_drops_a_dead_keeper_of_a_removed_value() {
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // An unused broadcast (already dead) names the scalar D in keep_live. The rewrite removes
+    // D's last live reader, so D goes, and the dead keeper with it.
+    let mut p = one_site_program();
+    let d = p.ops[5].dest.unwrap();
+    let mut op = SsaOp::new(p.ops.len(), Engine::Valu, Opcode::Vbroadcast, Some(VReg::vector(p.vreg_count)), vec![Operand::VReg(p.ops[1].dest.unwrap())]);
+    p.vreg_count += 1;
+    op.keep_live = Some(vec![d]);
+    p.ops.push(op);
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1, "{:?}", report.rejections);
+    assert!(!after.ops.iter().any(|o| o.dest == Some(d)));
+    assert!(!after.ops.iter().any(|o| o.keep_live.is_some()));
+    assert!(report.surgery.dropped_dead >= 1);
+}
+
+#[test]
+fn test_hash_merge_keeps_a_value_read_by_a_select_delta() {
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // A live SelectChoice reads the broadcast of D as its delta (not in srcs). The rewrite
+    // removes D's other reader (the site's add); the broadcast must stay for the select.
+    let mut p = one_site_program();
+    let (a, bd) = (p.ops[0].dest.unwrap(), p.ops[6].dest.unwrap());
+    let sel = VReg::vector(p.vreg_count);
+    p.vreg_count += 1;
+    let mut op = SsaOp::new(p.ops.len(), Engine::Flow, Opcode::SelectChoice, Some(sel), vec![Operand::VReg(a), Operand::VReg(a), Operand::VReg(a)]);
+    op.delta_vreg = Some(bd);
+    p.ops.push(op);
+    p.ops.push(SsaOp::new(p.ops.len(), Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(20000), Operand::VReg(sel)]));
+    let (after, report) = apply_hash_merge(p, &merge_rule(ProposalSource::Ops), |_| true).unwrap();
+    assert_eq!(report.sites, 1, "{:?}", report.rejections);
+    assert!(after.ops.iter().any(|o| o.dest == Some(bd)));
+}
+
+#[test]
+fn test_surgery_rename_cycle_is_an_error() {
+    use super::surgery::Surgery;
+    let p = one_site_program();
+    let (m, c) = (p.ops[2].dest.unwrap(), p.ops[4].dest.unwrap());
+    // An identity rename is nothing.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.replace_uses(m, m);
+    surgery.finish().unwrap();
+    // A cycle is an error, not a panic.
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.replace_uses(m, c);
+    surgery.replace_uses(c, m);
+    let err = surgery.finish().err().expect("a rename cycle is rejected");
+    assert!(err.contains("rename cycle"), "{}", err);
+}
+
+#[test]
+fn test_surgery_checks_inserted_readers_before_a_move() {
+    use super::surgery::{Stamp, Surgery};
+    use crate::types::{Engine, Opcode, Operand};
+    // A new op inserted before op 5 reads M (op 1): M cannot move after op 7.
+    let p = one_site_program();
+    let m = p.ops[1].dest.unwrap();
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    let dest = surgery.fresh(true);
+    let op = SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(dest), vec![Operand::VReg(m)]);
+    surgery.insert_before(5, op, &Stamp::of(&p.ops[1]));
+    let err = surgery.move_after(&[1, 2], 7).unwrap_err();
+    assert!(err.contains("inserted next to op 5"), "{}", err);
+    surgery.finish().unwrap();
+}
+
+#[test]
 fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
     use super::surgery::{Stamp, Surgery};
     use crate::types::{Engine, Opcode, Operand};
