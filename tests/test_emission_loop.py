@@ -299,3 +299,46 @@ def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
     assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
                      check_scheduler=False).scheduler == {"extension_sha256": "a"}
     assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #74)
+# ----------------------------------------------------------------------------
+def test_rows_loop_survives_a_failed_build_without_incumbent(table, tmp_path, monkeypatch):
+    """No valid incumbent yet and the candidate fails the scratch budget: the loop records it
+    and goes on (before, the feedback read best['cycles'] from None and aborted the run)."""
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    monkeypatch.setattr(el, "solve", lambda *a, **k: {"status": "optimal", "rows": rows, "solves": []})
+
+    def failing_evaluate(r, name, *a, **k):
+        return stage2._failed(r, name, el.plan_key(r), "ScratchBudgetExceeded: test", peak_live=1600), True
+
+    monkeypatch.setattr(stage2, "evaluate", failing_evaluate)
+    assert el.loop_rows(stage2, 2, 5, 1.0) is None
+    rows_entries = [e for e in stage2.trace if e["mode"] == "rows"]
+    assert len(rows_entries) == 2 and all("no valid incumbent" in e["feedback"] for e in rows_entries)
+
+
+def test_max_axis_below_two_is_rejected(table, tmp_path):
+    with pytest.raises(SystemExit):
+        el.main(["report", "--state", str(tmp_path / "s.json"), "--max-axis", "1"])
+    with pytest.raises(ValueError, match="max_axis"):
+        el.RowTable(CTX, {}, 0, max_axis=1)._axis([1, 2, 3])
+
+
+def test_valu_diagnostic_counts_selects_on_the_valu(table):
+    """valu_after_greedy_shift counts native vector ops left on the VALU plus selects lowered
+    to multiply_adds there; a build without the field counts none."""
+    stage2 = el.Stage2(table, "/nonexistent", None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    counts = table.predict(rows)
+    base = dict(_fake_build(rows), counts=counts, predicted_floor=es.choice_floor(counts)["cycles"],
+                summary={"static_bound_any": 0, "valu_shifted": 0})
+    native = counts["vec_fixed"] + counts["vec_shiftable"]
+    stage2.builds = {"a": base}
+    without = el.surrogates(stage2, None)[0]["valu_after_greedy_shift"]
+    assert without == -(-native // es.CAP["valu"])
+    with_selects = dict(base, summary=dict(base["summary"], select_ops_on_valu=6 * 7))
+    stage2.builds = {"a": with_selects}
+    assert el.surrogates(stage2, None)[0]["valu_after_greedy_shift"] == -(-(native + 42) // es.CAP["valu"])
