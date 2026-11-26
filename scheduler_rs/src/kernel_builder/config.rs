@@ -740,6 +740,13 @@ pub struct CompilerConfig {
     /// each lane at its own cycle (default: false, the greedy that feeds CP-SAT makes no
     /// split shifts).
     pub cpsat_split_shift_hint: bool,
+    /// When the greedy shifts a vector op to the scalar ALU (default: `WhenFull`).
+    pub greedy_shift_policy: GreedyShiftPolicyKind,
+    /// Pace target for `greedy_shift_policy` `Pace`/`ReservePace`: vector ops to run as 8
+    /// scalar ops over the whole schedule; `None` = the balanced split of the emitted counts.
+    pub greedy_shift_target: Option<usize>,
+    /// Wavefront: which ready loads get the load slots (default: `Key`, the wavefront key).
+    pub greedy_load_priority: super::ssa_greedy::LoadPriority,
 }
 
 /// Scratch size used for "no scratch constraint" (`--no-scratch-constraint`): large enough that
@@ -765,6 +772,9 @@ impl Default for CompilerConfig {
             greedy_split_shift: false,
             greedy_justify_iterations: 0,
             cpsat_split_shift_hint: false,
+            greedy_shift_policy: GreedyShiftPolicyKind::default(),
+            greedy_shift_target: None,
+            greedy_load_priority: super::ssa_greedy::LoadPriority::Key,
             pressure_thresholds: PressureThresholds::default(),
             greedy_budget_headroom: 0,
             scratch_size: SCRATCH_SIZE,
@@ -865,6 +875,55 @@ impl CompilerConfig {
             split_shift: self.greedy_split_shift,
             scratch_pools: self.scratch_model.is_pools(),
             pool_caps: None,
+            load_priority: self.greedy_load_priority,
+            shift_policy: {
+                use super::ssa_greedy::ShiftPolicy;
+                let target = self.greedy_shift_target;
+                match self.greedy_shift_policy {
+                    GreedyShiftPolicyKind::WhenFull => ShiftPolicy::WhenFull,
+                    GreedyShiftPolicyKind::Reserve => ShiftPolicy::Reserve,
+                    GreedyShiftPolicyKind::Pace => ShiftPolicy::Pace { target },
+                    GreedyShiftPolicyKind::ReservePace => ShiftPolicy::ReservePace { target },
+                }
+            },
+        }
+    }
+}
+
+/// When the greedy runs a shiftable vector op on the scalar ALU (`--greedy-shift-policy`).
+///
+/// See `ssa_greedy::ShiftPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GreedyShiftPolicyKind {
+    /// Only when the vector slots are full (default).
+    #[default]
+    WhenFull,
+    /// Also when the free vector slots are wanted by non-shiftable ops later in the cycle.
+    Reserve,
+    /// Also whenever behind the pace toward a target number of shifts.
+    Pace,
+    /// `Reserve` or `Pace`.
+    ReservePace,
+}
+
+impl GreedyShiftPolicyKind {
+    /// Parse the CLI/binding spelling.
+    ///
+    /// # Arguments
+    /// * `s` - `"when-full"`, `"reserve"`, `"pace"` or `"reserve-pace"`
+    ///
+    /// # Returns
+    /// The kind, or an error message naming the valid values.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "when-full" => Ok(GreedyShiftPolicyKind::WhenFull),
+            "reserve" => Ok(GreedyShiftPolicyKind::Reserve),
+            "pace" => Ok(GreedyShiftPolicyKind::Pace),
+            "reserve-pace" => Ok(GreedyShiftPolicyKind::ReservePace),
+            other => Err(format!(
+                "Invalid greedy_shift_policy '{}': must be 'when-full', 'reserve', 'pace' or 'reserve-pace'",
+                other
+            )),
         }
     }
 }
