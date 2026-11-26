@@ -92,6 +92,12 @@ def is_canonical(rows, ctx: es.Context) -> bool:
     return [list(r) for r in rows] == es.canonical_rows(rows, ctx)
 
 
+def same_scheduler(a: Mapping | None, b: Mapping | None) -> bool:
+    """True if two fingerprints name the same extension binary. A fingerprint that failed
+    ({"error": ...}) or is missing matches nothing, not even an equal failure."""
+    return bool(a and b and "extension_sha256" in a and a == b)
+
+
 def scheduler_fingerprint() -> dict:
     """SHA-256 of the installed scheduler_rs extension binary (or {"error": ...}). Builds made
     with different binaries are not comparable."""
@@ -436,7 +442,7 @@ class Stage2:
                                  f"not {self.greedy_extra}")
             self.greedy_extra = state.get("greedy_extra", {})
             recorded = state.get("scheduler")
-            if check_scheduler and state["builds"] and recorded != self.scheduler:
+            if check_scheduler and state["builds"] and not same_scheduler(recorded, self.scheduler):
                 raise ValueError(f"{state_path} holds builds from scheduler {recorded or 'unrecorded'}, not the "
                                  f"installed {self.scheduler}: they are not comparable; use a new --state")
             if not check_scheduler and recorded is not None:
@@ -1108,6 +1114,9 @@ def main(argv=None) -> int:
                            if e["mode"].startswith("caps") and "(new best)" in e["feedback"]), None)
     for path in args.extra_state:
         other = Stage2(table, workdir, path, log=None, check_scheduler=False)
+        if not same_scheduler(other.scheduler, stage2.scheduler):
+            print(f"note: --extra-state {path} holds builds from scheduler {other.scheduler or 'unrecorded'}, not "
+                  f"{stage2.scheduler or 'unrecorded'}; its builds are merged but were made by another binary")
         stage2.builds = {**other.builds, **stage2.builds}
         stage2.rowtable = stage2.rowtable.union(other.rowtable)
         stage2.trace = stage2.trace + other.trace
