@@ -162,8 +162,10 @@ chosen candidate, then dead code elimination. Three emitter-order effects are re
 explicitly so the result is the `--emission-plan` program op for op (up to VReg and op
 numbering; Rust tests over 74 plans at 4 and 32 groups, and the greedy schedule is the same): a mixed round's
 encodings in order of their first group; the level-end constant `L_d`, which the emitter
-creates at the first round that gathers at depth `d` (with its ALU-derived alternatives
-recomputed there); and the broadcast of a level's first table entry, shared by leaf pairs and
+creates at its first live user: the first round that gathers at depth `d`, or, when no round
+gathers there, the final mirrored index conversion if the last round leaves the indices at
+depth `d` (e.g. 15 rounds at height 10 and `L_4`; tested at that shape), with its ALU-derived
+alternatives recomputed there; and the broadcast of a level's first table entry, shared by leaf pairs and
 Mobius coefficients, which the emitter creates with the coefficients when no pair is used.
 
 ## 4. The objective: the capacity floor with choices resolved
