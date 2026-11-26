@@ -343,6 +343,7 @@ pub fn apply_prune_index(
     let mut surgery = Surgery::new(program)?;
     for s in &sites {
         *report.sites.entry(s.kind.as_str()).or_default() += 1;
+        report.add_facts(&s.facts);
         match counts_of([&surgery.ops()[s.op]]) {
             Ok(removed) => *report.site_classes.entry((s.kind.as_str(), sub(&[0; 10], &removed))).or_default() += 1,
             Err(e) => report.cost_error = Some(e),
