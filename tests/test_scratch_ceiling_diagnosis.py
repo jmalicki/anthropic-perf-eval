@@ -84,3 +84,26 @@ def test_peak_reports_cycle_and_kinds():
     r = peak_report(sched)
     assert (r["peak"], r["peak_cycle"]) == (17, 2)
     assert r["live_by_kind"] == {"HashState": 8, "hash": 8, "unknown": 1}
+
+
+def test_blame_attributes_a_vector_select_to_the_vector_alu():
+    """Review of #83: a SelectChoice lowered to a multiply_add keeps SSA engine flow but runs on
+    the vector ALU. With the vector ALU full at cycle 0 and flow empty, the select issued at 1
+    feeding a load is a delayed vector op with no room, not a flow op with room."""
+    from scripts.scratch_ceiling_diagnosis import _uses, blame, executed_ops
+
+    def op(i, engine, opcode, cycle, deps=()):
+        return {"id": i, "engine": engine, "opcode": opcode, "cycle": cycle, "dep_ids": list(deps)}
+
+    ssa = [op(i, "valu", "multiply_add", 0) for i in range(6)]
+    ssa += [op(6, "flow", "select_choice", 1), op(7, "load", "load", 2, deps=[6])]
+    lowered = [dict(o) for o in ssa[:6]]
+    lowered += [{"id": 6, "engine": "valu", "opcode": "multiply_add", "cycle": 1, "from_select_choice": 6},
+                {"id": 7, "engine": "load", "opcode": "load", "cycle": 2}]
+    sched = {"total_cycles": 3, "ssa_ops": ssa, "ops": lowered}
+    use, _, _ = _uses(sched)
+    assert blame(7, executed_ops(sched), use) == ("valu", True, 6)
+    # A select lowered to a vselect stays a flow op.
+    lowered[6] = {"id": 6, "engine": "flow", "opcode": "vselect", "cycle": 1, "from_select_choice": 6}
+    use, _, _ = _uses(sched)
+    assert blame(7, executed_ops(sched), use) == ("flow", False, 6)

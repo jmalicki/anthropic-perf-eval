@@ -11,6 +11,7 @@ pub mod greedy;
 pub mod hint_passes;
 pub mod assign_addrs;
 pub mod lower;
+pub mod transform;
 
 pub mod compute_bounds;
 #[cfg(feature = "cpsat")]
@@ -29,6 +30,7 @@ pub use hint_passes::{
 };
 pub use assign_addrs::AssignAddressesPass;
 pub use lower::LowerToOpsPass;
+pub use transform::TransformPass;
 
 #[cfg(feature = "cpsat")]
 pub use bulk_move::BulkMoveCompactionPass;

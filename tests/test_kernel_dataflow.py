@@ -55,9 +55,15 @@ def test_clean_greedy_kernel_is_proved(greedy):
     assert report.ssa_values > 1000
 
 
+# Shallow on purpose: one of the two CP-SAT smoke tests every PR runs (CLAUDE.md, test tiers).
 def test_clean_cpsat_kernel_is_proved(tmp_path_factory):
     """CP-SAT exercises the alternative encodings (shifted ops, FMA selects, add_imm)."""
-    kernel, sched = _build(tmp_path_factory, "cpsat", rounds=2, use_cpsat=True, cpsat_time_limit=20.0)
+    # The solve stops on CP-SAT's work count, not the clock, so every machine checks the same
+    # schedule. 1.0 reaches the same makespan as an unbounded solve (36 cycles, ~5 s locally,
+    # first solution at 0.05 s from the greedy hint). The 60 s wall limit is only a backstop and
+    # stays below pytest's 120 s timeout (pyproject.toml), leaving room for the build and check.
+    kernel, sched = _build(tmp_path_factory, "cpsat", rounds=2, use_cpsat=True,
+                           cpsat_deterministic_time=1.0, cpsat_time_limit=60.0)
     report = check(kernel, sched)
     assert report.ok, report.findings[:3]
 

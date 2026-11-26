@@ -3,9 +3,10 @@ scratch budget (docs/STALL_DEADLOCK.md). 16-round greedy builds take about a sec
 
 - Under stall + 0.98 each build fails with ScratchBudgetExceeded: a known limitation, pinned
   so a change to the greedy that fixes (or moves) it is noticed.
-- The first forced cycle (SCHEDULER_DEADLOCK_DUMP) is not a deadlock: ASAP inflation has
-  every op that would free words waiting for a later cycle, and the ops it let through all add
-  words and free none.
+- At the first forced cycle (SCHEDULER_DEADLOCK_DUMP) ASAP inflation deferred ops in that
+  same cycle, and the ready ops the hard budget check refused each write a vector. (Whether the
+  inflation-deferred ops would have freed words is not asserted: the script's frees count is
+  approximate.)
 - With 20 groups in flight each plan builds within the budget (proved and validated).
 """
 import json
@@ -46,7 +47,9 @@ def test_stall_fails_after_an_inflation_emptied_cycle(name, monkeypatch, tmp_pat
         build_kernel_with_args(emission_plan=rows(name), verbose=False, **JUDGE)
     state = json.loads(state_path.read_text())
     assert state["live_words"] > state["budget"] - 8  # less than one vector free
-    assert any(h["ready_at"] > state["cycle"] for h in state["heap"])  # work waiting: not a deadlock
+    # Inflation deferred ops in the forced cycle itself: the cycle was not empty for lack of work.
+    assert state["inflation_deferred"]
+    assert state["budget_deferred"] and all(d["reason"] == "budget" for d in state["budget_deferred"])
     r = sd.analyse(state, json.loads(sched_path.read_text()))
     # Every deferred op writes a vector (its 8 words are what the budget check refused). The
     # script's "frees" count is approximate (no lane aliases, keep_live or deltas): not asserted.
@@ -54,8 +57,10 @@ def test_stall_fails_after_an_inflation_emptied_cycle(name, monkeypatch, tmp_pat
 
 
 @pytest.mark.parametrize("name,cycles", sorted(PLANS.items()))
-def test_fewer_groups_in_flight_builds_within_budget(name, cycles):
+def test_fewer_groups_in_flight_builds_within_budget(name, cycles, monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
+        # A regression to a failed build must not write scheduler_output_error.json to the cwd.
+        monkeypatch.setenv("SCHEDULER_EXPORT_ON_ERROR_PATH", os.path.join(tmp, "error.json"))
         path = os.path.join(tmp, "sched.json")
         instrs, stats = build_kernel_with_args(emission_plan=rows(name), verbose=False, output_json=path,
                                                **dict(JUDGE, greedy_groups_in_flight=20))

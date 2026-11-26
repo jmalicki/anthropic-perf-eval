@@ -320,6 +320,7 @@ def test_greedy_justify(capfd):
     assert cycles[5] <= cycles[0], "justification never lengthens the greedy schedule"
 
 
+@pytest.mark.deep
 def test_greedy_justify_with_cpsat(tmp_path, capfd):
     """PyO3: with CP-SAT following, the justified greedy schedule is the hint CP-SAT starts from.
 
@@ -378,11 +379,12 @@ def test_greedy_justify_with_cpsat(tmp_path, capfd):
     assert cycles[10] <= cycles[0], "not longer than the same build without justification"
 
 
+@pytest.mark.deep
 def test_greedy_justify_is_skipped_with_forced_shifts(capfd):
     """PyO3: with individually forced shifts (what-if runs) the justification pass does not run.
 
-    The greedy does not see forced shifts, and its length sets the CP-SAT horizon and latest
-    cycles; the pass must not shorten a schedule that may not be one of that model.
+    The greedy places forced ops shifted, but the justification passes choose every shift
+    themselves and could put a forced op back on a vector slot.
     """
     import scheduler_rs
 
@@ -409,6 +411,57 @@ def test_greedy_justify_is_skipped_with_forced_shifts(capfd):
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
 
 
+def test_greedy_justify_is_skipped_with_forced_shifts_greedy_only(capfd, tmp_path):
+    """PyO3: the greedy-only build honours forced shifts, and justification is skipped there too.
+
+    The skip used to read only the CP-SAT configuration's forced set, which a greedy-only
+    build does not have.
+    """
+    import json
+
+    import scheduler_rs
+
+    forest_height, n_nodes, batch_size, rounds = 10, 2047, 16, 2
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+    common = dict(
+        verbose=True, use_cpsat=False, greedy_barriers="none", greedy_priority="wavefront", greedy_justify=10,
+    )
+
+    # Without a forced set the pass runs; pick a shiftable vector op it leaves on a vector slot.
+    free_path = tmp_path / "free.json"
+    capfd.readouterr()
+    scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height, n_nodes, batch_size, rounds, output_json=str(free_path), **common,
+    )
+    justify_lines = [line for line in "".join(capfd.readouterr()).splitlines() if "Greedy justify:" in line]
+    assert justify_lines and not any("skipped" in line for line in justify_lines), justify_lines
+    with open(free_path) as f:
+        free = json.load(f)
+    lowered = {op["id"] for op in free["ops"]}
+    forced = next(
+        op["id"] for op in free["ssa_ops"]
+        if op["engine"] == "valu" and op["opcode"] not in ("vbroadcast", "multiply_add")
+        and op["id"] * 1000 not in lowered
+    )
+
+    forced_path = tmp_path / "forced.json"
+    instrs, stats = scheduler_rs.build_tick_tock_kernel_ssa(
+        forest_height, n_nodes, batch_size, rounds, output_json=str(forced_path),
+        forced_shifts=[forced], **common,
+    )
+    justify_lines = [line for line in "".join(capfd.readouterr()).splitlines() if "Greedy justify:" in line]
+    assert justify_lines == ["Greedy justify: skipped: individually forced shifts are set"], justify_lines
+    with open(forced_path) as f:
+        sched = json.load(f)
+    lanes = [op for op in sched["ops"] if op["id"] // 1000 == forced and op["engine"] == "alu"]
+    assert len(lanes) == 8, "the forced op runs as 8 scalar ops"
+    assert not stats.get("budget_exceeded", False)
+    _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
+
+
+@pytest.mark.deep
 def test_cpsat_split_shift_hint():
     """PyO3: with cpsat_split_shift_hint the split-shift greedy schedule is accepted by CP-SAT and the kernel is correct."""
     import scheduler_rs
@@ -519,6 +572,7 @@ def test_depth4_validates():
     _run_kernel_and_assert_matches_reference(instrs, mem, batch_size)
 
 
+@pytest.mark.deep
 def test_scratch_size_and_scratch_constraint(tmp_path):
     """PyO3: scratch_size / scratch_constraint reach the allocator, are reported in stats and
     give correct kernels (relaxed ones on a simulator with that much scratch)."""

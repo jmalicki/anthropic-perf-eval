@@ -51,11 +51,12 @@ are analysis only, never kernels.
    gets 1,049 within 1,536 words.
 4. **Fix (flag, default unchanged): `--greedy-budget-force stall`.** An op the budget check
    defers waits while other ops are placed in the cycle and is forced only in a cycle where
-   nothing was placed (a real deadlock), as the `pools` model already does. With it the hard
+   nothing was placed, as the `pools` model already does. With it the hard
    check holds the budget on the plans measured here: the ceiling plan with the pressure
    policy off runs at peak 1,535 and 1,049 cycles. **It does not hold it on every plan:** a run
-   can reach a real deadlock (nothing placeable within the budget), and then it forces and can
-   stay over budget; under `stall` + 0.98, 3 of 28 later path-bit plans did that (peaks 1,761 to
+   can reach a cycle where nothing was placed (no single ready op fits within the budget; not
+   shown to be a state with no in-budget schedule, docs/STALL_DEADLOCK.md), and then it forces
+   and can stay over budget; under `stall` + 0.98, 3 of 28 later path-bit plans did that (peaks 1,761 to
    1,817; docs/STARTUP_AND_STALL_LOOP.md section A), so `stall` is not a safe judge. The best kernels do not change (1,033 / 1,034, 1,039): their
    gap is not scratch. Every ceiling plan improves by 8 to 78 cycles, none below 1,033.
 
@@ -200,7 +201,7 @@ Both follow-ups proposed here were done in #83 (docs/STARTUP_AND_STALL_LOOP.md):
 - The stage-1 path-bit loop rerun with `--greedy-budget-force stall
   --pressure-inflation-threshold 0.98` as the judge: negative. No plan beats the baselines
   (path best 1,034, `path_flow90.json` itself under that judge), and stall + 0.98 is not safe
-  on every plan: 3 of 28 new path-bit builds exceed the budget (docs/STALL_DEADLOCK.md on #88).
+  on every plan: 3 of 28 new path-bit builds exceed the budget (docs/STARTUP_AND_STALL_LOOP.md; diagnosed in docs/STALL_DEADLOCK.md, #88).
 - The start-up of `path_flow90.json`: `bits` selects for the first groups in rounds 1 to 3,
   negative (9 hand plans, all slower, 1,036 to 1,063). Ordering the start-up instead,
   `--greedy-flow-priority chain-first --greedy-alu-priority native-first`, gives 1,030
