@@ -68,6 +68,18 @@ _n_nodes = n_nodes_for_height
 # CP-SAT tuning switches (kept together, apart from the other option helpers)
 # ----------------------------------------------------------------------------
 
+def _early_stagger(text):
+    """K:S for --greedy-early-stagger: K >= 1 groups, S >= 0 cycles."""
+    try:
+        k, sep, c = text.partition(":")
+        k, c = int(k), int(c)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected K:S (two integers), got {text!r}")
+    if not sep or k < 1 or c < 0:
+        raise argparse.ArgumentTypeError(f"expected K:S with K >= 1 and S >= 0, got {text!r}")
+    return (k, c)
+
+
 def _positive_int(text: str) -> int:
     """argparse type: an integer greater than zero."""
     try:
@@ -421,7 +433,9 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     group.add_argument("--select-choice", choices=["optimize", "fma", "vselect"], default="optimize",
                        help="CP-SAT SelectChoice (default: optimize)")
     group.add_argument("--valu-shift", choices=["optimize", "alu", "valu"], default="optimize",
-                       help="CP-SAT VALU shift (default: optimize)")
+                       help="VALU shift (default: optimize): 'alu' every shiftable vector op as 8 scalar ops, "
+                            "'valu' none. Also under --use-greedy, where 'alu' is very slow (about one shifted "
+                            "op per cycle: 7,148 cycles at 16 rounds against 2,007; a warning is printed)")
     group.add_argument("--force-zero-gap", action="store_true",
                        help="Force 0 integral gap: prove the schedule optimal for the emitted ops (not for the problem)")
     group.add_argument("--asap-alap-tightening", choices=["none", "simple", "symmetry-aware", "energetic"],
@@ -476,6 +490,18 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
+    group.add_argument("--greedy-early-stagger", type=_early_stagger, default=None, metavar="K:S",
+                       help="Wavefront: the first K groups are staggered S cycles apart instead of "
+                            "--greedy-stagger-cycles (later groups keep that stagger after them); default off "
+                            "(docs/GREEDY_CONST_CHOICE.md)")
+    group.add_argument("--greedy-const-policy", choices=["default", "alu-first", "alu-when-load-full"],
+                       default="default",
+                       help="Greedy-only: where a ConstChoice is materialised. 'default' add_imm when the flow "
+                            "slot is free and idle, else a load; 'alu-first' derive it on the scalar ALU from "
+                            "two constants scheduled earlier and still live: an alternative the emitter offers, "
+                            "or else any a + b that equals it (non-negative, below 2^31); else the default; "
+                            "'alu-when-load-full' a load while a load slot is free, else ALU derivation, else "
+                            "the default (docs/GREEDY_CONST_CHOICE.md)")
     group.add_argument("--greedy-alu-priority", choices=["key", "native-first"], default="key",
                        help="Wavefront only (an error otherwise): 'key' (default) native scalar ops and "
                             "shiftable vector ops in one wavefront order; 'native-first' native scalar-ALU ops "
@@ -625,6 +651,40 @@ def check_greedy_shape_combinations(get) -> None:
             raise ValueError(f"--greedy-select-overflow valu is ignored when {owner} owns the select encoding")
 
 
+def check_encoding_option_combinations(get) -> None:
+    """Reject encoding options another option would silently override or ignore (same rules
+    as Rust's `config::check_encoding_option_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-early-stagger without --greedy-priority wavefront; a forced
+            --const-choice / --select-choice / --valu-shift together with the hint pass that
+            would overwrite it (--*-hint-pass, --hint-passes); --greedy-const-policy other than
+            default under CP-SAT (no --use-greedy), with a forced --const-choice, or with the
+            const-choice hint pass, all of which own the ConstChoice encoding instead.
+    """
+    if get("greedy_early_stagger") is not None and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError("--greedy-early-stagger staggers the wavefront priority only; it needs --greedy-priority wavefront")
+    all_hints = get("hint_passes", False)
+    for name, hint in (("const_choice", "const_choice"), ("select_choice", "select_choice"), ("valu_shift", "valu_shift")):
+        forced = get(name, "optimize")
+        if forced != "optimize" and (all_hints or get(f"enable_{hint}_hint_pass", False)):
+            flag = name.replace("_", "-")
+            raise ValueError(f"--{flag} {forced} forces the encoding, and the {flag} hint pass "
+                             f"(--{flag}-hint-pass / --hint-passes) would overwrite it; use one or the other")
+    policy = get("greedy_const_policy", "default")
+    if policy != "default":
+        if not get("use_greedy", False):
+            owner = "CP-SAT (it is greedy-only: the CP-SAT hint cannot name an ALU derivation; add --use-greedy)"
+        elif get("const_choice", "optimize") != "optimize":
+            owner = f"--const-choice {get('const_choice')}"
+        elif all_hints or get("enable_const_choice_hint_pass", False):
+            owner = "the const-choice hint pass (--const-choice-hint-pass / --hint-passes)"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-const-policy {policy} is ignored when {owner} owns the ConstChoice encoding")
+
+
 def args_to_build_kwargs(
     args=None,
     *,
@@ -653,6 +713,13 @@ def args_to_build_kwargs(
         return default
 
     check_greedy_shape_combinations(get)
+    check_encoding_option_combinations(get)
+    # Not with --no-valu-shift: shifting is off, so --valu-shift alu shifts nothing.
+    if get("use_greedy", False) and get("valu_shift", "optimize") == "alu" and get("enable_valu_shift", True):
+        import sys as _sys
+        print("WARNING: --valu-shift alu under --use-greedy runs every shiftable vector op as 8 scalar ops, "
+              "about one per cycle on the 12 scalar slots: expect a schedule several times longer "
+              "(16 rounds: 7,148 cycles against 2,007)", file=_sys.stderr)
     forest_height = get("forest_height", 10)
     n_nodes_val = get("n_nodes")
     n_nodes = n_nodes_val if n_nodes_val is not None else _n_nodes(forest_height)
@@ -749,6 +816,8 @@ def args_to_build_kwargs(
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -816,6 +885,8 @@ def args_to_build_kwargs(
         "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "greedy_budget_force": get("greedy_budget_force", "same-cycle"),
         "greedy_alu_priority": get("greedy_alu_priority", "key"),
+        "greedy_const_policy": get("greedy_const_policy", "default"),
+        "greedy_early_stagger": get("greedy_early_stagger"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),

@@ -31,6 +31,7 @@
 pub mod justify;
 pub mod pressure_policy;
 pub mod wavefront;
+pub use wavefront::EarlyStagger;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -83,6 +84,10 @@ pub struct GreedyShape {
     pub select_overflow: SelectOverflow,
     /// Wavefront only: native scalar ops before vector ops (see [`AluPriority`]).
     pub alu_priority: AluPriority,
+    /// Where a ConstChoice is materialised (see [`ConstPolicy`]).
+    pub const_policy: ConstPolicy,
+    /// Wavefront only: a different stagger for the first groups (see [`EarlyStagger`]).
+    pub early_stagger: Option<EarlyStagger>,
     /// When an op the scratch budget check deferred is forced past the budget (see
     /// [`BudgetForce`]). Scratch model `words` only; `pools` always stalls.
     pub budget_force: BudgetForce,
@@ -129,6 +134,28 @@ pub enum FlowPriority {
     /// selects of the first rounds are not overtaken by later groups' earlier selects, so they
     /// reach their first gather sooner (docs/STARTUP_AND_STALL_LOOP.md).
     ChainFirst,
+}
+
+/// Where the greedy materialises a ConstChoice (a constant with alternative encodings).
+///
+/// `Default` (the historical rule): `add_imm` on the flow slot when it is free and no other
+/// flow op is ready in the cycle, else a load. The other policies may also derive the constant
+/// on the scalar ALU from constants already materialised: the `ConstEncoding::{Add, Sub, Mul,
+/// Shift}` alternatives the emitter offers, else `a + b` for any two constants a, b > 0 with
+/// a + b = value < 2^31 (e.g. the batch address offsets 8g); only from producers scheduled in an earlier cycle
+/// whose values are still live in the scheduler's counter, so the read needs no lifetime
+/// extension (address assignment's AluDerive pass then changes nothing). Greedy-only: the
+/// CP-SAT pipeline keeps `Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConstPolicy {
+    /// add_imm when flow is free and idle, else load (default).
+    #[default]
+    Default,
+    /// ALU derivation when an alternative's operands are live and a scalar slot is free; else
+    /// the default rule.
+    AluFirst,
+    /// A load while a load slot is free; else ALU derivation; else the default rule.
+    AluWhenLoadFull,
 }
 
 /// Wavefront only: the order in which ready scalar-ALU work is offered the 12 scalar slots.
@@ -590,6 +617,9 @@ pub(crate) struct GreedyDiagnostics {
     worst_dump: Option<String>,
     /// Last cycle recorded, so several force-schedules in one cycle count once.
     last_cycle: Option<usize>,
+    /// Out: ConstChoices the scheduler derived on the scalar ALU (op id -> operands), under a
+    /// [`ConstPolicy`] other than `Default`. Lowering and address assignment need them.
+    pub const_alu_derive: HashMap<usize, crate::types::AluDeriveInfo>,
     /// Times the hard budget check (live words after the op > budget) deferred an op; an op
     /// retried in the same cycle counts once per rejection.
     pub budget_check_deferrals: usize,
@@ -1589,6 +1619,26 @@ pub(super) fn schedule_ssa_greedy_with_diagnostics(
 /// # Returns
 /// `((cycles, budget_exceeded, peak_live), agreement)`, or `Err` as for
 /// [`schedule_ssa_greedy_with_liveness_agreement`].
+/// After a greedy rerun with fixed ConstChoice encodings: every fixed `AluDerive` the rerun
+/// did not place as a derivation (`derived`, the rerun's `GreedyDiagnostics::const_alu_derive`)
+/// was scheduled as a load, so record it as `Load`; lowering then emits what was scheduled.
+///
+/// # Returns
+/// How many derivations became loads.
+pub(crate) fn reconcile_const_choice_encodings(
+    encodings: &mut HashMap<usize, ConstChoiceEncoding>,
+    derived: &HashMap<usize, crate::types::AluDeriveInfo>,
+) -> usize {
+    let mut demoted = 0;
+    for (id, enc) in encodings.iter_mut() {
+        if matches!(enc, ConstChoiceEncoding::AluDerive(_)) && !derived.contains_key(id) {
+            *enc = ConstChoiceEncoding::Load;
+            demoted += 1;
+        }
+    }
+    demoted
+}
+
 pub(crate) fn schedule_ssa_greedy_shaped(
     ops: &mut [SsaOp],
     enable_valu_shift: bool,
@@ -2005,6 +2055,35 @@ fn schedule_ssa_greedy_core(
         HashSet::new()
     };
 
+    // ConstPolicy: per ConstChoice, its ALU alternatives as (left value, right value, opcode),
+    // and per constant value the ops that produce it.
+    let mut const_derivations: HashMap<usize, Vec<(i64, i64, Opcode)>> = HashMap::new();
+    let mut value_producers: HashMap<i64, Vec<usize>> = HashMap::new();
+    if shape.const_policy != ConstPolicy::Default {
+        for (idx, op) in ops.iter().enumerate() {
+            if let (Some(v), Some(d)) = (op.produces_constant, op.dest) {
+                if d.is_scalar() {
+                    value_producers.entry(v).or_default().push(idx);
+                }
+            }
+            if op.opcode != Opcode::ConstChoice {
+                continue;
+            }
+            let alts: Vec<(i64, i64, Opcode)> = op
+                .const_alternatives
+                .iter()
+                .flatten()
+                .filter_map(|enc| {
+                    let deps = enc.dependencies();
+                    Some((*deps.first()?, *deps.get(1)?, enc.alu_opcode()?))
+                })
+                .collect();
+            if !alts.is_empty() {
+                const_derivations.insert(idx, alts);
+            }
+        }
+    }
+
     // A SelectChoice fixed to the multiply-add path without a precomputed delta (it has a
     // sub_temp: subtract at its cycle, multiply_add one cycle later) makes its result visible
     // one cycle later than the vselect path. The CP-SAT model requires that extra cycle
@@ -2227,6 +2306,7 @@ fn schedule_ssa_greedy_core(
             &dead_store_indices,
             stagger_cycles,
             groups_in_flight,
+            shape.early_stagger,
         )?),
     };
     if diagnostics.verbose {
@@ -2844,19 +2924,88 @@ fn schedule_ssa_greedy_core(
                 // When fixed_const_choice_encoding is Some (schedule-with-fixed-choices), use the map.
                 // SelectChoice: when fixed_select_choice_encoding is Some, use map (Fma => VALU, Vselect => Flow).
                 let op_id = ops[idx].id;
+                let mut const_derive: Option<crate::types::AluDeriveInfo> = None;
                 let engine = if ops[idx].opcode == Opcode::ConstChoice {
-                    if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
-                        if matches!(enc, ConstChoiceEncoding::AddImm) {
+                    let default_rule = |slots: &SlotTracker| {
+                        if slots.flow_used < 1 && flow_other_ready == 0 {
                             Engine::Flow
                         } else {
                             Engine::Load
                         }
+                    };
+                    if let Some(enc) = fixed_const_choice_encoding.and_then(|m| m.get(&op_id)) {
+                        match enc {
+                            ConstChoiceEncoding::AddImm => Engine::Flow,
+                            ConstChoiceEncoding::AluDerive(info) => {
+                                // A derivation of the first run: honour it only where it is
+                                // sound as the policy path makes it (both producers scheduled
+                                // in an earlier cycle and still live, ALU room); otherwise
+                                // the rerun loads the constant and the caller records Load
+                                // (`reconcile_const_choice_encodings`). Never an ALU op the
+                                // slot count and the precedences do not see.
+                                let producer_ok = |id: usize| {
+                                    id_to_idx.get(&id).is_some_and(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                };
+                                if slots.alu_used < 12 && producer_ok(info.left_op_id) && producer_ok(info.right_op_id) {
+                                    const_derive = Some(info.clone());
+                                    Engine::Alu
+                                } else {
+                                    Engine::Load
+                                }
+                            }
+                            _ => Engine::Load,
+                        }
                     } else if const_choice_fixed_to_load {
                         Engine::Load
-                    } else if slots.flow_used < 1 && flow_other_ready == 0 {
-                        Engine::Flow
-                    } else {
+                    } else if shape.const_policy == ConstPolicy::Default {
+                        default_rule(&slots)
+                    } else if shape.const_policy == ConstPolicy::AluWhenLoadFull && slots.load_used < 2 {
                         Engine::Load
+                    } else {
+                        const_derive = if slots.alu_used < 12 {
+                            // A producer of `value` scheduled in an earlier cycle whose value
+                            // is still live (so the read needs no lifetime extension).
+                            let live_producer = |value: i64| {
+                                value_producers.get(&value).and_then(|ps| {
+                                    ps.iter().copied().find(|&p| {
+                                        ops[p].cycle >= 0
+                                            && (ops[p].cycle as usize) < cycle
+                                            && ops[p].dest.is_some_and(|d| live_vregs.contains(&d))
+                                    })
+                                })
+                            };
+                            let derive = |a: i64, b: i64, opcode: Opcode| {
+                                Some(crate::types::AluDeriveInfo {
+                                    left_op_id: ops[live_producer(a)?].id,
+                                    right_op_id: ops[live_producer(b)?].id,
+                                    opcode,
+                                })
+                            };
+                            // The emitter's alternatives first, then any two live constants
+                            // that add up to the value (non-negative, below 2^31: no wrap).
+                            let target = ops[idx].produces_constant;
+                            const_derivations
+                                .get(&idx)
+                                .and_then(|alts| alts.iter().find_map(|&(a, b, opcode)| derive(a, b, opcode)))
+                                .or_else(|| {
+                                    let v = target.filter(|&v| v > 0 && v < (1i64 << 31))?;
+                                    let mut values: Vec<i64> =
+                                        value_producers.keys().copied().filter(|&a| a > 0 && a < v).collect();
+                                    values.sort_unstable_by(|x, y| y.cmp(x));
+                                    values.into_iter().find_map(|a| derive(a, v - a, Opcode::Add))
+                                })
+                        } else {
+                            None
+                        };
+                        if const_derive.is_some() {
+                            Engine::Alu
+                        } else {
+                            default_rule(&slots)
+                        }
                     }
                 } else if ops[idx].opcode == Opcode::SelectChoice {
                     if let Some(enc) = fixed_select_choice_encoding.and_then(|m| m.get(&op_id)) {
@@ -3078,6 +3227,10 @@ fn schedule_ssa_greedy_core(
                             && fixed_select_choice_encoding.is_none()
                         {
                             overflow_select_fma.insert(op_id);
+                        }
+                        if let Some(info) = const_derive.take() {
+                            debug_assert_eq!(engine, Engine::Alu);
+                            diagnostics.const_alu_derive.insert(op_id, info);
                         }
                         if engine == Engine::Valu && ops[idx].opcode == Opcode::SelectChoice
                             && ops[idx].delta_vreg.is_some()

@@ -186,7 +186,8 @@ def main():
               + (f" (target {target})" if target is not None and "pace" in args.greedy_shift_policy else ""))
     for name, default in (("greedy_load_priority", "key"), ("greedy_flow_priority", "key"),
                           ("greedy_select_overflow", "never"), ("greedy_budget_force", "same-cycle"),
-                          ("greedy_alu_priority", "key")):
+                          ("greedy_alu_priority", "key"), ("greedy_const_policy", "default"),
+                          ("greedy_early_stagger", None)):
         if getattr(args, name, default) != default:
             print(f"  {name}={getattr(args, name)}")
     if getattr(args, "greedy_justify", 0):

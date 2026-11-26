@@ -2880,6 +2880,7 @@ fn test_wavefront_finds_chains_and_keys() {
         &HashSet::new(),
         stagger,
         None,
+        None,
     )
     .unwrap();
 
@@ -2970,6 +2971,7 @@ fn wavefront_for(
         &HashSet::new(),
         stagger_cycles,
         groups_in_flight,
+        None,
     )
     .unwrap()
 }
@@ -5950,6 +5952,197 @@ fn test_budget_force_stall_holds_the_budget_in_the_shaped_pipeline() {
         }
     }
     assert!(control_overshoots > 0, "control: same-cycle never overshot, so the budgets do not bind");
+}
+
+// =========================================================================
+// ConstPolicy (ALU-derived constants) and EarlyStagger
+// =========================================================================
+
+/// Five ConstChoices 8, 16, 32, 24, 40, summed into one stored scalar, 24 + 40 first (so 8,
+/// 16 and 32 stay live until after them). Cycle 0 has two load slots and one flow slot; the
+/// last two constants come after, when 8 + 16 and 8 + 32 are live.
+fn emit_derivable_consts() -> SsaEmitContext {
+    let mut emit = SsaEmitContext::new();
+    let vals: Vec<VReg> = [8i64, 16, 32, 24, 40].iter().map(|&v| emit.emit_const_choice(v)).collect();
+    // The derived constants are summed first, so 8, 16 and 32 are read only after them.
+    let mut acc = emit.emit_alu(Opcode::Add, vals[3], vals[4]);
+    for v in &vals[..3] {
+        acc = emit.emit_alu(Opcode::Add, acc, *v);
+    }
+    let addr = emit.emit_const(100);
+    emit.emit_store(addr, acc);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    emit
+}
+
+/// Schedule with a ConstPolicy; returns the ALU derivations the greedy chose.
+fn schedule_with_const_policy(
+    emit: &mut SsaEmitContext,
+    const_policy: ConstPolicy,
+) -> HashMap<usize, crate::types::AluDeriveInfo> {
+    let shape = GreedyShape { const_policy, ..Default::default() };
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let mut add_imm = HashSet::new();
+    let (_, agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        1536,
+        None,
+        None,
+        None,
+        Some(&mut add_imm),
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        &mut diagnostics,
+        &shape,
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the constants");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    assert!(diagnostics.const_alu_derive.keys().all(|id| !add_imm.contains(id)), "one encoding per const");
+    diagnostics.const_alu_derive
+}
+
+/// Review of #86: a producer that is visible (an earlier cycle) but already dead must not be
+/// derived from. 8 is read only by `8 + 8`, early; 16 (= 8 + 8, its only derivation: the
+/// other constants sum to nothing here) is emitted last, so it is placed after 8 is dead.
+/// Without the liveness condition the greedy would read 8's word after it was freed.
+#[test]
+fn test_const_policy_never_derives_from_a_dead_constant() {
+    let mut emit = SsaEmitContext::new();
+    let c8 = emit.emit_const_choice(8);
+    let others: Vec<VReg> = [1001i64, 2003, 4007, 8009, 16019, 32003].iter().map(|&v| emit.emit_const_choice(v)).collect();
+    let c16 = emit.emit_const_choice(16);
+    let mut acc = emit.emit_alu(Opcode::Add, c8, c8); // the only reader of 8
+    for v in others.iter().chain([c16].iter()) {
+        acc = emit.emit_alu(Opcode::Add, acc, *v);
+    }
+    let addr = emit.emit_const(100);
+    emit.emit_store(addr, acc);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let id8 = emit.ops[0].id;
+    let id16 = emit.ops[7].id;
+    let derived = schedule_with_const_policy(&mut emit, ConstPolicy::AluFirst);
+    let cycle = |id: usize| emit.ops.iter().find(|o| o.id == id).unwrap().cycle;
+    let reader = emit.ops[8].cycle; // 8 + 8
+    assert!(cycle(id16) > reader, "control: 16 is placed after 8's last reader ({} vs {})", cycle(id16), reader);
+    assert!(!derived.contains_key(&id16), "16 = 8 + 8 needs 8, which is dead by then: {:?}", derived.get(&id16));
+}
+
+/// Review of #86: a rerun with fixed encodings (hint passes, --schedule-with-fixed-choices)
+/// schedules a fixed `AluDerive` as the ALU op it lowers to, after its producers, or, where
+/// that is not sound, as a load that `reconcile_const_choice_encodings` records as `Load`.
+/// Before, it always scheduled it as a load while lowering still emitted the ALU op.
+#[test]
+fn test_fixed_alu_derive_is_scheduled_as_derived_or_recorded_as_load() {
+    let mut first = emit_derivable_consts();
+    let derived = schedule_with_const_policy(&mut first, ConstPolicy::AluFirst);
+    assert!(!derived.is_empty());
+    let mut emit = emit_derivable_consts();
+    let id_of = |value: i64| emit.ops.iter().find(|o| o.produces_constant == Some(value)).unwrap().id;
+    let mut fixed: HashMap<usize, ConstChoiceEncoding> = emit
+        .ops
+        .iter()
+        .filter(|o| o.opcode == Opcode::ConstChoice)
+        .map(|o| (o.id, derived.get(&o.id).map_or(ConstChoiceEncoding::Load, |i| ConstChoiceEncoding::AluDerive(i.clone()))))
+        .collect();
+    // 8 = 24 - 16: its producers cannot be scheduled before it (all constants are ready at
+    // cycle 0 and 8 comes first), so this derivation cannot be honoured.
+    let unsound = (id_of(8), crate::types::AluDeriveInfo { left_op_id: id_of(24), right_op_id: id_of(16), opcode: Opcode::Sub });
+    assert!(!derived.contains_key(&unsound.0));
+    fixed.insert(unsound.0, ConstChoiceEncoding::AluDerive(unsound.1));
+
+    let mut diagnostics = GreedyDiagnostics::new(false);
+    let (_, agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops,
+        false,
+        &mut HashSet::new(),
+        1536,
+        None,
+        None,
+        None,
+        Some(&mut HashSet::new()),
+        &GreedyBoundsUsage::None,
+        &GreedyPolicy,
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some(&fixed),
+        None,
+        None,
+        &mut diagnostics,
+        &GreedyShape::default(),
+        &mut HashMap::new(),
+    )
+    .expect("greedy schedules the constants");
+    assert!(agreement.agrees(), "live-word counter disagrees: {}", agreement);
+    // Every honoured derivation runs on the ALU after both producers.
+    let cycle_of = |id: usize| emit.ops.iter().find(|o| o.id == id).unwrap().cycle;
+    for (id, info) in &diagnostics.const_alu_derive {
+        assert!(cycle_of(*id) > cycle_of(info.left_op_id) && cycle_of(*id) > cycle_of(info.right_op_id));
+    }
+    assert!(!diagnostics.const_alu_derive.contains_key(&unsound.0), "8 cannot be derived before 24 and 16");
+    assert!(!diagnostics.const_alu_derive.is_empty(), "the first run's derivations are kept");
+    let demoted = reconcile_const_choice_encodings(&mut fixed, &diagnostics.const_alu_derive);
+    assert!(demoted >= 1);
+    assert_eq!(fixed[&unsound.0], ConstChoiceEncoding::Load);
+    for id in diagnostics.const_alu_derive.keys() {
+        assert!(matches!(fixed[id], ConstChoiceEncoding::AluDerive(_)));
+    }
+}
+
+/// `alu-first` derives constants on the scalar ALU from two constants that are visible (an
+/// earlier cycle) and still live at the derive's cycle, and the operands add up to the value.
+/// The default policy never derives (control).
+#[test]
+fn test_const_policy_derives_from_live_constants() {
+    let mut control = emit_derivable_consts();
+    assert!(schedule_with_const_policy(&mut control, ConstPolicy::Default).is_empty());
+
+    let mut emit = emit_derivable_consts();
+    let derived = schedule_with_const_policy(&mut emit, ConstPolicy::AluFirst);
+    assert!(!derived.is_empty(), "alu-first derived nothing");
+    let by_id: HashMap<usize, &SsaOp> = emit.ops.iter().map(|op| (op.id, op)).collect();
+    for (id, info) in &derived {
+        let op = by_id[id];
+        let (l, r) = (by_id[&info.left_op_id], by_id[&info.right_op_id]);
+        assert_eq!(info.opcode, Opcode::Add);
+        assert_eq!(l.produces_constant.unwrap() + r.produces_constant.unwrap(), op.produces_constant.unwrap());
+        for p in [l, r] {
+            assert!(p.cycle < op.cycle, "producer {} at {} not before derive at {}", p.id, p.cycle, op.cycle);
+            // Still live: some reader of the producer's value runs at or after the derive.
+            let last_read = emit
+                .ops
+                .iter()
+                .filter(|o| o.srcs.iter().any(|s| matches!(s, Operand::VReg(v) if Some(*v) == p.dest)))
+                .map(|o| o.cycle)
+                .max()
+                .unwrap();
+            assert!(last_read >= op.cycle, "producer {} dead at {} before derive at {}", p.id, last_read, op.cycle);
+        }
+    }
+}
+
+/// The first `groups` chains use the early stagger; later chains continue from there with the
+/// normal stagger. Without an early stagger the offset is `stagger * rank`.
+#[test]
+fn test_early_stagger_chain_offsets() {
+    use wavefront::{chain_offset, EarlyStagger};
+    let early = Some(EarlyStagger { groups: 4, cycles: 2 });
+    let offsets: Vec<i64> = (0..7).map(|r| chain_offset(r, 9, early)).collect();
+    assert_eq!(offsets, vec![0, 2, 4, 6, 8, 17, 26]);
+    assert_eq!((0..7).map(|r| chain_offset(r, 9, None)).collect::<Vec<_>>(), vec![0, 9, 18, 27, 36, 45, 54]);
 }
 
 // =========================================================================

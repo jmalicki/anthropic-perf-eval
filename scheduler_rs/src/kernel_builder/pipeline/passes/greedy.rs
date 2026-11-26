@@ -43,7 +43,7 @@ impl ForcedEncodings {
         use crate::types::Engine;
 
         let Some(cpsat) = ctx.config.cpsat.as_ref() else {
-            return Self::default();
+            return Self::from_greedy_forced(ctx);
         };
         let all = |opcode: Opcode| ctx.ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
         let const_choice = match cpsat.const_choice_mode {
@@ -81,8 +81,36 @@ impl ForcedEncodings {
     }
 
     #[cfg(not(feature = "cpsat"))]
-    fn from_context(_ctx: &PipelineContext) -> Self {
-        Self::default()
+    fn from_context(ctx: &PipelineContext) -> Self {
+        Self::from_greedy_forced(ctx)
+    }
+
+    /// Greedy-only build: the encodings `--const-choice`, `--select-choice` and `--valu-shift`
+    /// force (`CompilerConfig::greedy_forced`). Before this they were ignored without CP-SAT.
+    fn from_greedy_forced(ctx: &PipelineContext) -> Self {
+        let forced = &ctx.config.compiler.greedy_forced;
+        let all = |opcode: Opcode| ctx.ops.iter().filter(move |op| op.opcode == opcode).map(|op| op.id);
+        let const_choice = forced
+            .const_choice
+            .as_ref()
+            .map(|enc| all(Opcode::ConstChoice).map(|id| (id, enc.clone())).collect());
+        let select_choice = forced
+            .select_choice
+            .as_ref()
+            .map(|enc| all(Opcode::SelectChoice).map(|id| (id, enc.clone())).collect());
+        let shifted_ops = match forced.valu_shift {
+            None => None,
+            Some(false) => Some(HashSet::new()),
+            Some(true) if ctx.config.compiler.enable_valu_shift => Some(
+                ctx.ops
+                    .iter()
+                    .filter(|op| op.engine == crate::types::Engine::Valu && op.opcode.can_shift_to_alu())
+                    .map(|op| op.id)
+                    .collect(),
+            ),
+            Some(true) => None,
+        };
+        Self { const_choice, shifted_ops, select_choice }
     }
 }
 
@@ -142,6 +170,10 @@ impl Pass for GreedySchedulePass {
         if is_cpsat_pipeline && !ctx.config.compiler.cpsat_split_shift_hint {
             shape.split_shift = false;
         }
+        // ALU-derived constants are not hinted to CP-SAT (its hint names Load or AddImm).
+        if is_cpsat_pipeline {
+            shape.const_policy = ssa_greedy::ConstPolicy::Default;
+        }
         let mut shifted_lane_cycles = std::collections::HashMap::new();
         let greedy_budget = ctx.greedy_budget();
         let ((cycles, budget_exceeded, peak_live), _agreement) =
@@ -190,7 +222,9 @@ impl Pass for GreedySchedulePass {
         }
         for op in &ctx.ops {
             if op.opcode == Opcode::ConstChoice {
-                let enc = if add_imm_ops.contains(&op.id) {
+                let enc = if let Some(info) = diagnostics.const_alu_derive.get(&op.id) {
+                    ConstChoiceEncoding::AluDerive(info.clone())
+                } else if add_imm_ops.contains(&op.id) {
                     ConstChoiceEncoding::AddImm
                 } else {
                     ConstChoiceEncoding::Load
@@ -283,6 +317,24 @@ impl Pass for GreedyJustifyPass {
         }
         if !ctx.greedy_decisions.eliminated_vbroadcast_ops.is_empty() {
             let summary = "skipped: eliminated vbroadcasts are not modelled".to_string();
+            announce(ctx, &summary);
+            return Ok(summary);
+        }
+        // `--greedy-const-policy` derives constants on the scalar ALU from producers that are
+        // still live where the greedy placed the derivation. Justification would move both
+        // without modelling the derivation's reads (precedence on its producers, their
+        // lifetimes in the scratch check and in address assignment), so it does not run.
+        let alu_derived = ctx
+            .greedy_decisions
+            .const_choice_encoding
+            .values()
+            .filter(|e| matches!(e, ConstChoiceEncoding::AluDerive(_)))
+            .count();
+        if alu_derived > 0 {
+            let summary = format!(
+                "skipped: {} ALU-derived constant(s) (--greedy-const-policy) are not modelled",
+                alu_derived
+            );
             announce(ctx, &summary);
             return Ok(summary);
         }

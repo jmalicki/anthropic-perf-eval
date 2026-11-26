@@ -1001,10 +1001,11 @@ def build_option_names() -> frozenset:
 # pressure_* option. Not allowed: CP-SAT-only options (cpsat_*, force_zero_gap,
 # per_section_optimize_secs, asap_alap_tightening, ...: no effect under --use-greedy), emission
 # options (they change the op counts the loop's cost table predicts), output and diagnostic
-# options, and the relaxed-scratch analysis switches. (--const-choice / --select-choice /
-# --valu-shift do nothing under the greedy on this branch; they take effect from #86.)
+# options, and the relaxed-scratch analysis switches. --const-choice / --select-choice /
+# --valu-shift take effect under the greedy since #86.
 GREEDY_BUILD_OPTIONS = frozenset({
     "scheduling_pressure_policy", "scratch_model", "enable_valu_shift", "hint_passes",
+    "const_choice", "select_choice", "valu_shift",
     "enable_const_choice_hint_pass", "enable_select_choice_hint_pass", "enable_valu_shift_hint_pass",
     "enable_schedule_with_fixed_choices",
 })
