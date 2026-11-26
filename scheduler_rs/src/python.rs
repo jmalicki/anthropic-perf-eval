@@ -1595,6 +1595,49 @@ struct SsaOpBulkMoveIn {
     dep_ids: Vec<usize>,
 }
 
+/// Tree-access cost table derived by instantiation (`kernel_builder::transform::cost`).
+///
+/// Emits the canonical program (root from the shared vector, every other round gathering)
+/// with every alternative of every choice site (round at depth 1 to 4, group) built next
+/// to it, and reduces each op's liveness to the features of `scripts/emission_structure.py`.
+/// The emission options are the context; no tree-access option may be given. Defaults are the
+/// structure model's context (merged hash, mirrored index); other contexts may report problems.
+///
+/// Returns a JSON string: `rule`, `context` (as the Python `Context`), `alternatives` (names
+/// and proof ids), `coefficients` (feature -> category -> count, the `CostTable` layout),
+/// `sites` (per site: counts of each alternative, the facts the match used and their
+/// sources), `resources` (shared setup grouped by the OR of features it lives under) and
+/// `problems` (anything that does not fit the feature model; empty when exact).
+#[pyfunction]
+#[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, *, merge_hash_stages=true, index_form="mirrored", select_bit_source="index", values_only=false))]
+pub fn derive_tree_access_cost_table(
+    forest_height: usize,
+    n_nodes: usize,
+    batch_size: usize,
+    rounds: usize,
+    merge_hash_stages: bool,
+    index_form: &str,
+    select_bit_source: &str,
+    values_only: bool,
+) -> PyResult<String> {
+    use crate::kernel_builder::config::{IndexForm, ProblemSpec, SelectBitSource};
+    let spec = ProblemSpec {
+        forest_height,
+        n_nodes,
+        batch_size,
+        rounds,
+        merge_hash_stages,
+        index_form: IndexForm::from_str(index_form).map_err(pyo3::exceptions::PyValueError::new_err)?,
+        select_bit_source: SelectBitSource::from_str(select_bit_source)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?,
+        values_only,
+        ..Default::default()
+    };
+    let table = crate::kernel_builder::transform::derive_tree_access_costs(&spec)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(table.to_json().to_string())
+}
+
 #[derive(serde::Deserialize)]
 struct OpBulkMove {
     id: usize,

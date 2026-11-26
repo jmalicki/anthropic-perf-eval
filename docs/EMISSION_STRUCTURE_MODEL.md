@@ -134,6 +134,28 @@ Stores (64) and fixed flow ops (0) are constant. Reading it: a group that select
 `bits-flow` instead of gathering saves 8 loads and costs 8 + 7 selects and 2 vector ops (bit
 extraction 4, minus the gather's 2); the level-4 table costs 16 loads and 53 + 8 scalar ops once.
 
+### 3.1 The same table by instantiation (no probe builds)
+
+`python -m scripts.emission_structure derive` gets the table from one emission instead of 144
+fits (`scheduler_rs/src/kernel_builder/transform/`, binding `derive_tree_access_cost_table`).
+The canonical program (root from the shared vector, every other round gathering) is emitted
+with every bit-driven alternative of every choice site built next to its gather by the
+emitter's own per-group code, on operands a structural matcher binds (rule `tree-access`;
+region tags only propose where to look). Then every op gets the condition under which dead
+code elimination keeps it, an OR of (round, group, encoding) choices, which reduces to the
+features above: shared tables to `table:d` / `pairs:d` / `pairs_high:d` / `mobius:d`, gathers'
+base vectors and level-end constants to `gather_round:r` / `gather_depth:d`, and ORs across
+levels, by inclusion-exclusion, to the `and:table:*` products (the scalar constants 3 to 15
+that address the cached nodes). Per-site differences to gathering give `groups:d:e` and are
+checked to be the same at every site. Whether a constant is `const` or `const_alu` depends
+on the constants created before it, so on emission order: every constant is checked to keep
+its category whatever the lazily created level-end constants `L_d` (and its own position, for
+those). Anything that does not reduce to the features is reported, never fitted. At 16 rounds the derived table equals the calibrated one entry for
+entry with 4 and with 32 groups (`tests/test_emission_structure.py`, and `derive` against
+`calibrate`); the Rust tests also compare its predictions with emitted programs directly.
+Contexts it does not cover yet: the zero-based index (bits are matched only on the mirrored
+index chain) and `--values-only` (dead index updates are per group, the `tail:*` features).
+
 ## 4. The objective: the capacity floor with choices resolved
 
 `choice_floor(counts)` is the smallest integer `T` such that some resolution of every choice fits
