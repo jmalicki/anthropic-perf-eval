@@ -1,6 +1,6 @@
 ---
 name: use-emission-structure
-description: Choose the kernel's structure with a solver - which tree-access encoding (gather, bits, bits-flow, mobius) each group of 8 lanes uses in each round - by minimising the capacity floor over op counts calibrated exactly from the emitter, then emit the plan with --emission-plan and measure it (PROVED, PASSED, upstream). Use when asked which emission mix is best, when adding a tree-access encoding, or to refresh docs/EMISSION_STRUCTURE_MODEL.md.
+description: Choose the kernel's structure with a solver - which tree-access encoding (gather, bits, bits-flow, mobius) each group of 8 lanes uses in each round - by minimising the capacity floor over op counts calibrated exactly from the emitter, then emit the plan with --emission-plan and measure it (PROVED, PASSED, upstream); or run the closed loop (loop) that feeds shaped-greedy schedules back into the choice. Use when asked which emission mix is best, when adding a tree-access encoding, or to refresh docs/EMISSION_STRUCTURE_MODEL.md.
 ---
 
 # Emission structure model
@@ -24,6 +24,33 @@ $M sweep --shaped --max-util none --max-util flow=0.9 ...            # solve + m
 $M solve --values-only --select-bit-source path --fix 15=gather --max-util flow=0.9 --out p.json
 $M solve --what-if gather-without-address-op                        # uncalibrated estimate for a future encoding
 ```
+
+## Closed loop with the shaped greedy (`loop`)
+
+`scripts/emission_loop.py`, design and results in section 10 of the doc. Each iteration solves
+stage 1, builds the plan once with the shaped greedy (proved, validated), reads the scheduler
+JSON and feeds back. Builds are cached in `--state`, so later runs and other modes reuse them.
+
+```bash
+L="uv run python -m scripts.emission_structure loop"
+$L run --state artifacts/benders/s.json --modes ""                       # seeds only (6 builds)
+$L run --state artifacts/benders/s.json --modes caps-underfilled --budget 10 --seed-plan gather
+$L run --state artifacts/benders/s.json --modes nogood --nogood-caps flow=0.92 --budget 8 --seed-plan gather
+$L run --state artifacts/benders/s.json --modes rows --budget 10 --seed-plan gather
+$L report --state a.json --extra-state b.json --caps flow=0.92                # trace + surrogate correlations
+```
+
+| Mode | Feedback | Bound? |
+|---|---|---|
+| `nogood` | no-good cut per built plan, floor < incumbent (`--nogood-caps`: enumerate under caps instead) | sound, weak |
+| `caps` / `caps-underfilled` | learned `max_util`: cap the engine the schedule saturates / under-fills relative to the plan | heuristic; `caps-underfilled` rediscovers flow 0.9 in 3 builds |
+| `rows` | M >= t + q + `window_floor`(work with head >= t, tail >= q) over plan variables | row form: engine coupling proved by Z3 for all counts, window containment argued by hand, composition a randomized check (`verification/window_rows_proof.py`); the per-class table is observed and can be contradicted by new mixes, so the default cut is `floor < best` (`--rows-cut heuristic` for `M < best + e`) |
+
+Result to remember: nothing beats `flow90.json` (1,104). Five plans tie at 1,104. Among
+near-optimal plans the floor and every lower bound do not rank (Spearman rho about 0 or
+negative); only the capped floor does (+0.64). Do not trust stage 1 to choose between plans
+within about 20 cycles: build them. A run builds at most `--max-builds` (default 60) new plans
+in total; builds are about 0.3 s each, but the machine budget is the limit.
 
 The cost table is cached per context (rounds, batch, global emission options) in
 `artifacts/emission_structure/costs_<hash>.json` and calibrated on first use. Context flags:
