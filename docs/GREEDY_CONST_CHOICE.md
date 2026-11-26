@@ -14,7 +14,8 @@ covers the ALU-derived constants) and PASSED.
 
 ## Answers
 
-1. **Constants off the load engine: works, worth 0 cycles (measured).** The new policy
+1. **Constants off the load engine: works, worth 0 cycles without justification
+   (measured).** The new policy
    (`--greedy-const-policy alu-first`) moves 23 of 35 load-engine constants to the scalar ALU
    on `path_flow90.json` (24 ALU-derived, 18 `add_imm`, 12 loads) and 23 of 33 on
    `flow90.json`. Cycles: **1,030 -> 1,030** and **1,039 -> 1,039**; `alu-when-load-full`
@@ -23,11 +24,24 @@ covers the ALU-derived constants) and PASSED.
    instead of 50, and the load engine idles in cycles 39 to 50 instead, because no gather can
    start before t = 51; after t the ramp has the same idle slots (41 -> 42 on path). The
    "load engine full" blame in the earlier accounting was the wavefront order of the batch
-   `vload`s of later groups, not load capacity.
+   `vload`s of later groups, not load capacity. Measured without `--greedy-justify`: on this
+   branch justification skips any schedule with an ALU-derived constant. With derived
+   constants modelled (#93), `alu-first` + justify 10 gives 1,016 on path, the same as
+   without `alu-first`; #91 records 1,026 for `alu-first` + `--reassociate-gather-xor`
+   (without justification) as a fragile interaction (1,067 at stagger 8).
 2. **Forced encodings under `--use-greedy` now take effect** (they were dropped: the greedy
    read them only from the CP-SAT config). `--const-choice add_imm`: 54 of 54 constants on
    flow, 1,072 cycles on path; `--const-choice load`: 54 on load, 1,038 (static bound 1,017);
    `--select-choice fma` runs every select as a multiply_add. All PROVED and PASSED.
+   Also tested (small sizes): `--select-choice vselect` (every select a flow vselect),
+   `--valu-shift valu` (no shift) and `--valu-shift alu` (every shiftable vector op on the
+   scalar ALU). The last is very slow under the greedy, about one shifted op per cycle on the
+   12 scalar slots: 7,148 cycles at 16 rounds against 2,007 (shaped: 7,117 against 1,313;
+   `valu`: 2,104 and 1,616), so a warning is printed. Options that another option would
+   override or ignore are errors (CLI and binding, `check_encoding_option_combinations`): a
+   forced encoding with the hint pass that would overwrite it, `--greedy-early-stagger`
+   without the wavefront priority, and `--greedy-const-policy` under CP-SAT, a forced
+   `--const-choice` or the const-choice hint pass.
 3. **Setup loads needed before t (accounted, first consumer in the schedule):** path, 107
    of 120 (13 later: 12 batch `vload`s, 1 constant); index, 80 of 120. 107 loads need 54
    cycles of the load engine, above t = 51, so on the path plan some must land after t unless
@@ -44,8 +58,8 @@ covers the ALU-derived constants) and PASSED.
    t 51 + q 14 + ceil(W / 2) with W the gather loads after t; constants are not in W. Only the
    tail row moves (path 1,008 -> 996, index 1,027 -> 1,015), and it was not binding.
 
-So no kernel beats a baseline here: the best stay 1,030 / 1,032 (path) and 1,039 / 1,041
-(index). The start-up loss after t is the ramp of group admission into the load stream under
+So no kernel beats a baseline here (without justification): the best stay 1,030 / 1,032
+(path) and 1,039 / 1,041 (index). The start-up loss after t is the ramp of group admission into the load stream under
 the wavefront stagger, and the early-stagger and const experiments show it is not cheaply
 changed in the greedy.
 

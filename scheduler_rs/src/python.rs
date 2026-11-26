@@ -1224,6 +1224,19 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         enable_schedule_with_fixed_choices,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    crate::kernel_builder::config::check_encoding_option_combinations(
+        greedy_priority,
+        greedy_early_stagger,
+        use_cpsat,
+        const_choice,
+        select_choice,
+        valu_shift,
+        enable_const_choice_hint_pass,
+        enable_select_choice_hint_pass,
+        enable_valu_shift_hint_pass,
+        greedy_const_policy,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
     if let Some(dtime) = cpsat_deterministic_time {
         if !(dtime.is_finite() && dtime > 0.0) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
