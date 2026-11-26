@@ -675,10 +675,12 @@ impl Surgery {
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
             let dangling = |op: &SsaOp| {
                 op_reads(op).chain(op.keep_live.iter().flatten().copied()).any(|v| {
+                    // Defined, a group alias all of whose lanes are defined, or a lane of a
+                    // defined vector: anything else is gone.
                     Some(v) != program.zero_vreg
                         && graph.def_index(v).is_none()
-                        && graph.group_lanes(v).is_none()
-                        && graph.element_of(v).is_none()
+                        && !graph.group_lanes(v).map_or(false, |ls| ls.iter().all(|l| graph.def_index(*l).is_some()))
+                        && !graph.element_of(v).map_or(false, |(vec, _)| graph.def_index(vec).is_some())
                 })
             };
             let before_len = kept.len();
