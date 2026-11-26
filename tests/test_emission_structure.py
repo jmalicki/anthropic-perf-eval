@@ -83,6 +83,39 @@ def test_calibration_is_exact_on_unseen_plans(table, tmp_path):
     assert result["compared"] >= 1 and result["bad"] == []
 
 
+def test_table_by_instantiation_equals_calibrated(table):
+    """The binding's cost table, derived from one program holding every alternative, equals
+    the table fitted from probe builds entry for entry, products of shared constants included."""
+    derived, doc = es.derive_table(CTX)
+    assert es.table_differences(derived, table) == []
+    assert any(derived.coefficients[name]["alu"] for name in es.feature_names(CTX) if name.startswith("and:"))
+    assert doc["problems"] == [] and doc["rule"] == "tree-access"
+    choice_rounds = len(CTX.choice_rounds())
+    assert len(doc["sites"]) == choice_rounds * CTX.n_groups
+    site = doc["sites"][0]
+    assert set(site["alternatives"]) == {"gather", "bits", "bits-flow", "mobius"}
+    assert {f["name"]: f["source"] for f in site["facts"]}["depth"] == "structure"
+
+
+@pytest.mark.parametrize("context", [
+    es.Context(rounds=16, batch_size=32, index_form="zero-based"),  # bits not matched on the zero-based chain
+    es.Context(rounds=16, batch_size=32, values_only=True),         # tail:* liveness is per group
+])
+def test_table_by_instantiation_refuses_unsupported_contexts(context):
+    with pytest.raises(RuntimeError, match="problems"):
+        es.derive_table(context)
+
+
+@pytest.mark.ci_only
+@pytest.mark.timeout(1800)
+def test_table_by_instantiation_equals_calibrated_32_groups(tmp_path):
+    """The parity gate at the shape of the recorded results (144 probe builds, a few minutes)."""
+    ctx = es.Context(rounds=16, batch_size=256)
+    calibrated = es.calibrate(ctx, str(tmp_path), log=None)
+    derived, _ = es.derive_table(ctx)
+    assert es.table_differences(derived, calibrated) == []
+
+
 def test_counts_cover_every_ssa_op(tmp_path):
     rows = es.flag_plan(CTX, "bits-flow", "after-wrap")
     _, _, sched, _ = es.build_emission(rows, CTX, str(tmp_path))
@@ -222,3 +255,41 @@ def test_solved_plan_floor_is_emitted(table, tmp_path, max_util):
     _, _, sched, _ = es.build_emission(result["rows"], CTX, str(tmp_path))
     assert es.emission_counts(sched) == result["counts"]
     assert math.isclose(es.choice_floor(es.emission_counts(sched))["cycles"], result["floor"]["cycles"])
+
+
+def test_derive_reports_before_calibrating(monkeypatch, capsys):
+    """`derive` runs and prints the derivation before it loads (or calibrates) the reference:
+    a calibration failure is reported after the derivation, not instead of it."""
+    called = []
+
+    def fake_derive(ctx):
+        called.append("derive")
+        return es.CostTable(ctx, {}, notes=[]), {"sites": [1, 2, 3], "resources": [1]}
+
+    def failing_calibration(*args, **kwargs):
+        called.append("calibrate")
+        raise RuntimeError("probe build failed")
+
+    monkeypatch.setattr(es, "derive_table", fake_derive)
+    monkeypatch.setattr(es, "load_or_calibrate", failing_calibration)
+    assert es.main(["derive", "--rounds", "2", "--batch-size", "16"]) == 1
+    out = capsys.readouterr().out
+    assert called == ["derive", "calibrate"]
+    assert "3 sites" in out and "probe build failed" in out
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_derive_refuses_to_overwrite_its_reference(tmp_path, monkeypatch, default):
+    """--json naming the reference table (given, or the default when --table is omitted) is
+    refused before anything runs."""
+    monkeypatch.setattr(es, "derive_table", lambda ctx: pytest.fail("derived despite the refusal"))
+    if default:
+        ref = es.default_table_path(es.Context(rounds=2, batch_size=16))
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--json", ref]
+    else:
+        ref = str(tmp_path / "costs.json")
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--table", ref,
+                "--json", str(tmp_path / "." / "costs.json")]
+    with pytest.raises(SystemExit) as e:
+        es.main(argv)
+    assert e.value.code == 2

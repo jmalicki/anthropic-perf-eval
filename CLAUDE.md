@@ -87,7 +87,7 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 
 **Testing strategy:** Heavy testing of **scheduler_rs** (scheduling, budget, CP-SAT, greedy, correctness) lives in **Rust** (`cargo test --manifest-path scheduler_rs/Cargo.toml --features cpsat`). Python tests for scheduler_rs **only exercise the PyO3 interface and its options** (e.g. `build_tick_tock_kernel_ssa`, `enable_valu_shift`, `use_cpsat`): they build via the binding → run on `Machine` → compare to `reference_kernel2`. They do **not** test underlying scheduler_rs functionality (that is for Rust tests). `tests/submission_tests.py` exercises the end-to-end pipeline.
 
-**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|upstream|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
+**One entry point:** `./scripts/test.sh [rust|python|proofs|kernel|upstream|ci-only|all]` sets the environment each suite needs (OR-Tools prefix, `PYO3_PYTHON` pointing at the project venv, `BUILD_FROM_PROJECT_ROOT`). Arguments after the suite name are passed through.
 
 **Machine load: test slots, and when to run suites locally.** Several agents in different worktrees share this machine; when they all run suites at once, timing-sensitive tests (pytest-timeout, subprocess timeouts, Z3 timeouts) fail for load alone. So:
 - Every `./scripts/test.sh` suite holds one of a few machine-wide test slots while it runs (`scripts/test_slot.py`; an `flock` on files in `~/.cache/anthropic-perf-eval/test-slots`, released automatically when the run ends or is killed). `PERF_EVAL_TEST_SLOTS` sets how many (default 2; `0` disables); CI takes no slot. The wrapper `exec`s the suite with the lock, so the slot is held exactly while the suite (and anything it leaves running) lives. A run that has to wait prints who holds the slots.
@@ -98,11 +98,12 @@ BUILD_FROM_PROJECT_ROOT=1 uv run maturin build --release --manifest-path schedul
 ./scripts/test.sh                 # everything
 ./scripts/test.sh rust            # cargo test --features cpsat
 ./scripts/test.sh rust -- test_vector_group      # one Rust test
-./scripts/test.sh python          # pytest: interface, dataflow replay, forced modes, rewrite proofs
+./scripts/test.sh python          # pytest: every tests/test_*.py (discovery) + solver/test_slot_utilization.py
 ./scripts/test.sh python tests/test_kernel_dataflow.py -k lane
 ./scripts/test.sh proofs          # Z3: liveness theorems + rewrite identities
 ./scripts/test.sh kernel          # greedy 2r and 16r builds with dataflow replay + validation
 ./scripts/test.sh upstream        # 16-round greedy kernel on the unmodified upstream simulator and tests
+./scripts/test.sh ci-only         # pytest -m ci_only: 16-round pin builds (CI step; not part of 'all')
 
 # Rust: include optional/CI-only tests (slow proptest, minimal failing config, etc.)
 ./scripts/test.sh rust --features "cpsat ci-tests"
@@ -117,14 +118,14 @@ uv run tests/submission_tests.py
 
 `uv run pytest` works directly: pytest, pytest-timeout and z3-solver are in the default `dev` dependency group. Running `cargo test` by hand needs `PYO3_PYTHON=$PWD/.venv/bin/python` if the system Python is newer than PyO3 supports ("the configured Python version is newer than PyO3's maximum supported version").
 
-**Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, use a pytest marker (e.g. `@pytest.mark.ci_only`) and run default with `-m "not ci_only"`; document in `pyproject.toml`.
+**Optional tests:** Prefer a **Cargo feature** (`ci-tests`) for optional/CI-only Rust tests so they run when requested (e.g. `cargo test --features "cpsat ci-tests"`). Use `#[ignore]` only for temporarily disabled tests that expose known bugs (with a comment and issue reference). CI should run with `--features "cpsat ci-tests"` for full coverage. For Python, mark the test `@pytest.mark.ci_only`: `pyproject.toml` deselects it in every pytest run (`addopts = "-m 'not ci_only'"`), and CI runs them in their own step, `./scripts/test.sh ci-only` (`pytest -m ci_only`; a later `-m` replaces the default).
 
 ### CI
 
 GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, on a macOS arm64 runner (`macos-latest`) with OR-Tools from Homebrew, the same setup as local development. Two jobs:
 
 - **Rust tests (scheduler_rs)** — `./scripts/test.sh rust` (debug profile, `--features cpsat`).
-- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, `./scripts/test.sh upstream`, one step each.
+- **Python tests, proofs, kernel builds** — `./scripts/build_scheduler_rs.sh --release`, then `./scripts/test.sh python`, `./scripts/test.sh proofs`, `./scripts/test.sh kernel`, `./scripts/test.sh upstream`, `./scripts/test.sh ci-only`, one step each. The python suite collects `tests/` by discovery, so every `tests/test_*.py` runs in CI without being listed; `tests/test_suite_coverage.py` fails on a test file outside `tests/` that the suite does not run.
 
 To reproduce a failure locally, run the suite named in the failing step: `./scripts/test.sh <suite>` (rebuild first with `./scripts/build_scheduler_rs.sh --release` for the Python-side suites). CI installs whatever OR-Tools version Homebrew currently ships (printed by the "Install OR-Tools" step); if a failure does not reproduce, compare that against `brew list --versions or-tools`.
 
