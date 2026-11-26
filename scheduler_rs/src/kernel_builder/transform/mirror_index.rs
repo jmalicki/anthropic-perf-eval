@@ -51,7 +51,7 @@ use super::graph::SsaGraph;
 use super::report::{dce_counts, RuleReport};
 use super::rule::{Fact, FactSource};
 use super::select_bits::{level_last, BitForm, BitPaths};
-use super::surgery::{Stamp, Surgery};
+use super::surgery::{Finished, Stamp, Surgery};
 use super::values::{Assumption, MemoryLayout, ValueFacts};
 
 /// Rule id.
@@ -187,7 +187,9 @@ impl MirrorIndexRule {
             let mut l2 = l;
             l2.push(o[0]);
             plan.index_values.insert(dest, (l2.len(), l2));
-            if values.relies_on_assumption(graph, x) {
+            // The step's first factor, or its own form (the constant 2, the offset's constants),
+            // may rely on InitialIndicesZero.
+            if values.relies_on_assumption(graph, x) || paths.assumed(i) {
                 plan.assumed = true;
             }
         }
@@ -240,6 +242,19 @@ impl MirrorIndexRule {
                     return Err(format!("index value {:?} is the delta of select op {}", v, r));
                 }
                 let u = self.classify(graph, &values, &plan, &index_stores, r, v, k)?;
+                // A mirror op is removed and its readers rewired as whole vectors: a result that is
+                // a vector group key or lane (read lane by lane) would leave lane readers dangling.
+                if u == IndexUse::Mirror {
+                    if let Some(d) = op.dest {
+                        if graph.group_lanes(d).is_some() || graph.element_of(d).is_some() {
+                            return Err(format!("mirror op {} (L_{} - idx) has a result read as a vector group", r, k));
+                        }
+                    }
+                }
+                // A stored depth-0 index that is the loaded input index is 0 only by assumption.
+                if u == IndexUse::Store && k == 0 && values.relies_on_assumption(graph, v) {
+                    plan.assumed = true;
+                }
                 // A constant the use rewrites with (compare, level position, mirror) may itself
                 // rely on InitialIndicesZero: the rewrite then does too.
                 if matches!(u, IndexUse::Compare { .. } | IndexUse::LevelPosition { .. } | IndexUse::Mirror)
@@ -463,6 +478,7 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
     if plan.steps.is_empty() {
         return Ok((program, report));
     }
+    report.add_facts(&plan.facts);
     if let Err(e) = Surgery::check(&program) {
         report.refused = Some(e);
         return Ok((program, report));
@@ -657,7 +673,14 @@ pub fn apply_mirror_index(program: SsaProgram, rule: &MirrorIndexRule) -> Result
             }
         }
     }
-    let (program, surgery_report) = surgery.finish()?;
+    let (program, surgery_report) = match surgery.finish_or_refuse()? {
+        Finished::Done(program, report) => (program, report),
+        Finished::Refused(program, why) => {
+            report.refused = Some(why);
+            report.sites = Default::default();
+            return Ok((program, report));
+        }
+    };
     report.surgery = surgery_report;
     if let (Some(before), None) = (before, &report.cost_error) {
         match dce_counts(&program) {

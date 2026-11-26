@@ -284,7 +284,8 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                             "forms proved on the ops, assuming the input indices start at 0 (proofs: R15). "
                             "mirror-index: rewrite every index value of a zero-based program to the mirrored "
                             "form n = L_d - idx (the program --index-form mirrored emits), or none if some index "
-                            "use is not one of the proved forms (proofs: R10, R15). Off by default")
+                            "use is not one of the proved forms, assuming the input indices start at 0 (proofs: R10, "
+                            "R15). Off by default")
     return group
 
 

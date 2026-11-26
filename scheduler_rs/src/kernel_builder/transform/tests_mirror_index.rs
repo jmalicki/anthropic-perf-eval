@@ -815,3 +815,78 @@ fn test_mirror_index_kernel_equals_the_flag_kernel() {
     assert_eq!(renum.0, renum.1, "{}: kernels differ beyond VReg numbering", label);
     }
 }
+
+// ----------------------------------------------------------------------------
+// Final-gate review of #81
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_mirror_index_refuses_a_mirror_result_read_as_a_vector_group() {
+    // Zero-based bits at depth 3: the extraction's `L_2 - idx` is a mirror op. Its result as a
+    // vector group key (lanes read by scalar ops) cannot be rewired by replace_uses.
+    let mut p = raw_program(&spec5());
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let plan = rule().plan(&g, p.zero_vreg).unwrap();
+    let (r, _, _) = *plan.uses.iter().find(|(_, _, u)| *u == IndexUse::Mirror).unwrap();
+    drop(g);
+    let d = p.ops[r].dest.unwrap();
+    let lanes: Vec<VReg> = (0..8).map(|_| fresh(&mut p, false)).collect();
+    p.vector_group_lanes.insert(d, lanes);
+    assert_refused(p, &rule(), "read as a vector group");
+}
+
+#[test]
+fn test_mirror_index_records_an_assumption_from_a_step_constant() {
+    // With --prune-dead-index every chain starts at `2 - b` (no loaded index): nothing is
+    // assumed. Make one step's constant 2 `vbroadcast(loaded_idx + 2)` (2 only when the input
+    // indices are 0): the rewrite now relies on InitialIndicesZero and says so.
+    let spec = ProblemSpec { rounds: 3, prune_dead_index: true, ..Default::default() };
+    let p = raw_program(&spec);
+    let (_, report) = apply_mirror_index(clone_program(&p), &rule()).unwrap();
+    assert!(report.n_sites() > 0 && report.assumptions().is_empty(), "{:?}", report.facts);
+
+    let mut p = p;
+    let st = step_of(&p, 2);
+    let two = vconst(&p, 2);
+    let k = p.ops[st].srcs.iter().position(|s| s.as_vreg() == Some(two)).unwrap();
+    let (c5, ptr, idx, c2, sum, b2) = (fresh(&mut p, false), fresh(&mut p, false), fresh(&mut p, false), fresh(&mut p, false), fresh(&mut p, false), fresh(&mut p, true));
+    let mut k5 = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(c5), vec![Operand::Imm(5)]);
+    k5.produces_constant = Some(5);
+    let mut k2 = SsaOp::new(0, Engine::Load, Opcode::ConstChoice, Some(c2), vec![Operand::Imm(2)]);
+    k2.produces_constant = Some(2);
+    p.ops[st].srcs[k] = Operand::VReg(b2);
+    insert_at(&mut p, 0, vec![
+        k5,
+        SsaOp::new(0, Engine::Load, Opcode::Load, Some(ptr), vec![Operand::VReg(c5)]),
+        SsaOp::new(0, Engine::Load, Opcode::Load, Some(idx), vec![Operand::VReg(ptr)]),
+        k2,
+        SsaOp::new(0, Engine::Alu, Opcode::Add, Some(sum), vec![Operand::VReg(idx), Operand::VReg(c2)]),
+        SsaOp::new(0, Engine::Valu, Opcode::Vbroadcast, Some(b2), vec![Operand::VReg(sum)]),
+    ]);
+    let (_, report) = apply_mirror_index(p, &rule()).unwrap();
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    assert_eq!(report.assumptions(), vec!["initial-indices-zero"]);
+}
+
+#[test]
+fn test_mirror_index_index_store_before_the_last_value_definer() {
+    // Group 0's index store moved to right after its operands are defined, i.e. before the
+    // values the value stores store are computed: the final L_k - n goes before the store.
+    let spec = spec5();
+    let mut p = raw_program(&spec);
+    let g = SsaGraph::new(&p.ops, &p.vector_group_lanes);
+    let plan = rule().plan(&g, p.zero_vreg).unwrap();
+    let (r, _, _) = *plan.uses.iter().find(|(_, _, u)| *u == IndexUse::Store).unwrap();
+    drop(g);
+    let store = p.ops.remove(r);
+    let ready = store.srcs.iter().filter_map(|s| s.as_vreg()).map(|v| p.ops.iter().position(|o| o.dest == Some(v)).unwrap()).max().unwrap();
+    let last_value_def = value_stores(&{ let mut q = clone_program(&p); q.ops.insert(ready + 1, store.clone()); renumber(&mut q); q })
+        .iter()
+        .map(|&s| s)
+        .max()
+        .unwrap();
+    p.ops.insert(ready + 1, store);
+    renumber(&mut p);
+    assert!(ready + 1 < last_value_def, "the index store must precede the last value definer");
+    rewrite_and_compare(&p, &spec, "index store early");
+}
