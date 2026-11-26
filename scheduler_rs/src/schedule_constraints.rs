@@ -147,7 +147,9 @@ pub fn build_ssa_schedule_constraints(
     }
 
     // 5b. Ordering groups: cycle[i] <= cycle[j] for consecutive in group
-    let mut groups: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+    // Ordered by key so the rows (and the scheduler JSON that lists them) do not follow a
+    // hash order.
+    let mut groups: std::collections::BTreeMap<Vec<i64>, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, op) in ops.iter().enumerate() {
         let Some(ref hint) = op.symmetry_hint else {
             continue;
@@ -171,7 +173,8 @@ pub fn build_ssa_schedule_constraints(
     }
 
     // 5c. Lexicographic streams: first_op[cur] <= first_op[next]
-    let mut streams: HashMap<Vec<i64>, std::collections::BTreeMap<i64, Vec<usize>>> = HashMap::new();
+    let mut streams: std::collections::BTreeMap<Vec<i64>, std::collections::BTreeMap<i64, Vec<usize>>> =
+        std::collections::BTreeMap::new();
     for (idx, op) in ops.iter().enumerate() {
         let Some(ref hint) = op.symmetry_hint else {
             continue;
