@@ -1,5 +1,10 @@
 # Transform pipeline: from an emitter with strategy flags to a compiler that rewrites
 
+> **Status.** Written 2026-11-24 as the design before implementation. It is kept as written:
+> the rule numbering and the coupling ids (C1-C18) are frozen, because code comments on the
+> rule branches cite them. What was built differs in places; see
+> [TRANSFORM_PIPELINE_AS_BUILT.md](TRANSFORM_PIPELINE_AS_BUILT.md).
+
 **Conclusion.** The kernel generator should emit one canonical SSA program and reach every
 current emission option by proved rewrites chosen by a small solver. The current flags turn
 out to be four kinds of thing, and only two of them are rewrites in the usual sense:
@@ -55,8 +60,8 @@ running anything.
 `scheduler_rs/src/kernel_builder/tick_tock_ssa/mod.rs:782`, and `build_and_schedule_cpsat` at
 `tick_tock_ssa/mod.rs:921`. The greedy path then runs `run_greedy_pipeline`
 (`pipeline/mod.rs:248`). The CP-SAT path runs its passes one at a time. `run_cpsat_pipeline`
-(`pipeline/mod.rs:296`) exists, but the only caller found was the greedy one
-(`tick_tock_ssa/mod.rs:800`).
+(`pipeline/mod.rs:300`) exists but has no caller on main at the time of writing; the call at
+`tick_tock_ssa/mod.rs:800` is to `run_greedy_pipeline`.
 
 T1 to T5 belong between `self.build()` and `PipelineContext::new`, as one function
 `transform(program, spec) -> SsaProgram` that both entry points call. They should not run

@@ -1,5 +1,10 @@
 # Transform rule catalogue
 
+> **Status.** Written 2026-11-24 as the design before implementation. It is kept as written:
+> the rule numbering and the coupling ids (C1-C18) are frozen, because code comments on the
+> rule branches cite them. What was built differs in places; see
+> [TRANSFORM_PIPELINE_AS_BUILT.md](TRANSFORM_PIPELINE_AS_BUILT.md).
+
 This catalogue lists every strategy branch in today's emitter, read from the code, written
 as a rule for the transform pipeline ([TRANSFORM_PIPELINE_DESIGN.md](TRANSFORM_PIPELINE_DESIGN.md)).
 

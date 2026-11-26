@@ -1,5 +1,10 @@
 # From the baseline kernel to our best: the gap a compiler has to close
 
+> **Status.** Written 2026-11-24 as the design before implementation. It is kept as written:
+> the rule numbering and the coupling ids (C1-C18) are frozen, because code comments on the
+> rule branches cite them. What was built differs in places; see
+> [TRANSFORM_PIPELINE_AS_BUILT.md](TRANSFORM_PIPELINE_AS_BUILT.md).
+
 **Conclusion.** The north star is a compiler that takes the original, unoptimised kernel and
 transforms it into a kernel as good as our best, with no strategy flags. The bar is a top
 model working on the kernel by hand for hours.
@@ -46,8 +51,9 @@ command is in section 6), or *(inferred)*.
 ### Where it lives
 
 - The repo's original baseline builder is `KernelBuilder.build_kernel` in `perf_takehome.py`
-  at the repo's first commit `dceff11`, at lines 28-147 of that version (**read**: `git show
-  dceff11:perf_takehome.py`).
+  at commit `dceff11` (`dceff1151fb8372e26ed19e7c1c490b92bd09c1d`), the first commit that
+  contains the file (the root commit `9da5787` has no `perf_takehome.py`), at lines 28-147
+  of that version (**read**: `git show dceff11:perf_takehome.py`).
 - Today's root `perf_takehome.py` imports our builder instead (`perf_takehome.py:27`,
   `from solver.kernel_builder import KernelBuilder`).
 - `upstream/perf_takehome.py` is a shim that loads a saved kernel (`upstream/perf_takehome.py:1-15`).
@@ -226,8 +232,9 @@ These are goal-only. None is needed for the benchmark number.
 
 ## 6. Reproduction
 
-`scripts/measure_baseline.py` reads the original builder from git (`git show
-dceff11:perf_takehome.py`, into a temporary directory; no copy is committed). It runs the
+`scripts/measure_baseline.py` reads the original builder from git (`perf_takehome.py` at the
+full sha `dceff1151fb8…`, checked against its sha256 `f9c1de09…`, into a temporary
+directory; no copy is committed). It runs the
 builder on the vendored upstream simulator (`upstream/tests/frozen_problem.py`) and prints
 the counts in section 1. `--save` writes the kernel without debug slots and with layout
 metadata for the lifter.

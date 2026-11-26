@@ -5,11 +5,14 @@
 
 The baseline builder (``KernelBuilder.build_kernel``) is no longer in the working tree: the
 root ``perf_takehome.py`` now imports this repository's builder. The script reads the
-original from git (``git show dceff11:perf_takehome.py``, the repository's first commit) into
-a temporary directory, runs its builder part, and simulates the kernel. The simulator is
-``upstream/tests/frozen_problem.py`` (vendored unchanged; ``upstream/SHA256SUMS``), bound
-as ``problem``, so neither this repository's ``problem.py`` nor the tests in the original
-file are used.
+original from git (``perf_takehome.py`` at commit ``dceff1151fb8…``, the first commit that
+contains the file; the root commit 9da5787 does not), checks its sha256, runs its builder
+part, and simulates the kernel. The commit is named by its full sha, so a branch or tag that
+happens to be called ``dceff11`` cannot be read instead. The simulator is
+``upstream/tests/frozen_problem.py`` (vendored unchanged), checked against
+``upstream/SHA256SUMS`` and imported under a private module name, bound as ``problem``, so
+neither this repository's ``problem.py`` nor the tests in the original file are used. The
+global ``random`` state is restored after the inputs are generated.
 
 Printed (JSON): cycles, bundles (all and with a non-debug slot), ops per engine, ops per
 opcode, scratch words used, and whether values and indices match ``reference_kernel2``.
@@ -23,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -32,27 +37,53 @@ import tempfile
 import types
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASELINE_COMMIT = "dceff11"
+# The first commit containing perf_takehome.py (full sha: an abbreviation could resolve to a
+# branch or tag of that name), and the sha256 of the file there.
+BASELINE_COMMIT = "dceff1151fb8372e26ed19e7c1c490b92bd09c1d"
 BASELINE_PATH = "perf_takehome.py"
+BASELINE_SHA256 = "f9c1de0945031d3333a0cae78cad2e93c93fe67fa0baaee6a3e9a9cc8e6267eb"
+# The part of the file that is the builder ends where its test harness begins.
+BUILDER_END_MARKER = "BASELINE = "
 FOREST_HEIGHT = 10
 
 
 def baseline_source(repo: str = REPO, commit: str = BASELINE_COMMIT) -> str:
-    """Text of the original baseline builder file, read from git."""
-    return subprocess.run(
+    """Text of the original baseline builder file, read from git and checked by sha256."""
+    data = subprocess.run(
         ["git", "-C", repo, "show", f"{commit}:{BASELINE_PATH}"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True,
     ).stdout
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != BASELINE_SHA256:
+        raise RuntimeError(f"{commit}:{BASELINE_PATH} has sha256 {digest}, expected {BASELINE_SHA256}")
+    return data.decode()
+
+
+def _expected_sha256(repo: str, relpath: str) -> str:
+    """The sha256 that upstream/SHA256SUMS records for `relpath` (relative to upstream/)."""
+    with open(os.path.join(repo, "upstream", "SHA256SUMS")) as f:
+        for line in f:
+            digest, name = line.split()
+            if name == relpath:
+                return digest
+    raise RuntimeError(f"upstream/SHA256SUMS has no entry for {relpath}")
 
 
 def upstream_problem(repo: str = REPO) -> types.ModuleType:
-    """The vendored upstream simulator module (upstream/tests/frozen_problem.py)."""
-    sys.path.insert(0, os.path.join(repo, "upstream", "tests"))
-    try:
-        import frozen_problem
-    finally:
-        sys.path.pop(0)
-    return frozen_problem
+    """The vendored upstream simulator (upstream/tests/frozen_problem.py), checked against
+    upstream/SHA256SUMS and loaded under a private module name, so a ``frozen_problem``
+    already imported from elsewhere (the root one re-exports this repository's simulator)
+    can be neither used nor replaced."""
+    path = os.path.join(repo, "upstream", "tests", "frozen_problem.py")
+    with open(path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    want = _expected_sha256(repo, "tests/frozen_problem.py")
+    if digest != want:
+        raise RuntimeError(f"{path} has sha256 {digest}, expected {want} (upstream/SHA256SUMS)")
+    spec = importlib.util.spec_from_file_location("_measure_baseline_upstream_problem", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_builder(source: str, problem: types.ModuleType, workdir: str) -> type:
@@ -61,7 +92,9 @@ def load_builder(source: str, problem: types.ModuleType, workdir: str) -> type:
     Only the part before ``BASELINE = `` (the builder) is executed; the file's own test
     harness is not.
     """
-    builder_part = source.split("BASELINE = ")[0]
+    if BUILDER_END_MARKER not in source:
+        raise RuntimeError(f"the baseline file has no {BUILDER_END_MARKER!r} marker; refusing to execute all of it")
+    builder_part = source.split(BUILDER_END_MARKER)[0]
     path = os.path.join(workdir, "baseline_perf_takehome.py")
     with open(path, "w") as f:
         f.write(builder_part)
@@ -88,9 +121,15 @@ def measure(rounds: int, batch_size: int, seed: int = 123) -> tuple[dict, list[d
     problem = upstream_problem()
     with tempfile.TemporaryDirectory() as tmp:
         builder_cls = load_builder(baseline_source(), problem, tmp)
-    random.seed(seed)
-    forest = problem.Tree.generate(FOREST_HEIGHT)
-    inp = problem.Input.generate(forest, batch_size, rounds)
+    # The simulator draws from the global `random`: seed it for this run and restore the
+    # caller's state afterwards.
+    state = random.getstate()
+    try:
+        random.seed(seed)
+        forest = problem.Tree.generate(FOREST_HEIGHT)
+        inp = problem.Input.generate(forest, batch_size, rounds)
+    finally:
+        random.setstate(state)
     mem = problem.build_mem_image(forest, inp)
     kb = builder_cls()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
