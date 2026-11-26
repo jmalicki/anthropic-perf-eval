@@ -1396,20 +1396,37 @@ fn test_transforms_leave_no_keep_live_only_reference() {
     // (BUGS.md). On the emitter's programs every keep_live value is also read through `srcs`
     // (the round R-2 hash output, read by round R-1), and every transform keeps it that way,
     // alone and combined.
-    let combos: [&[TransformKind]; 4] = [&[HashMerge], &[PruneIndex], &[ValuesOnly], &[HashMerge, PruneIndex, ValuesOnly]];
-    for rounds in [2, 16] {
-        let spec = ProblemSpec { rounds, ..Default::default() };
+    let combos: [&[TransformKind]; 6] = [
+        &[HashMerge],
+        &[PruneIndex],
+        &[ValuesOnly],
+        &[SelectBitsPath],
+        &[HashMerge, PruneIndex, ValuesOnly],
+        &[HashMerge, PruneIndex, ValuesOnly, SelectBitsPath],
+    ];
+    for (rounds, bits) in [(2, false), (16, false), (2, true), (16, true)] {
+        // The default emission, and bit-driven access at depths 3 and 4, where select-bits-path
+        // has sites (none at 2 rounds; on the default emission none at all).
+        let spec = if bits {
+            ProblemSpec { rounds, cached_select: CachedSelect::Bits, tree_reduce_max_depth: 4, ..Default::default() }
+        } else {
+            ProblemSpec { rounds, ..Default::default() }
+        };
         for combo in combos {
+            if !bits && combo.contains(&SelectBitsPath) {
+                continue;
+            }
             let mut p = raw_program(&spec);
             for &t in combo {
                 let (next, outcome) = apply_transform_with(p, t, Some(spec.batch_size), Some(spec.n_nodes)).unwrap();
-                assert!(outcome.sites > 0 && outcome.refused.is_none(), "rounds {} {:?}: {}", rounds, t, outcome.summary);
+                assert!(outcome.refused.is_none(), "rounds {} {:?}: {}", rounds, t, outcome.summary);
+                assert!(outcome.sites > 0 || (t == SelectBitsPath && rounds == 2), "rounds {} bits {} {:?}: {}", rounds, bits, t, outcome.summary);
                 p = next;
             }
             let read: std::collections::HashSet<VReg> = p.ops.iter().flat_map(|o| o.reads()).collect();
             let kept: Vec<VReg> = p.ops.iter().flat_map(|o| o.keep_live.iter().flatten().copied()).collect();
-            assert_eq!(kept.len(), 32, "rounds {} {:?}", rounds, combo);
-            assert!(kept.iter().all(|v| read.contains(v)), "rounds {} {:?}: a keep_live-only value", rounds, combo);
+            assert_eq!(kept.len(), 32, "rounds {} bits {} {:?}", rounds, bits, combo);
+            assert!(kept.iter().all(|v| read.contains(v)), "rounds {} bits {} {:?}: a keep_live-only value", rounds, bits, combo);
         }
     }
 }
@@ -1592,6 +1609,52 @@ fn test_surgery_refuses_to_lose_a_trace_id() {
     surgery.replace_uses(r, dest);
     surgery.remove(xor);
     assert!(matches!(surgery.finish_or_refuse().unwrap(), Finished::Done(..)));
+    // An already-dead op with the same id does not carry it (pipeline DCE removes it).
+    let mut q = clone_program(&p);
+    // It reads only the input a (which stays live), so the cleanup keeps it as an
+    // already-dead op.
+    let mut unused = q.ops[xor].clone();
+    let a = q.ops[0].dest.unwrap();
+    unused.srcs = vec![crate::types::Operand::VReg(a), crate::types::Operand::VReg(a)];
+    unused.dest = Some(crate::types::VReg::vector(q.vreg_count));
+    q.vreg_count += 1;
+    q.ops.push(unused);
+    let mut surgery = Surgery::new(q).unwrap();
+    surgery.replace_uses(r, t);
+    surgery.remove(xor);
+    match surgery.finish_or_refuse().unwrap() {
+        Finished::Refused(_, why) => assert!(why.contains("trace id"), "{}", why),
+        Finished::Done(..) => panic!("a trace id carried only by a dead op was accepted"),
+    }
+}
+
+#[test]
+fn test_surgery_refuses_an_incomplete_kept_live_alias() {
+    use super::surgery::{Finished, Surgery};
+    use crate::types::{Engine, Opcode, Operand, VReg};
+    // A store keeps an 8-lane alias live; removing a lane leaves the alias incomplete: the edit
+    // is refused (the program comes back), not an error.
+    let mut p = one_site_program();
+    let lanes: Vec<VReg> = (0..8).map(|k| VReg::scalar(p.vreg_count + k)).collect();
+    let key = VReg::vector(p.vreg_count + 8);
+    p.vreg_count += 9;
+    let first_lane = p.ops.len();
+    for (k, &l) in lanes.iter().enumerate() {
+        let mut op = SsaOp::new(p.ops.len(), Engine::Load, Opcode::ConstChoice, Some(l), vec![Operand::Imm(200 + k as i64)]);
+        op.produces_constant = Some(200 + k as i64);
+        p.ops.push(op);
+    }
+    p.vector_group_lanes.insert(key, lanes);
+    let store = p.ops.iter().rposition(|o| o.opcode == Opcode::Vstore).unwrap();
+    let mut keeper = p.ops[store].clone();
+    keeper.keep_live = Some(vec![key]);
+    p.ops.push(keeper);
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.remove(first_lane);
+    match surgery.finish_or_refuse().unwrap() {
+        Finished::Refused(_, why) => assert!(why.contains("keep_live"), "{}", why),
+        Finished::Done(..) => panic!("an incomplete kept-live alias was accepted"),
+    }
 }
 
 #[test]

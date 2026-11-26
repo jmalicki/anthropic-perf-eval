@@ -744,11 +744,13 @@ impl Surgery {
         {
             let ops_only: Vec<SsaOp> = kept.iter().map(|(o, _)| o.clone()).collect();
             let graph = SsaGraph::new(&ops_only, &program.vector_group_lanes);
+            // Defined, a group alias all of whose lanes are defined, or a lane of a defined
+            // vector.
             let exists = |v: VReg| {
                 Some(v) == program.zero_vreg
                     || graph.def_index(v).is_some()
-                    || graph.group_lanes(v).is_some()
-                    || graph.element_of(v).is_some()
+                    || graph.group_lanes(v).map_or(false, |ls| ls.iter().all(|l| graph.def_index(*l).is_some()))
+                    || graph.element_of(v).map_or(false, |(vec, _)| graph.def_index(vec).is_some())
             };
             let mut why: Option<String> = None;
             for (op, _) in &kept {
@@ -759,10 +761,12 @@ impl Surgery {
             }
             if why.is_none() {
                 let survived: BTreeSet<usize> = kept.iter().filter_map(|(_, o)| *o).collect();
-                // A dropped traced op is refused unless a surviving op carries its trace id
-                // (hash-merge moves the id of the XOR it replaces to the new XOR); a trace id
-                // that no surviving op carries would be lost.
-                let carried: BTreeSet<&str> = kept.iter().filter_map(|(o, _)| o.trace_id.as_deref()).collect();
+                // A dropped traced op is refused unless a live op of the result carries its
+                // trace id (hash-merge moves the id of the XOR it replaces to the new XOR). An
+                // already-dead carrier does not count: pipeline dead code elimination removes it.
+                let live_after = dce_live(&ops_only, &program);
+                let carried: BTreeSet<&str> =
+                    kept.iter().zip(&live_after).filter(|(_, &l)| l).filter_map(|((o, _), _)| o.trace_id.as_deref()).collect();
                 if let Some(i) = (0..program.ops.len()).find(|&i| {
                     live_before[i]
                         && !survived.contains(&i)

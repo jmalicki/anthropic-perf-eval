@@ -319,7 +319,13 @@ fn test_select_bits_checks_the_constant_annotation() {
     let proposal = Proposal { region_id: None, round: None, group: None, depth: None, ops: vec![and.op] };
     let why = rule().with_zero(p.zero_vreg).match_site(&g, &proposal).unwrap_err().0;
     assert!(why.contains("AND with neither operand the constant 1"), "{}", why);
-    assert_eq!(apply_and_compare(&p, &spec, &rule(), "annotation").n_sites(), 0);
+    // Nothing matched, so the program comes back unchanged (compared structurally: the
+    // interpreter evaluates a constant by its annotation, so running it would not execute
+    // the disagreeing immediate).
+    let before = super::tests::canonical_ops(&p);
+    let (after, report) = apply_select_bits(clone_program(&p), &rule(), |_| true).unwrap();
+    assert!(report.refused.is_none() && report.n_sites() == 0, "{:?}", report.refused);
+    assert_eq!(super::tests::canonical_ops(&after), before);
 }
 
 #[test]
@@ -688,11 +694,16 @@ fn test_select_bits_refuses_an_edit_that_drops_a_traced_op() {
     let mut p = raw_program(&spec);
     let (c, _) = mirroring_constant(&p);
     let d = def(&p, c);
+    // Unrefused, the zero-based first-pass sites rely on InitialIndicesZero.
+    let (_, unrefused) = apply_select_bits(clone_program(&p), &rule(), |_| true).unwrap();
+    assert_eq!(unrefused.assumptions(), vec!["initial-indices-zero"]);
     p.ops[d].trace_id = Some("l2".into());
     let before = canonical_ops(&p);
     let (after, report) = apply_select_bits(p, &rule(), |_| true).expect("refused, not an error");
     assert!(report.refused.as_deref().map_or(false, |r| r.contains("trace id")), "{:?}", report.refused);
     assert_eq!(canonical_ops(&after), before);
+    // Refused: nothing relied on the assumption.
+    assert!(report.assumptions().is_empty(), "{:?}", report.assumptions());
 }
 
 #[test]
