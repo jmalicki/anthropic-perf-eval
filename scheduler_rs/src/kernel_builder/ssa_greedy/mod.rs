@@ -3336,7 +3336,8 @@ fn schedule_ssa_greedy_core(
         // nothing was (docs/SCRATCH_CEILING_DIAGNOSIS.md).
         let force_same_cycle = pools.caps.is_none() && shape.budget_force == BudgetForce::SameCycle;
         // With `Stall`, a cycle whose only placement was a split-shift start is not a
-        // deadlock either (`pools` keeps its historical rule). Defensive: a split starts only
+        // deadlock either, with or without pool capacities (`pools` changes only
+        // `force_same_cycle` above). Defensive: a split starts only
         // with 1 to 7 scalar slots free, which takes a counted placement on the scalar ALU in
         // the same cycle (`split_only_cycles` stays 0; checked in the tests).
         let stall_progress = shape.budget_force == BudgetForce::Stall && split_started_this_cycle;
