@@ -236,3 +236,41 @@ def test_solved_plan_floor_is_emitted(table, tmp_path, max_util):
     _, _, sched, _ = es.build_emission(result["rows"], CTX, str(tmp_path))
     assert es.emission_counts(sched) == result["counts"]
     assert math.isclose(es.choice_floor(es.emission_counts(sched))["cycles"], result["floor"]["cycles"])
+
+
+def test_derive_reports_before_calibrating(monkeypatch, capsys):
+    """`derive` runs and prints the derivation before it loads (or calibrates) the reference:
+    a calibration failure is reported after the derivation, not instead of it."""
+    called = []
+
+    def fake_derive(ctx):
+        called.append("derive")
+        return es.CostTable(ctx, {}, notes=[]), {"sites": [1, 2, 3], "resources": [1]}
+
+    def failing_calibration(*args, **kwargs):
+        called.append("calibrate")
+        raise RuntimeError("probe build failed")
+
+    monkeypatch.setattr(es, "derive_table", fake_derive)
+    monkeypatch.setattr(es, "load_or_calibrate", failing_calibration)
+    assert es.main(["derive", "--rounds", "2", "--batch-size", "16"]) == 1
+    out = capsys.readouterr().out
+    assert called == ["derive", "calibrate"]
+    assert "3 sites" in out and "probe build failed" in out
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_derive_refuses_to_overwrite_its_reference(tmp_path, monkeypatch, default):
+    """--json naming the reference table (given, or the default when --table is omitted) is
+    refused before anything runs."""
+    monkeypatch.setattr(es, "derive_table", lambda ctx: pytest.fail("derived despite the refusal"))
+    if default:
+        ref = es.default_table_path(es.Context(rounds=2, batch_size=16))
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--json", ref]
+    else:
+        ref = str(tmp_path / "costs.json")
+        argv = ["derive", "--rounds", "2", "--batch-size", "16", "--table", ref,
+                "--json", str(tmp_path / "." / "costs.json")]
+    with pytest.raises(SystemExit) as e:
+        es.main(argv)
+    assert e.value.code == 2
