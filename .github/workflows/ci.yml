@@ -62,6 +62,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          # scripts/measure_baseline.py reads the original baseline builder from an old commit
+          fetch-depth: 0
 
       - name: Install OR-Tools (Homebrew; brings protobuf and abseil)
         run: |
