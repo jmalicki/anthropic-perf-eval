@@ -5218,6 +5218,55 @@ fn test_select_overflow_keeps_slot_limits_when_force_scheduling() {
     }
 }
 
+/// Review of #76 (CodeRabbit, second pass): a multiply-add select with a distinct `keep_live`
+/// vector it is the last holder of. `keep_live` is a liveness-only dependency through the
+/// select's cycle; only the values the multiply_add reads are held to cycle + 1. The counter
+/// and address assignment must apply the same rule (before: the counter held it to cycle + 1,
+/// the allocator's multiply-add branch skipped `keep_live`, and the check failed).
+#[test]
+fn test_overflow_select_keep_live_agrees_with_interval_liveness() {
+    let shape = GreedyShape {
+        priority: GreedyPriority::Wavefront { stagger_cycles: 1, groups_in_flight: None },
+        select_overflow: SelectOverflow::Valu { limit: None },
+        ..Default::default()
+    };
+    let mut emit = SsaEmitContext::new();
+    let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+        let c = emit.emit_const(v);
+        emit.emit_vbroadcast(c)
+    };
+    let one = vec_of(&mut emit, 1);
+    let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+    let (c1v, c2v) = (vec_of(&mut emit, 1), vec_of(&mut emit, 0));
+    let held = vec_of(&mut emit, 7);
+    let early = emit.emit_valu(Opcode::Add, held, one); // the only real read of `held`
+    // A chain delays the selects well past `early`, the last real read of `held`.
+    let mut b2 = b;
+    for _ in 0..4 {
+        b2 = emit.emit_valu(Opcode::Add, b2, one);
+    }
+    let t = emit.emit_valu(Opcode::Add, b2, d);
+    let s1 = emit.emit_select_choice_shared_delta(c1v, t, d, b2);
+    // Both selects keep `held` live until they run (liveness only); one of them overflows.
+    emit.ops.last_mut().unwrap().keep_live = Some(vec![held]);
+    let s2 = emit.emit_select_choice_shared_delta(c2v, t, d, b2);
+    emit.ops.last_mut().unwrap().keep_live = Some(vec![held]);
+    let addr = emit.emit_const(100);
+    let x = emit.emit_valu(Opcode::Add, s1, s2);
+    let y = emit.emit_valu(Opcode::Add, x, early);
+    emit.emit_vstore(addr, y);
+    compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+    let mut fma = HashSet::new();
+    let ((_, _, _), agreement) = schedule_ssa_greedy_shaped(
+        &mut emit.ops, true, &mut HashSet::new(), 1536, Some(&mut fma), None, None, None,
+        &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None, None,
+        &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
+    )
+    .expect("the counter agrees with interval liveness");
+    assert!(!fma.is_empty(), "control: a select overflowed to the multiply_add form");
+    assert!(agreement.agrees(), "{}", agreement);
+}
+
 /// Review of #76 (CodeRabbit): the budget fit check must not count as freed a value a
 /// multiply-add select read this cycle (it is held to cycle + 1). Swept over tight budgets
 /// with selects overflowing to the vector ALU: whenever the greedy reports the budget as kept,
@@ -5258,7 +5307,8 @@ fn test_fit_check_respects_multiply_add_read_holds() {
                 &shape,
                 &mut lanes,
             );
-            let Ok(((_, exceeded, _), _)) = result else { continue };
+            // An over-budget run returns Ok with `exceeded`; any error is a failure.
+            let ((_, exceeded, _), _) = result.unwrap_or_else(|e| panic!("budget {}: scheduler error: {}", budget, e));
             if exceeded {
                 continue;
             }
@@ -5311,11 +5361,12 @@ fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
         let mut emit = build();
         let mut fma = HashSet::new();
         let shape = GreedyShape { select_overflow: SelectOverflow::Valu { limit: None }, ..Default::default() };
-        let Ok(((_, exceeded, _), _)) = schedule_ssa_greedy_shaped(
+        let ((_, exceeded, _), _) = schedule_ssa_greedy_shaped(
             &mut emit.ops, true, &mut HashSet::new(), budget, Some(&mut fma), None, None, None,
             &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None, None,
             &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
-        ) else { continue };
+        )
+        .unwrap_or_else(|e| panic!("budget {}: scheduler error: {}", budget, e));
         if exceeded || fma.is_empty() {
             continue;
         }
@@ -5327,6 +5378,65 @@ fn test_fit_check_respects_a_same_cycle_multiply_add_hold() {
         checked += 1;
     }
     assert!(checked > 0, "control: some budget runs with a multiply-add select and is kept");
+}
+
+/// Review of #76 (CodeRabbit, second pass): the pools check must measure selects forced to the
+/// multiply_add form by `fixed_select_choice_encoding` with their cycle + 1 reads. Before, only
+/// the caller's set (which gets forced selects after the call) went into the measurement, so a
+/// schedule whose real pool split exceeds the budget was returned without the capacity rerun.
+#[test]
+fn test_scratch_pools_measure_forced_multiply_add_selects() {
+    let build = || {
+        let mut emit = SsaEmitContext::new();
+        let mut vec_of = |emit: &mut SsaEmitContext, v: i64| {
+            let c = emit.emit_const(v);
+            emit.emit_vbroadcast(c)
+        };
+        let (b, d) = (vec_of(&mut emit, 5), vec_of(&mut emit, 6));
+        let (c1v, c2v) = (vec_of(&mut emit, 1), vec_of(&mut emit, 0));
+        let t = emit.emit_valu(Opcode::Add, b, d);
+        let s1 = emit.emit_select_choice_shared_delta(c1v, t, d, b);
+        let s2 = emit.emit_select_choice_shared_delta(c2v, t, d, b);
+        let o = emit.emit_valu(Opcode::Add, b, t);
+        let addr = emit.emit_const(100);
+        let x = emit.emit_valu(Opcode::Add, s1, s2);
+        let y = emit.emit_valu(Opcode::Add, x, o);
+        emit.emit_vstore(addr, y);
+        compute_ssa_dependencies(&mut emit.ops, &emit.vreg_def, emit.zero_vreg, None);
+        emit
+    };
+    let mut checked = 0;
+    for budget in 16..=160 {
+        let mut emit = build();
+        let forced: HashMap<usize, SelectChoiceEncoding> = emit
+            .ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::SelectChoice)
+            .map(|op| (op.id, SelectChoiceEncoding::Fma))
+            .collect();
+        let forced_ids: HashSet<usize> = forced.keys().copied().collect();
+        let shape = GreedyShape { scratch_pools: true, ..Default::default() };
+        let mut fma = HashSet::new();
+        let result = schedule_ssa_greedy_shaped(
+            &mut emit.ops, true, &mut HashSet::new(), budget, Some(&mut fma), None, None, None,
+            &GreedyBoundsUsage::None, &GreedyPolicy, None, false, false, false, false, None, None,
+            Some(&forced), &mut GreedyDiagnostics::new(false), &shape, &mut HashMap::new(),
+        );
+        let ((_, exceeded, _), _) = result.unwrap_or_else(|e| panic!("budget {}: scheduler error: {}", budget, e));
+        if exceeded {
+            continue;
+        }
+        let measured: HashSet<usize> = fma.union(&forced_ids).copied().collect();
+        let peaks = scratch_pool_peaks(&emit.ops, None, &HashMap::new(), &measured).unwrap();
+        assert!(
+            peaks.split_words() <= budget,
+            "budget {}: kept within the pools, but the pool split with forced multiply-add reads is {}",
+            budget,
+            peaks.split_words()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "control: some budget is kept within the pools");
 }
 
 /// Review of #76 (CodeRabbit): a select whose condition is the same VReg as its delta. In the

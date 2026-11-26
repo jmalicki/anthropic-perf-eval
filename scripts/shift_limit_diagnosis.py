@@ -5,8 +5,8 @@ From a scheduler output JSON this prints:
 1. **Shift accounting.** Vector ops V, shifted s, cycles T and idle vector slots I satisfy
    V - s = 6 T - I exactly (every vector op not shifted takes one vector slot). So when the
    vector ALU is busy in every steady-state cycle, the shift count is fixed by the cycle
-   count: a schedule that is longer for any reason shifts fewer ops. "Missing" shifts
-   against the capacity floor's split are 6 (T - floor) - I, and the cycles above the floor
+   count at a fixed I (an idle cycle adds 1 to T and 6 to I and leaves s). "Missing" shifts
+   against the capacity floor's split (no idle vector slot) are 6 (T - floor) - I, and the cycles above the floor
    split into those any schedule of the emission needs (the static head/tail bound,
    `scripts.static_bounds`, minimum over encodings) and the rest.
 2. **Idle scalar-ALU slots by class**, per cycle: the vector ALU not full (nothing to shift);
@@ -64,7 +64,13 @@ def analyze(d: dict) -> dict:
     use = {e: [0] * total for e in CAP}
     shifted = set()
     start, finish = {}, {}
+    # SSA owner of each vector slot, per cycle: every lowered vector op (both ops of a two-op
+    # select included; shifted lanes run on the scalar ALU and hold no vector slot).
+    on_valu = collections.defaultdict(list)
     for low, s, lane in lowered_with_ssa(d):
+        if s is None and low.get("from_select_choice") is not None:
+            # The multiply_add of a two-op select has its own id (ssa_id + 1000000).
+            s = ssa.get(low["from_select_choice"])
         if low["engine"] in use:
             use[low["engine"]][low["cycle"]] += 1
         if s is not None:
@@ -72,11 +78,15 @@ def analyze(d: dict) -> dict:
             finish[s["id"]] = max(finish.get(s["id"], -1), low["cycle"])
             if lane:
                 shifted.add(s["id"])
-    valu_ssa = [o for o in d["ssa_ops"] if o["engine"] == "valu"]
-    on_valu = collections.defaultdict(list)
-    for o in valu_ssa:
-        if o["id"] not in shifted:
-            on_valu[o["cycle"]].append(o)
+            elif low["engine"] == "valu":
+                on_valu[low["cycle"]].append(s)
+    # A vbroadcast removed by broadcast elimination has no lowered op and takes no slot.
+    eliminated = set(d.get("eliminated_vbroadcast_ops") or [])
+    valu_ssa = [o for o in d["ssa_ops"] if o["engine"] == "valu" and o["id"] not in eliminated]
+
+    def shiftable(o):
+        # Selects (SSA engine flow) and fixed vector ops never shift.
+        return o["engine"] == "valu" and o["opcode"] not in FIXED_VECTOR
 
     def ready(o):
         # A split-shifted producer's lanes straddle two cycles: its result is complete only
@@ -118,7 +128,7 @@ def analyze(d: dict) -> dict:
             k = IDLE_CLASSES[0]
         elif w_shift[t]:
             k = IDLE_CLASSES[1]
-        elif w_fixed[t] and any(o["opcode"] not in FIXED_VECTOR for o in on_valu[t]):
+        elif w_fixed[t] and any(shiftable(o) for o in on_valu[t]):
             k = IDLE_CLASSES[2]
         else:
             k = IDLE_CLASSES[3]
@@ -181,7 +191,7 @@ def report(name: str, a: dict, floor: int | None, bound: int | None) -> str:
     out.append(f"  identity V - s = 6T - I: {'holds' if a['identity_holds'] else 'FAILS'}")
     if floor is not None:
         missing = 6 * (a["cycles"] - floor) - a["valu_idle"]
-        line = f"  vs floor {floor}: {a['cycles'] - floor} cycles above it = {missing} shifts 'missing'"
+        line = f"  vs floor {floor}: {a['cycles'] - floor} cycles above it = {missing} shifts 'missing' (against a schedule at the floor with no idle vector slot)"
         if bound is not None:
             forced = max(0, min(bound, a["cycles"]) - floor)
             line += (f"; static head/tail bound {bound}: {forced} of those cycles are needed by any schedule, "

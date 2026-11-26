@@ -8,10 +8,14 @@ kernel. Tables come from `uv run python -m scripts.schedule_report --table`.
 
 ## 0. Latest: what limits useful shifting (section 12)
 
-The greedy's shift count is a symptom of its cycle count, not a cause. Every vector op it does
-not shift takes one vector slot, so `V - s = 6T - I` exactly (V vector ops, s shifted, T cycles,
-I idle vector slots). The vector ALU is busy in every steady-state cycle, so a schedule that is
-longer for any reason shifts fewer ops. For `flow90.json` (1,039): 32 of its 42 cycles above
+Every vector op the greedy does not shift takes one vector slot, so `V - s = 6T - I` exactly
+(V vector ops, s shifted, T cycles, I idle vector slots). The identity ties the shift count to
+the cycle count only for a fixed number of idle slots: at the same I, a schedule that is longer
+for any reason shifts fewer ops, but an idle cycle adds 1 to T and 6 to I and leaves s
+unchanged. The greedy's vector ALU is busy in every steady-state cycle, so here I is small and
+nearly constant. Forcing more shifts (`pace`, `reserve`, PR #73) made these schedules slower,
+which rules out too few shifts as the cause for those policies only; a shift decision can still
+delay a schedule under policies not tested. For `flow90.json` (1,039): 32 of its 42 cycles above
 the floor are needed by any schedule of that emission (static head/tail bound 1,029, a
 bound (row arithmetic argued by hand, checked by Z3 on random small DAGs)); 10 are the gap above the static bound (an upper bound on scheduling loss: the bound is a lower bound, not the optimum). In shifts: the floor's split shifts 1,465 ops and the greedy
 1,307, 158 fewer. A schedule at 1,029 cycles **with the same 115 idle vector slots** could shift
@@ -770,7 +774,8 @@ kind that says what removing it buys; **accounting** = a decomposition of one sc
 
 In shift counts, for `flow90.json`: the floor's split is 1,465 and the greedy's is 1,307,
 158 "missing" shifts (`scripts.shift_limit_diagnosis` prints a different count, 6 x 42 - I =
-137, the shifts needed to close the 42 cycles to the floor at this schedule's idle slots). The
+137: the shifts a schedule at the floor with **no** idle vector slot would take beyond this one's.
+Closing the 42 cycles while keeping this schedule's 115 idle slots would need 6 x 42 = 252). The
 identity gives s = V - 6T + I, so the shifts a schedule can take depend on its idle vector
 slots I as well as on T. A schedule at the static bound of 1,029 cycles **with the same 115
 idle slots** could shift at most 1,367, 98 short of the floor's split; a schedule at 1,029 with
@@ -934,7 +939,10 @@ uv run python -m scripts.shift_limit_diagnosis s.json --floor 997
 # --greedy-flow-priority feeds-load-first. Scratch-relaxed analysis: --scratch-budget-override 4096.
 # Stage 1 with the greedy model
 uv run python -m scripts.emission_structure solve --greedy-model [--select-bit-source path] --out plan.json
-uv run python -m scripts.emission_structure loop report --state <state.json> ... --near 30   # greedy_model row
+# (the loop builds plans with the load-tail greedy and stores builds and flags in the state file)
+uv run python -m scripts.emission_structure loop run --load-tail --state loop_state.json \
+  --modes nogood --budget 4 --max-builds 8
+uv run python -m scripts.emission_structure loop report --state loop_state.json --near 30   # greedy_model row
 ```
 
 ## 13. Forward/backward justification (`--greedy-justify N`)
