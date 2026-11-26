@@ -53,6 +53,14 @@ Path kernel (1,030), same shape on the index kernel (1,039):
 | `--index-early-terms first-gather` | R17, also each group's first gather address | t -1 | +65 (path) |
 | `--select-xor-pushdown first-pass` | R18: `val ^ sel(c, a, b) = sel(c, val ^ a, val ^ b)` | t -3 (path), -2 (index) | +1 per group per select round (+116 path, +79 index) |
 
+An option that would change nothing in a kernel is an error (`ProblemSpec::check_critical_path_options`,
+for the CLI, the binding and Rust callers alike): `--index-early-terms` without `--index-form
+mirrored`; `--select-xor-pushdown` when no round it covers has a SelectChoice at the top of its
+select tree (`standard` or `mobius` cached select, `bits` only at depth 1); `--reassociate-gather-xor`
+when no group gathers. `first-pass` means rounds 0 to `forest_height` (up to the first wrap).
+`tests/test_critical_path_rewrites.py` also builds every option after the wrap (height 3, 7 to 9
+rounds), proved and validated.
+
 ## 3. Measurements (16 rounds)
 
 | Configuration | Path: bound (t, q), cycles | Index: bound (t, q), cycles |

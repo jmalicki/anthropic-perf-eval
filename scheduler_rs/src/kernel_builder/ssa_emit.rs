@@ -1104,20 +1104,11 @@ impl SsaTickTockKernelBuilder {
                 let bit_at = |level: usize| bits[level];
 
                 // Push the round XOR below the top select (R18) when the top is a SelectChoice.
-                let pushdown = {
-                    use crate::kernel_builder::config::SelectXorPushdown as P;
-                    let round_ok = match self.config.spec.select_xor_pushdown {
-                        P::None => false,
-                        P::FirstPass => self
-                            .emit
-                            .current_round
-                            .map_or(false, |r| (r as usize) <= self.config.spec.forest_height),
-                        P::All => true,
-                    };
-                    round_ok
-                        && tree_depth >= 1
-                        && (mode == CachedSelect::BitsFlow || (mode == CachedSelect::Bits && tree_depth >= 2))
-                };
+                let pushdown = self.config.spec.select_xor_pushdown_applies(
+                    self.emit.current_round.map(|r| r as usize),
+                    tree_depth,
+                    mode,
+                );
                 if pushdown && tree_depth == 1 {
                     // BitsFlow at depth 1: the top select is the leaf pair itself.
                     let pair = &table.pairs.as_ref().expect(&missing)[0];
@@ -1596,7 +1587,9 @@ impl SsaTickTockKernelBuilder {
                 let val = self.ctx.all_val[g].unwrap();
                 if let Some((bit, hi, lo)) = self.ctx.select_pushdown[it][i].take() {
                     // val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo) (R18).
+                    self.emit.set_next_var_type(VarType::RoundState);
                     let x_hi = self.emit.emit_valu(Opcode::Xor, val, hi);
+                    self.emit.set_next_var_type(VarType::RoundState);
                     let x_lo = self.emit.emit_valu(Opcode::Xor, val, lo);
                     self.ctx.all_val[g] = Some(self.select_2way(bit, x_hi, x_lo));
                     continue;

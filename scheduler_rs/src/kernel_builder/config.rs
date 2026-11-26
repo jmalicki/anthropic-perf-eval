@@ -479,6 +479,70 @@ impl ProblemSpec {
         })
     }
 
+    /// True if round `rnd` is in the first pass down the tree: rounds 0 to `forest_height`,
+    /// i.e. up to and including the first wrap round. Relies on round 0 being at depth 0
+    /// (`round_depth`), which `check_critical_path_options` asserts.
+    pub fn is_first_pass_round(&self, rnd: usize) -> bool {
+        rnd <= self.forest_height
+    }
+
+    /// True if `R18-select-xor-pushdown` applies to a group fetching its node with `mode` in
+    /// round `rnd` at `tree_depth`: the option covers the round (`FirstPass`: first pass only)
+    /// and the top of the group's select tree is a SelectChoice (`BitsFlow` from depth 1,
+    /// `Bits` from depth 2). The emitter and `check_critical_path_options` both use this.
+    pub fn select_xor_pushdown_applies(&self, rnd: Option<usize>, tree_depth: usize, mode: CachedSelect) -> bool {
+        let round_ok = match self.select_xor_pushdown {
+            SelectXorPushdown::None => false,
+            SelectXorPushdown::FirstPass => rnd.map_or(false, |r| self.is_first_pass_round(r)),
+            SelectXorPushdown::All => true,
+        };
+        round_ok
+            && tree_depth >= 1
+            && (mode == CachedSelect::BitsFlow || (mode == CachedSelect::Bits && tree_depth >= 2))
+    }
+
+    /// Reject critical-path rewrite options (docs/CRITICAL_PATH.md) that would be silent
+    /// no-ops for this problem, so a direct Rust caller gets the same errors as the CLI.
+    ///
+    /// # Returns
+    /// `Err` naming the option when `index_early_terms` is set without the mirrored index;
+    /// when `select_xor_pushdown` is set but no group in any round it covers has a
+    /// SelectChoice at the top of its select tree (e.g. `standard` or `mobius` cached select,
+    /// or `bits` only at depth 1); when `reassociate_gather_xor` is set but no group ever
+    /// gathers.
+    pub fn check_critical_path_options(&self) -> Result<(), String> {
+        // `is_first_pass_round` counts the first pass from round 0 at depth 0.
+        assert_eq!(self.round_depth(0), 0, "round 0 must visit depth 0 (the root)");
+        if self.index_early_terms != IndexEarlyTerms::None && self.index_form != IndexForm::Mirrored {
+            return Err("index_early_terms (--index-early-terms) needs index_form = Mirrored \
+                        (--index-form mirrored); otherwise it is ignored"
+                .to_string());
+        }
+        let any = |pred: &dyn Fn(usize, usize, AccessEncoding) -> bool| {
+            (0..self.rounds).any(|r| {
+                let d = self.round_depth(r);
+                (0..self.n_groups()).any(|g| pred(r, d, self.access_encoding(r, d, g)))
+            })
+        };
+        if self.select_xor_pushdown != SelectXorPushdown::None
+            && !any(&|r, d, e| e.cached_select().map_or(false, |m| self.select_xor_pushdown_applies(Some(r), d, m)))
+        {
+            return Err(format!(
+                "select_xor_pushdown = {:?} (--select-xor-pushdown) applies to no round of this kernel: it needs a \
+                 select tree whose top is a SelectChoice (bits-flow from depth 1, bits from depth 2){}; otherwise \
+                 it is ignored",
+                self.select_xor_pushdown,
+                if self.select_xor_pushdown == SelectXorPushdown::FirstPass { " in the first pass" } else { "" }
+            ));
+        }
+        if self.reassociate_gather_xor && !any(&|_, _, e| e == AccessEncoding::Gather) {
+            return Err("reassociate_gather_xor (--reassociate-gather-xor) applies to gather rounds and this kernel \
+                        has none; otherwise it is ignored"
+                .to_string());
+        }
+        Ok(())
+    }
+
     /// Check `access_plan` against the problem shape: one row per round, one entry per group,
     /// and every entry available at its round's depth (`AccessEncoding::check_plannable`).
     ///
@@ -1319,6 +1383,59 @@ mod tests {
         assert!(bad(&mut spec, 2, 3, AccessEncoding::Standard).unwrap_err().contains("standard"));
         spec.access_plan.as_mut().unwrap().pop();
         assert!(spec.check_access_plan().unwrap_err().contains("15 rounds"));
+    }
+
+    /// Critical-path options that would be silent no-ops are rejected for any caller of
+    /// `ProblemSpec` (review of #91), and `first-pass` is the rounds up to the first wrap.
+    #[test]
+    fn test_check_critical_path_options() {
+        let spec = |f: &dyn Fn(&mut ProblemSpec)| {
+            let mut s = ProblemSpec { forest_height: 3, n_nodes: 15, batch_size: 16, rounds: 9, ..Default::default() };
+            s.index_form = IndexForm::Mirrored;
+            s.tree_reduce_max_depth = 2;
+            s.cached_select = CachedSelect::BitsFlow;
+            f(&mut s);
+            s
+        };
+        assert_eq!(spec(&|_| {}).check_critical_path_options(), Ok(()));
+        // index_early_terms needs the mirrored index.
+        let e = spec(&|s| {
+            s.index_early_terms = IndexEarlyTerms::Final;
+            s.index_form = IndexForm::ZeroBased;
+        });
+        assert!(e.check_critical_path_options().unwrap_err().contains("index_early_terms"));
+        // Pushdown: fine for bits-flow; a no-op for standard, mobius, and bits at depth 1 only.
+        for mode in [SelectXorPushdown::FirstPass, SelectXorPushdown::All] {
+            assert_eq!(spec(&|s| s.select_xor_pushdown = mode).check_critical_path_options(), Ok(()));
+            for (cs, depth) in [(CachedSelect::Standard, 2), (CachedSelect::Mobius, 2), (CachedSelect::Bits, 1)] {
+                let s = spec(&|s| {
+                    s.select_xor_pushdown = mode;
+                    s.cached_select = cs;
+                    s.tree_reduce_max_depth = depth;
+                });
+                assert!(s.check_critical_path_options().unwrap_err().contains("select_xor_pushdown"), "{:?}", cs);
+            }
+            let bits2 = spec(&|s| {
+                s.select_xor_pushdown = mode;
+                s.cached_select = CachedSelect::Bits;
+            });
+            assert_eq!(bits2.check_critical_path_options(), Ok(()));
+        }
+        // Reassociation needs a gather round: none when every level is cached.
+        assert_eq!(spec(&|s| s.reassociate_gather_xor = true).check_critical_path_options(), Ok(()));
+        let all_cached = spec(&|s| {
+            s.reassociate_gather_xor = true;
+            s.tree_reduce_max_depth = 3;
+        });
+        assert!(all_cached.check_critical_path_options().unwrap_err().contains("reassociate_gather_xor"));
+        // First pass: rounds 0 to forest_height (the first wrap round), each at depth = round.
+        let s = spec(&|_| {});
+        for r in 0..s.rounds {
+            assert_eq!(s.is_first_pass_round(r), r <= 3);
+            if s.is_first_pass_round(r) {
+                assert_eq!(s.round_depth(r), r);
+            }
+        }
     }
 
     #[test]

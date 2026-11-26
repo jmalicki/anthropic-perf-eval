@@ -155,3 +155,26 @@ def test_all_three_after_the_wrap(rounds, merge):
                  index_early_terms="first-gather", select_xor_pushdown="all"))
     build(**dict(WRAP, rounds=rounds, merge_hash_stages=merge, reassociate_gather_xor=True,
                  index_early_terms="final", select_xor_pushdown="all", select_bit_source="index"))
+
+
+@pytest.mark.parametrize("options, name", [
+    ({"select_xor_pushdown": "all", "cached_select": "standard"}, "select_xor_pushdown"),
+    ({"select_xor_pushdown": "all", "cached_select": "mobius"}, "select_xor_pushdown"),
+    ({"reassociate_gather_xor": True, "tree_reduce_max_depth": 3}, "reassociate_gather_xor"),
+])
+def test_options_that_would_be_no_ops_are_rejected(options, name):
+    """Rejected by ProblemSpec::check_critical_path_options, so a Rust caller gets the same
+    error (Rust test test_check_critical_path_options)."""
+    with pytest.raises(ValueError, match=name):
+        build_kernel_with_args(verbose=False, **{**BASE, **WRAP, **options})
+
+
+def test_pushdown_with_bits_only_at_depth_1_is_rejected():
+    """bits at depth 1 has no SelectChoice at the top of its tree (a plan can ask for it; the
+    flags clamp tree_reduce_max_depth to 2 or more)."""
+    depth_enc = {0: "bits", 1: "bits", 2: "gather", 3: "gather"}
+    plan = [[depth_enc[r % 4]] * 2 for r in range(9)]
+    opts = {k: v for k, v in {**BASE, **WRAP}.items() if k not in ("cached_select", "tree_reduce_max_depth")}
+    build_kernel_with_args(verbose=False, **opts, emission_plan=plan)  # the plan itself is fine
+    with pytest.raises(ValueError, match="select_xor_pushdown"):
+        build_kernel_with_args(verbose=False, **opts, emission_plan=plan, select_xor_pushdown="all")

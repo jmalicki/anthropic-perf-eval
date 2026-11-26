@@ -1475,6 +1475,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
         .spec
         .check_access_plan()
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    config
+        .spec
+        .check_critical_path_options()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let scratch_relaxed = config.compiler.is_relaxed_scratch();
     if scratch_relaxed {
         // Keep the protected names in sync with kernel_build_args.NORMAL_KERNEL_PATHS.
