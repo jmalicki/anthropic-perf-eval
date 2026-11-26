@@ -59,6 +59,8 @@ pub(super) struct Wavefront {
     height: Vec<i64>,
     /// Whether some load depends on the op, per op index.
     feeds_load: Vec<bool>,
+    /// Whether a non-final load (one that some later load depends on) depends on the op.
+    feeds_nonfinal_load: Vec<bool>,
     /// Chain rank per op index; `None` for shared ops.
     chain: Vec<Option<usize>>,
     /// Ops still to be scheduled per chain.
@@ -119,6 +121,13 @@ impl Wavefront {
             feeds_load[idx] = consumers[idx]
                 .iter()
                 .any(|&c| feeds_load[c] || ops[c].engine == crate::types::Engine::Load);
+        }
+        // Whether a non-final load (a load with `feeds_load`) is reachable from the op.
+        let mut feeds_nonfinal_load = vec![false; n];
+        for &idx in order.iter().rev() {
+            feeds_nonfinal_load[idx] = consumers[idx].iter().any(|&c| {
+                feeds_nonfinal_load[c] || (ops[c].engine == crate::types::Engine::Load && feeds_load[c])
+            });
         }
 
         // Which sinks each op reaches, as a bitset over sinks.
@@ -218,6 +227,7 @@ impl Wavefront {
             key,
             height,
             feeds_load,
+            feeds_nonfinal_load,
             chain,
             remaining,
             admit_below: 0,
@@ -241,6 +251,11 @@ impl Wavefront {
     /// is a *final* load: no later load waits for it.
     pub(super) fn feeds_load(&self, idx: usize) -> bool {
         self.feeds_load[idx]
+    }
+
+    /// Whether a non-final load (one some later load depends on) depends on the op.
+    pub(super) fn feeds_nonfinal_load(&self, idx: usize) -> bool {
+        self.feeds_nonfinal_load[idx]
     }
 
     /// Chain rank of an op, `None` for shared ops.

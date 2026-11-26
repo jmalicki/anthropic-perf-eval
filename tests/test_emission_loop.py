@@ -215,6 +215,7 @@ def _non_canonical(rows):
     return other
 
 
+@pytest.mark.deep
 def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
     res = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
     assert el.is_canonical(res["rows"], CTX)
@@ -229,6 +230,7 @@ def test_solver_rows_are_canonical_and_seeds_need_not_be(table):
     assert not el.is_canonical(mixed, CTX)
 
 
+@pytest.mark.deep
 def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
     stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
     first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
@@ -245,6 +247,7 @@ def test_a_non_canonical_build_does_not_cut_its_model_point(table, tmp_path):
     assert es.plan_model_key(res["rows"], CTX) != es.plan_model_key(first["rows"], CTX)
 
 
+@pytest.mark.deep
 def test_floor_incumbent_is_the_sound_cut(table):
     first = es.solve_plan_isolated(table, time_limit=20, deterministic_time=5)
     res = es.solve_plan_isolated(table, time_limit=20, floor_incumbent=first["floor"]["cycles"])
@@ -275,6 +278,7 @@ def test_rows_cut_is_sound_by_default_and_never_claims_exhaustion_when_heuristic
     assert stage2.trace[-1]["solves"] == [{"phase": "main", "status": "INFEASIBLE"}]
 
 
+@pytest.mark.deep
 def test_solves_are_recorded_and_deterministic(table):
     a = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
     b = es.solve_plan_isolated(table, time_limit=60, deterministic_time=5)
@@ -299,6 +303,22 @@ def test_state_from_another_scheduler_build_is_refused(table, tmp_path):
     assert el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint={"extension_sha256": "b"},
                      check_scheduler=False).scheduler == {"extension_sha256": "a"}
     assert "extension_sha256" in el.scheduler_fingerprint() or "error" in el.scheduler_fingerprint()
+
+
+def test_error_fingerprints_never_match(table, tmp_path):
+    """Review of #76: a fingerprint that failed is a mismatch, even against an equal failure."""
+    assert el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "a"})
+    assert not el.same_scheduler({"extension_sha256": "a"}, {"extension_sha256": "b"})
+    err = {"error": "scheduler_rs not installed"}
+    assert not el.same_scheduler(err, dict(err))
+    assert not el.same_scheduler(None, {"extension_sha256": "a"})
+    state = tmp_path / "state.json"
+    stage2 = el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint=err)
+    rows = es.baseline_rows(CTX)
+    stage2.builds[el.plan_key(rows)] = _fake_build(rows)
+    stage2.save()
+    with pytest.raises(ValueError, match="not comparable"):
+        el.Stage2(table, str(tmp_path), str(state), log=None, fingerprint=dict(err))
 
 
 # ----------------------------------------------------------------------------
@@ -342,3 +362,40 @@ def test_valu_diagnostic_counts_selects_on_the_valu(table):
     with_selects = dict(base, summary=dict(base["summary"], select_ops_on_valu=6 * 7))
     stage2.builds = {"a": with_selects}
     assert el.surrogates(stage2, None)[0]["valu_after_greedy_shift"] == -(-(native + 42) // es.CAP["valu"])
+
+
+# ----------------------------------------------------------------------------
+# Review follow-ups (CodeRabbit on #76)
+# ----------------------------------------------------------------------------
+def _failing_stage2(table, tmp_path, monkeypatch):
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+    rows = es.baseline_rows(CTX)
+    monkeypatch.setattr(el, "solve", lambda *a, **k: {"status": "optimal", "rows": rows, "solves": []})
+    monkeypatch.setattr(stage2, "evaluate", lambda r, name, *a, **k: (
+        stage2._failed(r, name, el.plan_key(r), "ScratchBudgetExceeded: test", peak_live=1600), True))
+    return stage2
+
+
+def test_nogood_loop_survives_failed_builds_without_incumbent(table, tmp_path, monkeypatch):
+    """Every candidate fails the scratch budget and there is no valid incumbent: the no-good
+    loop records them and goes on (before, its feedback read best['cycles'] from None)."""
+    stage2 = _failing_stage2(table, tmp_path, monkeypatch)
+    assert el.loop_nogood(stage2, 2, 5, 1.0) is None
+    entries = [e for e in stage2.trace if e["mode"] == "nogood"]
+    assert len(entries) == 2 and all("no valid incumbent" in e["feedback"] for e in entries)
+
+
+def test_report_refuses_extra_state_with_other_greedy_options(table, tmp_path):
+    rows = es.baseline_rows(CTX)
+    paths = []
+    for name, extra in (("a.json", {"greedy_load_priority": "final-last"}), ("b.json", {})):
+        st = el.Stage2(table, str(tmp_path), str(tmp_path / name), log=None, greedy_extra=extra,
+                       fingerprint={"extension_sha256": "x"})
+        st.builds[el.plan_key(rows)] = dict(_fake_build(rows), counts=table.predict(rows))
+        st.save()
+        paths.append(str(tmp_path / name))
+    table_path = tmp_path / "table.json"
+    table_path.write_text(json.dumps(table.to_json()))
+    with pytest.raises(SystemExit):
+        el.main(["report", "--batch-size", "32", "--state", paths[0], "--extra-state", paths[1],
+                 "--table", str(table_path)])

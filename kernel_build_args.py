@@ -486,6 +486,18 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
                             "wavefront key; 'tail' the longest dependency path to the end of the program; "
                             "'final-last' loads that no later load depends on (the last gather round) only "
                             "after every other ready load. Other engines keep the wavefront order")
+    group.add_argument("--greedy-flow-priority", choices=["key", "feeds-load-first"], default="key",
+                       help="Wavefront: which ready flow op gets the flow slot: 'key' (default) the lowest "
+                            "wavefront key; 'feeds-load-first' flow ops that a non-final load depends on (the "
+                            "selects before the mid-kernel gathers) before the others "
+                            "(docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-select-overflow", choices=["never", "valu"], default="never",
+                       help="Where a SelectChoice with a one-op multiply_add form runs: 'never' (default) always "
+                            "a flow vselect; 'valu' the multiply_add on the vector ALU when the flow slot is taken "
+                            "in that cycle and a vector slot is free (docs/GREEDY_SHAPE_ABLATION.md section 12)")
+    group.add_argument("--greedy-select-overflow-limit", type=_positive_int, default=None, metavar="N",
+                       help="With --greedy-select-overflow valu: at most N selects take the multiply_add form "
+                            "(default: no limit). The structure model's floor resolution gives one value")
     group.add_argument("--greedy-justify", type=_non_negative_int, default=0, metavar="N",
                        help="Shorten the greedy schedule by forward/backward justification, at most N "
                             "iterations (default 0 = off). Keeps the greedy's const/select encodings; a "
@@ -570,6 +582,43 @@ def add_kernel_build_args(parser: argparse.ArgumentParser) -> argparse._Argument
     return group
 
 
+def check_greedy_shape_combinations(get) -> None:
+    """Reject greedy shape options that would be silently ignored (same rules as Rust's
+    `config::check_greedy_shape_combinations`, which guards direct binding calls).
+
+    Raises:
+        ValueError: --greedy-select-overflow-limit without --greedy-select-overflow valu;
+            --greedy-load-priority or --greedy-flow-priority other than key without
+            --greedy-priority wavefront;
+            --greedy-select-overflow valu when a fixed select encoding (--select-choice fma or
+            vselect), the select-choice hint pass (--select-choice-hint-pass, --hint-passes) or
+            --schedule-with-fixed-choices owns the select encoding.
+    """
+    overflow = get("greedy_select_overflow", "never")
+    if get("greedy_select_overflow_limit") is not None and overflow != "valu":
+        raise ValueError("--greedy-select-overflow-limit needs --greedy-select-overflow valu; otherwise it is ignored")
+    load_priority = get("greedy_load_priority", "key")
+    if load_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-load-priority {load_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    flow_priority = get("greedy_flow_priority", "key")
+    if flow_priority != "key" and get("greedy_priority", "fifo") != "wavefront":
+        raise ValueError(f"--greedy-flow-priority {flow_priority} orders the wavefront priority only; "
+                         "it needs --greedy-priority wavefront")
+    if overflow == "valu":
+        select_choice = get("select_choice", "optimize")
+        if select_choice != "optimize":
+            owner = f"--select-choice {select_choice}"
+        elif get("hint_passes", False) or get("enable_select_choice_hint_pass", False):
+            owner = "the select-choice hint pass (--select-choice-hint-pass / --hint-passes)"
+        elif get("enable_schedule_with_fixed_choices", False):
+            owner = "--schedule-with-fixed-choices"
+        else:
+            owner = None
+        if owner:
+            raise ValueError(f"--greedy-select-overflow valu is ignored when {owner} owns the select encoding")
+
+
 def args_to_build_kwargs(
     args=None,
     *,
@@ -597,6 +646,7 @@ def args_to_build_kwargs(
             return getattr(args, name, default)
         return default
 
+    check_greedy_shape_combinations(get)
     forest_height = get("forest_height", 10)
     n_nodes_val = get("n_nodes")
     n_nodes = n_nodes_val if n_nodes_val is not None else _n_nodes(forest_height)
@@ -688,6 +738,9 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
@@ -750,6 +803,9 @@ def args_to_build_kwargs(
         "greedy_shift_policy": get("greedy_shift_policy", "when-full"),
         "greedy_shift_target": get("greedy_shift_target"),
         "greedy_load_priority": get("greedy_load_priority", "key"),
+        "greedy_flow_priority": get("greedy_flow_priority", "key"),
+        "greedy_select_overflow": get("greedy_select_overflow", "never"),
+        "greedy_select_overflow_limit": get("greedy_select_overflow_limit"),
         "pressure_soft_threshold": get("pressure_soft_threshold"),
         "pressure_critical_threshold": get("pressure_critical_threshold"),
         "pressure_inflation_threshold": get("pressure_inflation_threshold"),
