@@ -395,7 +395,31 @@ def test_topk_stops_when_the_plan_space_is_exhausted(tmp_path, monkeypatch):
     el.loop_topk(stage2, 10, 20.0, "floor", per_level=1)
     assert len(stage2.builds) == 1, "one plan per score level, and there is one level"
     assert stage2.trace[-1]["feedback"].startswith("exhausted")
+    assert stage2.trace[-1]["exhausted"] is True and stage2.trace[-1]["skipped_levels"] == []
     assert len(calls) <= 8, f"{len(calls)} solves"
+
+
+def test_topk_after_a_skipped_level_is_not_reported_exhausted(tmp_path, monkeypatch):
+    """Review of #83: with no retries, a level whose solve returns a plan below it is skipped.
+    Plans at a skipped level may remain unbuilt, so the run must not end with "exhausted"; its
+    last record says which levels were skipped and that the rejected plans were not built."""
+    ctx = es.Context(rounds=2, batch_size=8)
+    table = flat_table(ctx, load=100)
+    stage2 = el.Stage2(table, str(tmp_path), None, log=None, fingerprint={"extension_sha256": "test"})
+
+    def fake_evaluate(rows, name, *a, **k):
+        rec = dict(_fake_build(rows), name=name, counts=table.predict(rows), proved=True, passed=True,
+                   predicted_floor=es.choice_floor(table.predict(rows))["cycles"])
+        stage2.builds[el.plan_key(rows)] = rec
+        return rec, True
+
+    monkeypatch.setattr(stage2, "evaluate", fake_evaluate)
+    el.loop_topk(stage2, 10, 20.0, "floor", per_level=1, retries=0)
+    assert any("no plan of exactly this score" in e["feedback"] for e in stage2.trace), "control: a level was skipped"
+    last = stage2.trace[-1]
+    assert not last["feedback"].startswith("exhausted"), last["feedback"]
+    assert last["exhausted"] is False and last["skipped_levels"]
+    assert "remain unbuilt" in last["feedback"]
 
 
 def test_error_fingerprints_never_match(table, tmp_path):

@@ -746,8 +746,9 @@ uv run python -m scripts.greedy_gap_diagnosis best.json --from 51 --slice 100
 
 ## 12. What limits useful shifting
 
-**Conclusion.** The number of vector ops the greedy shifts to the scalar ALU does not limit the
-schedule. It follows from the schedule's length. Every vector op left unshifted takes one
+**Conclusion.** For the shift policies tested here (`when-full`, `pace`, `reserve`), the number of
+vector ops the greedy shifts to the scalar ALU does not limit the schedule. At a fixed number of
+idle vector slots it follows from the schedule's length. Every vector op left unshifted takes one
 vector slot, so for vector ops V, shifted s, cycles T and idle vector slots I:
 
 ```
@@ -757,8 +758,9 @@ V - s = 6 T - I        (exact; checked on every schedule below)
 The vector ALU is busy in every steady-state cycle (I is 115 to 250 slots, all in the start-up
 and the tail). So a schedule that is longer for any reason shifts fewer ops. PR #74 found
 cycles = VALU ops left / 6 + 19 to 32 (Spearman +0.83 to +0.99). That is this identity, not a
-cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes schedules slower.
-The causes are elsewhere. "Needed by any schedule" is the static head/tail bound, a bound (row arithmetic argued by hand, checked by Z3 on random small DAGs):
+cause. PR #73 also found that forcing more shifts (`pace`, `reserve`) makes the tuned schedules
+slower (`reserve` gained 3 cycles only on the untuned 1,104-cycle schedule, section 11). For those
+policies the causes are elsewhere; an untested shift policy can still delay a schedule. "Needed by any schedule" is the static head/tail bound, a bound (row arithmetic argued by hand, checked by Z3 on random small DAGs):
 SB1 in verification/static_bounds_proof.py (150 random DAGs of 3 to 7 ops at VLEN 2) and
 makespan_rows.py, not a proof for all graphs. In the last column each
 number is labelled: **removal** = a build with the cause removed or changed (an A/B), the only
@@ -941,7 +943,8 @@ uv run python -m scripts.shift_limit_diagnosis s.json --floor 997
 # The flags of section 12.2 on top: --greedy-select-overflow valu [--greedy-select-overflow-limit N],
 # --greedy-flow-priority feeds-load-first. Scratch-relaxed analysis: --scratch-budget-override 4096.
 # Stage 1 with the greedy model
-uv run python -m scripts.emission_structure solve --greedy-model [--select-bit-source path] --out plan.json
+uv run python -m scripts.emission_structure solve --greedy-model --out plan.json        # index bits
+uv run python -m scripts.emission_structure solve --greedy-model --select-bit-source path --out plan_path.json
 # (the loop builds plans with the load-tail greedy and stores builds and flags in the state file)
 uv run python -m scripts.emission_structure loop run --load-tail --state loop_state.json \
   --modes nogood --budget 4 --max-builds 8
