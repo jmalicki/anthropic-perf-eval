@@ -1133,7 +1133,7 @@ fn kernel_build_error_to_py(prefix: &str, e: KernelBuilderError) -> PyErr {
 /// proved on the ops; see transform/select_bits.rs.
 #[pyfunction]
 #[pyo3(signature = (forest_height, n_nodes, batch_size, rounds, enable_valu_shift=true, verbose=true, use_cpsat=false, cpsat_time_limit=600.0, per_section_optimize_secs=None, output_json=None, tree_reduce_max_depth=3, const_choice="optimize", select_choice="optimize", valu_shift="optimize", *,
-    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None,
+    merge_hash_stages=false, index_form="zero-based", prune_dead_index=false, values_only=false, cached_select="standard", select_bit_source="index", depth4_select_rounds="all", emission_plan=None, transform=None, reassociate_gather_xor=false, index_early_terms="none", select_xor_pushdown="none",
     cpsat_tuning_json=None, liveness_detail=None, forced_shifts=None, force_zero_gap=None, enable_vbroadcast_elimination=None, run_options_json=None, git_sha=None, comment=None, asap_alap_tightening="energetic", enable_scratch_tightening=None, symmetry_precedence_integrated=false, precedence_neutral_horizon=false, scheduling_pressure_policy="adaptive", optional_constraint_groups_to_disable=None, enable_cse_groups=None, enable_trace_ids=None, verify_same_cycle_scratch=true, enable_bulk_move=false, greedy_use_full_bounds=false, enable_const_choice_hint_pass=false, enable_select_choice_hint_pass=false, enable_valu_shift_hint_pass=false, enable_schedule_with_fixed_choices=false, cpsat_deterministic_time=None, greedy_barriers="round", greedy_priority="fifo", greedy_stagger_cycles=None, greedy_groups_in_flight=None, greedy_split_shift=false, greedy_justify=0, pressure_soft_threshold=None, pressure_critical_threshold=None, pressure_inflation_threshold=None, greedy_budget_headroom=0, scratch_size=None, scratch_constraint=true, scratch_model="words", cpsat_split_shift_hint=false, cpsat_scratch_time="phase", greedy_shift_policy="when-full", greedy_shift_target=None, greedy_load_priority="key", greedy_flow_priority="key", greedy_select_overflow="never", greedy_select_overflow_limit=None, greedy_budget_force="same-cycle", greedy_alu_priority="key", greedy_const_policy="default", greedy_early_stagger=None))]
 pub fn build_tick_tock_kernel_ssa<'py>(
     py: Python<'py>,
@@ -1161,6 +1161,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     depth4_select_rounds: &str,
     emission_plan: Option<Vec<Vec<String>>>,
     transform: Option<Vec<String>>,
+    reassociate_gather_xor: bool,
+    index_early_terms: &str,
+    select_xor_pushdown: &str,
     // Scheduler, solver and output options.
     cpsat_tuning_json: Option<&str>,
     liveness_detail: Option<String>,
@@ -1301,6 +1304,35 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     // Emission options.
     let index_form = crate::kernel_builder::config::IndexForm::from_str(index_form)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let index_early_terms = match index_early_terms {
+        "none" => crate::kernel_builder::config::IndexEarlyTerms::None,
+        "final" => crate::kernel_builder::config::IndexEarlyTerms::Final,
+        "first-gather" => crate::kernel_builder::config::IndexEarlyTerms::FirstGather,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid index_early_terms '{}': must be 'none', 'final' or 'first-gather'",
+                other
+            )))
+        }
+    };
+    let select_xor_pushdown = match select_xor_pushdown {
+        "none" => crate::kernel_builder::config::SelectXorPushdown::None,
+        "first-pass" => crate::kernel_builder::config::SelectXorPushdown::FirstPass,
+        "all" => crate::kernel_builder::config::SelectXorPushdown::All,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid select_xor_pushdown '{}': must be 'none', 'first-pass' or 'all'",
+                other
+            )))
+        }
+    };
+    if index_early_terms != crate::kernel_builder::config::IndexEarlyTerms::None
+        && index_form != crate::kernel_builder::config::IndexForm::Mirrored
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "index_early_terms needs index_form = 'mirrored' (--index-form mirrored); otherwise it is ignored",
+        ));
+    }
     let cached_select = crate::kernel_builder::config::CachedSelect::from_str(cached_select)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let select_bit_source =
@@ -1371,6 +1403,9 @@ pub fn build_tick_tock_kernel_ssa<'py>(
             select_bit_source,
             depth4_select_after_wrap_only,
             access_plan,
+            reassociate_gather_xor,
+            index_early_terms,
+            select_xor_pushdown,
         },
         compiler: CompilerConfig {
             enable_valu_shift,
@@ -1478,6 +1513,10 @@ pub fn build_tick_tock_kernel_ssa<'py>(
     config
         .spec
         .check_access_plan()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    config
+        .spec
+        .check_critical_path_options()
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let scratch_relaxed = config.compiler.is_relaxed_scratch();
     if scratch_relaxed {

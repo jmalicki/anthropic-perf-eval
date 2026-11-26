@@ -681,6 +681,9 @@ impl SsaTickTockKernelBuilder {
         if let Err(e) = config.spec.check_access_plan() {
             panic!("invalid emission plan: {}", e);
         }
+        if let Err(e) = config.spec.check_critical_path_options() {
+            panic!("invalid critical-path options: {}", e);
+        }
         let uses_depth4 = if config.spec.access_plan.is_some() {
             // Some group selects among the cached level-4 nodes.
             [AccessEncoding::Bits, AccessEncoding::BitsFlow, AccessEncoding::Mobius]
