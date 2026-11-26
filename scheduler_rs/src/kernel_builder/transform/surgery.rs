@@ -135,8 +135,8 @@ pub struct Surgery {
     removed: BTreeSet<usize>,
     before: BTreeMap<usize, Vec<Slot>>,
     after: BTreeMap<usize, Vec<Slot>>,
-    /// Original ops placed elsewhere (`move_after`).
-    moved: BTreeSet<usize>,
+    /// Original ops placed elsewhere (`move_after`): op index -> the original op it now follows.
+    moved: BTreeMap<usize, usize>,
     rename: BTreeMap<VReg, VReg>,
     /// Value -> indices of `ConstChoice` / `Const` ops producing it, increasing (lookup only).
     const_ops: HashMap<i64, Vec<usize>>,
@@ -324,7 +324,7 @@ impl Surgery {
             removed: BTreeSet::new(),
             before: BTreeMap::new(),
             after: BTreeMap::new(),
-            moved: BTreeSet::new(),
+            moved: BTreeMap::new(),
             rename: BTreeMap::new(),
             const_ops,
             broadcast_ops,
@@ -391,25 +391,46 @@ impl Surgery {
     /// * `at` - Original op index they go after.
     ///
     /// # Returns
-    /// An error if an op that stays in place reads one of them at or before `at` (or one is
-    /// not before `at`); then nothing is recorded.
+    /// An error if an op that stays in place reads one of them, or names its value in
+    /// `keep_live`, at or before `at`, if one is not before `at`, or if one was already moved
+    /// or removed (an op has one placement); then nothing is recorded.
     pub fn move_after(&mut self, idxs: &[usize], at: usize) -> Result<(), String> {
         let group: BTreeSet<usize> = idxs.iter().copied().collect();
         let graph = SsaGraph::new(&self.program.ops, &self.program.vector_group_lanes);
+        // The op defining `v`, or the vector `v` is a lane of.
+        let definer = |v: VReg| graph.def_index(v).or_else(|| graph.element_of(v).and_then(|(vec, _)| graph.def_index(vec)));
         for &idx in &group {
             if idx >= at {
                 return Err(format!("op {} is not before op {}", idx, at));
             }
-            let stays = |r: &usize| !group.contains(r) && !self.removed.contains(r) && !self.moved.contains(r);
+            if self.moved.contains_key(&idx) {
+                return Err(format!("op {} is already moved", idx));
+            }
+            if self.removed.contains(&idx) {
+                return Err(format!("op {} is removed", idx));
+            }
+            let stays = |r: &usize| !group.contains(r) && !self.removed.contains(r) && !self.moved.contains_key(r);
             if let Some(&r) = graph.readers(idx).iter().find(|&&r| r <= at && stays(&r)) {
                 return Err(format!("op {} is read by op {} before op {}", idx, r, at));
             }
+            let keeper = (0..=at).find(|&r| {
+                stays(&r) && self.program.ops[r].keep_live.iter().flatten().any(|&v| definer(v) == Some(idx))
+            });
+            if let Some(r) = keeper {
+                return Err(format!("op {} is kept live by op {} before op {}", idx, r, at));
+            }
         }
         for idx in group {
-            self.moved.insert(idx);
+            self.moved.insert(idx, at);
             self.after.entry(at).or_default().push(Slot::Moved(idx));
         }
         Ok(())
+    }
+
+    /// Whether original op `i` is still in the program and placed at or before original op
+    /// `after` (its own position, or the op it was moved after).
+    fn visible_at(&self, i: usize, after: usize) -> bool {
+        !self.removed.contains(&i) && self.moved.get(&i).copied().unwrap_or(i) <= after
     }
 
     /// A new vector op `dest = opcode(srcs)` (VALU), inserted before `at`.
@@ -440,8 +461,8 @@ impl Surgery {
     }
 
     /// The scalar constant `value` visible right after original op `after`: an existing
-    /// `ConstChoice` / `Const` created at or before it (the first such, as the emitter's CSE
-    /// returns), one this surgery created at an anchor at or before it, the zero register for
+    /// `ConstChoice` / `Const` placed at or before it (the first such, as the emitter's CSE
+    /// returns; a moved op counts at the op it was moved after), one this surgery created at an anchor at or before it, the zero register for
     /// 0, or else a new `ConstChoice` inserted after `after` (alternatives set by `finish`).
     ///
     /// # Arguments
@@ -457,7 +478,7 @@ impl Surgery {
                 return z;
             }
         }
-        if let Some(&i) = self.const_ops.get(&value).and_then(|v| v.iter().find(|&&i| i <= after && !self.removed.contains(&i))) {
+        if let Some(&i) = self.const_ops.get(&value).and_then(|v| v.iter().find(|&&i| self.visible_at(i, after))) {
             return self.program.ops[i].dest.expect("constant op has a dest");
         }
         if let Some(&(a, v)) = self.new_consts.get(&value) {
@@ -475,7 +496,7 @@ impl Surgery {
     }
 
     /// `vbroadcast(scalar)` visible right after original op `after`: an existing broadcast of
-    /// `scalar` at or before it, one this surgery created, or a new one inserted after
+    /// `scalar` placed at or before it (a moved one counts at the op it was moved after), one this surgery created, or a new one inserted after
     /// `after`.
     ///
     /// # Arguments
@@ -486,7 +507,7 @@ impl Surgery {
     /// # Returns
     /// The vector VReg.
     pub fn broadcast(&mut self, scalar: VReg, after: usize, stamp: &Stamp) -> VReg {
-        if let Some(&i) = self.broadcast_ops.get(&scalar).and_then(|v| v.iter().find(|&&i| i <= after && !self.removed.contains(&i))) {
+        if let Some(&i) = self.broadcast_ops.get(&scalar).and_then(|v| v.iter().find(|&&i| self.visible_at(i, after))) {
             return self.program.ops[i].dest.expect("broadcast has a dest");
         }
         if let Some(&(a, v)) = self.new_broadcasts.get(&scalar) {
@@ -561,7 +582,7 @@ impl Surgery {
             for s in before.remove(&i).unwrap_or_default() {
                 seq.push(slot(s));
             }
-            if !removed.contains(&i) && !moved.contains(&i) {
+            if !removed.contains(&i) && !moved.contains_key(&i) {
                 seq.push((op.clone(), Some(i)));
             }
             for s in after.remove(&i).unwrap_or_default() {
@@ -583,6 +604,20 @@ impl Surgery {
                 }
                 if let Some(d) = op.delta_vreg.as_mut() {
                     *d = resolve(*d);
+                }
+            }
+        }
+        // Single assignment again, before dead ops are dropped: a rule that inserts a second
+        // definer of a VReg (e.g. two replacements of one op) must fail here. Checked later, the
+        // second definer would already be gone as "dead" (liveness follows the first one), and
+        // the program would silently use whichever came first.
+        {
+            let mut defined: HashSet<VReg> = HashSet::new();
+            for (op, _) in &seq {
+                if let Some(d) = op.dest {
+                    if !defined.insert(d) {
+                        return Err(format!("after the rewrite: {:?} is defined more than once", d));
+                    }
                 }
             }
         }
