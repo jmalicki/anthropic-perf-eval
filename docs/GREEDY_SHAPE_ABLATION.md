@@ -845,7 +845,7 @@ ends 14 cycles later.
 |---|---|---|
 | `--greedy-select-overflow {never,valu}` | `never` | `valu`: a SelectChoice with a precomputed delta (one `multiply_add`) runs on the vector ALU when the flow slot is taken in that cycle and a vector slot is free. The greedy reports these selects as multiply-add selects for lowering and address assignment. It refuses to run if the caller does not collect them |
 | `--greedy-select-overflow-limit N` | none | At most N selects take the multiply_add form |
-| `--greedy-flow-priority {key,feeds-load-first}` | `key` | Wavefront only: ready flow ops that a non-final load depends on go first |
+| `--greedy-flow-priority {key,feeds-load-first,chain-first}` | `key` | Wavefront only (an error otherwise): `feeds-load-first` ready flow ops that a non-final load depends on go first; `chain-first` (docs/STARTUP_AND_STALL_LOOP.md) |
 
 Tests (`ssa_greedy/tests.rs`): slot limits (vector 6, scalar 12, flow 1, with multiply-add
 selects counted as vector ops) under every overflow setting, with and without split shift,
