@@ -518,6 +518,42 @@ impl ProblemSpec {
                         (--index-form mirrored); otherwise it is ignored"
                 .to_string());
         }
+        // The early form needs an index update `n' = madd(n, 2, bit)` of a known index: the
+        // round before is at depth >= 1 and is not the wrap round (which resets the index).
+        let madd_update = |rnd: usize| {
+            let d = self.round_depth(rnd);
+            d >= 1 && d != self.forest_height
+        };
+        // `final`: the final index store after such an update (none with values_only, which
+        // drops the index store). `first-gather`: also a group's first gather after a round in
+        // which it did not gather, when that round's update is such an update.
+        let final_applies = !self.values_only && self.rounds > 0 && madd_update(self.rounds - 1);
+        let first_gather_applies = (1..self.rounds).any(|r| {
+            let (d, dp) = (self.round_depth(r), self.round_depth(r - 1));
+            madd_update(r - 1)
+                && (0..self.n_groups()).any(|g| {
+                    self.access_encoding(r, d, g) == AccessEncoding::Gather
+                        && self.access_encoding(r - 1, dp, g) != AccessEncoding::Gather
+                })
+        });
+        let early_applies = match self.index_early_terms {
+            IndexEarlyTerms::None => true,
+            IndexEarlyTerms::Final => final_applies,
+            IndexEarlyTerms::FirstGather => final_applies || first_gather_applies,
+        };
+        if !early_applies {
+            return Err(format!(
+                "index_early_terms = {:?} (--index-early-terms) applies to no op of this kernel: the final index \
+                 store needs a last round at depth >= 1 that is not the wrap round, and no --values-only{}; \
+                 otherwise it is ignored",
+                self.index_early_terms,
+                if self.index_early_terms == IndexEarlyTerms::FirstGather {
+                    ", and no group gathers right after such a round without gathering in it"
+                } else {
+                    ""
+                }
+            ));
+        }
         let any = |pred: &dyn Fn(usize, usize, AccessEncoding) -> bool| {
             (0..self.rounds).any(|r| {
                 let d = self.round_depth(r);
@@ -1500,6 +1536,22 @@ mod tests {
             });
             assert_eq!(bits2.check_critical_path_options(), Ok(()));
         }
+        // index_early_terms that applies to no op: `final` with the last round at depth 0 (9
+        // rounds), at the wrap round (8) or with values_only; fine at depth 2 (7 rounds).
+        // `first-gather` at 9 rounds still has the gather of round 3 after round 2 (depth 2).
+        let early = |rounds: usize, t: IndexEarlyTerms, values_only: bool| {
+            spec(&|s| {
+                s.rounds = rounds;
+                s.index_early_terms = t;
+                s.values_only = values_only;
+            })
+            .check_critical_path_options()
+        };
+        assert_eq!(early(7, IndexEarlyTerms::Final, false), Ok(()));
+        for (rounds, values_only) in [(8, false), (9, false), (7, true)] {
+            assert!(early(rounds, IndexEarlyTerms::Final, values_only).unwrap_err().contains("applies to no op"));
+        }
+        assert_eq!(early(9, IndexEarlyTerms::FirstGather, false), Ok(()));
         // Reassociation needs a gather round: none when every level is cached.
         assert_eq!(spec(&|s| s.reassociate_gather_xor = true).check_critical_path_options(), Ok(()));
         let all_cached = spec(&|s| {

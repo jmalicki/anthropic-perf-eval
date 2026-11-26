@@ -1598,6 +1598,7 @@ impl SsaTickTockKernelBuilder {
                 let val = if std::mem::take(&mut self.ctx.nv_raw[it][i]) {
                     // val ^ (node ^ K) = (val ^ K) ^ node: the node arrives last (R16).
                     let k = self.ctx.v_stage5_xor.unwrap();
+                    self.emit.set_next_var_type(VarType::RoundState);
                     self.emit.emit_valu(Opcode::Xor, val, k)
                 } else {
                     val
