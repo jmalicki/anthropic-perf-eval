@@ -1568,6 +1568,33 @@ fn test_surgery_drops_a_dead_reader_of_an_alias_whose_lanes_are_gone() {
 }
 
 #[test]
+fn test_surgery_refuses_to_lose_a_trace_id() {
+    use super::surgery::{Finished, Stamp, Surgery};
+    use crate::types::Opcode;
+    // The site's XOR r = t ^ s carries a trace id. Removing it (readers moved to t) loses the
+    // id: refused. Replacing it by a new op that carries the id is accepted.
+    let mut p = one_site_program();
+    let xor = p.ops.iter().position(|o| o.opcode == Opcode::Xor).unwrap();
+    p.ops[xor].trace_id = Some("r".into());
+    let (r, t) = (p.ops[xor].dest.unwrap(), p.ops[xor].srcs[0].as_vreg().unwrap());
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    surgery.replace_uses(r, t);
+    surgery.remove(xor);
+    match surgery.finish_or_refuse().unwrap() {
+        Finished::Refused(_, why) => assert!(why.contains("trace id"), "{}", why),
+        Finished::Done(..) => panic!("a lost trace id was accepted"),
+    }
+    let mut surgery = Surgery::new(clone_program(&p)).unwrap();
+    let dest = surgery.fresh(true);
+    let mut op = p.ops[xor].clone();
+    op.dest = Some(dest);
+    surgery.insert_after(xor, op, &Stamp::of(&p.ops[xor]));
+    surgery.replace_uses(r, dest);
+    surgery.remove(xor);
+    assert!(matches!(surgery.finish_or_refuse().unwrap(), Finished::Done(..)));
+}
+
+#[test]
 fn test_surgery_rejects_a_second_definition_before_dead_code_elimination() {
     use super::surgery::{Stamp, Surgery};
     use crate::types::{Engine, Opcode, Operand};

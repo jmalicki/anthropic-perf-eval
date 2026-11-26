@@ -759,11 +759,14 @@ impl Surgery {
             }
             if why.is_none() {
                 let survived: BTreeSet<usize> = kept.iter().filter_map(|(_, o)| *o).collect();
-                // Ops the rule removed itself are its responsibility (hash-merge moves the trace
-                // id of the XOR it replaces to the new XOR); only ops the rewrite dropped as dead
-                // are refused here.
+                // A dropped traced op is refused unless a surviving op carries its trace id
+                // (hash-merge moves the id of the XOR it replaces to the new XOR); a trace id
+                // that no surviving op carries would be lost.
+                let carried: BTreeSet<&str> = kept.iter().filter_map(|(o, _)| o.trace_id.as_deref()).collect();
                 if let Some(i) = (0..program.ops.len()).find(|&i| {
-                    live_before[i] && !survived.contains(&i) && !removed.contains(&i) && program.ops[i].trace_id.is_some()
+                    live_before[i]
+                        && !survived.contains(&i)
+                        && program.ops[i].trace_id.as_deref().map_or(false, |t| !carried.contains(t))
                 })
                 {
                     why = Some(format!("the edit would drop op {}, which carries a trace id", i));
