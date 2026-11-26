@@ -293,8 +293,8 @@ def add_emission_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGrou
                        help="Push the round XOR below the top select of a cached-level select tree: "
                             "val ^ select(bit, hi, lo) = select(bit, val ^ hi, val ^ lo), one cycle off the "
                             "chain per select round, one more vector op per group and round; only where the top "
-                            "is a SelectChoice (bits-flow; bits from depth 2). 'first-pass': rounds before the "
-                            "wrap (the chain to the first gather). Proof: R18-select-xor-pushdown")
+                            "is a SelectChoice (bits-flow; bits from depth 2). 'first-pass': rounds 0 to "
+                            "forest_height, up to and including the first wrap round (the chain to the first gather). Proof: R18-select-xor-pushdown")
     group.add_argument("--emission-plan", default=EMISSION_DEFAULTS["emission_plan"], metavar="PATH",
                        help="JSON plan of the tree-access encoding (gather, bits, bits-flow, mobius) of every "
                             "group in every round, as written by scripts/emission_structure.py (format: "
