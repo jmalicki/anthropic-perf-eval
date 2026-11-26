@@ -448,33 +448,30 @@ pub fn compute_live_intervals(
             continue;
         }
 
-        // Extend left producer's dest VReg interval to cover the AluDerive read
-        if let Some(&(_, Some(left_vreg))) = id_to_info.get(&left_op_id) {
-            if let Some(interval) = intervals.get_mut(&left_vreg) {
-                if derive_cycle > interval.end {
-                    if debug {
-                        eprintln!(
-                            "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
-                            left_vreg, left_op_id, interval.end, derive_cycle, derive_op_id
-                        );
-                    }
-                    interval.end = derive_cycle;
+        // Extend both producers' dest VReg intervals to cover the AluDerive read. Every
+        // scheduled op with a dest has an interval from the first pass (a value no op reads
+        // gets [D, D + 1]), so a producer read only by derivations is covered too. A producer
+        // missing from `ops` (unscheduled) or without a dest would leave the derive reading an
+        // unassigned word: never produced by the schedulers, and an error here (in release
+        // builds too: a skipped extension would be a silent liveness undercount).
+        for producer_op_id in [left_op_id, right_op_id] {
+            let producer_vreg = id_to_info.get(&producer_op_id).and_then(|&(_, dest)| dest);
+            let interval = producer_vreg.and_then(|v| intervals.get_mut(&v));
+            let Some(interval) = interval else {
+                return Err(format!(
+                    "BUG: AluDerive op {} (cycle {}) reads op {}, which has no live interval (not scheduled, or \
+                     no dest)",
+                    derive_op_id, derive_cycle, producer_op_id
+                ));
+            };
+            if derive_cycle > interval.end {
+                if debug {
+                    eprintln!(
+                        "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
+                        producer_vreg, producer_op_id, interval.end, derive_cycle, derive_op_id
+                    );
                 }
-            }
-        }
-
-        // Extend right producer's dest VReg interval to cover the AluDerive read
-        if let Some(&(_, Some(right_vreg))) = id_to_info.get(&right_op_id) {
-            if let Some(interval) = intervals.get_mut(&right_vreg) {
-                if derive_cycle > interval.end {
-                    if debug {
-                        eprintln!(
-                            "[AluDerive] Extending {:?} (producer op {}) interval end {} -> {} for AluDerive op {}",
-                            right_vreg, right_op_id, interval.end, derive_cycle, derive_op_id
-                        );
-                    }
-                    interval.end = derive_cycle;
-                }
+                interval.end = derive_cycle;
             }
         }
     }

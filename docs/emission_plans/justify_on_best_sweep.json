@@ -1,0 +1,501 @@
+{
+ "note": "Justification on the best greedy kernels: the sweep behind docs/CRITICAL_PATH.md",
+ "tables": {
+  "sweep": [
+   {
+    "row": "stagger 8 / 24, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1030,
+    "simulator_cycles": 1032,
+    "peak_live": 1534,
+    "justify": "1076 -> 1030 cycles in 10 iteration(s), 1257 shifted (409 split), peak live 1441 -> 1533 words, 4 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1541 words > budget 1535]"
+   },
+   {
+    "row": "stagger 8 / 24, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1032,
+    "simulator_cycles": 1034,
+    "peak_live": 1474,
+    "justify": "1101 -> 1032 cycles in 10 iteration(s), 1232 shifted (392 split), peak live 1478 -> 1473 words, 4 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1591 words > budget 1535]"
+   },
+   {
+    "row": "stagger 8 / 24, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1061,
+    "simulator_cycles": 1063,
+    "peak_live": 1338,
+    "justify": "1177 -> 1061 cycles in 10 iteration(s), 1237 shifted (400 split), peak live 1234 -> 1337 words, 3 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 8 / 24, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1057,
+    "simulator_cycles": 1059,
+    "peak_live": 1423,
+    "justify": "1126 -> 1057 cycles in 10 iteration(s), 1205 shifted (397 split), peak live 1226 -> 1422 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 8 / 32, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1489,
+    "justify": "1067 -> 1016 cycles in 10 iteration(s), 1337 shifted (441 split), peak live 1504 -> 1488 words, 2 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1576 words > budget 1535]"
+   },
+   {
+    "row": "stagger 8 / 32, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "fail": "scratch budget exceeded (peak_live 1729 > 1536)"
+   },
+   {
+    "row": "stagger 8 / 32, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1409,
+    "justify": "1038 -> 1038 cycles in 10 iteration(s), 1358 shifted (446 split), peak live 1408 -> 1408 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 8 / 32, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1401,
+    "justify": "1046 -> 1038 cycles in 10 iteration(s), 1350 shifted (461 split), peak live 1488 -> 1400 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 24, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1027,
+    "simulator_cycles": 1029,
+    "peak_live": 1393,
+    "justify": "1070 -> 1027 cycles in 10 iteration(s), 1273 shifted (429 split), peak live 1368 -> 1392 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 24, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1467,
+    "justify": "1095 -> 1033 cycles in 10 iteration(s), 1249 shifted (439 split), peak live 1436 -> 1466 words, 4 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 24, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1061,
+    "simulator_cycles": 1063,
+    "peak_live": 1330,
+    "justify": "1170 -> 1061 cycles in 10 iteration(s), 1214 shifted (386 split), peak live 1178 -> 1329 words, 3 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 24, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1061,
+    "simulator_cycles": 1063,
+    "peak_live": 1407,
+    "justify": "1121 -> 1061 cycles in 10 iteration(s), 1201 shifted (390 split), peak live 1202 -> 1406 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 32, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1497,
+    "justify": "1026 -> 1016 cycles in 10 iteration(s), 1322 shifted (452 split), peak live 1456 -> 1496 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 32, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "fail": "scratch budget exceeded (peak_live 1729 > 1536)"
+   },
+   {
+    "row": "stagger 9 / 32, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1357,
+    "justify": "1063 -> 1038 cycles in 10 iteration(s), 1342 shifted (439 split), peak live 1368 -> 1356 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 9 / 32, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1423,
+    "justify": "1038 -> 1038 cycles in 10 iteration(s), 1311 shifted (417 split), peak live 1422 -> 1422 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 24, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1028,
+    "simulator_cycles": 1030,
+    "peak_live": 1355,
+    "justify": "1065 -> 1028 cycles in 10 iteration(s), 1255 shifted (418 split), peak live 1322 -> 1354 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 24, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1035,
+    "simulator_cycles": 1037,
+    "peak_live": 1519,
+    "justify": "1097 -> 1035 cycles in 10 iteration(s), 1232 shifted (413 split), peak live 1354 -> 1518 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 24, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1063,
+    "simulator_cycles": 1065,
+    "peak_live": 1330,
+    "justify": "1169 -> 1063 cycles in 10 iteration(s), 1200 shifted (373 split), peak live 1162 -> 1329 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 24, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1059,
+    "simulator_cycles": 1061,
+    "peak_live": 1383,
+    "justify": "1117 -> 1059 cycles in 10 iteration(s), 1215 shifted (381 split), peak live 1178 -> 1382 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 32, path, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1497,
+    "justify": "1040 -> 1016 cycles in 10 iteration(s), 1310 shifted (443 split), peak live 1428 -> 1496 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 32, path, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1018,
+    "simulator_cycles": 1020,
+    "peak_live": 1530,
+    "justify": "1049 -> 1018 cycles in 10 iteration(s), 1344 shifted (438 split), peak live 1464 -> 1529 words, 14 candidate(s) checked, 13 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1568 words > budget 1535]"
+   },
+   {
+    "row": "stagger 10 / 32, index, prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1399,
+    "justify": "1084 -> 1038 cycles in 10 iteration(s), 1342 shifted (427 split), peak live 1320 -> 1398 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10 / 32, index, no prio",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1413,
+    "justify": "1056 -> 1038 cycles in 10 iteration(s), 1356 shifted (453 split), peak live 1360 -> 1412 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   }
+  ],
+  "rewrites": [
+   {
+    "row": "none, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --greedy-const-policy default",
+    "cycles": 1019,
+    "simulator_cycles": 1021,
+    "peak_live": 1529,
+    "justify": "1030 -> 1019 cycles in 10 iteration(s), 1307 shifted (450 split), peak live 1496 -> 1528 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "none, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-const-policy default",
+    "cycles": 1039,
+    "simulator_cycles": 1041,
+    "peak_live": 1431,
+    "justify": "1039 -> 1039 cycles in 10 iteration(s), 1307 shifted (421 split), peak live 1430 -> 1430 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "none, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --greedy-const-policy alu-first",
+    "cycles": 1019,
+    "simulator_cycles": 1021,
+    "peak_live": 1482,
+    "justify": "1030 -> 1019 cycles in 10 iteration(s), 1348 shifted (441 split), peak live 1496 -> 1481 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "none, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-const-policy alu-first",
+    "cycles": 1039,
+    "simulator_cycles": 1041,
+    "peak_live": 1431,
+    "justify": "1039 -> 1039 cycles in 10 iteration(s), 1303 shifted (425 split), peak live 1430 -> 1430 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy default",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1520,
+    "justify": "1031 -> 1016 cycles in 10 iteration(s), 1329 shifted (448 split), peak live 1464 -> 1519 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --greedy-const-policy default",
+    "cycles": 1036,
+    "simulator_cycles": 1038,
+    "peak_live": 1322,
+    "justify": "1084 -> 1036 cycles in 10 iteration(s), 1356 shifted (449 split), peak live 1494 -> 1321 words, 2 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1542 words > budget 1535]"
+   },
+   {
+    "row": "R16, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1497,
+    "justify": "1026 -> 1016 cycles in 10 iteration(s), 1322 shifted (452 split), peak live 1456 -> 1496 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --greedy-const-policy alu-first",
+    "cycles": 1036,
+    "simulator_cycles": 1038,
+    "peak_live": 1314,
+    "justify": "1082 -> 1036 cycles in 10 iteration(s), 1353 shifted (444 split), peak live 1486 -> 1313 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R17 final, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final --greedy-const-policy default",
+    "cycles": 1018,
+    "simulator_cycles": 1020,
+    "peak_live": 1485,
+    "justify": "1031 -> 1018 cycles in 10 iteration(s), 1306 shifted (448 split), peak live 1494 -> 1484 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R17 final, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final --greedy-const-policy default",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1423,
+    "justify": "1038 -> 1038 cycles in 10 iteration(s), 1311 shifted (417 split), peak live 1422 -> 1422 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R17 final, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --index-early-terms final --greedy-const-policy alu-first",
+    "cycles": 1018,
+    "simulator_cycles": 1020,
+    "peak_live": 1501,
+    "justify": "1029 -> 1018 cycles in 10 iteration(s), 1353 shifted (445 split), peak live 1496 -> 1500 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R17 final, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --index-early-terms final --greedy-const-policy alu-first",
+    "cycles": 1038,
+    "simulator_cycles": 1040,
+    "peak_live": 1423,
+    "justify": "1038 -> 1038 cycles in 10 iteration(s), 1305 shifted (420 split), peak live 1422 -> 1422 words, 0 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16 + R17 final, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --greedy-const-policy default",
+    "cycles": 1015,
+    "simulator_cycles": 1017,
+    "peak_live": 1465,
+    "justify": "1031 -> 1015 cycles in 10 iteration(s), 1332 shifted (442 split), peak live 1471 -> 1464 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16 + R17 final, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --greedy-const-policy default",
+    "cycles": 1035,
+    "simulator_cycles": 1037,
+    "peak_live": 1463,
+    "justify": "1074 -> 1035 cycles in 10 iteration(s), 1362 shifted (455 split), peak live 1500 -> 1462 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16 + R17 final, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --greedy-const-policy alu-first",
+    "cycles": 1015,
+    "simulator_cycles": 1017,
+    "peak_live": 1489,
+    "justify": "1026 -> 1015 cycles in 10 iteration(s), 1327 shifted (453 split), peak live 1470 -> 1488 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R16 + R17 final, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --greedy-const-policy alu-first",
+    "cycles": 1035,
+    "simulator_cycles": 1037,
+    "peak_live": 1486,
+    "justify": "1049 -> 1035 cycles in 10 iteration(s), 1360 shifted (454 split), peak live 1482 -> 1485 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --select-xor-pushdown first-pass --greedy-const-policy default",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1434,
+    "justify": "1048 -> 1016 cycles in 10 iteration(s), 1440 shifted (492 split), peak live 1400 -> 1433 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --select-xor-pushdown first-pass --greedy-const-policy default",
+    "cycles": 1037,
+    "simulator_cycles": 1039,
+    "peak_live": 1373,
+    "justify": "1046 -> 1037 cycles in 10 iteration(s), 1415 shifted (473 split), peak live 1352 -> 1372 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --select-xor-pushdown first-pass --greedy-const-policy alu-first",
+    "cycles": 1016,
+    "simulator_cycles": 1018,
+    "peak_live": 1470,
+    "justify": "1047 -> 1016 cycles in 10 iteration(s), 1444 shifted (488 split), peak live 1400 -> 1469 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --select-xor-pushdown first-pass --greedy-const-policy alu-first",
+    "cycles": 1037,
+    "simulator_cycles": 1039,
+    "peak_live": 1397,
+    "justify": "1048 -> 1037 cycles in 10 iteration(s), 1411 shifted (474 split), peak live 1360 -> 1396 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass + R16 + R17 final, path, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-const-policy default",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1409,
+    "justify": "1044 -> 1012 cycles in 10 iteration(s), 1442 shifted (488 split), peak live 1414 -> 1408 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass + R16 + R17 final, index, default",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-const-policy default",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1445,
+    "justify": "1047 -> 1033 cycles in 10 iteration(s), 1426 shifted (478 split), peak live 1406 -> 1444 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass + R16 + R17 final, path, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-const-policy alu-first",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1401,
+    "justify": "1043 -> 1012 cycles in 10 iteration(s), 1432 shifted (505 split), peak live 1414 -> 1400 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "R18 first-pass + R16 + R17 final, index, alu-first",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-const-policy alu-first",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1453,
+    "justify": "1046 -> 1033 cycles in 10 iteration(s), 1430 shifted (484 split), peak live 1432 -> 1452 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   }
+  ],
+  "neighbours": [
+   {
+    "row": "best, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1409,
+    "justify": "1044 -> 1012 cycles in 10 iteration(s), 1442 shifted (488 split), peak live 1414 -> 1408 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "best, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1445,
+    "justify": "1047 -> 1033 cycles in 10 iteration(s), 1426 shifted (478 split), peak live 1406 -> 1444 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 8, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1529,
+    "justify": "1033 -> 1012 cycles in 10 iteration(s), 1450 shifted (506 split), peak live 1464 -> 1528 words, 3 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1561 words > budget 1535]"
+   },
+   {
+    "row": "stagger 8, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 8 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1525,
+    "justify": "1085 -> 1033 cycles in 10 iteration(s), 1425 shifted (481 split), peak live 1504 -> 1524 words, 2 candidate(s) checked, 1 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains [last scratch rejection: peak live 1536 words > budget 1535]"
+   },
+   {
+    "row": "stagger 10, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1465,
+    "justify": "1059 -> 1012 cycles in 10 iteration(s), 1424 shifted (492 split), peak live 1352 -> 1464 words, 5 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "stagger 10, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 10 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1035,
+    "simulator_cycles": 1037,
+    "peak_live": 1445,
+    "justify": "1065 -> 1035 cycles in 10 iteration(s), 1425 shifted (624 split), peak live 1398 -> 1444 words, 3 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "28 in flight, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 28 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1014,
+    "simulator_cycles": 1016,
+    "peak_live": 1425,
+    "justify": "1047 -> 1014 cycles in 10 iteration(s), 1435 shifted (517 split), peak live 1394 -> 1424 words, 3 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "28 in flight, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 28 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1040,
+    "simulator_cycles": 1042,
+    "peak_live": 1415,
+    "justify": "1093 -> 1040 cycles in 10 iteration(s), 1396 shifted (462 split), peak live 1418 -> 1414 words, 6 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "24 in flight, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1026,
+    "simulator_cycles": 1028,
+    "peak_live": 1417,
+    "justify": "1063 -> 1026 cycles in 10 iteration(s), 1387 shifted (476 split), peak live 1307 -> 1416 words, 1 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "24 in flight, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 24 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1061,
+    "simulator_cycles": 1063,
+    "peak_live": 1425,
+    "justify": "1109 -> 1061 cycles in 10 iteration(s), 1281 shifted (421 split), peak live 1258 -> 1424 words, 4 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "justify 0, path",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 0 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1044,
+    "simulator_cycles": 1046,
+    "peak_live": 1415,
+    "justify": null
+   },
+   {
+    "row": "justify 0, index",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 0 --emission-plan docs/emission_plans/flow90.json --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1047,
+    "simulator_cycles": 1049,
+    "peak_live": 1407,
+    "justify": null
+   },
+   {
+    "row": "path without the priorities",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/path_flow90.json --select-bit-source path --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1012,
+    "simulator_cycles": 1014,
+    "peak_live": 1417,
+    "justify": "1053 -> 1012 cycles in 10 iteration(s), 1440 shifted (518 split), peak live 1456 -> 1416 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   },
+   {
+    "row": "index with the priorities",
+    "command": "uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95 --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan docs/emission_plans/flow90.json --greedy-flow-priority chain-first --greedy-alu-priority native-first --reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass",
+    "cycles": 1033,
+    "simulator_cycles": 1035,
+    "peak_live": 1409,
+    "justify": "1073 -> 1033 cycles in 10 iteration(s), 1411 shifted (490 split), peak live 1400 -> 1408 words, 2 candidate(s) checked, 0 rejected for scratch, 0 rejected by verification, 0 rejected for ASAP/ALAP domains"
+   }
+  ]
+ }
+}

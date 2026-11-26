@@ -20,6 +20,10 @@
 //! Only cycles and the shift decision (vector slot, or VLEN scalar lanes, possibly split
 //! over two consecutive cycles) change. The encodings the greedy chose for ConstChoice and
 //! SelectChoice ops are kept, and dead ops the greedy skipped (negative cycle) stay skipped.
+//! An ALU-derived constant (`--greedy-const-policy`) is a scalar ALU op that reads the
+//! values of its two producers at its cycle: it is scheduled after both (the edges are not in
+//! `dep_ids`), and the scratch checks keep both producers live until then, as address
+//! assignment does (`const_alu_derive_ops`).
 //!
 //! The pass does not trust its own list scheduler: every candidate is written to a copy of
 //! the ops in the pipeline's schedule representation and checked there by
@@ -34,7 +38,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::address_assign::{assign_addresses, AddressAssignConfig};
 use crate::kernel_builder::memory_deps::{check_memory_edges, memory_predecessors};
 use crate::types::{
-    ConstChoiceEncoding, Engine, Opcode, PrecedenceOffset, SelectChoiceEncoding, SsaOp, VReg, VLEN,
+    AluDeriveInfo, ConstChoiceEncoding, Engine, Opcode, PrecedenceOffset, SelectChoiceEncoding, SsaOp, VReg, VLEN,
 };
 
 use super::super::ssa_lower::can_ssa_valu_shift_to_alu;
@@ -155,7 +159,7 @@ impl JustifyOutcome {
 /// * `select_choice` - SelectChoice encoding per op id (absent = vselect)
 ///
 /// # Returns
-/// The engine, or `Err` for an encoding this pass does not model (ALU-derived constants).
+/// The engine.
 fn decided_engine(
     op: &SsaOp,
     const_choice: &HashMap<usize, ConstChoiceEncoding>,
@@ -165,9 +169,7 @@ fn decided_engine(
         Opcode::ConstChoice => match const_choice.get(&op.id) {
             Some(ConstChoiceEncoding::AddImm) => Engine::Flow,
             Some(ConstChoiceEncoding::Load) | None => Engine::Load,
-            Some(ConstChoiceEncoding::AluDerive(_)) => {
-                return Err(format!("op {} is an ALU-derived constant, which justification does not model", op.id))
-            }
+            Some(ConstChoiceEncoding::AluDerive(_)) => Engine::Alu,
         },
         Opcode::SelectChoice => match select_choice.get(&op.id) {
             Some(SelectChoiceEncoding::Fma) => Engine::Valu,
@@ -175,6 +177,31 @@ fn decided_engine(
         },
         _ => op.engine,
     })
+}
+
+/// Op ids of the two producers an ALU-derived constant reads (none for any other op).
+///
+/// The derivation reads the producers' values at its own cycle, but the edges are not in
+/// `dep_ids` (the constant has no VReg operands), so every check adds them here.
+fn derive_producers(op: &SsaOp, const_choice: &HashMap<usize, ConstChoiceEncoding>) -> Option<[usize; 2]> {
+    match const_choice.get(&op.id) {
+        Some(ConstChoiceEncoding::AluDerive(info)) if op.opcode == Opcode::ConstChoice => {
+            Some([info.left_op_id, info.right_op_id])
+        }
+        _ => None,
+    }
+}
+
+/// The ALU-derived constants among `const_choice`, as address assignment takes them
+/// (`AddressAssignConfig::const_alu_derive_ops`).
+fn alu_derive_ops(const_choice: &HashMap<usize, ConstChoiceEncoding>) -> HashMap<usize, AluDeriveInfo> {
+    const_choice
+        .iter()
+        .filter_map(|(id, enc)| match enc {
+            ConstChoiceEncoding::AluDerive(info) => Some((*id, info.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// True for a SelectChoice on the multiply-add path without a precomputed delta: the
@@ -306,6 +333,22 @@ pub(crate) fn verify_schedule(
     for (idx, op) in ops.iter().enumerate() {
         if op.cycle < 0 {
             continue;
+        }
+        if let Some(producers) = derive_producers(op, const_choice) {
+            for producer in producers {
+                let Some(&p_idx) = id_to_idx.get(&producer) else {
+                    return Err(format!("ALU-derived constant {} reads op {}, which is not in the program", op.id, producer));
+                };
+                if ops[p_idx].cycle < 0 {
+                    return Err(format!("ALU-derived constant {} reads op {}, which is not scheduled", op.id, producer));
+                }
+                if first_cycle[idx] < result_cycle[p_idx] {
+                    return Err(format!(
+                        "ALU-derived constant {} runs at cycle {} but its operand from op {} is readable from cycle {}",
+                        op.id, first_cycle[idx], producer, result_cycle[p_idx]
+                    ));
+                }
+            }
         }
         for dep_id in &op.dep_ids {
             let Some(&dep_idx) = id_to_idx.get(dep_id) else {
@@ -439,6 +482,14 @@ impl Graph {
                 .filter_map(|dep_id| id_to_idx.get(dep_id).and_then(|&dep_idx| node_of[dep_idx]))
                 .chain(mem_pred[idx].iter().filter_map(|&(src, _)| node_of[src]))
                 .collect();
+            if let Some(producers) = derive_producers(op, const_choice) {
+                for producer in producers {
+                    let node_p = id_to_idx.get(&producer).and_then(|&p_idx| node_of[p_idx]).ok_or_else(|| {
+                        format!("ALU-derived constant {} reads op {}, which is not scheduled", op.id, producer)
+                    })?;
+                    preds.push(node_p);
+                }
+            }
             preds.sort_unstable();
             preds.dedup();
             if preds.contains(&node) {
@@ -679,10 +730,10 @@ fn list_schedule(graph: &Graph, reversed: bool, key: &[i64]) -> Result<Times, St
 // ============================================================================
 
 /// A copy of the pipeline's schedule state that candidates are written to and checked in.
-struct Workspace {
-    ops: Vec<SsaOp>,
-    shifted_ops: HashSet<usize>,
-    shifted_lane_cycles: HashMap<usize, Vec<i32>>,
+pub(super) struct Workspace {
+    pub(super) ops: Vec<SsaOp>,
+    pub(super) shifted_ops: HashSet<usize>,
+    pub(super) shifted_lane_cycles: HashMap<usize, Vec<i32>>,
 }
 
 /// Why a candidate was dropped.
@@ -705,26 +756,36 @@ enum Rejection {
 ///
 /// # Returns
 /// The peak, or the reason the schedule does not fit.
-fn scratch_check(
+pub(super) fn scratch_check(
     work: &Workspace,
     vector_group_lanes: Option<&HashMap<VReg, Vec<VReg>>>,
     select_fma_ops: &HashSet<usize>,
+    alu_derive: &HashMap<usize, AluDeriveInfo>,
     config: &JustifyConfig,
 ) -> Result<usize, String> {
-    let (_, peak, _) =
-        interval_liveness_curve(&work.ops, vector_group_lanes, &work.shifted_lane_cycles, select_fma_ops)?;
+    let (_, peak, _) = interval_liveness_curve(
+        &work.ops,
+        vector_group_lanes,
+        &work.shifted_lane_cycles,
+        select_fma_ops,
+        alu_derive,
+    )?;
     if peak > config.scratch_budget {
         return Err(format!("peak live {} words > budget {}", peak, config.scratch_budget));
     }
     if config.scratch_pools {
-        let pools = scratch_pool_peaks(&work.ops, vector_group_lanes, &work.shifted_lane_cycles, select_fma_ops)?;
+        let pools =
+            scratch_pool_peaks(&work.ops, vector_group_lanes, &work.shifted_lane_cycles, select_fma_ops, alu_derive)?;
         if pools.split_words() > config.scratch_budget {
             return Err(format!("pools need {} words > budget {}", pools.split_words(), config.scratch_budget));
         }
     }
     if let Some(template) = &config.allocator {
+        // The derivations the pass schedules, whatever the template says: address
+        // assignment extends their producers' lifetimes to the derive's cycle.
         let allocator = AddressAssignConfig {
             shifted_alu_cycles: work.shifted_lane_cycles.clone(),
+            const_alu_derive_ops: alu_derive.clone(),
             ..template.clone()
         };
         let scheduled: Vec<SsaOp> = work.ops.iter().filter(|op| op.cycle >= 0).cloned().collect();
@@ -784,7 +845,10 @@ pub(crate) fn justify_schedule(
         .filter(|(_, e)| matches!(e, SelectChoiceEncoding::Fma))
         .map(|(id, _)| *id)
         .collect();
-    let (_, input_peak, _) = interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &select_fma_ops)?;
+    // ALU-derived constants: their producers stay live to the derive's cycle.
+    let alu_derive = alu_derive_ops(const_choice);
+    let (_, input_peak, _) =
+        interval_liveness_curve(ops, vector_group_lanes, shifted_lane_cycles, &select_fma_ops, &alu_derive)?;
     outcome.peak_live_before = input_peak;
     outcome.peak_live_after = input_peak;
     let count_shifts = |outcome: &mut JustifyOutcome, shifted: &HashSet<usize>, lanes: &HashMap<usize, Vec<i32>>| {
@@ -861,7 +925,7 @@ pub(crate) fn justify_schedule(
                 }
             }
         }
-        scratch_check(work, vector_group_lanes, &select_fma_ops, config).map_err(|e| {
+        scratch_check(work, vector_group_lanes, &select_fma_ops, &alu_derive, config).map_err(|e| {
             outcome.scratch_rejections += 1;
             Rejection::Scratch(e)
         })

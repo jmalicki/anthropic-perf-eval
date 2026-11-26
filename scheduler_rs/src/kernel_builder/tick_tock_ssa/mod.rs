@@ -106,6 +106,9 @@ pub struct SsaScheduleResult {
     /// Vector group key/alias → lane VRegs (read groups from `decompose_vector`, write groups
     /// from `fresh_vector_group`). Exported so external checkers can resolve lane aliases.
     pub vector_group_lanes: HashMap<VReg, Vec<VReg>>,
+    /// What `--greedy-justify` did (the GreedyJustify pass's summary: "off", "skipped: ...",
+    /// or its outcome), `None` when the pass did not run.
+    pub greedy_justify_summary: Option<String>,
     /// Peak words of the per-section scratch check on the greedy schedule (the most over all
     /// sections), counted with the allocator's intervals; None if the check did not run. The
     /// greedy-only path counts it on the phase timeline for comparison with
@@ -688,6 +691,7 @@ pub fn export_partial_result_on_error(
         cpsat_scratch_budget: ctx.cpsat_extra.as_ref().and_then(|e| e.cpsat_scratch_budget),
         scratch_relaxed: ctx.config.compiler.is_relaxed_scratch(),
         vector_group_lanes: ctx.vector_group_lanes.clone(),
+        greedy_justify_summary: None,
         section_check_peak: ctx.section_check_peak,
         transform_sites: ctx.transform_sites.clone(),
     };

@@ -24,10 +24,17 @@ covers the ALU-derived constants) and PASSED.
    instead of 50, and the load engine idles in cycles 39 to 50 instead, because no gather can
    start before t = 51; after t the ramp has the same idle slots (41 -> 42 on path). The
    "load engine full" blame in the earlier accounting was the wavefront order of the batch
-   `vload`s of later groups, not load capacity. Measured without `--greedy-justify`: on this
-   branch justification skips any schedule with an ALU-derived constant. With derived
-   constants modelled (#93), `alu-first` + justify 10 gives 1,016 on path, the same as
-   without `alu-first`; #91 records 1,026 for `alu-first` + `--reassociate-gather-xor`
+   `vload`s of later groups, not load capacity. Measured without `--greedy-justify` (on #86 justification
+   skipped any schedule with an ALU-derived constant). With derived constants modelled
+   (#93, docs/CRITICAL_PATH.md), `alu-first` + `--reassociate-gather-xor` (R16) + justify 10
+   gives 1,016 on path, the same as without `alu-first`; without R16 both const policies give
+   1,019. Command (docs/emission_plans/justify_on_best_sweep.json, row "R16, path, alu-first"):
+   `uv run generate_ssa_kernel.py --validate --rounds 16 --use-greedy --greedy-barriers none
+   --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95
+   --greedy-load-priority final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9
+   --merge-hash-stages --index-form mirrored --greedy-justify 10 --emission-plan
+   docs/emission_plans/path_flow90.json --select-bit-source path --greedy-flow-priority chain-first
+   --greedy-alu-priority native-first --reassociate-gather-xor --greedy-const-policy alu-first`; #91 records 1,026 for `alu-first` + `--reassociate-gather-xor`
    (without justification) as a fragile interaction (1,067 at stagger 8).
 2. **Forced encodings under `--use-greedy` now take effect** (they were dropped: the greedy
    read them only from the CP-SAT config). `--const-choice add_imm`: 54 of 54 constants on
