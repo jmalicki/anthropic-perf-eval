@@ -3,10 +3,13 @@
 #
 #   ./scripts/test.sh            # everything below
 #   ./scripts/test.sh rust       # scheduler_rs unit tests (cargo, --features cpsat)
-#   ./scripts/test.sh python     # pytest: interface, dataflow replay, SSA equivalence, forced modes, proofs, inspect_schedule, CP-SAT tuning
+#   ./scripts/test.sh python     # pytest: every tests/test_*.py, plus solver/test_slot_utilization.py
 #   ./scripts/test.sh proofs     # Z3: liveness theorems, rewrite identities, allocation conjectures, static makespan bounds, memory-alias rules
 #   ./scripts/test.sh kernel     # greedy 2-round and 16-round builds with replay + validation
 #   ./scripts/test.sh upstream   # 16-round greedy kernel on the unmodified upstream simulator and tests
+#   ./scripts/test.sh ci-only    # pytest -m ci_only: 16-round pin builds (CI; not part of 'all')
+#
+# Tests marked @pytest.mark.ci_only are deselected by every other pytest run (pyproject addopts).
 #
 # Extra arguments after the suite name are passed through, e.g.
 #   ./scripts/test.sh rust -- test_vector_group
@@ -39,14 +42,32 @@ run_rust() {
 }
 run_python() {
   if [ $# -eq 0 ]; then
-    set -- tests/test_kernel_dataflow.py tests/test_ssa_equivalence.py tests/test_rewrite_proofs.py tests/test_allocation_conjectures.py tests/test_forced_modes.py tests/test_determinism.py tests/test_cpsat_hint_complete.py \
-      tests/test_scheduler_rs_interface.py tests/test_kernel_bundle_consistency.py \
-      tests/test_trace_io.py tests/test_trace_io_integration.py tests/test_schedule_report.py \
-      tests/test_inspect_schedule.py tests/test_kernel_build_args.py tests/test_cpsat_tuning.py tests/test_run_cpsat_ablation.py \
-      tests/test_cpsat_lane_model.py tests/test_emission_options.py tests/test_emission_ablation.py tests/test_emission_plan.py tests/test_emission_structure.py tests/test_region_tags.py tests/test_kernel_lift.py tests/test_scratch_time_overcount.py tests/test_static_bounds.py tests/test_measure_baseline.py tests/test_window_optimality_probe.py tests/test_test_slot.py \
-      solver/test_slot_utilization.py
+    # Discovery, not a list: pytest collects every tests/test_*.py, so a new test file runs in
+    # CI without editing this script. tests/submission_tests.py does not match the pattern (it
+    # is not run in CI, see CLAUDE.md). The one test file outside tests/ is named here;
+    # tests/test_suite_coverage.py fails if another appears outside tests/.
+    set -- tests solver/test_slot_utilization.py
   fi
-  uv run pytest -q "$@"
+  rc=0
+  uv run pytest -q "$@" || rc=$?
+  if [ "$rc" -eq 5 ]; then
+    echo "test.sh python: no test selected. Tests marked ci_only are deselected by this suite;" \
+      "if that is what you named, run: ./scripts/test.sh ci-only $*" >&2
+  fi
+  return "$rc"
+}
+run_ci_only() {
+  if [ $# -eq 0 ]; then
+    set -- tests
+  fi
+  rc=0
+  uv run pytest -q -m ci_only "$@" || rc=$?
+  # Exit 5 = nothing collected: no ci_only test in the selection, which is not a failure.
+  if [ "$rc" -eq 5 ]; then
+    echo "test.sh ci-only: no ci_only test in $*" >&2
+    rc=0
+  fi
+  return "$rc"
 }
 run_proofs() {
   uv run python -m verification.verify -q "$@"
@@ -78,6 +99,7 @@ case "$suite" in
   proofs) run_proofs "$@" ;;
   kernel) run_kernel "$@" ;;
   upstream) run_upstream "$@" ;;
+  ci-only) run_ci_only "$@" ;;
   all) for s in rust python proofs kernel upstream; do "$(pwd)/scripts/test.sh" "$s"; done ;;
-  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | all)" >&2; exit 2 ;;
+  *) echo "unknown suite '$suite' (rust | python | proofs | kernel | upstream | ci-only | all)" >&2; exit 2 ;;
 esac
