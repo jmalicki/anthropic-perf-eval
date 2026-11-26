@@ -906,7 +906,16 @@ fn synthetic_hash_program(seed: u64, n: usize) -> (crate::kernel_builder::SsaPro
         };
         let [m, c, d] = [rng.word() as i64, rng.word() as i64, rng.word() as i64];
         constants.push([m, c, d, k]);
-        let a = push(&mut ops, Engine::Load, Opcode::Vload, Some(fresh(true)), vec![Operand::Imm(1000 + 8 * i as i64)]);
+        // Addresses are registers, as lowering reads them (`Const`, so the tests that rewrite
+        // the sites' `ConstChoice` immediates by position do not see them).
+        let mut address = |ops: &mut Vec<SsaOp>, a: i64| {
+            let d = push(ops, Engine::Load, Opcode::Const, Some(fresh(false)), vec![Operand::Imm(a)]).unwrap();
+            ops.last_mut().unwrap().produces_constant = Some(a);
+            d
+        };
+        let (load_at, out1_at, out2_at) =
+            (address(&mut ops, 1000 + 8 * i as i64), address(&mut ops, 5000 + 8 * i as i64), address(&mut ops, 9000 + 8 * i as i64));
+        let a = push(&mut ops, Engine::Load, Opcode::Vload, Some(fresh(true)), vec![Operand::VReg(load_at)]);
         let mut vec_const = |ops: &mut Vec<SsaOp>, value: i64| {
             let s = push(ops, Engine::Load, Opcode::ConstChoice, Some(fresh(false)), vec![Operand::Imm(value)]).unwrap();
             let v = push(ops, Engine::Valu, Opcode::Vbroadcast, Some(fresh(true)), vec![Operand::VReg(s)]).unwrap();
@@ -928,9 +937,9 @@ fn synthetic_hash_program(seed: u64, n: usize) -> (crate::kernel_builder::SsaPro
         };
         let xor_srcs = if i & 8 == 0 { vec![v(t), v(s)] } else { vec![v(s), v(t)] };
         let r = push(&mut ops, Engine::Valu, Opcode::Xor, Some(fresh(true)), xor_srcs).unwrap();
-        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(5000 + 8 * i as i64), v(r)]);
+        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![v(out1_at), v(r)]);
         let out = push(&mut ops, Engine::Valu, Opcode::Xor, Some(fresh(true)), vec![v(r), v(a)]).unwrap();
-        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![Operand::Imm(9000 + 8 * i as i64), v(out)]);
+        push(&mut ops, Engine::Store, Opcode::Vstore, None, vec![v(out2_at), v(out)]);
     }
     let vreg_def = ops.iter().filter_map(|o| o.dest.map(|d| (d, o.id))).collect();
     let program = crate::kernel_builder::SsaProgram {
@@ -947,15 +956,15 @@ fn synthetic_hash_program(seed: u64, n: usize) -> (crate::kernel_builder::SsaPro
 /// Run `before` and `after` on the same random inputs and compare every store.
 fn assert_same_values(before: &crate::kernel_builder::SsaProgram, after: &crate::kernel_builder::SsaProgram, seed: u64) {
     use super::interp::run;
-    let input = |v: crate::types::VReg, lane: usize| {
-        let mut r = Lcg(seed ^ ((v.id as u64) << 8) ^ lane as u64);
-        r.next();
-        r.word()
-    };
-    let (b, a) = (run(&before.ops, input).unwrap(), run(&after.ops, input).unwrap());
-    assert_eq!(b.stores.len(), a.stores.len());
-    for (i, (x, y)) in b.stores.iter().zip(&a.stores).enumerate() {
-        assert_eq!(x, y, "store {} differs (seed {})", i, seed);
+    // A random memory image (words biased to edge values); both programs run on a copy and
+    // the final memories must agree.
+    let mut r = Lcg(seed);
+    let image: Vec<u32> = (0..10_000).map(|_| r.word()).collect();
+    let (mut mb, mut ma) = (image.clone(), image);
+    run(before, &mut mb).unwrap();
+    run(after, &mut ma).unwrap();
+    for (i, (x, y)) in mb.iter().zip(&ma).enumerate() {
+        assert_eq!(x, y, "mem[{}] differs (seed {})", i, seed);
     }
 }
 

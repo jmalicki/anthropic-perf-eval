@@ -359,8 +359,12 @@ impl ValueFacts {
         }
         match (op.engine, op.opcode) {
             (Engine::Load, Opcode::Load) if !header_clobbered => {
+                // Lowering puts an immediate where the scratch address of the address goes:
+                // `load(Imm k)` reads mem[scratch[k]], known only for k = 0 (scratch[0] is
+                // always 0, so it reads header word 0).
                 let word = op.srcs.first().and_then(|s| match s {
-                    Operand::Imm(k) => Some(*k),
+                    Operand::Imm(0) => Some(0),
+                    Operand::Imm(_) => None,
                     Operand::VReg(w) => self.value(graph, *w),
                 })?;
                 Some(Address { word, offset: 0 })

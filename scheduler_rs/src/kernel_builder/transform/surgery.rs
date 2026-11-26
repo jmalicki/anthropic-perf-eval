@@ -286,6 +286,28 @@ impl Surgery {
                 }
             }
         }
+        // `fresh` numbers new VRegs from `vreg_count`: it must exceed every id in use, or a "new"
+        // VReg would be one the program already has (a lifted program may not keep the count).
+        let mut used: Vec<VReg> = program.zero_vreg.into_iter().collect();
+        for op in &program.ops {
+            used.extend(op.dest);
+            used.extend(op.srcs.iter().filter_map(|s| s.as_vreg()));
+            used.extend(op.keep_live.iter().flatten().copied());
+            used.extend(op.delta_vreg);
+            used.extend(op.sub_temp_vreg);
+        }
+        for (k, lanes) in &program.vector_group_lanes {
+            used.push(*k);
+            used.extend(lanes.iter().copied());
+        }
+        if let Some(max) = used.iter().map(|v| v.id).max() {
+            if max >= program.vreg_count {
+                return Err(format!(
+                    "vreg_count {} is not above the largest VReg id in use ({}): new VRegs would collide",
+                    program.vreg_count, max
+                ));
+            }
+        }
         // A vector with its own definer whose lanes are also listed as a group (a decomposed
         // vector, read lane by lane) must not have a lane written by another op: its value would
         // then be two things, and no rule's analysis (which reads the vector's definer) sees the
@@ -703,6 +725,26 @@ impl Surgery {
                 if let Some(v) = op.keep_live.iter().flatten().copied().find(|&v| !exists(v)) {
                     why = Some(format!("the edit would drop {:?}, which op {} keeps live (keep_live)", v, op.id));
                     break;
+                }
+            }
+            // A write-group key (no definer) is read by assembling its lanes: every lane must
+            // still be defined (a rule that renames a lane does not rewire the lane list).
+            if why.is_none() {
+                'ops: for (op, _) in &kept {
+                    for v in op_reads(op) {
+                        if graph.def_index(v).is_some() {
+                            continue;
+                        }
+                        if let Some(lanes) = graph.group_lanes(v) {
+                            if let Some(l) = lanes.iter().find(|&&l| Some(l) != program.zero_vreg && graph.def_index(l).is_none()) {
+                                why = Some(format!(
+                                    "the edit would drop lane {:?} of {:?}, which op {} reads as a vector group",
+                                    l, v, op.id
+                                ));
+                                break 'ops;
+                            }
+                        }
+                    }
                 }
             }
             if why.is_none() {

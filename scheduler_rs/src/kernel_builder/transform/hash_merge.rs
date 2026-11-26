@@ -122,7 +122,24 @@ impl HashMergeSite {
 /// # Returns
 /// `(m1, c1, m2, c2)` with `m1 = m`, `c1 = c + d`, `m2 = m << k`, `c2 = c << k`, mod 2^32.
 pub fn merged_constants(m: i64, c: i64, d: i64, k: i64) -> (i64, i64, i64, i64) {
-    (m & MASK, (c + d) & MASK, (m << k) & MASK, (c << k) & MASK)
+    // The inputs are whatever the constants' annotations say (any i64 that agrees with the
+    // immediate): reduce them first and wrap, so nothing overflows.
+    let (m, c, d) = (m & MASK, c & MASK, d & MASK);
+    let k = (k & 31) as u32;
+    (m, c.wrapping_add(d) & MASK, m.wrapping_shl(k) & MASK, c.wrapping_shl(k) & MASK)
+}
+
+#[cfg(test)]
+mod merged_constants_tests {
+    use super::merged_constants;
+
+    #[test]
+    fn test_merged_constants_wrap_mod_2_32() {
+        // Annotations may hold any i64 equal to the immediate: no overflow, results in 0..2^32.
+        assert_eq!(merged_constants(i64::MAX, i64::MAX, i64::MAX, 31), (0xFFFF_FFFF, 0xFFFF_FFFE, 0x8000_0000, 0x8000_0000));
+        assert_eq!(merged_constants(-1, -1, 1, 0), (0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(merged_constants(3, 0xFFFF_FFFF, 2, 4), (3, 1, 48, 0xFFFF_FFF0));
+    }
 }
 
 fn vreg_srcs(op: &SsaOp) -> Option<Vec<VReg>> {

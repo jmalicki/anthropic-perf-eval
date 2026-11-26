@@ -481,7 +481,7 @@ fn test_mirror_index_refuses_an_op_reading_two_index_values() {
     let (three, five) = (new_vconst(&mut p, 3), new_vconst(&mut p, 5));
     let one = vconst(&p, 1);
     let zero = zero_vec(&mut p);
-    let mut chain = |p: &mut SsaProgram, c: VReg| {
+    let chain = |p: &mut SsaProgram, c: VReg| {
         let b = push_valu(p, Opcode::And, &[c, one]);
         let off = push_valu(p, Opcode::Sub, &[two, b]);
         push_valu(p, Opcode::MultiplyAdd, &[zero, two, off])

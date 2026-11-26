@@ -61,6 +61,8 @@ mod tests_select_bits;
 mod tests_mirror_index;
 #[cfg(test)]
 mod tests_values;
+#[cfg(test)]
+mod tests_framework;
 
 pub use apply::apply_tree_access_plan;
 pub use cost::{derive_tree_access_costs, instantiate_tree_access, DerivedCostTable, CATEGORIES};
