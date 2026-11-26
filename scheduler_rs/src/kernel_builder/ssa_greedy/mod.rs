@@ -1078,19 +1078,24 @@ fn release_read_values(
     // aliases. A keep_live-only value is a liveness dependency through the op's own cycle, as
     // address assignment counts it (`use_cycles`).
     let fma_reads: HashSet<VReg> = if fma { multiply_add_reads(op, liveness_aliases) } else { HashSet::new() };
+    // What a vselect really reads or keeps live at its cycle (sources and keep_live values),
+    // expanded through the same aliases: a keep_live lane of the delta's group is a real read
+    // of the group's block, which address assignment holds through this cycle.
+    let real_reads: HashSet<VReg> = if delta_read && !fma {
+        liveness_release_vregs(op, liveness_aliases, false).into_iter().collect()
+    } else {
+        HashSet::new()
+    };
     for vreg in &liveness_release_vregs(op, liveness_aliases, delta_read) {
         let Some(remaining) = vreg_remaining_users.get_mut(vreg) else {
             continue;
         };
         *remaining = remaining.saturating_sub(1);
         // A vselect does not read the delta: no read, only one holder fewer. Unless the
-        // same VReg is also a direct source or keep-live read of the select (e.g. the
-        // condition is the delta), which the vselect does read at this cycle.
-        let delta_only = delta_read
-            && !fma
-            && op.delta_vreg == Some(*vreg)
-            && !op.srcs.iter().any(|src| src.as_vreg() == Some(*vreg))
-            && !op.keep_live.iter().flatten().any(|live| live == vreg);
+        // same VReg is also a source or keep-live read of the select, directly (e.g. the
+        // condition is the delta) or through a lane alias, which the vselect does read at
+        // this cycle.
+        let delta_only = delta_read && !fma && op.delta_vreg == Some(*vreg) && !real_reads.contains(vreg);
         if !delta_only {
             let end = cycle as i32 + i32::from(fma && fma_reads.contains(vreg));
             let e = trace.read_end.entry(*vreg).or_insert(end);
@@ -2149,6 +2154,16 @@ fn schedule_ssa_greedy_core(
     // sub_temp: subtract at its cycle, multiply_add one cycle later) makes its result visible
     // one cycle later than the vselect path. The CP-SAT model requires that extra cycle
     // (select_fma_extra_delay); without it the greedy hint violates the model's precedences.
+    // A fixed select encoding must name every SelectChoice: dispatch, delta tracking and the
+    // encoding output all read it per op, and a select missing from it would be placed by the
+    // overflow rule without being recorded (review of #88). Every caller passes a complete map
+    // (`ForcedEncodings`, `GreedyDecisions::select_choice_encoding`).
+    if let Some(fixed) = fixed_select_choice_encoding {
+        debug_assert!(
+            ops.iter().filter(|op| op.opcode == Opcode::SelectChoice).all(|op| fixed.contains_key(&op.id)),
+            "fixed_select_choice_encoding must name every SelectChoice"
+        );
+    }
     let fma_extra_latency: HashSet<usize> = fixed_select_choice_encoding
         .map(|fixed| {
             ops.iter()

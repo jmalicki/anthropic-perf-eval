@@ -2,11 +2,11 @@
 
 **Question.** At 16 rounds the whole-program CP-SAT solve never improves on its greedy warm start. Is the warm start locally near-optimal, or is the model too big for the solver to find improvements that exist? The answer feeds the decision on windowed or rolling-horizon CP-SAT.
 
-**Short answer (partial data, see [Status](#status)).**
-- The warm start is not locally optimal. With free encodings, about half of all 25-cycle windows and most 50-cycle windows can each be shortened by one cycle, proven optimal in most cases.
-- Applied in sequence, those gains add up. A rolling pass of 25-cycle windows took 1,399 to 1,393 cycles over the first 370 cycles of the schedule.
+**Short answer (partial data, see [Status](#status)).** Every gain below was found on the reduced model and is **not confirmed by the full model** (the two models later disagreed on a path-bit kernel: BUGS.md, docs/STARTUP_WINDOW_PROBE.md); read them as reduced-model results.
+- On the reduced model, the warm start is not locally optimal. With free encodings, about half of all 25-cycle windows and most 50-cycle windows can each be shortened by one cycle, proven optimal in most cases.
+- Applied in sequence, those reduced-model gains add up. A rolling pass (incomplete, not re-checked on the full model) of 25-cycle windows took 1,399 to 1,393 cycles over the first 370 cycles of the schedule.
 - Almost all of the gain needs different encodings, mainly VALU shift. With encodings fixed, 1 of 107 windows improves.
-- So whole-program CP-SAT is failing on scale: the improvements exist and its search does not reach them.
+- If the full model confirms them, whole-program CP-SAT is failing on scale: the improvements exist and its search does not reach them. Not confirmed.
 
 Tooling: `scripts/window_optimality_probe.py`, `scheduler_rs/src/cpsat_scheduler/window.rs`, skill `.cursor/skills/use-window-probe/SKILL.md`.
 
@@ -65,6 +65,8 @@ Reference: 1,399 cycles. "Saved" is per window, against the reference. "Bound" i
 
 ### Independent sweep
 
+Reduced model (`restrict_to_window`); the gains are unconfirmed by the full model (`--no-prune`), which was not run on these windows.
+
 | W | encodings | windows | proven optimal | improved | saved per improved window | max bound (open windows) | improved by phase | median / max s |
 |---|---|---|---|---|---|---|---|---|
 | 25 | free | 107 (all) | 87 | 49 | 1 (one window 2) | 8 | start-up 2, steady 40, tail 7 | 12 / 638 |
@@ -82,6 +84,8 @@ Notes:
 - **Window boundary follow-up.** The original W=25 sweep reported four infeasible free windows and five infeasible fixed windows among starts 26, 481, 624, 793 and 962. In the saved fixed model at 481, the reference used a one-cycle vselect at 505. An unconditional constraint also required its unused FMA cycle (506) to fit before the window ended. The window now applies that constraint only when the FMA executes. With this change and the preceding reference-domain fix, all five starts solved to optimality at 1,399 cycles in both modes (one worker, deterministic budget 5). All five generator runs passed symbolic replay and numeric validation of the reference kernel. The table retains the original sweep counts and timings.
 
 ### Rolling pass (what rolling-horizon CP-SAT would get)
+
+Reduced model, unconfirmed: the pass stopped at cycle 370, so its schedule was never re-checked on the full model or lowered.
 
 | W | windows | improved | final makespan | saved | complete |
 |---|---|---|---|---|---|

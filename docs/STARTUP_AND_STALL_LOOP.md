@@ -29,8 +29,9 @@ schedule's slots without a counterfactual build.
   enough.
   **Budget: stall + 0.98 is not safe on every plan.** 3 of the 28 new path-bit builds fail the
   scratch budget (peaks 1,761, 1,809, 1,817): the greedy reaches a cycle where nothing can be
-  placed at 1,528 live words (the greedy cannot proceed: no single ready op fits; not shown to
-  have no in-budget schedule, docs/STALL_DEADLOCK.md), forces an op and stays over budget for 265 to
+  placed at 1,528 live words (no operation was placed: ASAP inflation had deferred the other
+  ready ops before their budget checks, and whether they could have freed enough words was not
+  established; not shown to have no in-budget schedule, docs/STALL_DEADLOCK.md), forces an op and stays over budget for 265 to
   874 cycles. 0 of the index builds and 0 of the 85 earlier builds fail. They are recorded as
   failed plans, not tuned around.
 - **B, start-up: 1,033 -> 1,030** (1,032 simulated; PROVED, PASSED, `check_upstream.sh
