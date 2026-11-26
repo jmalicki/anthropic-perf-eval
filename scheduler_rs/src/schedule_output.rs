@@ -423,10 +423,28 @@ struct SsaOpDebugOut {
     /// flow op either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     select_fma_vector_ops: Option<u8>,
-    /// ConstChoice only: true if one of its encodings is a scalar ALU op (besides load and
-    /// flow add_imm).
+    /// ConstChoice only: true if the CP-SAT model can derive it on the scalar ALU, i.e. one of
+    /// its ALU alternatives reads only values some op of the program produces (an alternative
+    /// reading the hardware zero, which has no producing op, is kept but switched off).
     #[serde(skip_serializing_if = "Option::is_none")]
     const_alu_derivable: Option<bool>,
+    /// Emitter region tag (`SsaOp::region`): a hint about which region the op was emitted
+    /// for, never its semantics. Written only for tagged ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<RegionTagOut>,
+}
+
+/// `SsaOp::region` in the scheduler output JSON.
+#[derive(Serialize)]
+struct RegionTagOut {
+    id: u32,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u32>,
 }
 
 /// One memory ordering edge: the source op, its kind ("raw", "war", "waw") and the minimum
@@ -504,6 +522,25 @@ impl LivenessDetail {
     }
 }
 
+/// The items in ascending order (for serialising hash sets deterministically).
+fn sorted<T: Ord>(items: impl Iterator<Item = T>) -> Vec<T> {
+    let mut v: Vec<T> = items.collect();
+    v.sort_unstable();
+    v
+}
+
+/// Whether the CP-SAT model can derive this ConstChoice on the scalar ALU: one of its ALU
+/// alternatives reads only values in `produced` (values some op of the program produces).
+/// An alternative reading the hardware zero has no producer and is switched off in the model.
+fn const_alu_derivable(op: &crate::types::SsaOp, produced: &HashSet<i64>) -> bool {
+    op.const_alternatives.as_ref().map_or(false, |alts| {
+        alts.iter().any(|a| {
+            !matches!(a, crate::types::ConstEncoding::Load | crate::types::ConstEncoding::AddImm { .. })
+                && a.dependencies().iter().all(|v| produced.contains(v))
+        })
+    })
+}
+
 /// Write SSA schedule with usage accounting to JSON file.
 pub fn write_ssa_schedule_json(
     result: &crate::kernel_builder::SsaScheduleResult,
@@ -534,9 +571,11 @@ pub fn write_ssa_schedule_json(
                 engine: op.engine.as_str().to_string(),
                 opcode: slot.first().cloned().unwrap_or_default(),
                 slot,
-                dep_ids: op.dep_ids.iter().copied().collect(),
-                reads: op.reads.iter().copied().collect(),
-                writes: op.writes.iter().copied().collect(),
+                // `reads` / `writes` (and `dep_ids`) are hash sets: sort them so two runs of
+                // the same build write the same JSON.
+                dep_ids: sorted(op.dep_ids.iter().copied()),
+                reads: sorted(op.reads.iter().copied()),
+                writes: sorted(op.writes.iter().copied()),
                 from_const_choice: op.from_const_choice,
                 from_select_choice: op.from_select_choice,
             }
@@ -592,6 +631,8 @@ pub fn write_ssa_schedule_json(
 
     // Convert SSA ops to debug format
     let ssa_ops_debug: Option<Vec<SsaOpDebugOut>> = result.ssa_ops.as_ref().map(|ssa_ops| {
+        // Values some op produces: what an ALU alternative's operands must be for the model.
+        let produced: HashSet<i64> = ssa_ops.iter().filter_map(|op| op.produces_constant).collect();
         ssa_ops
             .iter()
             .map(|op| {
@@ -649,15 +690,14 @@ pub fn write_ssa_schedule_json(
                             2
                         }
                     }),
-                    const_alu_derivable: (op.opcode == crate::types::Opcode::ConstChoice).then(|| {
-                        op.const_alternatives.as_ref().map_or(false, |alts| {
-                            alts.iter().any(|a| {
-                                !matches!(
-                                    a,
-                                    crate::types::ConstEncoding::Load | crate::types::ConstEncoding::AddImm { .. }
-                                )
-                            })
-                        })
+                    const_alu_derivable: (op.opcode == crate::types::Opcode::ConstChoice)
+                        .then(|| const_alu_derivable(op, &produced)),
+                    region: op.region.map(|r| RegionTagOut {
+                        id: r.id,
+                        kind: r.kind.as_str(),
+                        round: r.round,
+                        group: r.group,
+                        depth: r.depth,
                     }),
                 }
             })
@@ -670,7 +710,11 @@ pub fn write_ssa_schedule_json(
         let mut spread_samples = Vec::new();
         let mut clustered_samples = Vec::new();
 
-        for (op_id, cycles) in &result.shifted_alu_cycles {
+        // In op id order: the first ten of each kind are written, and a hash order would
+        // pick different samples in every run.
+        let mut by_id: Vec<(&usize, &Vec<i32>)> = result.shifted_alu_cycles.iter().collect();
+        by_id.sort_unstable_by_key(|(id, _)| **id);
+        for (op_id, cycles) in by_id {
             let unique: HashSet<i32> = cycles.iter().copied().collect();
             let is_spread = unique.len() > 1;
 
@@ -756,11 +800,39 @@ pub fn write_ssa_schedule_json(
             .collect(),
     };
 
-    let json = serde_json::to_string_pretty(&output)
+    // Through `serde_json::Value`, whose maps are sorted by key: the output structs hold
+    // `HashMap`s, which would otherwise be written in a per-process random order.
+    let value = serde_json::to_value(&output).map_err(|e| format!("JSON serialization failed: {}", e))?;
+    let json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("JSON serialization failed: {}", e))?;
 
     std::fs::write(output_path, &json)
         .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod const_alu_derivable_tests {
+    use super::*;
+    use crate::types::{ConstEncoding, Opcode, SsaOp};
+
+    /// Only the kept zero form (`-5 = 0 - 5`, no op produces 0): not derivable; with a
+    /// produced operand pair it is.
+    #[test]
+    fn test_const_alu_derivable_ignores_the_zero_form() {
+        let mut op = SsaOp::new(0, crate::types::Engine::Load, Opcode::ConstChoice, None, vec![]);
+        op.produces_constant = Some(-5);
+        op.const_alternatives = Some(vec![
+            ConstEncoding::Load,
+            ConstEncoding::AddImm { value: -5 },
+            ConstEncoding::Sub { a_value: 0, b_value: 5 },
+        ]);
+        let produced: HashSet<i64> = [5].into_iter().collect();
+        assert!(!const_alu_derivable(&op, &produced));
+        let produced: HashSet<i64> = [0, 5].into_iter().collect();
+        assert!(const_alu_derivable(&op, &produced));
+        op.const_alternatives = Some(vec![ConstEncoding::Load, ConstEncoding::AddImm { value: -5 }]);
+        assert!(!const_alu_derivable(&op, &produced));
+    }
 }
