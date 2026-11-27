@@ -4,6 +4,8 @@
 > the rule numbering and the coupling ids (C1-C18) are frozen, because code comments on the
 > rule branches cite them. What was built differs in places; see
 > [TRANSFORM_PIPELINE_AS_BUILT.md](TRANSFORM_PIPELINE_AS_BUILT.md).
+> The "about 1,100 cycles" best quoted below is superseded: see
+> [CRITICAL_PATH.md](CRITICAL_PATH.md) (1,012 schedule / 1,014 simulator cycles, greedy only).
 
 **Conclusion.** The north star is a compiler that takes the original, unoptimised kernel and
 transforms it into a kernel as good as our best, with no strategy flags. The bar is a top

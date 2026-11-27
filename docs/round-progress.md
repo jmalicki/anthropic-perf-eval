@@ -62,6 +62,12 @@ Quick summary:
 - **68b1602** (tree-reduce depth3): 460 cycles, 1522 peak (greedy, valu-shift, batch 256)
 - **ae4a158** (current): 513 cycles, 1488 peak (greedy, no valu-shift, batch 256)
 
+Superseded (2026-11): ae4a158 was current in February 2026. Later 4-round figures at batch 256,
+schedule / simulator cycles: 423 / 425 from CP-SAT started from the shaped greedy with
+`--cpsat-split-shift-hint` ([GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 6),
+and 364 / 366 from the shaped greedy with `--greedy-justify 10`, greedy only (section 13 of the
+same document). For 16 rounds see [16 rounds](#16-rounds) below.
+
 ### From JSON files (all batch 256)
 
 | Date | SHA | Batch | Cycles | Peak live | Status | Validation | Notes | Source |
@@ -77,6 +83,17 @@ Quick summary:
 | 2026-02-07 | d6461724 | 256 | 499 | N/A | OPTIMAL | N/A | depth-3, no valu-shift | scheduler_output_depth3_novs.json |
 | 2026-02-07 | d6461724 | 256 | 506 | N/A | OPTIMAL | N/A | depth-2, no valu-shift | scheduler_output_depth2_novs.json |
 
+**Caveat on OPTIMAL in the February rows (added 2026-11):** from 1a4a1817 (2026-02-08) on,
+`generate_ssa_kernel.py` ran slot-capacity ASAP/ALAP tightening by default
+(`tighten_asap_alap_by_slots`); at d6461724 it was opt-in. PR #84 (2026-11) removed that
+function because, in its words, the rule behind it "excluded feasible, better schedules": at
+6 rounds / batch 64 "a validated 160-cycle schedule had 24 ops outside the resulting domains".
+OPTIMAL here therefore means optimal for the model as it was built then, with those domains.
+Whether the February version of the rule excluded any schedule on these instances was not
+checked, and the rows have not been re-measured since #79, #84 and #92 changed the CP-SAT
+model. The same applies to the OPTIMAL rows of the 3-round and 5-round tables from 1864ae7
+and 16d5766a.
+
 **Depth-3 validation note:** The validation failure for tree-reduce depth 3 at 614354c1 was later resolved in 29ad610b—the same configuration (4r, 256, depth 3) passed validation there. So identical configs show different outcomes because of fixes in between (e.g. scheduler/address-assign or validation; see BUGS.md for related scratch/liveness issues).
 
 ---
@@ -87,6 +104,44 @@ Quick summary:
 |------|-----|-------|--------|-----------|--------|------------|-------|--------|
 | 2026-02-09 | 16d5766a | 256 | 568 | N/A | OPTIMAL | N/A | depth-3 tree-reduce | scheduler_5r_depth3.json |
 | 2026-02-09 | 16d5766a | 256 | 704 | N/A | OPTIMAL | N/A | depth-4 tree-reduce | scheduler_5r_depth4.json |
+
+---
+
+## 16 rounds
+
+Added 2026-11 from the documents named in the last column; nothing was re-run for this table.
+All rows: batch 256, height 10, PROVED (dataflow replay) and PASSED (`--validate`). Cycles are
+schedule / simulator. "Strict" means `./scripts/check_upstream.sh --strict` passed (unmodified
+upstream correctness tests and every speed threshold).
+
+**The greedy rows are development figures, not CP-SAT results.** None of these is optimal or a
+bound.
+
+"Shaped" = `--greedy-barriers none --greedy-priority wavefront --greedy-split-shift
+--pressure-inflation-threshold 0.95`. "Load-tail" = shaped plus `--greedy-load-priority
+final-last --greedy-groups-in-flight 32 --greedy-stagger-cycles 9 --merge-hash-stages
+--index-form mirrored`.
+
+| Configuration | Cycles (sched / sim) | Scheduler | Strict | Output | Source |
+|---|---|---|---|---|---|
+| Default emission, default greedy | 2,007 / 1,994 | GREEDY | not stated | values and indices | [GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 1 |
+| Default emission, shaped | 1,313 / 1,315 | GREEDY | yes | values and indices | same, section 1 |
+| Default emission, shaped + `--greedy-justify 10` | 1,279 / 1,281 | GREEDY | yes | values and indices | same, section 13, PR #85 |
+| Shaped + `--merge-hash-stages --index-form mirrored --cached-select bits` | 1,153 / 1,155 | GREEDY | yes | values and indices | [EMISSION_ABLATION.md](EMISSION_ABLATION.md) section 3.5, PR #36 |
+| Load-tail + `--emission-plan docs/emission_plans/flow90.json` (index bits) | 1,039 / 1,041 | GREEDY | yes | values and indices | [GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 0.1, PR #73 |
+| Same plan + `--reassociate-gather-xor --index-early-terms final --select-xor-pushdown first-pass --greedy-justify 10` (best index-bit kernel) | 1,033 / 1,035 | GREEDY | yes | values and indices | [CRITICAL_PATH.md](CRITICAL_PATH.md), "Justification on the best kernels", PR #93 |
+| Load-tail + `path_flow90.json --select-bit-source path --greedy-alu-priority native-first --greedy-flow-priority chain-first` + the same three rewrites and `--greedy-justify 10` (best recorded) | **1,012 / 1,014** | GREEDY | yes | values and indices | same, PR #93 |
+| Shaped + `values_only_path_fix15_flow90.json` (no load-tail flags, no justify) | 1,081 / 1,083 | GREEDY | yes | **values only** | [EMISSION_STRUCTURE_MODEL.md](EMISSION_STRUCTURE_MODEL.md) section 6.1, PR #51 |
+| Default emission, shaped + `--cpsat-split-shift-hint`, `--cpsat-deterministic-time 60` | 1,314 / 1,316 | CP-SAT, returned its start unchanged | yes | values and indices | [GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 6, PR #57 |
+| Default emission, shaped hint, `--cpsat-objective makespan --cpsat-deterministic-time 60` | 1,399 / 1,401, `lb_cycles` 1,271 | CP-SAT, did not improve on its hint | not stated | values and indices | [RELAXED_SCRATCH_REFERENCE.md](RELAXED_SCRATCH_REFERENCE.md), CP-SAT table |
+| `flow90.json`, shaped, `--cpsat-deterministic-time 300` | 1,132 / 1,134, bound 1,000 | CP-SAT, stopped on the wall-clock backstop: not reproducible | not stated | values and indices | [EMISSION_STRUCTURE_MODEL.md](EMISSION_STRUCTURE_MODEL.md) section 5.1 |
+
+- The CP-SAT rows were measured before #79 (stale ConstChoice alternatives dropped), #84 (the
+  unsound energetic tightening rule replaced) and #92 (per-section scratch check changed), and
+  have not been re-measured.
+- The 1,012 and 1,033 rows are pinned by `tests/test_justify_on_best_pin.py` (ci_only).
+- The 1,271 capacity floor belongs to the default emission only. It is not a bound on the
+  problem, and the plan rows emit fewer ops.
 
 ---
 

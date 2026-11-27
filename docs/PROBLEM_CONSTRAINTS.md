@@ -131,6 +131,8 @@ From `interleaved_unrolled_kernel.py`:
 
 ### Current Performance
 
+Superseded (2026-11): the 2,390 figure is from early 2026. For the current best figures see [CRITICAL_PATH.md](CRITICAL_PATH.md) (1,012 schedule / 1,014 simulator cycles at 16 rounds, greedy only).
+
 | Kernel | Cycles | Speedup | Status |
 |--------|--------|---------|--------|
 | Baseline | 147,734 | 1.0x | Reference |

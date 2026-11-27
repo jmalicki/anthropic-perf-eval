@@ -8,6 +8,12 @@ kernel. Tables come from `uv run python -m scripts.schedule_report --table`.
 
 ## 0. Latest: what limits useful shifting (section 12)
 
+Note (2026-11): section 13 (`--greedy-justify N`, PR #85) is later than this summary and
+changes the best figures. Default emission: 1,313 / 1,315 to 1,279 / 1,281 (section 13). On
+the emission plans, together with the critical-path rewrites: 1,033 / 1,035 for `flow90.json`
+and 1,012 / 1,014 for `path_flow90.json` ([CRITICAL_PATH.md](CRITICAL_PATH.md), PR #93). All
+greedy-only development figures.
+
 Every vector op the greedy does not shift takes one vector slot, so `V - s = 6T - I` exactly
 (V vector ops, s shifted, T cycles, I idle vector slots). The identity ties the shift count to
 the cycle count only for a fixed number of idle slots: at the same I, a schedule that is longer
@@ -86,6 +92,11 @@ Rails for that command: PROVED, PASSED, greedy counter agrees with interval live
 limits hold, address assignment peak 1,244 of 1,536, two runs give the same kernel, and
 `./scripts/check_upstream.sh --strict` with the same options passes upstream's CorrectnessTests and
 every speed threshold at 1,315 cycles.
+
+Superseded as the best figure for the default emission (2026-11): adding `--greedy-justify 10`
+to the command above gives 1,279 schedule / 1,281 simulator cycles, 8 above the 1,271 floor,
+PROVED, PASSED and upstream `--strict` (section 13, PR #85). The table and the rest of this
+section are the measurement as it was made.
 
 **This is a greedy-only result.** By default split shift is switched off whenever CP-SAT
 follows the greedy, because CP-SAT's hint then carries one cycle per op, and CP-SAT starts
@@ -342,7 +353,10 @@ The greedy schedule is CP-SAT's warm start and bounds its search (every op's lat
 is capped at its greedy cycle + 15). Without `--cpsat-split-shift-hint`,
 `--greedy-split-shift` is ignored in this pipeline, so the start is the wavefront schedule
 without split shifts. All runs `--cpsat-deterministic-time 20` with a generous wall-clock
-backstop (none stopped on it), PROVED and PASSED. The table below was measured before #41,
+backstop (none stopped on it), PROVED and PASSED. Every CP-SAT figure in this section was
+measured before #79 (stale ConstChoice alternatives dropped), #84 (energetic tightening rule
+replaced) and #92 (per-section scratch check changed) and has not been re-measured since.
+The table below was measured before #41,
 when the hint handed to CP-SAT from 3 rounds up was incomplete (the shared CSE
 subtractions' scratch intervals were not hinted); the split-shift hint measurements further
 down are on main after #41, with a complete hint.
@@ -463,9 +477,10 @@ and PASSED unless it says fails. The wavefront found 32 chains in every row.
   5 to 7 cycles at 16 rounds (1,314 to 1,307), 12 or more groups abreast is worse (1,348).
   Not kept. The tail is the remaining 3%.
 - **A separate load-feeding priority**: not needed (section 3).
-- **Forward-backward justification after the greedy**: not done. It would have to move
-  split-shift lanes and keep the live-word counter exact while shifting ops later; the
-  tail it could recover is at most the 37 to 43 cycles left.
+- **Forward-backward justification after the greedy**: not done in this work. Done later as
+  `--greedy-justify N` (section 13, PR #85): it moves split-shift lanes, checks scratch on
+  each candidate after scheduling it, and takes 34 of the 42 cycles that were left at 16 rounds
+  (1,313 to 1,279).
 - **Priority-rule sampling** (several staggers and windows, keep the best): not built. The
   sweeps in section 5 show what it would find: about 5 cycles at 16 rounds, 14 at 4 rounds.
 - **The 2-lane minimum for starting a split** was not tuned.
@@ -475,6 +490,8 @@ and PASSED unless it says fails. The wavefront found 32 chains in every row.
 1. For a 16-round greedy kernel use the command in section 1. It is a clear win with all
    rails green: 1,994 to 1,315 simulator cycles, below the 1,487 target and past every
    upstream speed threshold, from the greedy alone (about a second to build).
+   Superseded (2026-11): add `--greedy-justify 10` to that command for 1,281 simulator
+   cycles (section 13).
 2. `--pressure-inflation-threshold 0.95` is safe to make the default on its own: it is
    better at every size measured, on the default shape and with the wavefront, and it keeps
    46 words of budget. This PR stack does not change it.
@@ -482,8 +499,9 @@ and PASSED unless it says fails. The wavefront found 32 chains in every row.
    gather rounds (5 rounds and up; at 4 rounds it still wins, 30 cycles in section 6,
    from running select rounds of some groups beside the hash of others), but at 3 rounds
    CP-SAT does better from the default
-   shape with the retuned threshold (section 6), and CP-SAT cannot yet take the split-shift
-   schedule.
+   shape with the retuned threshold (section 6). When this was written CP-SAT could not
+   take the split-shift schedule; since PR #57 `--cpsat-split-shift-hint` hands it over
+   (section 6, "Handing CP-SAT a split-shift schedule").
 4. The per-round barrier and the per-section repair it exists for are not needed by the
    wavefront greedy: it has never exceeded the budget at any size measured here.
 
@@ -1028,7 +1046,11 @@ build:
 `tests/test_scheduler_rs_interface.py::test_greedy_justify_with_cpsat` builds the first row
 both ways and checks the replay proof, the reference output, and that the result is no
 longer than the hint or than the build without justification. Nothing larger has been run
-with CP-SAT.
+with CP-SAT for this table. Later (PR #93, #89): the justified 16-round schedules of the two
+best emission plans (1,012 and 1,033) pass the window probe's all-fixed check as CP-SAT hints
+([CRITICAL_PATH.md](CRITICAL_PATH.md), "As a CP-SAT hint";
+[STARTUP_WINDOW_PROBE.md](STARTUP_WINDOW_PROBE.md) part B). That is a check of the hint; no
+whole-program CP-SAT solve from a justified 16-round hint is recorded.
 
 ### Limits
 
@@ -1048,9 +1070,15 @@ with CP-SAT.
   to the per-section repair where the greedy's would not; that has not been observed or
   measured.
 - Shift decisions change only when the greedy owned them (no forced shift encoding, no hint
-  pass); ALU-derived constants, eliminated vbroadcasts and individually forced shifts
-  (what-if runs, with or without CP-SAT: the greedy places the forced ops shifted, but the
-  justification passes choose every shift themselves) make the pass skip.
+  pass). The pass skips when the greedy schedule is over the scratch budget, when
+  vbroadcasts were eliminated, and when shifts are forced individually (what-if runs, with
+  or without CP-SAT: the greedy places the forced ops shifted, but the justification passes
+  choose every shift themselves).
+- ALU-derived constants (`--greedy-const-policy`) made the pass skip when this section was
+  written. Since PR #93 it models them: a derived constant is scheduled after both of its
+  producers, and both stay live to its cycle in the pass's scratch check and in its
+  address-assignment trial ([CRITICAL_PATH.md](CRITICAL_PATH.md), "Justification on the best
+  kernels").
 
 ```bash
 # 16 x 256: 1,279 cycles (1,281 on the simulator), PROVED and PASSED

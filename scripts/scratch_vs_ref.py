@@ -14,7 +14,6 @@ import argparse
 import json
 import sys
 import random
-import argparse
 
 from problem import (
     Machine,

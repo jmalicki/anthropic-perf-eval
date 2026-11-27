@@ -48,6 +48,10 @@ The gap to the leaders' level is therefore mostly emission:
 1,099 − 880 = 219 cycles: 121 from the floor (more ops, mostly loads and vector work) and
 98 from scheduling and the VALU/ALU split.
 
+Superseded as our best (2026-11): the best recorded kernel is now 1,012 schedule / 1,014
+simulator cycles, greedy only ([CRITICAL_PATH.md](CRITICAL_PATH.md)). The lift, the floors and
+the split of the gap above are for the 1,099-cycle kernel and have not been redone for it.
+
 **Does this make a CP-SAT-based design credible?** Partly.
 - CP-SAT proved optimality on two lifted graphs of about 20,000 ops, reaching 880 in 10 s
   and 899 within its budget. For the 982-cycle schedule, its bound reached 979 in a few

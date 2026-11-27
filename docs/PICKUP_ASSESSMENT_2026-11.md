@@ -6,6 +6,10 @@ this session unless marked otherwise. Commands are in the last section.
 
 ## 1. Where things stand
 
+Superseded (2026-11-26): this table is the state at the start of the November restart. For the
+current best figures see [CRITICAL_PATH.md](CRITICAL_PATH.md) (1,012 schedule / 1,014 simulator
+cycles, greedy only).
+
 | Item | Result |
 |------|--------|
 | 16-round kernel, greedy, before this session | Does not build (aborts past 5 rounds) |

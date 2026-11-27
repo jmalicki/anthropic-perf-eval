@@ -103,6 +103,7 @@ log says "All sections within budget" or is greedy-only. Every row PROVED and PA
 The queued 16-round solves were stopped for CPU priority (and two run at once were killed for
 memory); they run one at a time with the same options. 16 rounds, shaped, real: CP-SAT did not
 improve on the 1,399-cycle hint and proved 1,271, the capacity floor.
+(As of 2026-11-26 no result for the queued cells is recorded in this document.)
 
 `lb_cycles` is CP-SAT's proven bound; at 4 rounds it equals the capacity floor in every run,
 so removing the scratch constraint did not let CP-SAT prove anything stronger. Every solve
@@ -116,6 +117,13 @@ below the best real 4-round result here (425).
 - **Scratch is not what limits the shaped schedules.** With the wavefront shape the relaxed
   runs give the same cycles as the real ones, for the default emission, main's best emission
   and PR #51's plan. Their peaks (1,050 to 1,336) are below 1,536 already.
+  Qualified by later results (2026-11): this holds for the three configurations measured
+  here. On other plans scratch does limit the shaped greedy: path bits on `flow90.json` go
+  from 1,105 to 1,046 scratch-relaxed (not `path_flow90.json`, 1,033 to 1,034;
+  [EMISSION_STRUCTURE_MODEL.md](EMISSION_STRUCTURE_MODEL.md), "Update" paragraph), and the
+  45 cycles `--reassociate-gather-xor` costs the index plan are attributed to scratch
+  pressure ([CRITICAL_PATH.md](CRITICAL_PATH.md) section 3). "Main's best emission" in this
+  document is `--merge-hash-stages --index-form mirrored`, the best on main at the time.
 - **Scratch does limit the default (round-barrier) shape**, through the pressure policy's
   inflation throttle: relaxed gains 56 cycles (2,007 → 1,951) and 33 with main's best emission,
   with peaks of 1,620 to 1,628. That shape is far from the floor for other reasons (rounds run
@@ -124,9 +132,13 @@ below the best real 4-round result here (425).
   It reached 1,293 cycles at stagger 6 with a 2,009-word peak. The best real schedules reached
   1,308 at stagger 10 and 20 groups in flight, and 1,313 with the shaped greedy configuration.
   The relaxed schedule was still 22 cycles above the 1,271-cycle floor.
+  (Superseded, 2026-11: real schedules of this emission now reach 1,279 with
+  `--greedy-justify 10`, and 1,278 at stagger 10 and 20 groups in flight,
+  [GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 13; the best recorded kernel
+  on any emission is 1,012, [CRITICAL_PATH.md](CRITICAL_PATH.md). Greedy-only figures.)
 - **CP-SAT does find shorter schedules without scratch from the round-barrier hint** at 4
   rounds: 405 against 455 with scratch, and 20 cycles (5%) faster than the best real run of 425.
-  The 16-round comparison is still queued.
+  The 16-round comparison was queued and no result is recorded here.
 - **The CP-SAT bound does not move without scratch** at 4 rounds (357 in every run, the
   capacity floor), and 1,271 (the floor) with scratch at 16 rounds. So the bound gap is not a
   scratch artefact.

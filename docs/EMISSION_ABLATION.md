@@ -27,6 +27,10 @@ reduction behind a switch that is off by default and backed by a Z3 proof.
   --greedy-priority wavefront --greedy-split-shift --pressure-inflation-threshold 0.95`,
   section 3.5) the same emission goes from 1,313 to **1,153** schedule cycles (1,155 on the
   simulator), output unchanged, and passes every upstream speed threshold.
+  Superseded as the best figure (2026-11): with an emission plan (`--emission-plan`), the
+  critical-path rewrites and `--greedy-justify 10` the best recorded kernels are 1,012 / 1,014
+  (path bits) and 1,033 / 1,035 (index bits), output unchanged, greedy-only development
+  figures ([CRITICAL_PATH.md](CRITICAL_PATH.md)).
 - `--values-only` changes what the kernel writes (no final indices). It is worth 1 cycle of
   floor once the other options are on, because the floor is then bound by loads (3 cycles
   with the shaped greedy: 1,153 to 1,150). The user has approved it for recorded results
@@ -122,6 +126,7 @@ construction (tested).
 3 rounds, batch 64, `--cpsat-deterministic-time 10`. This checks that the options work
 through the per-section and full-kernel CP-SAT paths and the forced encodings; it is not a
 performance result. Measured on `main` at `cdb6ad1` (CP-SAT tuning switches #23 to #28 and #39, the domain and hint fixes #40, #41, #43) with this stack on top.
+That is before #79 (stale ConstChoice alternatives dropped), #84 (energetic tightening rule replaced) and #92 (per-section scratch check changed); the table has not been re-measured since.
 
 | Configuration | Forced mode | Vector-op equiv. | Loads | Flow | Floor | Cycles (sched / sim) | Peak live | PROVED | PASSED |
 |---|---|---|---|---|---|---|---|---|---|
@@ -330,6 +335,23 @@ bound on the problem.
 | `--values-only` | **Allowed for recorded results** (user decision, November 2026), on two conditions: the unmodified upstream tests pass, and the number is labelled "values only" | It stops writing the final indices. Upstream tests and the leaderboard compare values only, the repository's own `--validate` compares indices too (it compares values only under this flag and says so). Its gain is 1 cycle of floor with the other options on (the floor is then bound by loads), 14 cycles alone; 3 cycles with the shaped greedy |
 
 Defaults were not changed by this work.
+
+Later results (2026-11) that this table does not reflect; all greedy-only development figures
+at 16 rounds, output unchanged:
+
+- `--cached-select`: the best kernels choose the tree access per group and round with
+  `--emission-plan` instead (it replaces `--cached-select`). `docs/emission_plans/flow90.json`
+  with the retuned shaped greedy gives 1,039 / 1,041 against 1,153 / 1,155 for `bits`
+  ([GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 0.1).
+- `--select-bit-source path`: still needs the wavefront shape, but it is no longer worth only
+  1 cycle. The best recorded kernel uses it: 1,012 / 1,014 with `path_flow90.json` against
+  1,033 / 1,035 with index bits ([CRITICAL_PATH.md](CRITICAL_PATH.md), "Justification on the
+  best kernels").
+- Three more emitter options exist that this document does not measure:
+  `--reassociate-gather-xor`, `--index-early-terms` and `--select-xor-pushdown` (proofs R16
+  to R18, [CRITICAL_PATH.md](CRITICAL_PATH.md) section 2). Several options here can also be
+  applied as rewrites of the finished SSA with `--transform`
+  ([TRANSFORM_PIPELINE_AS_BUILT.md](TRANSFORM_PIPELINE_AS_BUILT.md)).
 
 What would lower the floor further, in order: fewer loads (the gathers: this is the
 packet / per-lane `vload` design of `docs/BOUND_GAP_ANALYSIS.md` section 4.4, out of scope
