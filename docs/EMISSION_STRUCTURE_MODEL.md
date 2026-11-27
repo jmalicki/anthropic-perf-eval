@@ -15,6 +15,15 @@ simulator with the output unchanged (branch bits kept live), and **1,083** with 
 the 1-based index and subtree packets (phases 2 and 3) are worth only about 35 cycles of floor
 on this structure: once loads stop binding, the vector work binds near 975 (section 6).
 
+Superseded (2026-11): the cycle counts in the paragraph above are the first measurement, and
+"today's best flags" and "current best plan" in sections 5 and 6 mean the best at that time.
+With the load-tail greedy the same two plans run 1,039 / 1,041 (`flow90.json`) and
+1,033 / 1,035 (`path_flow90.json`); see the next paragraph and section 10.0. With the
+critical-path rewrites and `--greedy-justify 10` on top they run 1,033 / 1,035 (`flow90.json`)
+and 1,012 / 1,014 (`path_flow90.json`), the best recorded
+([CRITICAL_PATH.md](CRITICAL_PATH.md), PR #93). All of these keep the output unchanged and are
+greedy-only development figures.
+
 A closed loop between this model and the shaped greedy (section 10, Benders-style feedback with
 no-goods, learned caps, and time-aware rows whose row form is argued (coupling proved) but
 whose per-class table is only observed) **finds no plan better than the hand-made ones, also with the load-tail greedy**
@@ -320,7 +329,9 @@ simulator cycles**, PROVED and PASSED, best bound 1,000. It stopped on the wall-
 after 172 of the 300 deterministic-time units, so it is not reproducible, and it did not improve
 its warm start. That warm start is worse than the greedy's own 1,104 because the greedy split
 shift is not used when CP-SAT follows the greedy. CP-SAT at 3 rounds through the same emission
-paths is covered by docs/EMISSION_ABLATION.md section 3.4.
+paths is covered by docs/EMISSION_ABLATION.md section 3.4. This run predates the changes of
+#79, #84 and #92 to the CP-SAT model, the default tightening and the per-section scratch
+check; it has not been re-measured.
 
 ## 6. Phases 2 and 3: what the model says they are worth
 
@@ -422,6 +433,10 @@ What this says:
   100 cycles.
 - Best plans, both checked in: `docs/emission_plans/path_flow90.json` (output unchanged, 1,099 on
   the simulator) and `docs/emission_plans/values_only_path_fix15_flow90.json` (values only, 1,083).
+- Note (2026-11): no later measurement of the values-only plan is recorded in the docs (none
+  with the load-tail greedy flags, the critical-path rewrites or `--greedy-justify`). The
+  output-unchanged plan has since reached 1,014 on the simulator
+  ([CRITICAL_PATH.md](CRITICAL_PATH.md)), below this values-only figure.
 
 
 ## 7. Limits

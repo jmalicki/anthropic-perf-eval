@@ -20,13 +20,15 @@ The implementation is the PR stack:
 | #81 | `transform/mirror-index-rule` | Rule 8 |
 | #70 | `ssa-equivalence-checker` | The SSA equivalence checker |
 
+As of 2026-11-26 (main at 0bc5324) all eight PRs are merged into main, not only #68.
+
 ## Where the transforms run
 
 - **Design (section 1):** one `transform(program, spec)` between `build()` and
   `PipelineContext::new`.
 - **Built:** `TransformPass` (`pipeline/passes/transform.rs`) is the first pass inside
   `run_greedy_pipeline` and `run_cpsat_pipeline` (`pipeline/mod.rs`; on
-  `transform/mirror-index-rule` at lines 254 and 309). It runs before
+  main at 0bc5324, lines 293 and 362). It runs before
   `ComputeDependenciesPass`, on the program exactly as emitted.
 
 ## Tree access

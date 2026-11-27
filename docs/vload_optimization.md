@@ -6,6 +6,8 @@ This document analyzes the potential for using `vload` (vector load) to optimize
 
 ## Current Performance
 
+Superseded (2026-11): the 2,390 figure is from early 2026. For the current best figures see [CRITICAL_PATH.md](CRITICAL_PATH.md) (1,012 schedule / 1,014 simulator cycles at 16 rounds, greedy only).
+
 | Metric | Value |
 |--------|-------|
 | Current best | 2,390 cycles |

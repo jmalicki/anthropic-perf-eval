@@ -16,6 +16,12 @@ kernels emit far fewer.
 | Public 880-cycle kernel (Sakauma, static tally) | 6,541 | 1,724 | 873 | 880 |
 | Budget of an 863-cycle kernel | at most 6,472 | at most 1,726 | | 863 |
 
+Superseded (2026-11): "Achieved 1,994 to 2,007" was the default greedy. The same emission now
+runs in 1,279 schedule / 1,281 simulator cycles with the shaped greedy and `--greedy-justify 10`
+([GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) section 13), and the best recorded kernel,
+on an emission with fewer ops, in 1,012 / 1,014 ([CRITICAL_PATH.md](CRITICAL_PATH.md)). Both are
+greedy-only development figures.
+
 Three assumptions are baked into our op set, and the public 880-cycle kernel breaks all three:
 
 1. **One scalar `load` per lane per gathered level.** A `vload` takes one load slot, reads
@@ -80,7 +86,9 @@ and >= q from the end (proved sound with Z3 in `verification/static_bounds_proof
 explain little. Main's best 16-round shaped greedy gets 1,130 -> 1,132 against 1,197 achieved
 (2 of 67 cycles). PR #51's 1,097-cycle kernel gets 994 -> 1,009 (15 of 103), from the load row:
 the gathers cannot start before cycle 51. The rest of the gap is not depth. `schedule_report`
-prints these rows.
+prints these rows. (Superseded, 2026-11: the kernels named here were the best when this was
+measured. The best recorded since is 1,012 schedule / 1,014 simulator cycles, greedy only;
+see [CRITICAL_PATH.md](CRITICAL_PATH.md).)
 
 ## 3. Where our ops go
 
@@ -238,6 +246,13 @@ Which design reaches which target:
 | 1,100 | B0 (floor 1,044). Needs a schedule within 5% of the floor, so round barriers must go | Public kernels of this shape reach 1,023 to 1,160 |
 | 1,000 | B1 or C1 (floors 954, 945). Needs a schedule within 5% | The public 975 kernel is this family: 5,800 vector ops, floor 967 |
 | 863 | Only D, and only with about 70 fewer equivalents than the 880 kernel (6,472 against 6,541) at the same load count | Not demonstrated publicly |
+
+Status (2026-11): the 1,100 target has been passed and the 1,000 target has not. The best
+recorded kernel is 1,012 schedule / 1,014 simulator cycles (greedy only, PROVED, PASSED,
+upstream `--strict`; [CRITICAL_PATH.md](CRITICAL_PATH.md)). Its emission plan caches level 4 in
+some groups of one visit (round 4, 20 groups), the kind of per-group mix that
+[EMISSION_STRUCTURE_MODEL.md](EMISSION_STRUCTURE_MODEL.md) section 5 identifies with design
+C1 for its index-bit plans (the path-bit plan is in its section 6.1).
 
 Why no scalar-gather design reaches 863 (V, arithmetic): levels 5 to 10 have 32 to 1,024
 nodes and must be gathered, so there are at least 6 gather rounds. Per group that is

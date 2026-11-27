@@ -191,7 +191,7 @@ xor would take 1 cycle off the setup.
 |---|---|---|
 | `--greedy-flow-priority chain-first` | `key` | Flow ops by chain rank (shared first), then key. Test: `test_flow_chain_first_lets_the_first_chain_through` (control: key is later) |
 | (both orderings, and `--greedy-load-priority`) | | Wavefront only: with another `--greedy-priority` they are an error (they were silently ignored). Test: `tests/test_wavefront_only_options.py` |
-| headline pin | | `tests/test_startup_orderings_pin.py` (16-round builds; marked ci_only, deselected by default once #93 lands): default 1,033, chain-first 1,031, native-first 1,033, both 1,030 |
+| headline pin | | `tests/test_startup_orderings_pin.py` (16-round builds; marked ci_only, deselected by default; CI runs it in its ci-only step): default 1,033, chain-first 1,031, native-first 1,033, both 1,030 |
 | `--greedy-alu-priority {key,native-first}` | `key` | Native scalar-ALU ops are tried before the cycle's vector ops (lanes of a split shift carried from the previous cycle are still placed first and can take scalar slots). Test: `test_alu_native_first_keeps_scalar_slots_for_natives` (control: under the key shifts split the natives over two cycles). The reorder also puts natives first in the ASAP-inflation scan, whose last 3 ops are exempt: measured on `path_flow90.json` with chain-first, total inflation deferrals 299 -> 206; alone it gives the default kernel (231 -> 231) |
 | `emission_structure loop --greedy-option KEY=VALUE` | none | Greedy build option for the judge, stored in the state |
 | loop modes `topk-floor`, `topk-greedy-model` | - | Build one plan per score level (floor / greedy model), lowest levels first, for k levels |

@@ -14,6 +14,10 @@ Tooling: `scripts/window_optimality_probe.py`, `scheduler_rs/src/cpsat_scheduler
 
 ### Warm start
 
+"Current best" below is as of this measurement. The best recorded schedules since are 1,012
+and 1,033 cycles (greedy only, [CRITICAL_PATH.md](CRITICAL_PATH.md));
+[STARTUP_WINDOW_PROBE.md](STARTUP_WINDOW_PROBE.md) part B probes those.
+
 The current best 16-round schedule, the shaped greedy (main's default emission):
 
 ```bash

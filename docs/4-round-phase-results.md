@@ -33,6 +33,10 @@ Tree-reduce depth3 (8-way selection) saves 5 cycles and 7 words peak liveness fo
 
 ## Current Status (ae4a158)
 
+Superseded (2026-11): this was the status as of 2026-01-31 (ae4a158). For the current best figures
+(16 rounds) see [CRITICAL_PATH.md](CRITICAL_PATH.md); later 4-round figures are in
+[GREEDY_SHAPE_ABLATION.md](GREEDY_SHAPE_ABLATION.md) sections 6 and 13.
+
 - **Git SHA:** ae4a158
 - **Changes:** Fixed SelectChoice lowering bug (allocate real VReg for sub temp), reserved zero VReg
 

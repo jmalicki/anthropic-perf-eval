@@ -96,7 +96,8 @@ Reading:
 - **Setup root broadcast before the deferred-constant XOR**: one cycle off the setup chain,
   but the head row is not the binding one alone (see Answers), and it costs one XOR per group.
 - **Transform rules**: the rewrites are emitter options; as transform rules
-  (`scheduler_rs/src/kernel_builder/transform/`, not in this stack) they would match:
+  (`scheduler_rs/src/kernel_builder/transform/`, on main since PRs #68 to #81; it has no rule
+  for R16 to R18) they would match:
   R16, a vector XOR whose operand is `gathered_node ^ broadcast(K)` with one reader;
   R17, a SUB `V - madd(n, 2, b)` (or the final store's) where `b` is a branch bit;
   R18, a vector XOR of a value with the result of a top-level select.
@@ -232,6 +233,11 @@ until #92 lands. Best flags plus
 
 Both final kernels PROVED and PASSED. So the justified schedule survives as the hint of a
 whole-program or windowed CP-SAT solve with these flags; no CP-SAT improvement was run here.
+
+Note (2026-11-26): #92 has since landed (312087d), so the per-section overcount no longer
+blocks this check on main. The table above is still the local-merge measurement and has not
+been re-run on main. An all-fixed check of the same two references on the #92 branch, with
+commands and reports, is in [STARTUP_WINDOW_PROBE.md](STARTUP_WINDOW_PROBE.md) part B.
 
 ```bash
 # 1,016 (path, R16, alu-first optional)
